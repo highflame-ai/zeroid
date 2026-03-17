@@ -139,6 +139,7 @@ func (a *API) getOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
 		}
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to get oauth client")
 		return nil, huma.Error500InternalServerError("failed to get oauth client")
 	}
 
@@ -153,6 +154,7 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 
 	clients, err := a.oauthClientSvc.ListClients(ctx, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
+		log.Error().Err(err).Msg("failed to list oauth clients")
 		return nil, huma.Error500InternalServerError("failed to list oauth clients")
 	}
 
@@ -173,6 +175,7 @@ func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientI
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
 		}
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to rotate oauth client secret")
 		return nil, huma.Error500InternalServerError("failed to rotate secret")
 	}
 
@@ -190,6 +193,7 @@ func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput
 	}
 
 	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to delete oauth client")
 		return nil, huma.Error500InternalServerError("failed to delete oauth client")
 	}
 

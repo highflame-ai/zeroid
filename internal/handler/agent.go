@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -15,6 +16,7 @@ import (
 )
 
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
+// Internal details are logged server-side; only generic messages are returned to clients.
 func mapErr(err error) error {
 	if err == nil {
 		return nil
@@ -22,13 +24,14 @@ func mapErr(err error) error {
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no rows in result set"), strings.Contains(msg, "not found"):
-		return huma.Error404NotFound(msg)
+		return huma.Error404NotFound("resource not found")
 	case strings.Contains(msg, "already exists"), strings.Contains(msg, "duplicate"):
-		return huma.Error409Conflict(msg)
+		return huma.Error409Conflict("resource already exists")
 	case strings.Contains(msg, "invalid status transition"):
-		return huma.Error400BadRequest(msg)
+		return huma.Error400BadRequest("invalid status transition")
 	default:
-		return huma.Error500InternalServerError(msg)
+		log.Error().Err(err).Msg("unexpected agent service error")
+		return huma.Error500InternalServerError("internal server error")
 	}
 }
 
@@ -213,7 +216,8 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
 		}
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register agent")
+		return nil, huma.Error500InternalServerError("failed to register agent")
 	}
 
 	return &RegisterAgentOutput{Body: resp}, nil

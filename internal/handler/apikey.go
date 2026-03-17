@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -123,7 +124,8 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Metadata:      input.Body.Metadata,
 	})
 	if err != nil {
-		return nil, huma.Error500InternalServerError("failed to create API key: " + err.Error())
+		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create API key")
+		return nil, huma.Error500InternalServerError("failed to create API key")
 	}
 
 	return &CreateAPIKeyOutput{Body: resp}, nil
@@ -150,6 +152,7 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 
 	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, "", "", input.Page, input.Limit)
 	if err != nil {
+		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")
 	}
 
@@ -169,6 +172,7 @@ func (a *API) revokeAPIKeyOp(ctx context.Context, input *RevokeAPIKeyInput) (*Re
 	revokedBy := internalMiddleware.GetCallerName(ctx)
 
 	if err := a.apiKeySvc.RevokeKey(ctx, input.ID, revokedBy, input.Body.Reason); err != nil {
+		log.Error().Err(err).Str("key_id", input.ID).Msg("failed to revoke API key")
 		return nil, huma.Error500InternalServerError("failed to revoke API key")
 	}
 

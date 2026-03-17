@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -125,7 +126,8 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 		if errors.Is(err, service.ErrPolicyNameConflict) {
 			return nil, huma.Error409Conflict("credential policy with this name already exists")
 		}
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create credential policy")
+		return nil, huma.Error500InternalServerError("failed to create credential policy")
 	}
 
 	return &PolicyOutput{Body: policy}, nil
@@ -153,6 +155,7 @@ func (a *API) listPoliciesOp(ctx context.Context, _ *struct{}) (*PolicyListOutpu
 
 	policies, err := a.credentialPolicySvc.ListPolicies(ctx, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
+		log.Error().Err(err).Msg("failed to list credential policies")
 		return nil, huma.Error500InternalServerError("failed to list credential policies")
 	}
 
@@ -183,7 +186,8 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error404NotFound("credential policy not found")
 		}
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to update credential policy")
+		return nil, huma.Error500InternalServerError("failed to update credential policy")
 	}
 
 	return &PolicyOutput{Body: policy}, nil
@@ -196,7 +200,8 @@ func (a *API) deletePolicyOp(ctx context.Context, input *PolicyIDInput) (*struct
 	}
 
 	if err := a.credentialPolicySvc.DeletePolicy(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
-		return nil, huma.Error409Conflict(err.Error())
+		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to delete credential policy")
+		return nil, huma.Error500InternalServerError("failed to delete credential policy")
 	}
 
 	return nil, nil

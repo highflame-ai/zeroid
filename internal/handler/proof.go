@@ -81,6 +81,7 @@ func (a *API) generateProofOp(ctx context.Context, input *GenerateProofInput) (*
 
 	proofToken, err := a.proofSvc.GenerateProofToken(ctx, identity, input.Body.Audience, input.Body.Nonce)
 	if err != nil {
+		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to generate proof token")
 		return nil, huma.Error500InternalServerError("failed to generate proof token")
 	}
 

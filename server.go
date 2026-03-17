@@ -33,6 +33,13 @@ import (
 	"github.com/zeroid-dev/zeroid/internal/worker"
 )
 
+// adminAuthHolder stores the optional admin auth middleware in a thread-safe way.
+// Shared between the router middleware closure and the AdminAuth() method.
+type adminAuthHolder struct {
+	mu sync.RWMutex
+	fn AdminAuthMiddleware
+}
+
 // Server is the main ZeroID server.
 //
 // Single port, two route groups:
@@ -69,7 +76,7 @@ type Server struct {
 	mu              sync.RWMutex
 	customGrants    map[string]GrantHandler
 	claimsEnrichers []ClaimsEnricher
-	adminAuth       AdminAuthMiddleware
+	adminAuthState  *adminAuthHolder
 }
 
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
@@ -155,6 +162,10 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
+	// Shared admin auth state — the closure and Server.AdminAuth both read/write
+	// through this shared struct so the middleware can be set after NewServer returns.
+	authState := &adminAuthHolder{}
+
 	// ── Single router, two route groups ──────────────────────────────────────
 	r := chi.NewRouter()
 
@@ -172,8 +183,22 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler.RegisterPublic(humaPublic)
 
 	// Admin routes — /api/v1/*
-	// No built-in auth. Protected at the network layer or via AdminAuth hook.
+	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
 	r.Group(func(r chi.Router) {
+		// Optional admin auth — checked at request time so it can be set after NewServer.
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				authState.mu.RLock()
+				auth := authState.fn
+				authState.mu.RUnlock()
+				if auth != nil {
+					auth(next).ServeHTTP(w, req)
+					return
+				}
+				next.ServeHTTP(w, req)
+			})
+		})
+
 		// Tenant context extraction from X-Account-ID / X-Project-ID headers.
 		r.Use(internalMiddleware.TenantContextMiddleware)
 
@@ -216,6 +241,7 @@ func NewServer(cfg Config) (*Server, error) {
 		refreshTokenSvc:     refreshTokenSvc,
 		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
 		customGrants:        make(map[string]GrantHandler),
+		adminAuthState:      authState,
 		http: &http.Server{
 			Addr:         ":" + cfg.Server.Port,
 			Handler:      r,
@@ -231,11 +257,6 @@ func NewServer(cfg Config) (*Server, error) {
 // Start starts the HTTP server and background workers. It blocks until a
 // SIGINT/SIGTERM is received and then performs graceful shutdown.
 func (s *Server) Start() error {
-	// Apply optional admin auth middleware if set before start.
-	if s.adminAuth != nil {
-		log.Info().Msg("Admin auth middleware configured for /api/v1/* routes")
-	}
-
 	// Start background workers.
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	s.workerCancel = workerCancel
@@ -313,10 +334,13 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 }
 
 // AdminAuth sets an optional authentication middleware for /api/v1/* admin routes.
-// Must be called before Start(). When nil (default), admin routes have no built-in
-// auth — protect them at the network layer (reverse proxy, VPN, firewall).
+// Can be called after NewServer and before Start — the middleware is checked at
+// request time. When nil (default), admin routes have no built-in auth — protect
+// them at the network layer (reverse proxy, VPN, firewall).
 func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
-	s.adminAuth = middleware
+	s.adminAuthState.mu.Lock()
+	defer s.adminAuthState.mu.Unlock()
+	s.adminAuthState.fn = middleware
 }
 
 // Router returns the chi.Router for custom route mounting.

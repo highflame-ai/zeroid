@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -181,7 +182,8 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
 		}
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
+		return nil, huma.Error500InternalServerError("failed to create identity")
 	}
 
 	return &IdentityOutput{Body: identity}, nil
@@ -209,6 +211,7 @@ func (a *API) listIdentitiesOp(ctx context.Context, _ *struct{}) (*IdentityListO
 
 	identities, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, "", "")
 	if err != nil {
+		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
 	}
 
@@ -263,7 +266,8 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Status:        status,
 	})
 	if err != nil {
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")
+		return nil, huma.Error500InternalServerError("failed to update identity")
 	}
 
 	return &IdentityOutput{Body: identity}, nil
@@ -276,6 +280,7 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*st
 	}
 
 	if err := a.identitySvc.DeleteIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to delete identity")
 		return nil, huma.Error500InternalServerError("failed to delete identity")
 	}
 

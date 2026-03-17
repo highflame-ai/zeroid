@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -90,6 +91,7 @@ func (a *API) submitAttestationOp(ctx context.Context, input *SubmitAttestationI
 		level, proofType, input.Body.ProofValue,
 	)
 	if err != nil {
+		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to submit attestation")
 		return nil, huma.Error500InternalServerError("failed to submit attestation")
 	}
 
@@ -104,6 +106,7 @@ func (a *API) verifyAttestationOp(ctx context.Context, input *VerifyAttestationI
 
 	result, err := a.attestationSvc.VerifyAttestation(ctx, input.Body.AttestationID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
+		log.Error().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification failed")
 		return nil, huma.Error500InternalServerError("attestation verification failed")
 	}
 

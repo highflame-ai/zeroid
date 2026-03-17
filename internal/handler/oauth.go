@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/internal/service"
 )
@@ -111,7 +112,8 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		RefreshTokenStr: input.Body.RefreshToken,
 	})
 	if err != nil {
-		return nil, huma.Error400BadRequest(err.Error())
+		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
+		return nil, huma.Error400BadRequest("token request failed")
 	}
 
 	return &TokenOutput{Body: accessToken}, nil

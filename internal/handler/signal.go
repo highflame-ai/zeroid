@@ -95,6 +95,7 @@ func (a *API) ingestSignalOp(ctx context.Context, input *IngestSignalInput) (*Si
 		input.Body.Payload,
 	)
 	if err != nil {
+		log.Error().Err(err).Str("signal_type", input.Body.SignalType).Msg("failed to ingest signal")
 		return nil, huma.Error500InternalServerError("failed to ingest signal")
 	}
 
@@ -114,6 +115,7 @@ func (a *API) listSignalsOp(ctx context.Context, input *SignalListInput) (*Signa
 
 	signals, err := a.signalSvc.ListSignals(ctx, tenant.AccountID, tenant.ProjectID, limit)
 	if err != nil {
+		log.Error().Err(err).Msg("failed to list signals")
 		return nil, huma.Error500InternalServerError("failed to list signals")
 	}
 

@@ -1,0 +1,345 @@
+// Package integration_test contains end-to-end integration tests for the
+// ZeroID service. Tests spin up a real PostgreSQL container via testcontainers,
+// wire the full service stack through zeroid.NewServer, and exercise every
+// supported OAuth2 flow through an httptest.Server.
+package integration_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	zeroid "github.com/zeroid-dev/zeroid"
+)
+
+const (
+	testIssuer    = "https://auth.test.zeroid.dev"
+	testKeyID     = "test-key-1"
+	testAccountID = "acct-test-001"
+	testProjectID = "proj-test-001"
+	testWIMSE     = "zeroid.dev"
+)
+
+// testServer is the shared httptest.Server for all tests in this package.
+var testServer *httptest.Server
+
+// testServerPrivKey is the server's ECDSA signing key, accessible so tests can
+// build valid assertions without going through disk files.
+var testServerPrivKey *ecdsa.PrivateKey
+
+func TestMain(m *testing.M) {
+	os.Exit(runTests(m))
+}
+
+func runTests(m *testing.M) int {
+	ctx := context.Background()
+
+	// Start a real PostgreSQL container.
+	pgContainer, err := tcpostgres.Run(ctx,
+		"postgres:14-alpine",
+		tcpostgres.WithDatabase("zeroid_test"),
+		tcpostgres.WithUsername("zeroid"),
+		tcpostgres.WithPassword("zeroid"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(60*time.Second),
+		),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start postgres: %v\n", err)
+		return 1
+	}
+	defer pgContainer.Terminate(ctx) //nolint:errcheck
+
+	dbURL, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "get connection string: %v\n", err)
+		return 1
+	}
+
+	// Generate the server's ECDSA P-256 key pair and write to temp files.
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "generate key pair: %v\n", err)
+		return 1
+	}
+	testServerPrivKey = privKey
+
+	privPath, pubPath, cleanKeys, err := writeKeyFiles(privKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write key files: %v\n", err)
+		return 1
+	}
+	defer cleanKeys()
+
+	// Build zeroid.Config for the test server.
+	cfg := zeroid.Config{
+		Server: zeroid.ServerConfig{
+			Port:                   "0", // not used — httptest picks a port
+			Env:                    "test",
+			ShutdownTimeoutSeconds: 5,
+		},
+		Database: zeroid.DatabaseConfig{
+			URL:          dbURL,
+			MaxOpenConns: 5,
+			MaxIdleConns: 2,
+		},
+		Keys: zeroid.KeysConfig{
+			PrivateKeyPath: privPath,
+			PublicKeyPath:  pubPath,
+			KeyID:          testKeyID,
+		},
+		Token: zeroid.TokenConfig{
+			Issuer:     testIssuer,
+			BaseURL:    testIssuer,
+			DefaultTTL: 3600,
+			MaxTTL:     86400,
+		},
+		Telemetry: zeroid.TelemetryConfig{
+			Enabled: false,
+		},
+		Logging: zeroid.LoggingConfig{
+			Level: "warn",
+		},
+		WIMSEDomain: testWIMSE,
+	}
+
+	// Create the server — handles DB connection, migrations, and wiring.
+	srv, err := zeroid.NewServer(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create server: %v\n", err)
+		return 1
+	}
+
+	testServer = httptest.NewServer(srv.Router())
+	defer testServer.Close()
+
+	return m.Run()
+}
+
+// writeKeyFiles serialises privKey to temp PEM files and returns their paths
+// plus a cleanup function. Uses formats expected by JWKSService:
+// "EC PRIVATE KEY" (SEC 1) and "PUBLIC KEY" (PKIX).
+func writeKeyFiles(privKey *ecdsa.PrivateKey) (privPath, pubPath string, cleanup func(), err error) {
+	privDER, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("marshal private key: %w", err)
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("marshal public key: %w", err)
+	}
+
+	privFile, err := os.CreateTemp("", "zeroid-test-priv-*.pem")
+	if err != nil {
+		return "", "", nil, err
+	}
+	if err := pem.Encode(privFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privDER}); err != nil {
+		privFile.Close()
+		os.Remove(privFile.Name())
+		return "", "", nil, err
+	}
+	privFile.Close()
+
+	pubFile, err := os.CreateTemp("", "zeroid-test-pub-*.pem")
+	if err != nil {
+		os.Remove(privFile.Name())
+		return "", "", nil, err
+	}
+	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
+		pubFile.Close()
+		os.Remove(privFile.Name())
+		os.Remove(pubFile.Name())
+		return "", "", nil, err
+	}
+	pubFile.Close()
+
+	return privFile.Name(), pubFile.Name(), func() {
+		os.Remove(privFile.Name())
+		os.Remove(pubFile.Name())
+	}, nil
+}
+
+// ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+// post sends a JSON POST to path and returns the response.
+func post(t *testing.T, path string, body any, headers map[string]string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodPost, path, body, headers)
+}
+
+// get sends a GET to path and returns the response.
+func get(t *testing.T, path string, headers map[string]string) *http.Response {
+	t.Helper()
+	return doRequest(t, http.MethodGet, path, nil, headers)
+}
+
+func doRequest(t *testing.T, method, path string, body any, headers map[string]string) *http.Response {
+	t.Helper()
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, testServer.URL+path, bodyReader)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// decode reads and JSON-decodes a response body, closing it after.
+func decode(t *testing.T, resp *http.Response) map[string]any {
+	t.Helper()
+	defer resp.Body.Close()
+	var m map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&m))
+	return m
+}
+
+// adminHeaders returns headers required for admin /api/v1 endpoints.
+// ZeroID admin routes have no built-in auth — only tenant context headers.
+func adminHeaders() map[string]string {
+	return map[string]string{
+		"X-Account-ID": testAccountID,
+		"X-Project-ID": testProjectID,
+	}
+}
+
+// uid returns a unique agent ID for each test to avoid conflicts.
+func uid(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// ── Platform setup helpers ────────────────────────────────────────────────────
+
+type identityResp struct {
+	ID            string   `json:"id"`
+	ExternalID    string   `json:"external_id"`
+	WIMSEURI      string   `json:"wimse_uri"`
+	AllowedScopes []string `json:"allowed_scopes"`
+}
+
+type oauthClientResp struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// registerIdentity calls POST /api/v1/identities and returns the created identity.
+func registerIdentity(t *testing.T, externalID string, scopes []string, publicKeyPEM ...string) identityResp {
+	t.Helper()
+	body := map[string]any{
+		"external_id":    externalID,
+		"trust_level":    "unverified",
+		"owner_user_id":  "user-test-owner",
+		"allowed_scopes": scopes,
+	}
+	if len(publicKeyPEM) > 0 && publicKeyPEM[0] != "" {
+		body["public_key_pem"] = publicKeyPEM[0]
+	}
+	resp := post(t, "/api/v1/identities", body, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerIdentity: expected 201")
+	raw := decode(t, resp)
+	return identityResp{
+		ID:         raw["id"].(string),
+		ExternalID: raw["external_id"].(string),
+		WIMSEURI:   raw["wimse_uri"].(string),
+	}
+}
+
+// registerOAuthClient calls POST /api/v1/oauth/clients using external_id
+// (ZeroID auto-generates the client secret) and returns client_id + client_secret.
+func registerOAuthClient(t *testing.T, externalID string, scopes []string) oauthClientResp {
+	t.Helper()
+	resp := post(t, "/api/v1/oauth/clients", map[string]any{
+		"name":        externalID + "-client",
+		"external_id": externalID,
+		"grant_types": []string{"client_credentials"},
+		"scopes":      scopes,
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerOAuthClient: expected 201")
+	raw := decode(t, resp)
+	client := raw["client"].(map[string]any)
+	return oauthClientResp{
+		ClientID:     client["client_id"].(string),
+		ClientSecret: raw["client_secret"].(string),
+	}
+}
+
+// ecPublicKeyPEM encodes an ECDSA public key to PKIX PEM string.
+func ecPublicKeyPEM(t *testing.T, key *ecdsa.PrivateKey) string {
+	t.Helper()
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	require.NoError(t, err)
+	var buf bytes.Buffer
+	require.NoError(t, pem.Encode(&buf, &pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	return buf.String()
+}
+
+// buildAssertion creates a self-signed ES256 JWT assertion for jwt_bearer and token_exchange flows.
+// issuerWIMSE is the agent's WIMSE URI used as the iss claim.
+func buildAssertion(t *testing.T, privKey *ecdsa.PrivateKey, issuerWIMSE string) string {
+	t.Helper()
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(issuerWIMSE).
+		Audience([]string{testIssuer}).
+		IssuedAt(now).
+		Expiration(now.Add(5 * time.Minute)).
+		Build()
+	require.NoError(t, err)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, privKey))
+	require.NoError(t, err)
+	return string(signed)
+}
+
+// newRequest builds an *http.Request for use with doRaw.
+func newRequest(t *testing.T, method, path string, body any, headers map[string]string) *http.Request {
+	t.Helper()
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		bodyReader = bytes.NewReader(b)
+	}
+	req, err := http.NewRequest(method, testServer.URL+path, bodyReader)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return req
+}
+
+// introspect calls POST /oauth2/token/introspect and returns the decoded response.
+func introspect(t *testing.T, tokenStr string) map[string]any {
+	t.Helper()
+	resp := post(t, "/oauth2/token/introspect", map[string]string{"token": tokenStr}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return decode(t, resp)
+}

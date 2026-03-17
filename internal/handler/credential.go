@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/zeroid-dev/zeroid/domain"
 	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
@@ -136,6 +137,7 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 		Audience:  input.Body.Audience,
 	})
 	if err != nil {
+		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to issue credential")
 		return nil, huma.Error500InternalServerError("failed to issue credential")
 	}
 
@@ -167,6 +169,7 @@ func (a *API) listCredentialsOp(ctx context.Context, input *CredentialListInput)
 
 	creds, err := a.credSvc.ListCredentials(ctx, input.IdentityID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
+		log.Error().Err(err).Str("identity_id", input.IdentityID).Msg("failed to list credentials")
 		return nil, huma.Error500InternalServerError("failed to list credentials")
 	}
 
@@ -183,6 +186,7 @@ func (a *API) revokeCredentialOp(ctx context.Context, input *RevokeCredentialInp
 	}
 
 	if err := a.credSvc.RevokeCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, input.Body.Reason); err != nil {
+		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to revoke credential")
 		return nil, huma.Error500InternalServerError("failed to revoke credential")
 	}
 
@@ -213,6 +217,7 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 
 	accessToken, newCred, err := a.credSvc.RotateCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, identity)
 	if err != nil {
+		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to rotate credential")
 		return nil, huma.Error500InternalServerError("failed to rotate credential")
 	}
 
