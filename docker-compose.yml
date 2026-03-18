@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:14-alpine
+    image: postgres:17-alpine3.22
+    container_name: highflame-db
+    restart: on-failure
     environment:
       POSTGRES_USER: zeroid
       POSTGRES_PASSWORD: zeroid
@@ -8,26 +10,46 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - highflame-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U zeroid -d zeroid"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 5
+      start_period: 30s
 
-  server:
-    build: .
-    ports:
-      - "8899:8899"
-    environment:
-      ZEROID_DATABASE_URL: "postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable"
-      ZEROID_ENV: development
-    volumes:
-      - ./keys:/keys:ro
+  zeroid:
     depends_on:
       postgres:
         condition: service_healthy
+    image: highflame-zeroid:latest
+    container_name: highflame-zeroid
+    restart: on-failure
+    environment:
+      ZEROID_DATABASE_URL: "postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable"
+      ZEROID_ENV: development
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./keys:/keys:ro
+    networks:
+      - highflame-network
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:8899/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     command: ["/zeroid", "-config", "/etc/zeroid/zeroid.yaml"]
 
+networks:
+  highflame-network:
+    driver: bridge
+
 volumes:
-  pgdata:
+  postgres-data:

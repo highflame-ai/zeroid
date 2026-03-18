@@ -1,0 +1,193 @@
+name: PR Merge Check - Zeroid
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - "main"
+  merge_group:
+    types:
+      - checks_requested
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VER: "1.25.0"
+  DOCKER_BUILD_RECORD_UPLOAD: false
+  GH_SEC_REPORT: false
+  TRIVY_SEVERITY: "HIGH,CRITICAL"
+  TRIVY_REPORT_FILE: "trivy-scan-result"
+
+jobs:
+  highflame-build-check:
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Golang Version
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ env.GO_VER }}-
+
+      - name: Build Go Binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+        shell: bash
+        run: |-
+          go vet
+          go build
+
+  highflame-sast-check:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Golang Version
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ env.GO_VER }}-
+
+      - name: Run tests
+        env:
+          CGO_ENABLED: 0
+        shell: bash
+        run: |-
+          make test-integration
+
+  highflame-docker-check:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: "pr-check-image"
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          pull: true
+          push: false
+          context: .
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  highflame-trivy-check:
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Trivy Scan - GitHub Security Report
+        if: ${{ env.GH_SEC_REPORT == 'true' }}
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          ignore-unfixed: true
+          scan-type: "fs"
+          cache: "true"
+          format: "sarif"
+          output: "${{ env.TRIVY_REPORT_FILE }}.sarif"
+          severity: "${{ env.TRIVY_SEVERITY }}"
+
+      - name: Upload Report - GitHub Security Report
+        if: ${{ env.GH_SEC_REPORT == 'true' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "${{ env.TRIVY_REPORT_FILE }}.sarif"
+
+      - name: Trivy Scan - Text Security Report
+        if: ${{ env.GH_SEC_REPORT == 'false' }}
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          ignore-unfixed: true
+          scan-type: "fs"
+          cache: "true"
+          format: "table"
+          output: "${{ env.TRIVY_REPORT_FILE }}.txt"
+          severity: "${{ env.TRIVY_SEVERITY }}"
+
+      - name: Report Check - Text Security Report
+        if: ${{ env.GH_SEC_REPORT == 'false' }}
+        id: report_check
+        shell: bash
+        run: |-
+          if [[ -s ${{ env.TRIVY_REPORT_FILE }}.txt ]] ; then
+            echo "report_file=available" >> ${GITHUB_OUTPUT}
+          else
+            echo "report_file=unavailable" >> ${GITHUB_OUTPUT}
+          fi
+          cat ${{ env.TRIVY_REPORT_FILE }}.txt
+
+      - name: Upload Report - Text Security Report
+        if: ${{ env.GH_SEC_REPORT == 'false' && steps.report_check.outputs.report_file  == 'available' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: "${{ env.TRIVY_REPORT_FILE }}"
+          path: "${{ env.TRIVY_REPORT_FILE }}.txt"
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Failing the Job
+        if: ${{ steps.report_check.outputs.report_file  == 'available' }}
+        shell: bash
+        run: |-
+          echo "Vulnerabilities Found.....!"
+          exit 1
