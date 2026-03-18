@@ -7,8 +7,8 @@
     OAuth 2.1 &middot; WIMSE/SPIFFE &middot; RFC 8693 delegation &middot; Developer SDKs
   </p>
   <p align="center">
-    <a href="https://github.com/highflame-ai/zeroid/actions/workflows/ci.yml">
-      <img src="https://github.com/highflame-ai/zeroid/actions/workflows/ci.yml/badge.svg" alt="CI" />
+    <a href="https://github.com/highflame-ai/zeroid/actions/workflows/release.yml">
+      <img src="https://github.com/highflame-ai/zeroid/actions/workflows/release.yml/badge.svg" alt="CI" />
     </a>
     <a href="https://goreportcard.com/report/github.com/highflame-ai/zeroid">
       <img src="https://goreportcard.com/badge/github.com/highflame-ai/zeroid" alt="Go Report Card" />
