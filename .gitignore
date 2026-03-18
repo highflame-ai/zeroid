@@ -1,5 +1,5 @@
-# Binaries
-zeroid
+# Binaries (root only, not cmd/zeroid/)
+/zeroid
 *.exe
 *.exe~
 *.dll
