@@ -136,57 +136,59 @@ jobs:
         with:
           persist-credentials: true
 
-      - name: Trivy Scan - GitHub Security Report
-        if: ${{ env.GH_SEC_REPORT == 'true' }}
-        uses: aquasecurity/trivy-action@0.35.0
+      - name: Manual Trivy Setup
+        uses: aquasecurity/setup-trivy@v0.2.5
         with:
-          ignore-unfixed: true
-          scan-type: "fs"
-          cache: "true"
-          format: "sarif"
-          output: "${{ env.TRIVY_REPORT_FILE }}.sarif"
-          severity: "${{ env.TRIVY_SEVERITY }}"
-
-      - name: Upload Report - GitHub Security Report
-        if: ${{ env.GH_SEC_REPORT == 'true' }}
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: "${{ env.TRIVY_REPORT_FILE }}.sarif"
+          cache: true
+          version: ${{ env.TRIVY_VER }}
 
       - name: Trivy Scan - Text Security Report
+        id: trivy_scan_txt
         if: ${{ env.GH_SEC_REPORT == 'false' }}
         uses: aquasecurity/trivy-action@0.35.0
+        continue-on-error: true
         with:
           ignore-unfixed: true
+          skip-setup-trivy: true
           scan-type: "fs"
-          cache: "true"
+          cache: "false"
           format: "table"
           output: "${{ env.TRIVY_REPORT_FILE }}.txt"
           severity: "${{ env.TRIVY_SEVERITY }}"
-
-      - name: Report Check - Text Security Report
-        if: ${{ env.GH_SEC_REPORT == 'false' }}
-        id: report_check
-        shell: bash
-        run: |-
-          if grep -qP 'Total:\s+[1-9]' ${{ env.TRIVY_REPORT_FILE }}.txt ; then
-            echo "report_file=available" >> ${GITHUB_OUTPUT}
-          else
-            echo "report_file=unavailable" >> ${GITHUB_OUTPUT}
-          fi
-          cat ${{ env.TRIVY_REPORT_FILE }}.txt
+          exit-code: 1
 
       - name: Upload Report - Text Security Report
-        if: ${{ env.GH_SEC_REPORT == 'false' && steps.report_check.outputs.report_file  == 'available' }}
-        uses: actions/upload-artifact@v7
+        if: ${{ env.GH_SEC_REPORT == 'false' && steps.trivy_scan_txt.outcome  == 'failure' }}
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ env.TRIVY_REPORT_FILE }}"
           path: "${{ env.TRIVY_REPORT_FILE }}.txt"
           if-no-files-found: error
           retention-days: 1
 
+      - name: Trivy Scan - GitHub Security Report
+        id: trivy_scan_sec
+        if: ${{ env.GH_SEC_REPORT == 'true' }}
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          ignore-unfixed: true
+          skip-setup-trivy: true
+          scan-type: "fs"
+          cache: "false"
+          format: "sarif"
+          output: "${{ env.TRIVY_REPORT_FILE }}.sarif"
+          severity: "${{ env.TRIVY_SEVERITY }}"
+          timeout: "${{ env.TRIVY_TIMEOUT }}"
+          exit-code: 1
+
+      - name: Upload Report - GitHub Security Report
+        if: ${{ env.GH_SEC_REPORT == 'true' && steps.trivy_scan_sec.outcome  == 'failure' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "${{ env.TRIVY_REPORT_FILE }}.sarif"
+
       - name: Failing the Job
-        if: ${{ steps.report_check.outputs.report_file  == 'available' }}
+        if: ${{ steps.trivy_scan_txt.outcome  == 'failure' || steps.trivy_scan_sec.outcome  == 'failure' }}
         shell: bash
         run: |-
           echo "Vulnerabilities Found.....!"
