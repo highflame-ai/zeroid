@@ -169,7 +169,7 @@ jobs:
         id: report_check
         shell: bash
         run: |-
-          if [[ -s ${{ env.TRIVY_REPORT_FILE }}.txt ]] ; then
+          if grep -qP 'Total:\s+[1-9]' ${{ env.TRIVY_REPORT_FILE }}.txt ; then
             echo "report_file=available" >> ${GITHUB_OUTPUT}
           else
             echo "report_file=unavailable" >> ${GITHUB_OUTPUT}
