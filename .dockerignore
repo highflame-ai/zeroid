@@ -1,0 +1,12 @@
+.dockerignore
+.git
+.github
+.chglog
+.gitignore
+docker-compose.yaml
+*.sw[op]
+*.log
+.DS_Store
+.env*
+.vscode
+gha-creds-*.json
