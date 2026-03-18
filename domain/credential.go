@@ -27,6 +27,38 @@ const (
 	GrantTypeRefreshToken GrantType = "refresh_token"
 )
 
+// urnToShortGrantType maps OAuth2 URN grant type identifiers to their canonical short forms.
+var urnToShortGrantType = map[string]GrantType{
+	"urn:ietf:params:oauth:grant-type:jwt-bearer":     GrantTypeJWTBearer,
+	"urn:ietf:params:oauth:grant-type:token-exchange":  GrantTypeTokenExchange,
+}
+
+// allValidGrantTypes is the set of all recognised canonical short forms.
+var allValidGrantTypes = map[GrantType]bool{
+	GrantTypeClientCredentials: true,
+	GrantTypeJWTBearer:         true,
+	GrantTypeTokenExchange:     true,
+	GrantTypeAPIKey:            true,
+	GrantTypeAuthorizationCode: true,
+	GrantTypeRefreshToken:      true,
+}
+
+// NormalizeGrantType converts a grant type string to its canonical short form.
+// Accepts both URN forms (e.g. "urn:ietf:params:oauth:grant-type:jwt-bearer")
+// and short forms (e.g. "jwt_bearer"). Returns the input unchanged if not recognised.
+func NormalizeGrantType(gt string) GrantType {
+	if short, ok := urnToShortGrantType[gt]; ok {
+		return short
+	}
+	return GrantType(gt)
+}
+
+// IsValidGrantType reports whether gt is a recognised grant type.
+// Accepts both URN and short forms.
+func IsValidGrantType(gt string) bool {
+	return allValidGrantTypes[NormalizeGrantType(gt)]
+}
+
 // IssuedCredential represents a JWT credential issued to an identity.
 // It is persisted for introspection, revocation, and audit purposes.
 type IssuedCredential struct {

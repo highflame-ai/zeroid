@@ -101,6 +101,8 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 	if len(req.AllowedGrantTypes) == 0 {
 		req.AllowedGrantTypes = []string{"client_credentials"}
 	}
+	// Normalize URN grant types to canonical short forms before validation and storage.
+	req.AllowedGrantTypes = normalizeGrantTypes(req.AllowedGrantTypes)
 	for _, gt := range req.AllowedGrantTypes {
 		if !isValidGrantType(gt) {
 			return nil, fmt.Errorf("invalid grant type: %s", gt)
@@ -193,12 +195,13 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 		policy.MaxTTLSeconds = *req.MaxTTLSeconds
 	}
 	if req.AllowedGrantTypes != nil {
-		for _, gt := range req.AllowedGrantTypes {
+		normalized := normalizeGrantTypes(req.AllowedGrantTypes)
+		for _, gt := range normalized {
 			if !isValidGrantType(gt) {
 				return nil, fmt.Errorf("invalid grant type: %s", gt)
 			}
 		}
-		policy.AllowedGrantTypes = req.AllowedGrantTypes
+		policy.AllowedGrantTypes = normalized
 	}
 	if req.AllowedScopes != nil {
 		policy.AllowedScopes = req.AllowedScopes
@@ -250,8 +253,9 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 		return fmt.Errorf("%w: requested TTL %ds exceeds policy maximum %ds", ErrPolicyViolation, req.TTL, policy.MaxTTLSeconds)
 	}
 
-	// 2. Grant type in policy.allowed_grant_types
-	if !containsString(policy.AllowedGrantTypes, string(req.GrantType)) {
+	// 2. Grant type in policy.allowed_grant_types (normalize for comparison)
+	normalizedGT := string(domain.NormalizeGrantType(string(req.GrantType)))
+	if !containsString(policy.AllowedGrantTypes, normalizedGT) {
 		return fmt.Errorf("%w: grant type %q is not permitted by policy (allowed: %v)", ErrPolicyViolation, req.GrantType, policy.AllowedGrantTypes)
 	}
 
@@ -320,11 +324,17 @@ func attestationLevelRank(level string) int {
 }
 
 func isValidGrantType(gt string) bool {
-	switch domain.GrantType(gt) {
-	case domain.GrantTypeClientCredentials, domain.GrantTypeJWTBearer, domain.GrantTypeTokenExchange, domain.GrantTypeAPIKey:
-		return true
+	return domain.IsValidGrantType(gt)
+}
+
+// normalizeGrantTypes converts all grant types to their canonical short forms
+// so that both URN and short forms are stored consistently.
+func normalizeGrantTypes(gts []string) []string {
+	out := make([]string, len(gts))
+	for i, gt := range gts {
+		out[i] = string(domain.NormalizeGrantType(gt))
 	}
-	return false
+	return out
 }
 
 func containsString(slice []string, s string) bool {

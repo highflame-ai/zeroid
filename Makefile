@@ -1,4 +1,4 @@
-.PHONY: build run test docker-build docker-up setup-keys migrate clean
+.PHONY: build run test test-integration lint docker-build docker-up setup-keys migrate clean
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -11,7 +11,13 @@ run: build
 	./$(BINARY) -config zeroid.yaml
 
 test:
-	go test ./... -v -race -count=1
+	go test ./... -v -race -count=1 -timeout=120s
+
+test-integration:
+	go test ./tests/integration/ -v -count=1 -timeout=120s
+
+lint:
+	go vet ./...
 
 docker-build:
 	docker build -t zeroid:latest .
