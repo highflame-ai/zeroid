@@ -316,7 +316,7 @@ delegated = client.tokens.issue(
 Any service that receives a ZeroID token can verify the full chain by calling introspect. This is how an MCP server, API gateway, or downstream tool answers: *"Is this token valid, who does it belong to, and on whose authority does it act?"*
 
 <details>
-<summary>Pythono</summary>
+<summary>Python</summary>
 
 ```python
 info = client.tokens.introspect(delegated.access_token)
