@@ -163,6 +163,7 @@ jobs:
           format: "table"
           output: "${{ env.TRIVY_REPORT_FILE }}.txt"
           severity: "${{ env.TRIVY_SEVERITY }}"
+          exit-code: 1
 
       - name: Report Check - Text Security Report
         if: ${{ env.GH_SEC_REPORT == 'false' }}
@@ -185,9 +186,3 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      - name: Failing the Job
-        if: ${{ steps.report_check.outputs.report_file  == 'available' }}
-        shell: bash
-        run: |-
-          echo "Vulnerabilities Found.....!"
-          exit 1
