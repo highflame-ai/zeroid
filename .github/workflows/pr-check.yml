@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VER: "1.25.0"
+  GO_VER: "1.25.8"
   DOCKER_BUILD_RECORD_UPLOAD: false
   GH_SEC_REPORT: false
   TRIVY_SEVERITY: "HIGH,CRITICAL"
