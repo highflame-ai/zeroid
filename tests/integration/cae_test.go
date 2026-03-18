@@ -22,6 +22,8 @@ func TestCAECriticalSignalRevokesCredential(t *testing.T) {
 	// Agent gets a valid token.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "data:read",
@@ -64,6 +66,8 @@ func TestCAEHighSignalRevokesCredential(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "data:read",
@@ -97,6 +101,8 @@ func TestCAELowSignalDoesNotRevokeCredential(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "data:read",
@@ -133,6 +139,8 @@ func TestCAESignalRevokesAllActiveCredentials(t *testing.T) {
 	getToken := func() string {
 		resp := post(t, "/oauth2/token", map[string]any{
 			"grant_type":    "client_credentials",
+			"account_id":    testAccountID,
+			"project_id":    testProjectID,
 			"client_id":     client.ClientID,
 			"client_secret": client.ClientSecret,
 			"scope":         "data:read",
@@ -174,6 +182,8 @@ func TestSignalListEndpoint(t *testing.T) {
 	client := registerOAuthClient(t, agentID, []string{"data:read"})
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "data:read",

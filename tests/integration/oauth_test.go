@@ -24,6 +24,8 @@ func TestClientCredentialsFlow(t *testing.T) {
 	// Agent: exchange client credentials for a JWT.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "billing:read",
@@ -64,6 +66,8 @@ func TestClientCredentialsScopeIntersection(t *testing.T) {
 	// Request only data:read even though client has data:read + data:write.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     client.ClientID,
 		"client_secret": client.ClientSecret,
 		"scope":         "data:read",
@@ -81,6 +85,8 @@ func TestClientCredentialsWrongSecret(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     agentID,
 		"client_secret": "wrong-secret",
 	}, nil)
@@ -157,6 +163,8 @@ func TestTokenExchangeFlow(t *testing.T) {
 	// Orchestrator gets its own active token.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     orchClient.ClientID,
 		"client_secret": orchClient.ClientSecret,
 		"scope":         "billing:read data:read",
@@ -211,6 +219,8 @@ func TestTokenExchangeScopeEnforcement(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     orchClient.ClientID,
 		"client_secret": orchClient.ClientSecret,
 		"scope":         "data:read",
@@ -251,6 +261,8 @@ func TestRevokedSubjectTokenCannotDelegate(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
 		"client_id":     orchClient.ClientID,
 		"client_secret": orchClient.ClientSecret,
 		"scope":         "data:read",
