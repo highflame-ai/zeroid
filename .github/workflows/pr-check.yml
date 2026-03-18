@@ -129,6 +129,7 @@ jobs:
   highflame-trivy-check:
     permissions:
       contents: 'read'
+      security-events: 'write'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
