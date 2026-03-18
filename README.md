@@ -608,14 +608,12 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 
 ## Roadmap
 
-- [ ] Python SDK (`pip install highflame`)
-- [ ] TypeScript SDK (`npm install @highflame/zeroid`)
-- [ ] CIBA (Client-Initiated Backchannel Authentication) for async human-in-the-loop approvals — agents pause long-running workflows and request out-of-band user authorization without blocking
-- [ ] Human-in-the-loop approval workflow (`/api/v1/approvals`)
-- [ ] LangGraph integration
-- [ ] CrewAI integration
-- [ ] MCP server middleware
-- [ ] `zeroid` CLI for local development
+- SDKs ([Python](https://github.com/highflame-ai/highflame-sdk/tree/main/python), [TypeScript](https://github.com/highflame-ai/highflame-sdk/tree/main/javascript), [RUST](https://github.com/highflame-ai/highflame-sdk/tree/main/rust))
+- CIBA (Client-Initiated Backchannel Authentication) for async human-in-the-loop approvals — agents pause long-running workflows and request out-of-band user authorization without blocking
+- Human-in-the-loop approval workflow (`/api/v1/approvals`)
+- Ecosystem integrations (langgraph, crewai...)
+- MCP server middleware
+- `zeroid` CLI 
 
 ---
 
