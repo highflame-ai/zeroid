@@ -151,23 +151,34 @@ Examples use `http://localhost:8899`. Swap in `https://auth.highflame.ai` for ho
 
 Point the client at your ZeroID instance. No credentials needed here — ZeroID's management API (`/api/v1/*`) is protected at the network layer by your infrastructure (API gateway, mTLS, allowlist). The token endpoints (`/oauth2/*`) are public.
 
+<details>
+<summary>Python</summary>
+
 ```python
 from highflame.zeroid import ZeroIDClient
-
 client = ZeroIDClient(base_url="http://localhost:8899")
 ```
 
+</details>
+
+<details>
+<summary>Typescript</summary>
+
 ```typescript
 import { ZeroIDClient } from "@highflame/zeroid";
-
 const client = new ZeroIDClient({ baseUrl: "http://localhost:8899" });
 ```
+
+</details>
 
 ### 2. Register an Agent
 
 Before an agent can do anything, it needs an identity. Registration answers: *who is this agent, what role does it play, who created it, and how much should it be trusted?*
 
 This call does two things atomically: it creates a persistent identity record (with a WIMSE/SPIFFE URI as a globally unique identifier) and issues a long-lived **API key** (`zid_sk_...`) that the agent will use to authenticate itself. Think of the API key as the agent's "password" — it proves ownership of the identity, but it never leaves your infrastructure and is only shown once.
+
+<details>
+<summary>Python</summary>
 
 ```python
 agent = client.agents.register(
@@ -186,6 +197,11 @@ print(agent.api_key)
 # zid_sk_...  ← save this securely, shown once
 ```
 
+</details>
+
+<details>
+<summary>Typescript</summary>
+
 ```typescript
 const agent = await client.agents.register({
   name: "Task Orchestrator",
@@ -198,11 +214,16 @@ const agent = await client.agents.register({
 // agent.api_key            → "zid_sk_..."    (save securely, shown once)
 ```
 
+</details>
+
 ### 3. Get an Access Token
 
 The API key proves the agent's identity to ZeroID, but it's not what gets presented to downstream services. Instead, the agent exchanges its API key for a **short-lived JWT access token** (default: 1 hour). This is the token the agent attaches to every API call it makes.
 
 Why this two-step design? The API key is long-lived and never leaves your system — it only ever talks to ZeroID. The JWT is short-lived, scoped to specific permissions, and safe to pass across service boundaries. If a JWT leaks, it expires. The API key stays secret.
+
+<details>
+<summary>Python</summary>
 
 ```python
 token = client.tokens.issue(
@@ -222,6 +243,11 @@ print(token.expires_in)    # 3600 seconds (1 hour)
 #   act:              (absent)             ← no user delegated this action; fully autonomous
 ```
 
+</details>
+
+<details>
+<summary>Typescript</summary>
+
 ```typescript
 const token = await client.tokens.issue({
   grant_type: "api_key",
@@ -232,11 +258,16 @@ const token = await client.tokens.issue({
 // token.expires_in   → 3600
 ```
 
+</details>
+
 ### 4. Delegate to a Sub-Agent
 
 When an orchestrator needs a specialized agent to handle part of a task, it delegates a **subset of its own permissions** — it cannot grant more than it has. The sub-agent gets its own token with its own identity, but the full chain of who authorized what is preserved cryptographically.
 
 This is the key difference from sharing credentials: the sub-agent has its own registered identity and its own keypair. It proves it holds that keypair by signing a short-lived JWT assertion (`actor_token`). ZeroID verifies both tokens and issues a delegated token that carries both identities.
+
+<details>
+<summary>Python</summary>
 
 ```python
 # Register the sub-agent — it has its own identity, separate from the orchestrator
@@ -278,9 +309,14 @@ delegated = client.tokens.issue(
 # their user ID (e.g., bob@example.com) rather than an agent WIMSE URI.
 ```
 
+</details>
+
 ### 5. Introspect — Verify the Full Chain
 
 Any service that receives a ZeroID token can verify the full chain by calling introspect. This is how an MCP server, API gateway, or downstream tool answers: *"Is this token valid, who does it belong to, and on whose authority does it act?"*
+
+<details>
+<summary>Python</summary>
 
 ```python
 info = client.tokens.introspect(delegated.access_token)
@@ -294,15 +330,25 @@ print(info.sub)      # spiffe://auth.highflame.ai/acme/prod/agent/data-fetcher
 #   trust_level      → first_party
 ```
 
+</details>
+
+<details>
+<summary>Typescript</summary>
+
 ```typescript
 const info = await client.tokens.introspect(delegated.access_token);
 // info.active → true/false
 // info.sub    → agent's WIMSE URI
 ```
 
+</details>
+
 ### 6. Revoke
 
 Revocation is immediate and cascades. Revoke any token in the chain and everything downstream of it becomes invalid — no need to wait for expiry.
+
+<details>
+<summary>Python</summary>
 
 ```python
 # Revoke a specific token
@@ -314,8 +360,10 @@ client.tokens.revoke(delegated.access_token)
 client.tokens.revoke(token.access_token)
 ```
 
+</details>
+
 <details>
-<summary>Using curl instead</summary>
+<summary>cURL</summary>
 
 ```bash
 # Register
@@ -348,19 +396,22 @@ Full interactive API docs: `GET http://localhost:8899/docs`
 
 ## Real-World Patterns
 
-### High-velocity agent with policy-based controls
+### Pattern 1: High-velocity autonomous agent with policy-based controls
 
-A marketing optimization agent receives one instruction: *"Reallocate budget to maximize click-through rate."* It translates this into hundreds of API calls in seconds. Per-action consent is impossible at this velocity.
+**Scenario:** A marketing optimization agent receives a single instruction — *"Reallocate budget to maximize click-through rate"* — and immediately begins making hundreds of API calls: pausing underperforming campaigns, adjusting bids, transferring budget across ad groups. It operates at machine speed, completing in seconds what would take a human hours.
 
-Define the agent's operational envelope upfront with a `CredentialPolicy`:
+**The problem without ZeroID:** The agent uses a shared service account with broad CRM and ad-platform access. There is no record of which agent took which action, no limit on what it can touch, and no way to stop it if it starts behaving unexpectedly — short of revoking the shared account and breaking every other service using it.
+
+**With ZeroID:** Define the agent's exact operational envelope once at registration time using a `CredentialPolicy`. The agent can only obtain tokens for the scopes the policy allows. It cannot delegate further. Every action carries its identity in the token `sub`, and `owner` traces it back to the team that provisioned it.
 
 ```python
+# Operations team defines the envelope once — before the agent runs
 policy = client.credential_policies.create(
     name="budget-optimizer-policy",
     allowed_scopes=["campaigns:read", "campaigns:write", "budget:reallocate"],
-    max_ttl_seconds=3600,
+    max_ttl_seconds=3600,           # tokens expire hourly — no long-lived access
     required_trust_level="first_party",
-    max_delegation_depth=0,    # this agent cannot delegate further
+    max_delegation_depth=0,         # this agent cannot spawn sub-agents
 )
 
 agent = client.agents.register(
@@ -368,68 +419,233 @@ agent = client.agents.register(
     external_id="budget-optimizer-v1",
     sub_type="autonomous",
     trust_level="first_party",
-    created_by="marketing-lead@company.com",
+    created_by="operations@company.com",  # owner claim in every token
+)
+
+# Agent runs autonomously. Per-action approvals are replaced by the policy envelope.
+# If the agent tries to request billing:write or customer:delete — ZeroID rejects the token request.
+# No runtime intervention needed; the policy is the control.
+token = client.tokens.issue(
+    grant_type="api_key",
+    api_key=agent.api_key,
+    scope="campaigns:read campaigns:write budget:reallocate",
 )
 ```
 
-The agent operates autonomously within those bounds. The policy enforces least privilege at the authorization layer—no per-action approvals required.
+**If something goes wrong:** One call revokes the agent's token. Every downstream API using that token immediately sees `active: false` on introspection. The shared service account is untouched — other services keep running.
 
-### Human authorizes once, agent runs autonomously
+---
+
+### Pattern 2: Human authorizes once, agent runs autonomously
+
+**Scenario:** A developer connects their coding agent to their GitHub account. From that point on, the agent opens PRs, reviews diffs, and pushes commits — entirely on its own, without the developer re-authorizing each action. But when something goes wrong in production, the security team needs to know: *who is responsible for this commit?*
+
+**The problem without ZeroID:** The agent authenticates as the developer (using their OAuth token or SSH key). There is no way to distinguish agent-authored commits from human-authored ones. If the agent is compromised, you revoke the developer's access — which also locks them out.
+
+**With ZeroID:** The agent has its own identity. The developer's identity is captured in `owner` at registration and appears in every token the agent issues — but the agent authenticates as itself, not as the developer. The audit trail is unambiguous.
 
 ```python
-# Developer registers a coding agent once
+# Developer registers their coding agent once — this is the authorization event
 agent = client.agents.register(
     name="Code Agent",
-    external_id="code-agent-prod",
+    external_id="code-agent-alice",
     sub_type="code_agent",
     trust_level="first_party",
-    created_by="dev@company.com",   # ← becomes owner claim in every token this agent issues
+    created_by="alice@company.com",  # becomes owner in every token
 )
 
-# Agent operates fully autonomously from here.
-# Every token carries:  sub = agent WIMSE URI,  owner = dev@company.com,  act = absent
-# act is absent because no user delegated this specific action — the agent is acting on its own.
-token = client.tokens.issue(grant_type="api_key", api_key=agent.api_key, scope="repo:write")
-info  = client.tokens.introspect(token.access_token)
-# info.sub          → spiffe://.../agent/code-agent-prod
-# info.extra["owner"] → dev@company.com
-# info.extra["act"]   → None  (fully autonomous — no user delegation)
+# From here the agent runs autonomously.
+# Alice is not involved in any individual commit, PR, or push.
+token = client.tokens.issue(
+    grant_type="api_key",
+    api_key=agent.api_key,
+    scope="repo:read repo:write",
+)
+
+# Every token the agent uses carries:
+#   sub:   spiffe://auth.highflame.ai/acme/prod/agent/code-agent-alice  ← the agent acted
+#   owner: alice@company.com                                             ← alice provisioned it
+#   act:   (absent)  ← no specific user delegated this action at runtime
+
+info = client.tokens.introspect(token.access_token)
+# Any downstream system — GitHub, CI pipeline, audit log — can answer:
+# "Which agent did this, and who is responsible for it?"
 ```
 
-### Autonomous agent chain (no human in the loop)
+**If Alice leaves the company:** Deactivate her agent. Its credential is revoked. The shared GitHub OAuth token Alice used before is unaffected — but the agent's identity is cleanly terminated.
 
 ```python
-# Cap delegation depth on the monitoring agent's policy — chain can go no deeper than 2
+client.agents.deactivate(agent.identity.id)
+# All tokens issued to code-agent-alice immediately return active: false
+```
+
+---
+
+### Pattern 3: Orchestrator delegates to a sub-agent chain
+
+**Scenario:** A security operations agent detects an anomaly in network traffic. It cannot remediate on its own — remediation requires a separate, more privileged agent with write access to firewall rules. The orchestrator needs to hand off the investigation and response while maintaining a complete audit trail of who authorized what at each step.
+
+**The problem without ZeroID:** The orchestrator passes its own credentials to the sub-agent, or the sub-agent has its own broad credentials. Either way, there is no record of the delegation. If the remediation agent makes a mistake, the audit trail stops at "the remediation agent did this" with no connection to the orchestrator that authorized it or the policy that govoked the chain.
+
+**With ZeroID:** Each agent in the chain has its own registered identity. The orchestrator delegates an explicit, attenuated subset of its permissions to the investigator via RFC 8693 token exchange. The investigator does the same for the remediator. Scope cannot expand at any hop. Delegation depth is enforced by policy. The full chain is cryptographically embedded in every token.
+
+```python
+# Policy caps the chain — no agent beyond depth 2 can act
 policy = client.credential_policies.create(
-    name="sec-monitor-policy",
+    name="sec-ops-policy",
     max_delegation_depth=2,
-    allowed_scopes=["alerts:read", "logs:read", "remediation:write"],
+    allowed_scopes=["alerts:read", "logs:read", "logs:query", "firewall:write"],
 )
 
-# When the monitoring agent detects an anomaly, it delegates to an investigator...
-# The investigator delegates to a remediator (depth 2 — can't delegate further).
-# Revoke the monitoring agent and the entire chain collapses immediately:
-client.tokens.revoke(monitoring_agent_token)
+# Three agents registered with separate identities
+monitor  = client.agents.register(name="Security Monitor",  
+                                  external_id="sec-monitor",
+                                  sub_type="orchestrator",  
+                                  trust_level="first_party",
+                                  created_by="operations@company.com")
+
+investigator = client.agents.register(name="Log Investigator", 
+                                      external_id="log-investigator",
+                                      sub_type="autonomous",    
+                                      trust_level="first_party",
+                                      created_by="operations@company.com")
+
+remediator   = client.agents.register(name="Firewall Agent",    
+                                      external_id="fw-remediator",
+                                      sub_type="tool_agent",    
+                                      trust_level="first_party",
+                                      created_by="operations@company.com")
+
+# Monitor detects anomaly → gets its token
+monitor_token = client.tokens.issue(grant_type="api_key", 
+                                    api_key=monitor.api_key,
+                                    scope="alerts:read logs:read logs:query firewall:write")
+
+# Monitor delegates log investigation to the investigator (depth 1)
+# Scope is attenuated — investigator gets read access only, not firewall:write
+investigator_token = client.tokens.issue(
+    grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
+    subject_token=monitor_token.access_token,
+    actor_token=build_jwt_assertion(investigator.identity.wimse_uri, investigator_private_key),
+    scope="logs:read logs:query",    # subset of monitor's scope
+)
+
+# investigator_token claims:
+#   sub:              spiffe://.../agent/log-investigator
+#   act.sub:          spiffe://.../agent/sec-monitor      ← monitor delegated this
+#   delegation_depth: 1
+#   scope:            logs:read logs:query
+
+# Investigator confirms breach → delegates remediation (depth 2)
+remediator_token = client.tokens.issue(
+    grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
+    subject_token=investigator_token.access_token,
+    actor_token=build_jwt_assertion(remediator.identity.wimse_uri, remediator_private_key),
+    scope="firewall:write",          # remediator only gets what it needs
+)
+
+# remediator_token claims:
+#   sub:              spiffe://.../agent/fw-remediator
+#   act.sub:          spiffe://.../agent/log-investigator  ← immediate delegator
+#   delegation_depth: 2                                    ← at the cap; cannot delegate further
+#   scope:            firewall:write
+
+# Incident resolved. Revoke the monitor token — the entire chain collapses immediately.
+# Investigator and remediator tokens are both invalidated. One call. Full containment.
+client.tokens.revoke(monitor_token.access_token)
 ```
 
-Every token in the chain carries the full `act` claim, traceable back to the org policy.
+---
 
-### MCP tool boundary
+### Pattern 4: User delegates a task to an agent at runtime
+
+**Scenario:** An enterprise user asks their AI assistant to *"book travel for my upcoming conference."* The assistant needs to query the user's calendar, check company travel policy, book flights, and submit an expense pre-approval — all on the user's behalf. The downstream travel and HR systems need to know this action came from Alice, not from a generic agent.
+
+**The problem without ZTA:** The agent logs into travel and HR systems as Alice (using her OAuth token). There's no distinction between Alice booking travel herself and the agent doing it on her behalf. Alice can't revoke just the agent's access — she'd have to revoke her own session.
+
+**With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries its own identity in `sub`, Alice's identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
 
 ```python
-# In your MCP server — verify ZeroID token before executing any tool
-def verify_agent_token(bearer_token: str) -> bool:
-    info = client.tokens.introspect(bearer_token)
-    if not info.active:
-        return False
-    if info.extra.get("delegation_depth", 0) > MAX_ALLOWED_DEPTH:
-        return False
-    if info.extra.get("trust_level") not in ("verified_third_party", "first_party"):
-        return False
-    return True
+# Alice authenticates via authorization_code + PKCE
+# Her user token is exchanged so the assistant can act on her behalf
+assistant_token = client.tokens.issue(
+    grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
+    subject_token=alice_user_token,      # alice's authorization_code-issued token
+    actor_token=build_jwt_assertion(assistant.identity.wimse_uri, assistant_private_key),
+    scope="calendar:read travel:book expenses:submit",
+)
+
+# The token the assistant presents to travel and HR systems carries:
+#   sub:              spiffe://.../agent/travel-assistant  ← the agent is acting
+#   owner:            operations@company.com               ← who provisioned the agent
+#   act.sub:          alice@company.com                    ← alice delegated this task
+#   scope:            calendar:read travel:book expenses:submit
+#   delegation_depth: 1
+
+# Travel system sees alice@company.com in act.sub:
+#   → books in Alice's name, charges Alice's cost center
+#   → audit log records: "booked by travel-assistant on behalf of alice@company.com"
+
+# Alice decides she wants to handle this herself — revoke just the agent's token
+client.tokens.revoke(assistant_token.access_token)
+# Alice's own session is untouched. Only the agent's delegated access is gone.
 ```
 
-Anonymous agents, revoked credentials, and agents that exceeded their delegation depth are all rejected before any tool executes.
+---
+
+### Pattern 5: MCP server enforcing identity at the tool boundary
+
+**Scenario:** An MCP server exposes tools that can read files, execute queries, and write to databases. It needs to verify that any agent calling it has a legitimate identity, appropriate permissions, and hasn't exceeded its authorized delegation depth — before any tool executes.
+
+**The problem without ZeroID:** MCP servers today typically accept any bearer token and trust the caller. There's no standard way to verify who the agent is, who authorized it, or whether it's still authorized (a token issued an hour ago may have been revoked since).
+
+**With ZeroID:** The MCP server calls introspect on every incoming token. The response carries the full identity context — the server can enforce its own access policy based on trust level, delegation depth, scope, and sub-type, without implementing its own identity logic.
+
+```python
+# In your MCP server — called before any tool executes
+def authorize_agent(bearer_token: str, required_scope: str) -> dict:
+    info = client.tokens.introspect(bearer_token)
+
+    # Token is expired or was explicitly revoked
+    if not info.active:
+        raise PermissionError("Token is not active")
+
+    # Only accept agents that were provisioned with first-party trust
+    if info.extra.get("trust_level") not in ("verified_third_party", "first_party"):
+        raise PermissionError(f"Insufficient trust level: {info.extra.get('trust_level')}")
+
+    # Reject agents that have already delegated too many times
+    # (prevents deep chains from reaching sensitive tools)
+    if info.extra.get("delegation_depth", 0) > 2:
+        raise PermissionError("Delegation depth exceeds allowed limit")
+
+    # Verify the agent has the specific scope this tool requires
+    granted_scopes = set(info.scope.split())
+    if required_scope not in granted_scopes:
+        raise PermissionError(f"Missing required scope: {required_scope}")
+
+    # Return identity context for logging and audit
+    return {
+        "agent":        info.sub,                       # spiffe://... URI
+        "owner":        info.extra.get("owner"),        # who provisioned this agent
+        "delegated_by": info.extra.get("act", {}).get("sub"),  # who delegated (if any)
+        "trust_level":  info.extra.get("trust_level"),
+    }
+
+# Tool handler
+def handle_query_database(bearer_token: str, query: str) -> dict:
+    ctx = authorize_agent(bearer_token, required_scope="database:read")
+    # At this point we know:
+    #   - the token is valid and not revoked
+    #   - the agent is trusted
+    #   - it has database:read scope
+    #   - it hasn't been delegated through too many hops
+    log_audit(action="database:read", agent=ctx["agent"], owner=ctx["owner"],
+              delegated_by=ctx["delegated_by"], query=query)
+    return execute_query(query)
+```
+
+**Why this matters:** The MCP server doesn't implement any identity logic of its own. It delegates all trust decisions to ZeroID. When the Highflame team revokes a compromised agent's token, every MCP server in the ecosystem immediately rejects it — without any coordination.
 
 ---
 
@@ -474,70 +690,6 @@ graph TD
 | Agent (`api_key` / `jwt_bearer`) | ES256 | 1 hour | WIMSE URI |
 | Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI + `act` claim |
 | SDK / CLI (`authorization_code`) | RS256 | 90 days | User ID |
-
----
-
-## Configuration
-
-```yaml
-server:
-  port: "8899"
-
-database:
-  url: "postgres://zeroid:zeroid@localhost:5432/zeroid?sslmode=disable"
-
-keys:
-  ecdsa_private_key_path: "keys/private.pem"
-  ecdsa_public_key_path:  "keys/public.pem"
-  # Optional: RSA keys for RS256 tokens (SDK/CLI)
-  # rsa_private_key_path: "keys/rsa_private.pem"
-  # rsa_public_key_path:  "keys/rsa_public.pem"
-
-token:
-  issuer:      "https://auth.highflame.ai"
-  default_ttl: 3600
-
-wimse_domain: "auth.highflame.ai"
-```
-
-Environment variables override YAML (prefix `ZEROID_`):
-
-```bash
-ZEROID_DATABASE_URL=postgres://...
-ZEROID_TOKEN_ISSUER=https://auth.example.com
-ZEROID_WIMSE_DOMAIN=example.com
-ZEROID_ECDSA_PRIVATE_KEY_PATH=keys/private.pem
-ZEROID_ECDSA_PUBLIC_KEY_PATH=keys/public.pem
-```
-
----
-
-## Embedding as a Go Library
-
-```go
-import zeroid "github.com/highflame-ai/zeroid"
-
-cfg, _ := zeroid.LoadConfig("")
-srv, _ := zeroid.NewServer(cfg)
-
-// Protect admin routes with custom auth
-srv.AdminAuth(func(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        if r.Header.Get("X-Admin-Key") != "secret" {
-            http.Error(w, "unauthorized", 401)
-            return
-        }
-        next.ServeHTTP(w, r)
-    })
-})
-
-// Enrich JWT claims at issuance
-srv.OnClaimsIssue(func(claims map[string]any, id *domain.Identity, gt domain.GrantType) {
-    claims["gateway_id"] = "gw-123"
-})
-
-log.Fatal(srv.Start())
-```
 
 ---
 
