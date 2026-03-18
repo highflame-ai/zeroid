@@ -119,6 +119,9 @@ func (a *API) listSignalsOp(ctx context.Context, input *SignalListInput) (*Signa
 		return nil, huma.Error500InternalServerError("failed to list signals")
 	}
 
+	if signals == nil {
+		signals = []*domain.CAESignal{}
+	}
 	out := &SignalListOutput{}
 	out.Body.Signals = signals
 	out.Body.Total = len(signals)

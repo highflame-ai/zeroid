@@ -117,6 +117,9 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		identity.ExternalID, identity.ID,
 	)
 	if err != nil {
+		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
+			return nil, huma.Error409Conflict("oauth client with this client_id already exists")
+		}
 		log.Error().Err(err).Msg("failed to register oauth client")
 		return nil, huma.Error500InternalServerError("failed to register oauth client")
 	}
@@ -158,6 +161,9 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 		return nil, huma.Error500InternalServerError("failed to list oauth clients")
 	}
 
+	if clients == nil {
+		clients = []*domain.OAuthClient{}
+	}
 	out := &OAuthClientListOutput{}
 	out.Body.Clients = clients
 	out.Body.Total = len(clients)

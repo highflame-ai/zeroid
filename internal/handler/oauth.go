@@ -18,6 +18,8 @@ type TokenInput struct {
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret"`
 		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
+		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID (required for client_credentials)"`
+		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID (required for client_credentials)"`
 		Subject      string `json:"subject,omitempty" doc:"JWT assertion for jwt_bearer grant"`
 		APIKey       string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
 		SubjectToken string `json:"subject_token,omitempty" doc:"Orchestrator's active token for token_exchange"`
@@ -102,6 +104,8 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		ClientID:        input.Body.ClientID,
 		ClientSecret:    input.Body.ClientSecret,
 		Scope:           input.Body.Scope,
+		AccountID:       input.Body.AccountID,
+		ProjectID:       input.Body.ProjectID,
 		Subject:         input.Body.Subject,
 		APIKey:          input.Body.APIKey,
 		SubjectToken:    input.Body.SubjectToken,

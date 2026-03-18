@@ -19,6 +19,9 @@ import (
 // ErrOAuthClientNotFound is returned when a client lookup fails.
 var ErrOAuthClientNotFound = errors.New("oauth client not found")
 
+// ErrOAuthClientAlreadyExists is returned when a client with the same client_id already exists.
+var ErrOAuthClientAlreadyExists = errors.New("oauth client already exists")
+
 // ErrInvalidClientSecret is returned when secret verification fails.
 var ErrInvalidClientSecret = errors.New("invalid client secret")
 
@@ -81,6 +84,9 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, accountID, proj
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, "", ErrOAuthClientAlreadyExists
+		}
 		return nil, "", fmt.Errorf("failed to register oauth client: %w", err)
 	}
 
@@ -107,9 +113,10 @@ func (s *OAuthClientService) ListClients(ctx context.Context, accountID, project
 	return s.repo.List(ctx, accountID, projectID)
 }
 
-// VerifyClientSecret looks up a client by client_id and verifies the provided secret against the bcrypt hash.
-func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, secret string) (*domain.OAuthClient, error) {
-	client, err := s.repo.GetByClientID(ctx, clientID)
+// VerifyClientSecret looks up a client by client_id within a tenant and verifies
+// the provided secret against the bcrypt hash.
+func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, secret, accountID, projectID string) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetByClientID(ctx, clientID, accountID, projectID)
 	if err != nil {
 		return nil, ErrOAuthClientNotFound
 	}

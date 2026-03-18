@@ -156,6 +156,9 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		return nil, huma.Error500InternalServerError("failed to list API keys")
 	}
 
+	if keys == nil {
+		keys = []*domain.APIKey{}
+	}
 	out := &APIKeyListOutput{}
 	out.Body.Keys = keys
 	out.Body.Total = total

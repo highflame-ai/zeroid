@@ -81,15 +81,16 @@ func NewOAuthService(
 }
 
 // TokenRequest represents an OAuth2 token request.
-// Tenant (account_id, project_id) is deliberately absent for NHI grants: the service derives
-// it from the client record (client_credentials) or the WIMSE URI (jwt_bearer/token_exchange).
-// For human grants (authorization_code, refresh_token), tenant comes from the
-// auth code JWT or the resolved context.
+// Tenant (account_id, project_id) is required for client_credentials grant
+// (multi-tenant client_id lookup) and optional for other grants where tenant
+// is derived from the credential material (WIMSE URI, auth code JWT, etc.).
 type TokenRequest struct {
 	GrantType    string
 	ClientID     string
 	ClientSecret string
 	Scope        string
+	AccountID    string // tenant — required for client_credentials
+	ProjectID    string // tenant — required for client_credentials
 	Subject      string // assertion JWT for jwt_bearer grant
 	APIKey       string // zid_sk_* API key for api_key grant
 	// token_exchange (RFC 8693) fields:
@@ -124,8 +125,12 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	// Validate client credentials against the oauth_clients table.
-	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	if req.AccountID == "" || req.ProjectID == "" {
+		return nil, fmt.Errorf("account_id and project_id are required for client_credentials grant")
+	}
+
+	// Validate client credentials against the oauth_clients table, scoped to tenant.
+	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret, req.AccountID, req.ProjectID)
 	if err != nil {
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
 			return nil, fmt.Errorf("invalid client credentials")

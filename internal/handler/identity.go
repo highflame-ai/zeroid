@@ -215,6 +215,9 @@ func (a *API) listIdentitiesOp(ctx context.Context, _ *struct{}) (*IdentityListO
 		return nil, huma.Error500InternalServerError("failed to list identities")
 	}
 
+	if identities == nil {
+		identities = []*domain.Identity{}
+	}
 	out := &IdentityListOutput{}
 	out.Body.Identities = identities
 	out.Body.Total = len(identities)

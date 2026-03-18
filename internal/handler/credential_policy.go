@@ -159,6 +159,9 @@ func (a *API) listPoliciesOp(ctx context.Context, _ *struct{}) (*PolicyListOutpu
 		return nil, huma.Error500InternalServerError("failed to list credential policies")
 	}
 
+	if policies == nil {
+		policies = []*domain.CredentialPolicy{}
+	}
 	out := &PolicyListOutput{}
 	out.Body.CredentialPolicies = policies
 	out.Body.Total = len(policies)

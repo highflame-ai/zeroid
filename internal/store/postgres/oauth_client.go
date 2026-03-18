@@ -28,11 +28,14 @@ func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuth
 	return nil
 }
 
-// GetByClientID retrieves a client by its OAuth2 client_id.
-func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
+// GetByClientID retrieves a client by its OAuth2 client_id, scoped to a tenant.
+// The (account_id, project_id, client_id) triple has a unique index.
+func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID, accountID, projectID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
 	err := r.db.NewSelect().Model(client).
 		Where("client_id = ?", clientID).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get oauth client: %w", err)
