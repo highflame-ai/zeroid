@@ -1,4 +1,4 @@
-module github.com/zeroid-dev/zeroid
+module github.com/highflame-ai/zeroid
 
 go 1.25.8
 

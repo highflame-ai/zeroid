@@ -12,8 +12,8 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	"github.com/zeroid-dev/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // ErrOAuthClientNotFound is returned when a client lookup fails.

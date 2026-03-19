@@ -8,8 +8,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	"github.com/zeroid-dev/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // AgentService handles agent registration (atomic identity + API key creation).

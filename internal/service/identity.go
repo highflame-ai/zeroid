@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	"github.com/zeroid-dev/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.

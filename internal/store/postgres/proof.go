@@ -7,7 +7,7 @@ import (
 
 	"github.com/uptrace/bun"
 
-	"github.com/zeroid-dev/zeroid/domain"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // ProofRepository handles database operations for WIMSE Proof Tokens.

@@ -92,6 +92,9 @@ const (
 	SubTypeAPIService SubType = "api_service"
 	SubTypeCustom     SubType = "custom"
 	SubTypeCodeAgent  SubType = "code_agent"
+
+	// Service sub-types.
+	SubTypeLLMProvider SubType = "llm_provider"
 )
 
 // agentSubTypes is the set of sub-types valid for identity_type = "agent".
@@ -112,6 +115,11 @@ var applicationSubTypes = map[SubType]bool{
 	SubTypeCodeAgent:  true,
 }
 
+// serviceSubTypes is the set of sub-types valid for identity_type = "service".
+var serviceSubTypes = map[SubType]bool{
+	SubTypeLLMProvider: true,
+}
+
 // ValidForIdentityType reports whether s is a valid sub-type for the given identity type.
 // Empty sub-type is always valid (no sub-classification).
 func (s SubType) ValidForIdentityType(t IdentityType) bool {
@@ -123,8 +131,10 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 		return agentSubTypes[s]
 	case IdentityTypeApplication:
 		return applicationSubTypes[s]
-	case IdentityTypeMCPServer, IdentityTypeService:
+	case IdentityTypeMCPServer:
 		return s == ""
+	case IdentityTypeService:
+		return serviceSubTypes[s]
 	default:
 		return false
 	}
@@ -289,7 +299,9 @@ func GetIdentitySchema() *IdentitySchema {
 				Value:       string(IdentityTypeService),
 				Label:       "Service",
 				Description: "Internal service or platform-level identity",
-				SubTypes:    []SchemaOption{},
+				SubTypes: []SchemaOption{
+					{Value: string(SubTypeLLMProvider), Label: "LLM Provider", Description: "Upstream LLM provider (OpenAI, Anthropic, Azure OpenAI)"},
+				},
 			},
 		},
 		TrustLevels: []SchemaOption{

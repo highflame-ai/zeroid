@@ -14,8 +14,8 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
-	"github.com/zeroid-dev/zeroid/internal/service"
-	"github.com/zeroid-dev/zeroid/internal/signing"
+	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/signing"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/zeroid-dev/zeroid/domain"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // ClaimsEnricher is called during JWT issuance to add custom claims.
@@ -23,3 +23,11 @@ type GrantHandler func(ctx context.Context, req map[string]string) (*domain.Acce
 // When nil (the default), the admin API has no authentication — protect it at the
 // network layer (VPN, service mesh, localhost-only binding, firewall rules).
 type AdminAuthMiddleware func(next http.Handler) http.Handler
+
+// TrustedServiceValidator checks whether the current request comes from a trusted
+// internal service that is allowed to perform external principal token exchange
+// (RFC 8693). Implementations read from context (set by deployer-provided global
+// middleware) and return the service name on success, or an error to reject.
+//
+// Set via Server.TrustedServiceValidator() after NewServer.
+type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)

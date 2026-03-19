@@ -7,7 +7,7 @@ import (
 
 	"github.com/uptrace/bun"
 
-	"github.com/zeroid-dev/zeroid/domain"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // CredentialRepository handles database operations for issued credentials.

@@ -17,9 +17,9 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	"github.com/zeroid-dev/zeroid/internal/signing"
-	"github.com/zeroid-dev/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/signing"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // OAuthService handles OAuth2 grant type implementations.
@@ -40,7 +40,16 @@ type OAuthService struct {
 	mcpClientPrefix string
 	// mcpStaticClients lists static client IDs that are MCP clients (short-lived tokens + refresh).
 	mcpStaticClients map[string]bool
+	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
+	trustedServiceValidator TrustedServiceValidator
 }
+
+// TrustedServiceValidator checks whether the current request comes from a trusted
+// internal service that is allowed to perform external principal exchange.
+// Implementations should return the service name on success, or an error to reject.
+// This is the integration point for deployment-specific auth (e.g. shared secrets,
+// mTLS, service mesh identity).
+type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
@@ -51,6 +60,10 @@ type OAuthServiceConfig struct {
 	ValidClientIDs   map[string]bool
 	MCPClientPrefix  string
 	MCPStaticClients map[string]bool
+	// TrustedServiceValidator is called during external principal token exchange
+	// to verify the caller is a trusted internal service. If nil, external
+	// principal exchange is disabled.
+	TrustedServiceValidator TrustedServiceValidator
 }
 
 // NewOAuthService creates a new OAuthService.
@@ -76,8 +89,15 @@ func NewOAuthService(
 		authCodeIssuer:   cfg.AuthCodeIssuer,
 		validClientIDs:   cfg.ValidClientIDs,
 		mcpClientPrefix:  cfg.MCPClientPrefix,
-		mcpStaticClients: cfg.MCPStaticClients,
+		mcpStaticClients:       cfg.MCPStaticClients,
+		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
+}
+
+// SetTrustedServiceValidator sets the validator for external principal token exchange.
+// Can be called after construction to override the config-provided validator.
+func (s *OAuthService) SetTrustedServiceValidator(v TrustedServiceValidator) {
+	s.trustedServiceValidator = v
 }
 
 // TokenRequest represents an OAuth2 token request.
@@ -89,19 +109,29 @@ type TokenRequest struct {
 	ClientID     string
 	ClientSecret string
 	Scope        string
-	AccountID    string // tenant — required for client_credentials
-	ProjectID    string // tenant — required for client_credentials
+	AccountID    string // tenant — required for client_credentials and external principal exchange
+	ProjectID    string // tenant — required for client_credentials and external principal exchange
 	Subject      string // assertion JWT for jwt_bearer grant
 	APIKey       string // zid_sk_* API key for api_key grant
 	// token_exchange (RFC 8693) fields:
-	SubjectToken string // the orchestrator's active access token (who is delegating)
-	ActorToken   string // the sub-agent's JWT assertion (who is receiving delegated authority)
+	SubjectToken     string // the subject token being exchanged
+	SubjectTokenType string // urn:ietf:params:oauth:token-type:access_token or jwt
+	ActorToken       string // the sub-agent's JWT assertion (NHI delegation only)
+	// External principal exchange fields (RFC 8693 with subject_token_type=jwt):
+	// Populated by the trusted service (e.g. admin) that already authenticated the user.
+	UserID        string // external user ID (e.g. Clerk user ID)
+	UserEmail     string // user email
+	UserName      string // user display name
+	ApplicationID string // optional application scope
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
 	RedirectURI  string // OAuth redirect URI
 	// refresh_token grant fields:
 	RefreshTokenStr string // raw refresh token (zid_rt_*)
+	// TrustedService is true when the caller has been authenticated as a trusted
+	// internal service (via AdminAuth middleware). Required for external principal exchange.
+	TrustedService bool
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -260,8 +290,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if req.SubjectToken == "" {
 		return nil, fmt.Errorf("invalid_request: subject_token is required for token_exchange grant")
 	}
+
+	// RFC 8693 defines two exchange modes:
+	//   1. NHI delegation: subject_token (orchestrator) + actor_token (sub-agent) → delegated token
+	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
+	// Mode is determined by the presence of actor_token.
 	if req.ActorToken == "" {
-		return nil, fmt.Errorf("invalid_request: actor_token is required for token_exchange grant")
+		return s.externalPrincipalExchange(ctx, req)
 	}
 
 	// Step 1: Verify the subject_token (orchestrator's active access token).
@@ -380,6 +415,84 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	return accessToken, nil
 }
 
+// externalPrincipalExchange handles RFC 8693 token exchange for externally-authenticated
+// principals (e.g. human users authenticated by Clerk, Google, Okta).
+//
+// A trusted internal service (e.g. an admin gateway) authenticates the external principal,
+// resolves tenant context, and calls the token endpoint with:
+//
+//	grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+//	subject_token=<external_jwt>
+//	subject_token_type=urn:ietf:params:oauth:token-type:jwt
+//	account_id=<resolved_tenant>
+//	project_id=<resolved_tenant>
+//	user_id=<external_user_id>
+//
+// ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
+// external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
+// with the external principal's claims embedded.
+func (s *OAuthService) externalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	// Step 1: Verify the caller is a trusted internal service.
+	if s.trustedServiceValidator == nil {
+		return nil, fmt.Errorf("invalid_grant: external principal exchange is not configured")
+	}
+	serviceName, err := s.trustedServiceValidator(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("invalid_grant: caller is not a trusted service: %w", err)
+	}
+
+	// Step 2: Validate required fields. The trusted service is responsible for
+	// authenticating the external principal and resolving tenant context.
+	if req.AccountID == "" || req.ProjectID == "" {
+		return nil, fmt.Errorf("invalid_request: account_id and project_id are required for external principal exchange")
+	}
+	if req.UserID == "" {
+		return nil, fmt.Errorf("invalid_request: user_id is required for external principal exchange")
+	}
+
+	// Step 3: Build a minimal identity for the external principal.
+	// External principals are not registered in ZeroID's identity table — they are
+	// authenticated by the external IdP and their token is scoped by the trusted service's
+	// resolved tenant context.
+	identity := &domain.Identity{
+		AccountID:    req.AccountID,
+		ProjectID:    req.ProjectID,
+		IdentityType: domain.IdentityTypeService, // external principal, not a ZeroID NHI
+		Status:       domain.IdentityStatusActive,
+	}
+
+	// Step 4: Build custom claims for the external principal.
+	customClaims := map[string]any{
+		"token_exchange": "external_principal",
+		"trusted_by":     serviceName,
+	}
+
+	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
+	// them from ES256 NHI tokens in downstream verification.
+	scopes := parseScopeString(req.Scope)
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+		Identity:        identity,
+		GrantType:       domain.GrantTypeTokenExchange,
+		Scopes:          scopes,
+		UseRS256:        true,
+		SubjectOverride: req.UserID,
+		UserEmail:       req.UserEmail,
+		UserName:        req.UserName,
+		ApplicationID:   req.ApplicationID,
+		TTL:             900, // 15 minutes — short-lived for external principals
+		CustomClaims:    customClaims,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("issuing external principal token: %w", err)
+	}
+
+	accessToken.AccountID = req.AccountID
+	accessToken.ProjectID = req.ProjectID
+	accessToken.UserID = req.UserID
+
+	return accessToken, nil
+}
+
 // apiKeyGrant validates a zid_sk_* API key and issues an RS256 JWT.
 // Tenant is derived from the API key record — no caller-supplied headers needed.
 func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
@@ -431,7 +544,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		Scopes:             scopes,
 		GrantType:          domain.GrantTypeAPIKey,
 		UseRS256:           true,
-		SubjectOverride:    sk.CreatedBy,
+		// sub = WIMSE URI (the identity), not the creator.
+		// owner_user_id is set from Identity.OwnerUserID automatically.
+		// The creator is the acting user (the developer using the SDK right now).
+		ActingUserID: sk.CreatedBy,
 	})
 	if err != nil {
 		return nil, err

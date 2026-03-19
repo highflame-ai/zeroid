@@ -6,7 +6,7 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // respondWithJSON writes a JSON-encoded payload with the given HTTP status.

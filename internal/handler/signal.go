@@ -11,8 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/domain"
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 )
 
 // ── Signal types ────────────────────────────────────────────────────────────

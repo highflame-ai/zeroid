@@ -6,7 +6,7 @@ import (
 
 	"github.com/uptrace/bun"
 
-	"github.com/zeroid-dev/zeroid/domain"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // SignalRepository handles database operations for CAE signals.

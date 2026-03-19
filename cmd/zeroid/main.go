@@ -4,7 +4,7 @@ import (
 	"flag"
 	"os"
 
-	zeroid "github.com/zeroid-dev/zeroid"
+	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/rs/zerolog/log"
 )
 

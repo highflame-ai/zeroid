@@ -8,8 +8,8 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
 
-	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
-	"github.com/zeroid-dev/zeroid/internal/service"
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── Proof types ──────────────────────────────────────────────────────────────

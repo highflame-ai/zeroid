@@ -22,22 +22,23 @@ import (
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/driver/pgdriver"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	"github.com/zeroid-dev/zeroid/internal/database"
-	"github.com/zeroid-dev/zeroid/internal/handler"
-	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
-	"github.com/zeroid-dev/zeroid/internal/service"
-	"github.com/zeroid-dev/zeroid/internal/signing"
-	"github.com/zeroid-dev/zeroid/internal/store/postgres"
-	"github.com/zeroid-dev/zeroid/internal/telemetry"
-	"github.com/zeroid-dev/zeroid/internal/worker"
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/database"
+	"github.com/highflame-ai/zeroid/internal/handler"
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/signing"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/internal/telemetry"
+	"github.com/highflame-ai/zeroid/internal/worker"
 )
 
-// adminAuthHolder stores the optional admin auth middleware in a thread-safe way.
-// Shared between the router middleware closure and the AdminAuth() method.
-type adminAuthHolder struct {
+// middlewareHolder stores an optional middleware in a thread-safe way.
+// The middleware closure is registered at router-build time; the actual function
+// is set later (before Start) via a setter method.
+type middlewareHolder struct {
 	mu sync.RWMutex
-	fn AdminAuthMiddleware
+	fn func(http.Handler) http.Handler
 }
 
 // Server is the main ZeroID server.
@@ -76,7 +77,8 @@ type Server struct {
 	mu              sync.RWMutex
 	customGrants    map[string]GrantHandler
 	claimsEnrichers []ClaimsEnricher
-	adminAuthState  *adminAuthHolder
+	adminAuthState  *middlewareHolder
+	globalMWState   *middlewareHolder
 }
 
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
@@ -162,9 +164,10 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
-	// Shared admin auth state — the closure and Server.AdminAuth both read/write
-	// through this shared struct so the middleware can be set after NewServer returns.
-	authState := &adminAuthHolder{}
+	// Shared middleware state — closures reference these holders; the actual functions
+	// are set after NewServer returns (before Start) via setter methods.
+	authState := &middlewareHolder{}
+	globalMW := &middlewareHolder{}
 
 	// ── Single router, two route groups ──────────────────────────────────────
 	r := chi.NewRouter()
@@ -176,6 +179,23 @@ func NewServer(cfg Config) (*Server, error) {
 	r.Use(errorRecoveryMiddleware)
 	r.Use(structuredLoggingMiddleware)
 	r.Use(chimiddleware.Recoverer)
+
+	// Optional global middleware — runs on ALL routes (public + admin).
+	// Set via Server.Use() after NewServer. Checked at request time.
+	// Use this to annotate request context (e.g. trusted service identity from headers)
+	// without blocking unauthenticated callers.
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			globalMW.mu.RLock()
+			mw := globalMW.fn
+			globalMW.mu.RUnlock()
+			if mw != nil {
+				mw(next).ServeHTTP(w, req)
+				return
+			}
+			next.ServeHTTP(w, req)
+		})
+	})
 
 	// Public routes — no auth.
 	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke
@@ -242,6 +262,7 @@ func NewServer(cfg Config) (*Server, error) {
 		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
 		customGrants:        make(map[string]GrantHandler),
 		adminAuthState:      authState,
+		globalMWState:       globalMW,
 		http: &http.Server{
 			Addr:         ":" + cfg.Server.Port,
 			Handler:      r,
@@ -341,6 +362,33 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 	s.adminAuthState.mu.Lock()
 	defer s.adminAuthState.mu.Unlock()
 	s.adminAuthState.fn = middleware
+}
+
+// Use adds a global middleware that runs on ALL routes (public + admin).
+// Unlike AdminAuth (which only protects admin routes), this middleware runs on
+// every request including the public /oauth2/token endpoint.
+//
+// Use this to annotate request context without blocking — for example, extracting
+// trusted service identity from headers so that TrustedServiceValidator can read it
+// during external principal token exchange.
+//
+// Can be called after NewServer and before Start.
+func (s *Server) Use(middleware func(http.Handler) http.Handler) {
+	s.globalMWState.mu.Lock()
+	defer s.globalMWState.mu.Unlock()
+	s.globalMWState.fn = middleware
+}
+
+// SetTrustedServiceValidator sets the validator used during external principal
+// token exchange (RFC 8693) to verify the caller is a trusted internal service.
+// The validator reads from context (populated by deployer-provided global middleware
+// via Server.Use). When nil (default), external principal exchange is disabled.
+//
+// Can be called after NewServer and before Start.
+func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
+	s.oauthSvc.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
+		return v(ctx)
+	})
 }
 
 // Router returns the chi.Router for custom route mounting.

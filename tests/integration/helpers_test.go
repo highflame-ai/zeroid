@@ -28,7 +28,7 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	zeroid "github.com/zeroid-dev/zeroid"
+	zeroid "github.com/highflame-ai/zeroid"
 )
 
 const (

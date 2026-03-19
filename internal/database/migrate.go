@@ -11,7 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
 
-	"github.com/zeroid-dev/zeroid/migrations"
+	"github.com/highflame-ai/zeroid/migrations"
 )
 
 // RunMigrations executes all pending database migrations using the embedded SQL files.

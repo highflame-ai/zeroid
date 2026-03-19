@@ -8,9 +8,9 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/domain"
-	internalMiddleware "github.com/zeroid-dev/zeroid/internal/middleware"
-	"github.com/zeroid-dev/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/domain"
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── OAuth Client types ──────────────────────────────────────────────────────

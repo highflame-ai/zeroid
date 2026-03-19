@@ -7,7 +7,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
 
-	"github.com/zeroid-dev/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── OAuth types ──────────────────────────────────────────────────────────────
@@ -18,12 +18,19 @@ type TokenInput struct {
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret"`
 		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
-		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID (required for client_credentials)"`
-		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID (required for client_credentials)"`
+		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID"`
+		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID"`
 		Subject      string `json:"subject,omitempty" doc:"JWT assertion for jwt_bearer grant"`
 		APIKey       string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
-		SubjectToken string `json:"subject_token,omitempty" doc:"Orchestrator's active token for token_exchange"`
-		ActorToken   string `json:"actor_token,omitempty" doc:"Sub-agent's JWT assertion for token_exchange"`
+		// token_exchange (RFC 8693) fields:
+		SubjectToken     string `json:"subject_token,omitempty" doc:"Subject token being exchanged"`
+		SubjectTokenType string `json:"subject_token_type,omitempty" doc:"RFC 8693 subject token type URI"`
+		ActorToken       string `json:"actor_token,omitempty" doc:"Actor token for NHI delegation"`
+		// External principal exchange fields (via trusted service):
+		UserID        string `json:"user_id,omitempty" doc:"External user ID (for external principal exchange)"`
+		UserEmail     string `json:"user_email,omitempty" doc:"User email (for external principal exchange)"`
+		UserName      string `json:"user_name,omitempty" doc:"User display name (for external principal exchange)"`
+		ApplicationID string `json:"application_id,omitempty" doc:"Application scope (for external principal exchange)"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -100,20 +107,25 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 
 func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, error) {
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
-		GrantType:       input.Body.GrantType,
-		ClientID:        input.Body.ClientID,
-		ClientSecret:    input.Body.ClientSecret,
-		Scope:           input.Body.Scope,
-		AccountID:       input.Body.AccountID,
-		ProjectID:       input.Body.ProjectID,
-		Subject:         input.Body.Subject,
-		APIKey:          input.Body.APIKey,
-		SubjectToken:    input.Body.SubjectToken,
-		ActorToken:      input.Body.ActorToken,
-		Code:            input.Body.Code,
-		CodeVerifier:    input.Body.CodeVerifier,
-		RedirectURI:     input.Body.RedirectURI,
-		RefreshTokenStr: input.Body.RefreshToken,
+		GrantType:        input.Body.GrantType,
+		ClientID:         input.Body.ClientID,
+		ClientSecret:     input.Body.ClientSecret,
+		Scope:            input.Body.Scope,
+		AccountID:        input.Body.AccountID,
+		ProjectID:        input.Body.ProjectID,
+		Subject:          input.Body.Subject,
+		APIKey:           input.Body.APIKey,
+		SubjectToken:     input.Body.SubjectToken,
+		SubjectTokenType: input.Body.SubjectTokenType,
+		ActorToken:       input.Body.ActorToken,
+		UserID:           input.Body.UserID,
+		UserEmail:        input.Body.UserEmail,
+		UserName:         input.Body.UserName,
+		ApplicationID:    input.Body.ApplicationID,
+		Code:             input.Body.Code,
+		CodeVerifier:     input.Body.CodeVerifier,
+		RedirectURI:      input.Body.RedirectURI,
+		RefreshTokenStr:  input.Body.RefreshToken,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
