@@ -13,15 +13,16 @@ database:
   url: "postgres://zeroid:zeroid@localhost:5432/zeroid?sslmode=disable"
   max_open_conns: 25
   max_idle_conns: 5
+  auto_migrate: true  # Set to false in production — use zeroid.Migrate() or MigrationFiles() instead
 
 keys:
   private_key_path: "./keys/private.pem"
   public_key_path: "./keys/public.pem"
   key_id: "zeroid-key-1"
-  # RSA keys (optional — needed for api_key grant type)
-  # rsa_private_key_path: "./keys/rsa_private.pem"
-  # rsa_public_key_path: "./keys/rsa_public.pem"
-  # rsa_key_id: "v1"
+  # RSA keys (needed for api_key grant and RS256 token flows)
+  rsa_private_key_path: "./keys/rsa_private.pem"
+  rsa_public_key_path: "./keys/rsa_public.pem"
+  rsa_key_id: "v1"
 
 token:
   issuer: "https://auth.zeroid.dev"

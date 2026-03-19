@@ -109,9 +109,14 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
 	}
 
-	// Run migrations.
-	if err := database.RunMigrations(db); err != nil {
-		return nil, fmt.Errorf("failed to run database migrations: %w", err)
+	// Run migrations unless the deployer has opted out.
+	autoMigrate := cfg.Database.AutoMigrate == nil || *cfg.Database.AutoMigrate
+	if autoMigrate {
+		if err := database.RunMigrations(db); err != nil {
+			return nil, fmt.Errorf("failed to run database migrations: %w", err)
+		}
+	} else {
+		log.Info().Msg("Auto-migrate disabled — deployer manages schema migrations")
 	}
 
 	// Initialize JWKS service (loads ECDSA P-256 key pair).

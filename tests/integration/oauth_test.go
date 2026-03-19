@@ -305,3 +305,130 @@ func TestIntrospectUnknownToken(t *testing.T) {
 	result := introspect(t, "unknown.token.value")
 	assert.False(t, result["active"].(bool))
 }
+
+// ── API Key + RS256 token exchange tests ─────────────────────────────────────
+
+// TestAPIKeyGrant exercises the api_key grant flow:
+// register agent (gets zid_sk_* key) → exchange for RS256 JWT → introspect → revoke.
+func TestAPIKeyGrant(t *testing.T) {
+	agent := registerAgent(t, uid("apikey-agent"))
+
+	// Exchange API key for RS256 JWT.
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    agent.APIKey,
+		"scope":      "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	token := decode(t, resp)
+	accessToken := token["access_token"].(string)
+	assert.Equal(t, "Bearer", token["token_type"])
+	assert.NotEmpty(t, accessToken)
+
+	// Introspect: token should be active.
+	result := introspect(t, accessToken)
+	assert.True(t, result["active"].(bool))
+	assert.Contains(t, result["sub"].(string), "spiffe://", "sub should be a WIMSE URI")
+	assert.Contains(t, result["scope"], "data:read")
+
+	// Revoke and confirm inactive.
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": accessToken}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	result = introspect(t, accessToken)
+	assert.False(t, result["active"].(bool))
+}
+
+// TestTokenExchangeWithRS256SubjectToken verifies that an RS256 token (from api_key grant)
+// can be used as subject_token in RFC 8693 token exchange for agent delegation.
+// This tests the parseTokenAnyAlg / tokenAlgorithm fix that reads the JWT alg header
+// to select the correct verification key instead of hardcoding ES256.
+func TestTokenExchangeWithRS256SubjectToken(t *testing.T) {
+	// Orchestrator: register and get RS256 token via api_key.
+	orch := registerAgent(t, uid("rs256-orch"))
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    orch.APIKey,
+		"scope":      "data:read data:write",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// Sub-agent: register with jwt_bearer key pair.
+	subKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	subID := uid("rs256-sub")
+	subIdentity := registerIdentity(t, subID, []string{"data:read"}, ecPublicKeyPEM(t, subKey))
+
+	// Sub-agent builds actor assertion.
+	actorAssertion := buildAssertion(t, subKey, subIdentity.WIMSEURI)
+
+	// Token exchange: RS256 subject_token + ES256 actor_token → delegated ES256 token.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   actorAssertion,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	token := decode(t, resp)
+	delegatedToken := token["access_token"].(string)
+	assert.NotEmpty(t, delegatedToken)
+	assert.Equal(t, "data:read", token["scope"])
+
+	// Introspect: verify delegation chain.
+	result := introspect(t, delegatedToken)
+	assert.True(t, result["active"].(bool))
+	assert.Equal(t, subIdentity.WIMSEURI, result["sub"], "sub should be the sub-agent WIMSE URI")
+
+	act, ok := result["act"].(map[string]any)
+	require.True(t, ok, "act claim must be present")
+	assert.Contains(t, act["sub"], "spiffe://", "act.sub should be the orchestrator WIMSE URI")
+
+	depth, ok := result["delegation_depth"]
+	require.True(t, ok, "delegation_depth must be present")
+	assert.EqualValues(t, 1, depth)
+}
+
+// TestTokenExchangeES256SubjectTokenStillWorks verifies that the standard ES256 delegation
+// flow (client_credentials → token_exchange) continues to work after the alg-detection change.
+func TestTokenExchangeES256SubjectTokenStillWorks(t *testing.T) {
+	// Orchestrator: client_credentials (ES256).
+	orchID := uid("es256-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// Sub-agent with jwt_bearer key pair.
+	subKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	subID := uid("es256-sub")
+	subIdentity := registerIdentity(t, subID, []string{"data:read"}, ecPublicKeyPEM(t, subKey))
+	actorAssertion := buildAssertion(t, subKey, subIdentity.WIMSEURI)
+
+	// Token exchange with ES256 subject_token.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   actorAssertion,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	token := decode(t, resp)
+	assert.NotEmpty(t, token["access_token"])
+	assert.Equal(t, "data:read", token["scope"])
+}

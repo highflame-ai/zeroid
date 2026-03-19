@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -92,6 +93,19 @@ func runTests(m *testing.M) int {
 	}
 	defer cleanKeys()
 
+	// Generate RSA 2048 key pair for RS256 signing (api_key grant).
+	rsaPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "generate RSA key pair: %v\n", err)
+		return 1
+	}
+	rsaPrivPath, rsaPubPath, cleanRSA, err := writeRSAKeyFiles(rsaPrivKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write RSA key files: %v\n", err)
+		return 1
+	}
+	defer cleanRSA()
+
 	// Build zeroid.Config for the test server.
 	cfg := zeroid.Config{
 		Server: zeroid.ServerConfig{
@@ -105,9 +119,12 @@ func runTests(m *testing.M) int {
 			MaxIdleConns: 2,
 		},
 		Keys: zeroid.KeysConfig{
-			PrivateKeyPath: privPath,
-			PublicKeyPath:  pubPath,
-			KeyID:          testKeyID,
+			PrivateKeyPath:    privPath,
+			PublicKeyPath:     pubPath,
+			KeyID:             testKeyID,
+			RSAPrivateKeyPath: rsaPrivPath,
+			RSAPublicKeyPath:  rsaPubPath,
+			RSAKeyID:          "test-rsa-1",
 		},
 		Token: zeroid.TokenConfig{
 			Issuer:     testIssuer,
@@ -342,4 +359,68 @@ func introspect(t *testing.T, tokenStr string) map[string]any {
 	resp := post(t, "/oauth2/token/introspect", map[string]string{"token": tokenStr}, adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return decode(t, resp)
+}
+
+// writeRSAKeyFiles serialises an RSA private key to temp PEM files (PKCS1 private, PKIX public)
+// and returns their paths plus a cleanup function.
+func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanup func(), err error) {
+	privDER := x509.MarshalPKCS1PrivateKey(privKey)
+	pubDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("marshal RSA public key: %w", err)
+	}
+
+	privFile, err := os.CreateTemp("", "zeroid-test-rsa-priv-*.pem")
+	if err != nil {
+		return "", "", nil, err
+	}
+	if err := pem.Encode(privFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER}); err != nil {
+		privFile.Close()
+		os.Remove(privFile.Name())
+		return "", "", nil, err
+	}
+	privFile.Close()
+
+	pubFile, err := os.CreateTemp("", "zeroid-test-rsa-pub-*.pem")
+	if err != nil {
+		os.Remove(privFile.Name())
+		return "", "", nil, err
+	}
+	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
+		pubFile.Close()
+		os.Remove(privFile.Name())
+		os.Remove(pubFile.Name())
+		return "", "", nil, err
+	}
+	pubFile.Close()
+
+	return privFile.Name(), pubFile.Name(), func() {
+		os.Remove(privFile.Name())
+		os.Remove(pubFile.Name())
+	}, nil
+}
+
+// agentRegistration holds the response from POST /api/v1/agents/register.
+type agentRegistration struct {
+	AgentID string // identity UUID
+	APIKey  string // plaintext zid_sk_* key
+}
+
+// registerAgent calls POST /api/v1/agents/register and returns the identity ID and API key.
+func registerAgent(t *testing.T, externalID string) agentRegistration {
+	t.Helper()
+	resp := post(t, "/api/v1/agents/register", map[string]any{
+		"name":        externalID,
+		"external_id": externalID,
+		"sub_type":    "orchestrator",
+		"trust_level": "first_party",
+		"created_by":  "test-user",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerAgent: expected 201")
+	raw := decode(t, resp)
+	agent := raw["agent"].(map[string]any)
+	return agentRegistration{
+		AgentID: agent["id"].(string),
+		APIKey:  raw["api_key"].(string),
+	}
 }

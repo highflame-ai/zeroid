@@ -28,8 +28,12 @@ services:
     container_name: highflame-zeroid
     restart: on-failure
     environment:
+      # Override paths for docker networking and container mount points.
       ZEROID_DATABASE_URL: "postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable"
-      ZEROID_ENV: development
+      ZEROID_PRIVATE_KEY_PATH: "/keys/private.pem"
+      ZEROID_PUBLIC_KEY_PATH: "/keys/public.pem"
+      ZEROID_RSA_PRIVATE_KEY_PATH: "/keys/rsa_private.pem"
+      ZEROID_RSA_PUBLIC_KEY_PATH: "/keys/rsa_public.pem"
     build:
       context: .
       dockerfile: Dockerfile
@@ -37,6 +41,7 @@ services:
       - "8899:8899"
     volumes:
       - ./keys:/keys:ro
+      - ./zeroid.yaml:/etc/zeroid/zeroid.yaml:ro
     networks:
       - highflame-network
     healthcheck:
@@ -45,7 +50,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    command: ["/zeroid", "-config", "/etc/zeroid/zeroid.yaml"]
+    command: ["/app/zeroid", "-config", "/etc/zeroid/zeroid.yaml"]
 
 networks:
   highflame-network:

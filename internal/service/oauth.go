@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -300,10 +301,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 1: Verify the subject_token (orchestrator's active access token).
-	subjectParsed, err := jwt.Parse([]byte(req.SubjectToken),
-		jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()),
-		jwt.WithValidate(true),
-	)
+	// Accept both ES256 and RS256 tokens — an orchestrator may have authenticated
+	// via any grant type (client_credentials → ES256, api_key → RS256).
+	subjectAlg, err := tokenAlgorithm(req.SubjectToken)
+	if err != nil {
+		return nil, fmt.Errorf("invalid_grant: subject_token is malformed: %w", err)
+	}
+	subjectParsed, err := s.parseToken(req.SubjectToken, subjectAlg, true)
 	if err != nil {
 		return nil, fmt.Errorf("invalid_grant: subject_token validation failed: %w", err)
 	}
@@ -724,9 +728,13 @@ func parseECPublicKeyPEM(pemStr string) (*ecdsa.PublicKey, error) {
 func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[string]any, error) {
 	inactive := map[string]any{"active": false}
 
-	parsed, err := s.parseTokenAnyAlg(tokenStr, true)
+	alg, err := tokenAlgorithm(tokenStr)
 	if err != nil {
-		return inactive, nil // expired or malformed — return active:false, no error
+		return inactive, nil // malformed — return active:false, no error
+	}
+	parsed, err := s.parseToken(tokenStr, alg, true)
+	if err != nil {
+		return inactive, nil // expired or invalid — return active:false, no error
 	}
 
 	jti := parsed.JwtID()
@@ -780,9 +788,13 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 // Per RFC 7009 section 2.2, always returns nil (success) even for unknown or already-revoked tokens.
 func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 	// Parse without full validation — token may already be expired but still revocable.
-	parsed, err := s.parseTokenAnyAlg(tokenStr, false)
+	alg, err := tokenAlgorithm(tokenStr)
 	if err != nil {
-		return nil // malformed token — treat as not found per RFC 7009 section 2.2
+		return nil // malformed — treat as not found per RFC 7009 section 2.2
+	}
+	parsed, err := s.parseToken(tokenStr, alg, false)
+	if err != nil {
+		return nil // invalid signature — treat as not found per RFC 7009 section 2.2
 	}
 
 	jti := parsed.JwtID()
@@ -804,30 +816,33 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 	return s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
 }
 
-// parseTokenAnyAlg attempts to parse and verify a JWT against all configured keys (ES256, RS256).
+// tokenAlgorithm reads the signing algorithm from an unverified JWT header.
+func tokenAlgorithm(tokenStr string) (jwa.SignatureAlgorithm, error) {
+	msg, err := jws.Parse([]byte(tokenStr))
+	if err != nil {
+		return "", fmt.Errorf("malformed token: %w", err)
+	}
+	sigs := msg.Signatures()
+	if len(sigs) == 0 {
+		return "", fmt.Errorf("token has no signatures")
+	}
+	return sigs[0].ProtectedHeaders().Algorithm(), nil
+}
+
+// parseToken verifies a JWT with the given algorithm and returns the parsed token.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
-func (s *OAuthService) parseTokenAnyAlg(tokenStr string, validate bool) (jwt.Token, error) {
-	// Try ES256 first (most common).
-	parsed, err := jwt.Parse([]byte(tokenStr),
-		jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()),
-		jwt.WithValidate(validate),
-	)
-	if err == nil {
-		return parsed, nil
-	}
-
-	// Try RS256 if RSA keys are loaded.
-	if s.jwksSvc.HasRSAKeys() {
-		parsed, err = jwt.Parse([]byte(tokenStr),
-			jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPublicKey()),
-			jwt.WithValidate(validate),
-		)
-		if err == nil {
-			return parsed, nil
+func (s *OAuthService) parseToken(tokenStr string, alg jwa.SignatureAlgorithm, validate bool) (jwt.Token, error) {
+	switch alg {
+	case jwa.ES256:
+		return jwt.Parse([]byte(tokenStr), jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()), jwt.WithValidate(validate))
+	case jwa.RS256:
+		if !s.jwksSvc.HasRSAKeys() {
+			return nil, fmt.Errorf("RS256 token received but no RSA keys configured")
 		}
+		return jwt.Parse([]byte(tokenStr), jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPublicKey()), jwt.WithValidate(validate))
+	default:
+		return nil, fmt.Errorf("unsupported signing algorithm: %s", alg)
 	}
-
-	return nil, fmt.Errorf("token validation failed with all configured algorithms")
 }
 
 // parseWIMSEURI extracts the account_id and project_id embedded in a WIMSE URI.

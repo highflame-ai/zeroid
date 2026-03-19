@@ -28,11 +28,14 @@ docker-build: ## Build Docker image
 docker-up: ## Start zeroid + postgres via docker compose
 	docker compose up --build -d
 
-setup-keys: ## Generate ECDSA P-256 signing keys
+setup-keys: ## Generate ECDSA P-256 + RSA 2048 signing keys
 	@mkdir -p $(KEYS_DIR)
 	@echo "Generating ECDSA P-256 key pair..."
 	openssl ecparam -genkey -name prime256v1 -noout -out $(KEYS_DIR)/private.pem
 	openssl ec -in $(KEYS_DIR)/private.pem -pubout -out $(KEYS_DIR)/public.pem
+	@echo "Generating RSA 2048 key pair..."
+	openssl genrsa -out $(KEYS_DIR)/rsa_private.pem 2048
+	openssl rsa -in $(KEYS_DIR)/rsa_private.pem -pubout -out $(KEYS_DIR)/rsa_public.pem
 	@echo "Keys written to $(KEYS_DIR)/"
 
 migrate: ## Run migrations (starts server, applies, exits)

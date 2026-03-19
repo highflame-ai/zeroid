@@ -127,8 +127,10 @@ npm install @highflame/zeroid   # Node / TypeScript
 **Run ZeroID locally** (Docker — 30 seconds):
 
 ```bash
-docker compose up -d
-curl http://localhost:8899/health   # {"status":"ok"}
+make setup-keys              # generate ECDSA P-256 + RSA 2048 signing keys
+docker compose up -d         # starts Postgres + ZeroID
+curl http://localhost:8899/health
+# {"status":"healthy","service":"zeroid","timestamp":"..."}
 ```
 
 Or use `https://auth.highflame.ai` (hosted — [sign up free →](https://studio.highflame.ai/sign-up)).
@@ -136,7 +138,7 @@ Or use `https://auth.highflame.ai` (hosted — [sign up free →](https://studio
 **From source:**
 
 ```bash
-make setup-keys           # generate ECDSA P-256 signing keys
+make setup-keys           # generate ECDSA P-256 + RSA 2048 signing keys
 docker compose up -d postgres
 make run
 ```
@@ -366,27 +368,30 @@ client.tokens.revoke(token.access_token)
 <summary>cURL</summary>
 
 ```bash
-# Register
+# Register (admin endpoint — requires tenant headers)
 curl -X POST http://localhost:8899/api/v1/agents/register \
   -H "Content-Type: application/json" \
+  -H "X-Account-ID: acme" -H "X-Project-ID: prod" \
   -d '{"name":"Task Orchestrator","external_id":"orchestrator-1","sub_type":"orchestrator","trust_level":"first_party","created_by":"dev@company.com"}'
+# → {"agent":{...},"api_key":"zid_sk_..."}
 
-# Token
+# Token (public endpoint — no headers needed)
 curl -X POST http://localhost:8899/oauth2/token \
-  -d grant_type=api_key -d api_key=zid_sk_... -d "scope=data:read data:write"
+  -H "Content-Type: application/json" \
+  -d '{"grant_type":"api_key","api_key":"zid_sk_...","scope":"data:read data:write"}'
 
-# Delegate
+# Delegate (both ES256 and RS256 subject_tokens accepted)
 curl -X POST http://localhost:8899/oauth2/token \
-  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
-  -d subject_token=<orchestrator_token> \
-  -d actor_token=<sub_agent_jwt_assertion> \
-  -d scope=data:read
+  -H "Content-Type: application/json" \
+  -d '{"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange","subject_token":"<orchestrator_token>","actor_token":"<sub_agent_jwt_assertion>","scope":"data:read"}'
 
 # Introspect
-curl -X POST http://localhost:8899/oauth2/token/introspect -d token=eyJ...
+curl -X POST http://localhost:8899/oauth2/token/introspect \
+  -H "Content-Type: application/json" -d '{"token":"eyJ..."}'
 
 # Revoke
-curl -X POST http://localhost:8899/oauth2/token/revoke -d token=eyJ...
+curl -X POST http://localhost:8899/oauth2/token/revoke \
+  -H "Content-Type: application/json" -d '{"token":"eyJ..."}'
 ```
 
 Full interactive API docs: `GET http://localhost:8899/docs`
@@ -685,11 +690,13 @@ graph TD
 
 **Token characteristics:**
 
-| Flow | Algorithm | Default TTL | Subject |
-|------|-----------|-------------|---------|
-| Agent (`api_key` / `jwt_bearer`) | ES256 | 1 hour | WIMSE URI |
-| Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI + `act` claim |
-| SDK / CLI (`authorization_code`) | RS256 | 90 days | User ID |
+| Flow | Algorithm | Default TTL | Subject | User Claims |
+|------|-----------|-------------|---------|-------------|
+| NHI (`client_credentials` / `jwt_bearer`) | ES256 | 1 hour | WIMSE URI | `owner_user_id` = registrant |
+| SDK (`api_key`) | RS256 | 1 hour | WIMSE URI | `act.sub` = developer using SDK |
+| Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI | `act.sub` = orchestrator URI |
+| CLI (`authorization_code`) | RS256 | 90 days | User ID | — |
+| MCP (`authorization_code` + refresh) | RS256 | 1 hour | User ID | — |
 
 ---
 

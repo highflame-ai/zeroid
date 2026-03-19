@@ -48,6 +48,10 @@ type DatabaseConfig struct {
 	SSLMode      string `koanf:"ssl_mode"`
 	MaxOpenConns int    `koanf:"max_open_conns"`
 	MaxIdleConns int    `koanf:"max_idle_conns"`
+	// AutoMigrate controls whether NewServer runs embedded migrations on startup.
+	// Default: true (convenient for standalone/dev). Set to false when the deployer
+	// manages schema migrations via their own pipeline (production recommended).
+	AutoMigrate *bool `koanf:"auto_migrate"`
 }
 
 // KeysConfig holds key paths for JWT signing.
@@ -210,7 +214,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"DB_USERNAME":         "database.user",
 		"DB_PASSWORD":         "database.password",
 		"ZEROID_DB_NAME":      "database.name",
-		"DB_SSL_MODE":         "database.ssl_mode",
+		"DB_SSL_MODE":             "database.ssl_mode",
+		"ZEROID_AUTO_MIGRATE":     "database.auto_migrate",
 
 		// Keys
 		"ZEROID_PRIVATE_KEY_PATH":     "keys.private_key_path",
