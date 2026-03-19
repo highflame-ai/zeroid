@@ -42,15 +42,13 @@ type OAuthService struct {
 	// mcpStaticClients lists static client IDs that are MCP clients (short-lived tokens + refresh).
 	mcpStaticClients map[string]bool
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
-	trustedServiceValidator TrustedServiceValidator
+	trustedServiceValidator trustedServiceValidatorFunc
 }
 
-// TrustedServiceValidator checks whether the current request comes from a trusted
+// trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
-// Implementations should return the service name on success, or an error to reject.
-// This is the integration point for deployment-specific auth (e.g. shared secrets,
-// mTLS, service mesh identity).
-type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)
+// The public type is zeroid.TrustedServiceValidator (hooks.go).
+type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, err error)
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
@@ -64,7 +62,7 @@ type OAuthServiceConfig struct {
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
-	TrustedServiceValidator TrustedServiceValidator
+	TrustedServiceValidator trustedServiceValidatorFunc
 }
 
 // NewOAuthService creates a new OAuthService.
@@ -97,7 +95,7 @@ func NewOAuthService(
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
 // Can be called after construction to override the config-provided validator.
-func (s *OAuthService) SetTrustedServiceValidator(v TrustedServiceValidator) {
+func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc) {
 	s.trustedServiceValidator = v
 }
 
