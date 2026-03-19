@@ -418,7 +418,7 @@ func registerAgent(t *testing.T, externalID string) agentRegistration {
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerAgent: expected 201")
 	raw := decode(t, resp)
-	agent := raw["agent"].(map[string]any)
+	agent := raw["identity"].(map[string]any)
 	return agentRegistration{
 		AgentID: agent["id"].(string),
 		APIKey:  raw["api_key"].(string),

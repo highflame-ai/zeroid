@@ -54,6 +54,7 @@ type AgentResponse struct {
 	ProjectID    string                `json:"project_id"`
 	Name         string                `json:"name"`
 	ExternalID   string                `json:"external_id"`
+	WIMSEURI     string                `json:"wimse_uri"`
 	APIKeyPrefix string                `json:"api_key_prefix"`
 	IdentityType domain.IdentityType   `json:"identity_type"`
 	SubType      domain.SubType        `json:"sub_type"`
@@ -73,8 +74,8 @@ type AgentResponse struct {
 
 // AgentRegistrationResponse is returned on agent creation — includes plaintext API key.
 type AgentRegistrationResponse struct {
-	Agent  AgentResponse `json:"agent"`
-	APIKey string        `json:"api_key"`
+	Identity AgentResponse `json:"identity"`
+	APIKey   string        `json:"api_key"`
 }
 
 // AgentListResponse is the paginated list response.
@@ -152,7 +153,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		Msg("Agent registered with API key")
 
 	return &AgentRegistrationResponse{
-		Agent:  identityToAgentResponse(identity, skResp.KeyPrefix),
+		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
 		APIKey: skResp.FullKey,
 	}, nil
 }
@@ -321,7 +322,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 		Msg("Agent API key rotated")
 
 	return &AgentRegistrationResponse{
-		Agent:  identityToAgentResponse(identity, skResp.KeyPrefix),
+		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
 		APIKey: skResp.FullKey,
 	}, nil
 }
@@ -348,6 +349,7 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 		ProjectID:    identity.ProjectID,
 		Name:         identity.Name,
 		ExternalID:   identity.ExternalID,
+		WIMSEURI:     identity.WIMSEURI,
 		APIKeyPrefix: keyPrefix,
 		IdentityType: identity.IdentityType,
 		SubType:      identity.SubType,

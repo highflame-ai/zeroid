@@ -149,16 +149,20 @@ make run
 
 Examples use `http://localhost:8899`. Swap in `https://auth.highflame.ai` for hosted.
 
-### 1. Connect
+### 1. Register an Agent
 
-Point the client at your ZeroID instance. No credentials needed here — ZeroID's management API (`/api/v1/*`) is protected at the network layer by your infrastructure (API gateway, mTLS, allowlist). The token endpoints (`/oauth2/*`) are public.
+Before an agent can do anything, it needs an identity. Registration creates a persistent identity record (with a WIMSE/SPIFFE URI) and issues an **API key** (`zid_sk_...`) — the agent's long-lived credential.
 
 <details>
 <summary>Python</summary>
 
 ```python
 from highflame.zeroid import ZeroIDClient
-client = ZeroIDClient(base_url="http://localhost:8899")
+
+client = ZeroIDClient(
+    base_url="http://localhost:8899",
+    api_key="zid_sk_...",  # from dashboard or registration below
+)
 ```
 
 </details>
@@ -168,16 +172,15 @@ client = ZeroIDClient(base_url="http://localhost:8899")
 
 ```typescript
 import { ZeroIDClient } from "@highflame/zeroid";
-const client = new ZeroIDClient({ baseUrl: "http://localhost:8899" });
+const client = new ZeroIDClient({
+  baseUrl: "http://localhost:8899",
+  apiKey: "zid_sk_...",
+});
 ```
 
 </details>
 
-### 2. Register an Agent
-
-Before an agent can do anything, it needs an identity. Registration answers: *who is this agent, what role does it play, who created it, and how much should it be trusted?*
-
-This call does two things atomically: it creates a persistent identity record (with a WIMSE/SPIFFE URI as a globally unique identifier) and issues a long-lived **API key** (`zid_sk_...`) that the agent will use to authenticate itself. Think of the API key as the agent's "password" — it proves ownership of the identity, but it never leaves your infrastructure and is only shown once.
+To register a new agent programmatically:
 
 <details>
 <summary>Python</summary>
@@ -188,12 +191,11 @@ agent = client.agents.register(
     external_id="orchestrator-1",   # your internal ID for this agent
     sub_type="orchestrator",        # role: orchestrator | autonomous | tool_agent | ...
     trust_level="first_party",      # how much to trust it: unverified | verified_third_party | first_party
-    created_by="dev@company.com",   # stored as owner claim in every token this agent issues
+    created_by="dev@company.com",   # stored as owner claim in every token
 )
 
 print(agent.identity.wimse_uri)
 # spiffe://auth.highflame.ai/acme/prod/agent/orchestrator-1
-# ↑ stable, globally unique identity URI — carried in every token this agent issues
 
 print(agent.api_key)
 # zid_sk_...  ← save this securely, shown once
@@ -218,51 +220,9 @@ const agent = await client.agents.register({
 
 </details>
 
-### 3. Get an Access Token
+*Under the hood, the SDK exchanges your API key for a short-lived JWT and refreshes it automatically.*
 
-The API key proves the agent's identity to ZeroID, but it's not what gets presented to downstream services. Instead, the agent exchanges its API key for a **short-lived JWT access token** (default: 1 hour). This is the token the agent attaches to every API call it makes.
-
-Why this two-step design? The API key is long-lived and never leaves your system — it only ever talks to ZeroID. The JWT is short-lived, scoped to specific permissions, and safe to pass across service boundaries. If a JWT leaks, it expires. The API key stays secret.
-
-<details>
-<summary>Python</summary>
-
-```python
-token = client.tokens.issue(
-    grant_type="api_key",     # agent authenticates using its API key
-    api_key=agent.api_key,    # proves ownership of the registered identity
-    scope="data:read data:write",  # request only the permissions this task needs
-)
-
-print(token.access_token)  # eyJ...  ← present this to downstream APIs
-print(token.expires_in)    # 3600 seconds (1 hour)
-
-# The JWT carries full context — any service can verify these claims:
-#   sub:              spiffe://auth.highflame.ai/acme/prod/agent/orchestrator-1
-#   owner:            dev@company.com      ← who provisioned this agent
-#   scope:            data:read data:write
-#   delegation_depth: 0
-#   act:              (absent)             ← no user delegated this action; fully autonomous
-```
-
-</details>
-
-<details>
-<summary>Typescript</summary>
-
-```typescript
-const token = await client.tokens.issue({
-  grant_type: "api_key",
-  api_key: agent.api_key,
-  scope: "data:read data:write",
-});
-// token.access_token → short-lived JWT to present to downstream services
-// token.expires_in   → 3600
-```
-
-</details>
-
-### 4. Delegate to a Sub-Agent
+### 2. Delegate to a Sub-Agent
 
 When an orchestrator needs a specialized agent to handle part of a task, it delegates a **subset of its own permissions** — it cannot grant more than it has. The sub-agent gets its own token with its own identity, but the full chain of who authorized what is preserved cryptographically.
 
@@ -281,8 +241,6 @@ sub_agent = client.agents.register(
 )
 
 # The sub-agent proves it holds its private key by signing a JWT assertion.
-# This is what makes delegation secure — you can't impersonate an agent without its private key.
-# zeroid CLI (coming soon): zeroid token assert --agent data-fetcher --key private.pem
 actor_token = build_jwt_assertion(
     iss=sub_agent.identity.wimse_uri,
     sub=sub_agent.identity.wimse_uri,
@@ -290,12 +248,12 @@ actor_token = build_jwt_assertion(
     private_key_pem=sub_agent_private_key,
 )
 
-# The orchestrator delegates data:read to the sub-agent.
+# The orchestrator delegates data:read to the sub-agent via RFC 8693 token exchange.
 # ZeroID enforces scope intersection: the sub-agent can only receive scopes
-# the orchestrator already holds. Requesting more than that is silently capped.
+# the orchestrator already holds.
 delegated = client.tokens.issue(
     grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
-    subject_token=token.access_token,  # orchestrator's current token
+    subject_token=orchestrator_token,  # orchestrator's current token
     actor_token=actor_token,           # sub-agent's proof of identity
     scope="data:read",                 # subset of orchestrator's data:read data:write
 )
@@ -313,7 +271,7 @@ delegated = client.tokens.issue(
 
 </details>
 
-### 5. Introspect — Verify the Full Chain
+### 3. Introspect — Verify the Full Chain
 
 Any service that receives a ZeroID token can verify the full chain by calling introspect. This is how an MCP server, API gateway, or downstream tool answers: *"Is this token valid, who does it belong to, and on whose authority does it act?"*
 
@@ -345,7 +303,7 @@ const info = await client.tokens.introspect(delegated.access_token);
 
 </details>
 
-### 6. Revoke
+### 4. Revoke
 
 Revocation is immediate and cascades. Revoke any token in the chain and everything downstream of it becomes invalid — no need to wait for expiry.
 
@@ -353,13 +311,13 @@ Revocation is immediate and cascades. Revoke any token in the chain and everythi
 <summary>Python</summary>
 
 ```python
-# Revoke a specific token
+# Revoke a specific delegated token
 client.tokens.revoke(delegated.access_token)
 # → delegated token now returns active: false on introspect
 
 # Revoke the orchestrator's token and the entire downstream chain collapses.
 # This is how you respond to a compromise: one call, full containment.
-client.tokens.revoke(token.access_token)
+client.tokens.revoke(orchestrator_token)
 ```
 
 </details>
