@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -235,12 +236,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
+	// kid is included in the JWS header so verifiers can select the correct key from JWKS.
 	var signed []byte
 	var signErr error
 	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
-		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPrivateKey()))
+		hdrs := jws.NewHeaders()
+		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.RSAKeyID())
+		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	} else {
-		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey()))
+		hdrs := jws.NewHeaders()
+		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
+		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	}
 	if signErr != nil {
 		return nil, nil, fmt.Errorf("failed to sign JWT: %w", signErr)

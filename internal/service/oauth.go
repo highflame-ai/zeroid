@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -299,13 +298,8 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 1: Verify the subject_token (orchestrator's active access token).
-	// Accept both ES256 and RS256 tokens — an orchestrator may have authenticated
-	// via any grant type (client_credentials → ES256, api_key → RS256).
-	subjectAlg, err := tokenAlgorithm(req.SubjectToken)
-	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: subject_token is malformed: %w", err)
-	}
-	subjectParsed, err := s.parseToken(req.SubjectToken, subjectAlg, true)
+	// Accept both ES256 and RS256 tokens — the library matches kid + alg from the JWKS.
+	subjectParsed, err := s.parseToken(req.SubjectToken, true)
 	if err != nil {
 		return nil, fmt.Errorf("invalid_grant: subject_token validation failed: %w", err)
 	}
@@ -515,9 +509,6 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		return nil, fmt.Errorf("invalid api key")
 	}
 
-	// Parse and intersect requested scopes with the key's allowed scopes.
-	scopes := intersectScopes(parseScopeString(req.Scope), sk.Scopes)
-
 	// Build a synthetic identity for the API key holder.
 	// API keys may or may not be linked to an identity.
 	var identity *domain.Identity
@@ -539,6 +530,15 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			Status:    domain.IdentityStatusActive,
 		}
 	}
+
+	// Resolve scopes: intersect requested with key's allowed scopes.
+	// If the key has no scopes set, fall through to the identity's allowed_scopes
+	// per RFC 6749 section 3.3 (server-defined default).
+	allowedScopes := sk.Scopes
+	if len(allowedScopes) == 0 && identity != nil {
+		allowedScopes = identity.AllowedScopes
+	}
+	scopes := intersectScopes(parseScopeString(req.Scope), allowedScopes)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:           identity,
@@ -726,13 +726,9 @@ func parseECPublicKeyPEM(pemStr string) (*ecdsa.PublicKey, error) {
 func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[string]any, error) {
 	inactive := map[string]any{"active": false}
 
-	alg, err := tokenAlgorithm(tokenStr)
+	parsed, err := s.parseToken(tokenStr, true)
 	if err != nil {
-		return inactive, nil // malformed — return active:false, no error
-	}
-	parsed, err := s.parseToken(tokenStr, alg, true)
-	if err != nil {
-		return inactive, nil // expired or invalid — return active:false, no error
+		return inactive, nil // malformed, expired, or invalid — return active:false, no error
 	}
 
 	jti := parsed.JwtID()
@@ -786,13 +782,9 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 // Per RFC 7009 section 2.2, always returns nil (success) even for unknown or already-revoked tokens.
 func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 	// Parse without full validation — token may already be expired but still revocable.
-	alg, err := tokenAlgorithm(tokenStr)
+	parsed, err := s.parseToken(tokenStr, false)
 	if err != nil {
-		return nil // malformed — treat as not found per RFC 7009 section 2.2
-	}
-	parsed, err := s.parseToken(tokenStr, alg, false)
-	if err != nil {
-		return nil // invalid signature — treat as not found per RFC 7009 section 2.2
+		return nil // malformed or invalid — treat as not found per RFC 7009 section 2.2
 	}
 
 	jti := parsed.JwtID()
@@ -814,33 +806,14 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 	return s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
 }
 
-// tokenAlgorithm reads the signing algorithm from an unverified JWT header.
-func tokenAlgorithm(tokenStr string) (jwa.SignatureAlgorithm, error) {
-	msg, err := jws.Parse([]byte(tokenStr))
-	if err != nil {
-		return "", fmt.Errorf("malformed token: %w", err)
-	}
-	sigs := msg.Signatures()
-	if len(sigs) == 0 {
-		return "", fmt.Errorf("token has no signatures")
-	}
-	return sigs[0].ProtectedHeaders().Algorithm(), nil
-}
-
-// parseToken verifies a JWT with the given algorithm and returns the parsed token.
+// parseToken verifies a JWT against the JWKS keyset. The library matches
+// the token's kid + alg headers to the correct key automatically.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
-func (s *OAuthService) parseToken(tokenStr string, alg jwa.SignatureAlgorithm, validate bool) (jwt.Token, error) {
-	switch alg {
-	case jwa.ES256:
-		return jwt.Parse([]byte(tokenStr), jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()), jwt.WithValidate(validate))
-	case jwa.RS256:
-		if !s.jwksSvc.HasRSAKeys() {
-			return nil, fmt.Errorf("RS256 token received but no RSA keys configured")
-		}
-		return jwt.Parse([]byte(tokenStr), jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPublicKey()), jwt.WithValidate(validate))
-	default:
-		return nil, fmt.Errorf("unsupported signing algorithm: %s", alg)
-	}
+func (s *OAuthService) parseToken(tokenStr string, validate bool) (jwt.Token, error) {
+	return jwt.Parse([]byte(tokenStr),
+		jwt.WithKeySet(s.jwksSvc.KeySet()),
+		jwt.WithValidate(validate),
+	)
 }
 
 // parseWIMSEURI extracts the account_id and project_id embedded in a WIMSE URI.

@@ -236,7 +236,7 @@ This is the key difference from sharing credentials: the sub-agent has its own r
 sub_agent = client.agents.register(
     name="Data Fetcher",
     external_id="data-fetcher",
-    sub_type="tool_agent",       # narrower role than the orchestrator
+    sub_type="tool_agent",
     trust_level="first_party",
 )
 
@@ -248,14 +248,12 @@ actor_token = build_jwt_assertion(
     private_key_pem=sub_agent_private_key,
 )
 
-# The orchestrator delegates data:read to the sub-agent via RFC 8693 token exchange.
-# ZeroID enforces scope intersection: the sub-agent can only receive scopes
+# Delegate data:read to the sub-agent.
+# ZeroID enforces scope intersection — the sub-agent can only receive scopes
 # the orchestrator already holds.
-delegated = client.tokens.issue(
-    grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
-    subject_token=orchestrator_token,  # orchestrator's current token
-    actor_token=actor_token,           # sub-agent's proof of identity
-    scope="data:read",                 # subset of orchestrator's data:read data:write
+delegated = client.tokens.exchange(
+    actor_token=actor_token,
+    scope="data:read",
 )
 
 # The delegated token carries the full chain:
@@ -264,9 +262,6 @@ delegated = client.tokens.issue(
 #   act.sub:          spiffe://.../agent/orchestrator-1 ← which agent delegated (RFC 8693)
 #   scope:            data:read                         ← capped by intersection
 #   delegation_depth: 1
-#
-# If a human user initiated the chain (e.g., via authorization_code), act.sub would be
-# their user ID (e.g., bob@example.com) rather than an agent WIMSE URI.
 ```
 
 </details>
@@ -331,7 +326,7 @@ curl -X POST http://localhost:8899/api/v1/agents/register \
   -H "Content-Type: application/json" \
   -H "X-Account-ID: acme" -H "X-Project-ID: prod" \
   -d '{"name":"Task Orchestrator","external_id":"orchestrator-1","sub_type":"orchestrator","trust_level":"first_party","created_by":"dev@company.com"}'
-# → {"agent":{...},"api_key":"zid_sk_..."}
+# → {"identity":{...},"api_key":"zid_sk_..."}
 
 # Token (public endpoint — no headers needed)
 curl -X POST http://localhost:8899/oauth2/token \
