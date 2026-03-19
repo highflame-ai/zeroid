@@ -666,6 +666,7 @@ graph TD
 | POST | `/oauth2/token` | Issue token (6 grant types) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
 | POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
+| GET | `/oauth2/token/verify` | Forward-auth endpoint for reverse proxies (nginx `auth_request`, Caddy `forward_auth`) |
 
 ### Admin (`/api/v1/*` — protect at network layer)
 
