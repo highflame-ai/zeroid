@@ -764,8 +764,8 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	if v, ok := parsed.Get("trust_level"); ok {
 		result["trust_level"] = v
 	}
-	if v, ok := parsed.Get("nhi_type"); ok {
-		result["nhi_type"] = v
+	if v, ok := parsed.Get("identity_type"); ok {
+		result["identity_type"] = v
 	}
 	if v, ok := parsed.Get("delegation_depth"); ok {
 		result["delegation_depth"] = v
