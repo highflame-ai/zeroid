@@ -91,11 +91,12 @@ func NewHumaAPI(router chi.Router) huma.API {
 }
 
 // RegisterPublic registers endpoints that require no authentication:
-// health, well-known, and public OAuth2 endpoints (token, revoke).
-func (a *API) RegisterPublic(api huma.API) {
+// health, well-known, OAuth2 endpoints (token, revoke), and forward-auth verify.
+func (a *API) RegisterPublic(api huma.API, router chi.Router) {
 	a.registerHealthRoutes(api)
 	a.registerWellKnownRoutes(api)
 	a.registerOAuthRoutes(api)
+	a.registerAuthVerifyRoute(router)
 }
 
 // RegisterAdmin registers admin/management endpoints:

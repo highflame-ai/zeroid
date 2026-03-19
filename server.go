@@ -203,9 +203,9 @@ func NewServer(cfg Config) (*Server, error) {
 	})
 
 	// Public routes — no auth.
-	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke
+	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke, /oauth2/token/verify
 	humaPublic := handler.NewHumaAPI(r)
-	apiHandler.RegisterPublic(humaPublic)
+	apiHandler.RegisterPublic(humaPublic, r)
 
 	// Admin routes — /api/v1/*
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
