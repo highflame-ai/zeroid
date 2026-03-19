@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jws"
@@ -121,10 +120,10 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 
 	token, err := jwt.Parse([]byte(tokenString), parseOpts...)
 	if err != nil {
-		if strings.Contains(err.Error(), "exp not satisfied") {
+		if errors.Is(err, jwt.ErrTokenExpired()) {
 			return nil, fmt.Errorf("%w: %v", ErrExpiredToken, err)
 		}
-		if strings.Contains(err.Error(), `"iss" not satisfied`) {
+		if errors.Is(err, jwt.ErrInvalidIssuer()) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidIssuer, err)
 		}
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)

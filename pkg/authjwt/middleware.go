@@ -2,6 +2,7 @@ package authjwt
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -109,8 +110,6 @@ func extractBearerToken(r *http.Request) string {
 	return strings.TrimSpace(parts[1])
 }
 
-func isExpired(err error) bool     { return strings.Contains(err.Error(), "token expired") }
-func isInvalidIssuer(err error) bool { return strings.Contains(err.Error(), "invalid issuer") }
-func isUnsupportedAlg(err error) bool {
-	return strings.Contains(err.Error(), "unsupported signing algorithm")
-}
+func isExpired(err error) bool        { return errors.Is(err, ErrExpiredToken) }
+func isInvalidIssuer(err error) bool   { return errors.Is(err, ErrInvalidIssuer) }
+func isUnsupportedAlg(err error) bool  { return errors.Is(err, ErrUnsupportedAlg) }

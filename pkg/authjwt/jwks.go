@@ -48,6 +48,16 @@ func WithRefreshInterval(d time.Duration) JWKSOption {
 	}
 }
 
+// WithRequestTimeout sets the timeout for individual JWKS HTTP requests.
+// Default 10 seconds.
+func WithRequestTimeout(d time.Duration) JWKSOption {
+	return func(c *JWKSClient) {
+		if d > 0 {
+			c.requestTimeout = d
+		}
+	}
+}
+
 // WithHTTPClient sets a custom HTTP client for JWKS fetching.
 func WithHTTPClient(client *http.Client) JWKSOption {
 	return func(c *JWKSClient) {
