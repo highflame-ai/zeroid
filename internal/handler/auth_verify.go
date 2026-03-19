@@ -37,7 +37,7 @@ func (a *API) registerAuthVerifyRoute(router chi.Router) {
 //	# Caddy
 //	forward_auth zeroid:8899 {
 //	  uri /oauth2/token/verify
-//	  copy_headers X-Forwarded-User X-Zeroid-Identity-Type X-Zeroid-Trust-Level
+//	  copy_headers X-Forwarded-User X-Zeroid-Identity-Type X-Zeroid-Trust-Level X-Zeroid-Account-ID X-Zeroid-Project-ID
 //	}
 func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
@@ -48,13 +48,14 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token, ok := strings.CutPrefix(authHeader, "Bearer ")
-	if !ok || strings.TrimSpace(token) == "" {
+	token = strings.TrimSpace(token)
+	if !ok || token == "" {
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)
 		http.Error(w, `{"error":"invalid_authorization_header"}`, http.StatusUnauthorized)
 		return
 	}
 
-	claims, err := a.oauthSvc.Introspect(r.Context(), strings.TrimSpace(token))
+	claims, err := a.oauthSvc.Introspect(r.Context(), token)
 	if err != nil {
 		log.Error().Err(err).Msg("auth/verify: introspect error")
 		http.Error(w, `{"error":"server_error"}`, http.StatusInternalServerError)
@@ -68,20 +69,17 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sub, _ := claims["sub"].(string); sub != "" {
-		w.Header().Set("X-Forwarded-User", sub)
+	headerMap := map[string]string{
+		"sub":         "X-Forwarded-User",
+		"nhi_type":    "X-Zeroid-Identity-Type",
+		"trust_level": "X-Zeroid-Trust-Level",
+		"account_id":  "X-Zeroid-Account-ID",
+		"project_id":  "X-Zeroid-Project-ID",
 	}
-	if v, _ := claims["identity_type"].(string); v != "" {
-		w.Header().Set("X-Zeroid-Identity-Type", v)
-	}
-	if v, _ := claims["trust_level"].(string); v != "" {
-		w.Header().Set("X-Zeroid-Trust-Level", v)
-	}
-	if v, _ := claims["account_id"].(string); v != "" {
-		w.Header().Set("X-Zeroid-Account-ID", v)
-	}
-	if v, _ := claims["project_id"].(string); v != "" {
-		w.Header().Set("X-Zeroid-Project-ID", v)
+	for claim, header := range headerMap {
+		if v, _ := claims[claim].(string); v != "" {
+			w.Header().Set(header, v)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
