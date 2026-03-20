@@ -8,7 +8,6 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// registerAuthVerifyRoute registers the forward-auth verification endpoint.
 func (a *API) registerAuthVerifyRoute(router chi.Router) {
 	router.Get("/oauth2/token/verify", a.authVerifyHandler)
 }
@@ -70,15 +69,23 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	headerMap := map[string]string{
-		"sub":         "X-Forwarded-User",
-		"nhi_type":    "X-Zeroid-Identity-Type",
-		"trust_level": "X-Zeroid-Trust-Level",
-		"account_id":  "X-Zeroid-Account-ID",
-		"project_id":  "X-Zeroid-Project-ID",
+		"sub":           "X-Forwarded-User",
+		"identity_type": "X-Zeroid-Identity-Type",
+		"trust_level":   "X-Zeroid-Trust-Level",
+		"account_id":    "X-Zeroid-Account-ID",
+		"project_id":    "X-Zeroid-Project-ID",
+		"external_id":   "X-Zeroid-External-ID",
 	}
 	for claim, header := range headerMap {
 		if v, _ := claims[claim].(string); v != "" {
 			w.Header().Set(header, v)
+		}
+	}
+
+	// act is a nested object {"sub": "..."} — extract act.sub separately.
+	if act, ok := claims["act"].(map[string]any); ok {
+		if v, _ := act["sub"].(string); v != "" {
+			w.Header().Set("X-Zeroid-Act-Sub", v)
 		}
 	}
 
