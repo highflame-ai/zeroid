@@ -84,8 +84,15 @@ func Middleware(cfg MiddlewareConfig) func(http.Handler) http.Handler {
 					msg = `{"error":"token expired"}`
 				case isInvalidIssuer(err):
 					msg = `{"error":"invalid issuer"}`
+				case isInvalidAudience(err):
+					msg = `{"error":"invalid audience"}`
 				case isUnsupportedAlg(err):
 					msg = `{"error":"unsupported signing algorithm"}`
+				case isTokenRevoked(err):
+					msg = `{"error":"token revoked"}`
+				case isInsufficientScope(err):
+					status = http.StatusForbidden
+					msg = `{"error":"insufficient scope"}`
 				}
 				http.Error(w, msg, status)
 				return
@@ -110,6 +117,9 @@ func extractBearerToken(r *http.Request) string {
 	return strings.TrimSpace(parts[1])
 }
 
-func isExpired(err error) bool        { return errors.Is(err, ErrExpiredToken) }
-func isInvalidIssuer(err error) bool   { return errors.Is(err, ErrInvalidIssuer) }
-func isUnsupportedAlg(err error) bool  { return errors.Is(err, ErrUnsupportedAlg) }
+func isExpired(err error) bool          { return errors.Is(err, ErrExpiredToken) }
+func isInvalidIssuer(err error) bool    { return errors.Is(err, ErrInvalidIssuer) }
+func isInvalidAudience(err error) bool  { return errors.Is(err, ErrInvalidAudience) }
+func isUnsupportedAlg(err error) bool   { return errors.Is(err, ErrUnsupportedAlg) }
+func isTokenRevoked(err error) bool     { return errors.Is(err, ErrTokenRevoked) }
+func isInsufficientScope(err error) bool { return errors.Is(err, ErrInsufficientScope) }

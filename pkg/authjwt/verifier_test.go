@@ -442,6 +442,196 @@ func TestJWKSClientRefreshOnUnknownKID(t *testing.T) {
 	assertEqual(t, "AccountID", claims.AccountID, "acc-rotated")
 }
 
+func TestVerifyAudience(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+
+	v, err := authjwt.NewVerifier(authjwt.VerifierConfig{
+		JWKSURL:  ks.server.URL,
+		Issuer:   issuer,
+		Audience: "my-mcp-server",
+	})
+	if err != nil {
+		t.Fatalf("create verifier: %v", err)
+	}
+	defer v.Close()
+
+	t.Run("matching audience passes", func(t *testing.T) {
+		c := baseClaims(issuer)
+		c["aud"] = []string{"my-mcp-server"}
+		token := ks.signRS256(t, c)
+		claims, err := v.Verify(context.Background(), token)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		assertEqual(t, "AccountID", claims.AccountID, "acc-001")
+	})
+
+	t.Run("wrong audience rejected", func(t *testing.T) {
+		c := baseClaims(issuer)
+		c["aud"] = []string{"other-service"}
+		token := ks.signRS256(t, c)
+		_, err := v.Verify(context.Background(), token)
+		if err == nil {
+			t.Fatal("expected error for wrong audience")
+		}
+	})
+}
+
+func TestScopeEnforcement(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+	v := newVerifier(t, ks, issuer)
+
+	c := agentClaims(issuer)
+	c["scopes"] = []string{"repo:read", "repo:write"}
+	token := ks.signES256(t, c)
+
+	claims, err := v.Verify(context.Background(), token)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	t.Run("HasScope true", func(t *testing.T) {
+		if !claims.HasScope("repo:read") {
+			t.Error("expected HasScope(repo:read) = true")
+		}
+	})
+
+	t.Run("HasScope false", func(t *testing.T) {
+		if claims.HasScope("admin:delete") {
+			t.Error("expected HasScope(admin:delete) = false")
+		}
+	})
+
+	t.Run("RequireScope passes", func(t *testing.T) {
+		if err := claims.RequireScope("repo:write"); err != nil {
+			t.Errorf("RequireScope(repo:write) = %v, want nil", err)
+		}
+	})
+
+	t.Run("RequireScope fails", func(t *testing.T) {
+		err := claims.RequireScope("admin:delete")
+		if err == nil {
+			t.Fatal("expected error for missing scope")
+		}
+	})
+}
+
+func TestAgentIdentity(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+	v := newVerifier(t, ks, issuer)
+
+	t.Run("agent token returns AgentIdentity", func(t *testing.T) {
+		c := agentClaims(issuer)
+		c["scopes"] = []string{"tool:call"}
+		c["owner_user_id"] = "user-admin"
+		token := ks.signES256(t, c)
+
+		claims, err := v.Verify(context.Background(), token)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+
+		agent := claims.Agent()
+		if agent == nil {
+			t.Fatal("Agent() returned nil for agent token")
+		}
+
+		assertEqual(t, "ExternalID", agent.ExternalID, "agent-smith")
+		assertEqual(t, "IdentityType", agent.IdentityType, "agent")
+		assertEqual(t, "SubType", agent.SubType, "orchestrator")
+		assertEqual(t, "TrustLevel", agent.TrustLevel, "verified_third_party")
+		assertEqual(t, "Framework", agent.Framework, "langchain")
+		assertEqual(t, "Publisher", agent.Publisher, "acme-corp")
+		assertEqual(t, "DelegatedBy", agent.DelegatedBy, "orchestrator-1")
+		assertEqual(t, "Owner", agent.Owner, "user-admin")
+
+		if agent.DelegationDepth != 1 {
+			t.Errorf("DelegationDepth = %d, want 1", agent.DelegationDepth)
+		}
+		if len(agent.Scopes) != 1 || agent.Scopes[0] != "tool:call" {
+			t.Errorf("Scopes = %v, want [tool:call]", agent.Scopes)
+		}
+	})
+
+	t.Run("human token returns nil", func(t *testing.T) {
+		token := ks.signRS256(t, baseClaims(issuer))
+		claims, err := v.Verify(context.Background(), token)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if claims.Agent() != nil {
+			t.Error("Agent() should return nil for human token")
+		}
+	})
+}
+
+func TestVerifyRealTime(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+
+	t.Run("active token passes", func(t *testing.T) {
+		introspectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"active":true}`))
+		}))
+		defer introspectServer.Close()
+
+		v, err := authjwt.NewVerifier(authjwt.VerifierConfig{
+			JWKSURL:       ks.server.URL,
+			Issuer:        issuer,
+			IntrospectURL: introspectServer.URL,
+		})
+		if err != nil {
+			t.Fatalf("create verifier: %v", err)
+		}
+		defer v.Close()
+
+		token := ks.signRS256(t, baseClaims(issuer))
+		claims, err := v.VerifyRealTime(context.Background(), token)
+		if err != nil {
+			t.Fatalf("VerifyRealTime: %v", err)
+		}
+		assertEqual(t, "AccountID", claims.AccountID, "acc-001")
+	})
+
+	t.Run("revoked token rejected", func(t *testing.T) {
+		introspectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"active":false}`))
+		}))
+		defer introspectServer.Close()
+
+		v, err := authjwt.NewVerifier(authjwt.VerifierConfig{
+			JWKSURL:       ks.server.URL,
+			Issuer:        issuer,
+			IntrospectURL: introspectServer.URL,
+		})
+		if err != nil {
+			t.Fatalf("create verifier: %v", err)
+		}
+		defer v.Close()
+
+		token := ks.signRS256(t, baseClaims(issuer))
+		_, err = v.VerifyRealTime(context.Background(), token)
+		if err == nil {
+			t.Fatal("expected error for revoked token")
+		}
+	})
+
+	t.Run("no introspect URL falls back to local", func(t *testing.T) {
+		v := newVerifier(t, ks, issuer) // no IntrospectURL
+		token := ks.signRS256(t, baseClaims(issuer))
+		claims, err := v.VerifyRealTime(context.Background(), token)
+		if err != nil {
+			t.Fatalf("VerifyRealTime fallback: %v", err)
+		}
+		assertEqual(t, "AccountID", claims.AccountID, "acc-001")
+	})
+}
+
 // Helpers
 
 func assertEqual(t *testing.T, field, got, want string) {

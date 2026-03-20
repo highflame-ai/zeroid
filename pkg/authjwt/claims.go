@@ -9,6 +9,7 @@ package authjwt
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwt"
@@ -89,6 +90,95 @@ func (c *Claims) GetCustom(key string) (interface{}, bool) {
 	}
 	v, ok := c.Custom[key]
 	return v, ok
+}
+
+// HasScope returns true if the token's scopes include the given scope.
+func (c *Claims) HasScope(scope string) bool {
+	for _, s := range c.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// RequireScope returns ErrInsufficientScope if the token does not have the
+// given scope. Use this for inline scope checks in handlers.
+func (c *Claims) RequireScope(scope string) error {
+	if !c.HasScope(scope) {
+		return fmt.Errorf("%w: required %q, have %v", ErrInsufficientScope, scope, c.Scopes)
+	}
+	return nil
+}
+
+// Agent returns a typed AgentIdentity if this token represents an NHI
+// (agent, application, service, mcp_server). Returns nil for human tokens.
+func (c *Claims) Agent() *AgentIdentity {
+	if c.ExternalID == "" {
+		return nil
+	}
+	a := &AgentIdentity{
+		Sub:             c.Subject,
+		ExternalID:      c.ExternalID,
+		IdentityType:    c.IdentityType,
+		SubType:         c.SubType,
+		TrustLevel:      c.TrustLevel,
+		Name:            c.Name,
+		Framework:       c.Framework,
+		Publisher:        c.Publisher,
+		Capabilities:    c.Capabilities,
+		Scopes:          c.Scopes,
+		DelegationDepth: c.DelegationDepth,
+		Owner:           c.OwnerUserID,
+	}
+	if c.ActorClaims != nil {
+		a.DelegatedBy = c.ActorClaims.Subject
+	}
+	return a
+}
+
+// AgentIdentity is the typed result object for NHI tokens.
+// Matches the SDK surface: agent.sub, agent.delegated_by, agent.depth, agent.owner.
+type AgentIdentity struct {
+	// Sub is the WIMSE URI (e.g., spiffe://zeroid.dev/acct/proj/agent/my-agent).
+	Sub string
+
+	// ExternalID is the caller-chosen identity identifier.
+	ExternalID string
+
+	// IdentityType is the identity class: agent, application, service, mcp_server.
+	IdentityType string
+
+	// SubType is the identity sub-classification (e.g., orchestrator, llm_provider).
+	SubType string
+
+	// TrustLevel is the trust classification: first_party, verified_third_party, unverified.
+	TrustLevel string
+
+	// Name is the human-readable identity name.
+	Name string
+
+	// Framework is the agent framework (e.g., langchain, crewai).
+	Framework string
+
+	// Publisher is the identity publisher/vendor.
+	Publisher string
+
+	// Capabilities are the declared agent capabilities.
+	Capabilities []string
+
+	// Scopes are the OAuth scopes granted to this token.
+	Scopes []string
+
+	// DelegationDepth is the number of delegation hops from the original principal.
+	DelegationDepth int
+
+	// DelegatedBy is the subject of the delegating principal (from act.sub).
+	// Empty if this is a direct credential, not a delegated token.
+	DelegatedBy string
+
+	// Owner is the user who provisioned this identity.
+	Owner string
 }
 
 // extractClaims builds Claims from a verified jwt.Token.

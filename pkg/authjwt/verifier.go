@@ -2,8 +2,12 @@ package authjwt
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jws"
@@ -12,12 +16,16 @@ import (
 )
 
 var (
-	ErrNoToken        = errors.New("authjwt: no token provided")
-	ErrInvalidToken   = errors.New("authjwt: invalid token")
-	ErrExpiredToken   = errors.New("authjwt: token expired")
-	ErrInvalidIssuer  = errors.New("authjwt: invalid issuer")
-	ErrUnsupportedAlg = errors.New("authjwt: unsupported signing algorithm")
-	ErrNoKeySet       = errors.New("authjwt: no JWKS available")
+	ErrNoToken          = errors.New("authjwt: no token provided")
+	ErrInvalidToken     = errors.New("authjwt: invalid token")
+	ErrExpiredToken     = errors.New("authjwt: token expired")
+	ErrInvalidIssuer    = errors.New("authjwt: invalid issuer")
+	ErrInvalidAudience  = errors.New("authjwt: invalid audience")
+	ErrUnsupportedAlg   = errors.New("authjwt: unsupported signing algorithm")
+	ErrNoKeySet         = errors.New("authjwt: no JWKS available")
+	ErrInsufficientScope = errors.New("authjwt: insufficient scope")
+	ErrTokenRevoked     = errors.New("authjwt: token revoked or inactive")
+	ErrIntrospectFailed = errors.New("authjwt: introspection request failed")
 )
 
 // allowedAlgorithms restricts which signing algorithms are accepted.
@@ -29,9 +37,12 @@ var allowedAlgorithms = map[jwa.SignatureAlgorithm]struct{}{
 
 // Verifier validates ZeroID-issued JWTs using a remote JWKS.
 type Verifier struct {
-	jwks   *JWKSClient
-	issuer string
-	logger zerolog.Logger
+	jwks          *JWKSClient
+	issuer        string
+	audience      string
+	introspectURL string
+	httpClient    *http.Client
+	logger        zerolog.Logger
 }
 
 // VerifierConfig configures a Verifier.
@@ -43,6 +54,15 @@ type VerifierConfig struct {
 	// Issuer is the expected "iss" claim value. If set, tokens with a
 	// different issuer are rejected. Recommended for production.
 	Issuer string
+
+	// Audience is the expected "aud" claim value. If set, tokens without this
+	// audience are rejected. Use your service identifier (e.g., "my-mcp-server").
+	Audience string
+
+	// IntrospectURL is the URL of the token introspection endpoint (RFC 7662).
+	// Required for VerifyRealTime(). Typically "https://auth.example.com/oauth2/token/introspect".
+	// If not set, VerifyRealTime() falls back to local-only validation.
+	IntrospectURL string
 
 	// Logger for verification events. Defaults to no-op.
 	Logger zerolog.Logger
@@ -66,9 +86,12 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 	}
 
 	return &Verifier{
-		jwks:   jwks,
-		issuer: cfg.Issuer,
-		logger: cfg.Logger,
+		jwks:          jwks,
+		issuer:        cfg.Issuer,
+		audience:      cfg.Audience,
+		introspectURL: cfg.IntrospectURL,
+		httpClient:    http.DefaultClient,
+		logger:        cfg.Logger,
 	}, nil
 }
 
@@ -117,6 +140,9 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 	if v.issuer != "" {
 		parseOpts = append(parseOpts, jwt.WithIssuer(v.issuer))
 	}
+	if v.audience != "" {
+		parseOpts = append(parseOpts, jwt.WithAudience(v.audience))
+	}
 
 	token, err := jwt.Parse([]byte(tokenString), parseOpts...)
 	if err != nil {
@@ -125,6 +151,9 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 		}
 		if errors.Is(err, jwt.ErrInvalidIssuer()) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidIssuer, err)
+		}
+		if errors.Is(err, jwt.ErrInvalidAudience()) {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidAudience, err)
 		}
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
@@ -154,6 +183,66 @@ func (v *Verifier) checkAlgorithm(tokenString string) error {
 		return fmt.Errorf("%w: %s", ErrUnsupportedAlg, alg)
 	}
 	return nil
+}
+
+// VerifyRealTime performs local JWT validation followed by a server-side
+// introspection call (RFC 7662) to confirm the token has not been revoked.
+// Use this for high-stakes operations where real-time revocation checking matters.
+//
+// If IntrospectURL was not configured, this falls back to local-only validation
+// (equivalent to Verify).
+func (v *Verifier) VerifyRealTime(ctx context.Context, tokenString string) (*Claims, error) {
+	// Step 1: local validation (signature, expiry, issuer, audience).
+	claims, err := v.Verify(ctx, tokenString)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: server-side introspection.
+	if v.introspectURL == "" {
+		v.logger.Warn().Msg("introspect URL not configured, falling back to local-only validation")
+		return claims, nil
+	}
+
+	active, err := v.introspect(ctx, tokenString)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrIntrospectFailed, err)
+	}
+	if !active {
+		return nil, ErrTokenRevoked
+	}
+
+	return claims, nil
+}
+
+// introspect calls the RFC 7662 introspection endpoint and returns whether
+// the token is active.
+func (v *Verifier) introspect(ctx context.Context, tokenString string) (bool, error) {
+	form := url.Values{"token": {tokenString}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.introspectURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return false, fmt.Errorf("build introspect request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := v.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("introspect HTTP call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("introspect returned status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Active bool `json:"active"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("decode introspect response: %w", err)
+	}
+
+	return result.Active, nil
 }
 
 // Close releases resources held by the verifier (stops JWKS background refresh).
