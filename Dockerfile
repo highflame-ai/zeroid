@@ -8,10 +8,11 @@ RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 COPY go.mod go.sum ./
+COPY pkg/authjwt/go.mod pkg/authjwt/go.sum ./pkg/authjwt/
 RUN go mod download
 
 COPY . .
-RUN go build -ldflags="-s -w" -o /app/zeroid ./cmd/zeroid
+RUN go build -ldflags="-s -w" -trimpath -o /app/zeroid ./cmd/zeroid
 
 FROM alpine:3.22 AS run-stage
 LABEL maintainer="Highflame Team"
