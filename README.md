@@ -718,6 +718,15 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 
 ---
 
+## Guides
+
+| Guide | Description |
+|-------|-------------|
+| [MCP + ZeroID Integration](docs/mcp-integration.md) | Integrate ZeroID with Model Context Protocol servers in TypeScript and Python. |
+| [Data Model](docs/data-model.md) | Complete reference for every ZeroID object and JWT claim. |
+
+---
+
 ## Roadmap
 
 - SDKs ([Python](https://github.com/highflame-ai/highflame-sdk/tree/main/python), [TypeScript](https://github.com/highflame-ai/highflame-sdk/tree/main/javascript), [RUST](https://github.com/highflame-ai/highflame-sdk/tree/main/rust))
