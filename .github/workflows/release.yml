@@ -38,6 +38,32 @@ jobs:
             exit 1
           fi
 
+  tag-submodules:
+    needs:
+      - highflame-validate
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Tag pkg/authjwt sub-module
+        shell: bash
+        run: |
+          VERSION="${{ env.RELEASE_NAME }}"
+          SUBTAG="pkg/authjwt/${VERSION}"
+          if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
+            echo "Tag ${SUBTAG} already exists, skipping"
+          else
+            git tag "${SUBTAG}"
+            git push origin "${SUBTAG}"
+            echo "Created and pushed tag ${SUBTAG}"
+          fi
+
   highflame-sast:
     needs:
       - highflame-validate
