@@ -161,8 +161,6 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.authorizationCode(ctx, req)
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
-	case "user_session":
-		return s.ExternalPrincipalExchange(ctx, req)
 	default:
 		// Check custom grant handlers registered via RegisterGrant.
 		if handler, ok := s.customGrants[req.GrantType]; ok {
