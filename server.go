@@ -75,7 +75,6 @@ type Server struct {
 
 	// Extensibility
 	mu              sync.RWMutex
-	customGrants    map[string]GrantHandler
 	claimsEnrichers []ClaimsEnricher
 	adminAuthState  *middlewareHolder
 	globalMWState   *middlewareHolder
@@ -265,7 +264,6 @@ func NewServer(cfg Config) (*Server, error) {
 		jwksSvc:             jwksSvc,
 		refreshTokenSvc:     refreshTokenSvc,
 		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
-		customGrants:        make(map[string]GrantHandler),
 		adminAuthState:      authState,
 		globalMWState:       globalMW,
 		http: &http.Server{
@@ -346,10 +344,40 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // RegisterGrant registers a custom OAuth2 grant type handler.
+// The handler is called when the token endpoint receives a grant_type matching name.
 func (s *Server) RegisterGrant(name string, handler GrantHandler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.customGrants[name] = handler
+	s.oauthSvc.RegisterGrant(name, func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
+		return handler(ctx, GrantRequest{
+			GrantType:        req.GrantType,
+			AccountID:        req.AccountID,
+			ProjectID:        req.ProjectID,
+			UserID:           req.UserID,
+			UserEmail:        req.UserEmail,
+			UserName:         req.UserName,
+			ApplicationID:    req.ApplicationID,
+			Scope:            req.Scope,
+			AdditionalClaims: req.AdditionalClaims,
+		})
+	})
+}
+
+// ExternalPrincipalExchange issues an RS256 token for an externally-authenticated user.
+// The caller (a trusted internal service) has already verified the user's identity and
+// resolved tenant context. ZeroID trusts the caller and issues a token with the provided claims.
+// This is the building block for custom grant types like "user_session".
+func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest) (*domain.AccessToken, error) {
+	return s.oauthSvc.ExternalPrincipalExchange(ctx, service.TokenRequest{
+		GrantType:        req.GrantType,
+		AccountID:        req.AccountID,
+		ProjectID:        req.ProjectID,
+		UserID:           req.UserID,
+		UserEmail:        req.UserEmail,
+		UserName:         req.UserName,
+		ApplicationID:    req.ApplicationID,
+		Scope:            req.Scope,
+		AdditionalClaims: req.AdditionalClaims,
+		TrustedService:   true,
+	})
 }
 
 // OnClaimsIssue registers a claims enricher called during JWT issuance.

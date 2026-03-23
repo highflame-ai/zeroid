@@ -42,6 +42,24 @@ type OAuthService struct {
 	mcpStaticClients map[string]bool
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
+	// customGrants holds registered custom grant type handlers.
+	customGrants map[string]CustomGrantHandler
+}
+
+// CustomGrantHandler implements a custom OAuth2 grant type.
+type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
+
+// reservedClaims are standard JWT and ZeroID claims that additional_claims cannot override.
+var reservedClaims = map[string]bool{
+	// RFC 7519 registered claims
+	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	// ZeroID identity claims
+	"account_id": true, "project_id": true, "user_id": true, "owner_user_id": true,
+	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
+	"status": true, "name": true, "framework": true, "version": true, "publisher": true,
+	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
+	// ZeroID internal claims
+	"act": true, "token_exchange": true, "trusted_by": true,
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
@@ -98,6 +116,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 	s.trustedServiceValidator = v
 }
 
+// RegisterGrant registers a custom grant type handler on the OAuth service.
+func (s *OAuthService) RegisterGrant(name string, handler CustomGrantHandler) {
+	if s.customGrants == nil {
+		s.customGrants = make(map[string]CustomGrantHandler)
+	}
+	s.customGrants[name] = handler
+}
+
 // TokenRequest represents an OAuth2 token request.
 // Tenant (account_id, project_id) is required for client_credentials grant
 // (multi-tenant client_id lookup) and optional for other grants where tenant
@@ -120,7 +146,8 @@ type TokenRequest struct {
 	UserID        string // external user ID (e.g. Clerk user ID)
 	UserEmail     string // user email
 	UserName      string // user display name
-	ApplicationID string // optional application scope
+	ApplicationID    string         // optional application scope
+	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -148,6 +175,10 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
 	default:
+		// Check custom grant handlers registered via RegisterGrant.
+		if handler, ok := s.customGrants[req.GrantType]; ok {
+			return handler(ctx, req)
+		}
 		return nil, fmt.Errorf("unsupported grant type: %s", req.GrantType)
 	}
 }
@@ -294,7 +325,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
 	// Mode is determined by the presence of actor_token.
 	if req.ActorToken == "" {
-		return s.externalPrincipalExchange(ctx, req)
+		return s.ExternalPrincipalExchange(ctx, req)
 	}
 
 	// Step 1: Verify the subject_token (orchestrator's active access token).
@@ -427,7 +458,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 // ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
 // external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
 // with the external principal's claims embedded.
-func (s *OAuthService) externalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+// ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
+// Exported so deployers can call it from custom grant handlers.
+func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	// Step 1: Verify the caller is a trusted internal service.
 	if s.trustedServiceValidator == nil {
 		return nil, fmt.Errorf("invalid_grant: external principal exchange is not configured")
@@ -461,6 +494,14 @@ func (s *OAuthService) externalPrincipalExchange(ctx context.Context, req TokenR
 	customClaims := map[string]any{
 		"token_exchange": "external_principal",
 		"trusted_by":     serviceName,
+	}
+	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
+	// Blocklist prevents overriding standard JWT/ZeroID claims.
+	for k, v := range req.AdditionalClaims {
+		if reservedClaims[k] {
+			continue
+		}
+		customClaims[k] = v
 	}
 
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
