@@ -86,9 +86,10 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID, ide
 	}
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)
-		if len(parts) == 2 {
-			q = q.Where("labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
+		if len(parts) != 2 || parts[0] == "" {
+			return nil, fmt.Errorf("invalid label format: expected non-empty-key:value, got %q", label)
 		}
+		q = q.Where("labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
 	}
 
 	if err := q.Scan(ctx); err != nil {
