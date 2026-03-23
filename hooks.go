@@ -12,8 +12,23 @@ import (
 type ClaimsEnricher func(claims map[string]any, identity *domain.Identity, grantType domain.GrantType)
 
 // GrantHandler implements a custom OAuth2 grant type.
-// Return a non-nil AccessToken on success. Returning an error causes a 400 response.
-type GrantHandler func(ctx context.Context, req map[string]string) (*domain.AccessToken, error)
+// The handler receives the full token request and returns an access token.
+// Returning an error causes a 400 response.
+type GrantHandler func(ctx context.Context, req GrantRequest) (*domain.AccessToken, error)
+
+// GrantRequest holds the parsed token endpoint fields passed to custom grant handlers.
+type GrantRequest struct {
+	GrantType        string
+	AccountID        string
+	ProjectID        string
+	ClientID         string
+	Scope            string
+	UserID           string
+	UserEmail        string
+	UserName         string
+	ApplicationID    string
+	AdditionalClaims map[string]any
+}
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before

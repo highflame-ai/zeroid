@@ -42,7 +42,12 @@ type OAuthService struct {
 	mcpStaticClients map[string]bool
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
+	// customGrants holds registered custom grant type handlers.
+	customGrants map[string]CustomGrantHandler
 }
+
+// CustomGrantHandler implements a custom OAuth2 grant type.
+type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
@@ -98,6 +103,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 	s.trustedServiceValidator = v
 }
 
+// RegisterGrant registers a custom grant type handler on the OAuth service.
+func (s *OAuthService) RegisterGrant(name string, handler CustomGrantHandler) {
+	if s.customGrants == nil {
+		s.customGrants = make(map[string]CustomGrantHandler)
+	}
+	s.customGrants[name] = handler
+}
+
 // TokenRequest represents an OAuth2 token request.
 // Tenant (account_id, project_id) is required for client_credentials grant
 // (multi-tenant client_id lookup) and optional for other grants where tenant
@@ -148,7 +161,13 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.authorizationCode(ctx, req)
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
+	case "user_session":
+		return s.ExternalPrincipalExchange(ctx, req)
 	default:
+		// Check custom grant handlers registered via RegisterGrant.
+		if handler, ok := s.customGrants[req.GrantType]; ok {
+			return handler(ctx, req)
+		}
 		return nil, fmt.Errorf("unsupported grant type: %s", req.GrantType)
 	}
 }
@@ -295,7 +314,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
 	// Mode is determined by the presence of actor_token.
 	if req.ActorToken == "" {
-		return s.externalPrincipalExchange(ctx, req)
+		return s.ExternalPrincipalExchange(ctx, req)
 	}
 
 	// Step 1: Verify the subject_token (orchestrator's active access token).
@@ -428,7 +447,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 // ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
 // external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
 // with the external principal's claims embedded.
-func (s *OAuthService) externalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+// ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
+// Exported so deployers can call it from custom grant handlers.
+func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	// Step 1: Verify the caller is a trusted internal service.
 	if s.trustedServiceValidator == nil {
 		return nil, fmt.Errorf("invalid_grant: external principal exchange is not configured")
