@@ -58,6 +58,7 @@ var reservedClaims = map[string]bool{
 	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
 	"status": true, "name": true, "framework": true, "version": true, "publisher": true,
 	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
+	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true,
 }
