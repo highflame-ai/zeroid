@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/uptrace/bun"
 
@@ -70,8 +71,10 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 	return identity, nil
 }
 
-// List returns identities for a tenant, optionally filtered by identity_type and product label.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID, identityType, product string) ([]*domain.Identity, error) {
+// List returns identities for a tenant, optionally filtered by identity_type and label.
+// The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
+// and filters using JSONB containment: labels @> {"key": "value"}.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID, identityType, label string) ([]*domain.Identity, error) {
 	var identities []*domain.Identity
 	q := r.db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
@@ -81,9 +84,11 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID, ide
 	if identityType != "" {
 		q = q.Where("identity_type = ?", identityType)
 	}
-	if product != "" {
-		// Labels are stored as JSONB: {"product:guardrails": "true"}
-		q = q.Where("labels @> ?::jsonb", fmt.Sprintf(`{"product:%s": "true"}`, product))
+	if label != "" {
+		parts := strings.SplitN(label, ":", 2)
+		if len(parts) == 2 {
+			q = q.Where("labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
+		}
 	}
 
 	if err := q.Scan(ctx); err != nil {
