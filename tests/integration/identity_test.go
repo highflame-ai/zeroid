@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -126,6 +127,28 @@ func TestDeleteIdentity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	resp.Body.Close()
+}
+
+func TestServerGetIdentity(t *testing.T) {
+	externalID := uid("get-identity-srv")
+	identity := registerIdentity(t, externalID, nil)
+
+	// Found: valid ID + tenant.
+	got, err := testZeroIDServer.GetIdentity(context.Background(), identity.ID, testAccountID, testProjectID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, identity.ID, got.ID)
+	assert.Equal(t, externalID, got.ExternalID)
+
+	// Wrong tenant — returns error, no identity.
+	got, err = testZeroIDServer.GetIdentity(context.Background(), identity.ID, "wrong-account", testProjectID)
+	assert.Error(t, err)
+	assert.Nil(t, got)
+
+	// Non-existent ID.
+	got, err = testZeroIDServer.GetIdentity(context.Background(), "00000000-0000-0000-0000-000000000000", testAccountID, testProjectID)
+	assert.Error(t, err)
+	assert.Nil(t, got)
 }
 
 // doRaw is a variant that accepts a method string for PATCH/DELETE.

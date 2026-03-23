@@ -43,6 +43,10 @@ const (
 // testServer is the shared httptest.Server for all tests in this package.
 var testServer *httptest.Server
 
+// testZeroIDServer is the zeroid.Server instance, exposed for tests that need
+// direct access to server methods (e.g., IdentityExists).
+var testZeroIDServer *zeroid.Server
+
 // testServerPrivKey is the server's ECDSA signing key, accessible so tests can
 // build valid assertions without going through disk files.
 var testServerPrivKey *ecdsa.PrivateKey
@@ -148,6 +152,7 @@ func runTests(m *testing.M) int {
 		return 1
 	}
 
+	testZeroIDServer = srv
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 
