@@ -72,7 +72,7 @@ type GetAgentOutput struct {
 
 type ListAgentsInput struct {
 	AgentType    string `query:"agent_type" doc:"Filter by agent type"`
-	IdentityType string `query:"identity_type" doc:"Filter by identity type (agent, application, mcp_server, service)"`
+	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
 	Label        string `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
 	TrustLevel   string `query:"trust_level" doc:"Filter by trust level"`
 	IsActive     string `query:"is_active" doc:"Filter by active status"`
