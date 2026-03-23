@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -44,7 +46,41 @@ type TokenInput struct {
 }
 
 type TokenOutput struct {
-	Body any // domain.AccessToken — dynamic shape per RFC 6749
+	Status int
+	Body   any // domain.AccessToken on success; oauthErrorBody on error
+}
+
+// oauthErrorBody is the RFC 6749 §5.2 token error response.
+type oauthErrorBody struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}
+
+// extractOAuthError maps a service-layer error to an OAuth 2.0 error code and
+// description per RFC 6749 §5.2 (https://www.rfc-editor.org/rfc/rfc6749#section-5.2).
+func extractOAuthError(err error) (code, description string) {
+	if errors.Is(err, service.ErrPolicyViolation) {
+		return "policy_violation", err.Error()
+	}
+	if errors.Is(err, service.ErrScopesNotAllowed) {
+		return "insufficient_scope", err.Error()
+	}
+	msg := err.Error()
+	for _, prefix := range []string{
+		"invalid_grant",
+		"invalid_client",
+		"invalid_request",
+		"invalid_scope",
+		"unauthorized_client",
+		"unsupported_grant_type",
+		"identity_inactive",
+		"server_error",
+	} {
+		if strings.HasPrefix(msg, prefix+":") {
+			return prefix, strings.TrimSpace(strings.TrimPrefix(msg, prefix+":"))
+		}
+	}
+	return "server_error", "an unexpected error occurred"
 }
 
 type IntrospectInput struct {
@@ -133,7 +169,11 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
-		return nil, huma.Error400BadRequest("token request failed")
+		code, desc := extractOAuthError(err)
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: code, ErrorDescription: desc},
+		}, nil
 	}
 
 	return &TokenOutput{Body: accessToken}, nil

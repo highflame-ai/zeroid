@@ -180,22 +180,22 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		if handler, ok := s.customGrants[req.GrantType]; ok {
 			return handler(ctx, req)
 		}
-		return nil, fmt.Errorf("unsupported grant type: %s", req.GrantType)
+		return nil, fmt.Errorf("unsupported_grant_type: %s", req.GrantType)
 	}
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, fmt.Errorf("account_id and project_id are required for client_credentials grant")
+		return nil, fmt.Errorf("invalid_request: account_id and project_id are required for client_credentials grant")
 	}
 
 	// Validate client credentials against the oauth_clients table, scoped to tenant.
 	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret, req.AccountID, req.ProjectID)
 	if err != nil {
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, fmt.Errorf("invalid client credentials")
+			return nil, fmt.Errorf("invalid_client: invalid client credentials")
 		}
-		return nil, fmt.Errorf("failed to verify client: %w", err)
+		return nil, fmt.Errorf("invalid_client: client verification failed")
 	}
 
 	// Ensure client_credentials grant is permitted.
@@ -207,7 +207,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		}
 	}
 	if !allowed {
-		return nil, fmt.Errorf("client not authorized for client_credentials grant")
+		return nil, fmt.Errorf("unauthorized_client: client not authorized for client_credentials grant")
 	}
 
 	// Parse and intersect requested scopes with the client's allowed scopes.
@@ -217,7 +217,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// Tenant is derived from the client record — not from caller-supplied headers.
 	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, client.AccountID, client.ProjectID)
 	if err != nil {
-		return nil, fmt.Errorf("no identity found for client_id %s: %w", req.ClientID, err)
+		return nil, fmt.Errorf("invalid_client: no identity found for client_id %s", req.ClientID)
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
@@ -237,7 +237,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 // iss must equal the agent's WIMSE URI; aud must equal the issuer URL.
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Subject == "" {
-		return nil, fmt.Errorf("subject (assertion JWT) is required for jwt_bearer grant")
+		return nil, fmt.Errorf("invalid_request: subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
@@ -263,7 +263,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, fmt.Errorf("invalid_grant: unknown issuer %s", wimseURI)
 	}
 	if !identity.Status.IsUsable() {
-		return nil, fmt.Errorf("invalid_grant: identity is inactive")
+		return nil, fmt.Errorf("identity_inactive: agent identity is suspended or deactivated")
 	}
 	if identity.PublicKeyPEM == "" {
 		return nil, fmt.Errorf("invalid_grant: no public key registered for identity %s — register a key before using jwt_bearer", identity.ID)
@@ -375,7 +375,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, fmt.Errorf("invalid_grant: unknown actor identity %s", actorWIMSEURI)
 	}
 	if !actorIdentity.Status.IsUsable() {
-		return nil, fmt.Errorf("invalid_grant: actor identity is inactive")
+		return nil, fmt.Errorf("identity_inactive: actor identity is suspended or deactivated")
 	}
 	if actorIdentity.PublicKeyPEM == "" {
 		return nil, fmt.Errorf("invalid_grant: no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID)
@@ -535,11 +535,11 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 // Tenant is derived from the API key record — no caller-supplied headers needed.
 func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.APIKey == "" {
-		return nil, fmt.Errorf("api_key is required for api_key grant")
+		return nil, fmt.Errorf("invalid_request: api_key is required for api_key grant")
 	}
 
 	if !s.jwksSvc.HasRSAKeys() {
-		return nil, fmt.Errorf("api_key grant requires RSA keys to be configured")
+		return nil, fmt.Errorf("server_error: api_key grant requires RSA keys to be configured")
 	}
 
 	// Hash the API key with SHA-256 to look up in the database.
@@ -548,7 +548,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
 	if err != nil {
-		return nil, fmt.Errorf("invalid api key")
+		return nil, fmt.Errorf("invalid_grant: invalid api key")
 	}
 
 	// Build a synthetic identity for the API key holder.
@@ -619,7 +619,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // CLI clients receive long-lived access tokens (90 days).
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
-		return nil, fmt.Errorf("code, code_verifier, client_id, and redirect_uri are required")
+		return nil, fmt.Errorf("invalid_request: code, code_verifier, client_id, and redirect_uri are required")
 	}
 
 	if !s.isValidClientID(req.ClientID) {
@@ -700,11 +700,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 // Implements single-use rotation with family-based reuse detection.
 func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.RefreshTokenStr == "" || req.ClientID == "" {
-		return nil, fmt.Errorf("refresh_token and client_id are required")
+		return nil, fmt.Errorf("invalid_request: refresh_token and client_id are required")
 	}
 
 	if s.refreshTokenSvc == nil {
-		return nil, fmt.Errorf("refresh tokens not configured")
+		return nil, fmt.Errorf("server_error: refresh tokens not configured")
 	}
 
 	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr)
