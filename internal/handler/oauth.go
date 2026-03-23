@@ -31,6 +31,9 @@ type TokenInput struct {
 		UserEmail     string `json:"user_email,omitempty" doc:"User email (for external principal exchange)"`
 		UserName      string `json:"user_name,omitempty" doc:"User display name (for external principal exchange)"`
 		ApplicationID string `json:"application_id,omitempty" doc:"Application scope (for external principal exchange)"`
+		// AdditionalClaims allows callers to inject arbitrary claims into the issued JWT.
+		// Keys must not collide with standard OAuth/ZeroID claims. Values are set as-is.
+		AdditionalClaims map[string]any `json:"additional_claims,omitempty" doc:"Arbitrary claims to include in the issued JWT"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -122,6 +125,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		UserEmail:        input.Body.UserEmail,
 		UserName:         input.Body.UserName,
 		ApplicationID:    input.Body.ApplicationID,
+		AdditionalClaims: input.Body.AdditionalClaims,
 		Code:             input.Body.Code,
 		CodeVerifier:     input.Body.CodeVerifier,
 		RedirectURI:      input.Body.RedirectURI,

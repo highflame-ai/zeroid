@@ -120,7 +120,8 @@ type TokenRequest struct {
 	UserID        string // external user ID (e.g. Clerk user ID)
 	UserEmail     string // user email
 	UserName      string // user display name
-	ApplicationID string // optional application scope
+	ApplicationID    string         // optional application scope
+	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -461,6 +462,11 @@ func (s *OAuthService) externalPrincipalExchange(ctx context.Context, req TokenR
 	customClaims := map[string]any{
 		"token_exchange": "external_principal",
 		"trusted_by":     serviceName,
+	}
+	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
+	// Additional claims cannot override standard ZeroID claims — they are additive.
+	for k, v := range req.AdditionalClaims {
+		customClaims[k] = v
 	}
 
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
