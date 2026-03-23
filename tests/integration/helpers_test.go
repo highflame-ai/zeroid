@@ -11,7 +11,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -38,6 +40,12 @@ const (
 	testAccountID = "acct-test-001"
 	testProjectID = "proj-test-001"
 	testWIMSE     = "zeroid.dev"
+
+	// authorization_code / refresh_token test constants.
+	testHMACSecret  = "test-hmac-secret-zeroid-32bytes!!"
+	testCLIClientID = "zeroid-cli-test"
+	testMCPClientID = "zeroid-mcp-test"
+	testRedirectURI = "http://localhost:9999/callback"
 )
 
 // testServer is the shared httptest.Server for all tests in this package.
@@ -127,10 +135,14 @@ func runTests(m *testing.M) int {
 			RSAKeyID:          "test-rsa-1",
 		},
 		Token: zeroid.TokenConfig{
-			Issuer:     testIssuer,
-			BaseURL:    testIssuer,
-			DefaultTTL: 3600,
-			MaxTTL:     86400,
+			Issuer:           testIssuer,
+			BaseURL:          testIssuer,
+			DefaultTTL:       3600,
+			MaxTTL:           90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
+			HMACSecret:       testHMACSecret,
+			AuthCodeIssuer:   testIssuer,
+			ValidClientIDs:   []string{testCLIClientID, testMCPClientID},
+			MCPStaticClients: []string{testMCPClientID},
 		},
 		Telemetry: zeroid.TelemetryConfig{
 			Enabled: false,
@@ -404,6 +416,43 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 type agentRegistration struct {
 	AgentID string // identity UUID
 	APIKey  string // plaintext zid_sk_* key
+}
+
+// buildPKCEPair generates a random PKCE code verifier and its S256 challenge.
+func buildPKCEPair(t *testing.T) (verifier, challenge string) {
+	t.Helper()
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	require.NoError(t, err)
+	verifier = base64.RawURLEncoding.EncodeToString(b)
+	hash := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(hash[:])
+	return
+}
+
+// buildAuthCode mints an HS256 auth code JWT that the server accepts for the
+// authorization_code grant. The JWT mirrors what a real authorization endpoint
+// would issue after user authentication.
+func buildAuthCode(t *testing.T, clientID, userID, redirectURI, codeChallenge string, scopes []string) string {
+	t.Helper()
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(testIssuer).
+		Subject("auth-code").
+		IssuedAt(now).
+		Expiration(now.Add(5*time.Minute)).
+		Claim("cid", clientID).
+		Claim("uid", userID).
+		Claim("aid", testAccountID).
+		Claim("pid", testProjectID).
+		Claim("cc", codeChallenge).
+		Claim("ruri", redirectURI).
+		Claim("scp", scopes).
+		Build()
+	require.NoError(t, err)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte(testHMACSecret)))
+	require.NoError(t, err)
+	return string(signed)
 }
 
 // registerAgent calls POST /api/v1/agents/register and returns the identity ID and API key.
