@@ -49,6 +49,19 @@ type OAuthService struct {
 // CustomGrantHandler implements a custom OAuth2 grant type.
 type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
 
+// reservedClaims are standard JWT and ZeroID claims that additional_claims cannot override.
+var reservedClaims = map[string]bool{
+	// RFC 7519 registered claims
+	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	// ZeroID identity claims
+	"account_id": true, "project_id": true, "user_id": true, "owner_user_id": true,
+	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
+	"status": true, "name": true, "framework": true, "version": true, "publisher": true,
+	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
+	// ZeroID internal claims
+	"act": true, "token_exchange": true, "trusted_by": true,
+}
+
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
@@ -483,8 +496,11 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		"trusted_by":     serviceName,
 	}
 	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
-	// Additional claims cannot override standard ZeroID claims — they are additive.
+	// Blocklist prevents overriding standard JWT/ZeroID claims.
 	for k, v := range req.AdditionalClaims {
+		if reservedClaims[k] {
+			continue
+		}
 		customClaims[k] = v
 	}
 
