@@ -3,7 +3,10 @@ package integration_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
+	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -152,6 +155,70 @@ func TestRefreshTokenFlow(t *testing.T) {
 	result := introspect(t, newAccessToken)
 	assert.True(t, result["active"].(bool))
 	assert.Equal(t, "user-rt-001", result["sub"])
+}
+
+// TestAuthorizationCodeExpired verifies that an auth code JWT whose exp is in the
+// past is rejected with invalid_grant.
+func TestAuthorizationCodeExpired(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+
+	// Build an already-expired auth code (exp = 1 second ago).
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(testIssuer).
+		Subject("auth-code").
+		IssuedAt(now.Add(-10 * time.Minute)).
+		Expiration(now.Add(-1 * time.Second)).
+		Claim("cid", testCLIClientID).
+		Claim("uid", "user-expired-001").
+		Claim("aid", testAccountID).
+		Claim("pid", testProjectID).
+		Claim("cc", challenge).
+		Claim("ruri", testRedirectURI).
+		Claim("scp", []string{"data:read"}).
+		Build()
+	require.NoError(t, err)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte(testHMACSecret)))
+	require.NoError(t, err)
+	expiredCode := string(signed)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testCLIClientID,
+		"code":          expiredCode,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// TestRefreshTokenClientIDMismatch verifies that presenting a refresh token with
+// a different client_id than the one it was issued for is rejected.
+func TestRefreshTokenClientIDMismatch(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, "user-cid-mismatch", testRedirectURI, challenge, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	refreshToken := decode(t, resp)["refresh_token"].(string)
+
+	// Present the refresh token with a different (but valid) client_id — must fail.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     testCLIClientID, // wrong client
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_grant", body["error"])
 }
 
 // TestRefreshTokenRotation verifies that a refresh token can only be used once —

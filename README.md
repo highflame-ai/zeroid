@@ -651,7 +651,7 @@ def handle_query_database(authorization_header: str, query: str) -> dict:
     return execute_query(query)
 ```
 
-**Why this matters:** The MCP server doesn't implement any identity logic of its own. It delegates all trust decisions to ZeroID. When a compromised agent's token is revoked, the next `verify()` call — which re-fetches the JWKS on the next cache expiry — will reject the token. For immediate revocation enforcement, swap `verify_bearer()` for `introspect()` on the sensitive tools that require it.
+**Why this matters:** The MCP server doesn't implement any identity logic of its own. It delegates all trust decisions to ZeroID. Note that `verify()` validates the JWT signature and expiry locally — it does **not** check revocation status in real time. A revoked token with a valid signature will continue to pass `verify()` until its `exp` claim is reached (typically 1 hour for MCP clients). For immediate revocation enforcement on sensitive operations, swap `verify_bearer()` for `introspect()` on those specific tools.
 
 ---
 

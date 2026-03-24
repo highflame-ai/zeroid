@@ -263,7 +263,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown issuer %s", wimseURI), err)
 	}
 	if !identity.Status.IsUsable() {
-		return nil, oauthBadRequest("identity_inactive", "agent identity is suspended or deactivated")
+		return nil, oauthBadRequest("invalid_grant", "agent identity is suspended or deactivated")
 	}
 	if identity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
@@ -375,7 +375,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown actor identity %s", actorWIMSEURI), err)
 	}
 	if !actorIdentity.Status.IsUsable() {
-		return nil, oauthBadRequest("identity_inactive", "actor identity is suspended or deactivated")
+		return nil, oauthBadRequest("invalid_grant", "actor identity is suspended or deactivated")
 	}
 	if actorIdentity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
