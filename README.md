@@ -644,7 +644,7 @@ def handle_query_database(authorization_header: str, query: str) -> dict:
     log_audit(
         action="database:read",
         agent=identity.sub,
-        delegated_by=identity.act["sub"] if identity.act else None,
+        delegated_by=identity.act.get("sub") if identity.act else None,
         task_id=identity.task_id,
         query=query,
     )
