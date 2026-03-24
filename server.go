@@ -441,6 +441,33 @@ func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID strin
 	return s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 }
 
+// PublicClientConfig defines a public OAuth client to ensure on startup.
+type PublicClientConfig struct {
+	ClientID     string
+	Name         string
+	AccountID    string
+	ProjectID    string
+	GrantTypes   []string
+	Scopes       []string
+	RedirectURIs []string
+}
+
+// EnsurePublicClient registers a public PKCE OAuth client if it doesn't already exist.
+// Idempotent — safe to call on every startup.
+func (s *Server) EnsurePublicClient(ctx context.Context, cfg PublicClientConfig) error {
+	_, err := s.oauthClientSvc.GetPublicClient(ctx, cfg.ClientID, cfg.AccountID, cfg.ProjectID)
+	if err == nil {
+		return nil // already exists
+	}
+
+	_, regErr := s.oauthClientSvc.RegisterPublicClient(
+		ctx, cfg.AccountID, cfg.ProjectID, cfg.Name, cfg.ClientID,
+		cfg.RedirectURIs, cfg.GrantTypes, cfg.Scopes,
+	)
+
+	return regErr
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
