@@ -563,7 +563,7 @@ client.tokens.revoke(monitor_token.access_token)
 
 **Scenario:** An enterprise user asks their AI assistant to *"book travel for my upcoming conference."* The assistant needs to query the user's calendar, check company travel policy, book flights, and submit an expense pre-approval — all on the user's behalf. The downstream travel and HR systems need to know this action came from Alice, not from a generic agent.
 
-**The problem without ZTA:** The agent logs into travel and HR systems as Alice (using her OAuth token). There's no distinction between Alice booking travel herself and the agent doing it on her behalf. Alice can't revoke just the agent's access — she'd have to revoke her own session.
+**Without ZeroID:** The agent logs into travel and HR systems as Alice (using her OAuth token). There's no distinction between Alice booking travel herself and the agent doing it on her behalf. Alice can't revoke just the agent's access — she'd have to revoke her own session.
 
 **With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries its own identity in `sub`, Alice's identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
 
