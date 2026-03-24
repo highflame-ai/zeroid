@@ -468,15 +468,25 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		return nil, oauthBadRequest("invalid_request", "user_id is required for external principal exchange")
 	}
 
-	// Step 3: Build a minimal identity for the external principal.
-	// External principals are not registered in ZeroID's identity table — they are
-	// authenticated by the external IdP and their token is scoped by the trusted service's
-	// resolved tenant context.
-	identity := &domain.Identity{
-		AccountID:    req.AccountID,
-		ProjectID:    req.ProjectID,
-		IdentityType: domain.IdentityTypeService, // external principal, not a ZeroID NHI
-		Status:       domain.IdentityStatusActive,
+	// Step 3: Resolve the identity for the token.
+	// When ApplicationID is set, look up the real identity from the DB so the JWT
+	// carries the full identity claims (external_id, identity_type, sub_type, trust_level).
+	// Fails if the identity doesn't exist or doesn't belong to the tenant (IDOR protection).
+	// When ApplicationID is absent, fall back to a synthetic identity for the external principal.
+	var identity *domain.Identity
+	if req.ApplicationID != "" {
+		resolved, err := s.identitySvc.GetIdentity(ctx, req.ApplicationID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
+		}
+		identity = resolved
+	} else {
+		identity = &domain.Identity{
+			AccountID:    req.AccountID,
+			ProjectID:    req.ProjectID,
+			IdentityType: domain.IdentityTypeService,
+			Status:       domain.IdentityStatusActive,
+		}
 	}
 
 	// Step 4: Build custom claims for the external principal.
