@@ -429,6 +429,12 @@ func (s *Server) Router() chi.Router {
 	return s.router
 }
 
+// GetIdentity returns the identity with the given ID for the specified tenant.
+// Returns an error if the identity is not found or does not belong to the tenant.
+func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	return s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────

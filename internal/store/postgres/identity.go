@@ -71,18 +71,20 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 	return identity, nil
 }
 
-// List returns identities for a tenant, optionally filtered by identity_type and label.
+// List returns identities for a tenant, optionally filtered by identity_type(s) and label.
 // The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
 // and filters using JSONB containment: labels @> {"key": "value"}.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID, identityType, label string) ([]*domain.Identity, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string) ([]*domain.Identity, error) {
 	var identities []*domain.Identity
 	q := r.db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		OrderExpr("created_at DESC")
 
-	if identityType != "" {
-		q = q.Where("identity_type = ?", identityType)
+	if len(identityTypes) == 1 {
+		q = q.Where("identity_type = ?", identityTypes[0])
+	} else if len(identityTypes) > 1 {
+		q = q.Where("identity_type IN (?)", bun.In(identityTypes))
 	}
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)
