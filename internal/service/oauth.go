@@ -483,7 +483,6 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// Step 3: Resolve the identity for the token.
 	// When ApplicationID is set, look up the real identity from the DB so the JWT
 	// carries the full identity claims (external_id, identity_type, sub_type, trust_level).
-	// This enables downstream Cedar policies scoped to specific agents/applications.
 	// Fails if the identity doesn't exist or doesn't belong to the tenant (IDOR protection).
 	// When ApplicationID is absent, fall back to a synthetic identity for the external principal.
 	var identity *domain.Identity
