@@ -1,12 +1,13 @@
-# Who Sent You? Solving the Agent Identity Crisis
+# ZeroID + OpenClaw: Cryptographic Identity & Automated Governance
 
 Enterprises want to deploy AI agents, but security teams are rightly blocking them. The current landscape relies on shared service accounts, long-lived API keys, and untrackable sub-agent delegation—making audit logs meaningless and least-privilege impossible.
 
 **ZeroID** is an open-source identity infrastructure that gives agents cryptographic identities, enforces least-privilege delegation, and enables instant credential revocation across entire agent chains.
 
-<div align="center">
-  <video src="./assets/openclaw-demo-24mar.mp4" width="100%" controls autoplay muted loop alt="OpenClaw + ZeroID Demo"></video>
-</div>
+### See it in Action
+We show the main OpenClaw agent with full permissions delegate a restricted, write-only scope to a sub-agent, followed by a cascading revocation that instantly terminates access for the entire agent chain.
+
+https://github.com/user-attachments/assets/bbee9eb6-34fd-4c13-9eb6-fdb011f870eb
 
 ---
 
