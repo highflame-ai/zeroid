@@ -27,10 +27,6 @@ type CreateOAuthClientInput struct {
 		GrantTypes   []string `json:"grant_types,omitempty" doc:"Permitted OAuth grant types"`
 		Scopes       []string `json:"scopes,omitempty" doc:"Permitted OAuth scopes"`
 		RedirectURIs []string `json:"redirect_uris,omitempty" doc:"Allowed redirect URIs (required for authorization_code clients)"`
-		// IsMCP marks an authorization_code client as an MCP client. MCP clients
-		// receive short-lived (1h) access tokens plus rotating refresh tokens;
-		// CLI clients receive 90-day tokens with no refresh token.
-		IsMCP bool `json:"is_mcp,omitempty" doc:"If true, issue short-lived tokens + refresh token (MCP flow); otherwise issue 90-day tokens (CLI flow)"`
 	}
 }
 
@@ -150,7 +146,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		client, regErr := a.oauthClientSvc.RegisterPublicClient(
 			ctx, tenant.AccountID, tenant.ProjectID,
 			input.Body.Name, input.Body.ClientID,
-			input.Body.IsMCP, input.Body.RedirectURIs,
+			input.Body.RedirectURIs,
 			input.Body.GrantTypes, input.Body.Scopes,
 		)
 		if regErr != nil {

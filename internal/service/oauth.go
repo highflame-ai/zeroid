@@ -603,10 +603,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 // authorizationCode handles the PKCE authorization code grant (RFC 6749 section 4.1).
 // Auth codes are HS256 JWTs containing all tenant context.
-// MCP clients receive short-lived access tokens + refresh tokens.
-// CLI clients receive long-lived access tokens (90 days).
-// MCP clients (is_mcp=true in oauth_clients) receive short-lived (1h) tokens
-// plus a rotating refresh token.
+// Token behaviour is derived from the client's registered grant_types:
+//   - Clients with "refresh_token" grant: short-lived (1h) access token + rotating refresh token.
+//   - Clients without: long-lived (90-day) access token, no refresh token.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
 		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
@@ -655,9 +654,20 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
-	ttl := 90 * 24 * 3600 // 90 days for CLI clients
-	if oauthClient.IsMCP {
-		ttl = 3600 // 1 hour for MCP clients
+	// Derive token policy from registered grant_types: if the client is
+	// authorised for refresh_token, issue short-lived access tokens (the
+	// refresh token provides continuity). Otherwise issue long-lived tokens.
+	hasRefreshGrant := false
+	for _, g := range oauthClient.GrantTypes {
+		if g == string(domain.GrantTypeRefreshToken) {
+			hasRefreshGrant = true
+			break
+		}
+	}
+
+	ttl := 90 * 24 * 3600 // 90 days for clients without refresh_token grant
+	if hasRefreshGrant {
+		ttl = 3600 // 1 hour when refresh tokens provide continuity
 	}
 
 	// Auth code JWT is self-contained — tenant context comes from the auth code.
@@ -684,8 +694,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	accessToken.ProjectID = authCode.ProjectID
 	accessToken.UserID = authCode.UserID
 
-	// Issue refresh token for MCP clients only.
-	if oauthClient.IsMCP && s.refreshTokenSvc != nil {
+	// Issue refresh token when the client is registered for the refresh_token grant.
+	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:  req.ClientID,
 			AccountID: authCode.AccountID,
