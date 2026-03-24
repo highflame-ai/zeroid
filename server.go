@@ -153,9 +153,15 @@ func NewServer(cfg Config) (*Server, error) {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
+	authCodeIssuer := cfg.Token.AuthCodeIssuer
+	if authCodeIssuer == "" {
+		authCodeIssuer = cfg.Token.Issuer
+	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
-		Issuer:      cfg.Token.Issuer,
-		WIMSEDomain: cfg.WIMSEDomain,
+		Issuer:         cfg.Token.Issuer,
+		WIMSEDomain:    cfg.WIMSEDomain,
+		HMACSecret:     cfg.Token.HMACSecret,
+		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo)
@@ -427,6 +433,39 @@ func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
 // Router returns the chi.Router for custom route mounting.
 func (s *Server) Router() chi.Router {
 	return s.router
+}
+
+// GetIdentity returns the identity with the given ID for the specified tenant.
+// Returns an error if the identity is not found or does not belong to the tenant.
+func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	return s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
+}
+
+// PublicClientConfig defines a public OAuth client to ensure on startup.
+type PublicClientConfig struct {
+	ClientID     string
+	Name         string
+	AccountID    string
+	ProjectID    string
+	GrantTypes   []string
+	Scopes       []string
+	RedirectURIs []string
+}
+
+// EnsurePublicClient registers a public PKCE OAuth client if it doesn't already exist.
+// Idempotent — safe to call on every startup.
+func (s *Server) EnsurePublicClient(ctx context.Context, cfg PublicClientConfig) error {
+	_, err := s.oauthClientSvc.GetPublicClient(ctx, cfg.ClientID, cfg.AccountID, cfg.ProjectID)
+	if err == nil {
+		return nil // already exists
+	}
+
+	_, regErr := s.oauthClientSvc.RegisterPublicClient(
+		ctx, cfg.AccountID, cfg.ProjectID, cfg.Name, cfg.ClientID,
+		cfg.RedirectURIs, cfg.GrantTypes, cfg.Scopes,
+	)
+
+	return regErr
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

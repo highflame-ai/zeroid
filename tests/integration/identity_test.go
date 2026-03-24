@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -101,6 +102,62 @@ func TestListIdentities(t *testing.T) {
 	assert.GreaterOrEqual(t, len(items), 2, "should have at least the two just registered")
 }
 
+func TestListAgentsFilterByIdentityType(t *testing.T) {
+	// Register an agent and an application.
+	agentExt := uid("filter-agent")
+	appExt := uid("filter-app")
+
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   agentExt,
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "unverified",
+		"name":          "Filter Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"product": "guardrails"},
+	}, adminHeaders())
+
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   appExt,
+		"identity_type": "application",
+		"sub_type":      "custom",
+		"trust_level":   "unverified",
+		"name":          "Filter App",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"product": "guardrails"},
+	}, adminHeaders())
+
+	// Single type filter — only agents.
+	resp := get(t, "/api/v1/agents/registry?identity_type=agent&label=product:guardrails", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	agents := body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		assert.Equal(t, "agent", m["identity_type"], "should only return agents")
+	}
+
+	// Multi-value filter — agents and applications (comma-separated).
+	resp = get(t, "/api/v1/agents/registry?identity_type=agent,application&label=product:guardrails", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	both := body["agents"].([]any)
+	types := map[string]bool{}
+	for _, a := range both {
+		m := a.(map[string]any)
+		types[m["identity_type"].(string)] = true
+	}
+	assert.True(t, types["agent"], "should include agents")
+	assert.True(t, types["application"], "should include applications")
+
+	// No filter — returns all types.
+	resp = get(t, "/api/v1/agents/registry?label=product:guardrails", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	all := body["agents"].([]any)
+	assert.GreaterOrEqual(t, len(all), len(both), "no filter should return at least as many as filtered")
+}
+
 // TestUpdateIdentityTrustLevel verifies that PATCH /api/v1/identities/{id}
 // can promote the trust level.
 func TestUpdateIdentityTrustLevel(t *testing.T) {
@@ -126,6 +183,28 @@ func TestDeleteIdentity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	resp.Body.Close()
+}
+
+func TestServerGetIdentity(t *testing.T) {
+	externalID := uid("get-identity-srv")
+	identity := registerIdentity(t, externalID, nil)
+
+	// Found: valid ID + tenant.
+	got, err := testZeroIDServer.GetIdentity(context.Background(), identity.ID, testAccountID, testProjectID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, identity.ID, got.ID)
+	assert.Equal(t, externalID, got.ExternalID)
+
+	// Wrong tenant — returns error, no identity.
+	got, err = testZeroIDServer.GetIdentity(context.Background(), identity.ID, "wrong-account", testProjectID)
+	assert.Error(t, err)
+	assert.Nil(t, got)
+
+	// Non-existent ID.
+	got, err = testZeroIDServer.GetIdentity(context.Background(), "00000000-0000-0000-0000-000000000000", testAccountID, testProjectID)
+	assert.Error(t, err)
+	assert.Nil(t, got)
 }
 
 // doRaw is a variant that accepts a method string for PATCH/DELETE.
