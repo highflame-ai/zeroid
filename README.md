@@ -778,9 +778,9 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 
 **In progress**
 - MCP server middleware — `zeroid.mcp_middleware()` drop-in for Python/TypeScript MCP servers; `verify()` + `allowed_tools` enforcement in < 5 lines
-- Coding agent scope vocabulary — `tools:read/write/execute/network/agent/vcs` constants + credential policy templates
 
 **Planned**
+- Coding agent scope vocabulary — `tools:read/write/execute/network/agent/vcs` constants + credential policy templates for common agent personas (`read-only-reviewer`, `code-editor`, `full-autonomy`)
 - CIBA (Client-Initiated Backchannel Authentication) — agents pause long-running workflows and request out-of-band user authorization without blocking
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
 - `zeroid` CLI
