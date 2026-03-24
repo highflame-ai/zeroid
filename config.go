@@ -73,6 +73,13 @@ type TokenConfig struct {
 	BaseURL    string `koanf:"base_url"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
+
+	// authorization_code grant configuration.
+	// HMACSecret is the shared secret used to sign and verify auth code JWTs (HS256).
+	HMACSecret string `koanf:"hmac_secret"`
+	// AuthCodeIssuer is the expected issuer claim in auth code JWTs.
+	// Defaults to Token.Issuer when empty.
+	AuthCodeIssuer string `koanf:"auth_code_issuer"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.

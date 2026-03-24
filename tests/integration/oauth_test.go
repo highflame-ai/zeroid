@@ -90,7 +90,7 @@ func TestClientCredentialsWrongSecret(t *testing.T) {
 		"client_id":     agentID,
 		"client_secret": "wrong-secret",
 	}, nil)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	resp.Body.Close()
 }
 
@@ -431,4 +431,71 @@ func TestTokenExchangeES256SubjectTokenStillWorks(t *testing.T) {
 	token := decode(t, resp)
 	assert.NotEmpty(t, token["access_token"])
 	assert.Equal(t, "data:read", token["scope"])
+}
+
+// TestMultiHopDelegation verifies that token_exchange can be chained:
+// orchestrator (depth 0) → sub-agent 1 (depth 1) → sub-agent 2 (depth 2).
+// delegation_depth must increment at each hop and act.sub must reflect the
+// immediate delegator (not the original orchestrator).
+func TestMultiHopDelegation(t *testing.T) {
+	// ── Orchestrator: client_credentials (depth 0) ─────────────────────────
+	orchID := uid("mh-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+	orchWIMSE := introspect(t, orchToken)["sub"].(string)
+
+	// ── Sub-agent 1: token_exchange from orchestrator (depth 1) ────────────
+	sub1Key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	sub1ID := uid("mh-sub1")
+	sub1Identity := registerIdentity(t, sub1ID, []string{"data:read"}, ecPublicKeyPEM(t, sub1Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, sub1Key, sub1Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth1Token := decode(t, resp)["access_token"].(string)
+
+	d1 := introspect(t, depth1Token)
+	assert.True(t, d1["active"].(bool))
+	assert.Equal(t, sub1Identity.WIMSEURI, d1["sub"], "depth-1 sub should be sub-agent 1")
+	assert.EqualValues(t, 1, d1["delegation_depth"], "depth-1 token should have delegation_depth=1")
+	act1 := d1["act"].(map[string]any)
+	assert.Equal(t, orchWIMSE, act1["sub"], "depth-1 act.sub should be orchestrator")
+
+	// ── Sub-agent 2: token_exchange from sub-agent 1 (depth 2) ─────────────
+	sub2Key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	sub2ID := uid("mh-sub2")
+	sub2Identity := registerIdentity(t, sub2ID, []string{"data:read"}, ecPublicKeyPEM(t, sub2Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": depth1Token,
+		"actor_token":   buildAssertion(t, sub2Key, sub2Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth2Token := decode(t, resp)["access_token"].(string)
+
+	d2 := introspect(t, depth2Token)
+	assert.True(t, d2["active"].(bool))
+	assert.Equal(t, sub2Identity.WIMSEURI, d2["sub"], "depth-2 sub should be sub-agent 2")
+	assert.EqualValues(t, 2, d2["delegation_depth"], "depth-2 token should have delegation_depth=2")
+	act2 := d2["act"].(map[string]any)
+	assert.Equal(t, sub1Identity.WIMSEURI, act2["sub"], "depth-2 act.sub should be sub-agent 1 (immediate delegator)")
 }

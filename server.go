@@ -153,9 +153,15 @@ func NewServer(cfg Config) (*Server, error) {
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
+	authCodeIssuer := cfg.Token.AuthCodeIssuer
+	if authCodeIssuer == "" {
+		authCodeIssuer = cfg.Token.Issuer
+	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
-		Issuer:      cfg.Token.Issuer,
-		WIMSEDomain: cfg.WIMSEDomain,
+		Issuer:         cfg.Token.Issuer,
+		WIMSEDomain:    cfg.WIMSEDomain,
+		HMACSecret:     cfg.Token.HMACSecret,
+		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo)

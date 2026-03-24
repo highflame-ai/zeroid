@@ -266,17 +266,61 @@ delegated = client.tokens.exchange(
 
 </details>
 
-### 3. Introspect — Verify the Full Chain
+### 3. Verify — Confirm the Token and Read Its Identity
 
-Any service that receives a ZeroID token can verify the full chain by calling introspect. This is how an MCP server, API gateway, or downstream tool answers: *"Is this token valid, who does it belong to, and on whose authority does it act?"*
+There are two paths depending on whether you need a network round-trip:
+
+**`verify()` — local path (preferred for high-throughput services).** Validates the JWT signature against the cached JWKS (fetched once, cached 5 minutes). No network call on the hot path. Returns a typed `ZeroIDIdentity` object.
+
+**`introspect()` — network path.** Calls the server on every request. Use this when you need definitive real-time revocation status (e.g., a payment gateway) or when you don't want to manage JWKS.
 
 <details>
-<summary>Python</summary>
+<summary>Python — local verify (recommended)</summary>
+
+```python
+identity = client.tokens.verify(delegated.access_token)
+
+print(identity.sub)              # spiffe://auth.highflame.ai/acme/prod/agent/data-fetcher
+print(identity.delegation_depth) # 1
+print(identity.act)              # {"sub": "spiffe://.../orchestrator-1"}
+
+# Scope and tool guards
+identity.has_scope("data:read")  # True
+identity.has_tool("Bash")        # True if allowed_tools claim includes "Bash"
+
+# From an Authorization header
+identity = client.tokens.verify_bearer(request.headers["Authorization"])
+
+# Async
+identity = await client.tokens.averify(token)
+identity = await client.tokens.averify_bearer(request.headers["Authorization"])
+```
+
+</details>
+
+<details>
+<summary>TypeScript — local verify (recommended)</summary>
+
+```typescript
+const identity = await client.tokens.verify(delegated.access_token);
+// identity.sub              → "spiffe://..."
+// identity.delegation_depth → 1
+// identity.act?.sub         → orchestrator's WIMSE URI
+// identity.scopes?.includes("data:read")
+
+// From an Authorization header
+const identity = await client.tokens.verifyBearer(request.headers.authorization);
+```
+
+</details>
+
+<details>
+<summary>Python — network introspect (definitive revocation status)</summary>
 
 ```python
 info = client.tokens.introspect(delegated.access_token)
 
-print(info.active)   # True — token is valid and not revoked
+print(info.active)   # True — confirmed live with the server, not revoked
 print(info.sub)      # spiffe://auth.highflame.ai/acme/prod/agent/data-fetcher
 # Full chain is readable from the token:
 #   owner            → ops@company.com               (who provisioned this agent)
@@ -288,11 +332,11 @@ print(info.sub)      # spiffe://auth.highflame.ai/acme/prod/agent/data-fetcher
 </details>
 
 <details>
-<summary>Typescript</summary>
+<summary>Typescript — network introspect</summary>
 
 ```typescript
 const info = await client.tokens.introspect(delegated.access_token);
-// info.active → true/false
+// info.active → true/false (confirmed live with the server)
 // info.sub    → agent's WIMSE URI
 ```
 
@@ -557,53 +601,57 @@ client.tokens.revoke(assistant_token.access_token)
 
 **The problem without ZeroID:** MCP servers today typically accept any bearer token and trust the caller. There's no standard way to verify who the agent is, who authorized it, or whether it's still authorized (a token issued an hour ago may have been revoked since).
 
-**With ZeroID:** The MCP server calls introspect on every incoming token. The response carries the full identity context — the server can enforce its own access policy based on trust level, delegation depth, scope, and sub-type, without implementing its own identity logic.
+**With ZeroID:** The MCP server verifies the token locally on every request using the SDK's `verify()` — no network call on the hot path after the initial JWKS fetch. The returned `ZeroIDIdentity` carries the full identity context; the server enforces its own access policy based on trust level, delegation depth, scope, and allowed tools, without implementing any identity logic of its own.
 
 ```python
-# In your MCP server — called before any tool executes
-def authorize_agent(bearer_token: str, required_scope: str) -> dict:
-    info = client.tokens.introspect(bearer_token)
+from highflame.zeroid import ZeroIDClient, ZeroIDIdentity
+from highflame.zeroid.errors import ZeroIDError
 
-    # Token is expired or was explicitly revoked
-    if not info.active:
-        raise PermissionError("Token is not active")
+client = ZeroIDClient(base_url="https://auth.highflame.ai", api_key="zid_sk_...")
 
-    # Only accept agents that were provisioned with first-party trust
-    if info.extra.get("trust_level") not in ("verified_third_party", "first_party"):
-        raise PermissionError(f"Insufficient trust level: {info.extra.get('trust_level')}")
+# In your MCP server — called before any tool executes.
+# verify() validates the signature against the cached JWKS — no network round-trip.
+def authorize_agent(authorization_header: str, required_scope: str, tool_name: str) -> ZeroIDIdentity:
+    try:
+        identity = client.tokens.verify_bearer(authorization_header)
+    except ZeroIDError as e:
+        raise PermissionError(f"Invalid token: {e.code}") from e
 
-    # Reject agents that have already delegated too many times
-    # (prevents deep chains from reaching sensitive tools)
-    if info.extra.get("delegation_depth", 0) > 2:
+    # Only accept agents provisioned with first-party trust
+    if identity.trust_level not in ("verified_third_party", "first_party"):
+        raise PermissionError(f"Insufficient trust level: {identity.trust_level}")
+
+    # Reject chains that have delegated too many times
+    if identity.delegation_depth > 2:
         raise PermissionError("Delegation depth exceeds allowed limit")
 
-    # Verify the agent has the specific scope this tool requires
-    granted_scopes = set(info.scope.split())
-    if required_scope not in granted_scopes:
+    # Verify the agent has the required scope for this tool
+    if not identity.has_scope(required_scope):
         raise PermissionError(f"Missing required scope: {required_scope}")
 
-    # Return identity context for logging and audit
-    return {
-        "agent":        info.sub,                       # spiffe://... URI
-        "owner":        info.extra.get("owner"),        # who provisioned this agent
-        "delegated_by": info.extra.get("act", {}).get("sub"),  # who delegated (if any)
-        "trust_level":  info.extra.get("trust_level"),
-    }
+    # If the token carries an allowed_tools claim, enforce it
+    if identity.allowed_tools and not identity.has_tool(tool_name):
+        raise PermissionError(f"Tool '{tool_name}' is not in the token's allowed_tools")
+
+    return identity
 
 # Tool handler
-def handle_query_database(bearer_token: str, query: str) -> dict:
-    ctx = authorize_agent(bearer_token, required_scope="database:read")
-    # At this point we know:
-    #   - the token is valid and not revoked
-    #   - the agent is trusted
-    #   - it has database:read scope
-    #   - it hasn't been delegated through too many hops
-    log_audit(action="database:read", agent=ctx["agent"], owner=ctx["owner"],
-              delegated_by=ctx["delegated_by"], query=query)
+def handle_query_database(authorization_header: str, query: str) -> dict:
+    identity = authorize_agent(authorization_header, required_scope="database:read", tool_name="query_database")
+    # identity.sub        → spiffe://... URI of the acting agent
+    # identity.act        → {"sub": "spiffe://.../orchestrator"} if delegated
+    # identity.task_id    → set if the token was issued for a specific task
+    log_audit(
+        action="database:read",
+        agent=identity.sub,
+        delegated_by=identity.act.get("sub") if identity.act else None,
+        task_id=identity.task_id,
+        query=query,
+    )
     return execute_query(query)
 ```
 
-**Why this matters:** The MCP server doesn't implement any identity logic of its own. It delegates all trust decisions to ZeroID. When the Highflame team revokes a compromised agent's token, every MCP server in the ecosystem immediately rejects it — without any coordination.
+**Why this matters:** The MCP server doesn't implement any identity logic of its own. It delegates all trust decisions to ZeroID. Note that `verify()` validates the JWT signature and expiry locally — it does **not** check revocation status in real time. A revoked token with a valid signature will continue to pass `verify()` until its `exp` claim is reached (typically 1 hour for MCP clients). For immediate revocation enforcement on sensitive operations, swap `verify_bearer()` for `introspect()` on those specific tools.
 
 ---
 
@@ -721,12 +769,22 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 
 ## Roadmap
 
-- SDKs ([Python](https://github.com/highflame-ai/highflame-sdk/tree/main/python), [TypeScript](https://github.com/highflame-ai/highflame-sdk/tree/main/javascript), [RUST](https://github.com/highflame-ai/highflame-sdk/tree/main/rust))
-- CIBA (Client-Initiated Backchannel Authentication) for async human-in-the-loop approvals — agents pause long-running workflows and request out-of-band user authorization without blocking
+**Released**
+- SDKs ([Python](https://github.com/highflame-ai/highflame-sdk/tree/main/python), [TypeScript](https://github.com/highflame-ai/highflame-sdk/tree/main/javascript), [Rust](https://github.com/highflame-ai/highflame-sdk/tree/main/rust))
+- Local JWT verification — `tokens.verify()` / `tokens.verifyBearer()` returning typed `ZeroIDIdentity` (Python + TypeScript); JWKS cached 5 min, zero network calls on the hot path
+- Structured errors — `ZeroIDError.code` / `.message` / `.status` with OAuth2 error codes across all three SDKs
+- Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
+- Ecosystem integrations (LangGraph, CrewAI, Strands)
+
+**In progress**
+- MCP server middleware — `zeroid.mcp_middleware()` drop-in for Python/TypeScript MCP servers; `verify()` + `allowed_tools` enforcement in < 5 lines
+
+**Planned**
+- Coding agent scope vocabulary — `tools:read/write/execute/network/agent/vcs` constants + credential policy templates for common agent personas (`read-only-reviewer`, `code-editor`, `full-autonomy`)
+- CIBA (Client-Initiated Backchannel Authentication) — agents pause long-running workflows and request out-of-band user authorization without blocking
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
-- Ecosystem integrations (langgraph, crewai...)
-- MCP server middleware
-- `zeroid` CLI 
+- `zeroid` CLI
+- GitHub Actions OIDC upstream validator — stamp `environment=ci` claims verified against GitHub's JWKS
 
 ---
 

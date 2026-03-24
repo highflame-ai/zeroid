@@ -32,14 +32,8 @@ type OAuthService struct {
 	refreshTokenSvc *RefreshTokenService
 	issuer          string
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
-	hmacSecret      string // HS256 shared secret for auth code JWT verification
-	authCodeIssuer  string // expected issuer in auth code JWTs
-	// validClientIDs is the set of recognised static client IDs.
-	validClientIDs map[string]bool
-	// mcpClientPrefix is the prefix for dynamically registered MCP client IDs.
-	mcpClientPrefix string
-	// mcpStaticClients lists static client IDs that are MCP clients (short-lived tokens + refresh).
-	mcpStaticClients map[string]bool
+	hmacSecret     string // HS256 shared secret for auth code JWT verification
+	authCodeIssuer string // expected issuer in auth code JWTs
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -70,13 +64,10 @@ type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, 
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
-	Issuer           string
-	WIMSEDomain      string
-	HMACSecret       string
-	AuthCodeIssuer   string
-	ValidClientIDs   map[string]bool
-	MCPClientPrefix  string
-	MCPStaticClients map[string]bool
+	Issuer          string
+	WIMSEDomain     string
+	HMACSecret      string
+	AuthCodeIssuer  string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -102,11 +93,8 @@ func NewOAuthService(
 		refreshTokenSvc:  refreshTokenSvc,
 		issuer:           cfg.Issuer,
 		wimseDomain:      cfg.WIMSEDomain,
-		hmacSecret:       cfg.HMACSecret,
-		authCodeIssuer:   cfg.AuthCodeIssuer,
-		validClientIDs:   cfg.ValidClientIDs,
-		mcpClientPrefix:  cfg.MCPClientPrefix,
-		mcpStaticClients:       cfg.MCPStaticClients,
+		hmacSecret:              cfg.HMACSecret,
+		authCodeIssuer:          cfg.AuthCodeIssuer,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
 }
@@ -180,22 +168,22 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		if handler, ok := s.customGrants[req.GrantType]; ok {
 			return handler(ctx, req)
 		}
-		return nil, fmt.Errorf("unsupported grant type: %s", req.GrantType)
+		return nil, oauthBadRequest("unsupported_grant_type", req.GrantType)
 	}
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, fmt.Errorf("account_id and project_id are required for client_credentials grant")
+		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for client_credentials grant")
 	}
 
 	// Validate client credentials against the oauth_clients table, scoped to tenant.
 	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret, req.AccountID, req.ProjectID)
 	if err != nil {
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, fmt.Errorf("invalid client credentials")
+			return nil, oauthUnauthorized("invalid client credentials", err)
 		}
-		return nil, fmt.Errorf("failed to verify client: %w", err)
+		return nil, oauthUnauthorized("client verification failed", err)
 	}
 
 	// Ensure client_credentials grant is permitted.
@@ -207,7 +195,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		}
 	}
 	if !allowed {
-		return nil, fmt.Errorf("client not authorized for client_credentials grant")
+		return nil, oauthBadRequest("unauthorized_client", "client not authorized for client_credentials grant")
 	}
 
 	// Parse and intersect requested scopes with the client's allowed scopes.
@@ -217,7 +205,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// Tenant is derived from the client record — not from caller-supplied headers.
 	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, client.AccountID, client.ProjectID)
 	if err != nil {
-		return nil, fmt.Errorf("no identity found for client_id %s: %w", req.ClientID, err)
+		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
@@ -237,41 +225,41 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 // iss must equal the agent's WIMSE URI; aud must equal the issuer URL.
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Subject == "" {
-		return nil, fmt.Errorf("subject (assertion JWT) is required for jwt_bearer grant")
+		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
 	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: assertion JWT is malformed")
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT is malformed", err)
 	}
 
 	wimseURI := peeked.Issuer()
 	if wimseURI == "" {
-		return nil, fmt.Errorf("invalid_grant: assertion JWT missing iss claim")
+		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing iss claim")
 	}
 
 	// Parse tenant from the WIMSE URI itself — no caller-supplied tenant headers needed.
 	accountID, projectID, err := s.parseWIMSEURI(wimseURI)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "invalid WIMSE URI in assertion", err)
 	}
 
 	// Resolve the identity by WIMSE URI, scoped to the tenant extracted above.
 	identity, err := s.identitySvc.repo.GetByWIMSEURI(ctx, wimseURI, accountID, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: unknown issuer %s", wimseURI)
+		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown issuer %s", wimseURI), err)
 	}
 	if !identity.Status.IsUsable() {
-		return nil, fmt.Errorf("invalid_grant: identity is inactive")
+		return nil, oauthBadRequest("invalid_grant", "agent identity is suspended or deactivated")
 	}
 	if identity.PublicKeyPEM == "" {
-		return nil, fmt.Errorf("invalid_grant: no public key registered for identity %s — register a key before using jwt_bearer", identity.ID)
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
 	}
 
 	agentPubKey, err := parseECPublicKeyPEM(identity.PublicKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: registered public key is invalid: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "registered public key is invalid", err)
 	}
 
 	// Fully validate the assertion JWT against the agent's registered public key.
@@ -281,12 +269,12 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: assertion JWT validation failed: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT validation failed", err)
 	}
 
 	// iss must match the identity's WIMSE URI.
 	if assertionToken.Issuer() != identity.WIMSEURI {
-		return nil, fmt.Errorf("invalid_grant: iss claim does not match identity WIMSE URI")
+		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
 	}
 
 	scopes := intersectScopes(parseScopeString(req.Scope), identity.AllowedScopes)
@@ -318,7 +306,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 // public key (same requirement as jwt_bearer).
 func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.SubjectToken == "" {
-		return nil, fmt.Errorf("invalid_request: subject_token is required for token_exchange grant")
+		return nil, oauthBadRequest("invalid_request", "subject_token is required for token_exchange grant")
 	}
 
 	// RFC 8693 defines two exchange modes:
@@ -333,58 +321,58 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// Accept both ES256 and RS256 tokens — the library matches kid + alg from the JWKS.
 	subjectParsed, err := s.parseToken(req.SubjectToken, true)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: subject_token validation failed: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "subject_token validation failed", err)
 	}
 
 	subjectJTI := subjectParsed.JwtID()
 	if subjectJTI == "" {
-		return nil, fmt.Errorf("invalid_grant: subject_token missing jti claim")
+		return nil, oauthBadRequest("invalid_grant", "subject_token missing jti claim")
 	}
 
 	// Check that the credential has not been revoked.
 	subjectCred, active, err := s.credentialSvc.IntrospectToken(ctx, subjectJTI)
 	if err != nil || subjectCred == nil || !active {
-		return nil, fmt.Errorf("invalid_grant: subject_token is inactive or has been revoked")
+		return nil, oauthBadRequest("invalid_grant", "subject_token is inactive or has been revoked")
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: actor_token is malformed")
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
 	}
 
 	actorWIMSEURI := actorPeeked.Issuer()
 	if actorWIMSEURI == "" {
-		return nil, fmt.Errorf("invalid_grant: actor_token missing iss claim")
+		return nil, oauthBadRequest("invalid_grant", "actor_token missing iss claim")
 	}
 
 	// Derive the tenant from the actor's WIMSE URI.
 	accountID, projectID, err := s.parseWIMSEURI(actorWIMSEURI)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: actor_token iss is not a valid WIMSE URI: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token iss is not a valid WIMSE URI", err)
 	}
 
 	// Subject and actor must belong to the same tenant.
 	if accountID != subjectCred.AccountID || projectID != subjectCred.ProjectID {
-		return nil, fmt.Errorf("invalid_grant: subject_token and actor_token must belong to the same tenant")
+		return nil, oauthBadRequest("invalid_grant", "subject_token and actor_token must belong to the same tenant")
 	}
 
 	// Look up the actor (sub-agent) identity.
 	actorIdentity, err := s.identitySvc.repo.GetByWIMSEURI(ctx, actorWIMSEURI, accountID, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: unknown actor identity %s", actorWIMSEURI)
+		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown actor identity %s", actorWIMSEURI), err)
 	}
 	if !actorIdentity.Status.IsUsable() {
-		return nil, fmt.Errorf("invalid_grant: actor identity is inactive")
+		return nil, oauthBadRequest("invalid_grant", "actor identity is suspended or deactivated")
 	}
 	if actorIdentity.PublicKeyPEM == "" {
-		return nil, fmt.Errorf("invalid_grant: no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID)
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
 	}
 
 	// Fully validate the actor_token against the sub-agent's registered public key.
 	actorPubKey, err := parseECPublicKeyPEM(actorIdentity.PublicKeyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: actor's registered public key is invalid: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "actor's registered public key is invalid", err)
 	}
 
 	validatedActorToken, err := jwt.Parse([]byte(req.ActorToken),
@@ -393,10 +381,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: actor_token validation failed: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
 	}
 	if validatedActorToken.Issuer() != actorIdentity.WIMSEURI {
-		return nil, fmt.Errorf("invalid_grant: actor_token iss does not match actor identity WIMSE URI")
+		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
 	}
 
 	// Step 3: Compute the granted scopes.
@@ -416,7 +404,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	if len(scopes) == 0 {
-		return nil, fmt.Errorf("invalid_scope: requested scopes are not available for delegation")
+		return nil, oauthBadRequest("invalid_scope", "requested scopes are not available for delegation")
 	}
 
 	// Step 4: Compute delegation depth (increment from orchestrator's depth).
@@ -464,20 +452,20 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	// Step 1: Verify the caller is a trusted internal service.
 	if s.trustedServiceValidator == nil {
-		return nil, fmt.Errorf("invalid_grant: external principal exchange is not configured")
+		return nil, oauthBadRequest("invalid_grant", "external principal exchange is not configured")
 	}
 	serviceName, err := s.trustedServiceValidator(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: caller is not a trusted service: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "caller is not a trusted service", err)
 	}
 
 	// Step 2: Validate required fields. The trusted service is responsible for
 	// authenticating the external principal and resolving tenant context.
 	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, fmt.Errorf("invalid_request: account_id and project_id are required for external principal exchange")
+		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external principal exchange")
 	}
 	if req.UserID == "" {
-		return nil, fmt.Errorf("invalid_request: user_id is required for external principal exchange")
+		return nil, oauthBadRequest("invalid_request", "user_id is required for external principal exchange")
 	}
 
 	// Step 3: Resolve the identity for the token.
@@ -531,7 +519,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		CustomClaims:    customClaims,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("issuing external principal token: %w", err)
+		return nil, oauthServerError("failed to issue external principal token", err)
 	}
 
 	accessToken.AccountID = req.AccountID
@@ -545,11 +533,11 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 // Tenant is derived from the API key record — no caller-supplied headers needed.
 func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.APIKey == "" {
-		return nil, fmt.Errorf("api_key is required for api_key grant")
+		return nil, oauthBadRequest("invalid_request", "api_key is required for api_key grant")
 	}
 
 	if !s.jwksSvc.HasRSAKeys() {
-		return nil, fmt.Errorf("api_key grant requires RSA keys to be configured")
+		return nil, oauthServerError("api_key grant requires RSA keys to be configured", nil)
 	}
 
 	// Hash the API key with SHA-256 to look up in the database.
@@ -558,7 +546,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
 	if err != nil {
-		return nil, fmt.Errorf("invalid api key")
+		return nil, oauthBadRequestCause("invalid_grant", "invalid api key", err)
 	}
 
 	// Build a synthetic identity for the API key holder.
@@ -625,42 +613,71 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 // authorizationCode handles the PKCE authorization code grant (RFC 6749 section 4.1).
 // Auth codes are HS256 JWTs containing all tenant context.
-// MCP clients receive short-lived access tokens + refresh tokens.
-// CLI clients receive long-lived access tokens (90 days).
+// Token behaviour is derived from the client's registered grant_types:
+//   - Clients with "refresh_token" grant: short-lived (1h) access token + rotating refresh token.
+//   - Clients without: long-lived (90-day) access token, no refresh token.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
-		return nil, fmt.Errorf("code, code_verifier, client_id, and redirect_uri are required")
-	}
-
-	if !s.isValidClientID(req.ClientID) {
-		return nil, fmt.Errorf("invalid_client: unknown client_id")
+		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
 	}
 
 	if s.hmacSecret == "" {
-		return nil, fmt.Errorf("authorization_code grant requires HMAC secret to be configured")
+		return nil, oauthServerError("authorization_code grant requires HMAC secret to be configured", nil)
 	}
 
+	// Decode the auth code first — tenant context (account_id, project_id) lives
+	// inside the signed JWT, not in caller-supplied headers.
 	authCode, err := decodeAuthCodeJWT(req.Code, s.hmacSecret, s.authCodeIssuer)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "invalid authorization code", err)
 	}
 
 	if authCode.ClientID != req.ClientID {
-		return nil, fmt.Errorf("invalid_grant: client_id mismatch")
+		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
+	}
+
+	// Look up the client in the registry — this is the authoritative check.
+	// GetPublicClient verifies the client is active and registered; no secret
+	// is required because PKCE provides the proof of possession.
+	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID, authCode.AccountID, authCode.ProjectID)
+	if err != nil {
+		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	}
+
+	// Verify the client is authorised to use the authorization_code grant.
+	grantAllowed := false
+	for _, g := range oauthClient.GrantTypes {
+		if g == string(domain.GrantTypeAuthorizationCode) {
+			grantAllowed = true
+			break
+		}
+	}
+	if !grantAllowed {
+		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
 	}
 
 	if normalizeLoopback(authCode.RedirectURI) != normalizeLoopback(req.RedirectURI) {
-		return nil, fmt.Errorf("invalid_grant: redirect_uri mismatch")
+		return nil, oauthBadRequest("invalid_grant", "redirect_uri mismatch")
 	}
 
 	if !verifyCodeChallenge(req.CodeVerifier, authCode.CodeChallenge) {
-		return nil, fmt.Errorf("invalid_grant: PKCE verification failed")
+		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
-	isMCP := s.isMCPClient(req.ClientID)
-	ttl := 90 * 24 * 3600 // 90 days for CLI clients
-	if isMCP {
-		ttl = 3600 // 1 hour for MCP clients
+	// Derive token policy from registered grant_types: if the client is
+	// authorised for refresh_token, issue short-lived access tokens (the
+	// refresh token provides continuity). Otherwise issue long-lived tokens.
+	hasRefreshGrant := false
+	for _, g := range oauthClient.GrantTypes {
+		if g == string(domain.GrantTypeRefreshToken) {
+			hasRefreshGrant = true
+			break
+		}
+	}
+
+	ttl := 90 * 24 * 3600 // 90 days for clients without refresh_token grant
+	if hasRefreshGrant {
+		ttl = 3600 // 1 hour when refresh tokens provide continuity
 	}
 
 	// Auth code JWT is self-contained — tenant context comes from the auth code.
@@ -687,8 +704,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	accessToken.ProjectID = authCode.ProjectID
 	accessToken.UserID = authCode.UserID
 
-	// Issue refresh token for MCP clients only.
-	if isMCP && s.refreshTokenSvc != nil {
+	// Issue refresh token when the client is registered for the refresh_token grant.
+	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:  req.ClientID,
 			AccountID: authCode.AccountID,
@@ -710,20 +727,20 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 // Implements single-use rotation with family-based reuse detection.
 func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.RefreshTokenStr == "" || req.ClientID == "" {
-		return nil, fmt.Errorf("refresh_token and client_id are required")
+		return nil, oauthBadRequest("invalid_request", "refresh_token and client_id are required")
 	}
 
 	if s.refreshTokenSvc == nil {
-		return nil, fmt.Errorf("refresh tokens not configured")
+		return nil, oauthServerError("refresh tokens not configured", nil)
 	}
 
 	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid_grant: %w", err)
+		return nil, oauthBadRequestCause("invalid_grant", "invalid or expired refresh token", err)
 	}
 
 	if oldToken.ClientID != req.ClientID {
-		return nil, fmt.Errorf("invalid_grant: client_id mismatch")
+		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
 	}
 
 	identity := &domain.Identity{
@@ -886,27 +903,6 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	return parts[0], parts[1], nil
 }
 
-// isValidClientID checks if a client ID is registered or is a dynamic MCP client.
-func (s *OAuthService) isValidClientID(clientID string) bool {
-	if s.validClientIDs[clientID] {
-		return true
-	}
-	if s.mcpClientPrefix != "" {
-		return strings.HasPrefix(clientID, s.mcpClientPrefix)
-	}
-	return false
-}
-
-// isMCPClient returns true for MCP clients that receive short-lived tokens + refresh tokens.
-func (s *OAuthService) isMCPClient(clientID string) bool {
-	if s.mcpStaticClients[clientID] {
-		return true
-	}
-	if s.mcpClientPrefix != "" {
-		return strings.HasPrefix(clientID, s.mcpClientPrefix)
-	}
-	return false
-}
 
 // parseScopeString splits a space-delimited scope string into a slice.
 func parseScopeString(scope string) []string {

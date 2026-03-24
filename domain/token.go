@@ -75,7 +75,7 @@ type OAuthClient struct {
 	ClientID     string    `bun:"client_id"         json:"client_id"`
 	ClientSecret string    `bun:"client_secret"     json:"-"`
 	Name         string    `bun:"name"              json:"name"`
-	IdentityID   string    `bun:"identity_id"       json:"identity_id,omitempty"`
+	IdentityID   string    `bun:"identity_id,nullzero" json:"identity_id,omitempty"`
 	GrantTypes   []string  `bun:"grant_types,array" json:"grant_types"`
 	RedirectURIs []string  `bun:"redirect_uris,array" json:"redirect_uris"`
 	Scopes       []string  `bun:"scopes,array"      json:"scopes"`
