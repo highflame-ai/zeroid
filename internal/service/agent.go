@@ -170,8 +170,8 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 	return &resp, nil
 }
 
-// ListAgents lists agents for a tenant, optionally filtered by identity_type and label.
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID, identityType, label string, limit, offset int) (*AgentListResponse, error) {
+// ListAgents lists agents for a tenant, optionally filtered by identity_type(s) and label.
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, limit, offset int) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -179,7 +179,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID, ide
 		offset = 0
 	}
 
-	identities, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityType, label)
+	identities, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label)
 	if err != nil {
 		return nil, err
 	}

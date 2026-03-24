@@ -51,6 +51,10 @@ const (
 // testServer is the shared httptest.Server for all tests in this package.
 var testServer *httptest.Server
 
+// testZeroIDServer is the zeroid.Server instance, exposed for tests that need
+// direct access to server methods (e.g., IdentityExists).
+var testZeroIDServer *zeroid.Server
+
 // testServerPrivKey is the server's ECDSA signing key, accessible so tests can
 // build valid assertions without going through disk files.
 var testServerPrivKey *ecdsa.PrivateKey
@@ -158,13 +162,14 @@ func runTests(m *testing.M) int {
 		return 1
 	}
 
+	testZeroIDServer = srv
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 
 	// Register the CLI and MCP test clients in the oauth_clients table.
 	// These are public PKCE clients — no client_secret, no linked identity.
-	registerTestOAuthClient(testCLIClientID, false)
-	registerTestOAuthClient(testMCPClientID, true)
+	registerTestOAuthClient(testCLIClientID, []string{"authorization_code"})
+	registerTestOAuthClient(testMCPClientID, []string{"authorization_code", "refresh_token"})
 
 	return m.Run()
 }
@@ -415,15 +420,16 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 	}, nil
 }
 
-// registerTestOAuthClient registers a public PKCE client (CLI or MCP) in the
-// oauth_clients table. Called once in TestMain before any tests run.
-func registerTestOAuthClient(clientID string, isMCP bool) {
+// registerTestOAuthClient registers a public PKCE client in the oauth_clients
+// table. Called once in TestMain before any tests run.
+// grantTypes controls token behaviour: include "refresh_token" for MCP-style
+// short-lived tokens with refresh rotation.
+func registerTestOAuthClient(clientID string, grantTypes []string) {
 	body, _ := json.Marshal(map[string]any{
 		"name":          clientID + "-test-client",
 		"client_id":     clientID,
-		"grant_types":   []string{"authorization_code"},
+		"grant_types":   grantTypes,
 		"redirect_uris": []string{testRedirectURI},
-		"is_mcp":        isMCP,
 	})
 	req, _ := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/oauth/clients", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

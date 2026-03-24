@@ -1,0 +1,21 @@
+title: Idea / Proposal
+labels: ["idea"]
+
+body:
+  - type: textarea
+    attributes:
+      label: Describe the idea
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Problem Statement
+
+  - type: textarea
+    attributes:
+      label: Proposed Solution
+
+  - type: textarea
+    attributes:
+      label: Impact

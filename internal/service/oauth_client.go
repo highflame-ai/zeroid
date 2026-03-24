@@ -105,9 +105,10 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, accountID, proj
 // linked agent identity — the user authenticates separately.
 //
 // clientID is the string the client presents in the authorization_code exchange.
-// isMCP controls token issuance behaviour: MCP clients receive short-lived (1h)
-// access tokens plus rotating refresh tokens; CLI clients receive 90-day tokens.
-func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID, projectID, name, clientID string, isMCP bool, redirectURIs, grantTypes, scopes []string) (*domain.OAuthClient, error) {
+// Token issuance behaviour is derived from grant_types: clients registered with
+// "refresh_token" receive short-lived (1h) access tokens plus rotating refresh
+// tokens; clients without it receive long-lived (90-day) tokens.
+func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID, projectID, name, clientID string, redirectURIs, grantTypes, scopes []string) (*domain.OAuthClient, error) {
 	if accountID == "" || projectID == "" || name == "" || clientID == "" {
 		return nil, fmt.Errorf("accountID, projectID, name, and clientID are required")
 	}
@@ -133,7 +134,6 @@ func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID
 		GrantTypes:   grantTypes,
 		RedirectURIs: redirectURIs,
 		Scopes:       scopes,
-		IsMCP:        isMCP,
 		IsActive:     true,
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -150,7 +150,6 @@ func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID
 		Str("client_id", clientID).
 		Str("account_id", accountID).
 		Str("project_id", projectID).
-		Bool("is_mcp", isMCP).
 		Msg("OAuth2 public client registered")
 
 	return client, nil
