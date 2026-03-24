@@ -23,4 +23,4 @@ The OpenID Foundation, NIST, and WIMSE all identify agent identity as a critical
 
 ---
 
-**Get Involved:** Star the repo and join our [Discord](https://discord.gg/zeroid) for early access!
+**Get Involved:** Star the repo to follow our progress!
