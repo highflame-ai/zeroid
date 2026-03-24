@@ -135,14 +135,12 @@ func runTests(m *testing.M) int {
 			RSAKeyID:          "test-rsa-1",
 		},
 		Token: zeroid.TokenConfig{
-			Issuer:           testIssuer,
-			BaseURL:          testIssuer,
-			DefaultTTL:       3600,
-			MaxTTL:           90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
-			HMACSecret:       testHMACSecret,
-			AuthCodeIssuer:   testIssuer,
-			ValidClientIDs:   []string{testCLIClientID, testMCPClientID},
-			MCPStaticClients: []string{testMCPClientID},
+			Issuer:         testIssuer,
+			BaseURL:        testIssuer,
+			DefaultTTL:     3600,
+			MaxTTL:         90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
+			HMACSecret:     testHMACSecret,
+			AuthCodeIssuer: testIssuer,
 		},
 		Telemetry: zeroid.TelemetryConfig{
 			Enabled: false,
@@ -162,6 +160,11 @@ func runTests(m *testing.M) int {
 
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
+
+	// Register the CLI and MCP test clients in the oauth_clients table.
+	// These are public PKCE clients — no client_secret, no linked identity.
+	registerTestOAuthClient(testCLIClientID, false)
+	registerTestOAuthClient(testMCPClientID, true)
 
 	return m.Run()
 }
@@ -410,6 +413,27 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 		os.Remove(privFile.Name())
 		os.Remove(pubFile.Name())
 	}, nil
+}
+
+// registerTestOAuthClient registers a public PKCE client (CLI or MCP) in the
+// oauth_clients table. Called once in TestMain before any tests run.
+func registerTestOAuthClient(clientID string, isMCP bool) {
+	body, _ := json.Marshal(map[string]any{
+		"name":          clientID + "-test-client",
+		"client_id":     clientID,
+		"grant_types":   []string{"authorization_code"},
+		"redirect_uris": []string{testRedirectURI},
+		"is_mcp":        isMCP,
+	})
+	req, _ := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/oauth/clients", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Account-ID", testAccountID)
+	req.Header.Set("X-Project-ID", testProjectID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || (resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict) {
+		panic(fmt.Sprintf("registerTestOAuthClient(%s): unexpected status %v err %v", clientID, resp.StatusCode, err))
+	}
+	resp.Body.Close()
 }
 
 // agentRegistration holds the response from POST /api/v1/agents/register.

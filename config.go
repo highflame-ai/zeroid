@@ -80,13 +80,6 @@ type TokenConfig struct {
 	// AuthCodeIssuer is the expected issuer claim in auth code JWTs.
 	// Defaults to Token.Issuer when empty.
 	AuthCodeIssuer string `koanf:"auth_code_issuer"`
-	// ValidClientIDs is the set of client IDs allowed to use the authorization_code grant.
-	ValidClientIDs []string `koanf:"valid_client_ids"`
-	// MCPClientPrefix enables dynamic MCP client registration — any client_id starting
-	// with this prefix is treated as an MCP client (short-lived token + refresh token).
-	MCPClientPrefix string `koanf:"mcp_client_prefix"`
-	// MCPStaticClients lists static client IDs that are MCP clients.
-	MCPStaticClients []string `koanf:"mcp_static_clients"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.

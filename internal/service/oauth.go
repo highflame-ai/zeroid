@@ -32,14 +32,8 @@ type OAuthService struct {
 	refreshTokenSvc *RefreshTokenService
 	issuer          string
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
-	hmacSecret      string // HS256 shared secret for auth code JWT verification
-	authCodeIssuer  string // expected issuer in auth code JWTs
-	// validClientIDs is the set of recognised static client IDs.
-	validClientIDs map[string]bool
-	// mcpClientPrefix is the prefix for dynamically registered MCP client IDs.
-	mcpClientPrefix string
-	// mcpStaticClients lists static client IDs that are MCP clients (short-lived tokens + refresh).
-	mcpStaticClients map[string]bool
+	hmacSecret     string // HS256 shared secret for auth code JWT verification
+	authCodeIssuer string // expected issuer in auth code JWTs
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -70,13 +64,10 @@ type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, 
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
-	Issuer           string
-	WIMSEDomain      string
-	HMACSecret       string
-	AuthCodeIssuer   string
-	ValidClientIDs   map[string]bool
-	MCPClientPrefix  string
-	MCPStaticClients map[string]bool
+	Issuer          string
+	WIMSEDomain     string
+	HMACSecret      string
+	AuthCodeIssuer  string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -102,11 +93,8 @@ func NewOAuthService(
 		refreshTokenSvc:  refreshTokenSvc,
 		issuer:           cfg.Issuer,
 		wimseDomain:      cfg.WIMSEDomain,
-		hmacSecret:       cfg.HMACSecret,
-		authCodeIssuer:   cfg.AuthCodeIssuer,
-		validClientIDs:   cfg.ValidClientIDs,
-		mcpClientPrefix:  cfg.MCPClientPrefix,
-		mcpStaticClients:       cfg.MCPStaticClients,
+		hmacSecret:              cfg.HMACSecret,
+		authCodeIssuer:          cfg.AuthCodeIssuer,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
 }
@@ -617,19 +605,19 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // Auth codes are HS256 JWTs containing all tenant context.
 // MCP clients receive short-lived access tokens + refresh tokens.
 // CLI clients receive long-lived access tokens (90 days).
+// MCP clients (is_mcp=true in oauth_clients) receive short-lived (1h) tokens
+// plus a rotating refresh token.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
 		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
-	}
-
-	if !s.isValidClientID(req.ClientID) {
-		return nil, oauthUnauthorized("unknown client_id", nil)
 	}
 
 	if s.hmacSecret == "" {
 		return nil, oauthServerError("authorization_code grant requires HMAC secret to be configured", nil)
 	}
 
+	// Decode the auth code first — tenant context (account_id, project_id) lives
+	// inside the signed JWT, not in caller-supplied headers.
 	authCode, err := decodeAuthCodeJWT(req.Code, s.hmacSecret, s.authCodeIssuer)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "invalid authorization code", err)
@@ -637,6 +625,26 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	if authCode.ClientID != req.ClientID {
 		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
+	}
+
+	// Look up the client in the registry — this is the authoritative check.
+	// GetPublicClient verifies the client is active and registered; no secret
+	// is required because PKCE provides the proof of possession.
+	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID, authCode.AccountID, authCode.ProjectID)
+	if err != nil {
+		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	}
+
+	// Verify the client is authorised to use the authorization_code grant.
+	grantAllowed := false
+	for _, g := range oauthClient.GrantTypes {
+		if g == string(domain.GrantTypeAuthorizationCode) {
+			grantAllowed = true
+			break
+		}
+	}
+	if !grantAllowed {
+		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
 	}
 
 	if normalizeLoopback(authCode.RedirectURI) != normalizeLoopback(req.RedirectURI) {
@@ -647,9 +655,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
-	isMCP := s.isMCPClient(req.ClientID)
 	ttl := 90 * 24 * 3600 // 90 days for CLI clients
-	if isMCP {
+	if oauthClient.IsMCP {
 		ttl = 3600 // 1 hour for MCP clients
 	}
 
@@ -678,7 +685,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	accessToken.UserID = authCode.UserID
 
 	// Issue refresh token for MCP clients only.
-	if isMCP && s.refreshTokenSvc != nil {
+	if oauthClient.IsMCP && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:  req.ClientID,
 			AccountID: authCode.AccountID,
@@ -876,27 +883,6 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	return parts[0], parts[1], nil
 }
 
-// isValidClientID checks if a client ID is registered or is a dynamic MCP client.
-func (s *OAuthService) isValidClientID(clientID string) bool {
-	if s.validClientIDs[clientID] {
-		return true
-	}
-	if s.mcpClientPrefix != "" {
-		return strings.HasPrefix(clientID, s.mcpClientPrefix)
-	}
-	return false
-}
-
-// isMCPClient returns true for MCP clients that receive short-lived tokens + refresh tokens.
-func (s *OAuthService) isMCPClient(clientID string) bool {
-	if s.mcpStaticClients[clientID] {
-		return true
-	}
-	if s.mcpClientPrefix != "" {
-		return strings.HasPrefix(clientID, s.mcpClientPrefix)
-	}
-	return false
-}
 
 // parseScopeString splits a space-delimited scope string into a slice.
 func parseScopeString(scope string) []string {
