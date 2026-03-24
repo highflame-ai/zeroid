@@ -1,0 +1,20 @@
+title: Support / Question
+labels: ["question"]
+
+body:
+  - type: textarea
+    attributes:
+      label: Describe your issue / question
+    validations:
+      required: true
+
+  - type: textarea
+    attributes:
+      label: Additional Details
+
+  - type: checkboxes
+    attributes:
+      label: Checklist
+      options:
+        - label: I have checked existing issues/discussions
+          required: true
