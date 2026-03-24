@@ -7,7 +7,7 @@ Enterprises want to deploy AI agents, but security teams are rightly blocking th
 ### See it in Action
 We show the main OpenClaw agent with full permissions delegate a restricted, write-only scope to a sub-agent, followed by a cascading revocation that instantly terminates access for the entire agent chain.
 
-https://github.com/user-attachments/assets/bbee9eb6-34fd-4c13-9eb6-fdb011f870eb
+[ZeroID + OpenClaw Demo](https://youtu.be/msboKc9XqRc)
 
 ---
 
@@ -24,3 +24,4 @@ The OpenID Foundation, NIST, and WIMSE all identify agent identity as a critical
 ---
 
 **Get Involved:** Star the repo to follow our progress!
+
