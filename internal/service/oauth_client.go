@@ -35,12 +35,13 @@ func NewOAuthClientService(repo *postgres.OAuthClientRepository) *OAuthClientSer
 	return &OAuthClientService{repo: repo}
 }
 
-// RegisterClient creates a new OAuth2 client, hashing the secret with bcrypt.
-// Returns the created client with the plain-text secret (only shown once).
+// RegisterClient creates a new confidential OAuth2 client (M2M flows).
+// Generates and bcrypt-hashes a client secret.
+// Returns the created client and the plain-text secret (shown once only).
 //
-// externalID is used as the client_id (must match the identity's external_id
-// so client_credentials grant can resolve the identity). identityID is the
-// identity UUID to link to. Both are required.
+// externalID is used as the client_id and must correspond to a registered
+// identity so the client_credentials grant can resolve the identity.
+// identityID is that identity's UUID. Both are required for M2M clients.
 func (s *OAuthClientService) RegisterClient(ctx context.Context, accountID, projectID, name string, grantTypes, scopes []string, externalID, identityID string) (*domain.OAuthClient, string, error) {
 	if accountID == "" || projectID == "" || name == "" {
 		return nil, "", fmt.Errorf("accountID, projectID, and name are required")
@@ -94,9 +95,77 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, accountID, proj
 		Str("client_id", externalID).
 		Str("account_id", accountID).
 		Str("project_id", projectID).
-		Msg("OAuth2 client registered")
+		Msg("OAuth2 confidential client registered")
 
 	return client, plainSecret, nil
+}
+
+// RegisterPublicClient creates a public OAuth2 client for user-facing flows
+// (authorization_code + PKCE). Public clients have no client_secret and no
+// linked agent identity — the user authenticates separately.
+//
+// clientID is the string the client presents in the authorization_code exchange.
+// Token issuance behaviour is derived from grant_types: clients registered with
+// "refresh_token" receive short-lived (1h) access tokens plus rotating refresh
+// tokens; clients without it receive long-lived (90-day) tokens.
+func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID, projectID, name, clientID string, redirectURIs, grantTypes, scopes []string) (*domain.OAuthClient, error) {
+	if accountID == "" || projectID == "" || name == "" || clientID == "" {
+		return nil, fmt.Errorf("accountID, projectID, name, and clientID are required")
+	}
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code"}
+	}
+	if redirectURIs == nil {
+		redirectURIs = []string{}
+	}
+	if scopes == nil {
+		scopes = []string{}
+	}
+
+	now := time.Now()
+	client := &domain.OAuthClient{
+		ID:           uuid.New().String(),
+		AccountID:    accountID,
+		ProjectID:    projectID,
+		ClientID:     clientID,
+		ClientSecret: "", // public client — no secret
+		Name:         name,
+		IdentityID:   "", // user-facing — no linked agent identity
+		GrantTypes:   grantTypes,
+		RedirectURIs: redirectURIs,
+		Scopes:       scopes,
+		IsActive:     true,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if err := s.repo.Create(ctx, client); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, ErrOAuthClientAlreadyExists
+		}
+		return nil, fmt.Errorf("failed to register public client: %w", err)
+	}
+
+	log.Info().
+		Str("client_id", clientID).
+		Str("account_id", accountID).
+		Str("project_id", projectID).
+		Msg("OAuth2 public client registered")
+
+	return client, nil
+}
+
+// GetPublicClient retrieves a registered client by client_id without validating
+// a secret. Used by the authorization_code grant to look up public PKCE clients.
+func (s *OAuthClientService) GetPublicClient(ctx context.Context, clientID, accountID, projectID string) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetByClientID(ctx, clientID, accountID, projectID)
+	if err != nil {
+		return nil, ErrOAuthClientNotFound
+	}
+	if !client.IsActive {
+		return nil, ErrOAuthClientNotFound
+	}
+	return client, nil
 }
 
 // GetClient retrieves a client by UUID, scoped to tenant.

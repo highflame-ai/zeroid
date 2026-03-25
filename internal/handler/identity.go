@@ -209,7 +209,7 @@ func (a *API) listIdentitiesOp(ctx context.Context, _ *struct{}) (*IdentityListO
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	identities, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, "", "")
+	identities, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, nil, "")
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")

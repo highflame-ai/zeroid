@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -44,7 +45,32 @@ type TokenInput struct {
 }
 
 type TokenOutput struct {
-	Body any // domain.AccessToken — dynamic shape per RFC 6749
+	Status int
+	Body   any // domain.AccessToken on success; oauthErrorBody on error
+}
+
+// oauthErrorBody is the RFC 6749 §5.2 token error response.
+type oauthErrorBody struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}
+
+// extractOAuthError maps a service-layer error to an OAuth 2.0 error code,
+// description, and HTTP status per RFC 6749 §5.2.
+func extractOAuthError(err error) (code, description string, status int) {
+	// Structured OAuthError from the service layer — preferred path.
+	var oauthErr *service.OAuthError
+	if errors.As(err, &oauthErr) {
+		return oauthErr.Code, oauthErr.Description, oauthErr.HTTPStatus
+	}
+	// Sentinel errors from deeper service layers (credential, policy).
+	if errors.Is(err, service.ErrPolicyViolation) {
+		return "policy_violation", err.Error(), http.StatusBadRequest
+	}
+	if errors.Is(err, service.ErrScopesNotAllowed) {
+		return "insufficient_scope", err.Error(), http.StatusBadRequest
+	}
+	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
 }
 
 type IntrospectInput struct {
@@ -133,10 +159,14 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
-		return nil, huma.Error400BadRequest("token request failed")
+		code, desc, status := extractOAuthError(err)
+		return &TokenOutput{
+			Status: status,
+			Body:   oauthErrorBody{Error: code, ErrorDescription: desc},
+		}, nil
 	}
 
-	return &TokenOutput{Body: accessToken}, nil
+	return &TokenOutput{Status: http.StatusOK, Body: accessToken}, nil
 }
 
 func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*IntrospectOutput, error) {
