@@ -43,6 +43,21 @@ func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID, acc
 	return client, nil
 }
 
+// GetPublicByClientID retrieves a public client by its OAuth2 client_id only.
+// Public PKCE clients are registered globally — tenant scoping is not required
+// because the tenant comes from the auth code JWT, not the client registration.
+func (r *OAuthClientRepository) GetPublicByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
+	client := &domain.OAuthClient{}
+	err := r.db.NewSelect().Model(client).
+		Where("client_id = ?", clientID).
+		Where("client_secret = ''").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public oauth client: %w", err)
+	}
+	return client, nil
+}
+
 // GetByID retrieves a client by its UUID, scoped to tenant.
 func (r *OAuthClientRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}

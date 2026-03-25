@@ -155,10 +155,11 @@ func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID
 	return client, nil
 }
 
-// GetPublicClient retrieves a registered client by client_id without validating
-// a secret. Used by the authorization_code grant to look up public PKCE clients.
-func (s *OAuthClientService) GetPublicClient(ctx context.Context, clientID, accountID, projectID string) (*domain.OAuthClient, error) {
-	client, err := s.repo.GetByClientID(ctx, clientID, accountID, projectID)
+// GetPublicClient retrieves a registered public PKCE client by client_id.
+// Public clients are registered globally (no tenant scoping) because the tenant
+// comes from the auth code JWT, not the client registration.
+func (s *OAuthClientService) GetPublicClient(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetPublicByClientID(ctx, clientID)
 	if err != nil {
 		return nil, ErrOAuthClientNotFound
 	}

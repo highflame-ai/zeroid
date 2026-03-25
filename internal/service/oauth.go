@@ -639,7 +639,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Look up the client in the registry — this is the authoritative check.
 	// GetPublicClient verifies the client is active and registered; no secret
 	// is required because PKCE provides the proof of possession.
-	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID, authCode.AccountID, authCode.ProjectID)
+	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
 	if err != nil {
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
 	}

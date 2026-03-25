@@ -455,7 +455,7 @@ type PublicClientConfig struct {
 // EnsurePublicClient registers a public PKCE OAuth client if it doesn't already exist.
 // Idempotent — safe to call on every startup.
 func (s *Server) EnsurePublicClient(ctx context.Context, cfg PublicClientConfig) error {
-	_, err := s.oauthClientSvc.GetPublicClient(ctx, cfg.ClientID, cfg.AccountID, cfg.ProjectID)
+	_, err := s.oauthClientSvc.GetPublicClient(ctx, cfg.ClientID)
 	if err == nil {
 		return nil // already exists
 	}
