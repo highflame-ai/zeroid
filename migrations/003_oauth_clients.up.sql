@@ -3,12 +3,9 @@
 
 CREATE TABLE IF NOT EXISTS oauth_clients (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    account_id    VARCHAR(255) NOT NULL,
-    project_id    VARCHAR(255) NOT NULL,
     client_id     VARCHAR(255) NOT NULL,
     client_secret VARCHAR(255),
     name          VARCHAR(255) NOT NULL,
-    identity_id   UUID REFERENCES identities(id) ON DELETE SET NULL,
     grant_types   TEXT[] NOT NULL DEFAULT '{"client_credentials"}',
     redirect_uris TEXT[] NOT NULL DEFAULT '{}',
     scopes        TEXT[] NOT NULL DEFAULT '{}',
@@ -17,11 +14,8 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_oauth_clients_tenant
-    ON oauth_clients (account_id, project_id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_clients_tenant_client_id
-    ON oauth_clients (account_id, project_id, client_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_clients_client_id
+    ON oauth_clients (client_id);
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),

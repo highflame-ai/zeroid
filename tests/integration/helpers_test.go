@@ -309,16 +309,17 @@ func registerIdentity(t *testing.T, externalID string, scopes []string, publicKe
 	}
 }
 
-// registerOAuthClient calls POST /api/v1/oauth/clients using external_id
-// (ZeroID auto-generates the client secret) and returns client_id + client_secret.
-func registerOAuthClient(t *testing.T, externalID string, scopes []string) oauthClientResp {
+// registerOAuthClient creates a confidential M2M OAuth client via POST /api/v1/oauth/clients.
+// Returns client_id + client_secret. Identity link happens at token issuance, not registration.
+func registerOAuthClient(t *testing.T, clientID string, scopes []string) oauthClientResp {
 	t.Helper()
 	resp := post(t, "/api/v1/oauth/clients", map[string]any{
-		"name":        externalID + "-client",
-		"external_id": externalID,
-		"grant_types": []string{"client_credentials"},
-		"scopes":      scopes,
-	}, adminHeaders())
+		"client_id":    clientID,
+		"name":         clientID + "-client",
+		"confidential": true,
+		"grant_types":  []string{"client_credentials"},
+		"scopes":       scopes,
+	}, nil)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerOAuthClient: expected 201")
 	raw := decode(t, resp)
 	client := raw["client"].(map[string]any)
@@ -420,26 +421,21 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 	}, nil
 }
 
-// registerTestOAuthClient registers a public PKCE client in the oauth_clients
-// table. Called once in TestMain before any tests run.
+// registerTestOAuthClient registers a global public PKCE client via Server.EnsurePublicClient.
+// Called once in TestMain before any tests run.
+// Public clients are global — no tenant scoping. Tenant comes from the auth code JWT.
 // grantTypes controls token behaviour: include "refresh_token" for MCP-style
 // short-lived tokens with refresh rotation.
 func registerTestOAuthClient(clientID string, grantTypes []string) {
-	body, _ := json.Marshal(map[string]any{
-		"name":          clientID + "-test-client",
-		"client_id":     clientID,
-		"grant_types":   grantTypes,
-		"redirect_uris": []string{testRedirectURI},
+	err := testZeroIDServer.EnsurePublicClient(context.Background(), zeroid.PublicClientConfig{
+		ClientID:     clientID,
+		Name:         clientID + "-test-client",
+		GrantTypes:   grantTypes,
+		RedirectURIs: []string{testRedirectURI},
 	})
-	req, _ := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/oauth/clients", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Account-ID", testAccountID)
-	req.Header.Set("X-Project-ID", testProjectID)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || (resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict) {
-		panic(fmt.Sprintf("registerTestOAuthClient(%s): unexpected status %v err %v", clientID, resp.StatusCode, err))
+	if err != nil {
+		panic(fmt.Sprintf("registerTestOAuthClient(%s): %v", clientID, err))
 	}
-	resp.Body.Close()
 }
 
 // agentRegistration holds the response from POST /api/v1/agents/register.

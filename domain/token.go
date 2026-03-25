@@ -63,19 +63,17 @@ type AccessToken struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-// OAuthClient represents a registered OAuth2 client scoped to a tenant.
+// OAuthClient represents a registered OAuth2 client.
+// Clients are global — tenant scoping happens at token issuance time, not client registration.
 // The ClientSecret field stores a bcrypt hash and is never serialised to JSON.
 // For public clients (PKCE), ClientSecret is empty.
 type OAuthClient struct {
 	bun.BaseModel `bun:"table:oauth_clients"`
 
 	ID           string    `bun:"id,pk"             json:"id"`
-	AccountID    string    `bun:"account_id"        json:"account_id"`
-	ProjectID    string    `bun:"project_id"        json:"project_id"`
 	ClientID     string    `bun:"client_id"         json:"client_id"`
 	ClientSecret string    `bun:"client_secret"     json:"-"`
 	Name         string    `bun:"name"              json:"name"`
-	IdentityID   string    `bun:"identity_id,nullzero" json:"identity_id,omitempty"`
 	GrantTypes   []string  `bun:"grant_types,array" json:"grant_types"`
 	RedirectURIs []string  `bun:"redirect_uris,array" json:"redirect_uris"`
 	Scopes       []string  `bun:"scopes,array"      json:"scopes"`
