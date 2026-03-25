@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"time"
@@ -26,6 +29,30 @@ type IdentityService struct {
 // NewIdentityService creates a new IdentityService.
 func NewIdentityService(repo *postgres.IdentityRepository, wimseDomain string) *IdentityService {
 	return &IdentityService{repo: repo, wimseDomain: wimseDomain}
+}
+
+// validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
+// Returns nil if keyPEM is empty (the field is optional).
+func validateECPublicKeyPEM(keyPEM string) error {
+	if keyPEM == "" {
+		return nil
+	}
+	block, _ := pem.Decode([]byte(keyPEM))
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return errors.New("invalid public_key_pem: must be a PEM block of type PUBLIC KEY")
+	}
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("invalid public_key_pem: %w", err)
+	}
+	ecKey, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return errors.New("invalid public_key_pem: not an ECDSA key")
+	}
+	if ecKey.Curve.Params().Name != "P-256" {
+		return fmt.Errorf("invalid public_key_pem: must use P-256 curve, got %s", ecKey.Curve.Params().Name)
+	}
+	return nil
 }
 
 // RegisterIdentityRequest holds parameters for identity registration.
@@ -84,6 +111,9 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if req.Metadata == nil {
 		req.Metadata = json.RawMessage("{}")
+	}
+	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		return nil, err
 	}
 
 	identity := &domain.Identity{
@@ -195,6 +225,9 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.AllowedScopes = req.AllowedScopes
 	}
 	if req.PublicKeyPEM != "" {
+		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+			return nil, err
+		}
 		identity.PublicKeyPEM = req.PublicKeyPEM
 	}
 	if req.Framework != nil {

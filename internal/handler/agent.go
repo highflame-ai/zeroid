@@ -52,6 +52,7 @@ type RegisterAgentInput struct {
 		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
 		CreatedBy    string          `json:"created_by,omitempty" doc:"User ID of the creator"`
+		PublicKeyPEM string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
@@ -211,6 +212,7 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		Labels:       input.Body.Labels,
 		Metadata:     input.Body.Metadata,
 		CreatedBy:    createdBy,
+		PublicKeyPEM: input.Body.PublicKeyPEM,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {

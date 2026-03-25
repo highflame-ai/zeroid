@@ -45,6 +45,7 @@ type RegisterAgentRequest struct {
 	Labels       json.RawMessage
 	Metadata     json.RawMessage
 	CreatedBy    string
+	PublicKeyPEM string
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -127,6 +128,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		Labels:       req.Labels,
 		Metadata:     req.Metadata,
 		CreatedBy:    req.CreatedBy,
+		PublicKeyPEM: req.PublicKeyPEM,
 	})
 	if err != nil {
 		return nil, err
