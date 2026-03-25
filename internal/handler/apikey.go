@@ -20,6 +20,7 @@ type CreateAPIKeyInput struct {
 		Name          string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
 		Description   string          `json:"description,omitempty" doc:"Key description"`
 		IdentityID    string          `json:"identity_id,omitempty" doc:"Optional identity link"`
+		Product       string          `json:"product,omitempty" doc:"Product namespace for key scoping"`
 		Scopes        []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
 		Environment   string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
 		ExpiresInDays *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
@@ -40,8 +41,11 @@ type APIKeyOutput struct {
 }
 
 type APIKeyListInput struct {
-	Page  int `query:"page" default:"1" doc:"Page number"`
-	Limit int `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Product       string `query:"product" doc:"Filter by product namespace"`
+	ApplicationID string `query:"application_id" doc:"Filter by application identity ID"`
+	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
+	Page          int    `query:"page" default:"1" doc:"Page number"`
+	Limit         int    `query:"limit" default:"20" doc:"Items per page (max 100)"`
 }
 
 type APIKeyListOutput struct {
@@ -118,6 +122,7 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Name:          input.Body.Name,
 		Description:   input.Body.Description,
 		IdentityID:    input.Body.IdentityID,
+		Product:       input.Body.Product,
 		Scopes:        input.Body.Scopes,
 		Environment:   input.Body.Environment,
 		ExpiresInDays: input.Body.ExpiresInDays,
@@ -150,7 +155,7 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, "", "", input.Page, input.Limit)
+	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, input.ApplicationID, input.Product, input.Label, input.Page, input.Limit)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")
@@ -159,6 +164,7 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 	if keys == nil {
 		keys = []*domain.APIKey{}
 	}
+
 	out := &APIKeyListOutput{}
 	out.Body.Keys = keys
 	out.Body.Total = total

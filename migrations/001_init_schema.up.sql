@@ -145,7 +145,6 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     token_hash  TEXT NOT NULL UNIQUE,
     client_id   TEXT NOT NULL,
     account_id  VARCHAR(255) NOT NULL,
-    gateway_id  TEXT DEFAULT '',
     project_id  VARCHAR(255) DEFAULT '',
     user_id     TEXT NOT NULL,
     identity_id UUID REFERENCES identities(id) ON DELETE SET NULL,

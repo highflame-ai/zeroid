@@ -36,6 +36,7 @@ type APIKey struct {
 	IdentityID         string          `bun:"identity_id,type:uuid"    json:"identity_id"`
 	CreatedBy          string          `bun:"created_by"               json:"created_by"`
 	Scopes             []string        `bun:"scopes,array"             json:"scopes"`
+	Product            string          `bun:"product"                  json:"product"`
 	Environment        string          `bun:"environment"              json:"environment"`
 	ExpiresAt          *time.Time      `bun:"expires_at"               json:"expires_at,omitempty"`
 	State              string          `bun:"state"                    json:"state"`

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -68,25 +69,34 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id string) (*domain.APIK
 }
 
 // ListByAccountProject returns paginated API keys for an account/project,
-// optionally filtered by application ID.
-func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID, applicationID, product string, limit, offset int) ([]*domain.APIKey, int, error) {
+// optionally filtered by application ID, product, or identity label.
+// The label parameter accepts "key:value" format (e.g. "env:production")
+// and filters by joining on the identities table using JSONB containment.
+func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID, applicationID, product, label string, limit, offset int) ([]*domain.APIKey, int, error) {
 	var keys []*domain.APIKey
 
 	q := r.db.NewSelect().
 		Model(&keys).
-		Where("account_id = ?", accountID).
-		OrderExpr("created_at DESC").
+		Where("sk.account_id = ?", accountID).
+		OrderExpr("sk.created_at DESC").
 		Limit(limit).
 		Offset(offset)
 
 	if projectID != "" {
-		q = q.Where("project_id = ?", projectID)
+		q = q.Where("sk.project_id = ?", projectID)
 	}
 	if applicationID != "" {
-		q = q.Where("identity_id = ?", applicationID)
+		q = q.Where("sk.identity_id = ?", applicationID)
 	}
 	if product != "" {
-		q = q.Where("product = ?", product)
+		q = q.Where("sk.product = ?", product)
+	}
+	if label != "" {
+		parts := strings.SplitN(label, ":", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			q = q.Join("JOIN identities AS i ON i.id = sk.identity_id").
+				Where("i.labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
+		}
 	}
 
 	count, err := q.ScanAndCount(ctx)

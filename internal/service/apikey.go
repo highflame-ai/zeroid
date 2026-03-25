@@ -42,6 +42,7 @@ type CreateAPIKeyRequest struct {
 	Description        string
 	IdentityID         string
 	CredentialPolicyID string // Optional — if empty, the tenant's default policy is assigned.
+	Product            string
 	Scopes             []string
 	Environment        string
 	ExpiresInDays      *int
@@ -63,9 +64,20 @@ type CreateAPIKeyResponse struct {
 
 // CreateKey generates a new API key, hashes it, stores the hash, and returns the full key once.
 // Every key is linked to an identity and assigned a credential policy.
-// If IdentityID is empty, no identity link is set.
+// If IdentityID is empty and Product is set, a service identity is auto-provisioned
+// (or reused if one already exists for this account+project+product).
 // If CredentialPolicyID is empty, the tenant's default policy is auto-created and assigned.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	// Ensure every key has an identity link.
+	// When no identity is provided, auto-provision a service identity for the product.
+	if req.IdentityID == "" && req.Product != "" {
+		identity, err := s.identitySvc.EnsureServiceIdentity(ctx, req.AccountID, req.ProjectID, req.Product, req.CreatedBy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to ensure service identity for product %s: %w", req.Product, err)
+		}
+		req.IdentityID = identity.ID
+	}
+
 	// Ensure the key has a credential policy.
 	policyID := req.CredentialPolicyID
 	if policyID == "" {
@@ -114,6 +126,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		IdentityID:         req.IdentityID,
 		CreatedBy:          req.CreatedBy,
 		CredentialPolicyID: policyID,
+		Product:            req.Product,
 		Scopes:             scopes,
 		Environment:        env,
 		ExpiresAt:          expiresAt,
@@ -145,7 +158,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 }
 
 // ListKeys returns paginated API keys for an account/project.
-func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, applicationID, product string, page, limit int) ([]*domain.APIKey, int, error) {
+func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, applicationID, product, label string, page, limit int) ([]*domain.APIKey, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -154,7 +167,7 @@ func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, appl
 	}
 	offset := (page - 1) * limit
 
-	return s.repo.ListByAccountProject(ctx, accountID, projectID, applicationID, product, limit, offset)
+	return s.repo.ListByAccountProject(ctx, accountID, projectID, applicationID, product, label, limit, offset)
 }
 
 // GetKey returns an API key by ID.
