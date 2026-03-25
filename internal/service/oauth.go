@@ -177,8 +177,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for client_credentials grant")
 	}
 
-	// Validate client credentials against the oauth_clients table, scoped to tenant.
-	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret, req.AccountID, req.ProjectID)
+	// Validate client credentials against the oauth_clients table.
+	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
 	if err != nil {
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
 			return nil, oauthUnauthorized("invalid client credentials", err)
@@ -202,8 +202,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	scopes := intersectScopes(parseScopeString(req.Scope), client.Scopes)
 
 	// Resolve the identity for this client (external_id == client_id within the tenant).
-	// Tenant is derived from the client record — not from caller-supplied headers.
-	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, client.AccountID, client.ProjectID)
+	// Tenant comes from the token request — client registration is global.
+	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
 	if err != nil {
 		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 	}

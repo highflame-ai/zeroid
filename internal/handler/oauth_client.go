@@ -84,7 +84,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 		OperationID: "list-oauth-clients",
 		Method:      http.MethodGet,
 		Path:        "/api/v1/oauth/clients",
-		Summary:     "List OAuth2 clients for the current tenant",
+		Summary:     "List all registered OAuth2 clients",
 		Tags:        []string{"OAuth Clients"},
 	}, a.listOAuthClientsOp)
 
@@ -106,11 +106,6 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 }
 
 func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientInput) (*OAuthClientCreatedOutput, error) {
-	tenant, err := internalMiddleware.GetTenant(ctx)
-	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
-	}
-
 	if input.Body.ExternalID == "" && input.Body.ClientID == "" {
 		return nil, huma.Error400BadRequest("provide either external_id (M2M client) or client_id (public PKCE client)")
 	}
@@ -122,13 +117,17 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 
 	if input.Body.ExternalID != "" {
 		// Confidential M2M client — resolve the linked agent identity.
+		// Tenant context is needed to look up the identity by external_id.
+		tenant, err := internalMiddleware.GetTenant(ctx)
+		if err != nil {
+			return nil, huma.Error401Unauthorized("missing tenant context (required for M2M client identity lookup)")
+		}
 		identity, idErr := a.identitySvc.GetIdentityByExternalID(ctx, input.Body.ExternalID, tenant.AccountID, tenant.ProjectID)
 		if idErr != nil {
 			return nil, huma.Error404NotFound("no identity found with external_id: " + input.Body.ExternalID)
 		}
 		client, plainSecret, regErr := a.oauthClientSvc.RegisterClient(
-			ctx, tenant.AccountID, tenant.ProjectID,
-			input.Body.Name, input.Body.GrantTypes, input.Body.Scopes,
+			ctx, input.Body.Name, input.Body.GrantTypes, input.Body.Scopes,
 			identity.ExternalID, identity.ID,
 		)
 		if regErr != nil {
@@ -144,8 +143,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 	} else {
 		// Public PKCE client (authorization_code) — no secret, no linked identity.
 		client, regErr := a.oauthClientSvc.RegisterPublicClient(
-			ctx, tenant.AccountID, tenant.ProjectID,
-			input.Body.Name, input.Body.ClientID,
+			ctx, input.Body.Name, input.Body.ClientID,
 			input.Body.RedirectURIs,
 			input.Body.GrantTypes, input.Body.Scopes,
 		)
@@ -165,12 +163,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 }
 
 func (a *API) getOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientOutput, error) {
-	tenant, err := internalMiddleware.GetTenant(ctx)
-	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
-	}
-
-	client, err := a.oauthClientSvc.GetClient(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
+	client, err := a.oauthClientSvc.GetClient(ctx, input.ID)
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
@@ -183,12 +176,7 @@ func (a *API) getOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (
 }
 
 func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClientListOutput, error) {
-	tenant, err := internalMiddleware.GetTenant(ctx)
-	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
-	}
-
-	clients, err := a.oauthClientSvc.ListClients(ctx, tenant.AccountID, tenant.ProjectID)
+	clients, err := a.oauthClientSvc.ListClients(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list oauth clients")
 		return nil, huma.Error500InternalServerError("failed to list oauth clients")
@@ -204,12 +192,7 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 }
 
 func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientCreatedOutput, error) {
-	tenant, err := internalMiddleware.GetTenant(ctx)
-	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
-	}
-
-	client, plainSecret, err := a.oauthClientSvc.RotateSecret(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
+	client, plainSecret, err := a.oauthClientSvc.RotateSecret(ctx, input.ID)
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
@@ -226,12 +209,7 @@ func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientI
 }
 
 func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*DeleteOAuthClientOutput, error) {
-	tenant, err := internalMiddleware.GetTenant(ctx)
-	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
-	}
-
-	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID); err != nil {
 		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to delete oauth client")
 		return nil, huma.Error500InternalServerError("failed to delete oauth client")
 	}

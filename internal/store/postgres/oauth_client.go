@@ -28,14 +28,11 @@ func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuth
 	return nil
 }
 
-// GetByClientID retrieves a client by its OAuth2 client_id, scoped to a tenant.
-// The (account_id, project_id, client_id) triple has a unique index.
-func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID, accountID, projectID string) (*domain.OAuthClient, error) {
+// GetByClientID retrieves a client by its globally unique OAuth2 client_id.
+func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
 	err := r.db.NewSelect().Model(client).
 		Where("client_id = ?", clientID).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get oauth client: %w", err)
@@ -44,8 +41,7 @@ func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID, acc
 }
 
 // GetPublicByClientID retrieves a public client by its OAuth2 client_id only.
-// Public PKCE clients are registered globally — tenant scoping is not required
-// because the tenant comes from the auth code JWT, not the client registration.
+// Public PKCE clients have no client_secret.
 func (r *OAuthClientRepository) GetPublicByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
 	err := r.db.NewSelect().Model(client).
@@ -58,13 +54,11 @@ func (r *OAuthClientRepository) GetPublicByClientID(ctx context.Context, clientI
 	return client, nil
 }
 
-// GetByID retrieves a client by its UUID, scoped to tenant.
-func (r *OAuthClientRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.OAuthClient, error) {
+// GetByID retrieves a client by its UUID.
+func (r *OAuthClientRepository) GetByID(ctx context.Context, id string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
 	err := r.db.NewSelect().Model(client).
 		Where("id = ?", id).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get oauth client: %w", err)
@@ -72,12 +66,10 @@ func (r *OAuthClientRepository) GetByID(ctx context.Context, id, accountID, proj
 	return client, nil
 }
 
-// List returns all OAuth2 clients for a tenant.
-func (r *OAuthClientRepository) List(ctx context.Context, accountID, projectID string) ([]*domain.OAuthClient, error) {
+// List returns all registered OAuth2 clients.
+func (r *OAuthClientRepository) List(ctx context.Context) ([]*domain.OAuthClient, error) {
 	var clients []*domain.OAuthClient
 	err := r.db.NewSelect().Model(&clients).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
 		OrderExpr("created_at DESC").
 		Scan(ctx)
 	if err != nil {
@@ -96,12 +88,10 @@ func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuth
 }
 
 // Delete removes an OAuth2 client (hard delete — clients are admin-controlled).
-func (r *OAuthClientRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
+func (r *OAuthClientRepository) Delete(ctx context.Context, id string) error {
 	_, err := r.db.NewDelete().
 		TableExpr("oauth_clients").
 		Where("id = ?", id).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to delete oauth client: %w", err)

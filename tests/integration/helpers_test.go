@@ -420,26 +420,21 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 	}, nil
 }
 
-// registerTestOAuthClient registers a public PKCE client in the oauth_clients
-// table. Called once in TestMain before any tests run.
+// registerTestOAuthClient registers a global public PKCE client via Server.EnsurePublicClient.
+// Called once in TestMain before any tests run.
+// Public clients are global — no tenant scoping. Tenant comes from the auth code JWT.
 // grantTypes controls token behaviour: include "refresh_token" for MCP-style
 // short-lived tokens with refresh rotation.
 func registerTestOAuthClient(clientID string, grantTypes []string) {
-	body, _ := json.Marshal(map[string]any{
-		"name":          clientID + "-test-client",
-		"client_id":     clientID,
-		"grant_types":   grantTypes,
-		"redirect_uris": []string{testRedirectURI},
+	err := testZeroIDServer.EnsurePublicClient(context.Background(), zeroid.PublicClientConfig{
+		ClientID:     clientID,
+		Name:         clientID + "-test-client",
+		GrantTypes:   grantTypes,
+		RedirectURIs: []string{testRedirectURI},
 	})
-	req, _ := http.NewRequest(http.MethodPost, testServer.URL+"/api/v1/oauth/clients", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Account-ID", testAccountID)
-	req.Header.Set("X-Project-ID", testProjectID)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil || (resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusConflict) {
-		panic(fmt.Sprintf("registerTestOAuthClient(%s): unexpected status %v err %v", clientID, resp.StatusCode, err))
+	if err != nil {
+		panic(fmt.Sprintf("registerTestOAuthClient(%s): %v", clientID, err))
 	}
-	resp.Body.Close()
 }
 
 // agentRegistration holds the response from POST /api/v1/agents/register.

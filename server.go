@@ -459,7 +459,7 @@ func (s *Server) EnsurePublicClient(ctx context.Context, cfg PublicClientConfig)
 	}
 
 	_, regErr := s.oauthClientSvc.RegisterPublicClient(
-		ctx, "", "", cfg.Name, cfg.ClientID,
+		ctx, cfg.Name, cfg.ClientID,
 		cfg.RedirectURIs, cfg.GrantTypes, cfg.Scopes,
 	)
 
