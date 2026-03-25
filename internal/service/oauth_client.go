@@ -38,16 +38,11 @@ func NewOAuthClientService(repo *postgres.OAuthClientRepository) *OAuthClientSer
 // RegisterClient creates a new confidential OAuth2 client (M2M flows).
 // Generates and bcrypt-hashes a client secret.
 // Returns the created client and the plain-text secret (shown once only).
-//
-// externalID is used as the client_id and must correspond to a registered
-// identity so the client_credentials grant can resolve the identity.
-// identityID is that identity's UUID. Both are required for M2M clients.
-func (s *OAuthClientService) RegisterClient(ctx context.Context, name string, grantTypes, scopes []string, externalID, identityID string) (*domain.OAuthClient, string, error) {
-	if name == "" {
-		return nil, "", fmt.Errorf("name is required")
-	}
-	if externalID == "" || identityID == "" {
-		return nil, "", fmt.Errorf("externalID and identityID are required")
+// Identity link is resolved at token issuance time (client_credentials grant),
+// not at registration time — matching industry standard (Auth0, Okta).
+func (s *OAuthClientService) RegisterClient(ctx context.Context, clientID, name string, grantTypes, scopes []string) (*domain.OAuthClient, string, error) {
+	if clientID == "" || name == "" {
+		return nil, "", fmt.Errorf("clientID and name are required")
 	}
 
 	plainSecret, err := generateSecureToken(32)
@@ -70,10 +65,9 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, name string, gr
 	now := time.Now()
 	client := &domain.OAuthClient{
 		ID:           uuid.New().String(),
-		ClientID:     externalID,
+		ClientID:     clientID,
 		ClientSecret: string(hashed),
 		Name:         name,
-		IdentityID:   identityID,
 		GrantTypes:   grantTypes,
 		RedirectURIs: []string{},
 		Scopes:       scopes,
@@ -90,7 +84,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, name string, gr
 	}
 
 	log.Info().
-		Str("client_id", externalID).
+		Str("client_id", clientID).
 		Msg("OAuth2 confidential client registered")
 
 	return client, plainSecret, nil
@@ -124,7 +118,6 @@ func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, name, cli
 		ClientID:     clientID,
 		ClientSecret: "", // public client — no secret
 		Name:         name,
-		IdentityID:   "", // user-facing — no linked agent identity
 		GrantTypes:   grantTypes,
 		RedirectURIs: redirectURIs,
 		Scopes:       scopes,

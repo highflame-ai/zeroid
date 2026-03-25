@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id     VARCHAR(255) NOT NULL,
     client_secret VARCHAR(255),
     name          VARCHAR(255) NOT NULL,
-    identity_id   UUID REFERENCES identities(id) ON DELETE SET NULL,
     grant_types   TEXT[] NOT NULL DEFAULT '{"client_credentials"}',
     redirect_uris TEXT[] NOT NULL DEFAULT '{}',
     scopes        TEXT[] NOT NULL DEFAULT '{}',

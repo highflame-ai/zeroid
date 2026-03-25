@@ -309,16 +309,17 @@ func registerIdentity(t *testing.T, externalID string, scopes []string, publicKe
 	}
 }
 
-// registerOAuthClient calls POST /api/v1/oauth/clients using external_id
-// (ZeroID auto-generates the client secret) and returns client_id + client_secret.
-func registerOAuthClient(t *testing.T, externalID string, scopes []string) oauthClientResp {
+// registerOAuthClient creates a confidential M2M OAuth client via POST /api/v1/oauth/clients.
+// Returns client_id + client_secret. Identity link happens at token issuance, not registration.
+func registerOAuthClient(t *testing.T, clientID string, scopes []string) oauthClientResp {
 	t.Helper()
 	resp := post(t, "/api/v1/oauth/clients", map[string]any{
-		"name":        externalID + "-client",
-		"external_id": externalID,
-		"grant_types": []string{"client_credentials"},
-		"scopes":      scopes,
-	}, adminHeaders())
+		"client_id":    clientID,
+		"name":         clientID + "-client",
+		"confidential": true,
+		"grant_types":  []string{"client_credentials"},
+		"scopes":       scopes,
+	}, nil)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerOAuthClient: expected 201")
 	raw := decode(t, resp)
 	client := raw["client"].(map[string]any)
