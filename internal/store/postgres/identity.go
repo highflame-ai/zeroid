@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -91,7 +92,8 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		if len(parts) != 2 || parts[0] == "" {
 			return nil, fmt.Errorf("invalid label format: expected non-empty-key:value, got %q", label)
 		}
-		q = q.Where("labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
+		labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
+		q = q.Where("labels @> ?::jsonb", string(labelJSON))
 	}
 
 	if err := q.Scan(ctx); err != nil {

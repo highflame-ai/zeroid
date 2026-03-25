@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -94,8 +95,10 @@ func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, 
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)
 		if len(parts) == 2 && parts[0] != "" {
+			labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
+
 			q = q.Join("JOIN identities AS i ON i.id = sk.identity_id").
-				Where("i.labels @> ?::jsonb", fmt.Sprintf(`{"%s": "%s"}`, parts[0], parts[1]))
+				Where("i.labels @> ?::jsonb", string(labelJSON))
 		}
 	}
 
