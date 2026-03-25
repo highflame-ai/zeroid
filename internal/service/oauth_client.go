@@ -109,8 +109,8 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, accountID, proj
 // "refresh_token" receive short-lived (1h) access tokens plus rotating refresh
 // tokens; clients without it receive long-lived (90-day) tokens.
 func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, accountID, projectID, name, clientID string, redirectURIs, grantTypes, scopes []string) (*domain.OAuthClient, error) {
-	if accountID == "" || projectID == "" || name == "" || clientID == "" {
-		return nil, fmt.Errorf("accountID, projectID, name, and clientID are required")
+	if name == "" || clientID == "" {
+		return nil, fmt.Errorf("name and clientID are required")
 	}
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"authorization_code"}
