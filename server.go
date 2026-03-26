@@ -482,15 +482,15 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 		existing.Description = cfg.Description
 		updated = true
 	}
-	if len(cfg.GrantTypes) > 0 && !slicesEqual(cfg.GrantTypes, existing.GrantTypes) {
+	if cfg.GrantTypes != nil && !slicesEqual(cfg.GrantTypes, existing.GrantTypes) {
 		existing.GrantTypes = cfg.GrantTypes
 		updated = true
 	}
-	if len(cfg.Scopes) > 0 && !slicesEqual(cfg.Scopes, existing.Scopes) {
+	if cfg.Scopes != nil && !slicesEqual(cfg.Scopes, existing.Scopes) {
 		existing.Scopes = cfg.Scopes
 		updated = true
 	}
-	if len(cfg.RedirectURIs) > 0 && !slicesEqual(cfg.RedirectURIs, existing.RedirectURIs) {
+	if cfg.RedirectURIs != nil && !slicesEqual(cfg.RedirectURIs, existing.RedirectURIs) {
 		existing.RedirectURIs = cfg.RedirectURIs
 		updated = true
 	}

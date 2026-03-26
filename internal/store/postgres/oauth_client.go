@@ -41,12 +41,12 @@ func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID stri
 }
 
 // GetPublicByClientID retrieves a public client by its OAuth2 client_id only.
-// Public PKCE clients have no client_secret.
+// Public PKCE clients are identified by client_type = 'public'.
 func (r *OAuthClientRepository) GetPublicByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
 	err := r.db.NewSelect().Model(client).
 		Where("client_id = ?", clientID).
-		Where("client_secret = ''").
+		Where("client_type = ?", "public").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get public oauth client: %w", err)

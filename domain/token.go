@@ -63,8 +63,6 @@ type AccessToken struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-// OAuthClient represents a registered OAuth2 client.
-// Clients are global — tenant scoping happens at token issuance time, not client registration.
 // OAuthClient represents a registered OAuth2 client (RFC 7591).
 // Clients are global — tenant scoping happens at token issuance, not registration.
 // The ClientSecret field stores a bcrypt hash and is never serialised to JSON.

@@ -749,6 +749,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
+	} else {
+		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("failed to get oauth client for TTL override, using defaults")
 	}
 
 	if accessTTL <= 0 {
