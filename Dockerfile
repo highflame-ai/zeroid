@@ -24,7 +24,7 @@ WORKDIR /app
 COPY --from=build-stage /app/zeroid /app/zeroid
 COPY --from=build-stage /app/migrations /app/migrations
 
-RUN apk add --no-cache ca-certificates tzdata tini \
+RUN apk add --no-cache ca-certificates tzdata tini curl \
     && addgroup -g ${APP_ID} ${APP_USER} \
     && adduser -u ${APP_ID} -G ${APP_USER} -D -s /bin/sh ${APP_USER} \
     && chown -R ${APP_USER}:${APP_USER} /app
