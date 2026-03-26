@@ -664,9 +664,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
-	// Derive token policy from registered grant_types: if the client is
-	// authorised for refresh_token, issue short-lived access tokens (the
-	// refresh token provides continuity). Otherwise issue long-lived tokens.
+	// Determine access token TTL.
+	// Priority: per-client config > grant-type-based default > server default.
 	hasRefreshGrant := false
 	for _, g := range oauthClient.GrantTypes {
 		if g == string(domain.GrantTypeRefreshToken) {
@@ -675,9 +674,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		}
 	}
 
-	ttl := 90 * 24 * 3600 // 90 days for clients without refresh_token grant
-	if hasRefreshGrant {
-		ttl = 3600 // 1 hour when refresh tokens provide continuity
+	ttl := oauthClient.AccessTokenTTL
+	if ttl <= 0 {
+		// No per-client TTL — use grant-type-based defaults.
+		ttl = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
+		if hasRefreshGrant {
+			ttl = 3600 // 1 hour when refresh tokens provide continuity
+		}
 	}
 
 	// Auth code JWT is self-contained — tenant context comes from the auth code.

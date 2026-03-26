@@ -67,13 +67,15 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, clientID, name 
 		ID:           uuid.New().String(),
 		ClientID:     clientID,
 		ClientSecret: string(hashed),
-		Name:         name,
-		GrantTypes:   grantTypes,
-		RedirectURIs: []string{},
-		Scopes:       scopes,
-		IsActive:     true,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		Name:                    name,
+		ClientType:              "confidential",
+		TokenEndpointAuthMethod: "client_secret_basic",
+		GrantTypes:              grantTypes,
+		RedirectURIs:            []string{},
+		Scopes:                  scopes,
+		IsActive:                true,
+		CreatedAt:               now,
+		UpdatedAt:               now,
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {
@@ -114,16 +116,18 @@ func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, name, cli
 
 	now := time.Now()
 	client := &domain.OAuthClient{
-		ID:           uuid.New().String(),
-		ClientID:     clientID,
-		ClientSecret: "", // public client — no secret
-		Name:         name,
-		GrantTypes:   grantTypes,
-		RedirectURIs: redirectURIs,
-		Scopes:       scopes,
-		IsActive:     true,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:                      uuid.New().String(),
+		ClientID:                clientID,
+		ClientSecret:            "", // public client — no secret
+		Name:                    name,
+		ClientType:              "public",
+		TokenEndpointAuthMethod: "none",
+		GrantTypes:              grantTypes,
+		RedirectURIs:            redirectURIs,
+		Scopes:                  scopes,
+		IsActive:                true,
+		CreatedAt:               now,
+		UpdatedAt:               now,
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {

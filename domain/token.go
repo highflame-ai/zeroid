@@ -65,21 +65,53 @@ type AccessToken struct {
 
 // OAuthClient represents a registered OAuth2 client.
 // Clients are global — tenant scoping happens at token issuance time, not client registration.
+// OAuthClient represents a registered OAuth2 client (RFC 7591).
+// Clients are global — tenant scoping happens at token issuance, not registration.
 // The ClientSecret field stores a bcrypt hash and is never serialised to JSON.
-// For public clients (PKCE), ClientSecret is empty.
 type OAuthClient struct {
 	bun.BaseModel `bun:"table:oauth_clients"`
 
-	ID           string    `bun:"id,pk"             json:"id"`
-	ClientID     string    `bun:"client_id"         json:"client_id"`
-	ClientSecret string    `bun:"client_secret"     json:"-"`
-	Name         string    `bun:"name"              json:"name"`
-	GrantTypes   []string  `bun:"grant_types,array" json:"grant_types"`
-	RedirectURIs []string  `bun:"redirect_uris,array" json:"redirect_uris"`
-	Scopes       []string  `bun:"scopes,array"      json:"scopes"`
-	IsActive     bool      `bun:"is_active"         json:"is_active"`
-	CreatedAt    time.Time `bun:"created_at"        json:"created_at"`
-	UpdatedAt    time.Time `bun:"updated_at"        json:"updated_at"`
+	// Core identity
+	ID           string `bun:"id,pk"         json:"id"`
+	ClientID     string `bun:"client_id"     json:"client_id"`
+	ClientSecret string `bun:"client_secret" json:"-"`
+	Name         string `bun:"name"          json:"name"`
+	Description  string `bun:"description"   json:"description,omitempty"`
+
+	// Classification (RFC 6749 §2.1, RFC 7591)
+	ClientType              string `bun:"client_type"                json:"client_type"`
+	TokenEndpointAuthMethod string `bun:"token_endpoint_auth_method" json:"token_endpoint_auth_method,omitempty"`
+
+	// OAuth configuration
+	GrantTypes   []string `bun:"grant_types,array"  json:"grant_types"`
+	RedirectURIs []string `bun:"redirect_uris,array" json:"redirect_uris"`
+	Scopes       []string `bun:"scopes,array"       json:"scopes"`
+
+	// Token lifetime (per-client, 0 = use server default)
+	AccessTokenTTL  int `bun:"access_token_ttl"  json:"access_token_ttl,omitempty"`
+	RefreshTokenTTL int `bun:"refresh_token_ttl" json:"refresh_token_ttl,omitempty"`
+
+	// Secret management
+	ClientSecretExpiresAt *time.Time `bun:"client_secret_expires_at" json:"client_secret_expires_at,omitempty"`
+
+	// Key material (for private_key_jwt — RFC 7523)
+	JWKSURI string          `bun:"jwks_uri"  json:"jwks_uri,omitempty"`
+	JWKS    json.RawMessage `bun:"jwks,type:jsonb" json:"jwks,omitempty"`
+
+	// Software identity (RFC 7591)
+	SoftwareID      string `bun:"software_id"      json:"software_id,omitempty"`
+	SoftwareVersion string `bun:"software_version"  json:"software_version,omitempty"`
+
+	// Ownership
+	Contacts []string `bun:"contacts,array" json:"contacts,omitempty"`
+
+	// Extensibility
+	Metadata json.RawMessage `bun:"metadata,type:jsonb" json:"metadata,omitempty"`
+
+	// Lifecycle
+	IsActive  bool      `bun:"is_active"   json:"is_active"`
+	CreatedAt time.Time `bun:"created_at"  json:"created_at"`
+	UpdatedAt time.Time `bun:"updated_at"  json:"updated_at"`
 }
 
 // ProofToken represents a persisted WIMSE Proof Token (WPT).
