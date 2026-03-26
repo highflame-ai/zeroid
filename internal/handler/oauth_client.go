@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -16,14 +17,37 @@ import (
 
 type CreateOAuthClientInput struct {
 	Body struct {
-		ClientID     string   `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier"`
-		Name         string   `json:"name" required:"true" minLength:"1" doc:"Client display name"`
+		// Core
+		ClientID    string `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier"`
+		Name        string `json:"name" required:"true" minLength:"1" doc:"Client display name"`
+		Description string `json:"description,omitempty" doc:"Human-readable description"`
+
+		// Classification
+		Confidential            bool   `json:"confidential,omitempty" doc:"If true, generates a client_secret for M2M flows"`
+		TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty" doc:"Auth method: none, client_secret_basic, client_secret_post, private_key_jwt"`
+
+		// OAuth configuration
 		GrantTypes   []string `json:"grant_types,omitempty" doc:"Permitted OAuth grant types"`
 		Scopes       []string `json:"scopes,omitempty" doc:"Permitted OAuth scopes"`
 		RedirectURIs []string `json:"redirect_uris,omitempty" doc:"Allowed redirect URIs (required for authorization_code clients)"`
-		// Confidential when true — generates a client_secret for M2M flows.
-		// Public (false/omitted) — PKCE only, no secret.
-		Confidential bool `json:"confidential,omitempty" doc:"If true, generates a client_secret for client_credentials grant"`
+
+		// Token lifetime (0 = server default)
+		AccessTokenTTL  int `json:"access_token_ttl,omitempty" doc:"Access token lifetime in seconds"`
+		RefreshTokenTTL int `json:"refresh_token_ttl,omitempty" doc:"Refresh token lifetime in seconds"`
+
+		// Key material (for private_key_jwt)
+		JWKSURI string          `json:"jwks_uri,omitempty" doc:"URL to client's public JWK Set"`
+		JWKS    json.RawMessage `json:"jwks,omitempty" doc:"Inline JWK Set (when no URI available)"`
+
+		// Software identity (RFC 7591)
+		SoftwareID      string `json:"software_id,omitempty" doc:"Identifies the client software"`
+		SoftwareVersion string `json:"software_version,omitempty" doc:"Client software version"`
+
+		// Ownership
+		Contacts []string `json:"contacts,omitempty" doc:"Email addresses of responsible parties"`
+
+		// Extensibility
+		Metadata json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata"`
 	}
 }
 
@@ -103,45 +127,40 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 }
 
 func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientInput) (*OAuthClientCreatedOutput, error) {
-	out := &OAuthClientCreatedOutput{}
-
-	if input.Body.Confidential {
-		// Confidential client — generates a client_secret for M2M (client_credentials) flows.
-		// Identity link happens at token issuance time, not at registration.
-		client, plainSecret, regErr := a.oauthClientSvc.RegisterClient(
-			ctx, input.Body.ClientID, input.Body.Name,
-			input.Body.GrantTypes, input.Body.Scopes,
-		)
-		if regErr != nil {
-			if errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
-				return nil, huma.Error409Conflict("oauth client with this client_id already exists")
-			}
-			log.Error().Err(regErr).Msg("failed to register oauth client")
-			return nil, huma.Error500InternalServerError("failed to register oauth client")
+	client, plainSecret, err := a.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
+		ClientID:                input.Body.ClientID,
+		Name:                    input.Body.Name,
+		Description:             input.Body.Description,
+		Confidential:            input.Body.Confidential,
+		TokenEndpointAuthMethod: input.Body.TokenEndpointAuthMethod,
+		GrantTypes:              input.Body.GrantTypes,
+		Scopes:                  input.Body.Scopes,
+		RedirectURIs:            input.Body.RedirectURIs,
+		AccessTokenTTL:          input.Body.AccessTokenTTL,
+		RefreshTokenTTL:         input.Body.RefreshTokenTTL,
+		JWKSURI:                 input.Body.JWKSURI,
+		JWKS:                    input.Body.JWKS,
+		SoftwareID:              input.Body.SoftwareID,
+		SoftwareVersion:         input.Body.SoftwareVersion,
+		Contacts:                input.Body.Contacts,
+		Metadata:                input.Body.Metadata,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
+			return nil, huma.Error409Conflict("oauth client with this client_id already exists")
 		}
+		log.Error().Err(err).Msg("failed to register oauth client")
+		return nil, huma.Error500InternalServerError("failed to register oauth client")
+	}
 
-		out.Body.Client = client
+	out := &OAuthClientCreatedOutput{}
+	out.Body.Client = client
+	if input.Body.Confidential {
 		out.Body.ClientSecret = plainSecret
 		out.Body.Note = "Save client_secret now — it will not be shown again."
 	} else {
-		// Public client — PKCE only, no secret.
-		client, regErr := a.oauthClientSvc.RegisterPublicClient(
-			ctx, input.Body.Name, input.Body.ClientID,
-			input.Body.RedirectURIs,
-			input.Body.GrantTypes, input.Body.Scopes,
-		)
-		if regErr != nil {
-			if errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
-				return nil, huma.Error409Conflict("oauth client with this client_id already exists")
-			}
-			log.Error().Err(regErr).Msg("failed to register public oauth client")
-			return nil, huma.Error500InternalServerError("failed to register public oauth client")
-		}
-
-		out.Body.Client = client
 		out.Body.Note = "Public PKCE client registered — no client_secret (use PKCE code_challenge instead)."
 	}
-
 	return out, nil
 }
 

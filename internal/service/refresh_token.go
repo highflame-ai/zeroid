@@ -36,6 +36,7 @@ type RefreshTokenParams struct {
 	UserID     string
 	IdentityID *string
 	Scopes     string
+	TTL        int // seconds, 0 = use default (90 days)
 }
 
 // RefreshTokenResult contains both the raw token (returned to client) and stored metadata.
@@ -55,7 +56,13 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 	tokenHash := hashRefreshToken(rawToken)
 	familyID := uuid.New().String()
 
-	ttl := time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
+	var ttl time.Duration
+	if params.TTL > 0 {
+		ttl = time.Duration(params.TTL) * time.Second
+	} else {
+		ttl = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
+	}
+
 	expiresAt := time.Now().Add(ttl)
 
 	record := &domain.RefreshToken{
@@ -86,7 +93,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 // Implements reuse detection: if a revoked token is presented, the entire family is revoked.
 // Wrapped in a serializable transaction to prevent race conditions where two concurrent
 // calls with the same token both succeed and issue duplicate tokens.
-func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string) (*domain.RefreshToken, *RefreshTokenResult, error) {
+func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int) (*domain.RefreshToken, *RefreshTokenResult, error) {
 	tokenHash := hashRefreshToken(rawToken)
 
 	var existing *domain.RefreshToken
@@ -135,8 +142,14 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 
 		newTokenHash := hashRefreshToken(newRawToken)
 
-		ttl := time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
-		expiresAt := time.Now().Add(ttl)
+		var rotationTTL time.Duration
+		if ttl > 0 {
+			rotationTTL = time.Duration(ttl) * time.Second
+		} else {
+			rotationTTL = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
+		}
+
+		expiresAt := time.Now().Add(rotationTTL)
 
 		newRecord := &domain.RefreshToken{
 			TokenHash:  newTokenHash,

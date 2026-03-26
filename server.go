@@ -441,29 +441,90 @@ func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID strin
 	return s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 }
 
-// PublicClientConfig defines a public OAuth client to ensure on startup.
-type PublicClientConfig struct {
-	ClientID     string
-	Name         string
-	GrantTypes   []string
-	Scopes       []string
-	RedirectURIs []string
-}
+// EnsureClient registers an OAuth client if it doesn't exist, or updates it if the
+// config has changed. Idempotent — safe to call on every startup.
+// Does not regenerate client_secret on update (secrets are rotated explicitly).
+func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error {
+	existing, err := s.oauthClientSvc.GetClientByClientID(ctx, cfg.ClientID)
+	if err != nil {
+		// Client doesn't exist — create it.
+		_, _, regErr := s.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
+			ClientID:                cfg.ClientID,
+			Name:                    cfg.Name,
+			Description:             cfg.Description,
+			Confidential:            cfg.Confidential,
+			TokenEndpointAuthMethod: cfg.TokenEndpointAuthMethod,
+			GrantTypes:              cfg.GrantTypes,
+			Scopes:                  cfg.Scopes,
+			RedirectURIs:            cfg.RedirectURIs,
+			AccessTokenTTL:          cfg.AccessTokenTTL,
+			RefreshTokenTTL:         cfg.RefreshTokenTTL,
+			JWKSURI:                 cfg.JWKSURI,
+			JWKS:                    cfg.JWKS,
+			SoftwareID:              cfg.SoftwareID,
+			SoftwareVersion:         cfg.SoftwareVersion,
+			Contacts:                cfg.Contacts,
+			Metadata:                cfg.Metadata,
+		})
 
-// EnsurePublicClient registers a public PKCE OAuth client if it doesn't already exist.
-// Public clients are global — no tenant scoping. Idempotent, safe to call on every startup.
-func (s *Server) EnsurePublicClient(ctx context.Context, cfg PublicClientConfig) error {
-	_, err := s.oauthClientSvc.GetPublicClient(ctx, cfg.ClientID)
-	if err == nil {
-		return nil // already exists
+		return regErr
 	}
 
-	_, regErr := s.oauthClientSvc.RegisterPublicClient(
-		ctx, cfg.Name, cfg.ClientID,
-		cfg.RedirectURIs, cfg.GrantTypes, cfg.Scopes,
-	)
+	// Client exists — update mutable fields from config.
+	// Secret is NOT touched (rotated explicitly via RotateSecret).
+	updated := false
 
-	return regErr
+	if cfg.Name != "" && cfg.Name != existing.Name {
+		existing.Name = cfg.Name
+		updated = true
+	}
+	if cfg.Description != "" && cfg.Description != existing.Description {
+		existing.Description = cfg.Description
+		updated = true
+	}
+	if len(cfg.GrantTypes) > 0 && !slicesEqual(cfg.GrantTypes, existing.GrantTypes) {
+		existing.GrantTypes = cfg.GrantTypes
+		updated = true
+	}
+	if len(cfg.Scopes) > 0 && !slicesEqual(cfg.Scopes, existing.Scopes) {
+		existing.Scopes = cfg.Scopes
+		updated = true
+	}
+	if len(cfg.RedirectURIs) > 0 && !slicesEqual(cfg.RedirectURIs, existing.RedirectURIs) {
+		existing.RedirectURIs = cfg.RedirectURIs
+		updated = true
+	}
+	if cfg.AccessTokenTTL > 0 && cfg.AccessTokenTTL != existing.AccessTokenTTL {
+		existing.AccessTokenTTL = cfg.AccessTokenTTL
+		updated = true
+	}
+	if cfg.RefreshTokenTTL > 0 && cfg.RefreshTokenTTL != existing.RefreshTokenTTL {
+		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
+		updated = true
+	}
+
+	if !updated {
+		return nil
+	}
+
+	existing.UpdatedAt = time.Now()
+
+	return s.oauthClientSvc.UpdateClient(ctx, existing)
+}
+
+// slicesEqual returns true if two string slices have the same elements in order.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

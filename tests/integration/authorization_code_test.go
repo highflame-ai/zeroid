@@ -1,10 +1,12 @@
 package integration_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
 
+	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/stretchr/testify/assert"
@@ -255,4 +257,114 @@ func TestRefreshTokenRotation(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "rotated refresh token must be rejected on reuse")
 	body := decode(t, resp)
 	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// TestAuthorizationCodePerClientTTL verifies that a client with a custom
+// access_token_ttl gets a token with that exact TTL, overriding the
+// grant-type-based defaults (90 days or 1 hour).
+func TestAuthorizationCodePerClientTTL(t *testing.T) {
+	customTTL := 7200 // 2 hours
+	customClientID := uid("ttl-client")
+
+	// Register a public client with custom access_token_ttl.
+	resp := post(t, "/api/v1/oauth/clients", map[string]any{
+		"client_id":        customClientID,
+		"name":             "Custom TTL Client",
+		"grant_types":      []string{"authorization_code", "refresh_token"},
+		"redirect_uris":    []string{testRedirectURI},
+		"access_token_ttl": customTTL,
+	}, nil)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	// Exchange an auth code for a token.
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, customClientID, "user-ttl-001", testRedirectURI, challenge, []string{"data:read"})
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     customClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	token := decode(t, resp)
+
+	// Token TTL must match the per-client override, not the default (1 hour for refresh clients).
+	assert.EqualValues(t, customTTL, token["expires_in"],
+		"access token TTL should match per-client access_token_ttl (%d), not grant-type default", customTTL)
+
+	// Refresh token should still be issued (client has refresh_token grant).
+	assert.NotEmpty(t, token["refresh_token"], "client with refresh_token grant should receive a refresh token")
+}
+
+// TestEnsureClientUpdatesConfig verifies that EnsureClient updates mutable fields
+// when the config changes, without regenerating the client_secret.
+func TestEnsureClientUpdatesConfig(t *testing.T) {
+	clientID := uid("ensure-update")
+
+	// First call — creates the client.
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:       clientID,
+		Name:           "Original Name",
+		GrantTypes:     []string{"authorization_code"},
+		RedirectURIs:   []string{testRedirectURI},
+		AccessTokenTTL: 3600,
+	})
+	require.NoError(t, err)
+
+	// Verify initial state.
+	resp := get(t, "/api/v1/oauth/clients", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	clients := body["clients"].([]any)
+
+	var found map[string]any
+	for _, c := range clients {
+		m := c.(map[string]any)
+		if m["client_id"] == clientID {
+			found = m
+			break
+		}
+	}
+
+	require.NotNil(t, found, "client should exist after EnsureClient")
+	assert.Equal(t, "Original Name", found["name"])
+	assert.EqualValues(t, 3600, found["access_token_ttl"])
+
+	// Second call — updates name and TTL.
+	err = testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:        clientID,
+		Name:            "Updated Name",
+		GrantTypes:      []string{"authorization_code", "refresh_token"},
+		RedirectURIs:    []string{testRedirectURI},
+		AccessTokenTTL:  7776000,
+		RefreshTokenTTL: 7776000,
+	})
+	require.NoError(t, err)
+
+	// Verify updated state.
+	resp = get(t, "/api/v1/oauth/clients", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	clients = body["clients"].([]any)
+
+	found = nil
+	for _, c := range clients {
+		m := c.(map[string]any)
+		if m["client_id"] == clientID {
+			found = m
+			break
+		}
+	}
+
+	require.NotNil(t, found, "client should still exist after update")
+	assert.Equal(t, "Updated Name", found["name"])
+	assert.EqualValues(t, 7776000, found["access_token_ttl"])
+	assert.EqualValues(t, 7776000, found["refresh_token_ttl"])
+
+	// Grant types should be updated.
+	grantTypes := found["grant_types"].([]any)
+	assert.Equal(t, 2, len(grantTypes))
 }

@@ -2,6 +2,7 @@ package zeroid
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -38,6 +39,27 @@ type GrantRequest struct {
 // When nil (the default), the admin API has no authentication — protect it at the
 // network layer (VPN, service mesh, localhost-only binding, firewall rules).
 type AdminAuthMiddleware func(next http.Handler) http.Handler
+
+// OAuthClientConfig holds all fields for registering an OAuth2 client (RFC 7591).
+// Used by EnsureClient for startup seeding and by deployers for programmatic registration.
+type OAuthClientConfig struct {
+	ClientID                string
+	Name                    string
+	Description             string
+	Confidential            bool
+	TokenEndpointAuthMethod string
+	GrantTypes              []string
+	Scopes                  []string
+	RedirectURIs            []string
+	AccessTokenTTL          int
+	RefreshTokenTTL         int
+	JWKSURI                 string
+	JWKS                    json.RawMessage
+	SoftwareID              string
+	SoftwareVersion         string
+	Contacts                []string
+	Metadata                json.RawMessage
+}
 
 // TrustedServiceValidator checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal token exchange

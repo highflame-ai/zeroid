@@ -421,13 +421,12 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 	}, nil
 }
 
-// registerTestOAuthClient registers a global public PKCE client via Server.EnsurePublicClient.
+// registerTestOAuthClient registers a global public PKCE client via Server.EnsureClient.
 // Called once in TestMain before any tests run.
-// Public clients are global — no tenant scoping. Tenant comes from the auth code JWT.
 // grantTypes controls token behaviour: include "refresh_token" for MCP-style
 // short-lived tokens with refresh rotation.
 func registerTestOAuthClient(clientID string, grantTypes []string) {
-	err := testZeroIDServer.EnsurePublicClient(context.Background(), zeroid.PublicClientConfig{
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
 		ClientID:     clientID,
 		Name:         clientID + "-test-client",
 		GrantTypes:   grantTypes,

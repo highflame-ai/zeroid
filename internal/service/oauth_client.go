@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -35,44 +36,109 @@ func NewOAuthClientService(repo *postgres.OAuthClientRepository) *OAuthClientSer
 	return &OAuthClientService{repo: repo}
 }
 
-// RegisterClient creates a new confidential OAuth2 client (M2M flows).
-// Generates and bcrypt-hashes a client secret.
-// Returns the created client and the plain-text secret (shown once only).
+// RegisterClientRequest holds all fields for creating an OAuth2 client.
+// Confidential clients get a generated bcrypt secret; public clients have none.
+type RegisterClientRequest struct {
+	ClientID                string
+	Name                    string
+	Description             string
+	Confidential            bool
+	TokenEndpointAuthMethod string
+	GrantTypes              []string
+	Scopes                  []string
+	RedirectURIs            []string
+	AccessTokenTTL          int
+	RefreshTokenTTL         int
+	JWKSURI                 string
+	JWKS                    json.RawMessage
+	SoftwareID              string
+	SoftwareVersion         string
+	Contacts                []string
+	Metadata                json.RawMessage
+}
+
+// RegisterClient creates a new OAuth2 client.
+//
+// If req.Confidential is true, a client_secret is generated and bcrypt-hashed;
+// the plain-text secret is returned (shown once only). For public clients the
+// returned secret string is empty.
+//
 // Identity link is resolved at token issuance time (client_credentials grant),
 // not at registration time — matching industry standard (Auth0, Okta).
-func (s *OAuthClientService) RegisterClient(ctx context.Context, clientID, name string, grantTypes, scopes []string) (*domain.OAuthClient, string, error) {
-	if clientID == "" || name == "" {
+func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterClientRequest) (*domain.OAuthClient, string, error) {
+	if req.ClientID == "" || req.Name == "" {
 		return nil, "", fmt.Errorf("clientID and name are required")
 	}
 
-	plainSecret, err := generateSecureToken(32)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to generate client_secret: %w", err)
+	var plainSecret string
+	var hashedSecret string
+	var clientType string
+	var authMethod string
+
+	if req.Confidential {
+		secret, err := generateSecureToken(32)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to generate client_secret: %w", err)
+		}
+		hashed, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to hash client secret: %w", err)
+		}
+		plainSecret = secret
+		hashedSecret = string(hashed)
+		clientType = "confidential"
+		authMethod = "client_secret_basic"
+	} else {
+		clientType = "public"
+		authMethod = "none"
 	}
 
-	hashed, err := bcrypt.GenerateFromPassword([]byte(plainSecret), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to hash client secret: %w", err)
+	if req.TokenEndpointAuthMethod != "" {
+		authMethod = req.TokenEndpointAuthMethod
 	}
 
+	grantTypes := req.GrantTypes
 	if len(grantTypes) == 0 {
-		grantTypes = []string{"client_credentials"}
+		if req.Confidential {
+			grantTypes = []string{"client_credentials"}
+		} else {
+			grantTypes = []string{"authorization_code"}
+		}
 	}
-	if len(scopes) == 0 {
+
+	redirectURIs := req.RedirectURIs
+	if redirectURIs == nil {
+		redirectURIs = []string{}
+	}
+	scopes := req.Scopes
+	if scopes == nil {
 		scopes = []string{}
+	}
+	contacts := req.Contacts
+	if contacts == nil {
+		contacts = []string{}
 	}
 
 	now := time.Now()
 	client := &domain.OAuthClient{
-		ID:           uuid.New().String(),
-		ClientID:     clientID,
-		ClientSecret: string(hashed),
-		Name:                    name,
-		ClientType:              "confidential",
-		TokenEndpointAuthMethod: "client_secret_basic",
+		ID:                      uuid.New().String(),
+		ClientID:                req.ClientID,
+		ClientSecret:            hashedSecret,
+		Name:                    req.Name,
+		Description:             req.Description,
+		ClientType:              clientType,
+		TokenEndpointAuthMethod: authMethod,
 		GrantTypes:              grantTypes,
-		RedirectURIs:            []string{},
+		RedirectURIs:            redirectURIs,
 		Scopes:                  scopes,
+		AccessTokenTTL:          req.AccessTokenTTL,
+		RefreshTokenTTL:         req.RefreshTokenTTL,
+		JWKSURI:                 req.JWKSURI,
+		JWKS:                    req.JWKS,
+		SoftwareID:              req.SoftwareID,
+		SoftwareVersion:         req.SoftwareVersion,
+		Contacts:                contacts,
+		Metadata:                req.Metadata,
 		IsActive:                true,
 		CreatedAt:               now,
 		UpdatedAt:               now,
@@ -86,62 +152,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, clientID, name 
 	}
 
 	log.Info().
-		Str("client_id", clientID).
-		Msg("OAuth2 confidential client registered")
+		Str("client_id", req.ClientID).
+		Str("client_type", clientType).
+		Msg("OAuth2 client registered")
 
 	return client, plainSecret, nil
-}
-
-// RegisterPublicClient creates a public OAuth2 client for user-facing flows
-// (authorization_code + PKCE). Public clients have no client_secret and no
-// linked agent identity — the user authenticates separately.
-//
-// clientID is the string the client presents in the authorization_code exchange.
-// Token issuance behaviour is derived from grant_types: clients registered with
-// "refresh_token" receive short-lived (1h) access tokens plus rotating refresh
-// tokens; clients without it receive long-lived (90-day) tokens.
-func (s *OAuthClientService) RegisterPublicClient(ctx context.Context, name, clientID string, redirectURIs, grantTypes, scopes []string) (*domain.OAuthClient, error) {
-	if name == "" || clientID == "" {
-		return nil, fmt.Errorf("name and clientID are required")
-	}
-	if len(grantTypes) == 0 {
-		grantTypes = []string{"authorization_code"}
-	}
-	if redirectURIs == nil {
-		redirectURIs = []string{}
-	}
-	if scopes == nil {
-		scopes = []string{}
-	}
-
-	now := time.Now()
-	client := &domain.OAuthClient{
-		ID:                      uuid.New().String(),
-		ClientID:                clientID,
-		ClientSecret:            "", // public client — no secret
-		Name:                    name,
-		ClientType:              "public",
-		TokenEndpointAuthMethod: "none",
-		GrantTypes:              grantTypes,
-		RedirectURIs:            redirectURIs,
-		Scopes:                  scopes,
-		IsActive:                true,
-		CreatedAt:               now,
-		UpdatedAt:               now,
-	}
-
-	if err := s.repo.Create(ctx, client); err != nil {
-		if isDuplicateKeyError(err) {
-			return nil, ErrOAuthClientAlreadyExists
-		}
-		return nil, fmt.Errorf("failed to register public client: %w", err)
-	}
-
-	log.Info().
-		Str("client_id", clientID).
-		Msg("OAuth2 public client registered (global)")
-
-	return client, nil
 }
 
 // GetPublicClient retrieves a registered public PKCE client by client_id.
@@ -153,6 +168,16 @@ func (s *OAuthClientService) GetPublicClient(ctx context.Context, clientID strin
 	if !client.IsActive {
 		return nil, ErrOAuthClientNotFound
 	}
+	return client, nil
+}
+
+// GetClientByClientID retrieves any client (public or confidential) by client_id.
+func (s *OAuthClientService) GetClientByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetByClientID(ctx, clientID)
+	if err != nil {
+		return nil, ErrOAuthClientNotFound
+	}
+
 	return client, nil
 }
 
@@ -210,6 +235,11 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	}
 
 	return client, plainSecret, nil
+}
+
+// UpdateClient persists changes to a client record.
+func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OAuthClient) error {
+	return s.repo.Update(ctx, client)
 }
 
 // DeleteClient removes an OAuth2 client.
