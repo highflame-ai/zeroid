@@ -251,7 +251,7 @@ actor_token = build_jwt_assertion(
 # Delegate data:read to the sub-agent.
 # ZeroID enforces scope intersection — the sub-agent can only receive scopes
 # the orchestrator already holds.
-delegated = client.tokens.exchange(
+delegated = client.tokens.delegate(
     actor_token=actor_token,
     scope="data:read",
 )
@@ -449,20 +449,20 @@ remediator   = client.agents.register(name="Firewall Agent",
                                       created_by="operations@company.com")
 
 # Each agent runs with its own client, initialized with its own api_key.
-# exchange() uses the client's internally managed token as the subject.
+# delegate() uses the client's internally managed token as the subject.
 monitor_client      = ZeroIDClient(base_url="...", api_key=monitor.api_key)
 investigator_client = ZeroIDClient(base_url="...", api_key=investigator.api_key)
 
 # Monitor detects anomaly → delegates log investigation (depth 1)
 # Scope is attenuated — investigator gets read access only, not firewall:write
-investigator_token = monitor_client.tokens.exchange(
+investigator_token = monitor_client.tokens.delegate(
     actor_token=build_jwt_assertion(investigator.identity.wimse_uri, investigator_private_key),
     scope="logs:read logs:query",
 )
 # investigator_token: sub=log-investigator, act.sub=sec-monitor, depth=1
 
 # Investigator confirms breach → delegates remediation (depth 2, at the cap)
-remediator_token = investigator_client.tokens.exchange(
+remediator_token = investigator_client.tokens.delegate(
     actor_token=build_jwt_assertion(remediator.identity.wimse_uri, remediator_private_key),
     scope="firewall:write",
 )
