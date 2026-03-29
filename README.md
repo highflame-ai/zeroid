@@ -115,6 +115,30 @@ ZeroID covers every agentic deployment pattern — from a single autonomous agen
 
 ---
 
+## Coding Agent Scope Vocabulary
+
+Standard scopes for coding agents and MCP servers. Using this vocabulary ensures `CredentialPolicy` configs, MCP server `require_scope()` checks, and `allowed_tools` claims are consistent across teams and tools.
+
+| Scope | Covers |
+|-------|--------|
+| `tools:read` | Read-only tool calls (Read, Glob, Grep, WebFetch, WebSearch) |
+| `tools:write` | File mutation (Write, Edit, NotebookEdit) |
+| `tools:execute` | Shell execution (Bash) |
+| `tools:network` | Outbound network (WebFetch, WebSearch) |
+| `tools:agent` | Spawning sub-agents |
+| `tools:vcs` | Git operations |
+
+**Common agent personas:**
+
+| Persona | Scopes | Max delegation depth |
+|---------|--------|---------------------|
+| `read-only-reviewer` | `tools:read` | 1 |
+| `code-editor` | `tools:read tools:write tools:vcs` | 2 |
+| `test-runner` | `tools:read tools:execute` | 1 |
+| `full-autonomy` | `tools:read tools:write tools:execute tools:network tools:agent tools:vcs` | 5 |
+
+---
+
 ## Quick Start
 
 **Install the SDK:**
@@ -647,11 +671,7 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
 - Ecosystem integrations (LangGraph, CrewAI, Strands)
 
-**In progress**
-- MCP server middleware — `zeroid.mcp_middleware()` drop-in for Python/TypeScript MCP servers; `verify()` + `allowed_tools` enforcement in < 5 lines
-
 **Planned**
-- Coding agent scope vocabulary — `tools:read/write/execute/network/agent/vcs` constants + credential policy templates for common agent personas (`read-only-reviewer`, `code-editor`, `full-autonomy`)
 - CIBA (Client-Initiated Backchannel Authentication) — agents pause long-running workflows and request out-of-band user authorization without blocking
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
 - `zeroid` CLI
