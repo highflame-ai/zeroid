@@ -16,6 +16,7 @@ export function registerInit(program: Command): void {
     .command("init")
     .description("Register a new agent and write credentials to .env.zeroid")
     .requiredOption("--name <name>", "Human-readable agent name")
+    .requiredOption("--owner <owner_id>", "User ID of the agent owner")
     .option("--id <external_id>", "External ID (defaults to --name)")
     .option(
       "--type <type>",
@@ -38,6 +39,7 @@ export function registerInit(program: Command): void {
           sub_type: opts.subType as SubType | undefined,
           framework: opts.framework as string | undefined,
           description: opts.description as string | undefined,
+          created_by: opts.owner as string
         });
 
         // Side effects always happen regardless of output format.
