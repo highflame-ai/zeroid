@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean
+.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -40,6 +40,18 @@ setup-keys: ## Generate ECDSA P-256 + RSA 2048 signing keys
 
 migrate: ## Run migrations (starts server, applies, exits)
 	go run $(CMD) -config zeroid.yaml
+
+cli-install: ## Install CLI dependencies
+	cd cli && npm install
+
+cli-build: cli-install ## Build the zid CLI
+	cd cli && npm run build
+
+cli-dev: ## Run CLI from source (no build needed)
+	cd cli && npx tsx src/index.ts
+
+cli-test: cli-install ## Run CLI tests
+	cd cli && npm test
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)
