@@ -9,8 +9,10 @@ import { join } from "node:path";
 
 export interface Profile {
   base_url: string;
-  account_id: string;
-  project_id: string;
+  /** Required for tenant-scoped operations (agents, creds, signals). */
+  account_id?: string;
+  /** Required for tenant-scoped operations (agents, creds, signals). */
+  project_id?: string;
   api_key: string;
 }
 
@@ -81,7 +83,7 @@ export function requireProfile(name?: string): Profile {
   const profile = getProfile(name);
   if (!profile) {
     throw new Error(
-      'No profile configured. Run "zid init" or set ZID_API_KEY, ZID_ACCOUNT_ID, ZID_PROJECT_ID env vars.',
+      'No profile configured. Run "zid init" or set the ZID_API_KEY env var.',
     );
   }
   return profile;
@@ -89,13 +91,13 @@ export function requireProfile(name?: string): Profile {
 
 function profileFromEnv(): Profile | undefined {
   const api_key = process.env["ZID_API_KEY"];
-  const account_id = process.env["ZID_ACCOUNT_ID"];
-  const project_id = process.env["ZID_PROJECT_ID"];
-  const base_url = process.env["ZID_BASE_URL"] ?? "https://api.zeroid.io";
-  if (api_key && account_id && project_id) {
-    return { api_key, account_id, project_id, base_url };
-  }
-  return undefined;
+  if (!api_key) return undefined;
+  return {
+    api_key,
+    account_id: process.env["ZID_ACCOUNT_ID"],
+    project_id: process.env["ZID_PROJECT_ID"],
+    base_url: process.env["ZID_BASE_URL"] ?? "https://api.zeroid.io",
+  };
 }
 
 /** Write api_key to .env.zeroid in the current working directory. */

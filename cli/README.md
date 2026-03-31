@@ -380,5 +380,5 @@ Or via the root Makefile:
 ```bash
 make cli-install
 make cli-build
-make cli-dev -- token decode eyJhbGc...
+make cli-dev ARGS="token decode eyJhbGc..."
 ```

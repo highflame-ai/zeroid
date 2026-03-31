@@ -40,6 +40,3 @@ tmp/
 .env
 .env.*
 
-# CLI (TypeScript)
-cli/node_modules/
-cli/dist/

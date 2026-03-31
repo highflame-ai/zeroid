@@ -47,8 +47,8 @@ cli-install: ## Install CLI dependencies
 cli-build: cli-install ## Build the zid CLI
 	cd cli && npm run build
 
-cli-dev: ## Run CLI from source (no build needed)
-	cd cli && npx tsx src/index.ts
+cli-dev: cli-install ## Run CLI from source (no build needed)
+	cd cli && npx tsx src/index.ts $(ARGS)
 
 cli-test: cli-install ## Run CLI tests
 	cd cli && npm test

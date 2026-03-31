@@ -8,12 +8,10 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { handleError, printJSON } from "../../lib/output.js";
+import { handleError, printJSON, relativeTime } from "../../lib/output.js";
 
 function _base64urlDecode(s: string): string {
-  const padded = s.replace(/-/g, "+").replace(/_/g, "/");
-  const b64 = padded + "=".repeat((4 - (padded.length % 4)) % 4);
-  return Buffer.from(b64, "base64").toString("utf8");
+  return Buffer.from(s, "base64url").toString("utf8");
 }
 
 function _decodeJWT(token: string): { header: Record<string, unknown>; payload: Record<string, unknown> } {
@@ -27,18 +25,18 @@ function _decodeJWT(token: string): { header: Record<string, unknown>; payload: 
   };
 }
 
+const KNOWN_CLAIMS = new Set([
+  "sub", "iss", "aud", "iat", "exp", "nbf", "jti",
+  "account_id", "project_id", "identity_type", "trust_level", "grant_type",
+  "scopes", "delegation_depth", "act", "external_id", "sub_type", "status",
+  "name", "owner_user_id", "framework", "version", "publisher", "capabilities",
+  "session_id", "task_id", "task_type", "allowed_tools", "workspace", "environment",
+]);
+
 function _formatTime(epoch: unknown): string {
   if (typeof epoch !== "number") return String(epoch);
   const d = new Date(epoch * 1000);
-  const now = Date.now() / 1000;
-  const delta = epoch - now;
-  const abs = Math.abs(delta);
-  let rel: string;
-  if (abs < 60) rel = `${Math.round(abs)}s`;
-  else if (abs < 3600) rel = `${Math.round(abs / 60)}m`;
-  else rel = `${Math.round(abs / 3600)}h`;
-  const label = delta < 0 ? `${rel} ago` : `in ${rel}`;
-  return `${d.toISOString()} (${label})`;
+  return `${d.toISOString()} (${relativeTime(d.toISOString())})`;
 }
 
 export function registerDecode(tokenCmd: Command): void {
@@ -104,16 +102,13 @@ export function registerDecode(tokenCmd: Command): void {
         }
 
         // Print any extra claims not shown above.
-        const known = new Set(["sub","iss","aud","iat","exp","nbf","jti","account_id","project_id",
-          "identity_type","trust_level","grant_type","scopes","delegation_depth","act",
-          "external_id","sub_type","status","name","owner_user_id","framework","version",
-          "publisher","capabilities","session_id","task_id","task_type","allowed_tools",
-          "workspace","environment"]);
-        const extra = Object.entries(payload).filter(([k]) => !known.has(k));
+        const extra = Object.entries(payload).filter(([k]) => !KNOWN_CLAIMS.has(k));
         if (extra.length > 0) {
           console.log(chalk.bold("\nCustom claims"));
+          const maxLen = Math.max(...extra.map(([k]) => k.length));
           for (const [k, v] of extra) {
-            console.log(`  ${k}: ${JSON.stringify(v)}`);
+            const val = typeof v === "string" ? v : JSON.stringify(v);
+            console.log(`  ${k.padEnd(maxLen)}: ${val}`);
           }
         }
         console.log();

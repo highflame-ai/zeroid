@@ -112,10 +112,16 @@ describe("requireProfile", () => {
     expect(p.base_url).toBe("https://api.zeroid.io");
   });
 
+  it("works with only ZID_API_KEY — account/project are optional", () => {
+    process.env["ZID_API_KEY"] = "env_key";
+    const p = requireProfile();
+    expect(p.api_key).toBe("env_key");
+    expect(p.account_id).toBeUndefined();
+    expect(p.project_id).toBeUndefined();
+  });
+
   it("uses ZID_BASE_URL env var when set", () => {
     process.env["ZID_API_KEY"] = "k";
-    process.env["ZID_ACCOUNT_ID"] = "a";
-    process.env["ZID_PROJECT_ID"] = "p";
     process.env["ZID_BASE_URL"] = "http://custom";
     expect(requireProfile().base_url).toBe("http://custom");
   });
@@ -123,8 +129,6 @@ describe("requireProfile", () => {
   it("env vars take precedence over config file", () => {
     setProfile("default", { base_url: "http://file", account_id: "a", project_id: "p", api_key: "file_key" });
     process.env["ZID_API_KEY"] = "env_key";
-    process.env["ZID_ACCOUNT_ID"] = "a";
-    process.env["ZID_PROJECT_ID"] = "p";
     expect(requireProfile().api_key).toBe("env_key");
   });
 
