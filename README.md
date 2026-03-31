@@ -148,6 +148,8 @@ pip install highflame        # Python
 npm install @highflame/zeroid   # Node / TypeScript
 ```
 
+Prefer a runnable walkthrough after installing the SDK? Open the [ZeroID Quickstart notebook](examples/zeroid_quickstart.ipynb) for an end-to-end demo covering agent registration, OAuth client credentials, agent-to-agent delegation, token introspection and revocation, credential policies, and CAE signals.
+
 **Run ZeroID locally** (Docker — 30 seconds):
 
 ```bash
