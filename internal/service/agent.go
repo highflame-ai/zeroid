@@ -181,21 +181,9 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		offset = 0
 	}
 
-	identities, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search)
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, limit, offset)
 	if err != nil {
 		return nil, err
-	}
-
-	// Apply simple offset/limit on the result set.
-	total := len(identities)
-	end := offset + limit
-	if offset >= total {
-		identities = nil
-	} else {
-		if end > total {
-			end = total
-		}
-		identities = identities[offset:end]
 	}
 
 	agents := make([]AgentResponse, len(identities))

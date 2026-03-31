@@ -75,7 +75,7 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // List returns identities for a tenant, optionally filtered by identity_type(s) and label.
 // The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
 // and filters using JSONB containment: labels @> {"key": "value"}.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string) ([]*domain.Identity, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	q := r.db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
@@ -90,7 +90,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)
 		if len(parts) != 2 || parts[0] == "" {
-			return nil, fmt.Errorf("invalid label format: expected non-empty-key:value, got %q", label)
+			return nil, 0, fmt.Errorf("invalid label format: expected non-empty-key:value, got %q", label)
 		}
 		labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
 		q = q.Where("labels @> ?::jsonb", string(labelJSON))
@@ -110,10 +110,22 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
 	}
 
-	if err := q.Scan(ctx); err != nil {
-		return nil, fmt.Errorf("failed to list identities: %w", err)
+	total, err := q.Count(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count identities: %w", err)
 	}
-	return identities, nil
+
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if offset > 0 {
+		q = q.Offset(offset)
+	}
+
+	if err := q.Scan(ctx); err != nil {
+		return nil, 0, fmt.Errorf("failed to list identities: %w", err)
+	}
+	return identities, total, nil
 }
 
 // Update saves changes to an existing identity.
