@@ -75,7 +75,7 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // List returns identities for a tenant, optionally filtered by identity_type(s) and label.
 // The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
 // and filters using JSONB containment: labels @> {"key": "value"}.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string) ([]*domain.Identity, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string) ([]*domain.Identity, error) {
 	var identities []*domain.Identity
 	q := r.db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
@@ -94,6 +94,20 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		}
 		labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
 		q = q.Where("labels @> ?::jsonb", string(labelJSON))
+	}
+	if trustLevel != "" {
+		q = q.Where("trust_level = ?", trustLevel)
+	}
+	if isActive != "" {
+		if isActive == "true" {
+			q = q.Where("status = 'active'")
+		} else if isActive == "false" {
+			q = q.Where("status != 'active'")
+		}
+	}
+	if search != "" {
+		searchPattern := "%" + search + "%"
+		q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
 	}
 
 	if err := q.Scan(ctx); err != nil {
