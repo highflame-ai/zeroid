@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -211,4 +212,258 @@ func TestServerGetIdentity(t *testing.T) {
 func doRaw(t *testing.T, method, path string, body any, headers map[string]string) (*http.Response, error) {
 	t.Helper()
 	return http.DefaultClient.Do(newRequest(t, method, path, body, headers))
+}
+
+// ── Filter & Pagination Tests ───────────────────────────────────────────────
+
+// TestListAgentsFilterByTrustLevel verifies that trust_level filter works server-side.
+func TestListAgentsFilterByTrustLevel(t *testing.T) {
+	fpExt := uid("trust-fp")
+	uvExt := uid("trust-uv")
+
+	// Register a first_party agent.
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   fpExt,
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "first_party",
+		"name":          "First Party Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"test": "trust-filter"},
+	}, adminHeaders())
+
+	// Register an unverified agent.
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   uvExt,
+		"identity_type": "agent",
+		"sub_type":      "tool_agent",
+		"trust_level":   "unverified",
+		"name":          "Unverified Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"test": "trust-filter"},
+	}, adminHeaders())
+
+	// Filter by first_party only.
+	resp := get(t, "/api/v1/agents/registry?trust_level=first_party&label=test:trust-filter", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	agents := body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		assert.Equal(t, "first_party", m["trust_level"], "should only return first_party agents")
+	}
+	assert.GreaterOrEqual(t, len(agents), 1, "should have at least one first_party agent")
+
+	// Filter by unverified — should not include first_party.
+	resp = get(t, "/api/v1/agents/registry?trust_level=unverified&label=test:trust-filter", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	agents = body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		assert.Equal(t, "unverified", m["trust_level"], "should only return unverified agents")
+	}
+}
+
+// TestListAgentsFilterByIsActive verifies that is_active filter works.
+func TestListAgentsFilterByIsActive(t *testing.T) {
+	activeExt := uid("active-a")
+	inactiveExt := uid("active-b")
+
+	// Register and keep one active.
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   activeExt,
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "unverified",
+		"name":          "Active Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"test": "active-filter"},
+	}, adminHeaders())
+
+	// Register and deactivate.
+	resp := post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   inactiveExt,
+		"identity_type": "agent",
+		"sub_type":      "tool_agent",
+		"trust_level":   "unverified",
+		"name":          "Inactive Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"test": "active-filter"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	registered := decode(t, resp)
+	agentID := registered["identity"].(map[string]any)["id"].(string)
+
+	// Deactivate.
+	deactivateResp, err := doRaw(t, http.MethodPost, "/api/v1/agents/registry/"+agentID+"/deactivate", nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, deactivateResp.StatusCode)
+	deactivateResp.Body.Close()
+
+	// is_active=true should exclude deactivated.
+	resp = get(t, "/api/v1/agents/registry?is_active=true&label=test:active-filter", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	agents := body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		assert.Equal(t, "active", m["status"], "is_active=true should only return active agents")
+	}
+
+	// is_active=false should only return non-active.
+	resp = get(t, "/api/v1/agents/registry?is_active=false&label=test:active-filter", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	agents = body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		assert.NotEqual(t, "active", m["status"], "is_active=false should exclude active agents")
+	}
+}
+
+// TestListAgentsSearch verifies that name/external_id search works.
+func TestListAgentsSearch(t *testing.T) {
+	searchTag := uid("search")
+	ext1 := uid("search-alpha")
+	ext2 := uid("search-beta")
+
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   ext1,
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "unverified",
+		"name":          "Alpha Research Bot " + searchTag,
+		"created_by":    "test-user",
+	}, adminHeaders())
+
+	post(t, "/api/v1/agents/register", map[string]any{
+		"external_id":   ext2,
+		"identity_type": "agent",
+		"sub_type":      "tool_agent",
+		"trust_level":   "unverified",
+		"name":          "Beta Trading Bot " + searchTag,
+		"created_by":    "test-user",
+	}, adminHeaders())
+
+	// Search by name substring.
+	resp := get(t, "/api/v1/agents/registry?search=Alpha+Research", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	agents := body["agents"].([]any)
+	found := false
+	for _, a := range agents {
+		m := a.(map[string]any)
+		if m["external_id"] == ext1 {
+			found = true
+		}
+	}
+	assert.True(t, found, "search should find Alpha Research Bot by name")
+
+	// Search by external_id substring.
+	resp = get(t, "/api/v1/agents/registry?search="+ext2[:20], adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	agents = body["agents"].([]any)
+	found = false
+	for _, a := range agents {
+		m := a.(map[string]any)
+		if m["external_id"] == ext2 {
+			found = true
+		}
+	}
+	assert.True(t, found, "search should find agent by external_id substring")
+}
+
+// TestListAgentsPagination verifies limit and offset work correctly.
+func TestListAgentsPagination(t *testing.T) {
+	paginationLabel := uid("page")
+
+	// Register 5 agents with a unique label.
+	for i := 0; i < 5; i++ {
+		post(t, "/api/v1/agents/register", map[string]any{
+			"external_id":   uid(fmt.Sprintf("page-%d", i)),
+			"identity_type": "agent",
+			"sub_type":      "autonomous",
+			"trust_level":   "unverified",
+			"name":          fmt.Sprintf("Page Agent %d", i),
+			"created_by":    "test-user",
+			"labels":        map[string]string{"pagination": paginationLabel},
+		}, adminHeaders())
+	}
+
+	// Request first page (limit=2).
+	resp := get(t, "/api/v1/agents/registry?limit=2&offset=0&label=pagination:"+paginationLabel, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	page1 := body["agents"].([]any)
+	assert.Equal(t, 2, len(page1), "first page should have 2 agents")
+	assert.Equal(t, float64(5), body["total"], "total should be 5")
+
+	// Request second page (limit=2, offset=2).
+	resp = get(t, "/api/v1/agents/registry?limit=2&offset=2&label=pagination:"+paginationLabel, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	page2 := body["agents"].([]any)
+	assert.Equal(t, 2, len(page2), "second page should have 2 agents")
+
+	// Pages should not overlap.
+	page1IDs := map[string]bool{}
+	for _, a := range page1 {
+		page1IDs[a.(map[string]any)["id"].(string)] = true
+	}
+	for _, a := range page2 {
+		id := a.(map[string]any)["id"].(string)
+		assert.False(t, page1IDs[id], "page 2 should not contain agents from page 1")
+	}
+
+	// Request last page (offset=4, limit=2) — should return 1 agent.
+	resp = get(t, "/api/v1/agents/registry?limit=2&offset=4&label=pagination:"+paginationLabel, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	page3 := body["agents"].([]any)
+	assert.Equal(t, 1, len(page3), "last page should have 1 agent")
+}
+
+// TestListIdentitiesEndpointFilters verifies that /api/v1/identities also supports filters.
+func TestListIdentitiesEndpointFilters(t *testing.T) {
+	ext := uid("id-filter")
+	post(t, "/api/v1/identities", map[string]any{
+		"external_id":    ext,
+		"trust_level":    "first_party",
+		"identity_type":  "application",
+		"sub_type":       "chatbot",
+		"owner_user_id":  "test-user",
+		"name":           "Filterable App " + ext,
+		"allowed_scopes": []string{"read:data"},
+	}, adminHeaders())
+
+	// Filter by identity_type.
+	resp := get(t, "/api/v1/identities?identity_type=application", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	identities := body["identities"].([]any)
+	for _, i := range identities {
+		m := i.(map[string]any)
+		assert.Equal(t, "application", m["identity_type"])
+	}
+
+	// Search by name.
+	resp = get(t, "/api/v1/identities?search=Filterable+App", adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	identities = body["identities"].([]any)
+	found := false
+	for _, i := range identities {
+		m := i.(map[string]any)
+		if m["external_id"] == ext {
+			found = true
+		}
+	}
+	assert.True(t, found, "search should find the identity by name")
+
+	// Pagination metadata present.
+	assert.NotNil(t, body["total"], "response should include total")
+	assert.NotNil(t, body["limit"], "response should include limit")
+	assert.NotNil(t, body["offset"], "response should include offset")
 }
