@@ -145,7 +145,7 @@ jobs:
       - name: Trivy Scan - Text Security Report
         id: trivy_scan_txt
         if: ${{ env.GH_SEC_REPORT == 'false' }}
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.35.0
         continue-on-error: true
         with:
           ignore-unfixed: true
@@ -169,7 +169,7 @@ jobs:
       - name: Trivy Scan - GitHub Security Report
         id: trivy_scan_sec
         if: ${{ env.GH_SEC_REPORT == 'true' }}
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           ignore-unfixed: true
           skip-setup-trivy: true
