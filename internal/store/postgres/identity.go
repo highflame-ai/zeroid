@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/uptrace/bun"
@@ -99,10 +100,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		q = q.Where("trust_level = ?", trustLevel)
 	}
 	if isActive != "" {
-		if isActive == "true" {
-			q = q.Where("status = 'active'")
-		} else if isActive == "false" {
-			q = q.Where("status != 'active'")
+		if active, err := strconv.ParseBool(isActive); err == nil {
+			if active {
+				q = q.Where("status = 'active'")
+			} else {
+				q = q.Where("status != 'active'")
+			}
 		}
 	}
 	if search != "" {

@@ -1,0 +1,10 @@
+# CVE-2026-34040: Moby AuthZ plugin bypass with oversized request bodies
+# github.com/docker/docker v28.5.2+incompatible → fixed in v29.3.1
+#
+# This is a test-only transitive dependency pulled in by testcontainers-go.
+# Docker client is NOT used in production code — only in integration tests
+# that spin up PostgreSQL containers. The vulnerable AuthZ plugin bypass
+# requires local Docker daemon access which is not exposed in production.
+#
+# Will be resolved when testcontainers-go releases a version using docker v29+.
+CVE-2026-34040
