@@ -171,8 +171,8 @@ func (s *IdentityService) GetIdentityByExternalID(ctx context.Context, externalI
 }
 
 // ListIdentities returns identities for a tenant, optionally filtered by identity_type(s) and label.
-func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label string) ([]*domain.Identity, error) {
-	return s.repo.List(ctx, accountID, projectID, identityTypes, label)
+func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) ([]*domain.Identity, int, error) {
+	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, limit, offset)
 }
 
 // UpdateIdentityRequest holds parameters for identity updates.
