@@ -38,8 +38,8 @@ function _read(): ConfigFile {
 }
 
 function _write(cfg: ConfigFile): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
 }
 
 export function getProfile(name?: string): Profile | undefined {
