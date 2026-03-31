@@ -43,10 +43,22 @@ type IdentityIDInput struct {
 	ID string `path:"id" doc:"Identity UUID"`
 }
 
+type ListIdentitiesInput struct {
+	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
+	IsActive     string   `query:"is_active" doc:"Filter by active status"`
+	Search       string   `query:"search" doc:"Search by name or external_id"`
+	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
+}
+
 type IdentityListOutput struct {
 	Body struct {
 		Identities []*domain.Identity `json:"identities"`
 		Total      int                `json:"total"`
+		Limit      int                `json:"limit"`
+		Offset     int                `json:"offset"`
 	}
 }
 
@@ -203,13 +215,22 @@ func (a *API) getIdentityOp(ctx context.Context, input *IdentityIDInput) (*Ident
 	return &IdentityOutput{Body: identity}, nil
 }
 
-func (a *API) listIdentitiesOp(ctx context.Context, _ *struct{}) (*IdentityListOutput, error) {
+func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) (*IdentityListOutput, error) {
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	identities, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, nil, "")
+	limit := input.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset := input.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
@@ -220,7 +241,9 @@ func (a *API) listIdentitiesOp(ctx context.Context, _ *struct{}) (*IdentityListO
 	}
 	out := &IdentityListOutput{}
 	out.Body.Identities = identities
-	out.Body.Total = len(identities)
+	out.Body.Total = total
+	out.Body.Limit = limit
+	out.Body.Offset = offset
 	return out, nil
 }
 

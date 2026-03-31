@@ -72,13 +72,14 @@ type GetAgentOutput struct {
 }
 
 type ListAgentsInput struct {
-	AgentType    string `query:"agent_type" doc:"Filter by agent type"`
+	AgentType    string   `query:"agent_type" doc:"Filter by agent type"`
 	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
-	Label        string `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel   string `query:"trust_level" doc:"Filter by trust level"`
-	IsActive     string `query:"is_active" doc:"Filter by active status"`
-	Limit        int    `query:"limit" default:"20" doc:"Items per page (max 100)"`
-	Offset       int    `query:"offset" default:"0" doc:"Offset for pagination"`
+	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
+	IsActive     string   `query:"is_active" doc:"Filter by active status"`
+	Search       string   `query:"search" doc:"Search by name or external_id"`
+	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
 
 type ListAgentsOutput struct {
@@ -245,7 +246,7 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.Limit, input.Offset)
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
 	}
