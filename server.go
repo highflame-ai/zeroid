@@ -2,6 +2,7 @@ package zeroid
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -65,6 +66,7 @@ type Server struct {
 	oauthClientSvc      *service.OAuthClientService
 	signalSvc           *service.SignalService
 	apiKeySvc           *service.APIKeyService
+	downstreamTokenSvc  *service.DownstreamTokenService
 	agentSvc            *service.AgentService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
@@ -151,6 +153,20 @@ func NewServer(cfg Config) (*Server, error) {
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
+
+	// Downstream token service (OAuth broker for third-party MCP servers)
+	downstreamTokenRepo := postgres.NewDownstreamTokenRepository(db)
+	encKey := []byte(cfg.Token.EncryptionKey)
+	if len(encKey) == 0 {
+		encKey = []byte("ZeroIDDefaultKey!") // dev fallback
+	}
+	// AES requires 16, 24, or 32 byte key — pad/truncate with SHA-256
+	if len(encKey) != 16 && len(encKey) != 24 && len(encKey) != 32 {
+		h := sha256.Sum256(encKey)
+		encKey = h[:32]
+	}
+	downstreamTokenSvc := service.NewDownstreamTokenService(downstreamTokenRepo, encKey)
+
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
@@ -170,7 +186,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, downstreamTokenSvc, agentSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
@@ -266,6 +282,7 @@ func NewServer(cfg Config) (*Server, error) {
 		oauthClientSvc:      oauthClientSvc,
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
+		downstreamTokenSvc:  downstreamTokenSvc,
 		agentSvc:            agentSvc,
 		jwksSvc:             jwksSvc,
 		refreshTokenSvc:     refreshTokenSvc,

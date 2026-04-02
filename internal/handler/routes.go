@@ -29,6 +29,7 @@ type API struct {
 	oauthClientSvc      *service.OAuthClientService
 	signalSvc           *service.SignalService
 	apiKeySvc           *service.APIKeyService
+	downstreamTokenSvc  *service.DownstreamTokenService
 	agentSvc            *service.AgentService
 	jwksSvc             *signing.JWKSService
 	db                  *bun.DB
@@ -48,6 +49,7 @@ func NewAPI(
 	oauthClientSvc *service.OAuthClientService,
 	signalSvc *service.SignalService,
 	apiKeySvc *service.APIKeyService,
+	downstreamTokenSvc *service.DownstreamTokenService,
 	agentSvc *service.AgentService,
 	jwksSvc *signing.JWKSService,
 	db *bun.DB,
@@ -63,6 +65,7 @@ func NewAPI(
 		oauthClientSvc:      oauthClientSvc,
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
+		downstreamTokenSvc:  downstreamTokenSvc,
 		agentSvc:            agentSvc,
 		jwksSvc:             jwksSvc,
 		db:                  db,
@@ -109,6 +112,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerAttestationRoutes(api)
 	a.registerOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
+	a.registerDownstreamTokenRoutes(api)
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)
 	a.registerProofVerifyRoute(api)

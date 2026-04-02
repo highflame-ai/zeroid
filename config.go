@@ -80,6 +80,10 @@ type TokenConfig struct {
 	// AuthCodeIssuer is the expected issuer claim in auth code JWTs.
 	// Defaults to Token.Issuer when empty.
 	AuthCodeIssuer string `koanf:"auth_code_issuer"`
+
+	// EncryptionKey is the AES-256 key for encrypting downstream OAuth tokens.
+	// Must be exactly 16, 24, or 32 bytes. Loaded from ZEROID_TOKEN_ENCRYPTION_KEY env var.
+	EncryptionKey string `koanf:"encryption_key"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
