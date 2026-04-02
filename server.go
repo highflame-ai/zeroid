@@ -439,19 +439,10 @@ func (s *Server) Router() chi.Router {
 // Call this after NewServer and before Start to mount ZeroID's router
 // under a path prefix or wrap it in an outer router.
 //
-// Example — split mounting (public under /auth, admin API under /api/v1/auth):
+// Example — mount all routes under /prefix:
 //
 //	outer := chi.NewRouter()
-//	outer.Mount("/auth", srv.Router())
-//	outer.Mount("/api/v1/auth", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-//	    // chi stripped /api/v1/auth; restore /api/v1 for ZeroID's /api/v1/* routes.
-//	    r.URL.Path = "/api/v1" + r.URL.Path
-//	    if rctx := chi.RouteContext(r.Context()); rctx != nil {
-//	        rctx.Reset()
-//	        rctx.RoutePath = r.URL.Path
-//	    }
-//	    srv.Router().ServeHTTP(w, r)
-//	}))
+//	outer.Mount("/prefix", srv.Router())
 //	srv.SetHandler(outer)
 //	srv.Start()
 func (s *Server) SetHandler(h http.Handler) {
