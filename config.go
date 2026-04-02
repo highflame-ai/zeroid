@@ -187,7 +187,7 @@ func loadDefaults(k *koanf.Koanf) error {
 		"token.max_ttl":     7776000, // 90 days
 
 		// WIMSE
-		"wimse_domain": "zeroid.dev",
+		"wimse_domain": "highflame.ai",
 
 		// Telemetry
 		"telemetry.enabled":       false,

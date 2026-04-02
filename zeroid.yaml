@@ -30,7 +30,7 @@ token:
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
 
-wimse_domain: "zeroid.dev"
+wimse_domain: "highflame.ai"
 
 # Admin routes (/api/v1/*) have no built-in auth.
 # In production, protect them at the network layer (reverse proxy, VPN, firewall)
