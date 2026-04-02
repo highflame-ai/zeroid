@@ -207,23 +207,14 @@ func NewServer(cfg Config) (*Server, error) {
 		})
 	})
 
-	// routeTarget is the router on which routes are registered.
-	// when BasePath is set, routes are mounted under that prefix via a sub-router.
-	routeTarget := chi.Router(r)
-	if cfg.Server.BasePath != "" {
-		r.Route(cfg.Server.BasePath, func(sub chi.Router) {
-			routeTarget = sub
-		})
-	}
-
 	// Public routes — no auth.
 	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke, /oauth2/token/verify
-	humaPublic := handler.NewHumaAPI(routeTarget)
-	apiHandler.RegisterPublic(humaPublic, routeTarget)
+	humaPublic := handler.NewHumaAPI(r)
+	apiHandler.RegisterPublic(humaPublic, r)
 
 	// Admin routes — /api/v1/*
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
-	routeTarget.Group(func(r chi.Router) {
+	r.Group(func(r chi.Router) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -305,9 +296,8 @@ func (s *Server) Start() error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
-		base := s.cfg.Server.BasePath
-		log.Info().Msgf("  Public:  %s/health, %s/.well-known/*, %s/oauth2/*", base, base, base)
-		log.Info().Msgf("  Admin:   %s/api/v1/* (no built-in auth — protect at network layer)", base)
+		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
+		log.Info().Msg("  Admin:   /api/v1/* (no built-in auth — protect at network layer)")
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -403,7 +393,7 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
 }
 
-// AdminAuth sets an optional authentication middleware for admin routes (e.g. /api/v1/* or {BasePath}/api/v1/*).
+// AdminAuth sets an optional authentication middleware for /api/v1/* admin routes.
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
@@ -443,6 +433,29 @@ func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
 // Router returns the chi.Router for custom route mounting.
 func (s *Server) Router() chi.Router {
 	return s.router
+}
+
+// SetHandler overrides the HTTP handler used by the server.
+// Call this after NewServer and before Start to mount ZeroID's router
+// under a path prefix or wrap it in an outer router.
+//
+// Example — split mounting (public under /auth, admin API under /api/v1/auth):
+//
+//	outer := chi.NewRouter()
+//	outer.Mount("/auth", srv.Router())
+//	outer.Mount("/api/v1/auth", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//	    // chi stripped /api/v1/auth; restore /api/v1 for ZeroID's /api/v1/* routes.
+//	    r.URL.Path = "/api/v1" + r.URL.Path
+//	    if rctx := chi.RouteContext(r.Context()); rctx != nil {
+//	        rctx.Reset()
+//	        rctx.RoutePath = r.URL.Path
+//	    }
+//	    srv.Router().ServeHTTP(w, r)
+//	}))
+//	srv.SetHandler(outer)
+//	srv.Start()
+func (s *Server) SetHandler(h http.Handler) {
+	s.http.Handler = h
 }
 
 // GetIdentity returns the identity with the given ID for the specified tenant.

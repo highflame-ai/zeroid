@@ -35,10 +35,6 @@ type ServerConfig struct {
 	WriteTimeout           string `koanf:"write_timeout"`
 	IdleTimeout            string `koanf:"idle_timeout"`
 	ShutdownTimeoutSeconds int    `koanf:"shutdown_timeout_seconds"`
-	// optional path prefix mounted in front of all routes.
-	// eg "/auth" causes all routes to be served under /auth/*, /auth/health, etc.
-	// When empty (default), routes are served at the root.
-	BasePath string `koanf:"base_path"`
 }
 
 // DatabaseConfig holds PostgreSQL connection settings.
@@ -215,9 +211,8 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT":      "server.port",
-		"ZEROID_ENV":       "server.env",
-		"ZEROID_BASE_PATH": "server.base_path",
+		"ZEROID_PORT": "server.port",
+		"ZEROID_ENV":  "server.env",
 
 		// Database
 		"ZEROID_DATABASE_URL": "database.url",
