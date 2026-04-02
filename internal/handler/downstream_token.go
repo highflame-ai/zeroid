@@ -95,7 +95,17 @@ func (a *API) registerDownstreamTokenRoutes(api huma.API) {
 
 // --- Operations ---
 
+func (a *API) checkDownstreamTokenSvc() error {
+	if a.downstreamTokenSvc == nil {
+		return huma.Error503ServiceUnavailable("downstream token service not configured (set ZEROID_TOKEN_ENCRYPTION_KEY)")
+	}
+	return nil
+}
+
 func (a *API) storeDownstreamTokenOp(ctx context.Context, input *StoreDownstreamTokenInput) (*StoreDownstreamTokenOutput, error) {
+	if err := a.checkDownstreamTokenSvc(); err != nil {
+		return nil, err
+	}
 	tenant, err := middleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -124,6 +134,9 @@ func (a *API) storeDownstreamTokenOp(ctx context.Context, input *StoreDownstream
 }
 
 func (a *API) getDownstreamTokenOp(ctx context.Context, input *GetDownstreamTokenInput) (*GetDownstreamTokenOutput, error) {
+	if err := a.checkDownstreamTokenSvc(); err != nil {
+		return nil, err
+	}
 	tenant, err := middleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -143,6 +156,9 @@ func (a *API) getDownstreamTokenOp(ctx context.Context, input *GetDownstreamToke
 }
 
 func (a *API) deleteDownstreamTokenOp(ctx context.Context, input *DeleteDownstreamTokenInput) (*DeleteDownstreamTokenOutput, error) {
+	if err := a.checkDownstreamTokenSvc(); err != nil {
+		return nil, err
+	}
 	tenant, err := middleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -163,6 +179,9 @@ func (a *API) deleteDownstreamTokenOp(ctx context.Context, input *DeleteDownstre
 }
 
 func (a *API) listDownstreamTokensOp(ctx context.Context, _ *struct{}) (*ListDownstreamTokensOutput, error) {
+	if err := a.checkDownstreamTokenSvc(); err != nil {
+		return nil, err
+	}
 	tenant, err := middleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")

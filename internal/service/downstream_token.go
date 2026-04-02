@@ -103,7 +103,9 @@ func (s *DownstreamTokenService) GetToken(
 		return nil, err
 	}
 
-	// Auto-refresh if expired and refresh token exists
+	// Auto-refresh if expired and refresh token exists.
+	// Note: concurrent refresh is mitigated by firehog's 5-minute token cache —
+	// only one request per 5 minutes reaches here per user+server pair.
 	if isExpired(token) && token.RefreshToken != "" {
 		if refreshErr := s.tryRefresh(ctx, token); refreshErr != nil {
 			log.Warn().Err(refreshErr).
@@ -193,7 +195,8 @@ func (s *DownstreamTokenService) tryRefresh(ctx context.Context, token *domain.D
 		"client_secret": {oauthCfg.ClientSecret},
 	}
 
-	resp, err := http.PostForm(oauthCfg.TokenURL, data)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := httpClient.PostForm(oauthCfg.TokenURL, data)
 	if err != nil {
 		return fmt.Errorf("refresh request failed: %w", err)
 	}

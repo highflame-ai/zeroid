@@ -82,7 +82,7 @@ type TokenConfig struct {
 	AuthCodeIssuer string `koanf:"auth_code_issuer"`
 
 	// EncryptionKey is the AES-256 key for encrypting downstream OAuth tokens.
-	// Must be exactly 16, 24, or 32 bytes. Loaded from ZEROID_TOKEN_ENCRYPTION_KEY env var.
+	// Loaded from ZEROID_TOKEN_ENCRYPTION_KEY env var. Required for downstream token API.
 	EncryptionKey string `koanf:"encryption_key"`
 }
 
@@ -241,6 +241,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_BASE_URL":              "token.base_url",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		"ZEROID_TOKEN_ENCRYPTION_KEY":  "token.encryption_key",
 
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",

@@ -156,16 +156,19 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Downstream token service (OAuth broker for third-party MCP servers)
 	downstreamTokenRepo := postgres.NewDownstreamTokenRepository(db)
-	encKey := []byte(cfg.Token.EncryptionKey)
-	if len(encKey) == 0 {
-		encKey = []byte("ZeroIDDefaultKey!") // dev fallback
+	var downstreamTokenSvc *service.DownstreamTokenService
+	if cfg.Token.EncryptionKey != "" {
+		encKey := []byte(cfg.Token.EncryptionKey)
+		// AES requires 16, 24, or 32 byte key — normalize via SHA-256
+		if len(encKey) != 16 && len(encKey) != 24 && len(encKey) != 32 {
+			h := sha256.Sum256(encKey)
+			encKey = h[:32]
+		}
+		downstreamTokenSvc = service.NewDownstreamTokenService(downstreamTokenRepo, encKey)
+		log.Info().Msg("Downstream token service initialized")
+	} else {
+		log.Warn().Msg("ZEROID_TOKEN_ENCRYPTION_KEY not set — downstream token API disabled")
 	}
-	// AES requires 16, 24, or 32 byte key — pad/truncate with SHA-256
-	if len(encKey) != 16 && len(encKey) != 24 && len(encKey) != 32 {
-		h := sha256.Sum256(encKey)
-		encKey = h[:32]
-	}
-	downstreamTokenSvc := service.NewDownstreamTokenService(downstreamTokenRepo, encKey)
 
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
