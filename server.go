@@ -435,6 +435,20 @@ func (s *Server) Router() chi.Router {
 	return s.router
 }
 
+// SetHandler overrides the HTTP handler used by the server.
+// Call this after NewServer and before Start to mount ZeroID's router
+// under a path prefix or wrap it in an outer router.
+//
+// Example — mount all routes under /prefix:
+//
+//	outer := chi.NewRouter()
+//	outer.Mount("/prefix", srv.Router())
+//	srv.SetHandler(outer)
+//	srv.Start()
+func (s *Server) SetHandler(h http.Handler) {
+	s.http.Handler = h
+}
+
 // GetIdentity returns the identity with the given ID for the specified tenant.
 // Returns an error if the identity is not found or does not belong to the tenant.
 func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {

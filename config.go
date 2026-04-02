@@ -159,11 +159,11 @@ func (c *Config) Validate() error {
 func loadDefaults(k *koanf.Koanf) error {
 	defaults := map[string]any{
 		// Server
-		"server.port":                    "8899",
-		"server.env":                     "development",
-		"server.read_timeout":            "15s",
-		"server.write_timeout":           "15s",
-		"server.idle_timeout":            "60s",
+		"server.port":                     "8899",
+		"server.env":                      "development",
+		"server.read_timeout":             "15s",
+		"server.write_timeout":            "15s",
+		"server.idle_timeout":             "60s",
 		"server.shutdown_timeout_seconds": 30,
 
 		// Database
@@ -221,8 +221,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"DB_USERNAME":         "database.user",
 		"DB_PASSWORD":         "database.password",
 		"ZEROID_DB_NAME":      "database.name",
-		"DB_SSL_MODE":             "database.ssl_mode",
-		"ZEROID_AUTO_MIGRATE":     "database.auto_migrate",
+		"DB_SSL_MODE":         "database.ssl_mode",
+		"ZEROID_AUTO_MIGRATE": "database.auto_migrate",
 
 		// Keys
 		"ZEROID_PRIVATE_KEY_PATH":     "keys.private_key_path",
