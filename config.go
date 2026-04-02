@@ -35,6 +35,10 @@ type ServerConfig struct {
 	WriteTimeout           string `koanf:"write_timeout"`
 	IdleTimeout            string `koanf:"idle_timeout"`
 	ShutdownTimeoutSeconds int    `koanf:"shutdown_timeout_seconds"`
+	// optional path prefix mounted in front of all routes.
+	// eg "/auth" causes all routes to be served under /auth/*, /auth/health, etc.
+	// When empty (default), routes are served at the root.
+	BasePath string `koanf:"base_path"`
 }
 
 // DatabaseConfig holds PostgreSQL connection settings.
@@ -159,11 +163,11 @@ func (c *Config) Validate() error {
 func loadDefaults(k *koanf.Koanf) error {
 	defaults := map[string]any{
 		// Server
-		"server.port":                    "8899",
-		"server.env":                     "development",
-		"server.read_timeout":            "15s",
-		"server.write_timeout":           "15s",
-		"server.idle_timeout":            "60s",
+		"server.port":                     "8899",
+		"server.env":                      "development",
+		"server.read_timeout":             "15s",
+		"server.write_timeout":            "15s",
+		"server.idle_timeout":             "60s",
 		"server.shutdown_timeout_seconds": 30,
 
 		// Database
@@ -211,8 +215,9 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT": "server.port",
-		"ZEROID_ENV":  "server.env",
+		"ZEROID_PORT":      "server.port",
+		"ZEROID_ENV":       "server.env",
+		"ZEROID_BASE_PATH": "server.base_path",
 
 		// Database
 		"ZEROID_DATABASE_URL": "database.url",
@@ -221,8 +226,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"DB_USERNAME":         "database.user",
 		"DB_PASSWORD":         "database.password",
 		"ZEROID_DB_NAME":      "database.name",
-		"DB_SSL_MODE":             "database.ssl_mode",
-		"ZEROID_AUTO_MIGRATE":     "database.auto_migrate",
+		"DB_SSL_MODE":         "database.ssl_mode",
+		"ZEROID_AUTO_MIGRATE": "database.auto_migrate",
 
 		// Keys
 		"ZEROID_PRIVATE_KEY_PATH":     "keys.private_key_path",

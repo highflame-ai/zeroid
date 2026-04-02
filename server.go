@@ -207,14 +207,23 @@ func NewServer(cfg Config) (*Server, error) {
 		})
 	})
 
+	// routeTarget is the router on which routes are registered.
+	// when BasePath is set, routes are mounted under that prefix via a sub-router.
+	routeTarget := chi.Router(r)
+	if cfg.Server.BasePath != "" {
+		r.Route(cfg.Server.BasePath, func(sub chi.Router) {
+			routeTarget = sub
+		})
+	}
+
 	// Public routes — no auth.
 	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke, /oauth2/token/verify
-	humaPublic := handler.NewHumaAPI(r)
-	apiHandler.RegisterPublic(humaPublic, r)
+	humaPublic := handler.NewHumaAPI(routeTarget)
+	apiHandler.RegisterPublic(humaPublic, routeTarget)
 
 	// Admin routes — /api/v1/*
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
-	r.Group(func(r chi.Router) {
+	routeTarget.Group(func(r chi.Router) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -296,8 +305,9 @@ func (s *Server) Start() error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
-		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Msg("  Admin:   /api/v1/* (no built-in auth — protect at network layer)")
+		base := s.cfg.Server.BasePath
+		log.Info().Msgf("  Public:  %s/health, %s/.well-known/*, %s/oauth2/*", base, base, base)
+		log.Info().Msgf("  Admin:   %s/api/v1/* (no built-in auth — protect at network layer)", base)
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -393,7 +403,7 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
 }
 
-// AdminAuth sets an optional authentication middleware for /api/v1/* admin routes.
+// AdminAuth sets an optional authentication middleware for admin routes (e.g. /api/v1/* or {BasePath}/api/v1/*).
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
