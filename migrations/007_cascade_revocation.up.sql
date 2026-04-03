@@ -12,6 +12,7 @@
 
 CREATE OR REPLACE FUNCTION revoke_credentials_cascade(
     p_identity_id UUID,
+    p_revoked_at TIMESTAMPTZ,
     p_reason      TEXT
 ) RETURNS INTEGER AS $$
 DECLARE
@@ -30,19 +31,19 @@ BEGIN
         FROM issued_credentials
         WHERE identity_id = p_identity_id
           AND is_revoked  = FALSE
-          AND expires_at  > NOW()
+          AND expires_at  > p_revoked_at
         UNION ALL
         SELECT ic.id, ic.jti, chain.depth + 1
         FROM issued_credentials ic
         JOIN chain ON ic.parent_jti = chain.jti
         WHERE ic.is_revoked = FALSE
-          AND ic.expires_at > NOW()
+          AND ic.expires_at > p_revoked_at
           AND chain.depth   < 50
     )
     CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
     UPDATE issued_credentials
     SET is_revoked    = TRUE,
-        revoked_at    = NOW(),
+        revoked_at    = p_revoked_at,
         revoke_reason = p_reason
     WHERE id IN (SELECT id FROM chain WHERE NOT is_cycle)
       AND is_revoked = FALSE;

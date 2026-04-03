@@ -77,10 +77,11 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 // (migration 007) which executes the full subtree update atomically in one statement.
 // Returns the total number of credentials revoked (root + descendants).
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
+	now := time.Now()
 	var count int64
 	if err := r.db.NewRaw(
-		"SELECT revoke_credentials_cascade(?, ?)",
-		identityID, reason,
+		"SELECT revoke_credentials_cascade(?, ?, ?)",
+		identityID, now, reason,
 	).Scan(ctx, &count); err != nil {
 		return 0, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
 	}
