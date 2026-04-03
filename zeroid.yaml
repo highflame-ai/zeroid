@@ -25,7 +25,7 @@ keys:
   rsa_key_id: "v1"
 
 token:
-  issuer: "https://auth.zeroid.dev"
+  issuer: "https://highflame.ai"
   base_url: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
