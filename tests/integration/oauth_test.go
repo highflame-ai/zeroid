@@ -499,3 +499,334 @@ func TestMultiHopDelegation(t *testing.T) {
 	act2 := d2["act"].(map[string]any)
 	assert.Equal(t, sub1Identity.WIMSEURI, act2["sub"], "depth-2 act.sub should be sub-agent 1 (immediate delegator)")
 }
+
+// TestRevokeTokenCascadesToChildren verifies that revoking a parent token via
+// POST /oauth2/token/revoke also invalidates all downstream credentials issued
+// via RFC 8693 token_exchange against that parent.
+//
+// Chain under test:
+//
+//	orchestrator (depth=0) → sub-agent (depth=1) → grandchild (depth=2)
+//
+// Revoking the orchestrator token must cause all three to become inactive.
+func TestRevokeTokenCascadesToChildren(t *testing.T) {
+	// ── Orchestrator: client_credentials (depth=0) ──────────────────────────
+	orchID := uid("rev-casc-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// ── Sub-agent: token_exchange from orchestrator (depth=1) ───────────────
+	sub1Key := generateKey(t)
+	sub1Identity := registerIdentity(t, uid("rev-casc-sub1"), []string{"data:read"}, ecPublicKeyPEM(t, sub1Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, sub1Key, sub1Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth1Token := decode(t, resp)["access_token"].(string)
+
+	// ── Grandchild: token_exchange from sub-agent (depth=2) ─────────────────
+	sub2Key := generateKey(t)
+	sub2Identity := registerIdentity(t, uid("rev-casc-sub2"), []string{"data:read"}, ecPublicKeyPEM(t, sub2Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": depth1Token,
+		"actor_token":   buildAssertion(t, sub2Key, sub2Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth2Token := decode(t, resp)["access_token"].(string)
+
+	// ── All three tokens must be active before revocation ───────────────────
+	require.True(t, introspect(t, orchToken)["active"].(bool), "orchestrator token must be active before revocation")
+	require.True(t, introspect(t, depth1Token)["active"].(bool), "depth-1 token must be active before revocation")
+	require.True(t, introspect(t, depth2Token)["active"].(bool), "depth-2 token must be active before revocation")
+
+	// ── Revoke only the orchestrator token ───────────────────────────────────
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchToken}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	// ── All three must now be inactive ───────────────────────────────────────
+	assert.False(t, introspect(t, orchToken)["active"].(bool),
+		"orchestrator token must be inactive after revocation")
+	assert.False(t, introspect(t, depth1Token)["active"].(bool),
+		"depth-1 token must be inactive: parent was revoked")
+	assert.False(t, introspect(t, depth2Token)["active"].(bool),
+		"depth-2 token must be inactive: grandparent was revoked")
+}
+
+// TestRevokeMidChainDoesNotRevokeParent verifies that revoking a mid-chain token
+// cascades downward to descendants but does NOT revoke the parent above it.
+//
+// Chain: orchestrator (depth=0) → sub-agent (depth=1) → grandchild (depth=2)
+// Action: revoke depth-1
+// Expected: depth-0 stays active, depth-1 and depth-2 become inactive.
+func TestRevokeMidChainDoesNotRevokeParent(t *testing.T) {
+	// ── Orchestrator (depth=0) ───────────────────────────────────────────────
+	orchID := uid("mid-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// ── Sub-agent (depth=1) ──────────────────────────────────────────────────
+	sub1Key := generateKey(t)
+	sub1Identity := registerIdentity(t, uid("mid-sub1"), []string{"data:read"}, ecPublicKeyPEM(t, sub1Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, sub1Key, sub1Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth1Token := decode(t, resp)["access_token"].(string)
+
+	// ── Grandchild (depth=2) ─────────────────────────────────────────────────
+	sub2Key := generateKey(t)
+	sub2Identity := registerIdentity(t, uid("mid-sub2"), []string{"data:read"}, ecPublicKeyPEM(t, sub2Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": depth1Token,
+		"actor_token":   buildAssertion(t, sub2Key, sub2Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth2Token := decode(t, resp)["access_token"].(string)
+
+	require.True(t, introspect(t, orchToken)["active"].(bool))
+	require.True(t, introspect(t, depth1Token)["active"].(bool))
+	require.True(t, introspect(t, depth2Token)["active"].(bool))
+
+	// ── Revoke depth-1 only ──────────────────────────────────────────────────
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": depth1Token}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	// ── Parent (depth=0) must remain active ──────────────────────────────────
+	assert.True(t, introspect(t, orchToken)["active"].(bool),
+		"orchestrator token must remain active: revocation does not propagate upward")
+
+	// ── depth-1 and depth-2 must be inactive ─────────────────────────────────
+	assert.False(t, introspect(t, depth1Token)["active"].(bool),
+		"depth-1 token must be inactive: it was directly revoked")
+	assert.False(t, introspect(t, depth2Token)["active"].(bool),
+		"depth-2 token must be inactive: its parent was revoked")
+}
+
+// TestRevokeCascadesFanOut verifies that revoking an orchestrator token invalidates
+// all parallel children that were independently issued via token_exchange against it.
+//
+// Chain: orchestrator → [sub-agent A, sub-agent B, sub-agent C]
+func TestRevokeCascadesFanOut(t *testing.T) {
+	// ── Orchestrator ─────────────────────────────────────────────────────────
+	orchID := uid("fan-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// ── Three independent sub-agents each get a delegated token ──────────────
+	childTokens := make([]string, 3)
+	for i := range childTokens {
+		key := generateKey(t)
+		identity := registerIdentity(t, uid("fan-sub"), []string{"data:read"}, ecPublicKeyPEM(t, key))
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": orchToken,
+			"actor_token":   buildAssertion(t, key, identity.WIMSEURI),
+			"scope":         "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		childTokens[i] = decode(t, resp)["access_token"].(string)
+		require.True(t, introspect(t, childTokens[i])["active"].(bool))
+	}
+
+	// ── Revoke orchestrator ───────────────────────────────────────────────────
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchToken}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	// ── All children must be inactive ────────────────────────────────────────
+	assert.False(t, introspect(t, orchToken)["active"].(bool), "orchestrator must be inactive")
+	for i, tok := range childTokens {
+		assert.False(t, introspect(t, tok)["active"].(bool),
+			"child token %d must be inactive after orchestrator revocation", i)
+	}
+}
+
+// TestRevokeDoesNotAffectSiblingChains verifies that revoking one delegation chain
+// has no effect on a completely independent chain issued by a different orchestrator.
+//
+// Chain A: orch-A → sub-A   (revoked)
+// Chain B: orch-B → sub-B   (must remain active)
+func TestRevokeDoesNotAffectSiblingChains(t *testing.T) {
+	issueChain := func(prefix string) (orchToken, childToken string) {
+		orchID := uid(prefix + "-orch")
+		registerIdentity(t, orchID, []string{"data:read"})
+		orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "client_credentials",
+			"account_id":    testAccountID,
+			"project_id":    testProjectID,
+			"client_id":     orchClient.ClientID,
+			"client_secret": orchClient.ClientSecret,
+			"scope":         "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		orchToken = decode(t, resp)["access_token"].(string)
+
+		key := generateKey(t)
+		identity := registerIdentity(t, uid(prefix+"-sub"), []string{"data:read"}, ecPublicKeyPEM(t, key))
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": orchToken,
+			"actor_token":   buildAssertion(t, key, identity.WIMSEURI),
+			"scope":         "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		childToken = decode(t, resp)["access_token"].(string)
+		return
+	}
+
+	orchA, subA := issueChain("sib-a")
+	orchB, subB := issueChain("sib-b")
+
+	require.True(t, introspect(t, orchA)["active"].(bool))
+	require.True(t, introspect(t, subA)["active"].(bool))
+	require.True(t, introspect(t, orchB)["active"].(bool))
+	require.True(t, introspect(t, subB)["active"].(bool))
+
+	// Revoke chain A only.
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchA}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	// Chain A is gone.
+	assert.False(t, introspect(t, orchA)["active"].(bool), "orch-A must be inactive")
+	assert.False(t, introspect(t, subA)["active"].(bool), "sub-A must be inactive: parent revoked")
+
+	// Chain B is completely unaffected.
+	assert.True(t, introspect(t, orchB)["active"].(bool), "orch-B must remain active: different chain")
+	assert.True(t, introspect(t, subB)["active"].(bool), "sub-B must remain active: different chain")
+}
+
+// TestRevokeDeepChain verifies cascade revocation works across four delegation hops.
+//
+// Chain: depth-0 → depth-1 → depth-2 → depth-3
+// Revoking depth-0 must invalidate all four tokens.
+func TestRevokeDeepChain(t *testing.T) {
+	// ── depth-0: client_credentials ──────────────────────────────────────────
+	orchID := uid("deep-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	tokens := []string{decode(t, resp)["access_token"].(string)}
+
+	// ── depth-1 through depth-3: each exchanges the previous token ───────────
+	for i := 1; i <= 3; i++ {
+		key := generateKey(t)
+		identity := registerIdentity(t, uid("deep-sub"), []string{"data:read"}, ecPublicKeyPEM(t, key))
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": tokens[i-1],
+			"actor_token":   buildAssertion(t, key, identity.WIMSEURI),
+			"scope":         "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "token exchange at depth %d failed", i)
+		tokens = append(tokens, decode(t, resp)["access_token"].(string))
+	}
+
+	for i, tok := range tokens {
+		require.True(t, introspect(t, tok)["active"].(bool), "depth-%d token must be active before revocation", i)
+	}
+
+	// ── Revoke the root ───────────────────────────────────────────────────────
+	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": tokens[0]}, nil)
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	revokeResp.Body.Close()
+
+	// ── All four must be inactive ─────────────────────────────────────────────
+	for i, tok := range tokens {
+		assert.False(t, introspect(t, tok)["active"].(bool),
+			"depth-%d token must be inactive after root revocation", i)
+	}
+}
+
+// TestRevokeIsIdempotent verifies that revoking an already-revoked token returns
+// 200 with no error, and the token remains inactive (RFC 7009 §2.2).
+func TestRevokeIsIdempotent(t *testing.T) {
+	agentID := uid("idem-agent")
+	registerIdentity(t, agentID, []string{"data:read"})
+	client := registerOAuthClient(t, agentID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	token := decode(t, resp)["access_token"].(string)
+
+	// First revocation.
+	r1 := post(t, "/oauth2/token/revoke", map[string]string{"token": token}, nil)
+	assert.Equal(t, http.StatusOK, r1.StatusCode)
+	r1.Body.Close()
+
+	assert.False(t, introspect(t, token)["active"].(bool), "token must be inactive after first revocation")
+
+	// Second revocation of the same token — must still return 200.
+	r2 := post(t, "/oauth2/token/revoke", map[string]string{"token": token}, nil)
+	assert.Equal(t, http.StatusOK, r2.StatusCode, "second revocation must return 200 per RFC 7009")
+	r2.Body.Close()
+
+	assert.False(t, introspect(t, token)["active"].(bool), "token must remain inactive after second revocation")
+}
