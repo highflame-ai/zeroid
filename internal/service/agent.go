@@ -227,6 +227,7 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 		Description:  req.Description,
 		Capabilities: req.Capabilities,
 		Labels:       req.Labels,
+		Metadata:     req.Metadata,
 		Status:       status,
 	})
 	if err != nil {
