@@ -78,6 +78,7 @@ type UpdateIdentityInput struct {
 		Description        *string         `json:"description,omitempty" doc:"Agent description"`
 		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
 	}
 }
@@ -289,6 +290,7 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Description:   input.Body.Description,
 		Capabilities:  input.Body.Capabilities,
 		Labels:        input.Body.Labels,
+		Metadata:      input.Body.Metadata,
 		Status:        status,
 	})
 	if err != nil {
