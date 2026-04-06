@@ -181,13 +181,13 @@ func loadDefaults(k *koanf.Koanf) error {
 		"keys.rsa_key_id":           "v1",
 
 		// Token
-		"token.issuer":      "https://auth.zeroid.dev",
-		"token.base_url":    "https://auth.zeroid.dev",
+		"token.issuer":      "https://highflame.ai",
+		"token.base_url":    "https://highflame.ai",
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 
 		// WIMSE
-		"wimse_domain": "zeroid.dev",
+		"wimse_domain": "highflame.ai",
 
 		// Telemetry
 		"telemetry.enabled":       false,
