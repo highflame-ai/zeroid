@@ -191,6 +191,7 @@ type UpdateIdentityRequest struct {
 	Description   *string
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
+	Metadata      json.RawMessage
 	Status        *domain.IdentityStatus
 }
 
@@ -247,6 +248,9 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	}
 	if req.Labels != nil {
 		identity.Labels = req.Labels
+	}
+	if req.Metadata != nil {
+		identity.Metadata = req.Metadata
 	}
 	if req.Status != nil {
 		if !identity.Status.CanTransitionTo(*req.Status) {
