@@ -34,7 +34,7 @@ echo "ZEROID_ACCOUNT_ID=${ZEROID_ACCOUNT_ID:-not set}"
 echo "ZEROID_PROJECT_ID=${ZEROID_PROJECT_ID:-not set}"
 ```
 
-All admin routes (`/api/v1/*`) require `X-Account-ID` and `X-Project-ID` headers for tenant context. Public routes (`/oauth2/*`, `/health`, `/.well-known/*`) do not.
+Admin routes (`/api/v1/*`) may use `X-Account-ID` and `X-Project-ID` headers for tenant context if required by the deployment. Public routes (`/oauth2/*`, `/health`, `/.well-known/*`) do not require any tenant headers.
 
 ## API Reference
 
@@ -99,6 +99,7 @@ Request body fields:
    - `subject_token` -- the orchestrator's access token
    - `subject_token_type` -- `urn:ietf:params:oauth:token-type:access_token`
    - `actor_token` -- the sub-agent's signed JWT assertion
+   - `actor_token_type` -- `urn:ietf:params:oauth:token-type:jwt` (required per RFC 8693 when actor_token is provided)
    - `scope` -- requested scopes (must be subset of subject_token's scopes)
 
 5. **`authorization_code`** -- PKCE flow for CLI/interactive
@@ -128,6 +129,7 @@ Required fields:
 - `subject_token`: the orchestrator's current access token
 - `subject_token_type`: `urn:ietf:params:oauth:token-type:access_token`
 - `actor_token`: the sub-agent's signed JWT assertion (proves it holds its private key)
+- `actor_token_type`: `urn:ietf:params:oauth:token-type:jwt` (required per RFC 8693 when actor_token is provided)
 - `scope`: the scopes to delegate (must be a subset of the orchestrator's scopes)
 
 The resulting token carries the full delegation chain:
@@ -225,12 +227,10 @@ When constructing curl commands, always use this pattern:
 ```bash
 curl -s -X <METHOD> "${ZEROID_BASE_URL}<path>" \
   -H "Content-Type: application/json" \
-  -H "X-Account-ID: ${ZEROID_ACCOUNT_ID}" \
-  -H "X-Project-ID: ${ZEROID_PROJECT_ID}" \
   -d '<json body>' | jq .
 ```
 
-For public endpoints (`/oauth2/*`, `/health`), omit the `X-Account-ID` and `X-Project-ID` headers.
+Tenant-specific headers (`X-Account-ID`, `X-Project-ID`) are deployment-specific and not part of the core API. Add them only if required by the deployment.
 
 Pipe responses through `jq` for readability. If `jq` is not available, use `python3 -m json.tool`.
 

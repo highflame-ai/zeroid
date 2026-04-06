@@ -186,7 +186,8 @@ curl -s -X POST "$ZEROID_BASE_URL/api/v1/credentials/{credential_id}/revoke" \
 
 ```json
 {
-  "status": "revoked"
+  "revoked": true,
+  "id": "uuid"
 }
 ```
 
