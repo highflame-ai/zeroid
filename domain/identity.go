@@ -226,7 +226,10 @@ type Identity struct {
 	Description  string          `bun:"description,type:text"        json:"description,omitempty"`
 	Capabilities json.RawMessage `bun:"capabilities,type:jsonb"      json:"capabilities"`
 	Labels       json.RawMessage `bun:"labels,type:jsonb"            json:"labels"`
-	Metadata     json.RawMessage `bun:"metadata,type:jsonb"          json:"metadata"`
+	// Metadata is opaque product-specific data (UI hints, config).
+	// It is never embedded in issued tokens. For authorization-relevant
+	// data, use AllowedScopes or Capabilities.
+	Metadata json.RawMessage `bun:"metadata,type:jsonb"          json:"metadata"`
 
 	// Lifecycle
 	CreatedBy string    `bun:"created_by,type:varchar(255)"    json:"created_by,omitempty"`
