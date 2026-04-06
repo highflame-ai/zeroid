@@ -3,7 +3,7 @@
  */
 
 import { Command } from "commander";
-import { makeClient } from "../../lib/client.js";
+import { makeTenantClient } from "../../lib/client.js";
 import { handleError, printJSON, printTable, relativeTime } from "../../lib/output.js";
 
 export function registerCredsList(credsCmd: Command): void {
@@ -16,11 +16,9 @@ export function registerCredsList(credsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid creds list");
         const result = await client.credentials.list(opts.agent as string);
-        const creds = opts.active
-          ? result.credentials.filter((c) => !c.is_revoked)
-          : result.credentials;
+        const creds = (result.credentials ?? []).filter((c) => !opts.active || !c.is_revoked);
 
         if (opts.json) {
           printJSON(creds);

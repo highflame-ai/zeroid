@@ -3,7 +3,7 @@
  */
 
 import { Command } from "commander";
-import { makeClient } from "../../lib/client.js";
+import { makeTenantClient } from "../../lib/client.js";
 import { handleError, printJSON, printSuccess, printWarning } from "../../lib/output.js";
 
 export function registerRotateKey(agentsCmd: Command): void {
@@ -14,7 +14,7 @@ export function registerRotateKey(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid agents rotate-key");
         const result = await client.agents.rotateKey(id);
 
         if (opts.json) {

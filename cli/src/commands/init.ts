@@ -7,7 +7,7 @@
 
 import { Command } from "commander";
 import type { IdentityType, SubType } from "@highflame/sdk";
-import { makeClient } from "../lib/client.js";
+import { makeTenantClient } from "../lib/client.js";
 import { setProfile, writeEnvFile } from "../lib/config.js";
 import { handleError, printJSON, printSuccess, printWarning } from "../lib/output.js";
 
@@ -31,7 +31,7 @@ export function registerInit(program: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid init");
         const result = await client.agents.register({
           name: opts.name as string,
           external_id: (opts.id as string | undefined) ?? (opts.name as string),
@@ -39,7 +39,7 @@ export function registerInit(program: Command): void {
           sub_type: opts.subType as SubType | undefined,
           framework: opts.framework as string | undefined,
           description: opts.description as string | undefined,
-          created_by: opts.owner as string
+          created_by: opts.owner as string,
         });
 
         // Side effects always happen regardless of output format.

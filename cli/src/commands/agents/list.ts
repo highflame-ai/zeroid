@@ -7,7 +7,7 @@
  */
 
 import { Command } from "commander";
-import { makeClient } from "../../lib/client.js";
+import { makeTenantClient } from "../../lib/client.js";
 import { handleError, printJSON, printTable, relativeTime } from "../../lib/output.js";
 
 export function registerList(agentsCmd: Command): void {
@@ -20,7 +20,7 @@ export function registerList(agentsCmd: Command): void {
     .option("--json", "Output raw JSON array")
     .action(async (opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid agents list");
         const limit = parseInt(opts.limit as string, 10);
         const result = await client.agents.list({
           identity_type: opts.type as string | undefined,

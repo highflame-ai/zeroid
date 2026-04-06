@@ -7,12 +7,18 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export interface Profile {
+export const DEFAULT_BASE_URL = "https://api.zeroid.io";
+
+export interface ClientContext {
   base_url: string;
   /** Required for tenant-scoped operations (agents, creds, signals). */
   account_id?: string;
   /** Required for tenant-scoped operations (agents, creds, signals). */
   project_id?: string;
+  api_key?: string;
+}
+
+export interface Profile extends ClientContext {
   api_key: string;
 }
 
@@ -76,31 +82,73 @@ export function listProfiles(): { name: string; active: boolean }[] {
 }
 
 export function requireProfile(name?: string): Profile {
-  // Env vars take precedence over config file — useful in CI.
-  const fromEnv = profileFromEnv();
-  if (fromEnv) return fromEnv;
-
-  const profile = getProfile(name);
-  if (!profile) {
-    throw new Error(
-      'No profile configured. Run "zid init" or set the ZID_API_KEY env var.',
-    );
+  const context = resolveContext(name);
+  if (!context?.api_key) {
+    throw new Error('No API key configured. Run "zid init" or set the ZID_API_KEY env var.');
   }
-  return profile;
+  return { ...context, api_key: context.api_key };
 }
 
-function profileFromEnv(): Profile | undefined {
-  const api_key = process.env["ZID_API_KEY"];
-  if (!api_key) return undefined;
+export function requireTenantContext(
+  name?: string,
+  command = "This command",
+): ClientContext & { account_id: string; project_id: string } {
+  const context = resolveContext(name);
+  if (!context?.account_id || !context?.project_id) {
+    throw new Error(
+      `${command} requires tenant context. Set ZID_ACCOUNT_ID and ZID_PROJECT_ID, or use a profile created by "zid init".`,
+    );
+  }
   return {
-    api_key,
-    account_id: process.env["ZID_ACCOUNT_ID"],
-    project_id: process.env["ZID_PROJECT_ID"],
-    base_url: process.env["ZID_BASE_URL"] ?? "https://api.zeroid.io",
+    base_url: context.base_url,
+    account_id: context.account_id,
+    project_id: context.project_id,
+    api_key: context.api_key,
   };
+}
+
+export function requireBaseURL(name?: string): string {
+  return resolveContext(name)?.base_url ?? DEFAULT_BASE_URL;
+}
+
+export function resolveContext(name?: string): ClientContext | undefined {
+  const profile = getProfile(name);
+  const env = contextFromEnv();
+
+  if (!profile && !hasContext(env)) {
+    return undefined;
+  }
+
+  return {
+    base_url: env.base_url ?? profile?.base_url ?? DEFAULT_BASE_URL,
+    account_id: env.account_id ?? profile?.account_id,
+    project_id: env.project_id ?? profile?.project_id,
+    api_key: env.api_key ?? profile?.api_key,
+  };
+}
+
+function contextFromEnv(): Partial<ClientContext> {
+  return {
+    api_key: readEnv("ZID_API_KEY"),
+    account_id: readEnv("ZID_ACCOUNT_ID"),
+    project_id: readEnv("ZID_PROJECT_ID"),
+    base_url: readEnv("ZID_BASE_URL"),
+  };
+}
+
+function readEnv(name: string): string | undefined {
+  const value = process.env[name];
+  return value && value.trim() !== "" ? value : undefined;
+}
+
+function hasContext(context: Partial<ClientContext>): boolean {
+  return Object.values(context).some((value) => value !== undefined);
 }
 
 /** Write api_key to .env.zeroid in the current working directory. */
 export function writeEnvFile(apiKey: string): void {
-  writeFileSync(join(process.cwd(), ".env.zeroid"), `ZID_API_KEY=${apiKey}\n`, "utf8");
+  writeFileSync(join(process.cwd(), ".env.zeroid"), `ZID_API_KEY=${apiKey}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 }

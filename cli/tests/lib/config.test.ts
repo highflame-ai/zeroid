@@ -3,7 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 // vi.hoisted ensures TEST_HOME is defined before vi.mock factories run.
@@ -18,8 +18,17 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: () => TEST_HOME };
 });
 
-const { getProfile, setProfile, useProfile, listProfiles, requireProfile, writeEnvFile } =
-  await import("../../src/lib/config.js");
+const {
+  getProfile,
+  setProfile,
+  useProfile,
+  listProfiles,
+  requireBaseURL,
+  requireProfile,
+  requireTenantContext,
+  resolveContext,
+  writeEnvFile,
+} = await import("../../src/lib/config.js");
 
 beforeEach(() => {
   mkdirSync(join(TEST_HOME, ".config", "zid"), { recursive: true });
@@ -137,14 +146,55 @@ describe("requireProfile", () => {
   });
 });
 
+describe("resolveContext / requireTenantContext / requireBaseURL", () => {
+  it("merges env vars over the saved profile", () => {
+    setProfile("default", {
+      base_url: "http://file",
+      account_id: "acct_file",
+      project_id: "proj_file",
+      api_key: "file_key",
+    });
+    process.env["ZID_BASE_URL"] = "http://env";
+    process.env["ZID_ACCOUNT_ID"] = "acct_env";
+
+    expect(resolveContext()).toEqual({
+      base_url: "http://env",
+      account_id: "acct_env",
+      project_id: "proj_file",
+      api_key: "file_key",
+    });
+  });
+
+  it("requires tenant context even when no api key is present", () => {
+    process.env["ZID_ACCOUNT_ID"] = "acct_env";
+    process.env["ZID_PROJECT_ID"] = "proj_env";
+
+    expect(requireTenantContext(undefined, "zid init")).toEqual({
+      base_url: "https://api.zeroid.io",
+      account_id: "acct_env",
+      project_id: "proj_env",
+      api_key: undefined,
+    });
+  });
+
+  it("throws a helpful error when tenant context is missing", () => {
+    expect(() => requireTenantContext(undefined, "zid agents list")).toThrow(/tenant context/i);
+  });
+
+  it("falls back to the default base url when nothing is configured", () => {
+    expect(requireBaseURL()).toBe("https://api.zeroid.io");
+  });
+});
+
 describe("writeEnvFile", () => {
   it("writes ZID_API_KEY to .env.zeroid in cwd", async () => {
-    const { readFileSync } = await import("node:fs");
     const envPath = join(process.cwd(), ".env.zeroid");
     try {
       writeEnvFile("zid_sk_test123");
+      const { readFileSync } = await import("node:fs");
       const contents = readFileSync(envPath, "utf8");
       expect(contents).toBe("ZID_API_KEY=zid_sk_test123\n");
+      expect(statSync(envPath).mode & 0o777).toBe(0o600);
     } finally {
       rmSync(envPath, { force: true });
     }

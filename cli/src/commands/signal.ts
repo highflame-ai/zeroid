@@ -8,7 +8,7 @@
 
 import { Command } from "commander";
 import type { SignalType, SignalSeverity } from "@highflame/sdk";
-import { makeClient } from "../lib/client.js";
+import { makeTenantClient } from "../lib/client.js";
 import { handleError, printJSON, printSuccess } from "../lib/output.js";
 
 export function registerSignal(program: Command): void {
@@ -27,7 +27,7 @@ export function registerSignal(program: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid signal");
         const payload: Record<string, unknown> | undefined =
           opts.reason ? { reason: opts.reason as string } : undefined;
 

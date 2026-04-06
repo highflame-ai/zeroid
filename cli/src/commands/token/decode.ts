@@ -41,6 +41,9 @@ export function registerDecode(tokenCmd: Command): void {
       try {
         let token = jwt;
         if (!token) {
+          if (process.stdin.isTTY) {
+            throw new Error("No JWT provided. Pass it as an argument or pipe it to stdin.");
+          }
           // Read from stdin if no argument given.
           const chunks: Buffer[] = [];
           for await (const chunk of process.stdin) {
@@ -101,7 +104,7 @@ export function registerDecode(tokenCmd: Command): void {
         if (nbf !== undefined) print("nbf", _formatTime(nbf));
         if (iat !== undefined) print("iat", _formatTime(iat));
         if (exp !== undefined) {
-          const expired = exp < Date.now() / 1000;
+          const expired = exp <= Date.now() / 1000;
           const label = _formatTime(exp);
           print("exp", expired ? chalk.red(label) : chalk.green(label));
         }

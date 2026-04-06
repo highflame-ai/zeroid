@@ -4,7 +4,7 @@
  */
 
 import { Command } from "commander";
-import { makeClient } from "../../lib/client.js";
+import { makeTenantClient } from "../../lib/client.js";
 import { handleError, printJSON, printSuccess } from "../../lib/output.js";
 
 export function registerDeactivate(agentsCmd: Command): void {
@@ -15,7 +15,7 @@ export function registerDeactivate(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid agents deactivate");
         const agent = await client.agents.deactivate(id);
         if (opts.json) { printJSON(agent); return; }
         printSuccess(`Agent ${agent.name} deactivated`);
@@ -31,7 +31,7 @@ export function registerDeactivate(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid agents activate");
         const agent = await client.agents.activate(id);
         if (opts.json) { printJSON(agent); return; }
         printSuccess(`Agent ${agent.name} activated`);

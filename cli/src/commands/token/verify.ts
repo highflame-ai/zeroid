@@ -10,7 +10,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { ZeroIDError } from "@highflame/sdk";
-import { makeClient } from "../../lib/client.js";
+import { makeBaseUrlClient } from "../../lib/client.js";
 import { handleError, printJSON } from "../../lib/output.js";
 
 export function registerVerify(tokenCmd: Command): void {
@@ -21,7 +21,7 @@ export function registerVerify(tokenCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (jwt: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeBaseUrlClient(opts.profile as string | undefined);
         const identity = await client.tokens.verify(jwt);
 
         if (opts.json) {

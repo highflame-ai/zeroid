@@ -13,8 +13,13 @@ npx @highflame/zid <command>
 ## Quick start
 
 ```bash
+# First-time init needs tenant context for the target account/project
+export ZID_ACCOUNT_ID=acct_123
+export ZID_PROJECT_ID=proj_456
+export ZID_BASE_URL=https://api.zeroid.io   # or http://localhost:8899 for local dev
+
 # Register your first agent — writes .env.zeroid and saves a local profile
-zid init --name "github-mcp-server" --type mcp_server
+zid init --name "github-mcp-server" --type mcp_server --owner "dev@company.com"
 
 # Verify a token your server received
 zid token verify eyJhbGc...
@@ -27,14 +32,16 @@ zid token decode eyJhbGc...
 
 ## Authentication
 
-`zid` authenticates using an API key tied to an agent identity. There are two ways to provide it:
+Most `zid` commands authenticate using an API key tied to an agent identity. The bootstrap exception is `zid init`, which only needs tenant context for the target account/project.
+
+There are two ways to provide configuration:
 
 **Environment variables** (recommended for CI/CD):
 ```bash
-export ZID_API_KEY=zid_sk_...
 export ZID_ACCOUNT_ID=acct_123
 export ZID_PROJECT_ID=proj_456
 export ZID_BASE_URL=https://api.zeroid.io   # optional, default shown
+export ZID_API_KEY=zid_sk_...               # required for token issue and authenticated agent flows
 ```
 
 **Local profile** (set automatically by `zid init`, stored in `~/.config/zid/config.json`):
@@ -54,14 +61,15 @@ Environment variables take precedence over the config file. Most commands also a
 Register a new agent, write its API key to `.env.zeroid`, and save a local profile.
 
 ```bash
-zid init --name "github-mcp-server" --type mcp_server
-zid init --name "code-reviewer" --type agent --sub-type code_agent --framework langchain
-zid init --name "my-agent" --save-profile staging
+zid init --name "github-mcp-server" --type mcp_server --owner "dev@company.com"
+zid init --name "code-reviewer" --type agent --sub-type code_agent --framework langchain --owner "dev@company.com"
+zid init --name "my-agent" --save-profile staging --owner "dev@company.com"
 ```
 
 | Flag | Description | Default |
 |---|---|---|
 | `--name <name>` | Human-readable agent name | required |
+| `--owner <owner_id>` | User ID recorded as the agent owner | required |
 | `--id <external_id>` | External ID (your own identifier) | same as `--name` |
 | `--type <type>` | `agent` \| `application` \| `mcp_server` \| `service` | `agent` |
 | `--sub-type <sub_type>` | `orchestrator` \| `tool_agent` \| `code_agent` \| `autonomous` \| ... | — |
@@ -70,6 +78,8 @@ zid init --name "my-agent" --save-profile staging
 | `--save-profile <name>` | Profile name to save credentials under | `default` |
 | `--profile <name>` | Profile to use for the parent account/project | active profile |
 | `--json` | Output raw JSON | — |
+
+On first use, provide tenant context via `ZID_ACCOUNT_ID` and `ZID_PROJECT_ID`, or point `--profile` at an existing saved profile.
 
 After running, the API key is written to `.env.zeroid` in the current directory. Add it to `.gitignore`.
 

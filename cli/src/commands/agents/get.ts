@@ -4,7 +4,7 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { makeClient } from "../../lib/client.js";
+import { makeTenantClient } from "../../lib/client.js";
 import { handleError, printJSON } from "../../lib/output.js";
 
 export function registerGet(agentsCmd: Command): void {
@@ -15,7 +15,7 @@ export function registerGet(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeTenantClient(opts.profile as string | undefined, "zid agents get");
         const agent = await client.agents.get(id);
 
         if (opts.json) {

@@ -113,6 +113,16 @@ describe("zid creds list", () => {
     expect(stdout.join("")).toMatch(/no credentials/i);
   });
 
+  it("normalizes null credentials to an empty array", async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/v1/credentials`, () =>
+        HttpResponse.json({ credentials: null, total: 0 }),
+      ),
+    );
+    const { stdout } = await runCLI(["creds", "list", "--agent", "agt_abc123", "--json"]);
+    expect(JSON.parse(stdout.join(""))).toEqual([]);
+  });
+
   it("exits 1 when --agent is missing", async () => {
     const { exitCode } = await runCLI(["creds", "list"]);
     expect(exitCode).toBe(1);

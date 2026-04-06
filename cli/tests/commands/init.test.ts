@@ -43,6 +43,7 @@ const REGISTER_RESPONSE: AgentRegistered = {
   identity: AGENT,
   api_key: "zid_sk_brand_new",
 };
+const OWNER = "user_xyz";
 
 // Cleanup .env.zeroid written by init
 afterEach(() => rmSync(join(process.cwd(), ".env.zeroid"), { force: true }));
@@ -57,11 +58,12 @@ describe("zid init", () => {
       }),
     );
 
-    await runCLI(["init", "--name", "github-mcp-server", "--type", "mcp_server"]);
+    await runCLI(["init", "--name", "github-mcp-server", "--type", "mcp_server", "--owner", OWNER]);
 
     expect(captured["name"]).toBe("github-mcp-server");
     expect(captured["external_id"]).toBe("github-mcp-server");
     expect(captured["identity_type"]).toBe("mcp_server");
+    expect(captured["created_by"]).toBe(OWNER);
   });
 
   it("uses --id as external_id when provided", async () => {
@@ -73,7 +75,7 @@ describe("zid init", () => {
       }),
     );
 
-    await runCLI(["init", "--name", "My Agent", "--id", "my-agent-001"]);
+    await runCLI(["init", "--name", "My Agent", "--id", "my-agent-001", "--owner", OWNER]);
 
     expect(captured["external_id"]).toBe("my-agent-001");
     expect(captured["name"]).toBe("My Agent");
@@ -90,6 +92,7 @@ describe("zid init", () => {
 
     await runCLI([
       "init", "--name", "agent",
+      "--owner", OWNER,
       "--framework", "langchain",
       "--description", "A code reviewer",
     ]);
@@ -103,7 +106,7 @@ describe("zid init", () => {
       http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
-    const { stdout, stderr } = await runCLI(["init", "--name", "github-mcp-server"]);
+    const { stdout, stderr } = await runCLI(["init", "--name", "github-mcp-server", "--owner", OWNER]);
     const out = stdout.join("\n");
     expect(out).toContain("wimse:agent:acct_test/proj_test/github-mcp-server");
     expect(out).toContain("zid_sk_brand_new");
@@ -116,7 +119,7 @@ describe("zid init", () => {
       http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
-    await runCLI(["init", "--name", "github-mcp-server"]);
+    await runCLI(["init", "--name", "github-mcp-server", "--owner", OWNER]);
 
     const { readFileSync } = await import("node:fs");
     const content = readFileSync(join(process.cwd(), ".env.zeroid"), "utf8");
@@ -128,7 +131,7 @@ describe("zid init", () => {
       http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
-    const { stdout } = await runCLI(["init", "--name", "agent", "--json"]);
+    const { stdout } = await runCLI(["init", "--name", "agent", "--owner", OWNER, "--json"]);
     const parsed = JSON.parse(stdout.join("")) as AgentRegistered;
     // SDK type contract: must be .identity not .agent
     expect(parsed.identity.id).toBe("agt_new123");
@@ -140,11 +143,29 @@ describe("zid init", () => {
       http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
-    await runCLI(["init", "--name", "agent", "--json"]);
+    await runCLI(["init", "--name", "agent", "--owner", OWNER, "--json"]);
 
     const { readFileSync } = await import("node:fs");
     const content = readFileSync(join(process.cwd(), ".env.zeroid"), "utf8");
     expect(content).toBe("ZID_API_KEY=zid_sk_brand_new\n");
+  });
+
+  it("bootstraps without ZID_API_KEY when tenant env vars are present", async () => {
+    let authorization: string | null = null;
+    server.use(
+      http.post(`${BASE_URL}/api/v1/agents/register`, ({ request }) => {
+        authorization = request.headers.get("authorization");
+        return HttpResponse.json(REGISTER_RESPONSE);
+      }),
+    );
+
+    const { exitCode } = await runCLI(
+      ["init", "--name", "bootstrap-agent", "--owner", OWNER],
+      { ZID_API_KEY: "" },
+    );
+
+    expect(exitCode).toBeUndefined();
+    expect(authorization).toBeNull();
   });
 
   it("exits 1 on conflict (agent already exists)", async () => {
@@ -153,13 +174,13 @@ describe("zid init", () => {
         HttpResponse.json({ title: "Conflict", detail: "agent already exists" }, { status: 409 }),
       ),
     );
-    const { exitCode, stderr } = await runCLI(["init", "--name", "duplicate"]);
+    const { exitCode, stderr } = await runCLI(["init", "--name", "duplicate", "--owner", OWNER]);
     expect(exitCode).toBe(1);
     expect(stderr.join("")).toMatch(/already exists/i);
   });
 
   it("exits 1 when --name is missing", async () => {
-    const { exitCode } = await runCLI(["init"]);
+    const { exitCode } = await runCLI(["init", "--owner", OWNER]);
     expect(exitCode).toBe(1);
   });
 });

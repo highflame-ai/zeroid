@@ -99,6 +99,15 @@ describe("zid agents list", () => {
     expect(stdout.join("")).toMatch(/no agents/i);
   });
 
+  it("exits 1 when tenant context is missing", async () => {
+    const { exitCode, stderr } = await runCLI(
+      ["agents", "list", "--profile", "ghost"],
+      { ZID_API_KEY: "", ZID_ACCOUNT_ID: "", ZID_PROJECT_ID: "" },
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr.join("")).toMatch(/tenant context/i);
+  });
+
   it("exits 1 on API error", async () => {
     server.use(
       http.get(`${BASE_URL}/api/v1/agents/registry`, () =>

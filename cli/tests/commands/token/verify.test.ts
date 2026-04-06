@@ -1,7 +1,7 @@
 /**
  * Tests for `zid token verify`.
  *
- * Mocks `makeClient` directly so we control what `tokens.verify()` returns
+ * Mocks `makeBaseUrlClient` directly so we control what `tokens.verify()` returns
  * without having to spread SDK internals or deal with real JWKS crypto.
  */
 
@@ -33,9 +33,9 @@ const DELEGATED_IDENTITY = {
   delegatedBy: () => "wimse:agent:acct_test/proj_test/orchestrator",
 };
 
-// Mock makeClient so tests never touch the network or JWKS crypto.
+// Mock makeBaseUrlClient so tests never touch the network or JWKS crypto.
 vi.mock("../../../src/lib/client.js", () => ({
-  makeClient: vi.fn(() => ({
+  makeBaseUrlClient: vi.fn(() => ({
     baseUrl: "http://zeroid.test",
     tokens: {
       verify: vi.fn(async (token: string) => {
@@ -94,5 +94,13 @@ describe("zid token verify — error paths", () => {
     const { exitCode, stderr } = await runCLI(["token", "verify", "invalid.jwt.token"]);
     expect(exitCode).toBe(1);
     expect(stderr.join("")).toMatch(/invalid/i);
+  });
+
+  it("does not require ZID_API_KEY when only base url is configured", async () => {
+    const { exitCode } = await runCLI(
+      ["token", "verify", "delegated.jwt.token"],
+      { ZID_API_KEY: "", ZID_ACCOUNT_ID: "", ZID_PROJECT_ID: "" },
+    );
+    expect(exitCode).toBe(0);
   });
 });

@@ -37,7 +37,10 @@ export function printError(message: string): void {
  * Handles both past ("2h ago") and future ("in 10m") timestamps.
  */
 export function relativeTime(iso: string): string {
-  const delta = Date.now() - new Date(iso).getTime();
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+
+  const delta = Date.now() - date.getTime();
   const abs = Math.abs(delta);
   const future = delta < 0;
 

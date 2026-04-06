@@ -3,7 +3,7 @@
  */
 
 import { Command } from "commander";
-import { makeClient } from "../../lib/client.js";
+import { makeBaseUrlClient } from "../../lib/client.js";
 import { handleError, printJSON, printSuccess } from "../../lib/output.js";
 
 export function registerTokenRevoke(tokenCmd: Command): void {
@@ -14,7 +14,7 @@ export function registerTokenRevoke(tokenCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (jwt: string, opts) => {
       try {
-        const client = makeClient(opts.profile as string | undefined);
+        const client = makeBaseUrlClient(opts.profile as string | undefined);
         const result = await client.tokens.revoke(jwt);
 
         if (opts.json) {

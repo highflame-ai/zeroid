@@ -48,6 +48,17 @@ describe("zid token revoke", () => {
     expect(capturedHeaders.get("x-project-id")).toBeNull();
   });
 
+  it("does not require ZID_API_KEY when only base url is configured", async () => {
+    server.use(
+      http.post(`${BASE_URL}/oauth2/token/revoke`, () => HttpResponse.json({ revoked: true })),
+    );
+    const { exitCode } = await runCLI(
+      ["token", "revoke", "eyJhbGc.test.sig"],
+      { ZID_API_KEY: "", ZID_ACCOUNT_ID: "", ZID_PROJECT_ID: "" },
+    );
+    expect(exitCode).toBeUndefined();
+  });
+
   it("outputs raw JSON with --json", async () => {
     server.use(
       http.post(`${BASE_URL}/oauth2/token/revoke`, () => HttpResponse.json({ revoked: true })),

@@ -84,4 +84,21 @@ describe("zid token decode", () => {
     expect(exitCode).toBe(1);
     expect(stderr.join("")).toMatch(/SyntaxError|invalid|unexpected/i);
   });
+
+  it("exits 1 with a helpful message when no jwt is provided in a tty", async () => {
+    const original = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+
+    try {
+      const { exitCode, stderr } = await runCLI(["token", "decode"]);
+      expect(exitCode).toBe(1);
+      expect(stderr.join("")).toMatch(/pipe it to stdin/i);
+    } finally {
+      if (original) {
+        Object.defineProperty(process.stdin, "isTTY", original);
+      } else {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      }
+    }
+  });
 });
