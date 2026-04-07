@@ -70,36 +70,36 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 	return creds, nil
 }
 
-// RevokeAllActiveForIdentity revokes all non-expired, non-revoked credentials for an identity.
-// Returns the number of credentials revoked.
+// RevokeAllActiveForIdentity revokes all non-expired, non-revoked credentials for an
+// identity and cascades the revocation to every downstream delegated credential in the
+// parent_jti chain (RFC 8693 token_exchange descendants), regardless of which identity
+// issued those child tokens. Implemented via the revoke_credentials_cascade DB function
+// (migration 007) which executes the full subtree update atomically in one statement.
+// Returns the total number of credentials revoked (root + descendants).
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
-		TableExpr("issued_credentials").
-		Set("is_revoked = TRUE, revoked_at = ?, revoke_reason = ?", now, reason).
-		Where("identity_id = ?", identityID).
-		Where("is_revoked = FALSE").
-		Where("expires_at > ?", now).
-		Exec(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to revoke all credentials for identity: %w", err)
+	var count int64
+	if err := r.db.NewRaw(
+		"SELECT revoke_credentials_cascade(?, ?, ?)",
+		identityID, now, reason,
+	).Scan(ctx, &count); err != nil {
+		return 0, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	return count, nil
 }
 
-// Revoke marks a credential as revoked.
+// Revoke marks a credential as revoked and cascades the revocation to every
+// downstream delegated credential in the parent_jti chain (RFC 8693 descendants).
+// account_id and project_id are enforced on the anchor as tenant-safety guards.
+// Implemented via the revoke_credential_cascade DB function (migration 008).
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) error {
 	now := time.Now()
-	_, err := r.db.NewUpdate().
-		TableExpr("issued_credentials").
-		Set("is_revoked = TRUE, revoked_at = ?, revoke_reason = ?", now, reason).
-		Where("id = ?", id).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to revoke credential: %w", err)
+	var count int64
+	if err := r.db.NewRaw(
+		"SELECT revoke_credential_cascade(?, ?, ?, ?, ?)",
+		id, accountID, projectID, now, reason,
+	).Scan(ctx, &count); err != nil {
+		return fmt.Errorf("failed to cascade-revoke credential %s: %w", id, err)
 	}
 	return nil
 }

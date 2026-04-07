@@ -1,9 +1,7 @@
 package integration_test
 
 import (
-	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -175,6 +173,89 @@ func TestCAESignalRevokesAllActiveCredentials(t *testing.T) {
 	assert.False(t, introspect(t, token2)["active"].(bool), "token2 must be revoked")
 }
 
+// TestCAESignalCascadesRevocationToChildren verifies that revoking a parent
+// credential via a CAE signal also invalidates all downstream credentials
+// that were issued via RFC 8693 token_exchange against that parent.
+//
+// Chain under test:
+//
+//	orchestrator (depth=0) → sub-agent (depth=1) → grandchild (depth=2)
+//
+// Firing a CRITICAL signal against the orchestrator must cause all three
+// tokens to become inactive on introspection.
+func TestCAESignalCascadesRevocationToChildren(t *testing.T) {
+	// ── Orchestrator: client_credentials (depth=0) ──────────────────────────
+	orchID := uid("casc-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	// ── Sub-agent: token_exchange from orchestrator (depth=1) ───────────────
+	sub1Key := generateKey(t)
+	sub1Identity := registerIdentity(t, uid("casc-sub1"), []string{"data:read"}, ecPublicKeyPEM(t, sub1Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, sub1Key, sub1Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth1Token := decode(t, resp)["access_token"].(string)
+
+	// ── Grandchild: token_exchange from sub-agent (depth=2) ─────────────────
+	sub2Key := generateKey(t)
+	sub2Identity := registerIdentity(t, uid("casc-sub2"), []string{"data:read"}, ecPublicKeyPEM(t, sub2Key))
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": depth1Token,
+		"actor_token":   buildAssertion(t, sub2Key, sub2Identity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	depth2Token := decode(t, resp)["access_token"].(string)
+
+	// ── All three tokens must be active before the signal ───────────────────
+	require.True(t, introspect(t, orchToken)["active"].(bool), "orchestrator token must be active before signal")
+	require.True(t, introspect(t, depth1Token)["active"].(bool), "depth-1 token must be active before signal")
+	require.True(t, introspect(t, depth2Token)["active"].(bool), "depth-2 token must be active before signal")
+
+	// ── Fire CRITICAL signal against the orchestrator identity ───────────────
+	orchIdentityID := identityIDFromToken(t, orchToken)
+	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+		"identity_id": orchIdentityID,
+		"signal_type": "anomalous_behavior",
+		"severity":    "critical",
+		"source":      "integration-test",
+		"payload":     map[string]any{"reason": "cascade revocation test"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
+	signalResp.Body.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// ── Orchestrator's own token must be inactive ────────────────────────────
+	assert.False(t, introspect(t, orchToken)["active"].(bool),
+		"orchestrator token must be inactive after CRITICAL signal")
+
+	// ── Downstream tokens must be inactive via cascade ───────────────────────
+	assert.False(t, introspect(t, depth1Token)["active"].(bool),
+		"depth-1 token must be inactive: parent credential was revoked")
+	assert.False(t, introspect(t, depth2Token)["active"].(bool),
+		"depth-2 token must be inactive: grandparent credential was revoked")
+}
+
 // TestSignalListEndpoint verifies that ingested signals are queryable.
 func TestSignalListEndpoint(t *testing.T) {
 	agentID := uid("signal-list-agent")
@@ -208,53 +289,4 @@ func TestSignalListEndpoint(t *testing.T) {
 	signals, ok := body["signals"].([]any)
 	require.True(t, ok)
 	assert.GreaterOrEqual(t, len(signals), 1)
-}
-
-// identityIDFromToken introspects a token and returns the identity_id claim.
-// Assumes the introspect response contains "identity_id" or derives it from "sub".
-func identityIDFromToken(t *testing.T, token string) string {
-	t.Helper()
-	result := introspect(t, token)
-
-	// The introspect response may include identity_id directly.
-	if id, ok := result["identity_id"].(string); ok && id != "" {
-		return id
-	}
-
-	// Fall back: look up the identity by external_id from the sub claim.
-	// sub = spiffe://{domain}/{account}/{project}/{identity_type}/{external_id}
-	sub, ok := result["sub"].(string)
-	require.True(t, ok, "introspect response must have sub claim")
-
-	// Extract external_id from WIMSE URI.
-	externalID, err := extractExternalIDFromWIMSE(sub)
-	require.NoError(t, err)
-
-	// Look up identity via list endpoint filtered by listing all and finding by external_id.
-	listResp := get(t, "/api/v1/identities", adminHeaders())
-	require.Equal(t, http.StatusOK, listResp.StatusCode)
-	body := decode(t, listResp)
-	items, ok := body["identities"].([]any)
-	require.True(t, ok)
-	for _, item := range items {
-		identity := item.(map[string]any)
-		if identity["external_id"].(string) == externalID {
-			return identity["id"].(string)
-		}
-	}
-	t.Fatalf("could not find identity for external_id=%s", externalID)
-	return ""
-}
-
-// extractExternalIDFromWIMSE parses spiffe://{domain}/{acct}/{proj}/{identity_type}/{external_id}.
-func extractExternalIDFromWIMSE(wimseURI string) (string, error) {
-	const prefix = "spiffe://" + testWIMSE + "/"
-	if len(wimseURI) <= len(prefix) {
-		return "", fmt.Errorf("invalid WIMSE URI: %s", wimseURI)
-	}
-	parts := strings.Split(wimseURI[len(prefix):], "/")
-	if len(parts) != 4 {
-		return "", fmt.Errorf("unexpected WIMSE URI format: %s (got %d parts)", wimseURI, len(parts))
-	}
-	return parts[3], nil
 }

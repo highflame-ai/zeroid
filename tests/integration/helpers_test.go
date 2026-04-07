@@ -18,6 +18,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"strings"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -478,6 +479,58 @@ func buildAuthCode(t *testing.T, clientID, userID, redirectURI, codeChallenge st
 	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte(testHMACSecret)))
 	require.NoError(t, err)
 	return string(signed)
+}
+
+// generateKey generates a fresh ECDSA P-256 key pair for use in token_exchange tests.
+func generateKey(t *testing.T) *ecdsa.PrivateKey {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	return key
+}
+
+// identityIDFromToken introspects a token and returns the identity_id claim.
+func identityIDFromToken(t *testing.T, token string) string {
+	t.Helper()
+	result := introspect(t, token)
+
+	if id, ok := result["identity_id"].(string); ok && id != "" {
+		return id
+	}
+
+	// Fall back: look up by external_id parsed from the sub claim.
+	sub, ok := result["sub"].(string)
+	require.True(t, ok, "introspect response must have sub claim")
+
+	externalID, err := extractExternalIDFromWIMSE(sub)
+	require.NoError(t, err)
+
+	listResp := get(t, "/api/v1/identities", adminHeaders())
+	require.Equal(t, http.StatusOK, listResp.StatusCode)
+	body := decode(t, listResp)
+	items, ok := body["identities"].([]any)
+	require.True(t, ok)
+	for _, item := range items {
+		identity := item.(map[string]any)
+		if identity["external_id"].(string) == externalID {
+			return identity["id"].(string)
+		}
+	}
+	t.Fatalf("could not find identity for external_id=%s", externalID)
+	return ""
+}
+
+// extractExternalIDFromWIMSE parses spiffe://{domain}/{acct}/{proj}/{identity_type}/{external_id}.
+func extractExternalIDFromWIMSE(wimseURI string) (string, error) {
+	const prefix = "spiffe://" + testWIMSE + "/"
+	if len(wimseURI) <= len(prefix) {
+		return "", fmt.Errorf("invalid WIMSE URI: %s", wimseURI)
+	}
+	parts := strings.Split(wimseURI[len(prefix):], "/")
+	if len(parts) != 4 {
+		return "", fmt.Errorf("unexpected WIMSE URI format: %s (got %d parts)", wimseURI, len(parts))
+	}
+	return parts[3], nil
 }
 
 // registerAgent calls POST /api/v1/agents/register and returns the identity ID and API key.
