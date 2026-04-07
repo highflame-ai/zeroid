@@ -4,25 +4,27 @@ This example demonstrates how ZeroID prevents the **Confused Deputy** problem (i
 
 ## The Vulnerability
 
-In a standard two-agent pipeline, an **Email Agent** reads an HR inbox and passes the contents to a **Payroll Agent** equipped with privileged HR system credentials.
-
-If an attacker sends an email containing a hidden `PAYROLL_COMMAND`, the Payroll Agent might implicitly trust its peer's output and execute the injected command—such as rerouting an employee's direct deposit to an attacker's account. This is Business Email Compromise (BEC) at AI speed, caused by a lack of identity boundaries between agents.
+In a standard multi-agent pipeline, an **Email Agent** reads an HR inbox and passes the contents to a **Payroll Agent** equipped with privileged HR system credentials. If an attacker sends an email containing a hidden `PAYROLL_COMMAND`, the Payroll Agent might implicitly trust its peer's output and execute the injected command—rerouting an employee's direct deposit to an attacker's account. This is Business Email Compromise (BEC) at AI speed.
 
 ## The Solution
 
-ZeroID prevents this by enforcing strict, cryptographically verifiable scope boundaries using **WIMSE (Workload Identity in Multi-Service Environments)** identities. It utilizes an **RFC 8693 3-hop delegation chain** to ensure the Payroll Agent is securely constrained when processing untrusted content.
+ZeroID enforces cryptographically verifiable scope boundaries using **WIMSE** identities and **RFC 8693 token exchange**. The same Payroll Agent uses different tokens depending on the data source:
 
-Instead of a single shared credential, tokens are attenuated (scoped down) at every handoff:
+* **`[depth=0]` Payroll Agent (own token):** Full access (`email:read`, `payroll:read`, `payroll:write`). Used for verified internal requests — the payroll write **succeeds**.
+* **`[depth=1]` Email Agent:** Delegated `email:read` only. Authenticates against the email API to read the inbox.
+* **`[depth=2]` Payroll Agent (context token):** When processing Email Agent output, the Payroll Agent operates under the Email Agent's scope ceiling (`email:read` only). The injected payroll command is **rejected at the tool boundary**.
 
-* **`[depth=0]` Payroll Agent:** Starts with full access (`email:read`, `payroll:read`, `payroll:write`). It delegates *only* `email:read` to the Email Agent.
-* **`[depth=1]` Email Agent:** Operates strictly with `email:read`. It processes the inbox and passes the output back to the Payroll Agent, delegating its restricted scope.
-* **`[depth=2]` Payroll Agent (Context Token):** The LangGraph workflow is designed so that the Payroll Agent **operates under this restricted context token** when processing the Email Agent's output. It now operates under the Email Agent's limited scope (`email:read`).
+The LangGraph graph uses conditional routing to direct requests to the appropriate handler based on data source:
 
+```
+                  ┌─ payroll_direct (own token) ──┐
+START → read_inbox┤                               ├→ END
+                  └─ payroll_from_email (context) ─┘
+```
 
+The tool boundary enforces scope cryptographically — it doesn't matter that the LLM was tricked into executing the injected command. The token can't authorize the action.
 
-If the injected prompt tricks the Payroll Agent into calling a privileged payroll tool, the tool verifies the active token. Because the `depth=2` context token lacks the `payroll:write` permission, the malicious action is **rejected at the tool boundary**—enforced by cryptography, not AI reasoning. 
-
-> *ZeroID provides the professional-grade tools to design secure workflows that enforce scope attenuation and least privilege, but correct implementation in the graph logic is required.*
+> *ZeroID provides the tools to enforce scope attenuation and least privilege. Correct implementation in the graph logic is required.*
 
 ## Quickstart
 
