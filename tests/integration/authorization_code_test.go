@@ -267,7 +267,7 @@ func TestAuthorizationCodePerClientTTL(t *testing.T) {
 	customClientID := uid("ttl-client")
 
 	// Register a public client with custom access_token_ttl.
-	resp := post(t, "/api/v1/oauth/clients", map[string]any{
+	resp := post(t, "/oauth/clients", map[string]any{
 		"client_id":        customClientID,
 		"name":             "Custom TTL Client",
 		"grant_types":      []string{"authorization_code", "refresh_token"},
@@ -315,7 +315,7 @@ func TestEnsureClientUpdatesConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify initial state.
-	resp := get(t, "/api/v1/oauth/clients", nil)
+	resp := get(t, "/oauth/clients", nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	clients := body["clients"].([]any)
@@ -345,7 +345,7 @@ func TestEnsureClientUpdatesConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify updated state.
-	resp = get(t, "/api/v1/oauth/clients", nil)
+	resp = get(t, "/oauth/clients", nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	clients = body["clients"].([]any)

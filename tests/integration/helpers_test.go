@@ -288,7 +288,7 @@ type oauthClientResp struct {
 	ClientSecret string `json:"client_secret"`
 }
 
-// registerIdentity calls POST /api/v1/identities and returns the created identity.
+// registerIdentity calls POST /identities and returns the created identity.
 func registerIdentity(t *testing.T, externalID string, scopes []string, publicKeyPEM ...string) identityResp {
 	t.Helper()
 	body := map[string]any{
@@ -300,7 +300,7 @@ func registerIdentity(t *testing.T, externalID string, scopes []string, publicKe
 	if len(publicKeyPEM) > 0 && publicKeyPEM[0] != "" {
 		body["public_key_pem"] = publicKeyPEM[0]
 	}
-	resp := post(t, "/api/v1/identities", body, adminHeaders())
+	resp := post(t, "/identities", body, adminHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerIdentity: expected 201")
 	raw := decode(t, resp)
 	return identityResp{
@@ -310,11 +310,11 @@ func registerIdentity(t *testing.T, externalID string, scopes []string, publicKe
 	}
 }
 
-// registerOAuthClient creates a confidential M2M OAuth client via POST /api/v1/oauth/clients.
+// registerOAuthClient creates a confidential M2M OAuth client via POST /oauth/clients.
 // Returns client_id + client_secret. Identity link happens at token issuance, not registration.
 func registerOAuthClient(t *testing.T, clientID string, scopes []string) oauthClientResp {
 	t.Helper()
-	resp := post(t, "/api/v1/oauth/clients", map[string]any{
+	resp := post(t, "/oauth/clients", map[string]any{
 		"client_id":    clientID,
 		"name":         clientID + "-client",
 		"confidential": true,
@@ -438,7 +438,7 @@ func registerTestOAuthClient(clientID string, grantTypes []string) {
 	}
 }
 
-// agentRegistration holds the response from POST /api/v1/agents/register.
+// agentRegistration holds the response from POST /agents/register.
 type agentRegistration struct {
 	AgentID string // identity UUID
 	APIKey  string // plaintext zid_sk_* key
@@ -505,7 +505,7 @@ func identityIDFromToken(t *testing.T, token string) string {
 	externalID, err := extractExternalIDFromWIMSE(sub)
 	require.NoError(t, err)
 
-	listResp := get(t, "/api/v1/identities", adminHeaders())
+	listResp := get(t, "/identities", adminHeaders())
 	require.Equal(t, http.StatusOK, listResp.StatusCode)
 	body := decode(t, listResp)
 	items, ok := body["identities"].([]any)
@@ -533,10 +533,10 @@ func extractExternalIDFromWIMSE(wimseURI string) (string, error) {
 	return parts[3], nil
 }
 
-// registerAgent calls POST /api/v1/agents/register and returns the identity ID and API key.
+// registerAgent calls POST /agents/register and returns the identity ID and API key.
 func registerAgent(t *testing.T, externalID string) agentRegistration {
 	t.Helper()
-	resp := post(t, "/api/v1/agents/register", map[string]any{
+	resp := post(t, "/agents/register", map[string]any{
 		"name":        externalID,
 		"external_id": externalID,
 		"sub_type":    "orchestrator",
