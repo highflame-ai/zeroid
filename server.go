@@ -297,7 +297,7 @@ func (s *Server) Start() error {
 	go func() {
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
 		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Msg("  Admin:   /identities/*, /agents/*, /api-keys/*, /credentials/*, /signals/*, /oauth/*, /proof/* (no built-in auth — protect at network layer)")
+		log.Info().Msg("  Admin:   /identities/*, /agents/*, /api-keys/*, /credentials/*, /credential-policies/*, /attestation/*, /signals/*, /oauth/*, /proof/* (no built-in auth — protect at network layer)")
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
