@@ -122,7 +122,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "register-agent",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/agents/register",
+		Path:          "/agents/register",
 		Summary:       "Register a new agent (creates identity + API key atomically)",
 		Tags:          []string{"Agents"},
 		DefaultStatus: http.StatusCreated,
@@ -131,7 +131,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-agent",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/agents/registry/{id}",
+		Path:        "/agents/registry/{id}",
 		Summary:     "Get an agent by identity ID",
 		Tags:        []string{"Agents"},
 	}, a.getAgentOp)
@@ -139,7 +139,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-agents",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/agents/registry",
+		Path:        "/agents/registry",
 		Summary:     "List agents for the current tenant",
 		Tags:        []string{"Agents"},
 	}, a.listAgentsOp)
@@ -147,7 +147,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "update-agent",
 		Method:      http.MethodPatch,
-		Path:        "/api/v1/agents/registry/{id}",
+		Path:        "/agents/registry/{id}",
 		Summary:     "Update mutable fields of an agent",
 		Tags:        []string{"Agents"},
 	}, a.updateAgentOp)
@@ -155,7 +155,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "delete-agent",
 		Method:        http.MethodDelete,
-		Path:          "/api/v1/agents/registry/{id}",
+		Path:          "/agents/registry/{id}",
 		Summary:       "Deactivate an agent (soft delete) and revoke its keys",
 		Tags:          []string{"Agents"},
 		DefaultStatus: http.StatusOK,
@@ -164,7 +164,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "activate-agent",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/agents/registry/{id}/activate",
+		Path:        "/agents/registry/{id}/activate",
 		Summary:     "Activate a previously deactivated agent",
 		Tags:        []string{"Agents"},
 	}, a.activateAgentOp)
@@ -172,7 +172,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "deactivate-agent",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/agents/registry/{id}/deactivate",
+		Path:        "/agents/registry/{id}/deactivate",
 		Summary:     "Deactivate an agent without deleting it",
 		Tags:        []string{"Agents"},
 	}, a.deactivateAgentOp)
@@ -180,7 +180,7 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "rotate-agent-key",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/agents/registry/{id}/rotate-key",
+		Path:        "/agents/registry/{id}/rotate-key",
 		Summary:     "Rotate an agent's API key (revokes old, issues new)",
 		Tags:        []string{"Agents"},
 	}, a.rotateAgentKeyOp)

@@ -76,7 +76,7 @@ func (a *API) registerAPIKeyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "create-api-key",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/api-keys",
+		Path:          "/api-keys",
 		Summary:       "Create a new API key",
 		Tags:          []string{"API Keys"},
 		DefaultStatus: http.StatusCreated,
@@ -85,7 +85,7 @@ func (a *API) registerAPIKeyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-api-key",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/api-keys/{id}",
+		Path:        "/api-keys/{id}",
 		Summary:     "Get an API key by ID",
 		Tags:        []string{"API Keys"},
 	}, a.getAPIKeyOp)
@@ -93,7 +93,7 @@ func (a *API) registerAPIKeyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-api-keys",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/api-keys",
+		Path:        "/api-keys",
 		Summary:     "List API keys for the current tenant",
 		Tags:        []string{"API Keys"},
 	}, a.listAPIKeysOp)
@@ -101,7 +101,7 @@ func (a *API) registerAPIKeyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "revoke-api-key",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/api-keys/{id}/revoke",
+		Path:        "/api-keys/{id}/revoke",
 		Summary:     "Revoke an API key",
 		Tags:        []string{"API Keys"},
 	}, a.revokeAPIKeyOp)
