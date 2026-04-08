@@ -238,8 +238,8 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT":               "server.port",
-		"ZEROID_ENV":                "server.env",
+		"ZEROID_PORT":              "server.port",
+		"ZEROID_ENV":               "server.env",
 		"ZEROID_ADMIN_PATH_PREFIX": "server.admin_path_prefix",
 
 		// Database
@@ -279,8 +279,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 	}
 
 	for envVar, configPath := range envMapping {
-		value := os.Getenv(envVar)
-		if value == "" {
+		value, ok := os.LookupEnv(envVar)
+		if !ok {
 			continue
 		}
 

@@ -637,8 +637,7 @@ func requestValidationMiddleware(next http.Handler) http.Handler {
 
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 			ct := r.Header.Get("Content-Type")
-			// Allow missing Content-Type for SSE stream endpoint (path varies by AdminPathPrefix).
-			if ct == "" && !strings.HasSuffix(r.URL.Path, "/signals/stream") {
+			if ct == "" {
 				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
 				return
 			}
