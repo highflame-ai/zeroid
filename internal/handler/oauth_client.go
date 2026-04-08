@@ -87,7 +87,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "create-oauth-client",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/oauth/clients",
+		Path:          "/oauth/clients",
 		Summary:       "Register an OAuth2 client",
 		Tags:          []string{"OAuth Clients"},
 		DefaultStatus: http.StatusCreated,
@@ -96,7 +96,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-oauth-client",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/oauth/clients/{id}",
+		Path:        "/oauth/clients/{id}",
 		Summary:     "Get an OAuth2 client by ID",
 		Tags:        []string{"OAuth Clients"},
 	}, a.getOAuthClientOp)
@@ -104,7 +104,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-oauth-clients",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/oauth/clients",
+		Path:        "/oauth/clients",
 		Summary:     "List all registered OAuth2 clients",
 		Tags:        []string{"OAuth Clients"},
 	}, a.listOAuthClientsOp)
@@ -112,7 +112,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "rotate-oauth-client-secret",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/oauth/clients/{id}/rotate-secret",
+		Path:        "/oauth/clients/{id}/rotate-secret",
 		Summary:     "Rotate an OAuth2 client secret",
 		Tags:        []string{"OAuth Clients"},
 	}, a.rotateOAuthClientSecretOp)
@@ -120,7 +120,7 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "delete-oauth-client",
 		Method:      http.MethodDelete,
-		Path:        "/api/v1/oauth/clients/{id}",
+		Path:        "/oauth/clients/{id}",
 		Summary:     "Delete an OAuth2 client",
 		Tags:        []string{"OAuth Clients"},
 	}, a.deleteOAuthClientOp)

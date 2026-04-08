@@ -14,7 +14,7 @@ import (
 // and the response contains the expected WIMSE URI format.
 func TestRegisterIdentity(t *testing.T) {
 	externalID := uid("research-agent")
-	resp := post(t, "/api/v1/identities", map[string]any{
+	resp := post(t, adminPath("/identities"), map[string]any{
 		"external_id":    externalID,
 		"trust_level":    "unverified",
 		"owner_user_id":  "user-test-owner",
@@ -43,7 +43,7 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 	registerIdentity(t, externalID, []string{"billing:read"})
 
 	// Second registration with the same external_id — must be rejected.
-	resp := post(t, "/api/v1/identities", map[string]any{
+	resp := post(t, adminPath("/identities"), map[string]any{
 		"external_id":    externalID,
 		"trust_level":    "unverified",
 		"owner_user_id":  "user-test-owner",
@@ -55,7 +55,7 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 
 // TestRegisterIdentityMissingExternalID verifies that omitting external_id returns 400/422.
 func TestRegisterIdentityMissingExternalID(t *testing.T) {
-	resp := post(t, "/api/v1/identities", map[string]any{
+	resp := post(t, adminPath("/identities"), map[string]any{
 		"trust_level":    "unverified",
 		"owner_user_id":  "user-test-owner",
 		"allowed_scopes": []string{"billing:read"},
@@ -72,7 +72,7 @@ func TestGetIdentity(t *testing.T) {
 	externalID := uid("get-agent")
 	identity := registerIdentity(t, externalID, []string{"billing:read"})
 
-	resp := get(t, "/api/v1/identities/"+identity.ID, adminHeaders())
+	resp := get(t, adminPath("/identities/"+identity.ID), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body := decode(t, resp)
@@ -83,7 +83,7 @@ func TestGetIdentity(t *testing.T) {
 
 // TestGetIdentityNotFound verifies that fetching an unknown ID returns 404.
 func TestGetIdentityNotFound(t *testing.T) {
-	resp := get(t, "/api/v1/identities/00000000-0000-0000-0000-000000000000", adminHeaders())
+	resp := get(t, adminPath("/identities/00000000-0000-0000-0000-000000000000"), adminHeaders())
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	resp.Body.Close()
 }
@@ -94,7 +94,7 @@ func TestListIdentities(t *testing.T) {
 	registerIdentity(t, uid("list-a"), []string{"billing:read"})
 	registerIdentity(t, uid("list-b"), []string{"data:read"})
 
-	resp := get(t, "/api/v1/identities", adminHeaders())
+	resp := get(t, adminPath("/identities"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 
@@ -108,7 +108,7 @@ func TestListAgentsFilterByIdentityType(t *testing.T) {
 	agentExt := uid("filter-agent")
 	appExt := uid("filter-app")
 
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   agentExt,
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
@@ -118,7 +118,7 @@ func TestListAgentsFilterByIdentityType(t *testing.T) {
 		"labels":        map[string]string{"product": "guardrails"},
 	}, adminHeaders())
 
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   appExt,
 		"identity_type": "application",
 		"sub_type":      "custom",
@@ -129,7 +129,7 @@ func TestListAgentsFilterByIdentityType(t *testing.T) {
 	}, adminHeaders())
 
 	// Single type filter — only agents.
-	resp := get(t, "/api/v1/agents/registry?identity_type=agent&label=product:guardrails", adminHeaders())
+	resp := get(t, adminPath("/agents/registry?identity_type=agent&label=product:guardrails"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	agents := body["agents"].([]any)
@@ -139,7 +139,7 @@ func TestListAgentsFilterByIdentityType(t *testing.T) {
 	}
 
 	// Multi-value filter — agents and applications (comma-separated).
-	resp = get(t, "/api/v1/agents/registry?identity_type=agent,application&label=product:guardrails", adminHeaders())
+	resp = get(t, adminPath("/agents/registry?identity_type=agent,application&label=product:guardrails"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	both := body["agents"].([]any)
@@ -152,7 +152,7 @@ func TestListAgentsFilterByIdentityType(t *testing.T) {
 	assert.True(t, types["application"], "should include applications")
 
 	// No filter — returns all types.
-	resp = get(t, "/api/v1/agents/registry?label=product:guardrails", adminHeaders())
+	resp = get(t, adminPath("/agents/registry?label=product:guardrails"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	all := body["agents"].([]any)
@@ -165,7 +165,7 @@ func TestUpdateIdentityTrustLevel(t *testing.T) {
 	externalID := uid("trust-agent")
 	identity := registerIdentity(t, externalID, []string{"billing:read"})
 
-	resp, err := doRaw(t, http.MethodPatch, "/api/v1/identities/"+identity.ID, map[string]any{
+	resp, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+identity.ID), map[string]any{
 		"trust_level": "verified_third_party",
 	}, adminHeaders())
 	require.NoError(t, err)
@@ -180,7 +180,7 @@ func TestDeleteIdentity(t *testing.T) {
 	externalID := uid("delete-agent")
 	identity := registerIdentity(t, externalID, []string{"billing:read"})
 
-	resp, err := doRaw(t, http.MethodDelete, "/api/v1/identities/"+identity.ID, nil, adminHeaders())
+	resp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+identity.ID), nil, adminHeaders())
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	resp.Body.Close()
@@ -222,7 +222,7 @@ func TestListAgentsFilterByTrustLevel(t *testing.T) {
 	uvExt := uid("trust-uv")
 
 	// Register a first_party agent.
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   fpExt,
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
@@ -233,7 +233,7 @@ func TestListAgentsFilterByTrustLevel(t *testing.T) {
 	}, adminHeaders())
 
 	// Register an unverified agent.
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   uvExt,
 		"identity_type": "agent",
 		"sub_type":      "tool_agent",
@@ -244,7 +244,7 @@ func TestListAgentsFilterByTrustLevel(t *testing.T) {
 	}, adminHeaders())
 
 	// Filter by first_party only.
-	resp := get(t, "/api/v1/agents/registry?trust_level=first_party&label=test:trust-filter", adminHeaders())
+	resp := get(t, adminPath("/agents/registry?trust_level=first_party&label=test:trust-filter"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	agents := body["agents"].([]any)
@@ -255,7 +255,7 @@ func TestListAgentsFilterByTrustLevel(t *testing.T) {
 	assert.GreaterOrEqual(t, len(agents), 1, "should have at least one first_party agent")
 
 	// Filter by unverified — should not include first_party.
-	resp = get(t, "/api/v1/agents/registry?trust_level=unverified&label=test:trust-filter", adminHeaders())
+	resp = get(t, adminPath("/agents/registry?trust_level=unverified&label=test:trust-filter"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	agents = body["agents"].([]any)
@@ -271,7 +271,7 @@ func TestListAgentsFilterByIsActive(t *testing.T) {
 	inactiveExt := uid("active-b")
 
 	// Register and keep one active.
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   activeExt,
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
@@ -282,7 +282,7 @@ func TestListAgentsFilterByIsActive(t *testing.T) {
 	}, adminHeaders())
 
 	// Register and deactivate.
-	resp := post(t, "/api/v1/agents/register", map[string]any{
+	resp := post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   inactiveExt,
 		"identity_type": "agent",
 		"sub_type":      "tool_agent",
@@ -296,13 +296,13 @@ func TestListAgentsFilterByIsActive(t *testing.T) {
 	agentID := registered["identity"].(map[string]any)["id"].(string)
 
 	// Deactivate.
-	deactivateResp, err := doRaw(t, http.MethodPost, "/api/v1/agents/registry/"+agentID+"/deactivate", nil, adminHeaders())
+	deactivateResp, err := doRaw(t, http.MethodPost, adminPath("/agents/registry/"+agentID+"/deactivate"), nil, adminHeaders())
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, deactivateResp.StatusCode)
 	deactivateResp.Body.Close()
 
 	// is_active=true should exclude deactivated.
-	resp = get(t, "/api/v1/agents/registry?is_active=true&label=test:active-filter", adminHeaders())
+	resp = get(t, adminPath("/agents/registry?is_active=true&label=test:active-filter"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	agents := body["agents"].([]any)
@@ -312,7 +312,7 @@ func TestListAgentsFilterByIsActive(t *testing.T) {
 	}
 
 	// is_active=false should only return non-active.
-	resp = get(t, "/api/v1/agents/registry?is_active=false&label=test:active-filter", adminHeaders())
+	resp = get(t, adminPath("/agents/registry?is_active=false&label=test:active-filter"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	agents = body["agents"].([]any)
@@ -328,7 +328,7 @@ func TestListAgentsSearch(t *testing.T) {
 	ext1 := uid("search-alpha")
 	ext2 := uid("search-beta")
 
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   ext1,
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
@@ -337,7 +337,7 @@ func TestListAgentsSearch(t *testing.T) {
 		"created_by":    "test-user",
 	}, adminHeaders())
 
-	post(t, "/api/v1/agents/register", map[string]any{
+	post(t, adminPath("/agents/register"), map[string]any{
 		"external_id":   ext2,
 		"identity_type": "agent",
 		"sub_type":      "tool_agent",
@@ -347,7 +347,7 @@ func TestListAgentsSearch(t *testing.T) {
 	}, adminHeaders())
 
 	// Search by name substring.
-	resp := get(t, "/api/v1/agents/registry?search=Alpha+Research", adminHeaders())
+	resp := get(t, adminPath("/agents/registry?search=Alpha+Research"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	agents := body["agents"].([]any)
@@ -361,7 +361,7 @@ func TestListAgentsSearch(t *testing.T) {
 	assert.True(t, found, "search should find Alpha Research Bot by name")
 
 	// Search by external_id substring.
-	resp = get(t, "/api/v1/agents/registry?search="+ext2[:20], adminHeaders())
+	resp = get(t, adminPath("/agents/registry?search=")+ext2[:20], adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	agents = body["agents"].([]any)
@@ -381,7 +381,7 @@ func TestListAgentsPagination(t *testing.T) {
 
 	// Register 5 agents with a unique label.
 	for i := 0; i < 5; i++ {
-		post(t, "/api/v1/agents/register", map[string]any{
+		post(t, adminPath("/agents/register"), map[string]any{
 			"external_id":   uid(fmt.Sprintf("page-%d", i)),
 			"identity_type": "agent",
 			"sub_type":      "autonomous",
@@ -393,7 +393,7 @@ func TestListAgentsPagination(t *testing.T) {
 	}
 
 	// Request first page (limit=2).
-	resp := get(t, "/api/v1/agents/registry?limit=2&offset=0&label=pagination:"+paginationLabel, adminHeaders())
+	resp := get(t, adminPath("/agents/registry?limit=2&offset=0&label=pagination:")+paginationLabel, adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	page1 := body["agents"].([]any)
@@ -401,7 +401,7 @@ func TestListAgentsPagination(t *testing.T) {
 	assert.Equal(t, float64(5), body["total"], "total should be 5")
 
 	// Request second page (limit=2, offset=2).
-	resp = get(t, "/api/v1/agents/registry?limit=2&offset=2&label=pagination:"+paginationLabel, adminHeaders())
+	resp = get(t, adminPath("/agents/registry?limit=2&offset=2&label=pagination:")+paginationLabel, adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	page2 := body["agents"].([]any)
@@ -418,7 +418,7 @@ func TestListAgentsPagination(t *testing.T) {
 	}
 
 	// Request last page (offset=4, limit=2) — should return 1 agent.
-	resp = get(t, "/api/v1/agents/registry?limit=2&offset=4&label=pagination:"+paginationLabel, adminHeaders())
+	resp = get(t, adminPath("/agents/registry?limit=2&offset=4&label=pagination:")+paginationLabel, adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	page3 := body["agents"].([]any)
@@ -428,7 +428,7 @@ func TestListAgentsPagination(t *testing.T) {
 // TestListIdentitiesEndpointFilters verifies that /api/v1/identities also supports filters.
 func TestListIdentitiesEndpointFilters(t *testing.T) {
 	ext := uid("id-filter")
-	post(t, "/api/v1/identities", map[string]any{
+	post(t, adminPath("/identities"), map[string]any{
 		"external_id":    ext,
 		"trust_level":    "first_party",
 		"identity_type":  "application",
@@ -439,7 +439,7 @@ func TestListIdentitiesEndpointFilters(t *testing.T) {
 	}, adminHeaders())
 
 	// Filter by identity_type.
-	resp := get(t, "/api/v1/identities?identity_type=application", adminHeaders())
+	resp := get(t, adminPath("/identities?identity_type=application"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	identities := body["identities"].([]any)
@@ -449,7 +449,7 @@ func TestListIdentitiesEndpointFilters(t *testing.T) {
 	}
 
 	// Search by name.
-	resp = get(t, "/api/v1/identities?search=Filterable+App", adminHeaders())
+	resp = get(t, adminPath("/identities?search=Filterable+App"), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	identities = body["identities"].([]any)
