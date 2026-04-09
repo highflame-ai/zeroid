@@ -39,7 +39,7 @@ from langgraph.graph import StateGraph, START, END
 # ---------------------------------------------------------------------------
 
 ZEROID_BASE_URL = os.getenv("ZEROID_BASE_URL", "http://localhost:8899")
-ADMIN_API_KEY   = os.getenv("ZEROID_ADMIN_API_KEY", "zid_sk_admin...")
+ADMIN_API_KEY   = os.environ["ZEROID_ADMIN_API_KEY"]
 
 client = ZeroIDClient(base_url=ZEROID_BASE_URL, api_key=ADMIN_API_KEY)
 
@@ -195,6 +195,7 @@ def payroll_tool(token: str, employee_id: str, routing: str, account: str) -> st
 
 class AgentState(TypedDict):
     messages: Annotated[List[dict], operator.add]
+    source: Literal["internal", "email"]  # drives routing at graph entry
     payroll_token: str          # depth=0, payroll:write — agent's own credential
     email_token: str            # depth=1, email:read — delegated to email agent
     payroll_context_token: str  # depth=2, email:read — payroll agent under email scope
@@ -211,7 +212,6 @@ def read_inbox(state: AgentState):
 
     inbox = email_tool(state["email_token"])
 
-    # Highlight the injected payload
     for line in inbox.split("\n"):
         if any(kw in line for kw in ("SYSTEM:", "PAYROLL_COMMAND:", "hr_api_key")):
             print(f"  {RED}{line}{RESET}")
@@ -221,21 +221,13 @@ def read_inbox(state: AgentState):
     return {"messages": [{"role": "assistant", "content": inbox}]}
 
 
-def route(state: AgentState) -> Literal["payroll_direct", "payroll_from_email"]:
-    """
-    Route based on data source. In production this could be an LLM classifier
-    or a check on message metadata. Here the inbox always contains a request,
-    so we process both paths to show the contrast.
-    """
-    # There's always at least one email-sourced request in the demo
-    return "payroll_from_email"
+def route(state: AgentState) -> Literal["payroll_direct", "read_inbox"]:
+    """Branch on request source — internal requests go direct, email goes through the inbox."""
+    return "payroll_direct" if state["source"] == "internal" else "read_inbox"
 
 
 def payroll_direct(state: AgentState):
-    """
-    Payroll Agent processes a verified internal request using its own token.
-    This is the normal happy path — the agent has payroll:write.
-    """
+    """Payroll Agent processes a verified internal request with its own token (payroll:write)."""
     print(f"\n{'─' * 60}")
     print(f"[payroll agent] {GREEN}Processing verified internal request (own token, depth=0){RESET}")
 
@@ -251,12 +243,12 @@ def payroll_direct(state: AgentState):
 
 def payroll_from_email(state: AgentState):
     """
-    Payroll Agent processes a request that originated from the Email Agent.
-    It MUST use the context token (depth=2, email:read only) — not its own.
-    The injected PAYROLL_COMMAND gets blocked at the tool boundary.
+    Payroll Agent processes a request sourced from the Email Agent.
+    Must use the context token (depth=2, email:read) — not its own.
+    The injected PAYROLL_COMMAND is blocked at the tool boundary.
     """
     print(f"\n{'─' * 60}")
-    print(f"[payroll agent] Processing email-sourced request (context token, depth=2)")
+    print("[payroll agent] Processing email-sourced request (context token, depth=2)")
 
     message = state["messages"][-1]["content"]
     if "PAYROLL_COMMAND" not in message:
@@ -274,20 +266,20 @@ def payroll_from_email(state: AgentState):
 
 
 # ---------------------------------------------------------------------------
-# Graph — the payroll agent hits two paths depending on data source
+# Graph — route at entry based on request source
 #
-#                    ┌─ payroll_direct (own token) ──┐
-# START → read_inbox─┤                               ├─→ END
-#                    └─ payroll_from_email (context) ─┘
+#          ┌─ payroll_direct ──────────────────┐
+# START ───┤                                   ├→ END
+#          └─ read_inbox → payroll_from_email ─┘
 # ---------------------------------------------------------------------------
 
 builder = StateGraph(AgentState)
-builder.add_node("read_inbox",          read_inbox)
-builder.add_node("payroll_direct",      payroll_direct)
-builder.add_node("payroll_from_email",  payroll_from_email)
+builder.add_node("read_inbox",         read_inbox)
+builder.add_node("payroll_direct",     payroll_direct)
+builder.add_node("payroll_from_email", payroll_from_email)
 
-builder.add_edge(START, "read_inbox")
-builder.add_conditional_edges("read_inbox", route)
+builder.add_conditional_edges(START, route)
+builder.add_edge("read_inbox",         "payroll_from_email")
 builder.add_edge("payroll_direct",     END)
 builder.add_edge("payroll_from_email", END)
 
@@ -313,10 +305,12 @@ if __name__ == "__main__":
     )
     print(f"[setup] Payroll token:  payroll:write payroll:read email:read  (depth=0)")
 
-    well_known = client._transport.request(
-        "GET", "/.well-known/oauth-authorization-server", {}, include_tenant=False
-    ).json()
-    issuer = well_known["issuer"]
+    # Read the issuer directly from a token ZeroID already issued — authoritative,
+    # no extra HTTP call, and avoids assumptions about how the base URL maps to the issuer.
+    issuer = jwt.decode(
+        payroll_token.access_token,
+        options={"verify_signature": False},
+    )["iss"]
 
     # Delegate email:read to Email Agent (scope attenuation — no payroll:write)
     email_delegated = client.tokens.issue(
@@ -336,27 +330,31 @@ if __name__ == "__main__":
     )
     print(f"[setup] Context token:  email:read                             (depth=2)")
 
-    # Show the direct path first (payroll agent with its own token)
-    print(f"\n{'─' * 60}")
-    print(f"[payroll agent] {GREEN}Processing verified internal request (own token, depth=0){RESET}")
-    direct_result = payroll_tool(
-        token=payroll_token.access_token,
-        employee_id="1042",
-        routing="021000021",
-        account="1234567890",
-    )
-    print(f"  {GREEN}{direct_result}{RESET}")
+    tokens = {
+        "payroll_token":         payroll_token.access_token,
+        "email_token":           email_delegated.access_token,
+        "payroll_context_token": payroll_context_token.access_token,
+    }
 
-    # Now run the graph — email → route → payroll_from_email (context token)
+    # Run 1: internal request — Payroll Agent uses its own token, write succeeds
     print(f"\n{'=' * 60}")
-    print("Now processing HR inbox (email-sourced data)...")
+    print("Run 1: verified internal change request")
+    print("=" * 60)
+    graph.invoke({
+        "messages": [{"role": "user", "content": "Process verified payroll change for employee 1042."}],
+        "source": "internal",
+        **tokens,
+    })
+
+    # Run 2: email-sourced request — Payroll Agent constrained to context token, injection blocked
+    print(f"\n{'=' * 60}")
+    print("Run 2: HR inbox (email-sourced data, contains injected PAYROLL_COMMAND)")
     print("=" * 60)
 
     final = graph.invoke({
         "messages": [{"role": "user", "content": "Process today's HR inbox."}],
-        "payroll_token":         payroll_token.access_token,
-        "email_token":           email_delegated.access_token,
-        "payroll_context_token": payroll_context_token.access_token,
+        "source": "email",
+        **tokens,
     })
 
     print(f"\n{'=' * 60}")
