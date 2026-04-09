@@ -46,9 +46,10 @@ type middlewareHolder struct {
 // Single port, two route groups:
 //   - Public routes (/oauth2/*, /.well-known/*, /health, /ready): No authentication.
 //     These are the token endpoints agents and SDKs call directly.
-//   - Admin routes (/api/v1/*): Identity management, credential policies,
-//     attestation, signals. No built-in auth by default — protect at the
-//     network layer or use the AdminAuth hook.
+//   - Admin routes ({AdminPathPrefix}/*): Identity management, credential policies,
+//     attestation, signals. AdminPathPrefix defaults to "/api/v1" for standalone
+//     deployments. No built-in auth by default — protect at the network layer
+//     or use the AdminAuth hook.
 type Server struct {
 	cfg    Config
 	db     *bun.DB
@@ -212,9 +213,10 @@ func NewServer(cfg Config) (*Server, error) {
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
-	// Admin routes — /api/v1/*
+	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
-	r.Group(func(r chi.Router) {
+	adminPrefix := cfg.Server.GetAdminPathPrefix()
+	mountAdmin := func(r chi.Router) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -246,7 +248,15 @@ func NewServer(cfg Config) (*Server, error) {
 			humaAgentAuth := handler.NewHumaAPI(r)
 			apiHandler.RegisterAgentAuth(humaAgentAuth)
 		})
-	})
+	}
+
+	if adminPrefix != "" {
+		r.Route(adminPrefix, mountAdmin)
+	} else {
+		// No prefix — register admin routes at the router root.
+		// Used when the deployer controls the prefix via an outer mount point.
+		r.Group(mountAdmin)
+	}
 
 	// Parse timeouts.
 	readTimeout := parseDurationOrDefault(cfg.Server.ReadTimeout, 15*time.Second)
@@ -295,9 +305,13 @@ func (s *Server) Start() error {
 	// Start HTTP server.
 	errCh := make(chan error, 1)
 	go func() {
+		prefix := s.cfg.Server.GetAdminPathPrefix()
+		if prefix == "" {
+			prefix = "/"
+		}
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
 		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Msg("  Admin:   /api/v1/* (no built-in auth — protect at network layer)")
+		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*")
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -393,7 +407,7 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
 }
 
-// AdminAuth sets an optional authentication middleware for /api/v1/* admin routes.
+// AdminAuth sets an optional authentication middleware for admin routes.
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
@@ -623,8 +637,7 @@ func requestValidationMiddleware(next http.Handler) http.Handler {
 
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
 			ct := r.Header.Get("Content-Type")
-			// Allow missing Content-Type for SSE stream endpoint.
-			if ct == "" && r.URL.Path != "/api/v1/signals/stream" {
+			if ct == "" {
 				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
 				return
 			}
