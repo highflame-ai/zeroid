@@ -39,7 +39,9 @@ from langgraph.graph import StateGraph, START, END
 # ---------------------------------------------------------------------------
 
 ZEROID_BASE_URL = os.getenv("ZEROID_BASE_URL", "http://localhost:8899")
-ADMIN_API_KEY   = os.environ["ZEROID_ADMIN_API_KEY"]
+ADMIN_API_KEY = os.getenv("ZEROID_ADMIN_API_KEY")
+if not ADMIN_API_KEY:
+    raise ValueError("ZEROID_ADMIN_API_KEY environment variable is required.")
 
 client = ZeroIDClient(base_url=ZEROID_BASE_URL, api_key=ADMIN_API_KEY)
 
