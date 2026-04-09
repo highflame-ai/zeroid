@@ -309,10 +309,13 @@ if __name__ == "__main__":
 
     # Read the issuer directly from a token ZeroID already issued — authoritative,
     # no extra HTTP call, and avoids assumptions about how the base URL maps to the issuer.
-    issuer = jwt.decode(
+    decoded_token = jwt.decode(
         payroll_token.access_token,
         options={"verify_signature": False},
-    )["iss"]
+    )
+    issuer = decoded_token.get("iss")
+    if not issuer:
+        raise ValueError("The issued token is missing the required 'iss' claim.")
 
     # Delegate email:read to Email Agent (scope attenuation — no payroll:write)
     email_delegated = client.tokens.issue(
