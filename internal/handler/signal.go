@@ -48,7 +48,7 @@ func (a *API) registerSignalRoutes(api huma.API, router chi.Router) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "ingest-signal",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/signals/ingest",
+		Path:          "/signals/ingest",
 		Summary:       "Ingest a CAE signal",
 		Tags:          []string{"Signals"},
 		DefaultStatus: http.StatusCreated,
@@ -57,13 +57,13 @@ func (a *API) registerSignalRoutes(api huma.API, router chi.Router) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-signals",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/signals",
+		Path:        "/signals",
 		Summary:     "List recent signals",
 		Tags:        []string{"Signals"},
 	}, a.listSignalsOp)
 
 	// SSE streaming stays on raw chi — Huma doesn't support streaming responses.
-	router.Get("/api/v1/signals/stream", a.streamSignalsHandler)
+	router.Get("/signals/stream", a.streamSignalsHandler)
 }
 
 func (a *API) ingestSignalOp(ctx context.Context, input *IngestSignalInput) (*SignalOutput, error) {

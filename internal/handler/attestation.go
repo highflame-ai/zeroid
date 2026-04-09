@@ -50,7 +50,7 @@ func (a *API) registerAttestationRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "submit-attestation",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/attestation/submit",
+		Path:          "/attestation/submit",
 		Summary:       "Submit an attestation proof for an agent identity",
 		Tags:          []string{"Attestation"},
 		DefaultStatus: http.StatusCreated,
@@ -59,7 +59,7 @@ func (a *API) registerAttestationRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "verify-attestation",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/attestation/verify",
+		Path:        "/attestation/verify",
 		Summary:     "Verify an attestation and promote trust level",
 		Tags:        []string{"Attestation"},
 	}, a.verifyAttestationOp)
@@ -67,7 +67,7 @@ func (a *API) registerAttestationRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-attestation",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/attestation/{id}",
+		Path:        "/attestation/{id}",
 		Summary:     "Get an attestation record by ID",
 		Tags:        []string{"Attestation"},
 	}, a.getAttestationOp)

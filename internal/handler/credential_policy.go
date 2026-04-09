@@ -64,7 +64,7 @@ func (a *API) registerCredentialPolicyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "create-credential-policy",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/credential-policies",
+		Path:          "/credential-policies",
 		Summary:       "Create a credential policy",
 		Tags:          []string{"Credential Policies"},
 		DefaultStatus: http.StatusCreated,
@@ -73,7 +73,7 @@ func (a *API) registerCredentialPolicyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-credential-policy",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/credential-policies/{id}",
+		Path:        "/credential-policies/{id}",
 		Summary:     "Get a credential policy by ID",
 		Tags:        []string{"Credential Policies"},
 	}, a.getPolicyOp)
@@ -81,7 +81,7 @@ func (a *API) registerCredentialPolicyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-credential-policies",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/credential-policies",
+		Path:        "/credential-policies",
 		Summary:     "List credential policies for the current tenant",
 		Tags:        []string{"Credential Policies"},
 	}, a.listPoliciesOp)
@@ -89,7 +89,7 @@ func (a *API) registerCredentialPolicyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "update-credential-policy",
 		Method:      http.MethodPatch,
-		Path:        "/api/v1/credential-policies/{id}",
+		Path:        "/credential-policies/{id}",
 		Summary:     "Update a credential policy",
 		Tags:        []string{"Credential Policies"},
 	}, a.updatePolicyOp)
@@ -97,7 +97,7 @@ func (a *API) registerCredentialPolicyRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "delete-credential-policy",
 		Method:        http.MethodDelete,
-		Path:          "/api/v1/credential-policies/{id}",
+		Path:          "/credential-policies/{id}",
 		Summary:       "Delete a credential policy",
 		Tags:          []string{"Credential Policies"},
 		DefaultStatus: http.StatusNoContent,

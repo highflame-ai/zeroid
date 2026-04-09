@@ -93,7 +93,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "identity-schema",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/identities/schema",
+		Path:        "/identities/schema",
 		Summary:     "Get the identity type schema (valid types, sub-types, trust levels, statuses)",
 		Tags:        []string{"Identities"},
 	}, a.identitySchemaOp)
@@ -101,7 +101,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "create-identity",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/identities",
+		Path:          "/identities",
 		Summary:       "Register a new identity",
 		Tags:          []string{"Identities"},
 		DefaultStatus: http.StatusCreated,
@@ -110,7 +110,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-identity",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/identities/{id}",
+		Path:        "/identities/{id}",
 		Summary:     "Get an identity by ID",
 		Tags:        []string{"Identities"},
 	}, a.getIdentityOp)
@@ -118,7 +118,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-identities",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/identities",
+		Path:        "/identities",
 		Summary:     "List all identities for the current tenant",
 		Tags:        []string{"Identities"},
 	}, a.listIdentitiesOp)
@@ -126,7 +126,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "update-identity",
 		Method:      http.MethodPatch,
-		Path:        "/api/v1/identities/{id}",
+		Path:        "/identities/{id}",
 		Summary:     "Update mutable fields of an identity",
 		Tags:        []string{"Identities"},
 	}, a.updateIdentityOp)
@@ -134,7 +134,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "delete-identity",
 		Method:        http.MethodDelete,
-		Path:          "/api/v1/identities/{id}",
+		Path:          "/identities/{id}",
 		Summary:       "Deactivate an identity (soft delete)",
 		Tags:          []string{"Identities"},
 		DefaultStatus: http.StatusNoContent,

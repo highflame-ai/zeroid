@@ -14,6 +14,11 @@ import (
 	"github.com/knadh/koanf/v2"
 )
 
+// DefaultAdminPathPrefix is the default URL prefix for admin API routes.
+// Standalone ZeroID serves admin routes at /api/v1/*. Deployers can override
+// this via ServerConfig.AdminPathPrefix.
+const DefaultAdminPathPrefix = "/api/v1"
+
 // Config holds the complete ZeroID service configuration.
 type Config struct {
 	Server    ServerConfig    `koanf:"server"`
@@ -35,6 +40,25 @@ type ServerConfig struct {
 	WriteTimeout           string `koanf:"write_timeout"`
 	IdleTimeout            string `koanf:"idle_timeout"`
 	ShutdownTimeoutSeconds int    `koanf:"shutdown_timeout_seconds"`
+
+	// AdminPathPrefix is the URL prefix for admin API routes (identities, agents,
+	// credentials, etc.). Defaults to "/api/v1" for standalone deployments.
+	//
+	// Deployers that mount ZeroID under their own path structure can override this.
+	// For example, highflame-authn sets this to "" and mounts the router at "/v1/auth"
+	// so admin routes become /v1/auth/identities/schema instead of /api/v1/identities/schema.
+	//
+	// Set to empty string ("") to register admin routes at the router root.
+	AdminPathPrefix *string `koanf:"admin_path_prefix"`
+}
+
+// GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"
+// when not explicitly set.
+func (s *ServerConfig) GetAdminPathPrefix() string {
+	if s.AdminPathPrefix != nil {
+		return *s.AdminPathPrefix
+	}
+	return DefaultAdminPathPrefix
 }
 
 // DatabaseConfig holds PostgreSQL connection settings.
@@ -196,6 +220,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"telemetry.service_name":  "zeroid",
 		"telemetry.sampling_rate": 1.0,
 
+		// Admin path prefix
+		"server.admin_path_prefix": DefaultAdminPathPrefix,
+
 		// Logging
 		"logging.level": "info",
 	}
@@ -211,8 +238,9 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT": "server.port",
-		"ZEROID_ENV":  "server.env",
+		"ZEROID_PORT":              "server.port",
+		"ZEROID_ENV":               "server.env",
+		"ZEROID_ADMIN_PATH_PREFIX": "server.admin_path_prefix",
 
 		// Database
 		"ZEROID_DATABASE_URL": "database.url",
@@ -251,8 +279,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 	}
 
 	for envVar, configPath := range envMapping {
-		value := os.Getenv(envVar)
-		if value == "" {
+		value, ok := os.LookupEnv(envVar)
+		if !ok {
 			continue
 		}
 
