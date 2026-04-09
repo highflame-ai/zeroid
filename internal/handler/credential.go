@@ -71,7 +71,7 @@ func (a *API) registerCredentialRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "issue-credential",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/credentials/issue",
+		Path:          "/credentials/issue",
 		Summary:       "Issue a short-lived JWT credential for an agent identity",
 		Tags:          []string{"Credentials"},
 		DefaultStatus: http.StatusCreated,
@@ -80,7 +80,7 @@ func (a *API) registerCredentialRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-credential",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/credentials/{id}",
+		Path:        "/credentials/{id}",
 		Summary:     "Get a credential record by ID",
 		Tags:        []string{"Credentials"},
 	}, a.getCredentialOp)
@@ -88,7 +88,7 @@ func (a *API) registerCredentialRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "list-credentials",
 		Method:      http.MethodGet,
-		Path:        "/api/v1/credentials",
+		Path:        "/credentials",
 		Summary:     "List credentials for an identity",
 		Tags:        []string{"Credentials"},
 	}, a.listCredentialsOp)
@@ -96,7 +96,7 @@ func (a *API) registerCredentialRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "revoke-credential",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/credentials/{id}/revoke",
+		Path:        "/credentials/{id}/revoke",
 		Summary:     "Revoke a credential",
 		Tags:        []string{"Credentials"},
 	}, a.revokeCredentialOp)
@@ -104,7 +104,7 @@ func (a *API) registerCredentialRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID:   "rotate-credential",
 		Method:        http.MethodPost,
-		Path:          "/api/v1/credentials/{id}/rotate",
+		Path:          "/credentials/{id}/rotate",
 		Summary:       "Rotate a credential (revoke old + issue new)",
 		Tags:          []string{"Credentials"},
 		DefaultStatus: http.StatusCreated,

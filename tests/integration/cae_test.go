@@ -37,7 +37,7 @@ func TestCAECriticalSignalRevokesCredential(t *testing.T) {
 	identityID := identityIDFromToken(t, token)
 
 	// Platform injects a CRITICAL anomalous_behavior signal.
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": identityID,
 		"signal_type": "anomalous_behavior",
 		"severity":    "critical",
@@ -74,7 +74,7 @@ func TestCAEHighSignalRevokesCredential(t *testing.T) {
 	token := decode(t, resp)["access_token"].(string)
 	identityID := identityIDFromToken(t, token)
 
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": identityID,
 		"signal_type": "anomalous_behavior",
 		"severity":    "high",
@@ -109,7 +109,7 @@ func TestCAELowSignalDoesNotRevokeCredential(t *testing.T) {
 	token := decode(t, resp)["access_token"].(string)
 	identityID := identityIDFromToken(t, token)
 
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": identityID,
 		"signal_type": "anomalous_behavior",
 		"severity":    "low",
@@ -156,7 +156,7 @@ func TestCAESignalRevokesAllActiveCredentials(t *testing.T) {
 	assert.True(t, introspect(t, token2)["active"].(bool))
 
 	// Ingest critical signal once.
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": identityID,
 		"signal_type": "credential_change",
 		"severity":    "critical",
@@ -233,7 +233,7 @@ func TestCAESignalCascadesRevocationToChildren(t *testing.T) {
 
 	// ── Fire CRITICAL signal against the orchestrator identity ───────────────
 	orchIdentityID := identityIDFromToken(t, orchToken)
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": orchIdentityID,
 		"signal_type": "anomalous_behavior",
 		"severity":    "critical",
@@ -273,7 +273,7 @@ func TestSignalListEndpoint(t *testing.T) {
 	token := decode(t, resp)["access_token"].(string)
 	identityID := identityIDFromToken(t, token)
 
-	signalResp := post(t, "/api/v1/signals/ingest", map[string]any{
+	signalResp := post(t, adminPath("/signals/ingest"), map[string]any{
 		"identity_id": identityID,
 		"signal_type": "ip_change",
 		"severity":    "medium",
@@ -283,7 +283,7 @@ func TestSignalListEndpoint(t *testing.T) {
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
 	signalResp.Body.Close()
 
-	listResp := get(t, "/api/v1/signals", adminHeaders())
+	listResp := get(t, adminPath("/signals"), adminHeaders())
 	require.Equal(t, http.StatusOK, listResp.StatusCode)
 	body := decode(t, listResp)
 	signals, ok := body["signals"].([]any)

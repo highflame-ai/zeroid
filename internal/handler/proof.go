@@ -51,7 +51,7 @@ func (a *API) registerProofGenerateRoute(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "generate-proof",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/proof/generate",
+		Path:        "/proof/generate",
 		Summary:     "Generate a WIMSE Proof Token for an agent identity",
 		Tags:        []string{"Proof Tokens"},
 	}, a.generateProofOp)
@@ -62,7 +62,7 @@ func (a *API) registerProofVerifyRoute(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "verify-proof",
 		Method:      http.MethodPost,
-		Path:        "/api/v1/proof/verify",
+		Path:        "/proof/verify",
 		Summary:     "Verify a WIMSE Proof Token",
 		Tags:        []string{"Proof Tokens"},
 	}, a.verifyProofOp)

@@ -239,7 +239,7 @@ type Identity struct {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Identity Schema — describes valid types, sub-types, trust levels, and statuses.
-// Served by GET /api/v1/identities/schema so frontends stay in sync.
+// Served by GET {AdminPathPrefix}/identities/schema so frontends stay in sync.
 // ──────────────────────────────────────────────────────────────────────────────
 
 // SchemaOption describes a single valid enum value.
