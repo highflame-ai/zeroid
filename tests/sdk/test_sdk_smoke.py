@@ -142,7 +142,10 @@ def zeroid_url():
 
     # Teardown
     proc.terminate()
-    proc.wait(timeout=5)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
     pg.stop()
     shutil.rmtree(keys_dir, ignore_errors=True)
 
@@ -179,10 +182,6 @@ class TestHealth:
 
 
 class TestAgentLifecycle:
-    @pytest.fixture(autouse=True)
-    def _setup(self, client):
-        self._client = client
-
     def test_register_get_list_delete(self, client):
         # Register
         result = client.agents.register(
