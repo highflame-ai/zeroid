@@ -1,0 +1,95 @@
+name: SDK Integration Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: sdk-integration-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-sdk-smoke:
+    name: Python SDK smoke tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout zeroid
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.8"
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-1.25.8-${{ hashFiles('**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-1.25.8-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          pip install --quiet "testcontainers[postgres]" "PyJWT[cryptography]>=2.8" pytest
+          pip install --quiet highflame || pip install --quiet git+https://github.com/highflame-ai/highflame-sdk.git#subdirectory=python
+
+      - name: Run Python SDK smoke tests
+        run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
+
+  typescript-sdk-smoke:
+    name: TypeScript SDK smoke tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout zeroid
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.8"
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-1.25.8-${{ hashFiles('**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-1.25.8-
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install test dependencies
+        working-directory: tests/sdk
+        run: |
+          npm init -y
+          npm install --save-dev vitest typescript @testcontainers/postgresql
+          npm install @highflame/sdk
+
+      - name: Run TypeScript SDK smoke tests
+        working-directory: tests/sdk
+        run: npx vitest run sdk-smoke.test.ts --reporter=verbose
