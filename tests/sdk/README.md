@@ -21,7 +21,7 @@ No Docker Compose, no manual setup — works identically in CI and local dev.
 
 ```bash
 # Install deps
-pip install highflame testcontainers "PyJWT[cryptography]>=2.8" pytest
+pip install highflame testcontainers "PyJWT>=2.8" cryptography pytest
 
 # Run
 pytest tests/sdk/test_sdk_smoke.py -v
