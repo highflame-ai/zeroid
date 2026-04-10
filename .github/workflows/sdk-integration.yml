@@ -2,13 +2,24 @@ name: SDK Integration Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-    branches: [main]
-  workflow_dispatch:
+    types:
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - "main"
+  merge_group:
+    types:
+      - checks_requested
 
 concurrency:
-  group: sdk-integration-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
+
+env:
+  GO_VER: "1.25.8"
+  PYTHON_VER: "3.12"
+  NODE_VER: "22"
 
 jobs:
   python-sdk-smoke:
@@ -26,7 +37,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.8"
+          go-version: ${{ env.GO_VER }}
           cache: false
 
       - name: Cache Go modules
@@ -41,10 +52,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VER }}
 
       - name: Install test dependencies
-        run: |
+        shell: bash
+        run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT[cryptography]>=2.8" pytest
           pip install --quiet highflame
 
@@ -66,7 +78,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.25.8"
+          go-version: ${{ env.GO_VER }}
           cache: false
 
       - name: Cache Go modules
@@ -81,15 +93,18 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ env.NODE_VER }}
 
       - name: Install test dependencies
         working-directory: tests/sdk
-        run: |
+        shell: bash
+        run: |-
           npm init -y
           npm install --save-dev vitest typescript @testcontainers/postgresql
           npm install @highflame/sdk
 
       - name: Run TypeScript SDK smoke tests
         working-directory: tests/sdk
-        run: npx vitest run sdk-smoke.test.ts --reporter=verbose
+        shell: bash
+        run: |-
+         npx vitest run sdk-smoke.test.ts --reporter=verbose
