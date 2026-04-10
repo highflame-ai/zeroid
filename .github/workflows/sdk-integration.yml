@@ -46,7 +46,7 @@ jobs:
       - name: Install test dependencies
         run: |
           pip install --quiet "testcontainers[postgres]" "PyJWT[cryptography]>=2.8" pytest
-          pip install --quiet highflame || pip install --quiet git+https://github.com/highflame-ai/highflame-sdk.git#subdirectory=python
+          pip install --quiet highflame
 
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
