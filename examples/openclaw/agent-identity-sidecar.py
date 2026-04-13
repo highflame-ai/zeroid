@@ -6,8 +6,6 @@ On each poll cycle:
 
 1. openclaw.json (shared):
    - Sets baseUrl to the proxy for every provider in models.providers
-   - Adds a real-key header (env var marker) per provider so the proxy can
-     forward the actual API key upstream
    - Upserts agents.list[] entries with per-agent tool policy derived from
      JWT scope claims — enforced mid-session since tools-invoke-http calls
      loadConfig() fresh on every tool invocation
@@ -18,7 +16,6 @@ On each poll cycle:
 
 With both in place every provider request carries:
   Authorization: Bearer <identity-key>   (from auth-profiles.json)
-  X-Real-Api-Key: <actual-key>           (from openclaw.json header, env-resolved)
 
 The proxy (NGINX auth_request → ZeroID /oauth2/token/verify) verifies the
 identity key, strips both headers, re-injects the real Authorization header,
@@ -30,7 +27,6 @@ Usage:
 identity-map.json format:
     {
       "proxy_base_url": "https://your-proxy.example.com/v1",
-      "real_key_header": "X-Real-Api-Key",
       "provider_key_env_vars": {
         "xai": "XAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
@@ -185,7 +181,6 @@ def upsert_agent_tools(agent_list: list, agent_id: str, tools_cfg: dict) -> bool
 def patch_openclaw_config(
     config_path: Path,
     proxy_base_url,  # str | dict — see resolve_provider_proxy_url
-    real_key_header: str,
     provider_key_env_vars: dict,
     agent_tool_updates: dict[str, dict],
 ) -> bool:
@@ -223,11 +218,6 @@ def patch_openclaw_config(
         if not env_var:
             continue
         headers = provider_cfg.setdefault("headers", {})
-        if headers.get(real_key_header) != env_var:
-            headers[real_key_header] = env_var
-            changed = True
-            log.info("openclaw.json: set %s=%s for provider %s", real_key_header, env_var, provider_id)
-
     # --- per-agent tool policy patches ---
     if agent_tool_updates:
         agents_cfg = config.setdefault("agents", {})
@@ -648,7 +638,6 @@ def run_cycle(
     key_store: "AgentKeyStore | None" = None,
 ) -> None:
     proxy_base_url: str = cfg["proxy_base_url"]
-    real_key_header: str = cfg["real_key_header"]
     provider_key_env_vars: dict = cfg["provider_key_env_vars"]
     scope_tool_map: dict = cfg["scope_tool_map"]
     agent_map: dict = cfg["agents"]
@@ -729,7 +718,6 @@ def run_cycle(
     patch_openclaw_config(
         openclaw_config_path,
         proxy_base_url,
-        real_key_header,
         provider_key_env_vars,
         agent_tool_updates,
     )
@@ -752,9 +740,6 @@ def load_sidecar_config(config_path: Path) -> dict:
             raise ValueError("identity-map.json 'proxy_base_url' dict must have at least one entry")
     else:
         raise ValueError("identity-map.json 'proxy_base_url' must be a string or object")
-    real_key_header = raw.get("real_key_header", "").strip()
-    if not real_key_header:
-        raise ValueError("identity-map.json must have a non-empty 'real_key_header'")
     provider_key_env_vars = raw.get("provider_key_env_vars", {})
     if not isinstance(provider_key_env_vars, dict):
         raise ValueError("identity-map.json 'provider_key_env_vars' must be an object")
@@ -774,7 +759,6 @@ def load_sidecar_config(config_path: Path) -> dict:
 
     return {
         "proxy_base_url": proxy_base_url,
-        "real_key_header": real_key_header,
         "provider_key_env_vars": provider_key_env_vars,
         "scope_tool_map": scope_tool_map,
         "agents": agents,
