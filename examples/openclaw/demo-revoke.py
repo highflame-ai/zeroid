@@ -98,8 +98,15 @@ def main() -> None:
     print("\n-- Before revocation --")
     print(f"  active={agent_tok.active}")
 
-    identity_id = agent_tok.sub or ""
-    print(f"\nIngesting CAE session_revoked signal for identity {identity_id!r}...")
+    # sub is the WIMSE URI, not a UUID — resolve the identity UUID from the registry.
+    agent_cfg = cfg.get("agents", {}).get(agent_id) or cfg.get("agents", {}).get("*") or {}
+    external_id = (agent_cfg.get("external_id") if isinstance(agent_cfg, dict) else None) or agent_id
+    identities = client.identities.list()
+    identity = next((i for i in identities if i.external_id == external_id), None)
+    if identity is None:
+        sys.exit(f"identity not found for external_id={external_id!r} — has the sidecar registered it?")
+    identity_id = identity.id
+    print(f"\nIngesting CAE session_revoked signal for identity {identity_id!r} (external_id={external_id!r})...")
     signal = client.signals.ingest(
         signal_type="session_revoked",
         severity="critical",
