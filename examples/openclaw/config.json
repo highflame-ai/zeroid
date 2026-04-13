@@ -4,7 +4,6 @@
       "anthropic": "http://127.0.0.1:8081/anthropic/v1",
       "*": "http://127.0.0.1:8081/{provider}/"
     },
-    "real_key_header": "X-Real-Api-Key",                                                                                                                                                 
                                                                                                                                                                                          
     "provider_key_env_vars": {                                                                                                                                                           
       "anthropic": "ANTHROPIC_API_KEY",                                                                                                                                                  
