@@ -1,0 +1,93 @@
+# OpenClaw + ZeroID demo stack.
+#
+# Services:
+#   postgres  — ZeroID backing store
+#   zeroid    — identity / token server (port 8899)
+#   nginx     — forward-auth proxy; verifies ZeroID JWTs and swaps in
+#               real provider API keys before forwarding to upstream LLMs (port 8081)
+#
+# The agent-identity-sidecar.py runs on the host (it needs access to
+# OpenClaw's ~/.openclaw state dir).  Point it at ZeroID on localhost:8899.
+#
+# Quick start:
+#   1. cd ../../ && make setup-keys          # generate signing keys (one-time)
+#   2. docker compose up -d
+#   3. python agent-identity-sidecar.py --config config.json
+#   4. Start OpenClaw normally — it will route through the nginx proxy on :8081
+
+networks:
+  openclaw-net:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:17-alpine3.22
+    container_name: openclaw-db
+    restart: on-failure
+    environment:
+      POSTGRES_USER: zeroid
+      POSTGRES_PASSWORD: zeroid
+      POSTGRES_DB: zeroid
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - openclaw-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeroid -d zeroid"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  zeroid:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    container_name: openclaw-zeroid
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZEROID_DATABASE_URL: "postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable"
+      ZEROID_PRIVATE_KEY_PATH: "/keys/private.pem"
+      ZEROID_PUBLIC_KEY_PATH: "/keys/public.pem"
+      ZEROID_RSA_PRIVATE_KEY_PATH: "/keys/rsa_private.pem"
+      ZEROID_RSA_PUBLIC_KEY_PATH: "/keys/rsa_public.pem"
+    volumes:
+      - ../../keys:/keys:ro
+      - ../../zeroid.yaml:/etc/zeroid/zeroid.yaml:ro
+    ports:
+      - "8899:8899"
+    networks:
+      - openclaw-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8899/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    command: ["/app/zeroid", "-config", "/etc/zeroid/zeroid.yaml"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: openclaw-nginx
+    restart: on-failure
+    depends_on:
+      zeroid:
+        condition: service_healthy
+    environment:
+      # nginx:alpine resolves *.template files in /etc/nginx/templates/ via envsubst
+      ZEROID_HOST: zeroid:8899
+    volumes:
+      - ./nginx/nginx-proxy.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "8081:8081"
+    networks:
+      - openclaw-net
+    extra_hosts:
+      # Allows nginx to reach upstream LLM APIs from inside the container
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:
