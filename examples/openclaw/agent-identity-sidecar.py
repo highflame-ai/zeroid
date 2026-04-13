@@ -408,6 +408,11 @@ class AgentKeyStore:
         self._store[_ORCH_KEY_FIELD] = key
         self._dirty = True
 
+    def clear_orchestrator_key(self) -> None:
+        if _ORCH_KEY_FIELD in self._store:
+            del self._store[_ORCH_KEY_FIELD]
+            self._dirty = True
+
     def get_or_create(self, agent_id: str) -> tuple[str, str]:
         """Return (private_pem, public_pem), generating a new P-256 key if absent."""
         if agent_id in self._store:
@@ -876,18 +881,43 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
 
 
 def _build_orch_client(cfg: dict, key_store: "AgentKeyStore"):
-    """Resolve the orchestrator API key then construct a ZeroIDClient."""
+    """Resolve the orchestrator API key then construct a ZeroIDClient.
+
+    If the stored key is invalid (revoked or expired), clears it from the key
+    store and re-registers so the next call to ensure_orchestrator_ready issues
+    a fresh key.
+    """
     try:
         from highflame.zeroid import ZeroIDClient
     except ImportError as e:
         raise SystemExit("dynamic mode requires the highflame SDK: pip install highflame") from e
+
+    def _make_client(api_key: str) -> "ZeroIDClient":
+        return ZeroIDClient(
+            base_url=cfg["zeroid_url"],
+            api_key=api_key,
+            account_id=cfg["admin_account_id"] or None,
+            project_id=cfg["admin_project_id"] or None,
+        )
+
     api_key = ensure_orchestrator_ready(cfg, key_store)
-    return ZeroIDClient(
-        base_url=cfg["zeroid_url"],
-        api_key=api_key,
-        account_id=cfg["admin_account_id"] or None,
-        project_id=cfg["admin_project_id"] or None,
-    )
+    client = _make_client(api_key)
+
+    # Validate the key with a cheap authenticated call. If it fails with an
+    # auth error, the stored key is stale — clear it and re-register.
+    try:
+        client.identities.list()
+    except Exception as e:
+        if "401" in str(e) or "403" in str(e) or getattr(e, "status_code", None) in (401, 403):
+            log.warning("stored orchestrator API key is invalid (%s) — re-registering", e)
+            key_store.clear_orchestrator_key()
+            key_store.save_if_dirty()
+            api_key = ensure_orchestrator_ready(cfg, key_store)
+            client = _make_client(api_key)
+        else:
+            log.warning("orchestrator key validation call failed (non-auth): %s", e)
+
+    return client
 
 
 def _ensure_credential_policy(client) -> None:
