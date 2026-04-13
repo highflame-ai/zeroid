@@ -126,27 +126,22 @@ def resolve_tool_config(payload: dict, scope_tool_map: dict) -> dict | None:
     """
     Map JWT scope claims to an AgentToolsConfig dict.
     Handles both ZeroID JWTs ("scopes": [...] array) and static JWTs ("scope": "..." string).
-    Accumulates allow lists across all matching scopes so an agent with multiple
-    scopes (e.g. ["read", "write"]) receives the union of their allowed tools.
+    Returns the first matching scope_tool_map entry as-is, supporting any combination of
+    "profile", "allow", and "deny" keys that openclaw accepts in agents.list[].tools.
     Returns None if no scopes match.
     """
     if not scope_tool_map:
         return None
-    # ZeroID JWTs store scopes as an array under "scopes" (credential.go:210).
-    # Static/RFC 7662 JWTs use a space-delimited string under "scope".
     raw = payload.get("scopes")
     if isinstance(raw, list):
         scopes = [s for s in raw if isinstance(s, str)]
     else:
         scopes = str(payload.get("scope", "")).split()
-    allowed: list[str] = []
     for scope in scopes:
         entry = scope_tool_map.get(scope)
-        if entry and isinstance(entry.get("allow"), list):
-            for tool in entry["allow"]:
-                if tool not in allowed:
-                    allowed.append(tool)
-    return {"allow": allowed} if allowed else None
+        if entry and isinstance(entry, dict):
+            return dict(entry)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +150,19 @@ def resolve_tool_config(payload: dict, scope_tool_map: dict) -> dict | None:
 
 def resolve_provider_env_var(provider_id: str, provider_key_env_vars: dict) -> str | None:
     return provider_key_env_vars.get(provider_id) or provider_key_env_vars.get("*") or None
+
+
+def resolve_provider_proxy_url(provider_id: str, proxy_base_url) -> str:
+    """Resolve the proxy base URL for a provider.
+
+    proxy_base_url may be a plain string (used for all providers) or a dict
+    mapping provider IDs to URLs, with an optional "*" fallback.  A "{provider}"
+    placeholder in the template is replaced with the provider ID.
+    """
+    if isinstance(proxy_base_url, dict):
+        tpl = proxy_base_url.get(provider_id) or proxy_base_url.get("*", "")
+        return tpl.replace("{provider}", provider_id)
+    return proxy_base_url  # backward-compatible string
 
 
 def upsert_agent_tools(agent_list: list, agent_id: str, tools_cfg: dict) -> bool:
@@ -176,7 +184,7 @@ def upsert_agent_tools(agent_list: list, agent_id: str, tools_cfg: dict) -> bool
 
 def patch_openclaw_config(
     config_path: Path,
-    proxy_base_url: str,
+    proxy_base_url,  # str | dict — see resolve_provider_proxy_url
     real_key_header: str,
     provider_key_env_vars: dict,
     agent_tool_updates: dict[str, dict],
@@ -205,10 +213,11 @@ def patch_openclaw_config(
     for provider_id, provider_cfg in providers.items():
         if not isinstance(provider_cfg, dict):
             continue
-        if provider_cfg.get("baseUrl") != proxy_base_url:
-            provider_cfg["baseUrl"] = proxy_base_url
+        provider_proxy_url = resolve_provider_proxy_url(provider_id, proxy_base_url)
+        if provider_cfg.get("baseUrl") != provider_proxy_url:
+            provider_cfg["baseUrl"] = provider_proxy_url
             changed = True
-            log.info("openclaw.json: set baseUrl for provider %s", provider_id)
+            log.info("openclaw.json: set baseUrl for provider %s → %s", provider_id, provider_proxy_url)
 
         env_var = resolve_provider_env_var(provider_id, provider_key_env_vars)
         if not env_var:
@@ -728,9 +737,16 @@ def run_cycle(
 def load_sidecar_config(config_path: Path) -> dict:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
 
-    proxy_base_url = raw.get("proxy_base_url", "").strip()
-    if not proxy_base_url:
-        raise ValueError("identity-map.json must have a non-empty 'proxy_base_url'")
+    proxy_base_url = raw.get("proxy_base_url")
+    if isinstance(proxy_base_url, str):
+        proxy_base_url = proxy_base_url.strip()
+        if not proxy_base_url:
+            raise ValueError("identity-map.json 'proxy_base_url' must be non-empty")
+    elif isinstance(proxy_base_url, dict):
+        if not proxy_base_url:
+            raise ValueError("identity-map.json 'proxy_base_url' dict must have at least one entry")
+    else:
+        raise ValueError("identity-map.json 'proxy_base_url' must be a string or object")
     real_key_header = raw.get("real_key_header", "").strip()
     if not real_key_header:
         raise ValueError("identity-map.json must have a non-empty 'real_key_header'")
@@ -874,6 +890,28 @@ def _build_orch_client(cfg: dict, key_store: "AgentKeyStore"):
     )
 
 
+def _ensure_credential_policy(client) -> None:
+    """
+    Create the openclaw credential policy if it doesn't already exist.
+    max_delegation_depth=2 allows orchestrator → main agent → sub-agent but
+    prevents sub-agents from spawning further delegates.
+    """
+    try:
+        from highflame.zeroid.errors import ZeroIDError
+        client.credential_policies.create(
+            name="openclaw-policy",
+            max_ttl_seconds=3600,
+            required_trust_level="first_party",
+            max_delegation_depth=2,
+        )
+        log.info("created credential policy 'openclaw-policy'")
+    except Exception as e:
+        if "409" in str(e) or getattr(e, "code", "") in ("conflict", "already_exists"):
+            log.debug("credential policy 'openclaw-policy' already exists")
+        else:
+            log.warning("could not create credential policy: %s", e)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -909,13 +947,9 @@ def main() -> None:
     # ensure_orchestrator_ready() can read/write the persisted API key.
     key_store = AgentKeyStore(Path(cfg["agent_key_store"]).expanduser()) if has_dynamic else None
     orch_client = _build_orch_client(cfg, key_store) if has_dynamic else None
-    
-    policy = orch_client.credential_policies.create(
-         name="openclaw-policy",
-         max_ttl_seconds=300,           # tokens expire hourly — no long-lived access
-         required_trust_level="first_party",
-         max_delegation_depth=2,         # this agent cannot spawn sub-agents
-     )
+
+    if orch_client is not None:
+        _ensure_credential_policy(orch_client)
     while True:
         try:
             # Re-read config each cycle so agent/scope changes take effect without restart.

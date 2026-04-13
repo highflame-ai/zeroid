@@ -1,5 +1,9 @@
 {                                                                                                                                                                                      
-    "proxy_base_url": "http://127.0.0.1:8081/",
+    "proxy_base_url": {
+      "xai": "http://127.0.0.1:8081/xai/",
+      "anthropic": "http://127.0.0.1:8081/anthropic/",
+      "*": "http://127.0.0.1:8081/{provider}/"
+    },
     "real_key_header": "X-Real-Api-Key",                                                                                                                                                 
                                                                                                                                                                                          
     "provider_key_env_vars": {                                                                                                                                                           
@@ -15,7 +19,7 @@
       "tools:full":      { "profile": "full" }                                                                                                                                           
     },                                                                                                                                                                                 
                                                                                                                                                                                          
-    "zeroid_url": "http://192.168.48.57:8899",
+    "zeroid_url": "http://127.0.0.1:8899",
     "admin_account_id": "default",
     "admin_user_id": "justin",
     "admin_project_id": "default",
