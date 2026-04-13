@@ -1,7 +1,7 @@
 {                                                                                                                                                                                      
     "proxy_base_url": {
-      "xai": "http://127.0.0.1:8081/xai/",
-      "anthropic": "http://127.0.0.1:8081/anthropic/",
+      "xai": "http://127.0.0.1:8081/xai/v1",
+      "anthropic": "http://127.0.0.1:8081/anthropic/v1",
       "*": "http://127.0.0.1:8081/{provider}/"
     },
     "real_key_header": "X-Real-Api-Key",                                                                                                                                                 
@@ -21,7 +21,7 @@
                                                                                                                                                                                          
     "zeroid_url": "http://127.0.0.1:8899",
     "admin_account_id": "default",
-    "admin_user_id": "justin",
+    "admin_user_id": "admin",
     "admin_project_id": "default",
                                                                                                                                                                                          
     "agent_key_store": "~/.openclaw/sidecar-agent-keys.json",                                                                                                                            
