@@ -10,4 +10,6 @@
 
 # What needs more work
 1. Ideally replace the demo-revoke.py script with CLI
-2. We could ideally return a valid message 
+2. We ideally return a valid message so show why the message is blocked 
+3. Add more fine-grain tool mapping to show scope delegation. Potentially work with the clawhub skill to have the orchestrator delegate scopes as needed.
+4. The first message is usually blocked with 401, I see it in ZeroID so likely it is Openclaw using cached tokens and not updating until it fails.
