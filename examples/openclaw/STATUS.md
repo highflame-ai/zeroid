@@ -9,5 +9,5 @@
 8. Nginx config can handle multiple providers
 
 # What needs more work
-3. Openclaw not passing in env variables cleanly in headers only the env variable name. Currently only working when provider bearer token hard coded in nginx config.
-4. Ideally replace the demo-revoke.py script with CLI
+1. Ideally replace the demo-revoke.py script with CLI
+2. We could ideally return a valid message 

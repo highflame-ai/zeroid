@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Demo: instant agent revocation via ZeroID.
+Demo: instant agent revocation via ZeroID CAE signal.
 
 Reads the live token from the agent's auth-profiles.json (written by the
-sidecar), shows the delegation chain, revokes it, then confirms active=false.
+sidecar), shows the delegation chain, then ingests a critical CAE
+session_revoked signal.  ZeroID auto-revokes all active credentials for the
+identity on high/critical signals, so the next proxy request fails immediately.
 
 Usage:
     python scripts/demo-revoke.py --config identity-map.json --agent <agent-id>
@@ -96,17 +98,25 @@ def main() -> None:
     print("\n-- Before revocation --")
     print(f"  active={agent_tok.active}")
 
-    print(f"\nRevoking live token (jti={agent_tok.jti!r})...")
-    client.tokens.revoke(live_token)
+    identity_id = agent_tok.sub or ""
+    print(f"\nIngesting CAE session_revoked signal for identity {identity_id!r}...")
+    signal = client.signals.ingest(
+        signal_type="session_revoked",
+        severity="critical",
+        source="demo-revoke",
+        identity_id=identity_id,
+        payload={"reason": args.reason, "agent_id": agent_id},
+    )
+    print(f"  signal_id={signal.id!r}  type={signal.signal_type!r}  severity={signal.severity!r}")
 
-    print("\n-- After revocation --")
+    print("\n-- After CAE signal --")
     after = client.tokens.introspect(live_token)
     print(f"  active={after.active}")
 
     if not after.active:
-        print("\nInstant revocation confirmed.")
+        print("\nInstant revocation confirmed via CAE signal.")
     else:
-        print("\nToken still active — check ZeroID CAE propagation.")
+        print("\nToken still active — ZeroID may need a moment to propagate.")
 
 
 if __name__ == "__main__":

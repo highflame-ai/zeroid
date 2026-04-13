@@ -77,11 +77,15 @@ services:
       zeroid:
         condition: service_healthy
     volumes:
-      - ./nginx/nginx-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      #- ./nginx/nginx-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - "./templates:/etc/nginx/templates/"
     ports:
       - "8081:8081"
     networks:
       - openclaw-net
+    environment:
+      - XAI_API_KEY="Bearer ${XAI_API_KEY}"
+      - ANTHROPIC_API_KEY="Bearer ${ANTHROPIC_API_KEY}"
     extra_hosts:
       # Allows nginx to reach upstream LLM APIs from inside the container
       - "host.docker.internal:host-gateway"

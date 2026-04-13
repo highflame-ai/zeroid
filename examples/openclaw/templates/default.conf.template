@@ -2,13 +2,8 @@ server {
     # Anyone deploying this should use ssl on to avoid bearer tokens in plaintext
     listen 8081;
     server_name _;
-
-    error_page 401 = @handle_revocation;
-    location @handle_revocation {
-        default_type application/json;
-        # Return 403 instead of 401 so openclaw fails cleanly (401 looks messier in the UI)
-        return 403 '{"error": {"message": "ZeroID: Identity Revoked. Access denied by security policy.", "type": "access_denied", "code": "revoked_identity"}}';
-    }
+    client_body_buffer_size 10M;
+    client_max_body_size 50M;
 
     # --- Providers ---
     # Add a location block here for each LLM provider.
@@ -16,12 +11,10 @@ server {
 
     location /xai/ {
         auth_request     /internal/zeroid-verify;
-        auth_request_set $real_api_key $http_x_real_api_key;
 
         rewrite ^/xai/(.*)$ /$1 break;
 
-        proxy_set_header  Authorization  "Bearer $real_api_key";
-        proxy_set_header  X-Real-Api-Key "";
+        proxy_set_header  Authorization  ${XAI_API_KEY};
         proxy_set_header  Host           $proxy_host;
         proxy_ssl_server_name on;
         # Disable response buffering so SSE / streaming responses flow through immediately
@@ -35,8 +28,7 @@ server {
 
         rewrite ^/anthropic/(.*)$ /$1 break;
 
-        proxy_set_header  Authorization  "Bearer $real_api_key";
-        proxy_set_header  X-Real-Api-Key "";
+        proxy_set_header  Authorization  ${ANTHROPIC_API_KEY};
         proxy_set_header  Host           $proxy_host;
         proxy_ssl_server_name on;
         proxy_buffering off;
