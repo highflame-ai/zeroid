@@ -144,7 +144,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.
-		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
+		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID, "")
 		return nil, fmt.Errorf("failed to create API key: %w", err)
 	}
 
@@ -247,7 +247,7 @@ func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID
 	}
 
 	// Hard delete — cascades to api_keys, credentials, etc. via FK ON DELETE CASCADE.
-	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID); err != nil {
+	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID, ""); err != nil {
 		return nil, err
 	}
 
