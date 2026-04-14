@@ -85,7 +85,6 @@ def main() -> None:
         account_id=cfg.get("admin_account_id") or None,
         project_id=cfg.get("admin_project_id") or None,
     )
-    print(client.identities.list())
     # Show the delegation chain from the live token.
     print("\n-- Delegation chain --")
     orch_token = client.tokens.issue_api_key(orch_key)
