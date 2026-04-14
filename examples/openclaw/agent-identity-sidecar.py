@@ -209,7 +209,7 @@ def patch_openclaw_config(
         if not isinstance(provider_cfg, dict):
             continue
         provider_proxy_url = resolve_provider_proxy_url(provider_id, proxy_base_url)
-        if provider_cfg.get("baseUrl") != provider_proxy_url:
+        if provider_cfg.get("baseUrl") != provider_proxy_url and provider_proxy_url:
             provider_cfg["baseUrl"] = provider_proxy_url
             changed = True
             log.info("openclaw.json: set baseUrl for provider %s → %s", provider_id, provider_proxy_url)
