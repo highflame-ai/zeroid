@@ -214,10 +214,7 @@ def patch_openclaw_config(
             changed = True
             log.info("openclaw.json: set baseUrl for provider %s → %s", provider_id, provider_proxy_url)
 
-        env_var = resolve_provider_env_var(provider_id, provider_key_env_vars)
-        if not env_var:
-            continue
-        headers = provider_cfg.setdefault("headers", {})
+        # --- per-agent tool policy patches ---
     # --- per-agent tool policy patches ---
     if agent_tool_updates:
         agents_cfg = config.setdefault("agents", {})
