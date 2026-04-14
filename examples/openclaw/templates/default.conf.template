@@ -1,0 +1,86 @@
+# Upstream pools — persistent connections avoid per-request TCP/TLS setup.
+upstream zeroid_backend {
+    server zeroid:8899;
+    keepalive 16;
+}
+
+upstream xai_backend {
+    server api.x.ai:443;
+    keepalive 8;
+}
+
+upstream anthropic_backend {
+    server api.anthropic.com:443;
+    keepalive 8;
+}
+
+server {
+    # Anyone deploying this should use ssl on to avoid bearer tokens in plaintext
+    listen 8081;
+    server_name _;
+    client_body_buffer_size 10M;
+    client_max_body_size 50M;
+
+    error_page 401 = @handle_revocation;
+    location @handle_revocation {
+        # Return a valid SSE stream so the OpenAI SDK delivers the message as assistant text.
+        # A JSON error body triggers OpenClaw's failover/rotation logic which silently swallows it.
+        default_type text/event-stream;
+        proxy_hide_header Www-Authenticate;
+        add_header Cache-Control no-cache;
+        return 200 "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"x\",\"output_index\":0,\"content_index\":0,\"delta\":\"[ZeroID] Identity revoked \u2014 access denied by security policy.\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"zeroid-revoked\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"zeroid\",\"output\":[{\"type\":\"message\",\"id\":\"x\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"[ZeroID] Identity revoked \u2014 access denied by security policy.\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\ndata: [DONE]\n\n";
+    }
+
+    # --- Providers ---
+    # Add a location block here for each LLM provider.
+    # The path prefix (e.g. /xai/) must match proxy_base_url in config.json.
+
+    location /xai/ {
+        auth_request     /internal/zeroid-verify;
+
+        rewrite ^/xai/(.*)$ /$1 break;
+
+        proxy_http_version 1.1;
+        proxy_set_header   Connection        "";
+        proxy_set_header   Authorization     ${XAI_API_KEY};
+        proxy_set_header   Host              api.x.ai;
+        proxy_ssl_server_name on;
+        proxy_ssl_name        api.x.ai;
+        proxy_buffering off;
+        proxy_pass https://xai_backend;
+    }
+
+    location /anthropic/ {
+        auth_request     /internal/zeroid-verify;
+        auth_request_set $real_api_key $upstream_http_x_real_api_key;
+
+        rewrite ^/anthropic/(.*)$ /$1 break;
+
+        proxy_http_version 1.1;
+        proxy_set_header   Connection        "";
+        proxy_set_header   Authorization     "Bearer $real_api_key";
+        proxy_set_header   X-Real-Api-Key    "";
+        proxy_set_header   Host              api.anthropic.com;
+        proxy_ssl_server_name on;
+        proxy_ssl_name        api.anthropic.com;
+        proxy_buffering off;
+        proxy_pass https://anthropic_backend;
+    }
+
+    # Catch-all: unknown provider prefix
+    location / {
+        default_type application/json;
+        return 400 '{"error": {"message": "Unknown provider prefix. Add a location block to nginx config.", "type": "configuration_error"}}';
+    }
+
+    location = /internal/zeroid-verify {
+        internal;
+
+        proxy_pass              http://zeroid_backend/oauth2/token/verify;
+        proxy_http_version      1.1;
+        proxy_set_header        Connection    "";
+        proxy_pass_request_body off;
+        proxy_set_header        Content-Length "";
+        proxy_set_header        Authorization $http_authorization;
+    }
+}
