@@ -30,22 +30,23 @@ func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, api
 
 // RegisterAgentRequest holds the parameters for registering a new identity.
 type RegisterAgentRequest struct {
-	AccountID    string
-	ProjectID    string
-	Name         string
-	ExternalID   string
-	IdentityType domain.IdentityType // Defaults to "agent" if empty.
-	SubType      domain.SubType
-	TrustLevel   domain.TrustLevel
-	Framework    string
-	Version      string
-	Publisher    string
-	Description  string
-	Capabilities json.RawMessage
-	Labels       json.RawMessage
-	Metadata     json.RawMessage
-	CreatedBy    string
-	PublicKeyPEM string
+	AccountID          string
+	ProjectID          string
+	Name               string
+	ExternalID         string
+	IdentityType       domain.IdentityType // Defaults to "agent" if empty.
+	SubType            domain.SubType
+	TrustLevel         domain.TrustLevel
+	Framework          string
+	Version            string
+	Publisher          string
+	Description        string
+	Capabilities       json.RawMessage
+	Labels             json.RawMessage
+	Metadata           json.RawMessage
+	CreatedBy          string
+	PublicKeyPEM       string
+	CredentialPolicyID string // Optional — if empty, the tenant's default policy is assigned to the auto-created API key.
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -136,11 +137,12 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 
 	// 2. Create linked API key.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
-		AccountID:  req.AccountID,
-		ProjectID:  req.ProjectID,
-		CreatedBy:  req.CreatedBy,
-		Name:       fmt.Sprintf("Agent: %s", req.Name),
-		IdentityID: identity.ID,
+		AccountID:          req.AccountID,
+		ProjectID:          req.ProjectID,
+		CreatedBy:          req.CreatedBy,
+		Name:               fmt.Sprintf("Agent: %s", req.Name),
+		IdentityID:         identity.ID,
+		CredentialPolicyID: req.CredentialPolicyID,
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.

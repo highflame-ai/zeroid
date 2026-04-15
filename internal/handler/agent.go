@@ -51,8 +51,9 @@ type RegisterAgentInput struct {
 		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		CreatedBy    string          `json:"created_by,omitempty" doc:"User ID of the creator"`
-		PublicKeyPEM string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
+		CreatedBy          string          `json:"created_by,omitempty" doc:"User ID of the creator"`
+		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy for the auto-created API key (default: tenant default policy)"`
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
@@ -198,22 +199,23 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 	}
 
 	resp, err := a.agentSvc.RegisterAgent(ctx, service.RegisterAgentRequest{
-		AccountID:    tenant.AccountID,
-		ProjectID:    tenant.ProjectID,
-		Name:         input.Body.Name,
-		ExternalID:   input.Body.ExternalID,
-		IdentityType: domain.IdentityType(input.Body.IdentityType),
-		SubType:      domain.SubType(input.Body.SubType),
-		TrustLevel:   domain.TrustLevel(input.Body.TrustLevel),
-		Framework:    input.Body.Framework,
-		Version:      input.Body.Version,
-		Publisher:    input.Body.Publisher,
-		Description:  input.Body.Description,
-		Capabilities: input.Body.Capabilities,
-		Labels:       input.Body.Labels,
-		Metadata:     input.Body.Metadata,
-		CreatedBy:    createdBy,
-		PublicKeyPEM: input.Body.PublicKeyPEM,
+		AccountID:          tenant.AccountID,
+		ProjectID:          tenant.ProjectID,
+		Name:               input.Body.Name,
+		ExternalID:         input.Body.ExternalID,
+		IdentityType:       domain.IdentityType(input.Body.IdentityType),
+		SubType:            domain.SubType(input.Body.SubType),
+		TrustLevel:         domain.TrustLevel(input.Body.TrustLevel),
+		Framework:          input.Body.Framework,
+		Version:            input.Body.Version,
+		Publisher:          input.Body.Publisher,
+		Description:        input.Body.Description,
+		Capabilities:       input.Body.Capabilities,
+		Labels:             input.Body.Labels,
+		Metadata:           input.Body.Metadata,
+		CreatedBy:          createdBy,
+		PublicKeyPEM:       input.Body.PublicKeyPEM,
+		CredentialPolicyID: input.Body.CredentialPolicyID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
