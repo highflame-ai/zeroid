@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -19,18 +20,19 @@ import (
 )
 
 // TestRefreshTokenConcurrentRotation closes the RFC 6749 §6 rotation race:
-// two concurrent POSTs with the same refresh token must not both issue a
-// successor. Exactly one request wins and receives a new token; the rest are
-// rejected with invalid_grant.
+// concurrent POSTs with the same refresh token must not both issue a successor.
+// Exactly one request wins; the rest are rejected. Additionally, the winner's
+// new refresh token MUST survive the race — late-arriving sibling requests
+// that see the original as "revoked" must not trip family revocation against
+// the fresh successor (handled via the reuse grace window).
 //
 // Before the fix, the read-check-revoke sequence ran under READ COMMITTED
-// (despite the comment claiming "serializable"), so both rotations passed the
+// (despite a comment claiming "serializable"), so both rotations passed the
 // active check before either committed the revocation — both then minted new
 // tokens, bypassing reuse detection entirely.
 func TestRefreshTokenConcurrentRotation(t *testing.T) {
 	const concurrency = 10
 
-	// Acquire a single refresh token via the authorization_code flow.
 	verifier, challenge := buildPKCEPair(t)
 	code := buildAuthCode(t, testMCPClientID, "user-race-001", testRedirectURI, challenge, []string{"data:read"})
 
@@ -46,9 +48,11 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 	require.NotEmpty(t, refreshToken)
 
 	var (
-		successes int32
-		failures  int32
-		wg        sync.WaitGroup
+		successes    int32
+		failures     int32
+		winnerTokMu  sync.Mutex
+		winnerTok    string
+		wg           sync.WaitGroup
 	)
 	start := make(chan struct{})
 
@@ -57,33 +61,50 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			status := rotateRaw(t, refreshToken)
+			status, body := rotateRaw(t, refreshToken)
 			if status == http.StatusOK {
 				atomic.AddInt32(&successes, 1)
+				// Capture the winner's successor token for the post-race assertion.
+				var parsed map[string]any
+				if err := json.Unmarshal(body, &parsed); err == nil {
+					if rt, ok := parsed["refresh_token"].(string); ok {
+						winnerTokMu.Lock()
+						winnerTok = rt
+						winnerTokMu.Unlock()
+					}
+				}
 			} else {
 				atomic.AddInt32(&failures, 1)
 			}
 		}()
 	}
 
-	close(start) // release all goroutines at once
+	close(start)
 	wg.Wait()
 
-	// Security-critical invariant: exactly one successor minted.
+	// Primary invariant: exactly one successor minted.
 	assert.Equal(t, int32(1), atomic.LoadInt32(&successes),
 		"exactly one concurrent rotation should succeed")
 	assert.Equal(t, int32(concurrency-1), atomic.LoadInt32(&failures),
 		"all other concurrent rotations should be rejected")
+
+	// Secondary invariant (grace window): the winner's new refresh token must
+	// survive — losing siblings that saw the original as revoked must not have
+	// tripped family revocation against it.
+	require.NotEmpty(t, winnerTok, "should have captured the winner's refresh_token")
+	status, _ := rotateRaw(t, winnerTok)
+	assert.Equal(t, http.StatusOK, status,
+		"winner's successor token must remain usable after the race (grace window protects it)")
 }
 
-// TestRefreshTokenReuseRevokesFamily verifies family revocation cascades when
-// reuse is detected: replaying an already-rotated refresh token must invalidate
-// not only the replayed token but every successor in the family (rt2 and
-// beyond). Complements TestRefreshTokenRotation, which only checks that the
-// replayed token itself is rejected.
-func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
+// TestRefreshTokenReuseWithinGraceWindowProtectsFamily verifies that a replay
+// arriving within the grace window returns a benign "already rotated" error
+// without nuking the family. Simulates a legitimate concurrent-retry scenario
+// (multi-tab, network retry) where the second request loses but the session —
+// represented by the freshly issued successor — must survive.
+func TestRefreshTokenReuseWithinGraceWindowProtectsFamily(t *testing.T) {
 	verifier, challenge := buildPKCEPair(t)
-	code := buildAuthCode(t, testMCPClientID, "user-reuse-001", testRedirectURI, challenge, []string{"data:read"})
+	code := buildAuthCode(t, testMCPClientID, "user-grace-within", testRedirectURI, challenge, []string{"data:read"})
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "authorization_code",
@@ -105,7 +126,7 @@ func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
 	rt2 := decode(t, resp)["refresh_token"].(string)
 	require.NotEmpty(t, rt2)
 
-	// Replay rt1 — already revoked → reuse detected → family revoked.
+	// Replay rt1 immediately — within grace window.
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": rt1,
@@ -114,14 +135,76 @@ func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
 
-	// rt2 must also be dead now — the family was revoked as a unit.
+	// rt2 MUST still be alive — grace window suppresses family revocation.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt2,
+		"client_id":     testMCPClientID,
+	}, nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"rt2 must remain usable: replay within grace window is treated as concurrent retry, not reuse")
+}
+
+// TestRefreshTokenReuseOutsideGraceWindowRevokesFamily verifies that a replay
+// arriving after the grace window fires the full RFC 6749 §10.4 reuse-detection
+// response: the entire family is revoked.
+//
+// Rather than sleeping for the grace window duration, the test backdates the
+// revoked_at column directly via testDB to simulate a delayed replay.
+func TestRefreshTokenReuseOutsideGraceWindowRevokesFamily(t *testing.T) {
+	ctx := context.Background()
+
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, "user-grace-outside", testRedirectURI, challenge, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rt1 := decode(t, resp)["refresh_token"].(string)
+
+	// First rotation: succeeds, yields rt2.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt1,
+		"client_id":     testMCPClientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rt2 := decode(t, resp)["refresh_token"].(string)
+	require.NotEmpty(t, rt2)
+
+	// Backdate rt1's revoked_at past the grace window so the next replay hits
+	// the reuse-detection path.
+	backdate := time.Now().Add(-2 * domain.RefreshTokenReuseGraceWindow)
+	_, err := testDB.NewUpdate().
+		Model((*domain.RefreshToken)(nil)).
+		Set("revoked_at = ?", backdate).
+		Where("user_id = ?", "user-grace-outside").
+		Where("state = ?", domain.RefreshTokenStateRevoked).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	// Replay rt1 — now outside grace window → family revocation fires.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt1,
+		"client_id":     testMCPClientID,
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
+
+	// rt2 must now be dead — the family was revoked as a unit.
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": rt2,
 		"client_id":     testMCPClientID,
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"rt2 must be revoked once reuse was detected on its sibling rt1")
+		"rt2 must be revoked once reuse was detected on its sibling rt1 outside the grace window")
 }
 
 // TestRefreshTokenRotationRollbackOnInsertFailure verifies that when the
@@ -138,7 +221,6 @@ func TestRefreshTokenRotationRollbackOnInsertFailure(t *testing.T) {
 	ctx := context.Background()
 	repo := postgres.NewRefreshTokenRepository(testDB)
 
-	// Seed two unrelated refresh tokens with known hashes.
 	victimHash := "rollback-victim-hash-" + uid("")
 	colliderHash := "rollback-collider-hash-" + uid("")
 
@@ -168,8 +250,6 @@ func TestRefreshTokenRotationRollbackOnInsertFailure(t *testing.T) {
 	}
 	require.NoError(t, repo.Create(ctx, testDB, collider))
 
-	// Drive the same claim + insert flow the service uses, but craft the
-	// successor to collide with `collider` on token_hash (UNIQUE violation).
 	txErr := testDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		claimed, err := repo.ClaimByTokenHash(ctx, tx, victimHash)
 		if err != nil {
@@ -192,14 +272,11 @@ func TestRefreshTokenRotationRollbackOnInsertFailure(t *testing.T) {
 	})
 	require.Error(t, txErr, "successor insert must fail with a UNIQUE violation")
 
-	// The claim UPDATE should have been rolled back — victim must be active.
 	got, err := repo.GetByTokenHash(ctx, victimHash)
 	require.NoError(t, err, "victim must still be retrievable as an active, non-expired token")
 	assert.Equal(t, domain.RefreshTokenStateActive, got.State,
 		"claim must have rolled back; victim should not be revoked")
 
-	// A subsequent legitimate claim must now succeed — i.e., the rollback fully
-	// restored the row, not just its state column.
 	reclaimed, err := repo.ClaimByTokenHash(ctx, testDB, victimHash)
 	require.NoError(t, err, "second claim after rollback must succeed")
 	assert.Equal(t, domain.RefreshTokenStateRevoked, reclaimed.State,
@@ -208,9 +285,10 @@ func TestRefreshTokenRotationRollbackOnInsertFailure(t *testing.T) {
 
 // rotateRaw issues a refresh_token grant request directly without going through
 // the require-heavy post helper, so it is safe to call from goroutines. Returns
-// the HTTP status code, or 0 if the request could not be made (surfaced via
-// t.Errorf so a real transport failure doesn't masquerade as a silent miss).
-func rotateRaw(t *testing.T, refreshToken string) int {
+// the HTTP status code and response body, or (0, nil) if the request could not
+// be made (surfaced via t.Errorf so a real transport failure does not
+// masquerade as a silent miss).
+func rotateRaw(t *testing.T, refreshToken string) (int, []byte) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"grant_type":    "refresh_token",
@@ -219,19 +297,24 @@ func rotateRaw(t *testing.T, refreshToken string) int {
 	})
 	if err != nil {
 		t.Errorf("marshal refresh request: %v", err)
-		return 0
+		return 0, nil
 	}
 	req, err := http.NewRequest(http.MethodPost, testServer.URL+"/oauth2/token", bytes.NewReader(body))
 	if err != nil {
 		t.Errorf("build refresh request: %v", err)
-		return 0
+		return 0, nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Errorf("execute refresh request: %v", err)
-		return 0
+		return 0, nil
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Errorf("read refresh response: %v", err)
+		return resp.StatusCode, nil
+	}
+	return resp.StatusCode, respBody
 }

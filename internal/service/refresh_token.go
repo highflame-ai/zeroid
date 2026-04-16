@@ -171,6 +171,24 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 	}
 
 	if existing.State == domain.RefreshTokenStateRevoked {
+		// Grace period: if the token was revoked very recently, treat the
+		// second presentation as a concurrent retry (multiple tabs, a client
+		// retry loop, a load balancer replay) rather than a replay attack.
+		// The concurrent request gets a benign error but the freshly issued
+		// successor — and therefore the user's session — survives.
+		//
+		// Outside the window, this is a genuine reuse signal (RFC 6749 §10.4)
+		// and the whole family is revoked.
+		if existing.RevokedAt != nil && time.Since(*existing.RevokedAt) < domain.RefreshTokenReuseGraceWindow {
+			log.Info().
+				Str("family_id", existing.FamilyID).
+				Str("user_id", existing.UserID).
+				Str("client_id", existing.ClientID).
+				Dur("age", time.Since(*existing.RevokedAt)).
+				Msg("Refresh token presented within reuse grace window — treating as concurrent retry")
+			return fmt.Errorf("refresh token already rotated")
+		}
+
 		count, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
 		log.Warn().
 			Str("family_id", existing.FamilyID).

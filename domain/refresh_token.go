@@ -13,6 +13,13 @@ const (
 	RefreshTokenTTLDays    = 90
 	RefreshTokenStateActive  = "active"
 	RefreshTokenStateRevoked = "revoked"
+
+	// RefreshTokenReuseGraceWindow is how long after a token is revoked that a
+	// subsequent presentation is treated as a concurrent retry rather than a
+	// replay attack. Within this window, family revocation is suppressed so
+	// legitimate multi-tab or network-retry scenarios don't kill the session.
+	// Outside the window, reuse detection fires as normal (RFC 6749 §10.4).
+	RefreshTokenReuseGraceWindow = 10 * time.Second
 )
 
 // RefreshToken is the Bun model for the refresh_tokens table.
