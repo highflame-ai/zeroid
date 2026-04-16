@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
@@ -21,11 +22,15 @@ import (
 // RefreshTokenService handles refresh token issuance and rotation.
 type RefreshTokenService struct {
 	repo *postgres.RefreshTokenRepository
+	// db is needed to wrap claim+insert in a transaction during rotation so a
+	// failed successor insert rolls back the claim, avoiding spurious reuse
+	// detection on a client retry after a transient DB error.
+	db *bun.DB
 }
 
 // NewRefreshTokenService creates a new refresh token service.
-func NewRefreshTokenService(repo *postgres.RefreshTokenRepository) *RefreshTokenService {
-	return &RefreshTokenService{repo: repo}
+func NewRefreshTokenService(repo *postgres.RefreshTokenRepository, db *bun.DB) *RefreshTokenService {
+	return &RefreshTokenService{repo: repo, db: db}
 }
 
 // RefreshTokenParams contains the data needed to issue a refresh token.
@@ -78,7 +83,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		ExpiresAt:  expiresAt,
 	}
 
-	if err := s.repo.Create(ctx, record); err != nil {
+	if err := s.repo.Create(ctx, s.db, record); err != nil {
 		return nil, fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
@@ -92,28 +97,24 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 // RotateRefreshToken validates the presented token, revokes it, and issues a new one.
 // Implements reuse detection: if a revoked token is presented, the entire family is revoked.
 //
-// Atomicity: the claim-and-revoke step is a single UPDATE ... WHERE state='active'
-// RETURNING in postgres/refresh_token.go. Postgres row-level locking guarantees
-// that exactly one concurrent caller wins, so two rotations racing on the same
-// input cannot both produce successor tokens.
+// Atomicity has two layers:
+//  1. Concurrent rotations on the same token: the claim-and-revoke step is a
+//     single UPDATE ... WHERE state='active' RETURNING. Postgres row-level
+//     locking guarantees exactly one concurrent caller wins, so two rotations
+//     racing on the same input cannot both produce successor tokens.
+//  2. Claim + successor insert: both run inside a single transaction. If the
+//     insert fails (transient DB error, disk, etc.), the claim rolls back and
+//     the original token remains active. Without this, a failed insert would
+//     leave the original token revoked with no successor, and the client's
+//     retry would trip reuse detection and nuke the whole family — turning a
+//     transient glitch into a forced re-auth across all sessions.
 func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int) (*domain.RefreshToken, *RefreshTokenResult, error) {
 	tokenHash := hashRefreshToken(rawToken)
-
-	// Atomic claim: revokes the token iff it is currently active and non-expired,
-	// returning the row on success.
-	claimed, err := s.repo.ClaimByTokenHash(ctx, tokenHash)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, s.handleFailedClaim(ctx, tokenHash)
-		}
-		return nil, nil, fmt.Errorf("failed to claim refresh token: %w", err)
-	}
 
 	newRawToken, err := generateRefreshToken()
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to generate new refresh token: %w", err)
 	}
-
 	newTokenHash := hashRefreshToken(newRawToken)
 
 	var rotationTTL time.Duration
@@ -122,24 +123,35 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 	} else {
 		rotationTTL = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
 	}
-
 	expiresAt := time.Now().Add(rotationTTL)
 
-	newRecord := &domain.RefreshToken{
-		TokenHash:  newTokenHash,
-		ClientID:   claimed.ClientID,
-		AccountID:  claimed.AccountID,
-		ProjectID:  claimed.ProjectID,
-		UserID:     claimed.UserID,
-		IdentityID: claimed.IdentityID,
-		Scopes:     claimed.Scopes,
-		FamilyID:   claimed.FamilyID, // Same family — rotation chain.
-		State:      domain.RefreshTokenStateActive,
-		ExpiresAt:  expiresAt,
-	}
+	var claimed *domain.RefreshToken
+	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		c, err := s.repo.ClaimByTokenHash(ctx, tx, tokenHash)
+		if err != nil {
+			return err
+		}
+		claimed = c
 
-	if err := s.repo.Create(ctx, newRecord); err != nil {
-		return nil, nil, fmt.Errorf("failed to store new refresh token: %w", err)
+		successor := &domain.RefreshToken{
+			TokenHash:  newTokenHash,
+			ClientID:   c.ClientID,
+			AccountID:  c.AccountID,
+			ProjectID:  c.ProjectID,
+			UserID:     c.UserID,
+			IdentityID: c.IdentityID,
+			Scopes:     c.Scopes,
+			FamilyID:   c.FamilyID, // Same family — rotation chain.
+			State:      domain.RefreshTokenStateActive,
+			ExpiresAt:  expiresAt,
+		}
+		return s.repo.Create(ctx, tx, successor)
+	})
+	if txErr != nil {
+		if errors.Is(txErr, sql.ErrNoRows) {
+			return nil, nil, s.handleFailedClaim(ctx, tokenHash)
+		}
+		return nil, nil, fmt.Errorf("refresh token rotation failed: %w", txErr)
 	}
 
 	return claimed, &RefreshTokenResult{
