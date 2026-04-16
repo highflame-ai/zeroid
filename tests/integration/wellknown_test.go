@@ -68,12 +68,12 @@ func TestOAuthServerMetadata(t *testing.T) {
 func TestHealthEndpoint(t *testing.T) {
 	resp := get(t, "/health", nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestReadyEndpoint verifies that /ready returns 200 when the database is reachable.
 func TestReadyEndpoint(t *testing.T) {
 	resp := get(t, "/ready", nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }

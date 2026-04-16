@@ -45,7 +45,7 @@ func TestCAECriticalSignalRevokesCredential(t *testing.T) {
 		"payload":     map[string]any{"reason": "test revocation"},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	// Give the in-process revocation goroutine a moment to complete.
 	time.Sleep(100 * time.Millisecond)
@@ -82,7 +82,7 @@ func TestCAEHighSignalRevokesCredential(t *testing.T) {
 		"payload":     map[string]any{},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -117,7 +117,7 @@ func TestCAELowSignalDoesNotRevokeCredential(t *testing.T) {
 		"payload":     map[string]any{},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -164,7 +164,7 @@ func TestCAESignalRevokesAllActiveCredentials(t *testing.T) {
 		"payload":     map[string]any{},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -241,7 +241,7 @@ func TestCAESignalCascadesRevocationToChildren(t *testing.T) {
 		"payload":     map[string]any{"reason": "cascade revocation test"},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -281,7 +281,7 @@ func TestSignalListEndpoint(t *testing.T) {
 		"payload":     map[string]any{"old_ip": "1.2.3.4", "new_ip": "5.6.7.8"},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
-	signalResp.Body.Close()
+	_ = signalResp.Body.Close()
 
 	listResp := get(t, adminPath("/signals"), adminHeaders())
 	require.Equal(t, http.StatusOK, listResp.StatusCode)

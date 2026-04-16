@@ -28,6 +28,7 @@ type OAuthService struct {
 	identitySvc     *IdentityService
 	oauthClientSvc  *OAuthClientService
 	apiKeyRepo      *postgres.APIKeyRepository
+	authCodeRepo    *postgres.AuthCodeRepository
 	jwksSvc         *signing.JWKSService
 	refreshTokenSvc *RefreshTokenService
 	issuer          string
@@ -86,6 +87,7 @@ func NewOAuthService(
 	identitySvc *IdentityService,
 	oauthClientSvc *OAuthClientService,
 	apiKeyRepo *postgres.APIKeyRepository,
+	authCodeRepo *postgres.AuthCodeRepository,
 	jwksSvc *signing.JWKSService,
 	refreshTokenSvc *RefreshTokenService,
 	cfg OAuthServiceConfig,
@@ -95,6 +97,7 @@ func NewOAuthService(
 		identitySvc:      identitySvc,
 		oauthClientSvc:   oauthClientSvc,
 		apiKeyRepo:       apiKeyRepo,
+		authCodeRepo:     authCodeRepo,
 		jwksSvc:          jwksSvc,
 		refreshTokenSvc:  refreshTokenSvc,
 		issuer:           cfg.Issuer,
@@ -622,6 +625,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // Token behaviour is derived from the client's registered grant_types:
 //   - Clients with "refresh_token" grant: short-lived (1h) access token + rotating refresh token.
 //   - Clients without: long-lived (90-day) access token, no refresh token.
+//
+// Each auth code is single-use per RFC 6749 §4.1.2. On first exchange, the code
+// is atomically marked as consumed. Replays are rejected with invalid_grant and
+// all tokens issued from the original exchange are revoked.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
 		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
@@ -670,6 +677,32 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
+	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
+	// Placed after all validation (client, redirect_uri, PKCE) so an
+	// attacker who intercepts a code but doesn't know the verifier cannot
+	// burn it by sending a request with a wrong verifier.
+	//
+	// Consume → IssueCredential → IssueRefreshToken → UpdateTokenInfo is
+	// not transactional. A replay arriving between Consume and
+	// UpdateTokenInfo is still rejected (the critical correctness
+	// property), but revokeAuthCodeTokens may find CredentialJTI unset and
+	// leave the in-flight exchange's tokens valid. RFC 6749 §4.1.2 says
+	// "SHOULD revoke" — best-effort revocation is acceptable here.
+	consumed, err := s.authCodeRepo.Consume(ctx, &domain.AuthCode{
+		JTI:       authCode.JTI,
+		ClientID:  authCode.ClientID,
+		AccountID: authCode.AccountID,
+		ProjectID: authCode.ProjectID,
+		ExpiresAt: authCode.ExpiresAt,
+	})
+	if err != nil {
+		return nil, oauthServerError("failed to check authorization code usage", err)
+	}
+	if !consumed {
+		s.revokeAuthCodeTokens(ctx, authCode.JTI)
+		return nil, oauthBadRequest("invalid_grant", "authorization code has already been used")
+	}
+
 	// Determine access token TTL.
 	// Priority: per-client config > grant-type-based default > server default.
 	hasRefreshGrant := false
@@ -713,6 +746,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	accessToken.ProjectID = authCode.ProjectID
 	accessToken.UserID = authCode.UserID
 
+	var refreshFamilyID string
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
@@ -727,10 +762,50 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
 		} else {
 			accessToken.RefreshToken = rtResult.RawToken
+			refreshFamilyID = rtResult.FamilyID
 		}
 	}
 
+	// Store token info so replay detection can revoke these tokens later.
+	if updateErr := s.authCodeRepo.UpdateTokenInfo(ctx, authCode.JTI, accessToken.JTI, refreshFamilyID); updateErr != nil {
+		log.Error().Err(updateErr).Str("auth_code_jti", authCode.JTI).Msg("Failed to store auth code token info for replay revocation")
+	}
+
 	return accessToken, nil
+}
+
+// revokeAuthCodeTokens revokes the access token and refresh token family that
+// were issued when the auth code was first exchanged. Per RFC 6749 §4.1.2:
+// "the authorization server [...] SHOULD revoke all tokens previously issued
+// based on that authorization code."
+func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string) {
+	record, err := s.authCodeRepo.GetByJTI(ctx, codeJTI)
+	if err != nil {
+		log.Warn().Err(err).Str("auth_code_jti", codeJTI).Msg("Auth code replay: could not look up original exchange for revocation")
+		return
+	}
+
+	if record.CredentialJTI != nil && *record.CredentialJTI != "" {
+		cred, _, introspectErr := s.credentialSvc.IntrospectToken(ctx, *record.CredentialJTI)
+		if introspectErr != nil {
+			log.Error().Err(introspectErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to introspect access token for revocation")
+		} else if cred != nil {
+			if revokeErr := s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "auth_code_replay"); revokeErr != nil {
+				log.Error().Err(revokeErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to revoke access token")
+			} else {
+				log.Warn().Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: revoked access token from original exchange")
+			}
+		}
+	}
+
+	if record.RefreshFamilyID != nil && *record.RefreshFamilyID != "" && s.refreshTokenSvc != nil {
+		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID)
+		if revokeErr != nil {
+			log.Error().Err(revokeErr).Str("family_id", *record.RefreshFamilyID).Msg("Auth code replay: failed to revoke refresh token family")
+		} else if count > 0 {
+			log.Warn().Str("family_id", *record.RefreshFamilyID).Int64("count", count).Msg("Auth code replay: revoked refresh token family from original exchange")
+		}
+	}
 }
 
 // refreshToken handles the refresh_token grant (RFC 6749 section 6).
