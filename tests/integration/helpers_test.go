@@ -13,15 +13,16 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
-	"strings"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,9 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	zeroid "github.com/highflame-ai/zeroid"
 )
@@ -65,6 +69,11 @@ var testZeroIDServer *zeroid.Server
 // testServerPrivKey is the server's ECDSA signing key, accessible so tests can
 // build valid assertions without going through disk files.
 var testServerPrivKey *ecdsa.PrivateKey
+
+// testDB is a bun.DB handle connected to the same postgres container the server
+// uses. Exposed so tests can exercise repository-level transactional semantics
+// directly, bypassing the HTTP surface.
+var testDB *bun.DB
 
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -172,6 +181,12 @@ func runTests(m *testing.M) int {
 	testZeroIDServer = srv
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
+
+	// Open a separate bun.DB handle for tests that need direct repo access.
+	// Uses the same connection string the server is wired to.
+	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dbURL)))
+	testDB = bun.NewDB(sqldb, pgdialect.New())
+	defer testDB.Close() //nolint:errcheck
 
 	// Register the CLI and MCP test clients in the oauth_clients table.
 	// These are public PKCE clients — no client_secret, no linked identity.
