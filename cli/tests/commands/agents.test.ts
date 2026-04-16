@@ -1,5 +1,5 @@
 /**
- * Tests for `zid agents` subcommands: list, get, rotate-key, deactivate, activate.
+ * Tests for `zeroid agents` subcommands: list, get, rotate-key, deactivate, activate.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -57,7 +57,7 @@ const ROTATED: AgentRegistered = {
 // agents list
 // ---------------------------------------------------------------------------
 
-describe("zid agents list", () => {
+describe("zeroid agents list", () => {
   it("GET /api/v1/agents/registry and renders a table", async () => {
     server.use(http.get(`${BASE_URL}/api/v1/agents/registry`, () => HttpResponse.json(AGENT_LIST)));
     const { stdout, exitCode } = await runCLI(["agents", "list"]);
@@ -123,7 +123,7 @@ describe("zid agents list", () => {
 // agents get
 // ---------------------------------------------------------------------------
 
-describe("zid agents get", () => {
+describe("zeroid agents get", () => {
   it("GET /api/v1/agents/registry/:id and prints agent details", async () => {
     server.use(
       http.get(`${BASE_URL}/api/v1/agents/registry/agt_abc123`, () => HttpResponse.json(AGENT)),
@@ -161,7 +161,7 @@ describe("zid agents get", () => {
 // agents rotate-key
 // ---------------------------------------------------------------------------
 
-describe("zid agents rotate-key", () => {
+describe("zeroid agents rotate-key", () => {
   it("POST /api/v1/agents/registry/:id/rotate-key and prints new key", async () => {
     server.use(
       http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/rotate-key`, () =>
@@ -203,7 +203,7 @@ describe("zid agents rotate-key", () => {
 // agents deactivate / activate
 // ---------------------------------------------------------------------------
 
-describe("zid agents deactivate", () => {
+describe("zeroid agents deactivate", () => {
   it("POST /api/v1/agents/registry/:id/deactivate", async () => {
     const deactivated = { ...AGENT, status: "deactivated" as const };
     server.use(
@@ -241,7 +241,7 @@ describe("zid agents deactivate", () => {
   });
 });
 
-describe("zid agents activate", () => {
+describe("zeroid agents activate", () => {
   it("POST /api/v1/agents/registry/:id/activate", async () => {
     server.use(
       http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/activate`, () =>

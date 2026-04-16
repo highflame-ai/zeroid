@@ -1,10 +1,10 @@
 {
-  "name": "@highflame/zid",
+  "name": "@highflame/zeroid",
   "version": "0.1.0",
   "description": "CLI for ZeroID — agent identity for AI systems",
   "type": "module",
   "bin": {
-    "zid": "./dist/index.js"
+    "zeroid": "./dist/index.js"
   },
   "files": [
     "dist"

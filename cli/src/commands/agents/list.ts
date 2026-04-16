@@ -1,9 +1,9 @@
 /**
- * zid agents list — list registered agents.
+ * zeroid agents list — list registered agents.
  *
  * Usage:
- *   zid agents list
- *   zid agents list --json | jq '.[].wimse_uri'
+ *   zeroid agents list
+ *   zeroid agents list --json | jq '.[].wimse_uri'
  */
 
 import { Command } from "commander";
@@ -20,7 +20,7 @@ export function registerList(agentsCmd: Command): void {
     .option("--json", "Output raw JSON array")
     .action(async (opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid agents list");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid agents list");
         const limit = parseInt(opts.limit as string, 10);
         const result = await client.agents.list({
           identity_type: opts.type as string | undefined,

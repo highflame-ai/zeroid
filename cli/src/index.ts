@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * zid — ZeroID CLI
+ * zeroid — ZeroID CLI
  *
  * Entry point. Registers all commands and parses argv.
  */
@@ -22,7 +22,7 @@ import { registerConfig } from "./commands/config.js";
 const program = new Command();
 
 program
-  .name("zid")
+  .name("zeroid")
   .description("ZeroID CLI — agent identity for AI systems")
   .version("0.1.0");
 

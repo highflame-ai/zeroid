@@ -3,12 +3,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // vi.hoisted ensures TEST_HOME is defined before vi.mock factories run.
 const TEST_HOME = vi.hoisted(
-  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zid-config-test-${process.pid}`,
+  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zeroid-config-test-${process.pid}`,
 );
 
 // Must mock before importing config (it resolves HOME at module load time).
@@ -34,7 +34,7 @@ const {
 } = await import("../../src/lib/config.js");
 
 beforeEach(() => {
-  mkdirSync(join(TEST_HOME, ".config", "zid"), { recursive: true });
+  mkdirSync(join(TEST_HOME, ".config", "zeroid"), { recursive: true });
   delete process.env["ZID_API_KEY"];
   delete process.env["ZID_ACCOUNT_ID"];
   delete process.env["ZID_PROJECT_ID"];
@@ -102,6 +102,36 @@ describe("getProfile / setProfile", () => {
       },
     });
   });
+
+  it("reads a legacy ~/.config/zid/config.json when the new path is absent", () => {
+    const legacyDir = join(TEST_HOME, ".config", "zid");
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(
+      join(legacyDir, "config.json"),
+      JSON.stringify(
+        {
+          active_profile: "legacy",
+          profiles: {
+            legacy: {
+              base_url: "http://legacy",
+              account_id: "acct_legacy",
+              project_id: "proj_legacy",
+              api_key: "legacy_key",
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    expect(getProfile()).toEqual({
+      base_url: "http://legacy",
+      account_id: "acct_legacy",
+      project_id: "proj_legacy",
+      api_key: "legacy_key",
+    });
+  });
 });
 
 describe("useProfile", () => {
@@ -165,7 +195,7 @@ describe("requireProfile", () => {
   });
 
   it("throws a helpful error when nothing is configured", () => {
-    expect(() => requireProfile()).toThrow(/zid init/i);
+    expect(() => requireProfile()).toThrow(/zeroid init/i);
   });
 });
 
@@ -192,7 +222,7 @@ describe("resolveContext / requireTenantContext / requireBaseURL", () => {
     process.env["ZID_ACCOUNT_ID"] = "acct_env";
     process.env["ZID_PROJECT_ID"] = "proj_env";
 
-    expect(requireTenantContext(undefined, "zid init")).toEqual({
+    expect(requireTenantContext(undefined, "zeroid init")).toEqual({
       base_url: "https://api.zeroid.io",
       account_id: "acct_env",
       project_id: "proj_env",
@@ -201,7 +231,7 @@ describe("resolveContext / requireTenantContext / requireBaseURL", () => {
   });
 
   it("throws a helpful error when tenant context is missing", () => {
-    expect(() => requireTenantContext(undefined, "zid agents list")).toThrow(/tenant context/i);
+    expect(() => requireTenantContext(undefined, "zeroid agents list")).toThrow(/tenant context/i);
   });
 
   it("falls back to the default base url when nothing is configured", () => {

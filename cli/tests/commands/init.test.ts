@@ -1,5 +1,5 @@
 /**
- * Tests for `zid init`.
+ * Tests for `zeroid init`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -48,7 +48,7 @@ const OWNER = "user_xyz";
 // Cleanup .env.zeroid written by init
 afterEach(() => rmSync(join(process.cwd(), ".env.zeroid"), { force: true }));
 
-describe("zid init", () => {
+describe("zeroid init", () => {
   it("POST /api/v1/agents/register with correct fields", async () => {
     let captured: Record<string, unknown> = {};
     server.use(

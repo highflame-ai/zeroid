@@ -1,5 +1,5 @@
 /**
- * zid agents get <id> — get an agent by ID.
+ * zeroid agents get <id> — get an agent by ID.
  */
 
 import { Command } from "commander";
@@ -15,7 +15,7 @@ export function registerGet(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid agents get");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid agents get");
         const agent = await client.agents.get(id);
 
         if (opts.json) {

@@ -1,9 +1,9 @@
 /**
- * zid token decode <jwt> — decode a JWT and display claims (no signature verification).
+ * zeroid token decode <jwt> — decode a JWT and display claims (no signature verification).
  *
  * Accepts the token as an argument or from stdin:
- *   zid token decode eyJhbGc...
- *   pbpaste | zid token decode
+ *   zeroid token decode eyJhbGc...
+ *   pbpaste | zeroid token decode
  */
 
 import { Command } from "commander";

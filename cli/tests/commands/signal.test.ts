@@ -1,5 +1,5 @@
 /**
- * Tests for `zid signal`.
+ * Tests for `zeroid signal`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -24,7 +24,7 @@ const SIGNAL_RESPONSE: CAESignal = {
   created_at: new Date().toISOString(),
 };
 
-describe("zid signal", () => {
+describe("zeroid signal", () => {
   it("POST /api/v1/signals/ingest with all required fields", async () => {
     let captured: CreateSignalRequest = {} as CreateSignalRequest;
     server.use(

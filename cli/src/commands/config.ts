@@ -1,9 +1,9 @@
 /**
- * zid config — manage CLI profiles.
+ * zeroid config — manage CLI profiles.
  *
  * Usage:
- *   zid config use-profile prod
- *   zid config list-profiles
+ *   zeroid config use-profile prod
+ *   zeroid config list-profiles
  */
 
 import { Command } from "commander";
@@ -34,7 +34,7 @@ export function registerConfig(program: Command): void {
       try {
         const profiles = listProfiles();
         if (profiles.length === 0) {
-          console.log('No profiles configured. Run "zid init" to get started.');
+          console.log('No profiles configured. Run "zeroid init" to get started.');
           return;
         }
         for (const p of profiles) {

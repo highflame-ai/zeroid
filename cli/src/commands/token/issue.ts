@@ -1,9 +1,9 @@
 /**
- * zid token issue — issue a short-lived token using the profile's api_key.
+ * zeroid token issue — issue a short-lived token using the profile's api_key.
  *
  * Usage:
- *   zid token issue
- *   zid token issue --scope "repo:read"
+ *   zeroid token issue
+ *   zeroid token issue --scope "repo:read"
  */
 
 import { Command } from "commander";

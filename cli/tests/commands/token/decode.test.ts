@@ -1,5 +1,5 @@
 /**
- * Tests for `zid token decode`.
+ * Tests for `zeroid token decode`.
  *
  * Pure local operation — no network calls, no msw needed.
  */
@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { runCLI, makeJWT } from "../../helpers.js";
 
-describe("zid token decode", () => {
+describe("zeroid token decode", () => {
   it("decodes a valid JWT and prints key claims", async () => {
     const now = Math.floor(Date.now() / 1000);
     const jwt = makeJWT({

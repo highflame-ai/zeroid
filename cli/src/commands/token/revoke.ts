@@ -1,5 +1,5 @@
 /**
- * zid token revoke <jwt> — revoke a token.
+ * zeroid token revoke <jwt> — revoke a token.
  */
 
 import { Command } from "commander";

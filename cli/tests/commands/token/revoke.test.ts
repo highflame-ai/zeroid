@@ -1,5 +1,5 @@
 /**
- * Tests for `zid token revoke`.
+ * Tests for `zeroid token revoke`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -12,7 +12,7 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-describe("zid token revoke", () => {
+describe("zeroid token revoke", () => {
   it("posts token to /oauth2/token/revoke", async () => {
     let captured: Record<string, unknown> = {};
     server.use(

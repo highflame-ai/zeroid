@@ -1,5 +1,5 @@
 /**
- * Config management — reads/writes ~/.config/zid/config.json.
+ * Config management — reads/writes ~/.config/zeroid/config.json.
  * Supports named profiles; "default" is used when no --profile is given.
  */
 
@@ -31,18 +31,26 @@ interface ConfigFile {
   profiles: Record<string, Profile>;
 }
 
-const CONFIG_DIR = join(homedir(), ".config", "zid");
+const CONFIG_DIR = join(homedir(), ".config", "zeroid");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+const LEGACY_CONFIG_PATH = join(homedir(), ".config", "zid", "config.json");
 
 function _read(): ConfigFile {
-  if (!existsSync(CONFIG_PATH)) {
-    return { active_profile: "", profiles: {} };
+  if (existsSync(CONFIG_PATH)) {
+    return readConfigFile(CONFIG_PATH);
   }
+  if (existsSync(LEGACY_CONFIG_PATH)) {
+    return readConfigFile(LEGACY_CONFIG_PATH);
+  }
+  return { active_profile: "", profiles: {} };
+}
+
+function readConfigFile(path: string): ConfigFile {
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as ConfigFile;
+    return JSON.parse(readFileSync(path, "utf8")) as ConfigFile;
   } catch {
     throw new Error(
-      `Config file is corrupted (${CONFIG_PATH}). Delete it and run "zid init" to start fresh.`,
+      `Config file is corrupted (${path}). Delete it and run "zeroid init" to start fresh.`,
     );
   }
 }
@@ -88,7 +96,7 @@ export function listProfiles(): { name: string; active: boolean }[] {
 export function requireProfile(name?: string): Profile {
   const context = resolveContext(name);
   if (!context?.api_key) {
-    throw new Error('No API key configured. Run "zid init" or set the ZID_API_KEY env var.');
+    throw new Error('No API key configured. Run "zeroid init" or set the ZID_API_KEY env var.');
   }
   return { ...context, api_key: context.api_key };
 }
@@ -100,7 +108,7 @@ export function requireTenantContext(
   const context = resolveContext(name);
   if (!context?.account_id || !context?.project_id) {
     throw new Error(
-      `${command} requires tenant context. Set ZID_ACCOUNT_ID and ZID_PROJECT_ID, or use a profile created by "zid init".`,
+      `${command} requires tenant context. Set ZID_ACCOUNT_ID and ZID_PROJECT_ID, or use a profile created by "zeroid init".`,
     );
   }
   return {

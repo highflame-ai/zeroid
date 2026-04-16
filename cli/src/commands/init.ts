@@ -1,8 +1,8 @@
 /**
- * zid init — register a new agent and write the api_key to .env.zeroid.
+ * zeroid init — register a new agent and write the api_key to .env.zeroid.
  *
  * Usage:
- *   zid init --name "github-mcp-server" --type mcp_server --scope "repo:read pr:write"
+ *   zeroid init --name "github-mcp-server" --type mcp_server --scope "repo:read pr:write"
  */
 
 import { Command } from "commander";
@@ -31,7 +31,7 @@ export function registerInit(program: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid init");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid init");
         const result = await client.agents.register({
           name: opts.name as string,
           external_id: (opts.id as string | undefined) ?? (opts.name as string),
@@ -66,7 +66,7 @@ export function registerInit(program: Command): void {
         console.log(`  Trust:      ${result.identity.trust_level}`);
         console.log(`  API key:    ${result.api_key}`);
         printSuccess("API key written to .env.zeroid");
-        printSuccess(`Profile "${opts.saveProfile as string}" saved to ~/.config/zid/config.json`);
+        printSuccess(`Profile "${opts.saveProfile as string}" saved to ~/.config/zeroid/config.json`);
         printWarning("Store the API key securely — it will not be shown again.");
       } catch (err) {
         handleError(err);

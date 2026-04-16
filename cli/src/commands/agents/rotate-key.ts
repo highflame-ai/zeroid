@@ -1,5 +1,5 @@
 /**
- * zid agents rotate-key <id> — rotate an agent's API key.
+ * zeroid agents rotate-key <id> — rotate an agent's API key.
  */
 
 import { Command } from "commander";
@@ -20,7 +20,7 @@ export function registerRotateKey(agentsCmd: Command): void {
     .action(async (id: string, opts) => {
       try {
         const selectedProfile = getSelectedProfile(opts.profile as string | undefined);
-        const client = makeTenantClient(opts.profile as string | undefined, "zid agents rotate-key");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid agents rotate-key");
         const result = await client.agents.rotateKey(id);
         const updatedProfileName = updateProfileAPIKeyForIdentity(
           selectedProfile?.name,

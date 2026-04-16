@@ -1,6 +1,6 @@
 /**
- * zid agents deactivate <id> — deactivate an agent (soft, reversible).
- * zid agents activate <id>   — re-activate a deactivated agent.
+ * zeroid agents deactivate <id> — deactivate an agent (soft, reversible).
+ * zeroid agents activate <id>   — re-activate a deactivated agent.
  */
 
 import { Command } from "commander";
@@ -15,7 +15,7 @@ export function registerDeactivate(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid agents deactivate");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid agents deactivate");
         const agent = await client.agents.deactivate(id);
         if (opts.json) { printJSON(agent); return; }
         printSuccess(`Agent ${agent.name} deactivated`);
@@ -31,7 +31,7 @@ export function registerDeactivate(agentsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (id: string, opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid agents activate");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid agents activate");
         const agent = await client.agents.activate(id);
         if (opts.json) { printJSON(agent); return; }
         printSuccess(`Agent ${agent.name} activated`);

@@ -1,5 +1,5 @@
 /**
- * zid token verify <jwt> — verify a JWT against the live JWKS.
+ * zeroid token verify <jwt> — verify a JWT against the live JWKS.
  *
  * Exit codes:
  *   0 — valid

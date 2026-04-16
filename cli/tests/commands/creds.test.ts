@@ -1,5 +1,5 @@
 /**
- * Tests for `zid creds list`.
+ * Tests for `zeroid creds list`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -50,7 +50,7 @@ const LIST_RESPONSE: CredentialListResponse = {
   total: 2,
 };
 
-describe("zid creds list", () => {
+describe("zeroid creds list", () => {
   it("GET /api/v1/credentials?identity_id=<agent> and renders table", async () => {
     let capturedUrl = "";
     server.use(

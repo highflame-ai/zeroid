@@ -1,8 +1,8 @@
 /**
- * zid signal — ingest a CAE signal for an agent.
+ * zeroid signal — ingest a CAE signal for an agent.
  *
  * Usage:
- *   zid signal --agent <id> --type anomalous_behavior --severity high \
+ *   zeroid signal --agent <id> --type anomalous_behavior --severity high \
  *     --source "security-monitor" --reason "unexpected outbound call"
  */
 
@@ -21,13 +21,13 @@ export function registerSignal(program: Command): void {
       "Signal type: credential_change | session_revoked | ip_change | anomalous_behavior | policy_violation | retirement | owner_change",
     )
     .requiredOption("--severity <level>", "Severity: low | medium | high | critical")
-    .requiredOption("--source <source>", "Source of the signal (e.g. zid-cli, siem, monitor)")
+    .requiredOption("--source <source>", "Source of the signal (e.g. zeroid-cli, siem, monitor)")
     .option("--reason <text>", "Human-readable reason (stored in payload.reason)")
     .option("--profile <profile>", "Config profile to use")
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid signal");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid signal");
         const payload: Record<string, unknown> | undefined =
           opts.reason ? { reason: opts.reason as string } : undefined;
 

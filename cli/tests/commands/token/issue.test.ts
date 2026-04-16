@@ -1,5 +1,5 @@
 /**
- * Tests for `zid token issue`.
+ * Tests for `zeroid token issue`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -23,7 +23,7 @@ const TOKEN_RESPONSE: AccessToken = {
   project_id: "proj_test",
 };
 
-describe("zid token issue", () => {
+describe("zeroid token issue", () => {
   it("posts to /oauth2/token with api_key grant", async () => {
     let captured: Record<string, unknown> = {};
     server.use(

@@ -1,5 +1,5 @@
 /**
- * Tests for `zid token verify`.
+ * Tests for `zeroid token verify`.
  *
  * Mocks `makeBaseUrlClient` directly so we control what `tokens.verify()` returns
  * without having to spread SDK internals or deal with real JWKS crypto.
@@ -54,7 +54,7 @@ vi.mock("../../../src/lib/client.js", () => ({
   })),
 }));
 
-describe("zid token verify — valid token", () => {
+describe("zeroid token verify — valid token", () => {
   it("exits 0 and prints identity details", async () => {
     const jwt = makeJWT();
     const { stdout, exitCode } = await runCLI(["token", "verify", jwt]);
@@ -75,7 +75,7 @@ describe("zid token verify — valid token", () => {
   });
 });
 
-describe("zid token verify — delegated token", () => {
+describe("zeroid token verify — delegated token", () => {
   it("prints delegated_by when token carries act claim", async () => {
     const { stdout, exitCode } = await runCLI(["token", "verify", "delegated.jwt.token"]);
     expect(exitCode).toBe(0);
@@ -83,7 +83,7 @@ describe("zid token verify — delegated token", () => {
   });
 });
 
-describe("zid token verify — error paths", () => {
+describe("zeroid token verify — error paths", () => {
   it("exits 2 for an expired token", async () => {
     const { exitCode, stderr } = await runCLI(["token", "verify", "expired.jwt.token"]);
     expect(exitCode).toBe(2);

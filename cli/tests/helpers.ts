@@ -42,7 +42,7 @@ export interface RunResult {
 /** Build a fresh Commander program with every command registered. */
 export function makeProgram(): Command {
   const program = new Command();
-  program.name("zid").exitOverride(); // throws instead of process.exit on parse errors
+  program.name("zeroid").exitOverride(); // throws instead of process.exit on parse errors
 
   registerInit(program);
   registerSignal(program);
@@ -105,7 +105,7 @@ export async function runCLI(
 
   const program = makeProgram();
   try {
-    await program.parseAsync(["node", "zid", ...args]);
+    await program.parseAsync(["node", "zeroid", ...args]);
   } catch (err) {
     if (!(err instanceof ExitError)) {
       // Commander parse errors (missing required args etc.) throw CommanderError.

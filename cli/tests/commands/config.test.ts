@@ -1,5 +1,5 @@
 /**
- * Tests for `zid config use-profile` and `zid config list-profiles`.
+ * Tests for `zeroid config use-profile` and `zeroid config list-profiles`.
  *
  * Uses a temp HOME dir so reads/writes don't touch the real config file.
  */
@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { runCLI } from "../helpers.js";
 
 const TEST_HOME = vi.hoisted(
-  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zid-config-cmd-test-${process.pid}`,
+  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zeroid-config-cmd-test-${process.pid}`,
 );
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
@@ -21,14 +21,14 @@ vi.mock("node:os", async (importOriginal) => {
 const { setProfile } = await import("../../src/lib/config.js");
 
 beforeEach(() => {
-  mkdirSync(join(TEST_HOME, ".config", "zid"), { recursive: true });
+  mkdirSync(join(TEST_HOME, ".config", "zeroid"), { recursive: true });
 });
 
 afterEach(() => {
   rmSync(TEST_HOME, { recursive: true, force: true });
 });
 
-describe("zid config list-profiles", () => {
+describe("zeroid config list-profiles", () => {
   it("prints a message when no profiles are configured", async () => {
     const { stdout } = await runCLI(["config", "list-profiles"], {
       // Clear auth env so it doesn't mask the empty config
@@ -50,7 +50,7 @@ describe("zid config list-profiles", () => {
   });
 });
 
-describe("zid config use-profile", () => {
+describe("zeroid config use-profile", () => {
   it("switches the active profile and prints confirmation", async () => {
     setProfile("dev", { base_url: "http://dev", account_id: "a", project_id: "p", api_key: "k1" });
     setProfile("prod", { base_url: "http://prod", account_id: "a", project_id: "p", api_key: "k2" });

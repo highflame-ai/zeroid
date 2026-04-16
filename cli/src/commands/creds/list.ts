@@ -1,5 +1,5 @@
 /**
- * zid creds list --agent <id> — list credentials for an agent.
+ * zeroid creds list --agent <id> — list credentials for an agent.
  */
 
 import { Command } from "commander";
@@ -16,7 +16,7 @@ export function registerCredsList(credsCmd: Command): void {
     .option("--json", "Output raw JSON")
     .action(async (opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zid creds list");
+        const client = makeTenantClient(opts.profile as string | undefined, "zeroid creds list");
         const result = await client.credentials.list(opts.agent as string);
         const creds = (result.credentials ?? []).filter((c) => !opts.active || !c.is_revoked);
 

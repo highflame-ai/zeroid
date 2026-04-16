@@ -44,7 +44,7 @@ migrate: ## Run migrations (starts server, applies, exits)
 cli-install: ## Install CLI dependencies
 	cd cli && npm install
 
-cli-build: cli-install ## Build the zid CLI
+cli-build: cli-install ## Build the zeroid CLI
 	cd cli && npm run build
 
 cli-dev: cli-install ## Run CLI from source (no build needed)
