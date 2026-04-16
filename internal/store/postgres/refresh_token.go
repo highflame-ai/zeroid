@@ -97,7 +97,10 @@ func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, db bun.ID
 		return nil, fmt.Errorf("failed to claim refresh token: %w", err)
 	}
 
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to check claim result: %w", err)
+	}
 	if n == 0 {
 		return nil, sql.ErrNoRows
 	}
@@ -120,7 +123,10 @@ func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID stri
 		return 0, fmt.Errorf("failed to revoke refresh token family: %w", err)
 	}
 
-	count, _ := res.RowsAffected()
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to check family revocation result: %w", err)
+	}
 
 	return count, nil
 }
