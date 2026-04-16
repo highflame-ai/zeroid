@@ -48,11 +48,11 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 	require.NotEmpty(t, refreshToken)
 
 	var (
-		successes    int32
-		failures     int32
-		winnerTokMu  sync.Mutex
-		winnerTok    string
-		wg           sync.WaitGroup
+		successes   int32
+		failures    int32
+		winnerTokMu sync.Mutex
+		winnerTok   string
+		wg          sync.WaitGroup
 	)
 	start := make(chan struct{})
 

@@ -8,9 +8,9 @@ import (
 
 // Refresh token constants.
 const (
-	RefreshTokenPrefix     = "zid_rt"
-	RefreshTokenByteLength = 32
-	RefreshTokenTTLDays    = 90
+	RefreshTokenPrefix       = "zid_rt"
+	RefreshTokenByteLength   = 32
+	RefreshTokenTTLDays      = 90
 	RefreshTokenStateActive  = "active"
 	RefreshTokenStateRevoked = "revoked"
 

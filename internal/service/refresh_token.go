@@ -46,8 +46,8 @@ type RefreshTokenParams struct {
 
 // RefreshTokenResult contains both the raw token (returned to client) and stored metadata.
 type RefreshTokenResult struct {
-	RawToken  string    // Returned to client once — never stored.
-	FamilyID  string    // For audit/debugging.
+	RawToken  string // Returned to client once — never stored.
+	FamilyID  string // For audit/debugging.
 	ExpiresAt time.Time
 }
 
@@ -60,15 +60,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 
 	tokenHash := hashRefreshToken(rawToken)
 	familyID := uuid.New().String()
-
-	var ttl time.Duration
-	if params.TTL > 0 {
-		ttl = time.Duration(params.TTL) * time.Second
-	} else {
-		ttl = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
-	}
-
-	expiresAt := time.Now().Add(ttl)
+	expiresAt := time.Now().Add(refreshTokenTTL(params.TTL))
 
 	record := &domain.RefreshToken{
 		TokenHash:  tokenHash,
@@ -116,14 +108,7 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 		return nil, nil, fmt.Errorf("failed to generate new refresh token: %w", err)
 	}
 	newTokenHash := hashRefreshToken(newRawToken)
-
-	var rotationTTL time.Duration
-	if ttl > 0 {
-		rotationTTL = time.Duration(ttl) * time.Second
-	} else {
-		rotationTTL = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
-	}
-	expiresAt := time.Now().Add(rotationTTL)
+	expiresAt := time.Now().Add(refreshTokenTTL(ttl))
 
 	var claimed *domain.RefreshToken
 	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
@@ -162,8 +147,15 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 }
 
 // handleFailedClaim runs when ClaimByTokenHash found no matching active,
-// non-expired row. It disambiguates between reuse (revoked → trigger family
-// revocation), expired, and not-found, returning the appropriate error.
+// non-expired row. It disambiguates among four possibilities:
+//
+//  1. Revoked within the reuse grace window — treated as a legitimate concurrent
+//     retry. Returns "already rotated" without revoking the family.
+//  2. Revoked outside the grace window — genuine RFC 6749 §10.4 reuse signal.
+//     Revokes the entire family and returns "reuse detected".
+//  3. Expired — normal TTL expiry. Returns "expired".
+//  4. Should-be-unreachable state (active and non-expired but claim still
+//     missed). Logs at Error level and returns a generic error.
 func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash string) error {
 	existing, err := s.repo.GetByTokenHashIncludingRevoked(ctx, tokenHash)
 	if err != nil {
@@ -219,6 +211,15 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 // Used during auth code replay detection per RFC 6749 §4.1.2.
 func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
 	return s.repo.RevokeFamily(ctx, familyID)
+}
+
+// refreshTokenTTL resolves the effective token lifetime: a positive
+// ttlSeconds overrides the default; zero falls back to RefreshTokenTTLDays.
+func refreshTokenTTL(ttlSeconds int) time.Duration {
+	if ttlSeconds > 0 {
+		return time.Duration(ttlSeconds) * time.Second
+	}
+	return time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
 }
 
 // generateRefreshToken creates a cryptographically random refresh token.
