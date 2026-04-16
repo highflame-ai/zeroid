@@ -70,11 +70,12 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 		"all other concurrent rotations should be rejected")
 }
 
-// TestRefreshTokenSequentialReusePreserved verifies that the atomic-claim
-// refactor did not break the family-revocation path: presenting an
-// already-revoked refresh token still trips reuse detection and kills the
-// family, so every refresh token issued from the same original is invalidated.
-func TestRefreshTokenSequentialReusePreserved(t *testing.T) {
+// TestRefreshTokenReuseRevokesFamily verifies family revocation cascades when
+// reuse is detected: replaying an already-rotated refresh token must invalidate
+// not only the replayed token but every successor in the family (rt2 and
+// beyond). Complements TestRefreshTokenRotation, which only checks that the
+// replayed token itself is rejected.
+func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
 	verifier, challenge := buildPKCEPair(t)
 	code := buildAuthCode(t, testMCPClientID, "user-reuse-001", testRedirectURI, challenge, []string{"data:read"})
 
@@ -119,7 +120,8 @@ func TestRefreshTokenSequentialReusePreserved(t *testing.T) {
 
 // rotateRaw issues a refresh_token grant request directly without going through
 // the require-heavy post helper, so it is safe to call from goroutines. Returns
-// the HTTP status code; any transport error is treated as a failure.
+// the HTTP status code, or 0 if the request could not be made (surfaced via
+// t.Errorf so a real transport failure doesn't masquerade as a silent miss).
 func rotateRaw(t *testing.T, refreshToken string) int {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
@@ -128,15 +130,18 @@ func rotateRaw(t *testing.T, refreshToken string) int {
 		"client_id":     testMCPClientID,
 	})
 	if err != nil {
+		t.Errorf("marshal refresh request: %v", err)
 		return 0
 	}
 	req, err := http.NewRequest(http.MethodPost, testServer.URL+"/oauth2/token", bytes.NewReader(body))
 	if err != nil {
+		t.Errorf("build refresh request: %v", err)
 		return 0
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		t.Errorf("execute refresh request: %v", err)
 		return 0
 	}
 	defer func() { _ = resp.Body.Close() }()

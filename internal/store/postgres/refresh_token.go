@@ -90,10 +90,7 @@ func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, tokenHash
 		return nil, fmt.Errorf("failed to claim refresh token: %w", err)
 	}
 
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, fmt.Errorf("failed to check claim result: %w", err)
-	}
+	n, _ := res.RowsAffected()
 	if n == 0 {
 		return nil, sql.ErrNoRows
 	}
