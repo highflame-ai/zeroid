@@ -150,6 +150,8 @@ npm install @highflame/sdk   # Node / TypeScript
 
 Prefer a runnable walkthrough after installing the SDK? Open the [ZeroID Quickstart notebook](examples/zeroid_quickstart.ipynb) for an end-to-end demo covering agent registration, OAuth client credentials, agent-to-agent delegation, token introspection and revocation, credential policies, and CAE signals.
 
+Want a LangChain-specific intro? Open the [Scope-Aware Tools notebook](examples/langchain/scope_aware_tools.ipynb) to see the same agent gain or lose tool access purely by changing its ZeroID token.
+
 **Run ZeroID locally** (Docker — 30 seconds):
 
 ```bash
