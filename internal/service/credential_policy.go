@@ -341,18 +341,25 @@ func (s *CredentialPolicyService) EnforceSubset(narrower, wider *domain.Credenti
 		}
 	}
 
-	// Grant-type ceiling. Both sides are required to declare a non-empty
-	// grant-type list (enforced at policy creation), so we can always do
-	// the subset check directly.
-	if len(wider.AllowedGrantTypes) > 0 {
-		widerGT := make(map[string]bool, len(wider.AllowedGrantTypes))
-		for _, gt := range wider.AllowedGrantTypes {
-			widerGT[gt] = true
-		}
-		for _, gt := range narrower.AllowedGrantTypes {
-			if !widerGT[gt] {
-				return fmt.Errorf("%w: grant type %q permitted by credential policy but not by identity policy", ErrPolicySubsetViolation, gt)
-			}
+	// Grant-type ceiling. Note the inverted empty-list semantic vs. scopes:
+	// at runtime EnforcePolicy rejects any grant type not in the policy's
+	// allowed_grant_types list, so an empty list there means "no grants
+	// permitted" (deny-by-default). That is the exact opposite of scopes,
+	// where an empty allowed_scopes means "no scope restriction".
+	// Therefore this subset check must NOT guard on `len(wider) > 0` —
+	// doing so would pass a narrower policy permitting grants that the
+	// identity policy forbids at runtime, producing a fail-fast miss at
+	// creation time and a confusing runtime rejection later.
+	// UpdatePolicy can legitimately store an empty allowed_grant_types
+	// slice (its `!= nil` guard lets an empty slice through), so this
+	// state is reachable, not theoretical.
+	widerGT := make(map[string]bool, len(wider.AllowedGrantTypes))
+	for _, gt := range wider.AllowedGrantTypes {
+		widerGT[gt] = true
+	}
+	for _, gt := range narrower.AllowedGrantTypes {
+		if !widerGT[gt] {
+			return fmt.Errorf("%w: grant type %q permitted by credential policy but not by identity policy", ErrPolicySubsetViolation, gt)
 		}
 	}
 

@@ -324,6 +324,57 @@ func TestAPIKeyCreate_SubsetInvariant_ScopeBroader(t *testing.T) {
 		"API-key policy broader than identity policy on scopes must be rejected at creation")
 }
 
+// TestAPIKeyCreate_SubsetInvariant_GrantTypeEmptyIdentityRejectsAny is the
+// regression for the Gemini review on EnforceSubset's grant-types branch.
+// At runtime EnforcePolicy treats an empty allowed_grant_types list as a
+// deny-by-default allow-list — every grant type is rejected. The subset
+// check must mirror that semantic and reject any narrower policy that
+// declares grant types the identity policy omits, even when the identity
+// policy's list is empty. Previously a `len(wider) > 0` guard made the
+// subset check permissive in that corner, creating a fail-fast miss at
+// key creation time that would only surface as an opaque invalid_grant
+// error later when the token was actually requested.
+//
+// The identity policy here has to be created via PATCH because
+// CreatePolicy defaults an empty allowed_grant_types to
+// ["client_credentials"]. UpdatePolicy accepts an empty slice and lets
+// it through untouched, so this corner is reachable in production.
+func TestAPIKeyCreate_SubsetInvariant_GrantTypeEmptyIdentityRejectsAny(t *testing.T) {
+	identityPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("subset-gt-id-cp"),
+		"allowed_grant_types":  []string{"api_key"},
+		"max_delegation_depth": 1,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+
+	// Patch the identity policy's allowed_grant_types to empty. Simulates
+	// an admin who wants to temporarily disable all credential issuance
+	// for this identity — runtime would reject every token, so the
+	// creation-time subset check must not pass any narrower policy.
+	patchCredentialPolicy(t, identityPolicyID, map[string]any{
+		"allowed_grant_types": []string{},
+	}, adminHeaders())
+
+	keyPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("subset-gt-key-cp"),
+		"allowed_grant_types":  []string{"api_key"},
+		"max_delegation_depth": 1,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+
+	identityID := registerIdentityWithPolicy(t, uid("subset-gt-target"), identityPolicyID, "", nil, adminHeaders())
+
+	headers := adminHeaders()
+	headers["X-User-ID"] = "test-user"
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":                 "subset-gt-violation",
+		"identity_id":          identityID,
+		"credential_policy_id": keyPolicyID,
+	}, headers)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"empty allowed_grant_types on identity policy must still reject any narrower policy that declares a grant type (deny-by-default semantic)")
+}
+
 // TestAPIKeyCreate_SubsetInvariant_TTLBroader verifies the TTL axis of the
 // subset invariant. A key policy with longer max_ttl_seconds than the
 // identity policy is rejected.

@@ -644,9 +644,18 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	scopes := parseScopeString(req.Scope)
 	scopes = intersectScopes(scopes, sk.Scopes)
 	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
-		if kp, err := s.credentialSvc.policySvc.GetPolicy(ctx, sk.CredentialPolicyID, sk.AccountID, sk.ProjectID); err == nil {
-			scopes = intersectScopes(scopes, kp.AllowedScopes)
+		// Hard fail rather than silently skip the intersection: a
+		// transient DB error during scope resolution must not widen
+		// authority. IssueCredential's own policy lookup is a separate
+		// layer — we don't want to degrade layer one on the expectation
+		// that layer two will catch the miss, especially since a DB
+		// blip would likely fail there too with a less specific error.
+		// Same-shape failure matches jwtBearer/tokenExchange above.
+		kp, err := s.credentialSvc.policySvc.GetPolicy(ctx, sk.CredentialPolicyID, sk.AccountID, sk.ProjectID)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve API key credential policy", err)
 		}
+		scopes = intersectScopes(scopes, kp.AllowedScopes)
 	}
 	scopes = intersectScopes(scopes, identityPolicyScopes)
 	if len(identityPolicyScopes) == 0 && identity != nil {

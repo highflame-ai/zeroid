@@ -54,7 +54,8 @@ type RegisterAgentInput struct {
 		AllowedScopes []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
 		CreatedBy          string          `json:"created_by,omitempty" doc:"User ID of the creator"`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
-		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy for the auto-created API key (default: tenant default policy)"`
+		CredentialPolicyID       string `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
+		APIKeyCredentialPolicyID string `json:"api_key_credential_policy_id,omitempty" doc:"Optional narrower policy for the auto-created API key. Must be a subset of the identity policy (scopes, TTL, grant types, delegation depth, trust level, attestation). When empty, the API key inherits the identity policy."`
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
@@ -217,7 +218,8 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		AllowedScopes:      input.Body.AllowedScopes,
 		CreatedBy:          createdBy,
 		PublicKeyPEM:       input.Body.PublicKeyPEM,
-		CredentialPolicyID: input.Body.CredentialPolicyID,
+		CredentialPolicyID:       input.Body.CredentialPolicyID,
+		APIKeyCredentialPolicyID: input.Body.APIKeyCredentialPolicyID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
