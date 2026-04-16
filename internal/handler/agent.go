@@ -221,6 +221,11 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
 		}
+		// Caller-supplied credential_policy_id that doesn't exist in this tenant
+		// is a client error, not a server error.
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register agent")
 		return nil, huma.Error500InternalServerError("failed to register agent")
 	}

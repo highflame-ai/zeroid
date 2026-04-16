@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -131,6 +132,12 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Metadata:           input.Body.Metadata,
 	})
 	if err != nil {
+		// Caller-supplied credential_policy_id that doesn't exist in this tenant
+		// is a client error, not a server error — return 400 so the caller can
+		// correct the request.
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create API key")
 		return nil, huma.Error500InternalServerError("failed to create API key")
 	}

@@ -86,6 +86,15 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 			return nil, fmt.Errorf("failed to ensure default credential policy: %w", err)
 		}
 		policyID = defaultPolicy.ID
+	} else {
+		// Verify a caller-supplied policy ID actually belongs to this tenant
+		// before using it. GetPolicy is already scoped by (accountID, projectID)
+		// and returns ErrPolicyNotFound on either "does not exist" or
+		// "belongs to a different tenant" — blocking cross-tenant IDOR where a
+		// user could associate a key with another org's credential policy.
+		if _, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID); err != nil {
+			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
+		}
 	}
 
 	rawKey, keyHash, displayPrefix, err := generateAPIKey(domain.APIKeyPrefix)
