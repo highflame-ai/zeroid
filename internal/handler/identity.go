@@ -170,7 +170,7 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		return nil, huma.Error400BadRequest("invalid sub_type for the given identity_type")
 	}
 
-	createdBy := internalMiddleware.GetCallerName(ctx)
+	callerUserID := internalMiddleware.GetCallerName(ctx)
 
 	identity, err := a.identitySvc.RegisterIdentity(ctx, service.RegisterIdentityRequest{
 		AccountID:     tenant.AccountID,
@@ -189,7 +189,8 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		Description:   input.Body.Description,
 		Capabilities:  input.Body.Capabilities,
 		Labels:        input.Body.Labels,
-		CreatedBy:     createdBy,
+		CreatedBy:     callerUserID,
+		CallerUserID:  callerUserID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -292,6 +293,7 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Labels:        input.Body.Labels,
 		Metadata:      input.Body.Metadata,
 		Status:        status,
+		CallerUserID:  internalMiddleware.GetCallerName(ctx),
 	})
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")
@@ -307,7 +309,7 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*st
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	if err := a.identitySvc.DeleteIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+	if err := a.identitySvc.DeleteIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID, internalMiddleware.GetCallerName(ctx)); err != nil {
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to delete identity")
 		return nil, huma.Error500InternalServerError("failed to delete identity")
 	}
