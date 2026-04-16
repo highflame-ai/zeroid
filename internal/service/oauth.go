@@ -779,8 +779,10 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 	}
 
 	if record.CredentialJTI != nil && *record.CredentialJTI != "" {
-		cred, _, _ := s.credentialSvc.IntrospectToken(ctx, *record.CredentialJTI)
-		if cred != nil {
+		cred, _, introspectErr := s.credentialSvc.IntrospectToken(ctx, *record.CredentialJTI)
+		if introspectErr != nil {
+			log.Error().Err(introspectErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to introspect access token for revocation")
+		} else if cred != nil {
 			if revokeErr := s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "auth_code_replay"); revokeErr != nil {
 				log.Error().Err(revokeErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to revoke access token")
 			} else {
