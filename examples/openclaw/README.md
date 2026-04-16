@@ -18,6 +18,28 @@ We show the main OpenClaw agent with full permissions delegate a restricted, wri
 * **Instant Cascading Revocation:** ZeroID tracks the delegation tree internally. If you revoke an orchestrator's credential, every downstream sub-agent is instantly revoked. It also supports Continuous Access Evaluation for real-time anomaly response.
 * **Zero-Rewrite Integration:** No framework rewrites required. ZeroID uses a sidecar for registration and a reverse proxy (Nginx, Caddy, Traefik) to validate tokens and forward identity headers.
 
+### Try it yourself
+First spinup the ZeroID instance with Nginx as an LLM proxy
+```bash
+export XAI_API_KEY=xai-...
+docker compose up -d
+```
+Create a virtual environment and install dependencies for the sidecar
+```bash
+uv venv
+. .venv/bin/activate
+uv pip install highflame cryptography
+```
+Run the sidecar to register agents from your config.json, and replace provider API keys with ZeroID short-lived tokens
+```bash
+.venv/bin/python agent_identity_sidecar.py --config config.json
+```
+Done, now your agent is routed through Nginx proxy which verifies the ZeroID token at each call. Revocation is instant.
+
+In another terminal run the revocation script
+```bash
+.venv/bin/python demo-revoke.py --config config.json --agent main
+```
 ### Built on Industry Standards
 The OpenID Foundation, NIST, and WIMSE all identify agent identity as a critical unsolved problem. ZeroID implements these requirements via **OAuth 2.1**, **WIMSE/SPIFFE**, and **RFC 8693**.
 

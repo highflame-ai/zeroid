@@ -145,10 +145,12 @@ Standard scopes for coding agents and MCP servers. Using this vocabulary ensures
 
 ```bash
 pip install highflame        # Python
-npm install @highflame/zeroid   # Node / TypeScript
+npm install @highflame/sdk   # Node / TypeScript
 ```
 
 Prefer a runnable walkthrough after installing the SDK? Open the [ZeroID Quickstart notebook](examples/zeroid_quickstart.ipynb) for an end-to-end demo covering agent registration, OAuth client credentials, agent-to-agent delegation, token introspection and revocation, credential policies, and CAE signals.
+
+Want a LangChain-specific intro? Open the [Scope-Aware Tools notebook](examples/langchain/scope_aware_tools.ipynb) to see the same agent gain or lose tool access purely by changing its ZeroID token.
 
 **Run ZeroID locally** (Docker — 30 seconds):
 
@@ -197,7 +199,7 @@ client = ZeroIDClient(
 <summary>TypeScript</summary>
 
 ```typescript
-import { ZeroIDClient } from "@highflame/zeroid";
+import { ZeroIDClient } from "@highflame/sdk";
 const client = new ZeroIDClient({
   baseUrl: "http://localhost:8899",
   apiKey: "zid_sk_...",
@@ -390,9 +392,8 @@ agent = client.agents.register(
 # Agent runs autonomously. Per-action approvals are replaced by the policy envelope.
 # If the agent tries to request billing:write or customer:delete — ZeroID rejects the token request.
 # No runtime intervention needed; the policy is the control.
-token = client.tokens.issue(
-    grant_type="api_key",
-    api_key=agent.api_key,
+token = client.tokens.issue_api_key(
+    agent.api_key,
     scope="campaigns:read campaigns:write budget:reallocate",
 )
 ```
@@ -511,8 +512,7 @@ client.agents.deactivate(monitor.identity.id)
 ```python
 # Alice authenticates via authorization_code + PKCE
 # Her user token is exchanged so the assistant can act on her behalf
-assistant_token = client.tokens.issue(
-    grant_type="urn:ietf:params:oauth:grant-type:token-exchange",
+assistant_token = client.tokens.issue_token_exchange(
     subject_token=alice_user_token,      # alice's authorization_code-issued token
     actor_token=build_jwt_assertion(assistant.identity.wimse_uri, assistant_private_key),
     scope="calendar:read travel:book expenses:submit",

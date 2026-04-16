@@ -1,0 +1,47 @@
+{                                                                                                                                                                                      
+    "proxy_base_url": {
+      "xai": "http://127.0.0.1:8081/xai/v1",
+      "anthropic": "http://127.0.0.1:8081/anthropic/v1",
+      "*": "http://127.0.0.1:8081/{provider}/"
+    },
+                                                                                                                                                                                         
+    "provider_key_env_vars": {                                                                                                                                                           
+      "anthropic": "ANTHROPIC_API_KEY",                                                                                                                                                  
+      "xai": "XAI_API_KEY",                                                                                                                                                            
+      "*": "PROVIDER_API_KEY"                                                                                                                                                            
+    },
+                                                                                                                                                                                         
+    "scope_tool_map": {                                                                                                                                                                
+      "tools:minimal":   { "profile": "minimal" },
+      "tools:coding":    { "profile": "coding" },                                                                                                                                        
+      "tools:messaging": { "profile": "messaging", "deny": ["web_fetch", "exec"] },
+      "tools:full":      { "profile": "full" }                                                                                                                                           
+    },                                                                                                                                                                                 
+                                                                                                                                                                                         
+    "zeroid_url": "http://127.0.0.1:8899",
+    "admin_account_id": "default",
+    "admin_user_id": "admin",
+    "admin_project_id": "default",
+                                                                                                                                                                                         
+    "agent_key_store": "~/.openclaw/sidecar-agent-keys.json",                                                                                                                            
+    "token_refresh_buffer_secs": 60,
+                                                                                                                                                                                         
+    "agents": {   
+      "main": {
+        "external_id": "main-agent",
+        "scope": "tools:full",                                                                                                                                                         
+        "allowed_scopes": ["tools:full"]
+      },                                                                                                                                                                                 
+      "sub": {      
+        "external_id": "sub-agent",                                                                                                                                                 
+        "scope": "tools:full",
+	"delegated_from": "main",
+        "allowed_scopes": ["tools:full"]                                                                                                                                              
+      },           
+      "*": {      
+        "external_id": "fallback-agent",                                                                                                                                                 
+        "scope": "tools:minimal",
+        "allowed_scopes": ["tools:minimal"]                                                                                                                                              
+      }           
+    }
+  }
