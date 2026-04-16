@@ -154,7 +154,7 @@ func NewServer(cfg Config) (*Server, error) {
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
-	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
+	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo)
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
