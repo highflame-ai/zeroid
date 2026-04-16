@@ -53,10 +53,10 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 			"urn:ietf:params:oauth:grant-type:token-exchange",
 			"api_key",
 		},
-		"jwks_uri":                                         a.baseURL + "/.well-known/jwks.json",
-		"introspection_endpoint":                           a.baseURL + "/oauth2/token/introspect",
-		"revocation_endpoint":                              a.baseURL + "/oauth2/token/revoke",
-		"response_types_supported":                         []string{"token"},
+		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
+		"introspection_endpoint":   a.baseURL + "/oauth2/token/introspect",
+		"revocation_endpoint":      a.baseURL + "/oauth2/token/revoke",
+		"response_types_supported": []string{"token"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 	}}, nil
 }

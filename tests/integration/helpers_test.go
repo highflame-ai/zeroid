@@ -18,10 +18,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"strings"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 

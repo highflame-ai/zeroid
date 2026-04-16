@@ -72,4 +72,3 @@ func (r *AuthCodeRepository) UpdateTokenInfo(ctx context.Context, jti, credentia
 	}
 	return nil
 }
-
