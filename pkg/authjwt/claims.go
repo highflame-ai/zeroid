@@ -125,7 +125,7 @@ func (c *Claims) Agent() *AgentIdentity {
 		TrustLevel:      c.TrustLevel,
 		Name:            c.Name,
 		Framework:       c.Framework,
-		Publisher:        c.Publisher,
+		Publisher:       c.Publisher,
 		Capabilities:    c.Capabilities,
 		Scopes:          c.Scopes,
 		DelegationDepth: c.DelegationDepth,
@@ -254,7 +254,7 @@ func extractClaims(token jwt.Token) *Claims {
 		"external_id": {}, "identity_type": {}, "sub_type": {}, "trust_level": {},
 		"status": {}, "name": {}, "framework": {}, "version": {}, "publisher": {},
 		"capabilities": {},
-		"grant_type": {}, "scopes": {}, "delegation_depth": {},
+		"grant_type":   {}, "scopes": {}, "delegation_depth": {},
 		"act": {},
 	}
 

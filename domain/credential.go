@@ -30,7 +30,7 @@ const (
 // urnToShortGrantType maps OAuth2 URN grant type identifiers to their canonical short forms.
 var urnToShortGrantType = map[string]GrantType{
 	"urn:ietf:params:oauth:grant-type:jwt-bearer":     GrantTypeJWTBearer,
-	"urn:ietf:params:oauth:grant-type:token-exchange":  GrantTypeTokenExchange,
+	"urn:ietf:params:oauth:grant-type:token-exchange": GrantTypeTokenExchange,
 }
 
 // allValidGrantTypes is the set of all recognised canonical short forms.

@@ -41,8 +41,8 @@ type RefreshTokenParams struct {
 
 // RefreshTokenResult contains both the raw token (returned to client) and stored metadata.
 type RefreshTokenResult struct {
-	RawToken  string    // Returned to client once — never stored.
-	FamilyID  string    // For audit/debugging.
+	RawToken  string // Returned to client once — never stored.
+	FamilyID  string // For audit/debugging.
 	ExpiresAt time.Time
 }
 

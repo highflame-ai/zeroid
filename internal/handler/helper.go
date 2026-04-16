@@ -24,4 +24,3 @@ func respondWithError(w http.ResponseWriter, status int, internalCode, message s
 	errResp := domain.NewErrorResponse(status, internalCode, message)
 	respondWithJSON(w, status, errResp)
 }
-

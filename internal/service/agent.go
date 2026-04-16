@@ -156,7 +156,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 
 	return &AgentRegistrationResponse{
 		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
-		APIKey: skResp.FullKey,
+		APIKey:   skResp.FullKey,
 	}, nil
 }
 
@@ -314,7 +314,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 
 	return &AgentRegistrationResponse{
 		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
-		APIKey: skResp.FullKey,
+		APIKey:   skResp.FullKey,
 	}, nil
 }
 
