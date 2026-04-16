@@ -17,14 +17,28 @@ const (
 	DefaultMaxTTLSeconds = 3600
 
 	// DefaultMaxDelegationDepth is the default maximum delegation chain depth.
-	DefaultMaxDelegationDepth = 1
+	// Set generously so out-of-the-box multi-hop agent chains
+	// (orchestrator → sub-agent → tool-agent → …) succeed without custom
+	// policies. Tenants that require stricter delegation limits attach a
+	// narrower policy explicitly. The revocation cascade caps traversal
+	// at 50 independently (migration 007).
+	DefaultMaxDelegationDepth = 5
 )
 
-// DefaultAllowedGrantTypes returns the grant types permitted by the default policy.
+// DefaultAllowedGrantTypes returns the grant types permitted by the default
+// policy. It covers every NHI-facing grant so that out-of-the-box tenants can
+// exercise the full OAuth surface without authoring a policy first. Tenants
+// who want to restrict grants (e.g. block delegation, disallow API keys)
+// must author a custom policy and attach it at identity registration.
+//
+// authorization_code and refresh_token are omitted because they flow through
+// oauth_clients (not identities) and are gated by the client's grant_types.
 func DefaultAllowedGrantTypes() []string {
 	return []string{
-		string(GrantTypeAPIKey),
 		string(GrantTypeClientCredentials),
+		string(GrantTypeAPIKey),
+		string(GrantTypeJWTBearer),
+		string(GrantTypeTokenExchange),
 	}
 }
 

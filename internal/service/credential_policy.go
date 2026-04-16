@@ -22,6 +22,12 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
+// ErrPolicySubsetViolation is returned when a would-be API-key policy is
+// broader than the owning identity's policy along any axis (scopes, TTL,
+// grant types, delegation depth, trust level, attestation). Returned as a
+// client error (HTTP 400) so the caller can correct the request.
+var ErrPolicySubsetViolation = errors.New("credential policy is broader than the identity policy")
+
 // CredentialPolicyService handles credential policy lifecycle and enforcement.
 type CredentialPolicyService struct {
 	repo *postgres.CredentialPolicyRepository
@@ -293,6 +299,89 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 	// 6. Delegation depth <= policy.max_delegation_depth
 	if req.DelegationDepth > policy.MaxDelegationDepth {
 		return fmt.Errorf("%w: delegation depth %d exceeds policy maximum %d", ErrPolicyViolation, req.DelegationDepth, policy.MaxDelegationDepth)
+	}
+
+	return nil
+}
+
+// EnforceSubset verifies that narrower is no broader than wider along every
+// axis of the credential policy. Used at API-key creation time to reject
+// keys whose policy would grant more than the owning identity's policy
+// permits. Runtime enforcement in IssueCredential is still mandatory (see
+// the policy-drift note there), but failing fast here gives callers a
+// precise error instead of a later opaque invalid_scope at token issuance.
+//
+// Axis semantics:
+//   - AllowedScopes: narrower ⊆ wider. Empty on wider means "no
+//     restriction" (passes for any narrower set).
+//   - AllowedGrantTypes: narrower ⊆ wider. Always required (both sides
+//     must declare at least one grant type).
+//   - MaxTTLSeconds: narrower ≤ wider. Longer-lived keys are rejected.
+//   - MaxDelegationDepth: narrower ≤ wider. Deeper chains are rejected.
+//   - RequiredTrustLevel: narrower rank ≥ wider rank. A key policy may
+//     require equal or stricter trust, never weaker.
+//   - RequiredAttestation: narrower rank ≥ wider rank. Same direction.
+func (s *CredentialPolicyService) EnforceSubset(narrower, wider *domain.CredentialPolicy) error {
+	if narrower == nil || wider == nil {
+		return nil
+	}
+
+	// Scope ceiling: narrower.AllowedScopes must be ⊆ wider.AllowedScopes
+	// when wider declares restrictions. Empty wider means no restriction
+	// and any narrower set is legal.
+	if len(wider.AllowedScopes) > 0 {
+		widerSet := make(map[string]bool, len(wider.AllowedScopes))
+		for _, s := range wider.AllowedScopes {
+			widerSet[s] = true
+		}
+		for _, scope := range narrower.AllowedScopes {
+			if !widerSet[scope] {
+				return fmt.Errorf("%w: scope %q permitted by credential policy but not by identity policy", ErrPolicySubsetViolation, scope)
+			}
+		}
+	}
+
+	// Grant-type ceiling. Both sides are required to declare a non-empty
+	// grant-type list (enforced at policy creation), so we can always do
+	// the subset check directly.
+	if len(wider.AllowedGrantTypes) > 0 {
+		widerGT := make(map[string]bool, len(wider.AllowedGrantTypes))
+		for _, gt := range wider.AllowedGrantTypes {
+			widerGT[gt] = true
+		}
+		for _, gt := range narrower.AllowedGrantTypes {
+			if !widerGT[gt] {
+				return fmt.Errorf("%w: grant type %q permitted by credential policy but not by identity policy", ErrPolicySubsetViolation, gt)
+			}
+		}
+	}
+
+	// TTL ceiling.
+	if wider.MaxTTLSeconds > 0 && narrower.MaxTTLSeconds > wider.MaxTTLSeconds {
+		return fmt.Errorf("%w: max_ttl_seconds %d exceeds identity policy maximum %d",
+			ErrPolicySubsetViolation, narrower.MaxTTLSeconds, wider.MaxTTLSeconds)
+	}
+
+	// Delegation-depth ceiling.
+	if narrower.MaxDelegationDepth > wider.MaxDelegationDepth {
+		return fmt.Errorf("%w: max_delegation_depth %d exceeds identity policy maximum %d",
+			ErrPolicySubsetViolation, narrower.MaxDelegationDepth, wider.MaxDelegationDepth)
+	}
+
+	// Trust level — narrower must be at least as strict as wider.
+	if wider.RequiredTrustLevel != "" {
+		if domain.TrustLevelRank(narrower.RequiredTrustLevel) < domain.TrustLevelRank(wider.RequiredTrustLevel) {
+			return fmt.Errorf("%w: required_trust_level %q is weaker than identity policy's %q",
+				ErrPolicySubsetViolation, narrower.RequiredTrustLevel, wider.RequiredTrustLevel)
+		}
+	}
+
+	// Attestation — same direction as trust level.
+	if wider.RequiredAttestation != "" {
+		if attestationLevelRank(narrower.RequiredAttestation) < attestationLevelRank(wider.RequiredAttestation) {
+			return fmt.Errorf("%w: required_attestation %q is weaker than identity policy's %q",
+				ErrPolicySubsetViolation, narrower.RequiredAttestation, wider.RequiredAttestation)
+		}
 	}
 
 	return nil

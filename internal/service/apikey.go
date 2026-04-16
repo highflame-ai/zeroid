@@ -79,6 +79,24 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	}
 
 	// Ensure the key has a credential policy.
+	// Two layers of validation run here:
+	//
+	//   1. Tenant-scope IDOR guard (always): GetPolicy is scoped by
+	//      (accountID, projectID) and returns ErrPolicyNotFound if the
+	//      policy doesn't exist or belongs to a different tenant. This
+	//      blocks a user in tenant B from attaching tenant A's policy to
+	//      their key.
+	//
+	//   2. Subset invariant (when the key policy differs from the
+	//      identity policy): the key policy must be no broader than the
+	//      identity policy on every axis (scopes, TTL, grant types,
+	//      delegation depth, trust level, attestation). Failing here
+	//      gives a precise client-facing error at creation time.
+	//      Runtime dual-enforcement in IssueCredential is still the
+	//      authoritative security boundary (see the policy-drift note
+	//      there), but catching violations up front avoids a later
+	//      opaque invalid_scope at token issuance.
+	var keyPolicy *domain.CredentialPolicy
 	policyID := req.CredentialPolicyID
 	if policyID == "" {
 		defaultPolicy, err := s.credentialPolicySvc.EnsureDefaultPolicy(ctx, req.AccountID, req.ProjectID)
@@ -86,14 +104,33 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 			return nil, fmt.Errorf("failed to ensure default credential policy: %w", err)
 		}
 		policyID = defaultPolicy.ID
+		keyPolicy = defaultPolicy
 	} else {
-		// Verify a caller-supplied policy ID actually belongs to this tenant
-		// before using it. GetPolicy is already scoped by (accountID, projectID)
-		// and returns ErrPolicyNotFound on either "does not exist" or
-		// "belongs to a different tenant" — blocking cross-tenant IDOR where a
-		// user could associate a key with another org's credential policy.
-		if _, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID); err != nil {
+		p, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
+		if err != nil {
 			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
+		}
+		keyPolicy = p
+	}
+
+	// Enforce the subset invariant against the identity that will own this
+	// key. Skipped when the key inherits the identity policy verbatim (the
+	// common case — EnsureServiceIdentity-provisioned keys, or callers who
+	// don't override CredentialPolicyID), because a policy is trivially a
+	// subset of itself.
+	if req.IdentityID != "" {
+		identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load identity %s for subset check: %w", req.IdentityID, err)
+		}
+		if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
+			identityPolicy, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to load identity policy %s for subset check: %w", identity.CredentialPolicyID, err)
+			}
+			if err := s.credentialPolicySvc.EnforceSubset(keyPolicy, identityPolicy); err != nil {
+				return nil, err
+			}
 		}
 	}
 

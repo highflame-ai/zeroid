@@ -44,9 +44,13 @@ type RegisterAgentRequest struct {
 	Capabilities       json.RawMessage
 	Labels             json.RawMessage
 	Metadata           json.RawMessage
+	AllowedScopes      []string // Deprecated: set scope ceiling on the identity's credential policy.
 	CreatedBy          string
 	PublicKeyPEM       string
-	CredentialPolicyID string // Optional — if empty, the tenant's default policy is assigned to the auto-created API key.
+	// CredentialPolicyID is the identity policy — the authority ceiling for
+	// the new identity and for the auto-created API key. Must exist in the
+	// caller's tenant. If empty, the tenant default policy is assigned.
+	CredentialPolicyID string
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -111,25 +115,29 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		identityType = domain.IdentityTypeAgent
 	}
 
-	// 1. Create identity.
+	// 1. Create identity. CredentialPolicyID is the identity policy —
+	// attached at registration so the authority ceiling is fixed before
+	// any credential is issued for this identity.
 	identity, err := s.identitySvc.RegisterIdentity(ctx, RegisterIdentityRequest{
-		AccountID:    req.AccountID,
-		ProjectID:    req.ProjectID,
-		ExternalID:   req.ExternalID,
-		Name:         req.Name,
-		TrustLevel:   req.TrustLevel,
-		IdentityType: identityType,
-		SubType:      req.SubType,
-		OwnerUserID:  req.CreatedBy,
-		Framework:    req.Framework,
-		Version:      req.Version,
-		Publisher:    req.Publisher,
-		Description:  req.Description,
-		Capabilities: req.Capabilities,
-		Labels:       req.Labels,
-		Metadata:     req.Metadata,
-		CreatedBy:    req.CreatedBy,
-		PublicKeyPEM: req.PublicKeyPEM,
+		AccountID:          req.AccountID,
+		ProjectID:          req.ProjectID,
+		ExternalID:         req.ExternalID,
+		Name:               req.Name,
+		TrustLevel:         req.TrustLevel,
+		IdentityType:       identityType,
+		SubType:            req.SubType,
+		OwnerUserID:        req.CreatedBy,
+		Framework:          req.Framework,
+		Version:            req.Version,
+		Publisher:          req.Publisher,
+		Description:        req.Description,
+		Capabilities:       req.Capabilities,
+		Labels:             req.Labels,
+		Metadata:           req.Metadata,
+		AllowedScopes:      req.AllowedScopes,
+		CreatedBy:          req.CreatedBy,
+		PublicKeyPEM:       req.PublicKeyPEM,
+		CredentialPolicyID: req.CredentialPolicyID,
 	})
 	if err != nil {
 		return nil, err

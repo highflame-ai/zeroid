@@ -48,9 +48,10 @@ type RegisterAgentInput struct {
 		Version      string          `json:"version,omitempty" doc:"Agent version string"`
 		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
 		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
-		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
-		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
-		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
+		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels        json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
+		AllowedScopes []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
 		CreatedBy          string          `json:"created_by,omitempty" doc:"User ID of the creator"`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy for the auto-created API key (default: tenant default policy)"`
@@ -213,6 +214,7 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		Capabilities:       input.Body.Capabilities,
 		Labels:             input.Body.Labels,
 		Metadata:           input.Body.Metadata,
+		AllowedScopes:      input.Body.AllowedScopes,
 		CreatedBy:          createdBy,
 		PublicKeyPEM:       input.Body.PublicKeyPEM,
 		CredentialPolicyID: input.Body.CredentialPolicyID,
@@ -225,6 +227,11 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		// is a client error, not a server error.
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		// Subset invariant violation — the requested key policy is broader
+		// than the owning identity's policy along at least one axis.
+		if errors.Is(err, service.ErrPolicySubsetViolation) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register agent")
 		return nil, huma.Error500InternalServerError("failed to register agent")

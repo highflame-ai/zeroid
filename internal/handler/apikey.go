@@ -138,6 +138,12 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
+		// Subset invariant violation — the requested key policy is broader
+		// than the owning identity's policy. Surface the precise reason so
+		// the caller knows which axis to narrow.
+		if errors.Is(err, service.ErrPolicySubsetViolation) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create API key")
 		return nil, huma.Error500InternalServerError("failed to create API key")
 	}
