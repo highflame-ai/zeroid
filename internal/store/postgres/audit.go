@@ -47,7 +47,7 @@ func (r *AuditRepository) Insert(ctx context.Context, accountID, projectID, call
 		Status:       status,
 		OldData:      oldData,
 		NewData:      newData,
-		CreatedAt:    time.Now(),
+		CreatedAt:    time.Now().UTC(),
 	}
 	_, err := r.db.NewInsert().Model(entry).Exec(ctx)
 	return err
