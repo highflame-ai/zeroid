@@ -27,7 +27,10 @@ const {
   requireProfile,
   requireTenantContext,
   resolveContext,
+  getSelectedProfile,
   writeEnvFile,
+  writeEnvFileIfPresent,
+  updateProfileAPIKeyForIdentity,
 } = await import("../../src/lib/config.js");
 
 beforeEach(() => {
@@ -78,6 +81,26 @@ describe("getProfile / setProfile", () => {
     setProfile("default", { base_url: "http://old", account_id: "a", project_id: "p", api_key: "old" });
     setProfile("default", { base_url: "http://new", account_id: "a", project_id: "p", api_key: "new" });
     expect(getProfile("default")?.api_key).toBe("new");
+  });
+
+  it("returns the selected saved profile", () => {
+    setProfile("default", {
+      base_url: "http://localhost",
+      account_id: "a",
+      project_id: "p",
+      api_key: "k",
+      identity_id: "agt_123",
+    });
+    expect(getSelectedProfile()).toEqual({
+      name: "default",
+      profile: {
+        base_url: "http://localhost",
+        account_id: "a",
+        project_id: "p",
+        api_key: "k",
+        identity_id: "agt_123",
+      },
+    });
   });
 });
 
@@ -195,6 +218,54 @@ describe("writeEnvFile", () => {
       const contents = readFileSync(envPath, "utf8");
       expect(contents).toBe("ZID_API_KEY=zid_sk_test123\n");
       expect(statSync(envPath).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(envPath, { force: true });
+    }
+  });
+});
+
+describe("updateProfileAPIKeyForIdentity", () => {
+  it("updates the matching saved profile", () => {
+    setProfile("default", {
+      base_url: "http://localhost",
+      account_id: "a",
+      project_id: "p",
+      api_key: "old",
+      identity_id: "agt_123",
+    });
+
+    const updated = updateProfileAPIKeyForIdentity(undefined, "agt_123", "new");
+    expect(updated).toBe("default");
+    expect(getProfile("default")?.api_key).toBe("new");
+  });
+
+  it("does not update when the identity does not match", () => {
+    setProfile("default", {
+      base_url: "http://localhost",
+      account_id: "a",
+      project_id: "p",
+      api_key: "old",
+      identity_id: "agt_123",
+    });
+
+    const updated = updateProfileAPIKeyForIdentity(undefined, "agt_999", "new");
+    expect(updated).toBeUndefined();
+    expect(getProfile("default")?.api_key).toBe("old");
+  });
+});
+
+describe("writeEnvFileIfPresent", () => {
+  it("does nothing when .env.zeroid is absent", () => {
+    expect(writeEnvFileIfPresent("zid_sk_new")).toBe(false);
+  });
+
+  it("updates .env.zeroid when the file already exists", async () => {
+    const envPath = join(process.cwd(), ".env.zeroid");
+    try {
+      writeEnvFile("zid_sk_old");
+      expect(writeEnvFileIfPresent("zid_sk_new")).toBe(true);
+      const { readFileSync } = await import("node:fs");
+      expect(readFileSync(envPath, "utf8")).toBe("ZID_API_KEY=zid_sk_new\n");
     } finally {
       rmSync(envPath, { force: true });
     }

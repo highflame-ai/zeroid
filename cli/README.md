@@ -254,7 +254,9 @@ Revoke the agent's current API key and issue a new one.
 zid agents rotate-key agt_abc123
 ```
 
-The new API key is printed once and not stored — save it immediately.
+The new API key is printed once. If the selected saved profile belongs to the
+rotated agent, `zid` updates that profile automatically. If `.env.zeroid`
+already exists in the current directory, it is refreshed as well.
 
 | Flag | Description |
 |---|---|

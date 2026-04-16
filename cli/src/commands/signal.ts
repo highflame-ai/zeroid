@@ -7,9 +7,9 @@
  */
 
 import { Command } from "commander";
-import type { SignalType, SignalSeverity } from "@highflame/sdk";
 import { makeTenantClient } from "../lib/client.js";
 import { handleError, printJSON, printSuccess } from "../lib/output.js";
+import type { SignalType, SignalSeverity } from "../lib/types.js";
 
 export function registerSignal(program: Command): void {
   program

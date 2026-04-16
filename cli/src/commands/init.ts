@@ -6,10 +6,10 @@
  */
 
 import { Command } from "commander";
-import type { IdentityType, SubType } from "@highflame/sdk";
 import { makeTenantClient } from "../lib/client.js";
 import { setProfile, writeEnvFile } from "../lib/config.js";
 import { handleError, printJSON, printSuccess, printWarning } from "../lib/output.js";
+import type { IdentityType, SubType } from "../lib/types.js";
 
 export function registerInit(program: Command): void {
   program
@@ -49,6 +49,9 @@ export function registerInit(program: Command): void {
           account_id: result.identity.account_id,
           project_id: result.identity.project_id,
           api_key: result.api_key,
+          identity_id: result.identity.id,
+          external_id: result.identity.external_id,
+          wimse_uri: result.identity.wimse_uri,
         });
 
         if (opts.json) {

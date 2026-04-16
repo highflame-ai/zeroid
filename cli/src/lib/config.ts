@@ -16,6 +16,10 @@ export interface ClientContext {
   /** Required for tenant-scoped operations (agents, creds, signals). */
   project_id?: string;
   api_key?: string;
+  /** Optional identity metadata used for profile-aware UX flows. */
+  identity_id?: string;
+  external_id?: string;
+  wimse_uri?: string;
 }
 
 export interface Profile extends ClientContext {
@@ -111,6 +115,36 @@ export function requireBaseURL(name?: string): string {
   return resolveContext(name)?.base_url ?? DEFAULT_BASE_URL;
 }
 
+export function getSelectedProfile(name?: string): { name: string; profile: Profile } | undefined {
+  const cfg = _read();
+  const key = name ?? cfg.active_profile;
+  if (!key || !cfg.profiles[key]) {
+    return undefined;
+  }
+  return { name: key, profile: cfg.profiles[key] };
+}
+
+export function updateProfileAPIKeyForIdentity(
+  name: string | undefined,
+  identityId: string,
+  apiKey: string,
+): string | undefined {
+  const cfg = _read();
+  const key = name ?? cfg.active_profile;
+  if (!key) {
+    return undefined;
+  }
+
+  const profile = cfg.profiles[key];
+  if (!profile || profile.identity_id !== identityId) {
+    return undefined;
+  }
+
+  cfg.profiles[key] = { ...profile, api_key: apiKey };
+  _write(cfg);
+  return key;
+}
+
 export function resolveContext(name?: string): ClientContext | undefined {
   const profile = getProfile(name);
   const env = contextFromEnv();
@@ -151,4 +185,13 @@ export function writeEnvFile(apiKey: string): void {
     encoding: "utf8",
     mode: 0o600,
   });
+}
+
+export function writeEnvFileIfPresent(apiKey: string): boolean {
+  const envPath = join(process.cwd(), ".env.zeroid");
+  if (!existsSync(envPath)) {
+    return false;
+  }
+  writeEnvFile(apiKey);
+  return true;
 }
