@@ -3,8 +3,10 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwt"
@@ -12,6 +14,8 @@ import (
 
 // AuthCodeClaims holds the decoded claims from an authorization code JWT.
 type AuthCodeClaims struct {
+	JTI           string   // JWT ID (jti claim or derived hash)
+	ExpiresAt     time.Time // Token expiration
 	ClientID      string   // "cid" — Client application ID
 	CodeChallenge string   // "cc"  — PKCE code challenge (S256)
 	RedirectURI   string   // "ruri" — OAuth redirect URI
@@ -42,7 +46,18 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 		return nil, fmt.Errorf("auth code has invalid subject: %s", token.Subject())
 	}
 
+	// Use the JWT's jti claim if present; otherwise derive a deterministic
+	// identifier from the SHA-256 hash of the raw code string. This ensures
+	// replay protection works even for auth codes issued without a jti.
+	jti := token.JwtID()
+	if jti == "" {
+		h := sha256.Sum256([]byte(code))
+		jti = "derived:" + hex.EncodeToString(h[:])
+	}
+
 	claims := &AuthCodeClaims{
+		JTI:           jti,
+		ExpiresAt:     token.Expiration(),
 		ClientID:      getStringClaim(token, "cid"),
 		CodeChallenge: getStringClaim(token, "cc"),
 		RedirectURI:   getStringClaim(token, "ruri"),

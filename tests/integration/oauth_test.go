@@ -49,7 +49,7 @@ func TestClientCredentialsFlow(t *testing.T) {
 	// Agent: revoke the token (RFC 7009 — must return 200 regardless).
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": accessToken}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// Introspect again: token must now be inactive.
 	result = introspect(t, accessToken)
@@ -91,7 +91,7 @@ func TestClientCredentialsWrongSecret(t *testing.T) {
 		"client_secret": "wrong-secret",
 	}, nil)
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestJWTBearerFlow exercises the full RFC 7523 jwt_bearer flow:
@@ -147,7 +147,7 @@ func TestJWTBearerWrongKey(t *testing.T) {
 		"scope":      "data:read",
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestTokenExchangeFlow exercises the full RFC 8693 token_exchange / agent delegation flow:
@@ -248,7 +248,7 @@ func TestTokenExchangeScopeEnforcement(t *testing.T) {
 		assert.NotContains(t, scope, "data:write", "data:write must not be granted when orchestrator lacks it")
 	} else {
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }
 
@@ -273,7 +273,7 @@ func TestRevokedSubjectTokenCannotDelegate(t *testing.T) {
 	// Revoke the orchestrator token.
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchToken}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// Attempt token_exchange with the now-revoked token.
 	subKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -289,7 +289,7 @@ func TestRevokedSubjectTokenCannotDelegate(t *testing.T) {
 		"scope":         "data:read",
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "revoked subject_token must be rejected")
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestRevokeMissingTokenReturns200 verifies RFC 7009 §2.2: revoke always returns 200
@@ -297,7 +297,7 @@ func TestRevokedSubjectTokenCannotDelegate(t *testing.T) {
 func TestRevokeMissingTokenReturns200(t *testing.T) {
 	resp := post(t, "/oauth2/token/revoke", map[string]string{"token": "not-a-real-token"}, nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestIntrospectUnknownToken verifies that introspecting an unknown token returns active:false.
@@ -335,7 +335,7 @@ func TestAPIKeyGrant(t *testing.T) {
 	// Revoke and confirm inactive.
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": accessToken}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	result = introspect(t, accessToken)
 	assert.False(t, result["active"].(bool))
@@ -560,7 +560,7 @@ func TestRevokeTokenCascadesToChildren(t *testing.T) {
 	// ── Revoke only the orchestrator token ───────────────────────────────────
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchToken}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// ── All three must now be inactive ───────────────────────────────────────
 	assert.False(t, introspect(t, orchToken)["active"].(bool),
@@ -627,7 +627,7 @@ func TestRevokeMidChainDoesNotRevokeParent(t *testing.T) {
 	// ── Revoke depth-1 only ──────────────────────────────────────────────────
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": depth1Token}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// ── Parent (depth=0) must remain active ──────────────────────────────────
 	assert.True(t, introspect(t, orchToken)["active"].(bool),
@@ -680,7 +680,7 @@ func TestRevokeCascadesFanOut(t *testing.T) {
 	// ── Revoke orchestrator ───────────────────────────────────────────────────
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchToken}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// ── All children must be inactive ────────────────────────────────────────
 	assert.False(t, introspect(t, orchToken)["active"].(bool), "orchestrator must be inactive")
@@ -736,7 +736,7 @@ func TestRevokeDoesNotAffectSiblingChains(t *testing.T) {
 	// Revoke chain A only.
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": orchA}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// Chain A is gone.
 	assert.False(t, introspect(t, orchA)["active"].(bool), "orch-A must be inactive")
@@ -789,7 +789,7 @@ func TestRevokeDeepChain(t *testing.T) {
 	// ── Revoke the root ───────────────────────────────────────────────────────
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": tokens[0]}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// ── All four must be inactive ─────────────────────────────────────────────
 	for i, tok := range tokens {
@@ -819,14 +819,14 @@ func TestRevokeIsIdempotent(t *testing.T) {
 	// First revocation.
 	r1 := post(t, "/oauth2/token/revoke", map[string]string{"token": token}, nil)
 	assert.Equal(t, http.StatusOK, r1.StatusCode)
-	r1.Body.Close()
+	_ = r1.Body.Close()
 
 	assert.False(t, introspect(t, token)["active"].(bool), "token must be inactive after first revocation")
 
 	// Second revocation of the same token — must still return 200.
 	r2 := post(t, "/oauth2/token/revoke", map[string]string{"token": token}, nil)
 	assert.Equal(t, http.StatusOK, r2.StatusCode, "second revocation must return 200 per RFC 7009")
-	r2.Body.Close()
+	_ = r2.Body.Close()
 
 	assert.False(t, introspect(t, token)["active"].(bool), "token must remain inactive after second revocation")
 }
