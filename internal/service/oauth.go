@@ -681,6 +681,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Placed after all validation (client, redirect_uri, PKCE) so an
 	// attacker who intercepts a code but doesn't know the verifier cannot
 	// burn it by sending a request with a wrong verifier.
+	//
+	// Consume → IssueCredential → IssueRefreshToken → UpdateTokenInfo is
+	// not transactional. A replay arriving between Consume and
+	// UpdateTokenInfo is still rejected (the critical correctness
+	// property), but revokeAuthCodeTokens may find CredentialJTI unset and
+	// leave the in-flight exchange's tokens valid. RFC 6749 §4.1.2 says
+	// "SHOULD revoke" — best-effort revocation is acceptable here.
 	consumed, err := s.authCodeRepo.Consume(ctx, &domain.AuthCode{
 		JTI:       authCode.JTI,
 		ClientID:  authCode.ClientID,
