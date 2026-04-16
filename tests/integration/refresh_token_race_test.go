@@ -2,14 +2,20 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun"
+
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // TestRefreshTokenConcurrentRotation closes the RFC 6749 §6 rotation race:
@@ -116,6 +122,88 @@ func TestRefreshTokenReuseRevokesFamily(t *testing.T) {
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"rt2 must be revoked once reuse was detected on its sibling rt1")
+}
+
+// TestRefreshTokenRotationRollbackOnInsertFailure verifies that when the
+// successor insert fails during rotation, the Postgres transaction rolls back
+// the claim UPDATE and leaves the original token active. This is the specific
+// property that protects a client from a transient DB error turning into a
+// forced family revocation on retry.
+//
+// Primarily this pins the contract that repo methods honor the bun.IDB they
+// are given — if someone accidentally reverts ClaimByTokenHash or Create to
+// use r.db directly, the transaction would no longer cover them and this test
+// would fail.
+func TestRefreshTokenRotationRollbackOnInsertFailure(t *testing.T) {
+	ctx := context.Background()
+	repo := postgres.NewRefreshTokenRepository(testDB)
+
+	// Seed two unrelated refresh tokens with known hashes.
+	victimHash := "rollback-victim-hash-" + uid("")
+	colliderHash := "rollback-collider-hash-" + uid("")
+
+	victim := &domain.RefreshToken{
+		TokenHash: victimHash,
+		ClientID:  testMCPClientID,
+		AccountID: testAccountID,
+		ProjectID: testProjectID,
+		UserID:    "user-rollback-victim",
+		Scopes:    "data:read",
+		FamilyID:  "00000000-0000-0000-0000-00000000aaaa",
+		State:     domain.RefreshTokenStateActive,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, repo.Create(ctx, testDB, victim))
+
+	collider := &domain.RefreshToken{
+		TokenHash: colliderHash,
+		ClientID:  testMCPClientID,
+		AccountID: testAccountID,
+		ProjectID: testProjectID,
+		UserID:    "user-rollback-collider",
+		Scopes:    "data:read",
+		FamilyID:  "00000000-0000-0000-0000-00000000bbbb",
+		State:     domain.RefreshTokenStateActive,
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(t, repo.Create(ctx, testDB, collider))
+
+	// Drive the same claim + insert flow the service uses, but craft the
+	// successor to collide with `collider` on token_hash (UNIQUE violation).
+	txErr := testDB.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		claimed, err := repo.ClaimByTokenHash(ctx, tx, victimHash)
+		if err != nil {
+			return err
+		}
+		require.Equal(t, victimHash, claimed.TokenHash)
+
+		successor := &domain.RefreshToken{
+			TokenHash: colliderHash, // forces UNIQUE violation on insert
+			ClientID:  claimed.ClientID,
+			AccountID: claimed.AccountID,
+			ProjectID: claimed.ProjectID,
+			UserID:    claimed.UserID,
+			Scopes:    claimed.Scopes,
+			FamilyID:  claimed.FamilyID,
+			State:     domain.RefreshTokenStateActive,
+			ExpiresAt: time.Now().Add(1 * time.Hour),
+		}
+		return repo.Create(ctx, tx, successor)
+	})
+	require.Error(t, txErr, "successor insert must fail with a UNIQUE violation")
+
+	// The claim UPDATE should have been rolled back — victim must be active.
+	got, err := repo.GetByTokenHash(ctx, victimHash)
+	require.NoError(t, err, "victim must still be retrievable as an active, non-expired token")
+	assert.Equal(t, domain.RefreshTokenStateActive, got.State,
+		"claim must have rolled back; victim should not be revoked")
+
+	// A subsequent legitimate claim must now succeed — i.e., the rollback fully
+	// restored the row, not just its state column.
+	reclaimed, err := repo.ClaimByTokenHash(ctx, testDB, victimHash)
+	require.NoError(t, err, "second claim after rollback must succeed")
+	assert.Equal(t, domain.RefreshTokenStateRevoked, reclaimed.State,
+		"claimed row reflects the revoked state returned by UPDATE RETURNING")
 }
 
 // rotateRaw issues a refresh_token grant request directly without going through
