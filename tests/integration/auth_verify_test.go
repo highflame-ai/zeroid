@@ -29,7 +29,7 @@ func issueAPIKeyToken(t *testing.T, externalID string) string {
 // challenge.
 func TestAuthVerify_MissingAuthorizationHeader(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", nil)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, `Bearer error="missing_token"`, resp.Header.Get("WWW-Authenticate"))
@@ -41,7 +41,7 @@ func TestAuthVerify_WrongScheme(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Basic dXNlcjpwYXNz",
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, `Bearer error="invalid_request"`, resp.Header.Get("WWW-Authenticate"))
@@ -53,7 +53,7 @@ func TestAuthVerify_EmptyBearerToken(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Bearer   ",
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, `Bearer error="invalid_request"`, resp.Header.Get("WWW-Authenticate"))
@@ -65,7 +65,7 @@ func TestAuthVerify_InvalidToken(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Bearer not.a.valid.jwt",
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, `Bearer error="invalid_token"`, resp.Header.Get("WWW-Authenticate"))
@@ -80,7 +80,7 @@ func TestAuthVerify_ValidToken(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Bearer " + token,
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, "application/json", resp.Header.Get("Content-Type"))
@@ -101,13 +101,13 @@ func TestAuthVerify_RevokedToken(t *testing.T) {
 	// Revoke the token.
 	revokeResp := post(t, "/oauth2/token/revoke", map[string]string{"token": token}, nil)
 	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
-	revokeResp.Body.Close()
+	_ = revokeResp.Body.Close()
 
 	// Verify must now reject it.
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Bearer " + token,
 	})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, `Bearer error="invalid_token"`, resp.Header.Get("WWW-Authenticate"))
@@ -135,7 +135,7 @@ func authVerifyHeaders(t *testing.T, token string) http.Header {
 	resp := get(t, "/oauth2/token/verify", map[string]string{
 		"Authorization": "Bearer " + token,
 	})
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return resp.Header
 }

@@ -50,7 +50,7 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 		"allowed_scopes": []string{"billing:read"},
 	}, adminHeaders())
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestRegisterIdentityMissingExternalID verifies that omitting external_id returns 400/422.
@@ -64,7 +64,7 @@ func TestRegisterIdentityMissingExternalID(t *testing.T) {
 		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity,
 		"expected 400 or 422 for missing external_id, got %d", resp.StatusCode,
 	)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestGetIdentity verifies that GET /api/v1/identities/{id} returns the identity.
@@ -85,7 +85,7 @@ func TestGetIdentity(t *testing.T) {
 func TestGetIdentityNotFound(t *testing.T) {
 	resp := get(t, adminPath("/identities/00000000-0000-0000-0000-000000000000"), adminHeaders())
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 // TestListIdentities verifies that the list endpoint returns identities scoped to the tenant.
@@ -183,7 +183,7 @@ func TestDeleteIdentity(t *testing.T) {
 	resp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+identity.ID), nil, adminHeaders())
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 }
 
 func TestServerGetIdentity(t *testing.T) {
@@ -299,7 +299,7 @@ func TestListAgentsFilterByIsActive(t *testing.T) {
 	deactivateResp, err := doRaw(t, http.MethodPost, adminPath("/agents/registry/"+agentID+"/deactivate"), nil, adminHeaders())
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, deactivateResp.StatusCode)
-	deactivateResp.Body.Close()
+	_ = deactivateResp.Body.Close()
 
 	// is_active=true should exclude deactivated.
 	resp = get(t, adminPath("/agents/registry?is_active=true&label=test:active-filter"), adminHeaders())

@@ -199,28 +199,28 @@ func writeKeyFiles(privKey *ecdsa.PrivateKey) (privPath, pubPath string, cleanup
 		return "", "", nil, err
 	}
 	if err := pem.Encode(privFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privDER}); err != nil {
-		privFile.Close()
-		os.Remove(privFile.Name())
+		_ = privFile.Close()
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
-	privFile.Close()
+	_ = privFile.Close()
 
 	pubFile, err := os.CreateTemp("", "zeroid-test-pub-*.pem")
 	if err != nil {
-		os.Remove(privFile.Name())
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
 	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
-		pubFile.Close()
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = pubFile.Close()
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 		return "", "", nil, err
 	}
-	pubFile.Close()
+	_ = pubFile.Close()
 
 	return privFile.Name(), pubFile.Name(), func() {
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 	}, nil
 }
 
@@ -260,7 +260,7 @@ func doRequest(t *testing.T, method, path string, body any, headers map[string]s
 // decode reads and JSON-decodes a response body, closing it after.
 func decode(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var m map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&m))
 	return m
@@ -403,28 +403,28 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 		return "", "", nil, err
 	}
 	if err := pem.Encode(privFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER}); err != nil {
-		privFile.Close()
-		os.Remove(privFile.Name())
+		_ = privFile.Close()
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
-	privFile.Close()
+	_ = privFile.Close()
 
 	pubFile, err := os.CreateTemp("", "zeroid-test-rsa-pub-*.pem")
 	if err != nil {
-		os.Remove(privFile.Name())
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
 	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
-		pubFile.Close()
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = pubFile.Close()
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 		return "", "", nil, err
 	}
-	pubFile.Close()
+	_ = pubFile.Close()
 
 	return privFile.Name(), pubFile.Name(), func() {
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 	}, nil
 }
 

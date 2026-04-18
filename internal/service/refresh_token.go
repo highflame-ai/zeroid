@@ -184,6 +184,12 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 	return existing, result, nil
 }
 
+// RevokeFamily revokes all active tokens in a refresh token family.
+// Used during auth code replay detection per RFC 6749 §4.1.2.
+func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
+	return s.repo.RevokeFamily(ctx, familyID)
+}
+
 // generateRefreshToken creates a cryptographically random refresh token.
 // Format: zid_rt_<base64url(32 random bytes)>
 func generateRefreshToken() (string, error) {
