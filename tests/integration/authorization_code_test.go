@@ -169,8 +169,8 @@ func TestAuthorizationCodeExpired(t *testing.T) {
 	tok, err := jwt.NewBuilder().
 		Issuer(testIssuer).
 		Subject("auth-code").
-		IssuedAt(now.Add(-10 * time.Minute)).
-		Expiration(now.Add(-1 * time.Second)).
+		IssuedAt(now.Add(-10*time.Minute)).
+		Expiration(now.Add(-1*time.Second)).
 		Claim("cid", testCLIClientID).
 		Claim("uid", "user-expired-001").
 		Claim("aid", testAccountID).

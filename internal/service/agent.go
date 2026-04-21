@@ -30,23 +30,23 @@ func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, api
 
 // RegisterAgentRequest holds the parameters for registering a new identity.
 type RegisterAgentRequest struct {
-	AccountID          string
-	ProjectID          string
-	Name               string
-	ExternalID         string
-	IdentityType       domain.IdentityType // Defaults to "agent" if empty.
-	SubType            domain.SubType
-	TrustLevel         domain.TrustLevel
-	Framework          string
-	Version            string
-	Publisher          string
-	Description        string
-	Capabilities       json.RawMessage
-	Labels             json.RawMessage
-	Metadata           json.RawMessage
-	AllowedScopes      []string // Deprecated: set scope ceiling on the identity's credential policy.
-	CreatedBy          string
-	PublicKeyPEM       string
+	AccountID     string
+	ProjectID     string
+	Name          string
+	ExternalID    string
+	IdentityType  domain.IdentityType // Defaults to "agent" if empty.
+	SubType       domain.SubType
+	TrustLevel    domain.TrustLevel
+	Framework     string
+	Version       string
+	Publisher     string
+	Description   string
+	Capabilities  json.RawMessage
+	Labels        json.RawMessage
+	Metadata      json.RawMessage
+	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	CreatedBy     string
+	PublicKeyPEM  string
 	// CredentialPolicyID is the identity policy — the authority ceiling for
 	// the new identity. Also applied to the auto-created API key unless
 	// APIKeyCredentialPolicyID is provided. Must exist in the caller's
@@ -183,7 +183,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 
 	return &AgentRegistrationResponse{
 		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
-		APIKey: skResp.FullKey,
+		APIKey:   skResp.FullKey,
 	}, nil
 }
 
@@ -341,7 +341,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 
 	return &AgentRegistrationResponse{
 		Identity: identityToAgentResponse(identity, skResp.KeyPrefix),
-		APIKey: skResp.FullKey,
+		APIKey:   skResp.FullKey,
 	}, nil
 }
 

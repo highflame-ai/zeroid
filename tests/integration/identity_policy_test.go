@@ -552,4 +552,3 @@ func fetchIdentityWIMSEByExternalID(t *testing.T, externalID string) string {
 	t.Fatalf("identity with external_id=%s not found", externalID)
 	return ""
 }
-

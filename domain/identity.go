@@ -234,8 +234,8 @@ type Identity struct {
 	// ceiling on the policy, not on the identity row.
 	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
-	AllowedScopes     []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
-	PublicKeyPEM      string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
+	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
+	PublicKeyPEM       string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.
 	Framework    string          `bun:"framework,type:varchar(100)"  json:"framework,omitempty"`
