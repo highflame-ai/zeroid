@@ -18,20 +18,21 @@ import (
 
 type CreateIdentityInput struct {
 	Body struct {
-		ExternalID    string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
-		Name          string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		TrustLevel    string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
-		IdentityType  string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
-		SubType       string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
-		OwnerUserID   string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
-		AllowedScopes []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request"`
-		PublicKeyPEM  string          `json:"public_key_pem,omitempty" doc:"ECDSA P-256 public key in PEM format for jwt_bearer grant"`
-		Framework     string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
-		Version       string          `json:"version,omitempty" doc:"Agent version string"`
-		Publisher     string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
-		Description   string          `json:"description,omitempty" doc:"Human-readable description of the identity"`
-		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
-		Labels        json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		ExternalID         string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
+		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
+		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
+		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy."`
+		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA P-256 public key in PEM format for jwt_bearer grant"`
+		Framework          string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
+		Version            string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher          string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description        string          `json:"description,omitempty" doc:"Human-readable description of the identity"`
+		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels             json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 	}
 }
 
@@ -65,21 +66,22 @@ type IdentityListOutput struct {
 type UpdateIdentityInput struct {
 	ID   string `path:"id" doc:"Identity UUID"`
 	Body struct {
-		Name          string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		TrustLevel    string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
-		IdentityType  string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
-		SubType       string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
-		OwnerUserID   string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`
-		AllowedScopes []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes"`
-		PublicKeyPEM  string          `json:"public_key_pem,omitempty" doc:"ECDSA public key PEM"`
-		Framework     *string         `json:"framework,omitempty" doc:"Agent framework"`
-		Version       *string         `json:"version,omitempty" doc:"Agent version"`
-		Publisher     *string         `json:"publisher,omitempty" doc:"Agent publisher"`
-		Description   *string         `json:"description,omitempty" doc:"Agent description"`
-		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
-		Labels        json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
-		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
-		Status        *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
+		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
+		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
+		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
+		OwnerUserID        string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
+		CredentialPolicyID *string         `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Empty string resets to tenant default; omit to leave unchanged."`
+		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA public key PEM"`
+		Framework          *string         `json:"framework,omitempty" doc:"Agent framework"`
+		Version            *string         `json:"version,omitempty" doc:"Agent version"`
+		Publisher          *string         `json:"publisher,omitempty" doc:"Agent publisher"`
+		Description        *string         `json:"description,omitempty" doc:"Agent description"`
+		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
+		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
 	}
 }
 
@@ -173,27 +175,33 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 	createdBy := internalMiddleware.GetCallerName(ctx)
 
 	identity, err := a.identitySvc.RegisterIdentity(ctx, service.RegisterIdentityRequest{
-		AccountID:     tenant.AccountID,
-		ProjectID:     tenant.ProjectID,
-		ExternalID:    input.Body.ExternalID,
-		Name:          input.Body.Name,
-		TrustLevel:    trustLevel,
-		IdentityType:  identityType,
-		SubType:       subType,
-		OwnerUserID:   input.Body.OwnerUserID,
-		AllowedScopes: input.Body.AllowedScopes,
-		PublicKeyPEM:  input.Body.PublicKeyPEM,
-		Framework:     input.Body.Framework,
-		Version:       input.Body.Version,
-		Publisher:     input.Body.Publisher,
-		Description:   input.Body.Description,
-		Capabilities:  input.Body.Capabilities,
-		Labels:        input.Body.Labels,
-		CreatedBy:     createdBy,
+		AccountID:          tenant.AccountID,
+		ProjectID:          tenant.ProjectID,
+		ExternalID:         input.Body.ExternalID,
+		Name:               input.Body.Name,
+		TrustLevel:         trustLevel,
+		IdentityType:       identityType,
+		SubType:            subType,
+		OwnerUserID:        input.Body.OwnerUserID,
+		AllowedScopes:      input.Body.AllowedScopes,
+		PublicKeyPEM:       input.Body.PublicKeyPEM,
+		Framework:          input.Body.Framework,
+		Version:            input.Body.Version,
+		Publisher:          input.Body.Publisher,
+		Description:        input.Body.Description,
+		Capabilities:       input.Body.Capabilities,
+		Labels:             input.Body.Labels,
+		CreatedBy:          createdBy,
+		CredentialPolicyID: input.Body.CredentialPolicyID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
+		}
+		// Caller-supplied credential_policy_id that doesn't exist in this
+		// tenant is a client error, not a server error.
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
 		return nil, huma.Error500InternalServerError("failed to create identity")
@@ -277,23 +285,27 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 	}
 
 	identity, err := a.identitySvc.UpdateIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID, service.UpdateIdentityRequest{
-		Name:          input.Body.Name,
-		TrustLevel:    trustLevel,
-		IdentityType:  identityType,
-		SubType:       subType,
-		OwnerUserID:   input.Body.OwnerUserID,
-		AllowedScopes: input.Body.AllowedScopes,
-		PublicKeyPEM:  input.Body.PublicKeyPEM,
-		Framework:     input.Body.Framework,
-		Version:       input.Body.Version,
-		Publisher:     input.Body.Publisher,
-		Description:   input.Body.Description,
-		Capabilities:  input.Body.Capabilities,
-		Labels:        input.Body.Labels,
-		Metadata:      input.Body.Metadata,
-		Status:        status,
+		Name:               input.Body.Name,
+		TrustLevel:         trustLevel,
+		IdentityType:       identityType,
+		SubType:            subType,
+		OwnerUserID:        input.Body.OwnerUserID,
+		AllowedScopes:      input.Body.AllowedScopes,
+		PublicKeyPEM:       input.Body.PublicKeyPEM,
+		Framework:          input.Body.Framework,
+		Version:            input.Body.Version,
+		Publisher:          input.Body.Publisher,
+		Description:        input.Body.Description,
+		Capabilities:       input.Body.Capabilities,
+		Labels:             input.Body.Labels,
+		Metadata:           input.Body.Metadata,
+		Status:             status,
+		CredentialPolicyID: input.Body.CredentialPolicyID,
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")
 		return nil, huma.Error500InternalServerError("failed to update identity")
 	}

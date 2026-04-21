@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,7 +22,10 @@ import (
 // RefreshTokenService handles refresh token issuance and rotation.
 type RefreshTokenService struct {
 	repo *postgres.RefreshTokenRepository
-	db   *bun.DB
+	// db is needed to wrap claim+insert in a transaction during rotation so a
+	// failed successor insert rolls back the claim, avoiding spurious reuse
+	// detection on a client retry after a transient DB error.
+	db *bun.DB
 }
 
 // NewRefreshTokenService creates a new refresh token service.
@@ -55,15 +60,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 
 	tokenHash := hashRefreshToken(rawToken)
 	familyID := uuid.New().String()
-
-	var ttl time.Duration
-	if params.TTL > 0 {
-		ttl = time.Duration(params.TTL) * time.Second
-	} else {
-		ttl = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
-	}
-
-	expiresAt := time.Now().Add(ttl)
+	expiresAt := time.Now().Add(refreshTokenTTL(params.TTL))
 
 	record := &domain.RefreshToken{
 		TokenHash:  tokenHash,
@@ -78,7 +75,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		ExpiresAt:  expiresAt,
 	}
 
-	if err := s.repo.Create(ctx, record); err != nil {
+	if err := s.repo.Create(ctx, s.db, record); err != nil {
 		return nil, fmt.Errorf("failed to store refresh token: %w", err)
 	}
 
@@ -91,103 +88,138 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 
 // RotateRefreshToken validates the presented token, revokes it, and issues a new one.
 // Implements reuse detection: if a revoked token is presented, the entire family is revoked.
-// Wrapped in a serializable transaction to prevent race conditions where two concurrent
-// calls with the same token both succeed and issue duplicate tokens.
+//
+// Atomicity has two layers:
+//  1. Concurrent rotations on the same token: the claim-and-revoke step is a
+//     single UPDATE ... WHERE state='active' RETURNING. Postgres row-level
+//     locking guarantees exactly one concurrent caller wins, so two rotations
+//     racing on the same input cannot both produce successor tokens.
+//  2. Claim + successor insert: both run inside a single transaction. If the
+//     insert fails (transient DB error, disk, etc.), the claim rolls back and
+//     the original token remains active. Without this, a failed insert would
+//     leave the original token revoked with no successor, and the client's
+//     retry would trip reuse detection and nuke the whole family — turning a
+//     transient glitch into a forced re-auth across all sessions.
 func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int) (*domain.RefreshToken, *RefreshTokenResult, error) {
 	tokenHash := hashRefreshToken(rawToken)
 
-	var existing *domain.RefreshToken
-	var result *RefreshTokenResult
+	newRawToken, err := generateRefreshToken()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate new refresh token: %w", err)
+	}
+	newTokenHash := hashRefreshToken(newRawToken)
+	expiresAt := time.Now().Add(refreshTokenTTL(ttl))
 
-	err := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
-		var err error
-
-		// First check if this token exists at all (including revoked) for reuse detection.
-		existing, err = s.repo.GetByTokenHashIncludingRevoked(ctx, tokenHash)
+	var claimed *domain.RefreshToken
+	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		c, err := s.repo.ClaimByTokenHash(ctx, tx, tokenHash)
 		if err != nil {
-			return fmt.Errorf("refresh token not found: %w", err)
+			return err
 		}
+		claimed = c
 
-		// Reuse detection: if the token was already revoked, someone is replaying it.
-		// Revoke the entire family as a security measure.
-		if existing.State == domain.RefreshTokenStateRevoked {
-			count, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
-
-			log.Warn().
-				Str("family_id", existing.FamilyID).
-				Str("user_id", existing.UserID).
-				Str("client_id", existing.ClientID).
-				Int64("revoked_count", count).
-				Err(revokeErr).
-				Msg("Refresh token reuse detected — entire family revoked")
-
-			return fmt.Errorf("refresh token reuse detected — family revoked")
-		}
-
-		// Check expiry.
-		if time.Now().After(existing.ExpiresAt) {
-			return fmt.Errorf("refresh token expired")
-		}
-
-		// Revoke the current token (single-use rotation).
-		if err := s.repo.RevokeByID(ctx, existing.ID); err != nil {
-			return fmt.Errorf("failed to revoke old refresh token: %w", err)
-		}
-
-		// Issue a new token in the same family.
-		newRawToken, err := generateRefreshToken()
-		if err != nil {
-			return fmt.Errorf("failed to generate new refresh token: %w", err)
-		}
-
-		newTokenHash := hashRefreshToken(newRawToken)
-
-		var rotationTTL time.Duration
-		if ttl > 0 {
-			rotationTTL = time.Duration(ttl) * time.Second
-		} else {
-			rotationTTL = time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
-		}
-
-		expiresAt := time.Now().Add(rotationTTL)
-
-		newRecord := &domain.RefreshToken{
+		successor := &domain.RefreshToken{
 			TokenHash:  newTokenHash,
-			ClientID:   existing.ClientID,
-			AccountID:  existing.AccountID,
-			ProjectID:  existing.ProjectID,
-			UserID:     existing.UserID,
-			IdentityID: existing.IdentityID,
-			Scopes:     existing.Scopes,
-			FamilyID:   existing.FamilyID, // Same family — rotation chain.
+			ClientID:   c.ClientID,
+			AccountID:  c.AccountID,
+			ProjectID:  c.ProjectID,
+			UserID:     c.UserID,
+			IdentityID: c.IdentityID,
+			Scopes:     c.Scopes,
+			FamilyID:   c.FamilyID, // Same family — rotation chain.
 			State:      domain.RefreshTokenStateActive,
 			ExpiresAt:  expiresAt,
 		}
-
-		if err := s.repo.Create(ctx, newRecord); err != nil {
-			return fmt.Errorf("failed to store new refresh token: %w", err)
-		}
-
-		result = &RefreshTokenResult{
-			RawToken:  newRawToken,
-			FamilyID:  existing.FamilyID,
-			ExpiresAt: expiresAt,
-		}
-
-		return nil
+		return s.repo.Create(ctx, tx, successor)
 	})
-
-	if err != nil {
-		return nil, nil, err
+	if txErr != nil {
+		if errors.Is(txErr, sql.ErrNoRows) {
+			return nil, nil, s.handleFailedClaim(ctx, tokenHash)
+		}
+		return nil, nil, fmt.Errorf("refresh token rotation failed: %w", txErr)
 	}
 
-	return existing, result, nil
+	return claimed, &RefreshTokenResult{
+		RawToken:  newRawToken,
+		FamilyID:  claimed.FamilyID,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+// handleFailedClaim runs when ClaimByTokenHash found no matching active,
+// non-expired row. It disambiguates among four possibilities:
+//
+//  1. Revoked within the reuse grace window — treated as a legitimate concurrent
+//     retry. Returns "already rotated" without revoking the family.
+//  2. Revoked outside the grace window — genuine RFC 6749 §10.4 reuse signal.
+//     Revokes the entire family and returns "reuse detected".
+//  3. Expired — normal TTL expiry. Returns "expired".
+//  4. Should-be-unreachable state (active and non-expired but claim still
+//     missed). Logs at Error level and returns a generic error.
+func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash string) error {
+	existing, err := s.repo.GetByTokenHashIncludingRevoked(ctx, tokenHash)
+	if err != nil {
+		return fmt.Errorf("refresh token not found: %w", err)
+	}
+
+	if existing.State == domain.RefreshTokenStateRevoked {
+		// Grace period: if the token was revoked very recently, treat the
+		// second presentation as a concurrent retry (multiple tabs, a client
+		// retry loop, a load balancer replay) rather than a replay attack.
+		// The concurrent request gets a benign error but the freshly issued
+		// successor — and therefore the user's session — survives.
+		//
+		// Outside the window, this is a genuine reuse signal (RFC 6749 §10.4)
+		// and the whole family is revoked.
+		if existing.RevokedAt != nil && time.Since(*existing.RevokedAt) < domain.RefreshTokenReuseGraceWindow {
+			log.Info().
+				Str("family_id", existing.FamilyID).
+				Str("user_id", existing.UserID).
+				Str("client_id", existing.ClientID).
+				Dur("age", time.Since(*existing.RevokedAt)).
+				Msg("Refresh token presented within reuse grace window — treating as concurrent retry")
+			return fmt.Errorf("refresh token already rotated")
+		}
+
+		count, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
+		log.Warn().
+			Str("family_id", existing.FamilyID).
+			Str("user_id", existing.UserID).
+			Str("client_id", existing.ClientID).
+			Int64("revoked_count", count).
+			Err(revokeErr).
+			Msg("Refresh token reuse detected — entire family revoked")
+		return fmt.Errorf("refresh token reuse detected — family revoked")
+	}
+
+	if time.Now().After(existing.ExpiresAt) {
+		return fmt.Errorf("refresh token expired")
+	}
+
+	// Should be unreachable: state is active and not expired, but ClaimByTokenHash
+	// returned no row. Indicates clock skew or a concurrent state transition we
+	// did not anticipate. Log loudly.
+	log.Error().
+		Str("family_id", existing.FamilyID).
+		Str("state", existing.State).
+		Time("expires_at", existing.ExpiresAt).
+		Msg("Refresh token claim failed but lookup shows active non-expired token")
+	return fmt.Errorf("refresh token in unexpected state")
 }
 
 // RevokeFamily revokes all active tokens in a refresh token family.
 // Used during auth code replay detection per RFC 6749 §4.1.2.
 func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
 	return s.repo.RevokeFamily(ctx, familyID)
+}
+
+// refreshTokenTTL resolves the effective token lifetime: a positive
+// ttlSeconds overrides the default; zero falls back to RefreshTokenTTLDays.
+func refreshTokenTTL(ttlSeconds int) time.Duration {
+	if ttlSeconds > 0 {
+		return time.Duration(ttlSeconds) * time.Second
+	}
+	return time.Duration(domain.RefreshTokenTTLDays) * 24 * time.Hour
 }
 
 // generateRefreshToken creates a cryptographically random refresh token.
