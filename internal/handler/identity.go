@@ -187,7 +187,7 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		PublicKeyPEM:       input.Body.PublicKeyPEM,
 		Framework:          input.Body.Framework,
 		Version:            input.Body.Version,
-		Publisher:           input.Body.Publisher,
+		Publisher:          input.Body.Publisher,
 		Description:        input.Body.Description,
 		Capabilities:       input.Body.Capabilities,
 		Labels:             input.Body.Labels,

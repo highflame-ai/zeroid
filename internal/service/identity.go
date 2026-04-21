@@ -22,9 +22,9 @@ var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
-	repo          *postgres.IdentityRepository
-	policySvc     *CredentialPolicyService
-	wimseDomain   string
+	repo        *postgres.IdentityRepository
+	policySvc   *CredentialPolicyService
+	wimseDomain string
 }
 
 // NewIdentityService creates a new IdentityService. policySvc must be non-nil —

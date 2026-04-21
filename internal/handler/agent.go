@@ -39,23 +39,23 @@ func mapErr(err error) error {
 
 type RegisterAgentInput struct {
 	Body struct {
-		Name         string          `json:"name" required:"true" minLength:"1" doc:"Human-readable name"`
-		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
-		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
-		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Operational role"`
-		TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
-		Framework    string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
-		Version      string          `json:"version,omitempty" doc:"Agent version string"`
-		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
-		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
-		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
-		Labels        json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
-		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		AllowedScopes []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
-		CreatedBy          string          `json:"created_by,omitempty" doc:"User ID of the creator"`
-		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
-		CredentialPolicyID       string `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
-		APIKeyCredentialPolicyID string `json:"api_key_credential_policy_id,omitempty" doc:"Optional narrower policy for the auto-created API key. Must be a subset of the identity policy (scopes, TTL, grant types, delegation depth, trust level, attestation). When empty, the API key inherits the identity policy."`
+		Name                     string          `json:"name" required:"true" minLength:"1" doc:"Human-readable name"`
+		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
+		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
+		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Operational role"`
+		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
+		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
+		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher                string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description              string          `json:"description,omitempty" doc:"Human-readable description"`
+		Capabilities             json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels                   json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata                 json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
+		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
+		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator"`
+		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
+		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
+		APIKeyCredentialPolicyID string          `json:"api_key_credential_policy_id,omitempty" doc:"Optional narrower policy for the auto-created API key. Must be a subset of the identity policy (scopes, TTL, grant types, delegation depth, trust level, attestation). When empty, the API key inherits the identity policy."`
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
@@ -201,23 +201,23 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 	}
 
 	resp, err := a.agentSvc.RegisterAgent(ctx, service.RegisterAgentRequest{
-		AccountID:          tenant.AccountID,
-		ProjectID:          tenant.ProjectID,
-		Name:               input.Body.Name,
-		ExternalID:         input.Body.ExternalID,
-		IdentityType:       domain.IdentityType(input.Body.IdentityType),
-		SubType:            domain.SubType(input.Body.SubType),
-		TrustLevel:         domain.TrustLevel(input.Body.TrustLevel),
-		Framework:          input.Body.Framework,
-		Version:            input.Body.Version,
-		Publisher:          input.Body.Publisher,
-		Description:        input.Body.Description,
-		Capabilities:       input.Body.Capabilities,
-		Labels:             input.Body.Labels,
-		Metadata:           input.Body.Metadata,
-		AllowedScopes:      input.Body.AllowedScopes,
-		CreatedBy:          createdBy,
-		PublicKeyPEM:       input.Body.PublicKeyPEM,
+		AccountID:                tenant.AccountID,
+		ProjectID:                tenant.ProjectID,
+		Name:                     input.Body.Name,
+		ExternalID:               input.Body.ExternalID,
+		IdentityType:             domain.IdentityType(input.Body.IdentityType),
+		SubType:                  domain.SubType(input.Body.SubType),
+		TrustLevel:               domain.TrustLevel(input.Body.TrustLevel),
+		Framework:                input.Body.Framework,
+		Version:                  input.Body.Version,
+		Publisher:                input.Body.Publisher,
+		Description:              input.Body.Description,
+		Capabilities:             input.Body.Capabilities,
+		Labels:                   input.Body.Labels,
+		Metadata:                 input.Body.Metadata,
+		AllowedScopes:            input.Body.AllowedScopes,
+		CreatedBy:                createdBy,
+		PublicKeyPEM:             input.Body.PublicKeyPEM,
 		CredentialPolicyID:       input.Body.CredentialPolicyID,
 		APIKeyCredentialPolicyID: input.Body.APIKeyCredentialPolicyID,
 	})

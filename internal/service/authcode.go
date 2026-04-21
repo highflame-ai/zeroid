@@ -14,16 +14,16 @@ import (
 
 // AuthCodeClaims holds the decoded claims from an authorization code JWT.
 type AuthCodeClaims struct {
-	JTI           string   // JWT ID (jti claim or derived hash)
+	JTI           string    // JWT ID (jti claim or derived hash)
 	ExpiresAt     time.Time // Token expiration
-	ClientID      string   // "cid" — Client application ID
-	CodeChallenge string   // "cc"  — PKCE code challenge (S256)
-	RedirectURI   string   // "ruri" — OAuth redirect URI
-	Scopes        []string // "scp" — Granted scopes
-	UserID        string   // "uid" — User ID
-	OrgID         string   // "oid" — Organization ID
-	AccountID     string   // "aid" — Account ID
-	ProjectID     string   // "pid" — Project ID (optional)
+	ClientID      string    // "cid" — Client application ID
+	CodeChallenge string    // "cc"  — PKCE code challenge (S256)
+	RedirectURI   string    // "ruri" — OAuth redirect URI
+	Scopes        []string  // "scp" — Granted scopes
+	UserID        string    // "uid" — User ID
+	OrgID         string    // "oid" — Organization ID
+	AccountID     string    // "aid" — Account ID
+	ProjectID     string    // "pid" — Project ID (optional)
 }
 
 // decodeAuthCodeJWT verifies and decodes a stateless auth code JWT (HS256).
