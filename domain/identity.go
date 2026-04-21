@@ -214,10 +214,28 @@ type Identity struct {
 	TrustLevel   TrustLevel     `bun:"trust_level,type:varchar(50)"   json:"trust_level"`
 	Status       IdentityStatus `bun:"status,type:varchar(50)"        json:"status"`
 
-	// Ownership and governance
-	OwnerUserID   string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
-	AllowedScopes []string `bun:"allowed_scopes,array"            json:"allowed_scopes"`
-	PublicKeyPEM  string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
+	// Ownership and governance.
+	//
+	// CredentialPolicyID is the identity policy — the authority ceiling for
+	// every credential this identity can hold. Scopes, TTL, grant types,
+	// delegation depth, trust level, and attestation all resolve through this
+	// policy at token issuance time. API keys may carry their own (narrower)
+	// policy for per-credential restriction; the effective authority is the
+	// intersection of both (AWS/GCP/Azure pattern).
+	//
+	// Nullable only during the rollout of migration 008. After backfill every
+	// identity points at the tenant's default policy unless the creator chose
+	// a more specific one.
+	//
+	// AllowedScopes is deprecated in favour of the identity policy's
+	// allowed_scopes. It is still read as a fallback during the deprecation
+	// window when the identity policy does not restrict scopes (i.e. the
+	// policy's allowed_scopes is empty). New code should set the scope
+	// ceiling on the policy, not on the identity row.
+	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
+	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
+	AllowedScopes     []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
+	PublicKeyPEM      string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.
 	Framework    string          `bun:"framework,type:varchar(100)"  json:"framework,omitempty"`

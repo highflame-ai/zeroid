@@ -8,6 +8,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// createCredentialPolicy is a test helper that creates a credential policy
+// scoped by the caller-supplied tenant headers and returns the policy ID.
+// Uses a short name suffix to avoid unique-name collisions across parallel
+// tests.
+func createCredentialPolicy(t *testing.T, name string, headers map[string]string) string {
+	t.Helper()
+	resp := post(t, adminPath("/credential-policies"), map[string]any{
+		"name":            name,
+		"max_ttl_seconds": 3600,
+	}, headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "createCredentialPolicy: expected 201")
+	body := decode(t, resp)
+	id, ok := body["id"].(string)
+	require.True(t, ok, "createCredentialPolicy: response missing id")
+	require.NotEmpty(t, id)
+	return id
+}
+
+// tenantHeaders returns admin headers with the given account/project IDs,
+// used for cross-tenant IDOR test scenarios. `X-User-ID` is required by
+// EnsureServiceIdentity when the API-key path auto-provisions a service
+// identity for a product, so we always populate it.
+func tenantHeaders(accountID, projectID string) map[string]string {
+	return map[string]string{
+		"X-Account-ID": accountID,
+		"X-Project-ID": projectID,
+		"X-User-ID":    "test-user-" + accountID,
+	}
+}
+
 func TestAPIKeyProductFilter(t *testing.T) {
 	// Create keys with different products — no identity_id needed.
 	// EnsureServiceIdentity auto-provisions a service identity per product.
@@ -63,4 +93,53 @@ func TestAPIKeyProductFilter(t *testing.T) {
 	body = decode(t, resp)
 	allKeys := body["keys"].([]any)
 	assert.GreaterOrEqual(t, len(allKeys), 3, "should return at least all three created keys")
+}
+
+// TestCreateAPIKey_CustomCredentialPolicy_Propagates verifies that a
+// caller-supplied credential_policy_id on POST /api-keys is persisted on the
+// created key. Regression coverage for the propagation wiring in
+// APIKeyService.CreateKey.
+func TestCreateAPIKey_CustomCredentialPolicy_Propagates(t *testing.T) {
+	headers := adminHeaders()
+	headers["X-User-ID"] = "test-user" // required by EnsureServiceIdentity when auto-creating a service identity for the product.
+	policyID := createCredentialPolicy(t, uid("cp-propagation"), headers)
+
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":                 "propagation-key",
+		"product":              "propagation-test",
+		"credential_policy_id": policyID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	created := decode(t, resp)
+	keyID := created["id"].(string)
+	require.NotEmpty(t, keyID)
+
+	// Fetch the key back and assert the policy ID was persisted.
+	fetched := get(t, adminPath("/api-keys/"+keyID), headers)
+	require.Equal(t, http.StatusOK, fetched.StatusCode)
+	got := decode(t, fetched)
+	assert.Equal(t, policyID, got["credential_policy_id"],
+		"custom credential_policy_id supplied at creation must be stored on the key")
+}
+
+// TestCreateAPIKey_CrossTenantCredentialPolicyRejected verifies the IDOR guard:
+// a caller in tenant B cannot associate a new API key with a credential policy
+// that belongs to tenant A. GetPolicy is tenant-scoped and returns
+// ErrPolicyNotFound for cross-tenant lookups — the handler must surface that
+// as a 400 Bad Request, not a 500 and not a silent success.
+func TestCreateAPIKey_CrossTenantCredentialPolicyRejected(t *testing.T) {
+	tenantA := tenantHeaders("acct-tenant-a-"+uid(""), "proj-tenant-a-"+uid(""))
+	tenantB := tenantHeaders("acct-tenant-b-"+uid(""), "proj-tenant-b-"+uid(""))
+
+	// Tenant A creates a policy.
+	foreignPolicyID := createCredentialPolicy(t, uid("cp-tenant-a"), tenantA)
+
+	// Tenant B attempts to reference tenant A's policy ID on a new key.
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":                 "cross-tenant-attempt",
+		"product":              "idor-test",
+		"credential_policy_id": foreignPolicyID,
+	}, tenantB)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"cross-tenant credential_policy_id must be rejected with 400, not stored on the key")
 }

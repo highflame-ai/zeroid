@@ -30,47 +30,61 @@ func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, api
 
 // RegisterAgentRequest holds the parameters for registering a new identity.
 type RegisterAgentRequest struct {
-	AccountID    string
-	ProjectID    string
-	Name         string
-	ExternalID   string
-	IdentityType domain.IdentityType // Defaults to "agent" if empty.
-	SubType      domain.SubType
-	TrustLevel   domain.TrustLevel
-	Framework    string
-	Version      string
-	Publisher    string
-	Description  string
-	Capabilities json.RawMessage
-	Labels       json.RawMessage
-	Metadata     json.RawMessage
-	CreatedBy    string
-	PublicKeyPEM string
+	AccountID          string
+	ProjectID          string
+	Name               string
+	ExternalID         string
+	IdentityType       domain.IdentityType // Defaults to "agent" if empty.
+	SubType            domain.SubType
+	TrustLevel         domain.TrustLevel
+	Framework          string
+	Version            string
+	Publisher          string
+	Description        string
+	Capabilities       json.RawMessage
+	Labels             json.RawMessage
+	Metadata           json.RawMessage
+	AllowedScopes      []string // Deprecated: set scope ceiling on the identity's credential policy.
+	CreatedBy          string
+	PublicKeyPEM       string
+	// CredentialPolicyID is the identity policy — the authority ceiling for
+	// the new identity. Also applied to the auto-created API key unless
+	// APIKeyCredentialPolicyID is provided. Must exist in the caller's
+	// tenant. If empty, the tenant default policy is assigned.
+	CredentialPolicyID string
+	// APIKeyCredentialPolicyID optionally scopes the auto-created API key
+	// to a narrower policy than the identity's. Must be a subset of the
+	// identity policy on every axis (scopes, TTL, grant types, delegation
+	// depth, trust level, attestation); the subset invariant is enforced
+	// inside APIKeyService.CreateKey. When empty, the API key inherits the
+	// identity policy verbatim (common case).
+	APIKeyCredentialPolicyID string
 }
 
 // AgentResponse is the API response for a single agent identity.
 type AgentResponse struct {
-	ID           string                `json:"id"`
-	AccountID    string                `json:"account_id"`
-	ProjectID    string                `json:"project_id"`
-	Name         string                `json:"name"`
-	ExternalID   string                `json:"external_id"`
-	WIMSEURI     string                `json:"wimse_uri"`
-	APIKeyPrefix string                `json:"api_key_prefix"`
-	IdentityType domain.IdentityType   `json:"identity_type"`
-	SubType      domain.SubType        `json:"sub_type"`
-	TrustLevel   domain.TrustLevel     `json:"trust_level"`
-	Status       domain.IdentityStatus `json:"status"`
-	Framework    string                `json:"framework"`
-	Version      string                `json:"version"`
-	Publisher    string                `json:"publisher"`
-	Description  string                `json:"description"`
-	Capabilities json.RawMessage       `json:"capabilities"`
-	Labels       json.RawMessage       `json:"labels"`
-	Metadata     json.RawMessage       `json:"metadata"`
-	CreatedAt    time.Time             `json:"created_at"`
-	CreatedBy    string                `json:"created_by"`
-	UpdatedAt    time.Time             `json:"updated_at"`
+	ID                 string                `json:"id"`
+	AccountID          string                `json:"account_id"`
+	ProjectID          string                `json:"project_id"`
+	Name               string                `json:"name"`
+	ExternalID         string                `json:"external_id"`
+	WIMSEURI           string                `json:"wimse_uri"`
+	APIKeyPrefix       string                `json:"api_key_prefix"`
+	IdentityType       domain.IdentityType   `json:"identity_type"`
+	SubType            domain.SubType        `json:"sub_type"`
+	TrustLevel         domain.TrustLevel     `json:"trust_level"`
+	Status             domain.IdentityStatus `json:"status"`
+	CredentialPolicyID string                `json:"credential_policy_id,omitempty"`
+	Framework          string                `json:"framework"`
+	Version            string                `json:"version"`
+	Publisher          string                `json:"publisher"`
+	Description        string                `json:"description"`
+	Capabilities       json.RawMessage       `json:"capabilities"`
+	Labels             json.RawMessage       `json:"labels"`
+	Metadata           json.RawMessage       `json:"metadata"`
+	CreatedAt          time.Time             `json:"created_at"`
+	CreatedBy          string                `json:"created_by"`
+	UpdatedAt          time.Time             `json:"updated_at"`
 }
 
 // AgentRegistrationResponse is returned on agent creation — includes plaintext API key.
@@ -110,37 +124,50 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		identityType = domain.IdentityTypeAgent
 	}
 
-	// 1. Create identity.
+	// 1. Create identity. CredentialPolicyID is the identity policy —
+	// attached at registration so the authority ceiling is fixed before
+	// any credential is issued for this identity.
 	identity, err := s.identitySvc.RegisterIdentity(ctx, RegisterIdentityRequest{
-		AccountID:    req.AccountID,
-		ProjectID:    req.ProjectID,
-		ExternalID:   req.ExternalID,
-		Name:         req.Name,
-		TrustLevel:   req.TrustLevel,
-		IdentityType: identityType,
-		SubType:      req.SubType,
-		OwnerUserID:  req.CreatedBy,
-		Framework:    req.Framework,
-		Version:      req.Version,
-		Publisher:    req.Publisher,
-		Description:  req.Description,
-		Capabilities: req.Capabilities,
-		Labels:       req.Labels,
-		Metadata:     req.Metadata,
-		CreatedBy:    req.CreatedBy,
-		PublicKeyPEM: req.PublicKeyPEM,
+		AccountID:          req.AccountID,
+		ProjectID:          req.ProjectID,
+		ExternalID:         req.ExternalID,
+		Name:               req.Name,
+		TrustLevel:         req.TrustLevel,
+		IdentityType:       identityType,
+		SubType:            req.SubType,
+		OwnerUserID:        req.CreatedBy,
+		Framework:          req.Framework,
+		Version:            req.Version,
+		Publisher:          req.Publisher,
+		Description:        req.Description,
+		Capabilities:       req.Capabilities,
+		Labels:             req.Labels,
+		Metadata:           req.Metadata,
+		AllowedScopes:      req.AllowedScopes,
+		CreatedBy:          req.CreatedBy,
+		PublicKeyPEM:       req.PublicKeyPEM,
+		CredentialPolicyID: req.CredentialPolicyID,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Create linked API key.
+	// 2. Create linked API key. Defaults to inheriting the identity policy;
+	// the caller may supply a narrower APIKeyCredentialPolicyID to scope the
+	// bootstrap key tighter than the identity ceiling. The subset invariant
+	// is enforced inside CreateKey — broader-than-identity policies are
+	// rejected with ErrPolicySubsetViolation.
+	apiKeyPolicyID := req.APIKeyCredentialPolicyID
+	if apiKeyPolicyID == "" {
+		apiKeyPolicyID = req.CredentialPolicyID
+	}
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
-		AccountID:  req.AccountID,
-		ProjectID:  req.ProjectID,
-		CreatedBy:  req.CreatedBy,
-		Name:       fmt.Sprintf("Agent: %s", req.Name),
-		IdentityID: identity.ID,
+		AccountID:          req.AccountID,
+		ProjectID:          req.ProjectID,
+		CreatedBy:          req.CreatedBy,
+		Name:               fmt.Sprintf("Agent: %s", req.Name),
+		IdentityID:         identity.ID,
+		CredentialPolicyID: apiKeyPolicyID,
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.
@@ -335,27 +362,28 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 	}
 
 	return AgentResponse{
-		ID:           identity.ID,
-		AccountID:    identity.AccountID,
-		ProjectID:    identity.ProjectID,
-		Name:         identity.Name,
-		ExternalID:   identity.ExternalID,
-		WIMSEURI:     identity.WIMSEURI,
-		APIKeyPrefix: keyPrefix,
-		IdentityType: identity.IdentityType,
-		SubType:      identity.SubType,
-		TrustLevel:   identity.TrustLevel,
-		Status:       identity.Status,
-		Framework:    identity.Framework,
-		Version:      identity.Version,
-		Publisher:    identity.Publisher,
-		Description:  identity.Description,
-		Capabilities: caps,
-		Labels:       labels,
-		Metadata:     metadata,
-		CreatedAt:    identity.CreatedAt,
-		CreatedBy:    identity.CreatedBy,
-		UpdatedAt:    identity.UpdatedAt,
+		ID:                 identity.ID,
+		AccountID:          identity.AccountID,
+		ProjectID:          identity.ProjectID,
+		Name:               identity.Name,
+		ExternalID:         identity.ExternalID,
+		WIMSEURI:           identity.WIMSEURI,
+		APIKeyPrefix:       keyPrefix,
+		IdentityType:       identity.IdentityType,
+		SubType:            identity.SubType,
+		TrustLevel:         identity.TrustLevel,
+		Status:             identity.Status,
+		CredentialPolicyID: identity.CredentialPolicyID,
+		Framework:          identity.Framework,
+		Version:            identity.Version,
+		Publisher:          identity.Publisher,
+		Description:        identity.Description,
+		Capabilities:       caps,
+		Labels:             labels,
+		Metadata:           metadata,
+		CreatedAt:          identity.CreatedAt,
+		CreatedBy:          identity.CreatedBy,
+		UpdatedAt:          identity.UpdatedAt,
 	}
 }
 

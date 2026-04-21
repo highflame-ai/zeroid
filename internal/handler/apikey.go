@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -17,14 +18,15 @@ import (
 
 type CreateAPIKeyInput struct {
 	Body struct {
-		Name          string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
-		Description   string          `json:"description,omitempty" doc:"Key description"`
-		IdentityID    string          `json:"identity_id,omitempty" doc:"Optional identity link"`
-		Product       string          `json:"product,omitempty" doc:"Product namespace for key scoping"`
-		Scopes        []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
-		Environment   string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
-		ExpiresInDays *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
-		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata for extensions"`
+		Name               string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
+		Description        string          `json:"description,omitempty" doc:"Key description"`
+		IdentityID         string          `json:"identity_id,omitempty" doc:"Optional identity link"`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: tenant default policy)"`
+		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping"`
+		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
+		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
+		ExpiresInDays      *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
+		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata for extensions"`
 	}
 }
 
@@ -116,19 +118,32 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 	createdBy := internalMiddleware.GetCallerName(ctx)
 
 	resp, err := a.apiKeySvc.CreateKey(ctx, service.CreateAPIKeyRequest{
-		AccountID:     tenant.AccountID,
-		ProjectID:     tenant.ProjectID,
-		CreatedBy:     createdBy,
-		Name:          input.Body.Name,
-		Description:   input.Body.Description,
-		IdentityID:    input.Body.IdentityID,
-		Product:       input.Body.Product,
-		Scopes:        input.Body.Scopes,
-		Environment:   input.Body.Environment,
-		ExpiresInDays: input.Body.ExpiresInDays,
-		Metadata:      input.Body.Metadata,
+		AccountID:          tenant.AccountID,
+		ProjectID:          tenant.ProjectID,
+		CreatedBy:          createdBy,
+		Name:               input.Body.Name,
+		Description:        input.Body.Description,
+		IdentityID:         input.Body.IdentityID,
+		CredentialPolicyID: input.Body.CredentialPolicyID,
+		Product:            input.Body.Product,
+		Scopes:             input.Body.Scopes,
+		Environment:        input.Body.Environment,
+		ExpiresInDays:      input.Body.ExpiresInDays,
+		Metadata:           input.Body.Metadata,
 	})
 	if err != nil {
+		// Caller-supplied credential_policy_id that doesn't exist in this tenant
+		// is a client error, not a server error — return 400 so the caller can
+		// correct the request.
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		// Subset invariant violation — the requested key policy is broader
+		// than the owning identity's policy. Surface the precise reason so
+		// the caller knows which axis to narrow.
+		if errors.Is(err, service.ErrPolicySubsetViolation) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create API key")
 		return nil, huma.Error500InternalServerError("failed to create API key")
 	}
