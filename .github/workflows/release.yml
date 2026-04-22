@@ -130,7 +130,7 @@ jobs:
             go-${{ runner.os }}-${{ env.GO_VER }}-
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         env:
           GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
         with:
