@@ -144,7 +144,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.
-		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID, req.CreatedBy)
+		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
 		return nil, fmt.Errorf("failed to create API key: %w", err)
 	}
 
@@ -201,7 +201,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 }
 
 // UpdateAgent updates an agent identity with PATCH semantics.
-func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID, callerUserID string, req UpdateAgentRequest) (*AgentResponse, error) {
+func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID string, req UpdateAgentRequest) (*AgentResponse, error) {
 	var subType domain.SubType
 	if req.SubType != nil {
 		subType = domain.SubType(*req.SubType)
@@ -229,7 +229,6 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 		Labels:       req.Labels,
 		Metadata:     req.Metadata,
 		Status:       status,
-		CallerUserID: callerUserID,
 	})
 	if err != nil {
 		return nil, err
@@ -241,14 +240,14 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 }
 
 // DeleteAgent deactivates an agent and revokes its keys.
-func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID, callerUserID string) (*AgentResponse, error) {
+func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
 
 	// Hard delete — cascades to api_keys, credentials, etc. via FK ON DELETE CASCADE.
-	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID, callerUserID); err != nil {
+	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID); err != nil {
 		return nil, err
 	}
 
@@ -257,11 +256,10 @@ func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID
 }
 
 // ActivateAgent enables a previously deactivated agent.
-func (s *AgentService) ActivateAgent(ctx context.Context, id, accountID, projectID, callerUserID string) (*AgentResponse, error) {
+func (s *AgentService) ActivateAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
 	status := domain.IdentityStatusActive
 	identity, err := s.identitySvc.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{
-		Status:       &status,
-		CallerUserID: callerUserID,
+		Status: &status,
 	})
 	if err != nil {
 		return nil, err
@@ -273,11 +271,10 @@ func (s *AgentService) ActivateAgent(ctx context.Context, id, accountID, project
 }
 
 // DeactivateAgent disables an agent without deleting it.
-func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, projectID, callerUserID string) (*AgentResponse, error) {
+func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
 	status := domain.IdentityStatusDeactivated
 	identity, err := s.identitySvc.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{
-		Status:       &status,
-		CallerUserID: callerUserID,
+		Status: &status,
 	})
 	if err != nil {
 		return nil, err

@@ -260,7 +260,7 @@ func (a *API) updateAgentOp(ctx context.Context, input *UpdateAgentInput) (*GetA
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.UpdateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID, internalMiddleware.GetCallerName(ctx), service.UpdateAgentRequest{
+	resp, err := a.agentSvc.UpdateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID, service.UpdateAgentRequest{
 		Name:         input.Body.Name,
 		SubType:      input.Body.SubType,
 		TrustLevel:   input.Body.TrustLevel,
@@ -286,7 +286,7 @@ func (a *API) deleteAgentOp(ctx context.Context, input *AgentActionInput) (*Agen
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.DeleteAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID, internalMiddleware.GetCallerName(ctx))
+	resp, err := a.agentSvc.DeleteAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -300,7 +300,7 @@ func (a *API) activateAgentOp(ctx context.Context, input *AgentActionInput) (*Ag
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.ActivateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID, internalMiddleware.GetCallerName(ctx))
+	resp, err := a.agentSvc.ActivateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -314,7 +314,7 @@ func (a *API) deactivateAgentOp(ctx context.Context, input *AgentActionInput) (*
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.DeactivateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID, internalMiddleware.GetCallerName(ctx))
+	resp, err := a.agentSvc.DeactivateAgent(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		return nil, mapErr(err)
 	}

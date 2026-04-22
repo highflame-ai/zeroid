@@ -10,6 +10,7 @@ import (
 	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 )
 
 // IdentityRepository handles database operations for identities.
@@ -132,7 +133,9 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 }
 
 // Update saves changes to an existing identity.
+// Sets modified_by from the request context so the audit trigger captures the acting user.
 func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
+	identity.ModifiedBy = middleware.GetCallerName(ctx)
 	_, err := r.db.NewUpdate().Model(identity).
 		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
 		Exec(ctx)
@@ -143,7 +146,15 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 }
 
 // Delete removes an identity.
+// Sets modified_by before deleting so the AFTER DELETE trigger captures the acting user.
 func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		_, _ = r.db.NewUpdate().
+			TableExpr("identities").
+			Set("modified_by = ?", callerID).
+			Where("id = ? AND account_id = ? AND project_id = ?", id, accountID, projectID).
+			Exec(ctx)
+	}
 	_, err := r.db.NewDelete().
 		TableExpr("identities").
 		Where("id = ?", id).

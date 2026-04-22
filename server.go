@@ -136,7 +136,6 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Initialize repositories.
 	identityRepo := postgres.NewIdentityRepository(db)
-	auditRepo := postgres.NewAuditRepository(db)
 	credentialRepo := postgres.NewCredentialRepository(db)
 	attestationRepo := postgres.NewAttestationRepository(db)
 	signalRepo := postgres.NewSignalRepository(db)
@@ -147,7 +146,7 @@ func NewServer(cfg Config) (*Server, error) {
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 
 	// Initialize services.
-	identitySvc := service.NewIdentityService(identityRepo, auditRepo, cfg.WIMSEDomain)
+	identitySvc := service.NewIdentityService(identityRepo, cfg.WIMSEDomain)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)

@@ -17,26 +17,18 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-const (
-	auditActionCreate = "CREATE"
-	auditActionUpdate = "UPDATE"
-	auditActionDelete = "DELETE"
-	auditStatusOK     = "SUCCESS"
-)
-
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
 	repo        *postgres.IdentityRepository
-	auditRepo   *postgres.AuditRepository
 	wimseDomain string
 }
 
 // NewIdentityService creates a new IdentityService.
-func NewIdentityService(repo *postgres.IdentityRepository, auditRepo *postgres.AuditRepository, wimseDomain string) *IdentityService {
-	return &IdentityService{repo: repo, auditRepo: auditRepo, wimseDomain: wimseDomain}
+func NewIdentityService(repo *postgres.IdentityRepository, wimseDomain string) *IdentityService {
+	return &IdentityService{repo: repo, wimseDomain: wimseDomain}
 }
 
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
@@ -82,9 +74,7 @@ type RegisterIdentityRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	CreatedBy     string
-	// CallerUserID is the acting user (from X-User-ID header) — who registered this identity.
-	CallerUserID string
+	CreatedBy string
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -167,13 +157,6 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		Str("wimse_uri", identity.WIMSEURI).
 		Msg("Identity registered")
 
-	if s.auditRepo != nil {
-		newSnap, _ := json.Marshal(identity)
-		if err := s.auditRepo.Insert(ctx, req.AccountID, req.ProjectID, req.CallerUserID, identity.ID, auditActionCreate, auditStatusOK, nil, newSnap); err != nil {
-			log.Error().Err(err).Str("identity_id", identity.ID).Msg("failed to write identity audit log")
-		}
-	}
-
 	return identity, nil
 }
 
@@ -209,9 +192,7 @@ type UpdateIdentityRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	Status        *domain.IdentityStatus
-	// CallerUserID is the acting user (from X-User-ID header) — who made this update.
-	CallerUserID string
+	Status *domain.IdentityStatus
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -221,11 +202,6 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		return nil, err
 	}
 
-	// Snapshot the identity before mutation for the audit log.
-	var oldSnap json.RawMessage
-	if s.auditRepo != nil {
-		oldSnap, _ = json.Marshal(identity)
-	}
 	if req.Name != "" {
 		identity.Name = req.Name
 	}
@@ -288,13 +264,6 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		return nil, err
 	}
 
-	if s.auditRepo != nil {
-		newSnap, _ := json.Marshal(identity)
-		if err := s.auditRepo.Insert(ctx, accountID, projectID, req.CallerUserID, id, auditActionUpdate, auditStatusOK, oldSnap, newSnap); err != nil {
-			log.Error().Err(err).Str("identity_id", id).Msg("failed to write identity audit log")
-		}
-	}
-
 	return identity, nil
 }
 
@@ -336,23 +305,6 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 }
 
 // DeleteIdentity permanently removes an identity and cascades to related records.
-func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID, callerUserID string) error {
-	var oldSnap json.RawMessage
-	if s.auditRepo != nil {
-		if existing, err := s.repo.GetByID(ctx, id, accountID, projectID); err == nil {
-			oldSnap, _ = json.Marshal(existing)
-		}
-	}
-
-	if err := s.repo.Delete(ctx, id, accountID, projectID); err != nil {
-		return err
-	}
-
-	if s.auditRepo != nil {
-		if err := s.auditRepo.Insert(ctx, accountID, projectID, callerUserID, id, auditActionDelete, auditStatusOK, oldSnap, nil); err != nil {
-			log.Error().Err(err).Str("identity_id", id).Msg("failed to write identity audit log")
-		}
-	}
-
-	return nil
+func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID string) error {
+	return s.repo.Delete(ctx, id, accountID, projectID)
 }

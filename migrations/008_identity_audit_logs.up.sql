@@ -18,13 +18,6 @@ CREATE TABLE IF NOT EXISTS identity_audit_logs (
 CREATE INDEX IF NOT EXISTS idx_identity_audit_logs_tenant
     ON identity_audit_logs (account_id, project_id);
 
-CREATE INDEX IF NOT EXISTS idx_identity_audit_logs_identity
-    ON identity_audit_logs (identity_id)
-    WHERE identity_id != '';
-
 CREATE INDEX IF NOT EXISTS idx_identity_audit_logs_caller
     ON identity_audit_logs (caller_user_id)
     WHERE caller_user_id != '';
-
-CREATE INDEX IF NOT EXISTS idx_identity_audit_logs_created_at
-    ON identity_audit_logs (created_at DESC);
