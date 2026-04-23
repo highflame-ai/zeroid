@@ -72,7 +72,7 @@ func toAuditLogResponse(e postgres.AuditLogEntry) AuditLogResponse {
 	return AuditLogResponse{
 		AuditID:    e.ID,
 		AccountID:  e.AccountID,
-		TableName:  e.TableName,
+		TableName:  "identities",
 		Action:     e.Action,
 		Status:     e.Status,
 		UserID:     e.UserID,

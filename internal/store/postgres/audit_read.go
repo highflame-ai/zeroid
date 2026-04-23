@@ -15,7 +15,6 @@ type AuditLogEntry struct {
 	AccountID  string          `bun:"account_id"     json:"account_id"`
 	ProjectID  string          `bun:"project_id"     json:"project_id"`
 	IdentityID string          `bun:"identity_id"    json:"identity_id"`
-	TableName  string          `bun:"table_name"     json:"table_name"`
 	Action     string          `bun:"action"         json:"action"`
 	Status     string          `bun:"status"         json:"status"`
 	UserID     string          `bun:"caller_user_id" json:"user_id"`
