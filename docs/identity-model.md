@@ -4,7 +4,7 @@ Anyone adopting ZeroID for agentic systems hits the same question within the fir
 
 They're not competing. They're **different roles in a single request**, and a well-designed token carries all of them at once as a delegation chain. This doc names those roles, shows how they compose, and walks through the three common trust-federation patterns that emerge when MCP servers have their own authorization stories.
 
-> **The cryptographic caveat up front.** A JWT is signed by exactly one private key, so "one token with Okta + ZeroID + GitHub all inside" is not literally possible — no issuer can forge another's signature. What IS possible is attestation via federation: a trusted service verifies Okta's ID token, ZeroID **re-asserts** the user claims under its own signature (vouching for the trusted service's verification), and the result is a single JWT authoritative within ZeroID's trust domain. Crossing into a different trust domain (e.g., GitHub) requires a separate token minted by that domain's authority. See [How ZeroID composes claims from upstream IdPs](#how-zeroid-composes-claims-from-upstream-idps) and [Three federation patterns](#three-federation-patterns-for-remote-mcp-servers) below for the mechanics.
+> **The cryptographic caveat up front.** A JWT is signed by exactly one private key, so "one token with Okta + ZeroID + GitHub all inside" is not literally possible — no issuer can forge another's signature. What IS possible is attestation via federation: ZeroID verifies the upstream IdP's ID token and re-asserts the user claims under its own signature (preserving `user_id_iss` to record which IdP authenticated), producing a single JWT authoritative within ZeroID's trust domain. Crossing into a different trust domain (e.g., GitHub) requires a separate token minted by that domain's authority. See [How ZeroID composes claims from upstream IdPs](#how-zeroid-composes-claims-from-upstream-idps) for the direct-federation mechanics and [Three federation patterns](#three-federation-patterns-for-remote-mcp-servers) for the outbound side.
 
 ---
 
@@ -70,35 +70,21 @@ No identity is lost. Every hop is accountable. Every field has a standardized ho
 │                                    ▼                                 │
 │   [Cursor]  ◄────── Okta ID token ─────                             │
 │      │                                                               │
+│      │ Preferred: ZeroID verifies Okta directly (tracked in #88).    │
+│      │ Today:     trusted-service broker verifies, ZeroID trusts it. │
 │      │                                                               │
 │      ▼                                                               │
-│   [Trusted service / gateway]                                        │
-│      • Verifies Okta's signature against Okta's JWKS ← happens HERE │
-│      • Extracts user_id from Okta's sub                              │
-│      • Resolves tenant context (account_id, project_id)              │
-│      │                                                               │
-│      │ calls ExternalPrincipalExchange on ZeroID:                    │
-│      │   grant_type         = ...:token-exchange                     │
-│      │   subject_token      = <Okta JWT>  (passed but not re-verified)
-│      │   subject_token_type = ...:token-type:jwt                     │
-│      │   user_id            = alice@example.com                      │
-│      │   account_id, project_id                                      │
-│      ▼                                                               │
-│   ZeroID  • Validates CALLER via TrustedServiceValidator             │
-│           • Does NOT re-verify Okta's signature (trust boundary crossed
-│             at the trusted-service hop)                              │
-│           • Issues ZeroID-signed session token:                      │
-│              sub = <cursor client identity>                          │
-│              user_id = alice@example.com                             │
-│              trusted_by = gateway-prod-us-west                       │
+│   ZeroID — mints a session token carrying whichever provenance the   │
+│            chosen path supports (user_id_iss for direct;             │
+│            trusted_by for broker).                                   │
 │                                                                      │
-│   Later, on agent spawn, Cursor calls token_exchange again:          │
+│   On agent spawn, Cursor calls token_exchange:                       │
 │      subject_token = <session token>                                 │
 │      actor_token   = <agent's signed JWT assertion>                  │
 │   → ZeroID issues task token:                                        │
 │              sub = spiffe://...agent/claude-code-session-abc         │
 │              user_id = alice@example.com   (propagated)              │
-│              trusted_by = gateway-prod-us-west (propagated)          │
+│              user_id_iss or trusted_by    (propagated)               │
 │              azp = cursor-macos-v1.2.3                               │
 │              act.sub = claude-code-orchestrator                      │
 │              scopes narrowed to task requirements                    │
@@ -144,9 +130,15 @@ Each layer writes exactly the fields it's responsible for, and each downstream l
 
 ## How ZeroID composes claims from upstream IdPs
 
-You won't store human users in ZeroID. Okta / Entra ID / Auth0 / Google Workspace own that directory; ZeroID's job is agent identity. So when Alice logs in to Cursor, her identity is first minted by Okta as an OIDC ID token — signed by Okta. A few milliseconds later, that identity needs to appear as a `user_id` claim inside a ZeroID-signed token that the agent will use for the rest of its session. How does the claim get from Okta's signature to a ZeroID-signed token?
+You won't store human users in ZeroID. Okta / Entra ID / Auth0 / Google Workspace own that directory; ZeroID's job is agent identity. When Alice logs in to Cursor, her identity is first minted by the IdP as an OIDC ID token — signed by the IdP. A few milliseconds later, that identity needs to land as a `user_id` claim inside a ZeroID-signed token that the agent will use for the rest of its session.
 
-ZeroID today implements a **trusted-service broker** pattern. It does *not* verify external IdP tokens directly; it delegates that verification to a caller the deployer controls and trusts. The flow:
+Two patterns get it there. They produce substantively different tokens and are not equivalent.
+
+### Direct IdP federation (spec-aligned preferred path)
+
+**Status: tracked in [#88](https://github.com/highflame-ai/zeroid/issues/88); preferred default once shipped.**
+
+ZeroID verifies the IdP's ID token itself, using the IdP's published JWKS. Authentication context — which IdP did the authenticating, when, at what assurance level — is preserved end-to-end as first-class claims the consumer can read.
 
 ```
 1. Alice → Cursor → Okta
@@ -154,71 +146,113 @@ ZeroID today implements a **trusted-service broker** pattern. It does *not* veri
    Okta issues: ID token signed by Okta.
        { sub: alice@ex.com, email, groups, aud: cursor, iss: okta }
 
+2. Cursor → ZeroID
+   POST /oauth2/token
+     grant_type           = urn:ietf:params:oauth:grant-type:token-exchange
+     subject_token        = <Okta ID token>
+     subject_token_type   = urn:ietf:params:oauth:token-type:id_token
+     account_id, project_id
+
+3. ZeroID resolves Okta from its configured external_issuers allowlist,
+   fetches Okta's JWKS, verifies signature / iss / aud / exp / nbf / iat,
+   extracts user claims per the configured claim-mapping rules, then
+   mints a new token:
+
+       {
+         iss:          ZeroID,
+         sub:          <cursor client identity>,
+         user_id:      alice@ex.com,                      ← from Okta's sub/email
+         user_id_iss:  https://auth.example.okta.com,     ← real upstream issuer
+         auth_time:    1735600000,                         ← when Okta authenticated
+         scopes:       [...]
+       }
+       Signed by ZeroID.
+```
+
+**Why this is the preferred default.** It's what the standards actually ask for:
+
+- **RFC 8693** defines `subject_token_type = id_token` precisely for this case — the receiver verifies the ID token.
+- **OIDC Core** expects `iss` (and its propagation) to trace to the IdP that did the authenticating.
+- **RFC 9068 (JWT Access Token Profile)** specifies `acr` / `amr` / `auth_time` as authentication-context claims that only make sense if you know where auth happened.
+- **NIST SP 800-63C §4.1** requires assertions to name the IdP that authenticated the subject, not an intermediate aggregator.
+- **CoSAI Agentic IAM**'s "prove control on demand" principle collapses without IdP-level provenance.
+
+Any regulator, auditor, or consumer that asks *"which IdP authenticated this user?"* gets an answer directly from `user_id_iss`. The broker pattern below can't.
+
+### Trusted-service broker (currently-available fallback)
+
+**Status: implemented today via `ExternalPrincipalExchange`.** Lossier on provenance than the direct path. Use when an operational constraint below applies; otherwise wait for #88.
+
+A deployer-controlled service verifies the IdP's token, extracts claims, and calls ZeroID with pre-validated user context. ZeroID validates the *caller* — not the original IdP token — via its `TrustedServiceValidator` hook.
+
+```
+1. Alice → Cursor → Okta  (same as above)
+
 2. Cursor → Trusted service (gateway / admin tier / identity broker)
-   The trusted service verifies Okta's signature against Okta's JWKS,
-   checks iss / aud / exp, extracts the user claims, and resolves
-   tenant context (account_id, project_id).
+   The trusted service verifies Okta's signature, extracts user claims,
+   resolves tenant context.
 
 3. Trusted service → ZeroID
    POST /oauth2/token
      grant_type           = urn:ietf:params:oauth:grant-type:token-exchange
      subject_token        = <Okta JWT>
      subject_token_type   = urn:ietf:params:oauth:token-type:jwt
-     user_id              = alice@ex.com         ← extracted by trusted service
+     user_id              = alice@ex.com      ← extracted by trusted service
      account_id, project_id
 
-4. ZeroID validates the CALLER via TrustedServiceValidator middleware.
-   It does NOT re-verify Okta's signature — that happened in step 2.
-   ZeroID mints a new token:
+4. ZeroID validates the CALLER via TrustedServiceValidator.
+   Does NOT re-verify Okta's signature — that happened in step 2.
+   Mints a new token:
 
        {
-         iss:         ZeroID,
-         sub:         <cursor client identity>,
-         user_id:     alice@ex.com,              ← from the request
-         trusted_by:  gateway-prod-us-west,      ← which service vouched
-         token_exchange: "external_principal",
-         scopes:      [...]
+         iss:              ZeroID,
+         sub:              <cursor client identity>,
+         user_id:          alice@ex.com,
+         trusted_by:       gateway-prod-us-west,   ← which service vouched
+         token_exchange:   "external_principal",
+         scopes:           [...]
        }
        Signed by ZeroID.
-
-5. The ZeroID session token is what Cursor holds from here on. Okta's
-   token is never forwarded past the trusted-service hop.
 ```
 
-Every subsequent ZeroID token derived from this session — task tokens for agents, delegated tokens for sub-agents — carries `user_id` and `trusted_by` as propagated claims. Consumers that need to know which service vouched for the user read `trusted_by`; consumers that just need "which user" read `user_id`.
+**What's lost.** `trusted_by` is **service-granular, not IdP-granular**. The consumer can see *which service vouched* but not *which IdP authenticated*. For regulators, audit trails, or downstream policy engines that need per-IdP provenance (common in finance and healthcare), this is information that's just gone. If Alice authenticates via corporate Entra on her laptop and personal Google on her phone and both route through the same gateway, the ZeroID tokens look identical at the provenance layer. They shouldn't.
 
-**Why a trusted service instead of direct IdP verification?** Keeps IdP-specific quirks (Okta claim layout, Entra tenant metadata, per-IdP rotation) out of the identity server. Deployers own their federation topology; ZeroID owns agent identity. The design intentionally narrows what ZeroID is responsible for.
+### When the broker is actually right
 
-**Trust model.** `user_id` is not cryptographically backed by Okta at consume time — the Okta signature lived and died inside the trusted-service hop. ZeroID is saying *"I trust the `gateway-prod-us-west` service to have correctly verified an Okta ID token and extracted `alice@ex.com`."* Consumers who trust ZeroID transitively trust the gateway, which transitively trusts Okta. Three parties in the chain, two of them attesting on behalf of the others.
+Three narrow cases where the broker's simplifications are operationally justified:
 
-The `trusted_by` claim is **service-level provenance, not IdP-level**. You can see *which service vouched*, but not *which upstream IdP they vouched based on*. Deployers who need per-IdP provenance (e.g., regulators who require knowing whether a user was authenticated by corporate Entra vs. personal Google) can add a deployment-specific claim through `AdditionalClaims` on the exchange call — ZeroID passes arbitrary custom claims through — but it isn't built into the standard shape.
+1. **You already run a dedicated identity-broker tier.** The gateway is doing OIDC verification for many downstream services (not just ZeroID), with its own policy, audit, and compliance boundary. Adding direct federation to ZeroID duplicates work and creates two places where IdP trust config lives. Pick one.
 
-If you need Okta's signature at consume time (for regulatory proof-of-authentication), the relying party has to verify the Okta token directly during the login hop. ZeroID can't produce Okta signatures after the fact.
+2. **Complex per-deployment claim mapping.** Your claim rules involve cross-referencing an internal HR directory, normalizing identifiers across merged orgs, or applying time-of-day policy. Keeping that logic in a dedicated broker is cleaner than extending ZeroID's config.
 
-**Why not forward the Okta token alongside the ZeroID token?** Two reasons:
+3. **Air-gapped or egress-restricted ZeroID.** ZeroID runs in an environment that can't reach external IdP JWKS endpoints. A broker in the DMZ does the IdP round-trip; ZeroID trusts what it gets.
 
-1. **Lifetime mismatch.** Okta's access tokens are typically 60 minutes; ZeroID-derived task tokens can be minutes or seconds. Pairing them means either throwing away the task token's short lifetime or juggling asymmetric refresh cycles.
-2. **Audience mismatch.** The Okta token's `aud` is Okta-side consumers (a SaaS app, an Okta-protected API). MCP servers aren't in that audience. Re-asserting the claims under ZeroID's signature puts them in an audience the MCP server understands.
+If none of these apply, use direct federation.
 
-The same pattern applies to any upstream IdP: Entra ID for enterprise, Google Workspace, custom SAML/OIDC providers. The trusted service is the IdP-specific layer; ZeroID is uniform.
+### Provenance comparison
+
+| Question a consumer might ask | Direct federation (#88) | Broker (today) |
+|---|---|---|
+| Which IdP authenticated this user? | `user_id_iss` | Not preserved |
+| When did that authentication happen? | `auth_time` | Not preserved |
+| At what assurance level? | `acr` / `amr` | Not preserved |
+| Which service vouched? | N/A (direct) | `trusted_by` |
+| Is the token ZeroID-signed? | ✅ | ✅ |
+| Can I reason about the trust chain from the token alone? | Yes | No — need to know what `trusted_by` maps to |
 
 ### Wiring the trusted-service validator
 
-The `TrustedServiceValidator` hook is deployer-supplied. Typical implementations:
+If you use the broker path today, the `TrustedServiceValidator` hook is deployer-supplied. Typical implementations:
 
-- **mTLS at the ingress** — the validator checks the presented client certificate against an internal CA / identity list.
-- **Service JWT** — the trusted service presents its own ZeroID-issued service token; the validator verifies it inline.
-- **Network policy** — validator reads a trusted header (`X-Highflame-Trusted-Service`) populated by a known-good ingress controller. Only works when the ingress is itself locked down.
+- **mTLS at the ingress** — validator checks the presented client certificate against an internal CA.
+- **Service JWT** — the trusted service presents its own ZeroID-issued service token; validator verifies it inline.
+- **Network policy** — validator reads a trusted header populated by a locked-down ingress controller.
 
-See `internal/service/oauth.go:ExternalPrincipalExchange` for the code path and the `SetTrustedServiceValidator` hook on `Server` for wiring.
+See `internal/service/oauth.go:ExternalPrincipalExchange` for the code path and `SetTrustedServiceValidator` on `Server` for wiring.
 
-### What ZeroID doesn't do today (and how to extend)
+### Optional: preserving the upstream token for high-assurance paths
 
-ZeroID today does not itself speak to external OIDC IdPs. If you want ZeroID to verify the Okta token directly (no trusted-service layer, simpler topology), that's [issue #88 — direct OIDC IdP federation](https://github.com/highflame-ai/zeroid/issues/88) on the ZeroID backlog. The sketch there covers per-issuer config, JWKS fetching, claim-mapping rules, and a first-class `user_id_iss` provenance claim to replace the service-granularity `trusted_by`. Not blocked; just not built.
-
-### Optional: preserving the Okta token for high-assurance paths
-
-For operations that need direct proof-of-authentication (not ZeroID's attestation), the deployer can configure Cursor to cache the Okta access token and include it in a secondary header (`X-User-Assertion: <okta jwt>`) on specific requests. The MCP server's interceptor chain then verifies both: the ZeroID token (for agent identity + delegation) and the Okta token (for direct user proof). This is uncommon — most deployments accept transitive trust via federation — but it's the answer when regulatory or contractual requirements demand it.
+Independent of which federation pattern you use, for operations that need *direct cryptographic proof-of-authentication* (the Okta signature, not ZeroID's attestation of it), the deployer can configure Cursor to carry the Okta access token in a secondary header (`X-User-Assertion: <okta jwt>`) on specific requests. The MCP server's interceptor chain then verifies both: the ZeroID token for agent identity + delegation, the Okta token for direct user proof. This is uncommon — most deployments accept transitive trust via federation — but it's the answer when regulatory or contractual requirements demand it.
 
 ## Three federation patterns for remote MCP servers
 
