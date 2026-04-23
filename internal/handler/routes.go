@@ -30,6 +30,7 @@ type API struct {
 	signalSvc           *service.SignalService
 	apiKeySvc           *service.APIKeyService
 	agentSvc            *service.AgentService
+	auditSvc            *service.AuditService
 	jwksSvc             *signing.JWKSService
 	db                  *bun.DB
 	issuer              string
@@ -49,6 +50,7 @@ func NewAPI(
 	signalSvc *service.SignalService,
 	apiKeySvc *service.APIKeyService,
 	agentSvc *service.AgentService,
+	auditSvc *service.AuditService,
 	jwksSvc *signing.JWKSService,
 	db *bun.DB,
 	issuer, baseURL string,
@@ -64,6 +66,7 @@ func NewAPI(
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
 		agentSvc:            agentSvc,
+		auditSvc:            auditSvc,
 		jwksSvc:             jwksSvc,
 		db:                  db,
 		issuer:              issuer,

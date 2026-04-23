@@ -144,8 +144,10 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicyRepo := postgres.NewCredentialPolicyRepository(db)
 	apiKeyRepo := postgres.NewAPIKeyRepository(db)
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
+	auditRepo := postgres.NewAuditLogRepository(db)
 
 	// Initialize services.
+	auditSvc := service.NewAuditService(auditRepo)
 	identitySvc := service.NewIdentityService(identityRepo, cfg.WIMSEDomain)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
@@ -171,7 +173,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 

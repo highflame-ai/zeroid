@@ -74,7 +74,7 @@ type RegisterIdentityRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	CreatedBy string
+	CreatedBy     string
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -192,7 +192,7 @@ type UpdateIdentityRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	Status *domain.IdentityStatus
+	Status        *domain.IdentityStatus
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
