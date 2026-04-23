@@ -30,7 +30,7 @@ const (
 // urnToShortGrantType maps OAuth2 URN grant type identifiers to their canonical short forms.
 var urnToShortGrantType = map[string]GrantType{
 	"urn:ietf:params:oauth:grant-type:jwt-bearer":     GrantTypeJWTBearer,
-	"urn:ietf:params:oauth:grant-type:token-exchange":  GrantTypeTokenExchange,
+	"urn:ietf:params:oauth:grant-type:token-exchange": GrantTypeTokenExchange,
 }
 
 // allValidGrantTypes is the set of all recognised canonical short forms.
@@ -64,16 +64,20 @@ func IsValidGrantType(gt string) bool {
 type IssuedCredential struct {
 	bun.BaseModel `bun:"table:issued_credentials,alias:ic"`
 
-	ID              string     `bun:"id,pk,type:uuid"              json:"id"`
-	IdentityID      *string    `bun:"identity_id,type:uuid"        json:"identity_id,omitempty"`
-	AccountID       string     `bun:"account_id,type:varchar(255)" json:"account_id"`
-	ProjectID       string     `bun:"project_id,type:varchar(255)" json:"project_id"`
-	JTI             string     `bun:"jti,type:varchar(255),unique"  json:"jti"`
-	Subject         string     `bun:"subject,type:text"             json:"subject"`
-	IssuedAt        time.Time  `bun:"issued_at,nullzero,notnull,default:current_timestamp" json:"issued_at"`
-	ExpiresAt       time.Time  `bun:"expires_at,nullzero,notnull"   json:"expires_at"`
-	TTLSeconds      int        `bun:"ttl_seconds"                   json:"ttl_seconds"`
-	Scopes          []string   `bun:"scopes,array"                  json:"scopes"`
+	ID         string    `bun:"id,pk,type:uuid"              json:"id"`
+	IdentityID *string   `bun:"identity_id,type:uuid"        json:"identity_id,omitempty"`
+	AccountID  string    `bun:"account_id,type:varchar(255)" json:"account_id"`
+	ProjectID  string    `bun:"project_id,type:varchar(255)" json:"project_id"`
+	JTI        string    `bun:"jti,type:varchar(255),unique"  json:"jti"`
+	Subject    string    `bun:"subject,type:text"             json:"subject"`
+	IssuedAt   time.Time `bun:"issued_at,nullzero,notnull,default:current_timestamp" json:"issued_at"`
+	ExpiresAt  time.Time `bun:"expires_at,nullzero,notnull"   json:"expires_at"`
+	TTLSeconds int       `bun:"ttl_seconds"                   json:"ttl_seconds"`
+	Scopes     []string  `bun:"scopes,array"                  json:"scopes"`
+	// Audience holds the explicit audience supplied at issuance. NULL/empty
+	// means no audience was specified — in that case the JWT's `aud` claim
+	// defaults to the issuer URL. Preserved across rotation.
+	Audience        []string   `bun:"audience,array"                json:"audience,omitempty"`
 	IsRevoked       bool       `bun:"is_revoked"                    json:"is_revoked"`
 	RevokedAt       *time.Time `bun:"revoked_at"                    json:"revoked_at,omitempty"`
 	RevokeReason    string     `bun:"revoke_reason,type:text"       json:"revoke_reason,omitempty"`

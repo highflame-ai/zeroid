@@ -337,6 +337,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		ExpiresAt:           expiresAt,
 		TTLSeconds:          ttl,
 		Scopes:              coalesceScopeSlice(req.Scopes),
+		Audience:            req.Audience, // persist explicit only; nil → default to issuer on rotation too
 		GrantType:           req.GrantType,
 		DelegationDepth:     req.DelegationDepth,
 		ParentJTI:           req.ParentJTI,
@@ -399,10 +400,14 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		return nil, nil, fmt.Errorf("failed to revoke old credential during rotation: %w", err)
 	}
 
-	// Issue a new one with the same parameters.
+	// Issue a new one with the same parameters. Audience is propagated so
+	// clients expecting a specific `aud` on the original token see the same
+	// value on the rotated token. If the original had no explicit audience,
+	// old.Audience is nil and the new token re-defaults to the issuer URL.
 	return s.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
 		Scopes:    old.Scopes,
+		Audience:  old.Audience,
 		TTL:       old.TTLSeconds,
 		GrantType: old.GrantType,
 	})

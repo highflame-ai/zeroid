@@ -33,8 +33,8 @@ type OAuthService struct {
 	refreshTokenSvc *RefreshTokenService
 	issuer          string
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
-	hmacSecret     string // HS256 shared secret for auth code JWT verification
-	authCodeIssuer string // expected issuer in auth code JWTs
+	hmacSecret      string // HS256 shared secret for auth code JWT verification
+	authCodeIssuer  string // expected issuer in auth code JWTs
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -46,7 +46,7 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 
 // Default token TTLs (used when per-client TTL is not configured).
 const (
-	defaultAccessTokenTTLWithRefresh = 3600          // 1 hour when refresh tokens provide continuity
+	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
 	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
 )
 
@@ -71,10 +71,10 @@ type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, 
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
-	Issuer          string
-	WIMSEDomain     string
-	HMACSecret      string
-	AuthCodeIssuer  string
+	Issuer         string
+	WIMSEDomain    string
+	HMACSecret     string
+	AuthCodeIssuer string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -93,15 +93,15 @@ func NewOAuthService(
 	cfg OAuthServiceConfig,
 ) *OAuthService {
 	return &OAuthService{
-		credentialSvc:    credentialSvc,
-		identitySvc:      identitySvc,
-		oauthClientSvc:   oauthClientSvc,
-		apiKeyRepo:       apiKeyRepo,
-		authCodeRepo:     authCodeRepo,
-		jwksSvc:          jwksSvc,
-		refreshTokenSvc:  refreshTokenSvc,
-		issuer:           cfg.Issuer,
-		wimseDomain:      cfg.WIMSEDomain,
+		credentialSvc:           credentialSvc,
+		identitySvc:             identitySvc,
+		oauthClientSvc:          oauthClientSvc,
+		apiKeyRepo:              apiKeyRepo,
+		authCodeRepo:            authCodeRepo,
+		jwksSvc:                 jwksSvc,
+		refreshTokenSvc:         refreshTokenSvc,
+		issuer:                  cfg.Issuer,
+		wimseDomain:             cfg.WIMSEDomain,
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
@@ -141,9 +141,9 @@ type TokenRequest struct {
 	ActorToken       string // the sub-agent's JWT assertion (NHI delegation only)
 	// External principal exchange fields (RFC 8693 with subject_token_type=jwt):
 	// Populated by the trusted service (e.g. admin) that already authenticated the user.
-	UserID        string // external user ID (e.g. Clerk user ID)
-	UserEmail     string // user email
-	UserName      string // user display name
+	UserID           string         // external user ID (e.g. Clerk user ID)
+	UserEmail        string         // user email
+	UserName         string         // user display name
 	ApplicationID    string         // optional application scope
 	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
 	// authorization_code grant fields:
@@ -991,6 +991,7 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 		"active":     true,
 		"sub":        parsed.Subject(),
 		"iss":        parsed.Issuer(),
+		"aud":        parsed.Audience(),
 		"jti":        jti,
 		"iat":        parsed.IssuedAt().Unix(),
 		"exp":        parsed.Expiration().Unix(),
@@ -1074,7 +1075,6 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	}
 	return parts[0], parts[1], nil
 }
-
 
 // parseScopeString splits a space-delimited scope string into a slice.
 func parseScopeString(scope string) []string {
