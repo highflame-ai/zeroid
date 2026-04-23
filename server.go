@@ -157,7 +157,6 @@ func NewServer(cfg Config) (*Server, error) {
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
 	if authCodeIssuer == "" {
@@ -171,6 +170,9 @@ func NewServer(cfg Config) (*Server, error) {
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo)
+	// agentSvc depends on credentialSvc + signalSvc for DeactivateAgent's
+	// revoke-and-signal behavior, so it is constructed last.
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, credentialSvc, signalSvc)
 
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(

@@ -383,6 +383,17 @@ func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID,
 	return s.repo.Revoke(ctx, id, accountID, projectID, reason)
 }
 
+// RevokeAllActiveForIdentity revokes every active credential issued to the given
+// identity and cascades to any delegated descendants via the parent_jti chain.
+// Returns the total number of credentials revoked. Used during agent deactivation
+// so existing tokens stop working immediately rather than surviving until TTL.
+func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
+	if reason == "" {
+		reason = "identity_deactivated"
+	}
+	return s.repo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+}
+
 // RotateCredential revokes an existing credential and immediately issues a new one for the same identity.
 // The new credential inherits the scopes and TTL of the old one unless overridden.
 func (s *CredentialService) RotateCredential(ctx context.Context, credID, accountID, projectID string, identity *domain.Identity) (*domain.AccessToken, *domain.IssuedCredential, error) {

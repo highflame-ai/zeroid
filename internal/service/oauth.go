@@ -216,6 +216,9 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if err != nil {
 		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 	}
+	if !identity.Status.IsUsable() {
+		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
@@ -526,6 +529,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		if err != nil {
 			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
 		}
+		if !resolved.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
 		identity = resolved
 	} else {
 		identity = &domain.Identity{
@@ -605,6 +611,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		if err != nil {
 			log.Warn().Str("identity_id", sk.IdentityID).Str("key_id", sk.ID).Msg("API key linked to unknown identity_id, issuing without identity")
 			identity = nil
+		} else if !identity.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 		}
 	}
 
