@@ -214,7 +214,7 @@ See `internal/service/oauth.go:ExternalPrincipalExchange` for the code path and 
 
 ### What ZeroID doesn't do today (and how to extend)
 
-ZeroID today does not itself speak to external OIDC IdPs. If you want ZeroID to verify the Okta token directly (no trusted-service layer, simpler topology), that's **issue [TBD] — direct OIDC IdP federation** on the ZeroID backlog. The sketch there covers per-issuer config, JWKS fetching, claim-mapping rules, and a first-class `user_id_iss` provenance claim to replace the service-granularity `trusted_by`. Not blocked; just not built.
+ZeroID today does not itself speak to external OIDC IdPs. If you want ZeroID to verify the Okta token directly (no trusted-service layer, simpler topology), that's [issue #88 — direct OIDC IdP federation](https://github.com/highflame-ai/zeroid/issues/88) on the ZeroID backlog. The sketch there covers per-issuer config, JWKS fetching, claim-mapping rules, and a first-class `user_id_iss` provenance claim to replace the service-granularity `trusted_by`. Not blocked; just not built.
 
 ### Optional: preserving the Okta token for high-assurance paths
 
