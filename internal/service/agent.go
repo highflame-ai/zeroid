@@ -14,27 +14,17 @@ import (
 
 // AgentService handles agent registration (atomic identity + API key creation).
 type AgentService struct {
-	identitySvc   *IdentityService
-	apiKeySvc     *APIKeyService
-	apiKeyRepo    *postgres.APIKeyRepository
-	credentialSvc *CredentialService
-	signalSvc     *SignalService
+	identitySvc *IdentityService
+	apiKeySvc   *APIKeyService
+	apiKeyRepo  *postgres.APIKeyRepository
 }
 
 // NewAgentService creates a new AgentService.
-func NewAgentService(
-	identitySvc *IdentityService,
-	apiKeySvc *APIKeyService,
-	apiKeyRepo *postgres.APIKeyRepository,
-	credentialSvc *CredentialService,
-	signalSvc *SignalService,
-) *AgentService {
+func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, apiKeyRepo *postgres.APIKeyRepository) *AgentService {
 	return &AgentService{
-		identitySvc:   identitySvc,
-		apiKeySvc:     apiKeySvc,
-		apiKeyRepo:    apiKeyRepo,
-		credentialSvc: credentialSvc,
-		signalSvc:     signalSvc,
+		identitySvc: identitySvc,
+		apiKeySvc:   apiKeySvc,
+		apiKeyRepo:  apiKeyRepo,
 	}
 }
 
@@ -307,23 +297,12 @@ func (s *AgentService) ActivateAgent(ctx context.Context, id, accountID, project
 	return &resp, nil
 }
 
-// DeactivateAgent disables an agent without deleting it. Flips the identity's
-// status AND fully stops any further token use:
-//
-//   - revokes every linked API key (so the api_key grant rejects the key);
-//   - revokes every active issued credential, cascading to delegated
-//     descendants via the parent_jti chain (so tokens already in flight
-//     become inactive on next introspection);
-//   - emits a high-severity CAE retirement signal so federated subscribers
-//     (edge gateways, external SIEM, CAE-aware relying parties) pick up the
-//     deactivation in near real time rather than on their next introspection.
-//
-// Each of these is best-effort: a failure on one step is logged and the
-// method continues. The status flip is the authoritative outcome; the
-// secondary revocations make the effect visible quickly rather than waiting
-// for TTL expiry. The issuance paths also gate on identity.Status.IsUsable(),
-// so new token requests are blocked regardless of whether these cleanup
-// steps succeed.
+// DeactivateAgent disables an agent without deleting it. The underlying
+// IdentityService.UpdateIdentity sweeps linked API keys, cascade-revokes
+// active credentials, and emits a retirement CAE signal on any fresh
+// transition into the deactivated status — so this endpoint, a direct
+// PUT /identities/{id} with status=deactivated, and any programmatic
+// caller all produce the same end state.
 func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
 	status := domain.IdentityStatusDeactivated
 	identity, err := s.identitySvc.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{
@@ -332,33 +311,6 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 	if err != nil {
 		return nil, err
 	}
-
-	// Revoke linked API keys so the api_key grant stops accepting them.
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID); err != nil {
-		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to revoke linked API keys")
-	}
-
-	// Revoke active issued credentials (cascades to delegated descendants).
-	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, "identity_deactivated"); err != nil {
-		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to revoke active credentials")
-	} else if n > 0 {
-		log.Info().Str("identity_id", identity.ID).Int64("count", n).Msg("deactivate: revoked active credentials (cascade)")
-	}
-
-	// Emit CAE signal so federated subscribers pick up the deactivation.
-	if _, err := s.signalSvc.IngestSignal(
-		ctx,
-		accountID,
-		projectID,
-		identity.ID,
-		domain.SignalTypeRetirement,
-		domain.SignalSeverityHigh,
-		"agent_deactivation",
-		map[string]any{"reason": "identity_deactivated"},
-	); err != nil {
-		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to emit CAE signal")
-	}
-
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
 	resp := identityToAgentResponse(identity, keyPrefix)
 	return &resp, nil

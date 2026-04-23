@@ -100,7 +100,21 @@ type IssueRequest struct {
 var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
 
 // IssueCredential issues a short-lived JWT for an identity.
+//
+// Gate: identities not in a usable status never receive a fresh credential.
+// This is the authoritative chokepoint — every issuance path in the codebase
+// (admin /credentials/issue, oauth grants, RotateCredential, attestation
+// verification) funnels through here. Per-grant checks elsewhere remain as
+// defense-in-depth and for better error messages, but this gate is the
+// guarantee that bypasses via a new or forgotten path still fail closed.
 func (s *CredentialService) IssueCredential(ctx context.Context, req IssueRequest) (*domain.AccessToken, *domain.IssuedCredential, error) {
+	if req.Identity == nil {
+		return nil, nil, fmt.Errorf("identity is required")
+	}
+	if !req.Identity.Status.IsUsable() {
+		return nil, nil, fmt.Errorf("identity is not usable (status: %s)", req.Identity.Status)
+	}
+
 	ttl := req.TTL
 	if ttl <= 0 {
 		ttl = s.defaultTTL

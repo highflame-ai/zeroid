@@ -165,5 +165,85 @@ func TestDeactivationEmitsRetirementSignal(t *testing.T) {
 	}
 	require.NotNil(t, found, "a retirement signal for the deactivated agent must be present")
 	assert.Equal(t, "high", found["severity"], "deactivation signal should be high severity")
-	assert.Equal(t, "agent_deactivation", found["source"])
+	assert.Equal(t, "identity_lifecycle", found["source"])
+}
+
+// TestIdentityUpdateToDeactivatedRunsCleanup verifies that the centralized
+// cleanup fires when the status transition happens via the generic
+// PUT /identities/{id} path, not only via AgentService.DeactivateAgent. This
+// guards the original #89 bypass: any route that sets status to deactivated
+// must perform the full cleanup, not just the dedicated agent endpoint.
+func TestIdentityUpdateToDeactivatedRunsCleanup(t *testing.T) {
+	ext := uid("deactivate-via-update")
+	reg := registerAgent(t, ext)
+
+	// Issue a token while the identity is still active.
+	issueResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    reg.APIKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, issueResp.StatusCode)
+	token := decode(t, issueResp)["access_token"].(string)
+	require.True(t, introspect(t, token)["active"].(bool))
+
+	// Deactivate via the generic identity update — not the agent endpoint.
+	patchResp, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID),
+		map[string]any{"status": "deactivated"}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, patchResp.StatusCode, "PATCH /identities/{id} should succeed")
+	_ = patchResp.Body.Close()
+
+	// Existing token must be revoked by the centralized cleanup.
+	assert.False(t, introspect(t, token)["active"].(bool),
+		"PATCH /identities status=deactivated must trigger credential revocation")
+}
+
+// TestAdminIssueOnDeactivatedIdentityRejected verifies the IssueCredential gate
+// closes the admin /credentials/issue bypass. Even an admin cannot mint a
+// fresh credential for a deactivated identity.
+func TestAdminIssueOnDeactivatedIdentityRejected(t *testing.T) {
+	ext := uid("admin-issue-deactivated")
+	reg := registerAgent(t, ext)
+
+	// Deactivate.
+	deact, err := doRaw(t, http.MethodPost, adminPath("/agents/registry/"+reg.AgentID+"/deactivate"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, deact.StatusCode)
+	_ = deact.Body.Close()
+
+	// Try the admin /credentials/issue endpoint — must fail.
+	issueResp := post(t, adminPath("/credentials/issue"), map[string]any{
+		"identity_id": reg.AgentID,
+		"scopes":      []string{"data:read"},
+	}, adminHeaders())
+	assert.GreaterOrEqual(t, issueResp.StatusCode, 400,
+		"admin /credentials/issue must reject deactivated identity")
+	assert.Less(t, issueResp.StatusCode, 600)
+}
+
+// TestDeleteIdentityRunsCleanup verifies DeleteIdentity sweeps linked tokens
+// before removing the identity row. Otherwise, credentials with the deleted
+// identity_id would survive (FK set to NULL) and remain valid until TTL.
+func TestDeleteIdentityRunsCleanup(t *testing.T) {
+	ext := uid("delete-cleanup")
+	reg := registerAgent(t, ext)
+
+	issueResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    reg.APIKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, issueResp.StatusCode)
+	token := decode(t, issueResp)["access_token"].(string)
+	require.True(t, introspect(t, token)["active"].(bool))
+
+	// DELETE /identities/{id} — permanent removal.
+	delResp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+reg.AgentID), nil, adminHeaders())
+	require.NoError(t, err)
+	require.True(t, delResp.StatusCode >= 200 && delResp.StatusCode < 300,
+		"DELETE /identities/{id} should succeed")
+	_ = delResp.Body.Close()
+
+	// Token must be revoked — cleanup ran before delete.
+	assert.False(t, introspect(t, token)["active"].(bool),
+		"DELETE /identities must revoke credentials before removing the identity row")
 }
