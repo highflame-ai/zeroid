@@ -40,20 +40,20 @@ func TestDeactivatedAgentCannotIssueViaApiKey(t *testing.T) {
 	_ = deact.Body.Close()
 
 	// Existing token must now be inactive — cascade revocation on deactivate.
-	post := introspect(t, tokenBefore)
-	assert.False(t, post["active"].(bool),
+	afterRevoke := introspect(t, tokenBefore)
+	assert.False(t, afterRevoke["active"].(bool),
 		"previously-issued token must be revoked after agent deactivation")
 
 	// New api_key grant request must be rejected. Either the key has been
 	// revoked (invalid_grant at key lookup) or the identity status gate
 	// trips (invalid_grant at identity check). Both are correct.
-	resp = postInt(t, "/oauth2/token", map[string]any{
+	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type": "api_key",
 		"api_key":    reg.APIKey,
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"api_key grant must reject deactivated agent")
-	body := decodeInt(t, resp)
+	body := decode(t, resp)
 	assert.Equal(t, "invalid_grant", body["error"])
 }
 
@@ -86,7 +86,7 @@ func TestDeactivatedAgentCannotIssueViaClientCredentials(t *testing.T) {
 	_ = deact.Body.Close()
 
 	// client_credentials request must now fail.
-	resp = postInt(t, "/oauth2/token", map[string]any{
+	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
 		"account_id":    testAccountID,
 		"project_id":    testProjectID,
@@ -95,7 +95,7 @@ func TestDeactivatedAgentCannotIssueViaClientCredentials(t *testing.T) {
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"client_credentials must reject deactivated identity")
-	body := decodeInt(t, resp)
+	body := decode(t, resp)
 	assert.Equal(t, "invalid_grant", body["error"])
 }
 
@@ -166,18 +166,4 @@ func TestDeactivationEmitsRetirementSignal(t *testing.T) {
 	require.NotNil(t, found, "a retirement signal for the deactivated agent must be present")
 	assert.Equal(t, "high", found["severity"], "deactivation signal should be high severity")
 	assert.Equal(t, "agent_deactivation", found["source"])
-}
-
-// postInt + decodeInt mirror the default `post`/`decode` helpers but do not
-// invoke `require.Equal` on the status code, since the deactivation tests
-// expect 400s that `require.Equal` would abort on before we can assert on
-// the error body.
-func postInt(t *testing.T, path string, body any, headers map[string]string) *http.Response {
-	t.Helper()
-	return doRequest(t, http.MethodPost, path, body, headers)
-}
-
-func decodeInt(t *testing.T, resp *http.Response) map[string]any {
-	t.Helper()
-	return decode(t, resp)
 }

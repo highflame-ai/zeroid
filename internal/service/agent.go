@@ -339,29 +339,24 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 	}
 
 	// Revoke active issued credentials (cascades to delegated descendants).
-	if s.credentialSvc != nil {
-		if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, "identity_deactivated"); err != nil {
-			log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to revoke active credentials")
-		} else if n > 0 {
-			log.Info().Str("identity_id", identity.ID).Int64("count", n).Msg("deactivate: revoked active credentials (cascade)")
-		}
+	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, "identity_deactivated"); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to revoke active credentials")
+	} else if n > 0 {
+		log.Info().Str("identity_id", identity.ID).Int64("count", n).Msg("deactivate: revoked active credentials (cascade)")
 	}
 
 	// Emit CAE signal so federated subscribers pick up the deactivation.
-	if s.signalSvc != nil {
-		_, err := s.signalSvc.IngestSignal(
-			ctx,
-			accountID,
-			projectID,
-			identity.ID,
-			domain.SignalTypeRetirement,
-			domain.SignalSeverityHigh,
-			"agent_deactivation",
-			map[string]any{"reason": "identity_deactivated"},
-		)
-		if err != nil {
-			log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to emit CAE signal")
-		}
+	if _, err := s.signalSvc.IngestSignal(
+		ctx,
+		accountID,
+		projectID,
+		identity.ID,
+		domain.SignalTypeRetirement,
+		domain.SignalSeverityHigh,
+		"agent_deactivation",
+		map[string]any{"reason": "identity_deactivated"},
+	); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("deactivate: failed to emit CAE signal")
 	}
 
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
