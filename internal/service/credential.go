@@ -271,9 +271,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		_ = token.Set("capabilities", req.Identity.Capabilities)
 	}
 
-	if len(req.Audience) > 0 {
-		_ = token.Set(jwt.AudienceKey, req.Audience)
+	// JWT-SVID §3 requires `aud` to be present on every issued token. Default
+	// to the issuer URL when no audience was supplied so tokens remain
+	// interoperable with spec-compliant verifiers (e.g., pkg/authjwt).
+	aud := req.Audience
+	if len(aud) == 0 {
+		aud = []string{s.issuer}
 	}
+	_ = token.Set(jwt.AudienceKey, aud)
 	if len(req.Scopes) > 0 {
 		_ = token.Set("scopes", req.Scopes)
 	}
