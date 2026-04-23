@@ -4,6 +4,8 @@ Anyone adopting ZeroID for agentic systems hits the same question within the fir
 
 They're not competing. They're **different roles in a single request**, and a well-designed token carries all of them at once as a delegation chain. This doc names those roles, shows how they compose, and walks through the three common trust-federation patterns that emerge when MCP servers have their own authorization stories.
 
+> **The cryptographic caveat up front.** A JWT is signed by exactly one private key, so "one token with Okta + ZeroID + GitHub all inside" is not literally possible — no issuer can forge another's signature. What IS possible is attestation via federation: ZeroID verifies Okta's ID token and **re-asserts** the user claims under its own signature, producing a single JWT that is authoritative within ZeroID's trust domain. Crossing into a different trust domain (e.g., GitHub) requires a separate token minted by that domain's authority. See [How ZeroID composes claims from upstream IdPs](#how-zeroid-composes-claims-from-upstream-idps) and [Three federation patterns](#three-federation-patterns-for-remote-mcp-servers) below for the mechanics.
+
 ---
 
 ## The four identities, named precisely
@@ -119,6 +121,56 @@ No identity is lost. Every hop is accountable. Every field has a standardized ho
 
 Each layer writes exactly the fields it's responsible for, and each downstream layer reads what the ones above provided. No layer re-parses anything.
 
+## How ZeroID composes claims from upstream IdPs
+
+You won't store human users in ZeroID. Okta / Entra ID / Auth0 / Google Workspace own that directory; ZeroID's job is agent identity. So when Alice logs in to Cursor, her identity is first minted by Okta as an OIDC ID token — signed by Okta. A few milliseconds later, that identity needs to appear as a `uid` claim inside a ZeroID-signed token that the agent will use for the rest of its session. How does the claim get from one signature to the other?
+
+**Via federation + re-assertion**, not cryptographic merging. RFC 8693 Token Exchange is the standard mechanism, and ZeroID's `ExternalPrincipalExchange` implements it for this exact case:
+
+```
+1. Alice → Cursor → Okta
+   Interactive OIDC login (browser, PKCE, SSO, MFA).
+   Okta issues: ID token signed by Okta.
+       { sub: alice@ex.com, email, groups, aud: cursor, iss: okta }
+
+2. Cursor → ZeroID
+   POST /oauth2/token
+     grant_type           = urn:ietf:params:oauth:grant-type:token-exchange
+     subject_token        = <Okta ID token>
+     subject_token_type   = urn:ietf:params:oauth:token-type:id_token
+
+3. ZeroID verifies Okta's signature against Okta's JWKS,
+   verifies iss / aud / exp, extracts the user claims,
+   then mints a NEW token:
+
+       {
+         iss:     ZeroID,
+         sub:     <cursor client_id>,
+         uid:     alice@ex.com,    ← learned from Okta, re-asserted by ZeroID
+         uid_iss: okta,            ← provenance: where uid came from
+         scopes:  [...]
+       }
+       Signed by ZeroID.
+
+4. The ZeroID session token is what Cursor holds from here on.
+   Okta's token is never forwarded anywhere else.
+```
+
+Every subsequent ZeroID token derived from this session — task tokens for agents, delegated tokens for sub-agents — carries `uid: alice@ex.com` and `uid_iss: okta` as propagated claims. Consumers that want to know where a user identity originated can read `uid_iss`; consumers that just need "which user" read `uid`.
+
+**Trust model.** ZeroID's `uid` claim is not cryptographically backed by Okta at consume time — the Okta signature is long gone. ZeroID is saying *"I verified Okta's signature when the session started, and I'm attesting that the Okta ID token contained `sub: alice@ex.com`."* Consumers who trust ZeroID transitively trust Okta by proxy. If you need Okta's signature at consume time (e.g., for regulatory proof-of-authentication), the relying party has to verify the Okta token directly during the login hop — ZeroID can't produce Okta signatures after the fact.
+
+**Why not forward the Okta token alongside the ZeroID token?** Two reasons:
+
+1. **Lifetime mismatch.** Okta's access tokens are typically 60 minutes; ZeroID-derived task tokens can be minutes or seconds. Pairing them means either throwing away the task token's short lifetime or juggling asymmetric refresh cycles.
+2. **Audience mismatch.** The Okta token's `aud` is Okta-side consumers (a SaaS app, an Okta-protected API). MCP servers aren't in that audience. Re-asserting the claims under ZeroID's signature puts them in an audience the MCP server understands.
+
+The same pattern applies to any upstream IdP: Entra ID for enterprise, Google Workspace, custom SAML/OIDC providers. ZeroID's role is **aggregator for the agent-side trust domain** — it turns "I was authenticated by Okta as alice" into "I am a ZeroID-issued agent token acting on behalf of alice."
+
+### Optional: preserving the Okta token for high-assurance paths
+
+For operations that need direct proof-of-authentication (not ZeroID's attestation), the deployer can configure Cursor to cache the Okta access token and include it in a secondary header (`X-User-Assertion: <okta jwt>`) on specific requests. The MCP server's interceptor chain then verifies both: the ZeroID token (for agent identity + delegation) and the Okta token (for direct user proof). This is uncommon — most deployments accept transitive trust via federation — but it's the answer when regulatory or contractual requirements demand it.
+
 ## Three federation patterns for remote MCP servers
 
 The architecturally interesting question is which MCP servers accept which identities. Three patterns cover almost every real deployment:
@@ -137,7 +189,38 @@ GitHub, Slack, Atlassian, etc. run their own authorization servers and don't kno
 
 - **When:** calling external MCP servers operated by third parties.
 - **Setup:** the gateway holds Alice's refresh token for each server in a credential vault. On every MCP call initiated by Alice, the gateway attaches a fresh access token minted by that server's auth system.
-- **Tradeoff:** the delegation chain stops at the gateway boundary — the third-party server's audit log can only say "Alice called `create_issue`," not "Alice's Claude Code session, spawned from an orchestrator, called `create_issue`." ZeroID's own audit still has the full chain; the third-party server's doesn't.
+
+**Two tokens in flight, not one.** This pattern is where the single-JWT composition story visibly breaks. At the gateway boundary the Authorization header gets swapped:
+
+```
+Agent → Gateway:   Authorization: Bearer <ZeroID task token>
+                                         (iss=ZeroID, uid=alice, sub=<agent>,
+                                          act.sub=<orchestrator>, scopes=[...])
+
+Gateway:           [validate ZeroID token]
+                   [lookup alice's github refresh token in vault]
+                   [mint fresh GitHub access token via refresh flow]
+
+Gateway → GitHub:  Authorization: Bearer <GitHub access token>
+                                         (iss=github.com, sub=<alice's github id>)
+```
+
+The two tokens are signed by different issuers, live in separate trust domains, and are never cryptographically combined. GitHub verifies only the GitHub-issued token; ZeroID's token never leaves the gateway's memory.
+
+**What gets lost.** GitHub's audit log can reconstruct only: "user alice invoked `create_issue` at 14:37." It cannot see:
+
+- Which agent acted for Alice (was it Claude Code? Cursor-native? a scheduled batch job?)
+- Which orchestrator session delegated the authority
+- The delegation depth or the `act.sub` chain
+- The task context (`task_id`, `allowed_tools`, `workspace`)
+
+Those dimensions live in ZeroID's audit stream, not GitHub's. An SRE investigating "why did Alice file 400 spammy issues last night?" can answer *that it was Alice* from GitHub's logs and *which agent it was* only by correlating to ZeroID's logs via timestamp + user. There's no cryptographic linkage — only log-level correlation — and only operations teams with access to both log systems can reconstruct the full picture.
+
+**Mitigations.** Three options, best to worst:
+
+1. **Prefer Pattern 3** for any third-party MCP that implements Token Exchange (see below). Preserves the chain cryptographically.
+2. **Correlation IDs**. Gateway injects a `X-Request-ID` / `traceparent` into the outbound GitHub request; the same ID is logged on the ZeroID side. Best-effort link, readable by a human joining two log streams.
+3. **Accept the loss** for low-stakes third-party integrations. For high-stakes ones (finance, healthcare, prod-write) either pick a federated MCP server or hold the agent back from that tool.
 
 ### Pattern 3 — Delegated via RFC 8693 (the right answer when available)
 
