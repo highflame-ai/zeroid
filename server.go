@@ -170,7 +170,7 @@ func NewServer(cfg Config) (*Server, error) {
 		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	signalSvc := service.NewSignalService(signalRepo, credentialRepo)
+	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
