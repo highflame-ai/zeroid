@@ -133,6 +133,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 }
 
 func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
+	identity.ModifiedBy = middleware.GetCallerName(ctx)
 	_, err := r.db.NewUpdate().Model(identity).
 		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
 		Exec(ctx)
@@ -144,7 +145,6 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 
 func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
 	// Pre-stamp modified_by so the AFTER DELETE trigger can read the actor from OLD.modified_by.
-	// BeforeAppendModel only fires for INSERT/UPDATE, so DELETE needs an explicit pre-update.
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
 		_, _ = r.db.NewUpdate().
 			TableExpr("identities").

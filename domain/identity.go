@@ -3,14 +3,11 @@
 package domain
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/uptrace/bun"
-
-	"github.com/highflame-ai/zeroid/internal/middleware"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -239,21 +236,6 @@ type Identity struct {
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
 	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
-}
-
-// BeforeAppendModel is a bun hook that automatically populates audit fields before
-// INSERT and UPDATE queries so callers don't need to set them explicitly.
-func (i *Identity) BeforeAppendModel(ctx context.Context, query bun.Query) error {
-	callerID := middleware.GetCallerName(ctx)
-	switch query.(type) {
-	case *bun.InsertQuery:
-		if i.CreatedBy == "" {
-			i.CreatedBy = callerID
-		}
-	case *bun.UpdateQuery:
-		i.ModifiedBy = callerID
-	}
-	return nil
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
