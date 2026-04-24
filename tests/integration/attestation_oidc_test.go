@@ -1,9 +1,11 @@
 package integration_test
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,6 +17,22 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// assertErrorBodyContains reads the response body (non-destructively — the
+// body is restored after inspection so tests can still decode it) and
+// asserts that the error message inside includes substr. Covers the case
+// where a test passed with the right status but the WRONG reason (e.g.
+// DB blip 500 → 400 after wrapping); without a body check, those slip
+// through.
+func assertErrorBodyContains(t *testing.T, resp *http.Response, substr string) {
+	t.Helper()
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	// Put the bytes back so defer Close and any further decode still work.
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	assert.Containsf(t, string(raw), substr,
+		"error response body must mention %q (got: %s)", substr, string(raw))
+}
 
 // oidcIssuer stands up a minimal OIDC discovery + JWKS server for tests so
 // the attestation OIDC verifier has a real issuer to talk to. It returns
@@ -120,14 +138,18 @@ func upsertOIDCPolicy(t *testing.T, cfg map[string]any) {
 // AttestationPolicy exists for the tenant + proof type. This is the fix
 // for the "any submitted attestation becomes verified trust" bug.
 func TestAttestationFailsClosedWithNoPolicy(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
 	reg := registerAgent(t, uid("attest-no-policy"))
-	token := newOIDCIssuer(t).sign(map[string]any{"sub": "ci-job-1"})
+	token := iss.sign(map[string]any{"sub": "ci-job-1"})
 	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
 
 	resp := verifyAttestation(t, id)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"verify must fail closed when the tenant has no attestation policy")
+	assertErrorBodyContains(t, resp, "no attestation policy configured")
 }
 
 // TestAttestationOIDCVerifierHappyPath covers the full working flow:
@@ -188,6 +210,7 @@ func TestAttestationOIDCVerifierRejectsUntrustedIssuer(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"JWT from an untrusted issuer must be rejected")
+	assertErrorBodyContains(t, resp, "issuer not in allowlist")
 }
 
 // TestAttestationOIDCVerifierRejectsTamperedSignature ensures the JWT
@@ -212,6 +235,10 @@ func TestAttestationOIDCVerifierRejectsTamperedSignature(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"tampered JWT must fail signature verification")
+	// Either "malformed JWT" (base64 decode flagged the corruption) or
+	// "token validation failed" (signature check flagged it) is an
+	// acceptable rejection reason — both come from the OIDC verifier.
+	assertErrorBodyContains(t, resp, "oidc verifier")
 }
 
 // TestAttestationOIDCVerifierRejectsExpired ensures the verifier enforces
@@ -240,6 +267,7 @@ func TestAttestationOIDCVerifierRejectsExpired(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"expired JWT must be rejected")
+	assertErrorBodyContains(t, resp, "token validation failed")
 }
 
 // TestAttestationOIDCVerifierRejectsRequiredClaimMismatch verifies that the
@@ -268,6 +296,90 @@ func TestAttestationOIDCVerifierRejectsRequiredClaimMismatch(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"required_claims mismatch must reject the attestation")
+	assertErrorBodyContains(t, resp, "required claim")
+}
+
+// TestAttestationDoubleVerifyIsRejected enforces the ErrAttestationAlreadyVerified
+// guard: once a record has been verified (even once successfully), a second
+// /verify on the same record must be rejected so a retry-after-partial-
+// failure can't mint a second credential from a single proof.
+func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	reg := registerAgent(t, uid("attest-double"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	token := iss.sign(map[string]any{"sub": "ci-job-double"})
+	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
+
+	first := verifyAttestation(t, id)
+	require.Equal(t, http.StatusOK, first.StatusCode, "first verify expected 200")
+	_ = first.Body.Close()
+
+	second := verifyAttestation(t, id)
+	defer func() { _ = second.Body.Close() }()
+	assert.Equal(t, http.StatusConflict, second.StatusCode,
+		"second verify on an already-verified record must be 409 Conflict")
+	assertErrorBodyContains(t, second, "already verified")
+}
+
+// TestAttestationPolicyUpsertReactivatesDisabled verifies the upsert-against-
+// inactive-row bug is fixed: disabling a policy via is_active=false and then
+// PUTting a fresh config must update the row in place, not violate the
+// unique constraint.
+func TestAttestationPolicyUpsertReactivatesDisabled(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	// First create an active policy.
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	// Soft-disable it.
+	disabled := false
+	disableResp := doRequest(t, http.MethodPut, adminPath("/attestation-policies"), map[string]any{
+		"proof_type": "oidc_token",
+		"config": map[string]any{
+			"issuers": []map[string]any{{"url": iss.URL}},
+		},
+		"is_active": &disabled,
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, disableResp.StatusCode)
+	_ = disableResp.Body.Close()
+
+	// Now re-enable (or just upsert again). Before the fix this hit the
+	// unique constraint because GetByTenantProofType filters is_active.
+	enabled := true
+	reenable := doRequest(t, http.MethodPut, adminPath("/attestation-policies"), map[string]any{
+		"proof_type": "oidc_token",
+		"config": map[string]any{
+			"issuers": []map[string]any{{"url": iss.URL}},
+		},
+		"is_active": &enabled,
+	}, adminHeaders())
+	defer func() { _ = reenable.Body.Close() }()
+	assert.Equal(t, http.StatusOK, reenable.StatusCode,
+		"upserting an inactive policy must reactivate it, not 500 on unique constraint")
+}
+
+// TestAttestationPolicyRejectsNonHTTPSIssuer exercises the write-time config
+// validator: an http://... issuer URL should be rejected before it's stored,
+// because OIDC discovery over plaintext lets a network attacker swap JWKS.
+func TestAttestationPolicyRejectsNonHTTPSIssuer(t *testing.T) {
+	resp := doRequest(t, http.MethodPut, adminPath("/attestation-policies"), map[string]any{
+		"proof_type": "oidc_token",
+		"config": map[string]any{
+			"issuers": []map[string]any{{"url": "http://plaintext.example.com"}},
+		},
+	}, adminHeaders())
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"non-https issuer URL must be rejected at write time with 400")
+	assertErrorBodyContains(t, resp, "https")
 }
 
 // flipLastByte returns the last byte of s with a single bit flipped, so

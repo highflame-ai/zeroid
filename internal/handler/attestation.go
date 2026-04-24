@@ -114,6 +114,13 @@ func (a *API) verifyAttestationOp(ctx context.Context, input *VerifyAttestationI
 			log.Info().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification rejected")
 			return nil, huma.Error400BadRequest(err.Error())
 		}
+		// Re-verification of a record that's already verified is a
+		// caller mistake — 409 so clients can distinguish idempotent
+		// retries from validation errors.
+		if errors.Is(err, service.ErrAttestationAlreadyVerified) {
+			log.Info().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation already verified")
+			return nil, huma.Error409Conflict(err.Error())
+		}
 		log.Error().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification failed")
 		return nil, huma.Error500InternalServerError("attestation verification failed")
 	}

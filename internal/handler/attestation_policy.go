@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -91,6 +92,12 @@ func (a *API) upsertAttestationPolicyOp(ctx context.Context, input *UpsertAttest
 		IsActive:  input.Body.IsActive,
 	})
 	if err != nil {
+		// Validation errors (bad config, non-https issuer URL, etc.) are
+		// client-fixable — return 400 with the cause so the admin can
+		// correct the payload. Everything else is infrastructure.
+		if errors.Is(err, service.ErrInvalidAttestationPolicy) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("proof_type", input.Body.ProofType).Msg("failed to upsert attestation policy")
 		return nil, huma.Error500InternalServerError("failed to upsert attestation policy")
 	}

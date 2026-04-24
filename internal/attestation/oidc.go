@@ -176,15 +176,17 @@ func anyAudienceMatches(got, want []string) bool {
 	return false
 }
 
-// jwksCache is a tiny per-issuer in-memory JWKS cache. It coalesces misses
-// so a burst of verification requests doesn't fan out into multiple JWKS
-// HTTP calls for the same issuer.
+// jwksCache is a per-issuer in-memory JWKS cache. Each issuer entry carries
+// its own mutex so a cold-cache miss on issuer A doesn't block lookups for
+// issuer B. Concurrent misses on the SAME issuer coalesce via the entry
+// mutex — one fetch, everyone else waits for it to populate.
 type jwksCache struct {
-	mu      sync.Mutex
+	mu      sync.Mutex // protects the entries map only, not the fetch
 	entries map[string]*jwksEntry
 }
 
 type jwksEntry struct {
+	mu        sync.Mutex // held during fetch; released when keys is populated
 	keys      jwk.Set
 	expiresAt time.Time
 }
@@ -194,13 +196,23 @@ func newJWKSCache() *jwksCache {
 }
 
 // get returns a cached key set for issuerURL, refreshing via OIDC discovery
-// when the entry is absent or stale.
+// when the entry is absent or stale. The two-phase locking pattern (map
+// mutex for entry lookup, then entry mutex for fetch) ensures cross-issuer
+// lookups don't serialize on a single slow upstream.
 func (c *jwksCache) get(ctx context.Context, httpClient *http.Client, issuerURL string, ttl time.Duration) (jwk.Set, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	entry, ok := c.entries[issuerURL]
+	if !ok {
+		entry = &jwksEntry{}
+		c.entries[issuerURL] = entry
+	}
+	c.mu.Unlock()
 
-	if e, ok := c.entries[issuerURL]; ok && time.Now().Before(e.expiresAt) {
-		return e.keys, nil
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
+	if entry.keys != nil && time.Now().Before(entry.expiresAt) {
+		return entry.keys, nil
 	}
 
 	jwksURL, err := discoverJWKSURL(ctx, httpClient, issuerURL)
@@ -212,7 +224,8 @@ func (c *jwksCache) get(ctx context.Context, httpClient *http.Client, issuerURL 
 		return nil, fmt.Errorf("fetch JWKS %s: %w", jwksURL, err)
 	}
 
-	c.entries[issuerURL] = &jwksEntry{keys: keySet, expiresAt: time.Now().Add(ttl)}
+	entry.keys = keySet
+	entry.expiresAt = time.Now().Add(ttl)
 	return keySet, nil
 }
 
@@ -220,28 +233,42 @@ func (c *jwksCache) get(ctx context.Context, httpClient *http.Client, issuerURL 
 // document. Issuers that don't serve /.well-known/openid-configuration are
 // not supported by this verifier — they'd need a dedicated pinned-keys
 // verifier, which can be added later if a concrete tenant needs it.
+//
+// Per RFC 8414 §3.3, the issuer field in the discovery document MUST match
+// the issuer URL used to fetch it — otherwise a DNS-hijacked or MITM'd
+// discovery endpoint could redirect jwks_uri at attacker-controlled keys
+// while pretending to serve the trusted issuer's metadata.
 func discoverJWKSURL(ctx context.Context, httpClient *http.Client, issuerURL string) (string, error) {
-	url := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	discoveryURL := strings.TrimRight(issuerURL, "/") + "/.well-known/openid-configuration"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("build discovery request: %w", err)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("discovery GET %s: %w", url, err)
+		return "", fmt.Errorf("discovery GET %s: %w", discoveryURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("discovery %s returned %d", url, resp.StatusCode)
+		return "", fmt.Errorf("discovery %s returned %d", discoveryURL, resp.StatusCode)
 	}
 	var doc struct {
+		Issuer  string `json:"issuer"`
 		JWKSURI string `json:"jwks_uri"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		return "", fmt.Errorf("parse discovery doc: %w", err)
 	}
 	if doc.JWKSURI == "" {
-		return "", fmt.Errorf("discovery doc at %s has no jwks_uri", url)
+		return "", fmt.Errorf("discovery doc at %s has no jwks_uri", discoveryURL)
+	}
+	// RFC 8414 §3.3: the discovery doc's issuer field MUST match the URL
+	// we used to fetch it. Trailing slashes are insignificant (same
+	// normalisation as findIssuer).
+	want := strings.TrimRight(issuerURL, "/")
+	got := strings.TrimRight(doc.Issuer, "/")
+	if got != want {
+		return "", fmt.Errorf("discovery doc issuer mismatch: got %q, want %q", doc.Issuer, issuerURL)
 	}
 	return doc.JWKSURI, nil
 }

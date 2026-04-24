@@ -81,23 +81,36 @@ type VerifyAttestationResult struct {
 	Credential  *domain.IssuedCredential
 }
 
+// ErrAttestationAlreadyVerified is returned when VerifyAttestation is called
+// on a record that is already marked verified. Re-verification is rejected
+// so a partial-failure retry cannot mint a second credential against the
+// same proof.
+var ErrAttestationAlreadyVerified = errors.New("attestation already verified")
+
 // VerifyAttestation runs the proof through the registered Verifier for its
-// ProofType, using the caller's tenant policy. On success it marks the
-// record verified, copies the issuer / subject / expiry from the Verifier
-// Result onto the record, promotes the identity's trust level, and issues
-// a credential. Any failure along the way leaves the record unverified and
-// returns an error — no partial state.
+// ProofType, using the caller's tenant policy. On success it issues a
+// credential, promotes the identity's trust level, and commits the record
+// update with the credential link and the verified issuer/subject/expiry.
 //
 // Fail-closed contract:
 //   - No Verifier registered for the proof type → ErrAttestationRejected.
 //   - No AttestationPolicy for the tenant + proof type → ErrAttestationRejected.
 //   - Verifier.Verify returns an error → ErrAttestationRejected.
+//   - Record already verified → ErrAttestationAlreadyVerified (rejects retries).
 //
-// This replaces the previous stub that accepted any submitted proof.
+// Write ordering rationale: credential issuance runs BEFORE identity trust
+// promotion, so the most common failure (IssueCredential) leaves nothing
+// committed. Trust promotion and record update run last, in that order, so
+// a failure between them leaves trust promoted (harmless — backed by a
+// valid proof) with the record unmarked. The re-verify guard prevents a
+// second IssueCredential call in that retry window.
 func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountID, projectID string) (*VerifyAttestationResult, error) {
 	record, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
+	}
+	if record.IsVerified {
+		return nil, fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, record.ID)
 	}
 
 	verifier, err := s.verifiers.Get(record.ProofType)
@@ -118,23 +131,17 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		return nil, fmt.Errorf("%w: %v", ErrAttestationRejected, err)
 	}
 
-	now := time.Now()
-	record.IsVerified = true
-	record.VerifiedAt = &now
-	if result.ExpiresAt != nil {
-		record.ExpiresAt = result.ExpiresAt
-	}
-
-	// Elevate trust level based on attestation level.
-	promotedTrust := trustLevelForAttestation(record.Level)
-	identity, err := s.identitySvc.UpdateIdentity(ctx, record.IdentityID, accountID, projectID, UpdateIdentityRequest{
-		TrustLevel: promotedTrust,
-	})
+	// Load the identity without promoting yet — IssueCredential needs a
+	// valid, non-nil, usable identity and re-fetching guarantees we see
+	// the current state (another request might have deactivated it).
+	identity, err := s.identitySvc.GetIdentity(ctx, record.IdentityID, accountID, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to promote identity trust level: %w", err)
+		return nil, fmt.Errorf("failed to load identity for verified attestation: %w", err)
 	}
 
-	// Issue a credential for the newly verified identity.
+	// Step 1: issue the credential. This is the most likely failure point
+	// (policy checks, scope derivation, signing). Running it first means
+	// a failure leaves no partial state behind.
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
 		GrantType: domain.GrantTypeClientCredentials,
@@ -143,8 +150,23 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		return nil, fmt.Errorf("failed to issue post-attestation credential: %w", err)
 	}
 
-	record.CredentialID = cred.ID
+	// Step 2: promote trust level. Backed by the just-verified proof.
+	promotedTrust := trustLevelForAttestation(record.Level)
+	if _, err := s.identitySvc.UpdateIdentity(ctx, record.IdentityID, accountID, projectID, UpdateIdentityRequest{
+		TrustLevel: promotedTrust,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to promote identity trust level: %w", err)
+	}
 
+	// Step 3: commit the record with verified flag, audit fields, and
+	// credential link in a single write.
+	now := time.Now()
+	record.IsVerified = true
+	record.VerifiedAt = &now
+	if result.ExpiresAt != nil {
+		record.ExpiresAt = result.ExpiresAt
+	}
+	record.CredentialID = cred.ID
 	if err := s.repo.Update(ctx, record); err != nil {
 		return nil, fmt.Errorf("failed to update attestation record: %w", err)
 	}

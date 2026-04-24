@@ -76,6 +76,27 @@ func (r *AttestationPolicyRepository) GetByTenantProofType(ctx context.Context, 
 	return p, nil
 }
 
+// GetByTenantProofTypeAny returns the policy for the tenant + proof type
+// regardless of is_active. Used by the upsert path so a soft-disabled policy
+// can be re-enabled without violating the unique (account_id, project_id,
+// proof_type) constraint (GetByTenantProofType would miss the row and the
+// follow-up INSERT would fail).
+func (r *AttestationPolicyRepository) GetByTenantProofTypeAny(ctx context.Context, accountID, projectID string, pt domain.ProofType) (*domain.AttestationPolicy, error) {
+	p := &domain.AttestationPolicy{}
+	err := r.db.NewSelect().Model(p).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("proof_type = ?", string(pt)).
+		Scan(ctx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAttestationPolicyNotFound
+		}
+		return nil, fmt.Errorf("failed to get attestation policy: %w", err)
+	}
+	return p, nil
+}
+
 // List returns all policies for a tenant.
 func (r *AttestationPolicyRepository) List(ctx context.Context, accountID, projectID string) ([]*domain.AttestationPolicy, error) {
 	var policies []*domain.AttestationPolicy

@@ -149,9 +149,11 @@ func NewServer(cfg Config) (*Server, error) {
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
-	// first (OIDC today; image_hash and TPM to follow). The dev stub only
-	// fills in for proof types without a real verifier, and only when the
-	// unsafe flag is set — so production deployments fail closed by default.
+	// first (OIDC today). The dev stub — only registered when the unsafe
+	// flag is set — covers image_hash and TPM because those verifiers have
+	// not landed yet, so without the stub any submission with those proof
+	// types would fail closed. Production deployments leave the flag off
+	// and those proof types stay unimplemented (as intended).
 	attestationVerifiers := attestation.NewRegistry()
 	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
 	if cfg.Attestation.AllowUnsafeDevStub {
@@ -165,6 +167,9 @@ func NewServer(cfg Config) (*Server, error) {
 			}
 		}
 	}
+	log.Info().
+		Interface("proof_types", attestationVerifiers.ProofTypes()).
+		Msg("Attestation verifiers registered")
 
 	// Initialize services.
 	// credentialPolicySvc must be created before identitySvc because every

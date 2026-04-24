@@ -3,13 +3,22 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
+
+// ErrInvalidAttestationPolicy is returned for caller-induced validation
+// errors on UpsertPolicy (bad proof_type, malformed config, non-https
+// issuer URL, etc.). Distinguished from infrastructure errors so the
+// handler maps it to 400 rather than 500.
+var ErrInvalidAttestationPolicy = errors.New("invalid attestation policy")
 
 // AttestationPolicyService is a thin wrapper around the policy repo. The
 // verifier registry holds the concrete verification code; this service
@@ -39,15 +48,25 @@ type UpsertAttestationPolicyRequest struct {
 // this is the admin API's natural write shape.
 func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertAttestationPolicyRequest) (*domain.AttestationPolicy, error) {
 	if !req.ProofType.Valid() {
-		return nil, fmt.Errorf("invalid proof_type: %s", req.ProofType)
+		return nil, fmt.Errorf("%w: invalid proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
 	}
 	if len(req.Config) == 0 {
-		return nil, fmt.Errorf("config is required")
+		return nil, fmt.Errorf("%w: config is required", ErrInvalidAttestationPolicy)
+	}
+	// Validate the per-proof-type config shape up front so bad configs can't
+	// sit in the DB until a /verify call finally trips on them. Catches
+	// typos, wrong types, missing issuer URLs, etc. at write time.
+	if err := validatePolicyConfig(req.ProofType, req.Config); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAttestationPolicy, err)
 	}
 
-	existing, err := s.repo.GetByTenantProofType(ctx, req.AccountID, req.ProjectID, req.ProofType)
-	switch err {
-	case nil:
+	// GetByTenantProofTypeAny ignores is_active so an upsert against a
+	// soft-disabled row updates it in place. GetByTenantProofType filters
+	// is_active and would drive this branch into an INSERT that violates
+	// the uq_attestation_policy_tenant_type unique constraint.
+	existing, err := s.repo.GetByTenantProofTypeAny(ctx, req.AccountID, req.ProjectID, req.ProofType)
+	switch {
+	case err == nil:
 		existing.Config = req.Config
 		if req.IsActive != nil {
 			existing.IsActive = *req.IsActive
@@ -56,7 +75,7 @@ func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertA
 			return nil, err
 		}
 		return existing, nil
-	case postgres.ErrAttestationPolicyNotFound:
+	case errors.Is(err, postgres.ErrAttestationPolicyNotFound):
 		active := true
 		if req.IsActive != nil {
 			active = *req.IsActive
@@ -76,6 +95,65 @@ func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertA
 	default:
 		return nil, err
 	}
+}
+
+// validatePolicyConfig checks the per-proof-type Config shape at write time.
+// Parsing the JSONB into its typed Go struct catches the obvious "this will
+// never verify successfully" cases (missing issuer list, non-https issuer
+// URL, malformed URL, etc.) before the config reaches the verifier.
+func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage) error {
+	switch pt {
+	case domain.ProofTypeOIDCToken:
+		var oidc domain.OIDCPolicyConfig
+		if err := json.Unmarshal(cfg, &oidc); err != nil {
+			return fmt.Errorf("invalid oidc_token config: %w", err)
+		}
+		if len(oidc.Issuers) == 0 {
+			return fmt.Errorf("invalid oidc_token config: at least one issuer is required")
+		}
+		for i, iss := range oidc.Issuers {
+			if strings.TrimSpace(iss.URL) == "" {
+				return fmt.Errorf("invalid oidc_token config: issuer[%d].url is empty", i)
+			}
+			u, err := url.Parse(iss.URL)
+			if err != nil {
+				return fmt.Errorf("invalid oidc_token config: issuer[%d].url is malformed: %w", i, err)
+			}
+			// OIDC discovery is unauthenticated — if we'd fetch jwks_uri
+			// over plain HTTP, a DNS or network attacker could substitute
+			// their own keys and forge any workload identity. Require TLS
+			// except for loopback addresses, which are safe to serve over
+			// HTTP because traffic never leaves the machine — useful for
+			// local dev and httptest-based integration tests.
+			if u.Scheme != "https" && !isLoopbackHost(u.Host) {
+				return fmt.Errorf("invalid oidc_token config: issuer[%d].url must use https (got %q)", i, u.Scheme)
+			}
+		}
+	case domain.ProofTypeImageHash, domain.ProofTypeTPM:
+		// No typed config yet — verifiers for these proof types haven't
+		// shipped. Accept the raw blob so operators can pre-configure
+		// policy rows before the verifier lands.
+	default:
+		return fmt.Errorf("unsupported proof_type: %s", pt)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether the host portion of a URL (possibly
+// including a port) is a loopback address. Used to carve out a safe-to-
+// serve-over-HTTP exception for OIDC discovery in dev/test environments.
+func isLoopbackHost(host string) bool {
+	// Strip an optional :port suffix. Host is in URL form already so
+	// IPv6 addresses are bracketed as [::1]:port — handle both shapes.
+	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i+1:], "]") {
+		host = host[:i]
+	}
+	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // GetPolicy returns the policy for the given tenant + proof type, or
