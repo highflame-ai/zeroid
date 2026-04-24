@@ -145,6 +145,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiKeyRepo := postgres.NewAPIKeyRepository(db)
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
+	auditRepo := postgres.NewAuditLogRepository(db)
 
 	// Initialize services.
 	// Construction order matters because identitySvc now depends on
@@ -153,7 +154,9 @@ func NewServer(cfg Config) (*Server, error) {
 	// transition into deactivated. credentialPolicySvc has no service
 	// dependencies and goes first; credentialSvc and signalSvc depend only
 	// on repos; then identitySvc; then attestationSvc / apiKeySvc which
-	// need identitySvc; then oauthSvc / agentSvc last.
+	// need identitySvc; then oauthSvc / agentSvc last. auditSvc is
+	// dependency-free and sits alongside credentialPolicySvc at the top.
+	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo)
@@ -179,7 +182,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
