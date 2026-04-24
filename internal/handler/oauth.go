@@ -132,6 +132,45 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 		Tags:          []string{"OAuth"},
 		DefaultStatus: http.StatusNotImplemented,
 	}, a.bcAuthorizeOp)
+
+	advertiseFormContentType(api, "/oauth2/token", "/oauth2/token/introspect", "/oauth2/token/revoke")
+}
+
+// advertiseFormContentType mirrors the JSON request-body schema Huma generated
+// for each given path into an additional application/x-www-form-urlencoded
+// entry. Generated OpenAPI clients then know these endpoints accept form
+// encoding (as RFC 6749/7662/7009 require) in addition to the JSON shape the
+// input struct declares.
+//
+// Safe because oauthFormCompatMiddleware rewrites form bodies to JSON before
+// the handler runs, so the JSON-generated schema is the effective schema for
+// both content types.
+func advertiseFormContentType(api huma.API, paths ...string) {
+	oapi := api.OpenAPI()
+	if oapi == nil || oapi.Paths == nil {
+		return
+	}
+	for _, p := range paths {
+		item, ok := oapi.Paths[p]
+		if !ok || item == nil || item.Post == nil || item.Post.RequestBody == nil {
+			continue
+		}
+		content := item.Post.RequestBody.Content
+		if content == nil {
+			continue
+		}
+		jsonMT, ok := content["application/json"]
+		if !ok || jsonMT == nil {
+			continue
+		}
+		// Shallow-copy the MediaType so the JSON and form entries stay
+		// decoupled. Future spec-post-processing (adding an example, a
+		// content-type-specific encoding hint) must not cross-contaminate.
+		// Nested pointers (Schema, Examples, Encoding) are shared — safe
+		// because those structures are not mutated after registration.
+		formMT := *jsonMT
+		content["application/x-www-form-urlencoded"] = &formMT
+	}
 }
 
 func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, error) {

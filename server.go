@@ -1,9 +1,12 @@
 package zeroid
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -197,6 +200,10 @@ func NewServer(cfg Config) (*Server, error) {
 	// Global middleware.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
+	// oauthFormCompat must run before requestValidationMiddleware so that
+	// RFC-mandated form-encoded bodies on /oauth2/* endpoints are rewritten
+	// to JSON before the JSON-only Content-Type gate runs.
+	r.Use(oauthFormCompatMiddleware)
 	r.Use(requestValidationMiddleware)
 	r.Use(errorRecoveryMiddleware)
 	r.Use(structuredLoggingMiddleware)
@@ -639,6 +646,103 @@ func errorRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// OAuthFormEndpoints lists paths that MUST accept application/x-www-form-urlencoded
+// per RFC 6749 §4, RFC 7662 §2.1, and RFC 7009 §2.1. Clients built to the
+// RFCs (e.g. pkg/authjwt real-time introspection) post form-encoded bodies,
+// so any mismatch between the spec and our JSON-only validation gate breaks
+// interoperability silently. Exported so the handler layer can mirror the
+// list when advertising the alternate content type in the OpenAPI spec.
+var OAuthFormEndpoints = map[string]struct{}{
+	"/oauth2/token":            {},
+	"/oauth2/token/introspect": {},
+	"/oauth2/token/revoke":     {},
+}
+
+// mediaTypeEquals parses a Content-Type header and reports whether the media
+// type portion matches want (case-insensitive per RFC 7231 §3.1.1.1).
+// Parameters like charset are ignored for the comparison.
+func mediaTypeEquals(headerValue, want string) bool {
+	if headerValue == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(headerValue)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mt, want)
+}
+
+// oauthFormCompatMiddleware rewrites application/x-www-form-urlencoded bodies
+// on RFC OAuth endpoints into application/json so downstream Huma handlers
+// (which bind from JSON) and the JSON-only requestValidationMiddleware both
+// see a uniform shape. The target schemas for these endpoints are flat maps
+// of string fields, so form → JSON is a lossless flatten when each parameter
+// appears at most once (RFC 6749 §3.1) and has a non-empty value (§3.2).
+func oauthFormCompatMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := OAuthFormEndpoints[r.URL.Path]; !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !mediaTypeEquals(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Apply the same 10 MiB body cap that requestValidationMiddleware
+		// enforces on JSON bodies. Go's ParseForm already imposes an internal
+		// 10 MiB defaultMaxFormSize, but wiring MaxBytesReader here makes the
+		// limit explicit in our own code — a reader who later raises the
+		// JSON cap will see the form cap in the same spot, and ParseForm
+		// short-circuits to MaxBytesError (with limit info) instead of the
+		// opaque "http: POST too large" string.
+		const maxBodySize = 10 * 1024 * 1024
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+
+		// ParseForm reads and consumes r.Body for urlencoded POSTs.
+		if err := r.ParseForm(); err != nil {
+			writeValidationError(w, r, "malformed form body: "+err.Error())
+			return
+		}
+
+		flat := make(map[string]string, len(r.PostForm))
+		for k, vs := range r.PostForm {
+			// RFC 6749 §3.1: request parameters MUST NOT be included more
+			// than once. Duplicate keys are rejected rather than silently
+			// collapsed to vs[0].
+			if len(vs) > 1 {
+				writeValidationError(w, r, "duplicate OAuth parameter: "+k)
+				return
+			}
+			if len(vs) == 0 {
+				continue
+			}
+			// RFC 6749 §3.2: parameters sent without a value MUST be treated
+			// as if they were omitted. Drop so downstream handlers see a
+			// missing field, not a bound empty string.
+			if vs[0] == "" {
+				continue
+			}
+			flat[k] = vs[0]
+		}
+
+		b, err := gojson.Marshal(flat)
+		if err != nil {
+			writeValidationError(w, r, "failed to re-encode form body: "+err.Error())
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Type", "application/json")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // requestValidationMiddleware limits request body size to 10 MiB and enforces
 // application/json Content-Type on mutating requests (POST, PUT, PATCH).
 func requestValidationMiddleware(next http.Handler) http.Handler {
@@ -652,7 +756,7 @@ func requestValidationMiddleware(next http.Handler) http.Handler {
 				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
 				return
 			}
-			if ct != "" && !strings.HasPrefix(ct, "application/json") {
+			if !mediaTypeEquals(ct, "application/json") {
 				writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
 				return
 			}
@@ -663,6 +767,19 @@ func requestValidationMiddleware(next http.Handler) http.Handler {
 }
 
 func writeValidationError(w http.ResponseWriter, r *http.Request, msg string) {
+	// Emit a log line here because the validation middlewares run before
+	// structuredLoggingMiddleware — without this, rejected requests leave no
+	// trace for operators. Use Info (not Warn/Error) because these are client
+	// mistakes, not server faults.
+	reqID := chimiddleware.GetReqID(r.Context())
+	log.Info().
+		Str("request_id", reqID).
+		Str("method", r.Method).
+		Str("path", r.RequestURI).
+		Str("content_type", r.Header.Get("Content-Type")).
+		Str("reason", msg).
+		Msg("request validation rejected")
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	errResp := map[string]any{
@@ -674,7 +791,7 @@ func writeValidationError(w http.ResponseWriter, r *http.Request, msg string) {
 			"timestamp":    time.Now().UTC().Format(time.RFC3339),
 		},
 	}
-	if reqID := chimiddleware.GetReqID(r.Context()); reqID != "" {
+	if reqID != "" {
 		errResp["error"].(map[string]any)["requestId"] = reqID
 	}
 	_ = gojson.NewEncoder(w).Encode(errResp)
