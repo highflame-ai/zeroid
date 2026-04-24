@@ -132,6 +132,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	return identities, total, nil
 }
 
+// Update saves changes to an existing identity.
 func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
 	identity.ModifiedBy = middleware.GetCallerName(ctx)
 	_, err := r.db.NewUpdate().Model(identity).
@@ -143,6 +144,7 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 	return nil
 }
 
+// Delete removes an identity.
 func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
 	// Pre-stamp modified_by so the AFTER DELETE trigger can read the actor from OLD.modified_by.
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {

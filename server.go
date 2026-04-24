@@ -148,8 +148,8 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Initialize services.
 	auditSvc := service.NewAuditService(auditRepo)
-	identitySvc := service.NewIdentityService(identityRepo, cfg.WIMSEDomain)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
+	identitySvc := service.NewIdentityService(identityRepo, cfg.WIMSEDomain)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
