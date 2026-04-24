@@ -12,8 +12,9 @@ import (
 
 type ListAuditLogsInput struct {
 	IdentityID string `query:"identity_id" doc:"Filter by identity ID"`
-	Action     string `query:"action" doc:"Filter by action (INSERT, UPDATE, DELETE)"`
-	UserID     string `query:"user_id" doc:"Filter by user ID"`
+	TableName  string `query:"table_name"  doc:"Filter by source table (e.g. identities, credential_policies, service_keys)"`
+	Action     string `query:"action"      doc:"Filter by action (CREATE, UPDATE, DELETE)"`
+	UserID     string `query:"user_id"     doc:"Filter by user ID"`
 }
 
 type ListAuditLogsOutput struct {
@@ -40,6 +41,7 @@ func (a *API) listAuditLogsOp(ctx context.Context, input *ListAuditLogsInput) (*
 
 	logs, err := a.auditSvc.ListAuditLogs(ctx, tenant.AccountID, tenant.ProjectID, service.AuditLogFilter{
 		IdentityID: input.IdentityID,
+		TableName:  input.TableName,
 		Action:     input.Action,
 		UserID:     input.UserID,
 	})

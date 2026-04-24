@@ -15,6 +15,7 @@ type AuditLogEntry struct {
 	AccountID  string          `bun:"account_id"     json:"account_id"`
 	ProjectID  string          `bun:"project_id"     json:"project_id"`
 	IdentityID string          `bun:"identity_id"    json:"identity_id"`
+	TableName  string          `bun:"table_name"     json:"table_name"`
 	Action     string          `bun:"action"         json:"action"`
 	Status     string          `bun:"status"         json:"status"`
 	UserID     string          `bun:"caller_user_id" json:"user_id"`
@@ -31,7 +32,7 @@ func NewAuditLogRepository(db *bun.DB) *AuditLogRepository {
 	return &AuditLogRepository{db: db}
 }
 
-func (r *AuditLogRepository) List(ctx context.Context, accountID, projectID, identityID, action, userID string) ([]AuditLogEntry, error) {
+func (r *AuditLogRepository) List(ctx context.Context, accountID, projectID, identityID, tableName, action, userID string) ([]AuditLogEntry, error) {
 	var entries []AuditLogEntry
 
 	q := r.db.NewSelect().
@@ -44,6 +45,9 @@ func (r *AuditLogRepository) List(ctx context.Context, accountID, projectID, ide
 	}
 	if identityID != "" {
 		q = q.Where("identity_id = ?", identityID)
+	}
+	if tableName != "" {
+		q = q.Where("table_name = ?", tableName)
 	}
 	if action != "" {
 		q = q.Where("action = ?", action)

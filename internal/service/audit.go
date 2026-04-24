@@ -11,6 +11,7 @@ import (
 // AuditLogFilter holds optional filters for querying audit logs.
 type AuditLogFilter struct {
 	IdentityID string
+	TableName  string
 	Action     string
 	UserID     string
 }
@@ -41,7 +42,7 @@ func NewAuditService(repo *postgres.AuditLogRepository) *AuditService {
 }
 
 func (s *AuditService) ListAuditLogs(ctx context.Context, accountID, projectID string, filter AuditLogFilter) ([]AuditLogResponse, error) {
-	entries, err := s.repo.List(ctx, accountID, projectID, filter.IdentityID, filter.Action, filter.UserID)
+	entries, err := s.repo.List(ctx, accountID, projectID, filter.IdentityID, filter.TableName, filter.Action, filter.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +73,7 @@ func toAuditLogResponse(e postgres.AuditLogEntry) AuditLogResponse {
 	return AuditLogResponse{
 		AuditID:    e.ID,
 		AccountID:  e.AccountID,
-		TableName:  "identities",
+		TableName:  e.TableName,
 		Action:     e.Action,
 		Status:     e.Status,
 		UserID:     e.UserID,
