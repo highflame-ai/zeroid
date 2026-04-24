@@ -216,14 +216,19 @@ func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, appl
 	return s.repo.ListByAccountProject(ctx, accountID, projectID, applicationID, product, label, limit, offset)
 }
 
-// GetKey returns an API key by ID.
-func (s *APIKeyService) GetKey(ctx context.Context, id string) (*domain.APIKey, error) {
-	return s.repo.GetByID(ctx, id)
+// GetKey returns an API key by ID, scoped to the given tenant. Cross-tenant
+// IDs surface as not-found to prevent existence disclosure.
+func (s *APIKeyService) GetKey(ctx context.Context, id, accountID, projectID string) (*domain.APIKey, error) {
+	return s.repo.GetByID(ctx, id, accountID, projectID)
 }
 
-// RevokeKey revokes an API key by ID.
-func (s *APIKeyService) RevokeKey(ctx context.Context, id, revokedBy, reason string) error {
-	return s.repo.Revoke(ctx, id, revokedBy, reason)
+// RevokeKey revokes an API key by ID, scoped to the given tenant. Returns the
+// number of rows affected — zero means either "not in this tenant" or
+// "already revoked". Callers that need to distinguish can probe GetKey first,
+// but the common revoke-by-ID path treats both as a silent no-op to avoid
+// leaking cross-tenant existence.
+func (s *APIKeyService) RevokeKey(ctx context.Context, id, accountID, projectID, revokedBy, reason string) (int64, error) {
+	return s.repo.Revoke(ctx, id, accountID, projectID, revokedBy, reason)
 }
 
 // generateAPIKey creates a cryptographically random API key with the given prefix.

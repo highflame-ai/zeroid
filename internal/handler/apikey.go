@@ -152,11 +152,12 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 }
 
 func (a *API) getAPIKeyOp(ctx context.Context, input *APIKeyIDInput) (*APIKeyOutput, error) {
-	if _, err := internalMiddleware.GetTenant(ctx); err != nil {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	sk, err := a.apiKeySvc.GetKey(ctx, input.ID)
+	sk, err := a.apiKeySvc.GetKey(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		return nil, huma.Error404NotFound("API key not found")
 	}
@@ -189,15 +190,23 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 }
 
 func (a *API) revokeAPIKeyOp(ctx context.Context, input *RevokeAPIKeyInput) (*RevokeAPIKeyOutput, error) {
-	if _, err := internalMiddleware.GetTenant(ctx); err != nil {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
 	revokedBy := internalMiddleware.GetCallerName(ctx)
 
-	if err := a.apiKeySvc.RevokeKey(ctx, input.ID, revokedBy, input.Body.Reason); err != nil {
+	n, err := a.apiKeySvc.RevokeKey(ctx, input.ID, tenant.AccountID, tenant.ProjectID, revokedBy, input.Body.Reason)
+	if err != nil {
 		log.Error().Err(err).Str("key_id", input.ID).Msg("failed to revoke API key")
 		return nil, huma.Error500InternalServerError("failed to revoke API key")
+	}
+	// Zero rows affected means the key either doesn't exist in this tenant
+	// or is already revoked. Return 404 so cross-tenant callers see the same
+	// response as hitting a truly missing key — avoids existence disclosure.
+	if n == 0 {
+		return nil, huma.Error404NotFound("API key not found")
 	}
 
 	out := &RevokeAPIKeyOutput{}
