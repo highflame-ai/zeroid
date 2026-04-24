@@ -31,6 +31,7 @@ type API struct {
 	signalSvc            *service.SignalService
 	apiKeySvc            *service.APIKeyService
 	agentSvc             *service.AgentService
+	auditSvc             *service.AuditService
 	jwksSvc              *signing.JWKSService
 	db                   *bun.DB
 	issuer               string
@@ -51,6 +52,7 @@ func NewAPI(
 	signalSvc *service.SignalService,
 	apiKeySvc *service.APIKeyService,
 	agentSvc *service.AgentService,
+	auditSvc *service.AuditService,
 	jwksSvc *signing.JWKSService,
 	db *bun.DB,
 	issuer, baseURL string,
@@ -67,6 +69,7 @@ func NewAPI(
 		signalSvc:            signalSvc,
 		apiKeySvc:            apiKeySvc,
 		agentSvc:             agentSvc,
+		auditSvc:             auditSvc,
 		jwksSvc:              jwksSvc,
 		db:                   db,
 		issuer:               issuer,
@@ -116,6 +119,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)
 	a.registerProofVerifyRoute(api)
+	a.registerAuditRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

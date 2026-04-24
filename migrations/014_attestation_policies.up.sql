@@ -1,4 +1,4 @@
--- 010_attestation_policies.up.sql
+-- 014_attestation_policies.up.sql
 -- Per-tenant attestation trust configuration.
 --
 -- Each row declares "for this tenant + this proof type, here are the trusted
