@@ -21,15 +21,28 @@ const DefaultAdminPathPrefix = "/api/v1"
 
 // Config holds the complete ZeroID service configuration.
 type Config struct {
-	Server    ServerConfig    `koanf:"server"`
-	Database  DatabaseConfig  `koanf:"database"`
-	Keys      KeysConfig      `koanf:"keys"`
-	Token     TokenConfig     `koanf:"token"`
-	Telemetry TelemetryConfig `koanf:"telemetry"`
-	Logging   LoggingConfig   `koanf:"logging"`
+	Server      ServerConfig      `koanf:"server"`
+	Database    DatabaseConfig    `koanf:"database"`
+	Keys        KeysConfig        `koanf:"keys"`
+	Token       TokenConfig       `koanf:"token"`
+	Telemetry   TelemetryConfig   `koanf:"telemetry"`
+	Logging     LoggingConfig     `koanf:"logging"`
+	Attestation AttestationConfig `koanf:"attestation"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+}
+
+// AttestationConfig governs the attestation verification subsystem. The
+// default is fail-closed: no proof type has a verifier wired until a tenant
+// configures an AttestationPolicy for it. AllowUnsafeDevStub re-enables the
+// legacy demo behaviour (any submitted proof verifies) behind an explicit
+// opt-in, so production deployments cannot accidentally inherit it.
+type AttestationConfig struct {
+	// AllowUnsafeDevStub, when true, registers a stub verifier that accepts
+	// any submitted proof for any configured proof type. Prints a loud
+	// startup warning. MUST never be enabled in production.
+	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
 }
 
 // ServerConfig holds HTTP server settings.

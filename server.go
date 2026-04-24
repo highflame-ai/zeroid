@@ -26,6 +26,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
@@ -141,6 +142,7 @@ func NewServer(cfg Config) (*Server, error) {
 	identityRepo := postgres.NewIdentityRepository(db)
 	credentialRepo := postgres.NewCredentialRepository(db)
 	attestationRepo := postgres.NewAttestationRepository(db)
+	attestationPolicyRepo := postgres.NewAttestationPolicyRepository(db)
 	signalRepo := postgres.NewSignalRepository(db)
 	proofRepo := postgres.NewProofRepository(db)
 	oauthClientRepo := postgres.NewOAuthClientRepository(db)
@@ -149,6 +151,29 @@ func NewServer(cfg Config) (*Server, error) {
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
+
+	// Build the attestation verifier registry. Real verifiers are wired
+	// first (OIDC today). The dev stub — only registered when the unsafe
+	// flag is set — covers image_hash and TPM because those verifiers have
+	// not landed yet, so without the stub any submission with those proof
+	// types would fail closed. Production deployments leave the flag off
+	// and those proof types stay unimplemented (as intended).
+	attestationVerifiers := attestation.NewRegistry()
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	if cfg.Attestation.AllowUnsafeDevStub {
+		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
+		for _, pt := range []domain.ProofType{
+			domain.ProofTypeImageHash,
+			domain.ProofTypeTPM,
+		} {
+			if _, err := attestationVerifiers.Get(pt); err != nil {
+				attestationVerifiers.Register(attestation.NewDevStubVerifier(pt))
+			}
+		}
+	}
+	log.Info().
+		Interface("proof_types", attestationVerifiers.ProofTypes()).
+		Msg("Attestation verifiers registered")
 
 	// Initialize services.
 	// Construction order matters because identitySvc now depends on
@@ -164,7 +189,8 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
+	attestationPolicySvc := service.NewAttestationPolicyService(attestationPolicyRepo)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
@@ -184,7 +210,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
-		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
+		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
 		signalSvc, apiKeySvc, agentSvc, auditSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
