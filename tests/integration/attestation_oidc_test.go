@@ -366,6 +366,41 @@ func TestAttestationPolicyUpsertReactivatesDisabled(t *testing.T) {
 		"upserting an inactive policy must reactivate it, not 500 on unique constraint")
 }
 
+// TestAttestationPolicyUpsertIsConcurrencySafe fires N simultaneous PUTs
+// for the same (tenant, proof_type) and asserts every one returns 200.
+// Under the prior read-then-write implementation two concurrent upserts
+// could both see "not found", both try to INSERT, and the loser would
+// 500 with a unique-constraint violation. The atomic INSERT ... ON
+// CONFLICT path eliminates that race.
+func TestAttestationPolicyUpsertIsConcurrencySafe(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	// Use a tenant that no other test touches so the race is clean.
+	tenant := tenantHeaders("acct-upsert-race-"+uid(""), "proj-upsert-race-"+uid(""))
+
+	const parallelism = 8
+	results := make(chan int, parallelism)
+	body := map[string]any{
+		"proof_type": "oidc_token",
+		"config": map[string]any{
+			"issuers": []map[string]any{{"url": iss.URL}},
+		},
+	}
+	for i := 0; i < parallelism; i++ {
+		go func() {
+			resp := doRequest(t, http.MethodPut, adminPath("/attestation-policies"), body, tenant)
+			_ = resp.Body.Close()
+			results <- resp.StatusCode
+		}()
+	}
+	for i := 0; i < parallelism; i++ {
+		status := <-results
+		assert.Equal(t, http.StatusOK, status,
+			"every concurrent upsert must succeed; atomic INSERT ... ON CONFLICT has no race window")
+	}
+}
+
 // TestAttestationPolicyRejectsNonHTTPSIssuer exercises the write-time config
 // validator: an http://... issuer URL should be rejected before it's stored,
 // because OIDC discovery over plaintext lets a network attacker swap JWKS.

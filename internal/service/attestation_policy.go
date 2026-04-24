@@ -43,9 +43,11 @@ type UpsertAttestationPolicyRequest struct {
 }
 
 // UpsertPolicy creates a policy if none exists for the (tenant, proof_type)
-// pair, or updates the existing one in place. The unique index
-// uq_attestation_policy_tenant_type guarantees a single row per key, so
-// this is the admin API's natural write shape.
+// pair, or updates the existing one in place. Backed by a single atomic
+// INSERT ... ON CONFLICT statement so two concurrent admin PUTs for the
+// same key can't both see "not found" and race on the unique constraint —
+// an earlier read-then-write version did, producing a 500 under concurrent
+// writes.
 func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertAttestationPolicyRequest) (*domain.AttestationPolicy, error) {
 	if !req.ProofType.Valid() {
 		return nil, fmt.Errorf("%w: invalid proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
@@ -60,41 +62,25 @@ func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertA
 		return nil, fmt.Errorf("%w: %v", ErrInvalidAttestationPolicy, err)
 	}
 
-	// GetByTenantProofTypeAny ignores is_active so an upsert against a
-	// soft-disabled row updates it in place. GetByTenantProofType filters
-	// is_active and would drive this branch into an INSERT that violates
-	// the uq_attestation_policy_tenant_type unique constraint.
-	existing, err := s.repo.GetByTenantProofTypeAny(ctx, req.AccountID, req.ProjectID, req.ProofType)
-	switch {
-	case err == nil:
-		existing.Config = req.Config
-		if req.IsActive != nil {
-			existing.IsActive = *req.IsActive
-		}
-		if err := s.repo.Update(ctx, existing); err != nil {
-			return nil, err
-		}
-		return existing, nil
-	case errors.Is(err, postgres.ErrAttestationPolicyNotFound):
-		active := true
-		if req.IsActive != nil {
-			active = *req.IsActive
-		}
-		p := &domain.AttestationPolicy{
-			ID:        uuid.New().String(),
-			AccountID: req.AccountID,
-			ProjectID: req.ProjectID,
-			ProofType: req.ProofType,
-			Config:    req.Config,
-			IsActive:  active,
-		}
-		if err := s.repo.Create(ctx, p); err != nil {
-			return nil, err
-		}
-		return p, nil
-	default:
+	active := true
+	if req.IsActive != nil {
+		active = *req.IsActive
+	}
+	p := &domain.AttestationPolicy{
+		ID:        uuid.New().String(),
+		AccountID: req.AccountID,
+		ProjectID: req.ProjectID,
+		ProofType: req.ProofType,
+		Config:    req.Config,
+		IsActive:  active,
+	}
+	// Only overwrite is_active on conflict when the caller explicitly set
+	// it. Otherwise a PUT that lacks is_active would silently re-enable a
+	// previously disabled policy.
+	if err := s.repo.Upsert(ctx, p, req.IsActive != nil); err != nil {
 		return nil, err
 	}
+	return p, nil
 }
 
 // validatePolicyConfig checks the per-proof-type Config shape at write time.

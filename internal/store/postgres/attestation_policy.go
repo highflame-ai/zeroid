@@ -76,25 +76,32 @@ func (r *AttestationPolicyRepository) GetByTenantProofType(ctx context.Context, 
 	return p, nil
 }
 
-// GetByTenantProofTypeAny returns the policy for the tenant + proof type
-// regardless of is_active. Used by the upsert path so a soft-disabled policy
-// can be re-enabled without violating the unique (account_id, project_id,
-// proof_type) constraint (GetByTenantProofType would miss the row and the
-// follow-up INSERT would fail).
-func (r *AttestationPolicyRepository) GetByTenantProofTypeAny(ctx context.Context, accountID, projectID string, pt domain.ProofType) (*domain.AttestationPolicy, error) {
-	p := &domain.AttestationPolicy{}
-	err := r.db.NewSelect().Model(p).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Where("proof_type = ?", string(pt)).
-		Scan(ctx)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrAttestationPolicyNotFound
-		}
-		return nil, fmt.Errorf("failed to get attestation policy: %w", err)
+// Upsert inserts a new policy row or updates the existing row for the
+// tenant + proof_type in a single atomic statement. Two concurrent admin
+// requests for the same key race only on the DB's row-lock — neither 500s
+// with a unique-constraint violation, which the prior read-then-write
+// pattern could hit. Last-writer-wins semantics on the config column.
+//
+// When updateIsActive is true, EXCLUDED.is_active overwrites the stored
+// value; when false (caller didn't specify), the existing is_active is
+// preserved so a PUT-without-is_active cannot silently re-enable a
+// previously disabled policy.
+//
+// Bun's INSERT ... RETURNING populates p back with the row's authoritative
+// state (on conflict, the existing row's id and created_at are kept; only
+// the SET columns change).
+func (r *AttestationPolicyRepository) Upsert(ctx context.Context, p *domain.AttestationPolicy, updateIsActive bool) error {
+	q := r.db.NewInsert().Model(p).
+		On("CONFLICT (account_id, project_id, proof_type) DO UPDATE").
+		Set("config = EXCLUDED.config").
+		Set("updated_at = NOW()")
+	if updateIsActive {
+		q = q.Set("is_active = EXCLUDED.is_active")
 	}
-	return p, nil
+	if _, err := q.Returning("*").Exec(ctx); err != nil {
+		return fmt.Errorf("failed to upsert attestation policy: %w", err)
+	}
+	return nil
 }
 
 // List returns all policies for a tenant.
