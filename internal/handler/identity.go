@@ -288,7 +288,7 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Capabilities:  input.Body.Capabilities,
 		Labels:        input.Body.Labels,
 		Metadata:      input.Body.Metadata,
-		Status: status,
+		Status:        status,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")

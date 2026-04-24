@@ -201,7 +201,6 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if err != nil {
 		return nil, err
 	}
-
 	if req.Name != "" {
 		identity.Name = req.Name
 	}
@@ -263,7 +262,6 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
 	}
-
 	return identity, nil
 }
 
