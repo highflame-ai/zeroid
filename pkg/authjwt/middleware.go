@@ -117,9 +117,9 @@ func extractBearerToken(r *http.Request) string {
 	return strings.TrimSpace(parts[1])
 }
 
-func isExpired(err error) bool          { return errors.Is(err, ErrExpiredToken) }
-func isInvalidIssuer(err error) bool    { return errors.Is(err, ErrInvalidIssuer) }
-func isInvalidAudience(err error) bool  { return errors.Is(err, ErrInvalidAudience) }
-func isUnsupportedAlg(err error) bool   { return errors.Is(err, ErrUnsupportedAlg) }
-func isTokenRevoked(err error) bool     { return errors.Is(err, ErrTokenRevoked) }
+func isExpired(err error) bool           { return errors.Is(err, ErrExpiredToken) }
+func isInvalidIssuer(err error) bool     { return errors.Is(err, ErrInvalidIssuer) }
+func isInvalidAudience(err error) bool   { return errors.Is(err, ErrInvalidAudience) }
+func isUnsupportedAlg(err error) bool    { return errors.Is(err, ErrUnsupportedAlg) }
+func isTokenRevoked(err error) bool      { return errors.Is(err, ErrTokenRevoked) }
 func isInsufficientScope(err error) bool { return errors.Is(err, ErrInsufficientScope) }

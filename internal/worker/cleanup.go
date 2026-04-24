@@ -64,4 +64,15 @@ func (w *CleanupWorker) runOnce(ctx context.Context) {
 	} else if n, err := proofRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired proof tokens")
 	}
+
+	// Delete consumed auth codes past their expiry (single-use enforcement records).
+	authCodeRes, err := w.db.NewDelete().
+		TableExpr("auth_codes").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired auth codes")
+	} else if n, err := authCodeRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired auth codes")
+	}
 }

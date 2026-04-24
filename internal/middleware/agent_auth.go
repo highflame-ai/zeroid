@@ -15,7 +15,7 @@ import (
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
 // It is populated by AgentAuthMiddleware and available via GetAgentClaims.
 type AgentClaims struct {
-	Subject    string   // WIMSE URI
+	Subject    string // WIMSE URI
 	AccountID  string
 	ProjectID  string
 	AgentID    string

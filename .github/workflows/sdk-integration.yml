@@ -50,7 +50,7 @@ jobs:
           restore-keys: go-${{ runner.os }}-1.25.8-
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VER }}
 
@@ -91,7 +91,7 @@ jobs:
           restore-keys: go-${{ runner.os }}-1.25.8-
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VER }}
 

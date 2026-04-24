@@ -169,8 +169,8 @@ func TestAuthorizationCodeExpired(t *testing.T) {
 	tok, err := jwt.NewBuilder().
 		Issuer(testIssuer).
 		Subject("auth-code").
-		IssuedAt(now.Add(-10 * time.Minute)).
-		Expiration(now.Add(-1 * time.Second)).
+		IssuedAt(now.Add(-10*time.Minute)).
+		Expiration(now.Add(-1*time.Second)).
 		Claim("cid", testCLIClientID).
 		Claim("uid", "user-expired-001").
 		Claim("aid", testAccountID).
@@ -367,4 +367,76 @@ func TestEnsureClientUpdatesConfig(t *testing.T) {
 	// Grant types should be updated.
 	grantTypes := found["grant_types"].([]any)
 	assert.Equal(t, 2, len(grantTypes))
+}
+
+// TestAuthorizationCodeReplayRejected verifies that an auth code can only be
+// exchanged once (RFC 6749 §4.1.2). The second exchange must return invalid_grant.
+func TestAuthorizationCodeReplayRejected(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testCLIClientID, "user-replay-001", testRedirectURI, challenge, []string{"data:read"})
+
+	payload := map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testCLIClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}
+
+	// First exchange — must succeed.
+	resp := post(t, "/oauth2/token", payload, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	firstToken := decode(t, resp)
+	assert.NotEmpty(t, firstToken["access_token"])
+
+	// Second exchange with the same code — must be rejected.
+	resp = post(t, "/oauth2/token", payload, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// TestAuthorizationCodeReplayRevokesTokens verifies that when an auth code is
+// replayed, the tokens issued during the first exchange are revoked per
+// RFC 6749 §4.1.2.
+func TestAuthorizationCodeReplayRevokesTokens(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, "user-replay-revoke-001", testRedirectURI, challenge, []string{"data:read"})
+
+	payload := map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}
+
+	// First exchange — succeeds, issues access + refresh token.
+	resp := post(t, "/oauth2/token", payload, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	firstToken := decode(t, resp)
+	accessToken := firstToken["access_token"].(string)
+	refreshToken := firstToken["refresh_token"].(string)
+	assert.NotEmpty(t, accessToken)
+	assert.NotEmpty(t, refreshToken)
+
+	// Access token must be active before replay.
+	result := introspect(t, accessToken)
+	assert.True(t, result["active"].(bool), "access token should be active before replay")
+
+	// Replay the auth code — triggers revocation of the first exchange's tokens.
+	resp = post(t, "/oauth2/token", payload, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	// Access token from the first exchange must now be revoked.
+	result = introspect(t, accessToken)
+	assert.False(t, result["active"].(bool), "access token should be revoked after auth code replay")
+
+	// Refresh token from the first exchange must also be revoked.
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     testMCPClientID,
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "refresh token should be revoked after auth code replay")
 }

@@ -49,11 +49,18 @@ func NewCredentialService(
 }
 
 // IssueRequest holds parameters for credential issuance.
-// If Scopes is non-empty, they are validated against the identity's AllowedScopes.
 // TTL defaults to the service default and is capped at MaxTTL.
+//
+// Authority is enforced through one or two policy layers. IdentityPolicyID
+// is the authority ceiling assigned to the identity at registration time
+// and is checked for every grant type. CredentialPolicyID is the API
+// key's own (optional) restriction and is checked in addition whenever a
+// request is api_key-backed. Both must permit the request for issuance
+// to succeed (intersection semantics, AWS/GCP/Azure pattern).
 type IssueRequest struct {
 	Identity           *domain.Identity
-	CredentialPolicyID string // From the API key, not the identity.
+	IdentityPolicyID   string // Identity policy — authority ceiling.
+	CredentialPolicyID string // API key policy — per-credential restriction (optional).
 	Scopes             []string
 	TTL                int
 	GrantType          domain.GrantType
@@ -105,7 +112,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
 
-	// Enforce allowed_scopes: if the identity has a non-empty allowed list, requested scopes must be a subset.
+	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes
+	// list, requested scopes must still be a subset. This is retained for one
+	// deprecation cycle so tenants that set scope ceilings on the identity row
+	// (pre-migration-008) keep working until they migrate the restriction onto
+	// their credential policy's allowed_scopes. New callers should not rely on
+	// this path.
 	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {
@@ -118,33 +130,89 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 	}
 
-	// Enforce credential policy (all six constraints) if one is assigned to the key.
-	if req.CredentialPolicyID != "" && s.policySvc != nil {
-		policy, err := s.policySvc.GetPolicy(ctx, req.CredentialPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
-		}
-
-		// Look up the identity's highest verified attestation level for check #5.
+	// Enforce credential policies. The identity policy is the authority
+	// ceiling attached at identity registration time; the API key policy is
+	// an additional per-credential restriction. Both are checked — the
+	// issued token is valid only if it satisfies every assigned policy.
+	// Intersection semantics fall out naturally: the narrowest policy wins.
+	//
+	// Why check both even though the subset invariant guarantees
+	// key.policy ⊆ identity.policy at creation time?
+	//
+	// The subset invariant is a point-in-time check. Two writes can break
+	// it after the key is created:
+	//
+	//   1. Admin tightens the identity policy later. Every existing key
+	//      whose policy was a valid subset at creation may now be broader
+	//      than the current identity policy. If we only enforce the key
+	//      policy, those keys keep minting tokens with scopes/TTLs the
+	//      security team has since revoked — the tightening never takes
+	//      effect until every key is manually rotated.
+	//
+	//   2. Admin edits an existing key's policy. Unless every update path
+	//      re-validates the subset invariant against the current identity
+	//      policy (easy to forget; and cross-admin races make this racy
+	//      anyway), a bad edit can leave an over-privileged key.
+	//
+	// Enforcing both layers at every token issuance makes policy drift
+	// self-healing: the narrowest currently-active policy wins, without
+	// any reconciliation job or per-key migration. This mirrors how AWS
+	// STS re-intersects session policies with the IAM policy on every
+	// call (not just AssumeRole) — "session policies cannot grant more
+	// permissions than those allowed by the identity-based policy."
+	//
+	// The extra cost is one GetPolicy lookup per token, and we skip even
+	// that when the key inherits the identity policy verbatim (the common
+	// case: CredentialPolicyID == IdentityPolicyID), so the hot path pays
+	// for exactly one enforcement pass.
+	if s.policySvc != nil {
 		var attestationLevel string
-		if s.attestationRepo != nil {
+		if s.attestationRepo != nil && req.Identity.ID != "" {
 			attestationLevel, _ = s.attestationRepo.GetHighestVerifiedLevel(ctx, req.Identity.ID)
 		}
-
-		if err := s.policySvc.EnforcePolicy(ctx, policy, EnforcePolicyRequest{
+		enforceReq := EnforcePolicyRequest{
 			TTL:              ttl,
 			GrantType:        req.GrantType,
 			Scopes:           req.Scopes,
 			TrustLevel:       req.Identity.TrustLevel,
 			AttestationLevel: attestationLevel,
 			DelegationDepth:  req.DelegationDepth,
-		}); err != nil {
-			log.Warn().
-				Err(err).
-				Str("identity_id", req.Identity.ID).
-				Str("policy_id", req.CredentialPolicyID).
-				Msg("Credential policy enforcement denied issuance")
-			return nil, nil, err
+		}
+
+		// Identity policy — governance ceiling.
+		if req.IdentityPolicyID != "" {
+			policy, err := s.policySvc.GetPolicy(ctx, req.IdentityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", req.IdentityPolicyID, err)
+			}
+			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
+				log.Warn().
+					Err(err).
+					Str("identity_id", req.Identity.ID).
+					Str("policy_id", req.IdentityPolicyID).
+					Str("policy_layer", "identity").
+					Msg("Identity policy enforcement denied issuance")
+				return nil, nil, err
+			}
+		}
+
+		// API key policy — per-credential restriction. Checked only when a
+		// distinct policy is supplied; if the API key inherits the identity
+		// policy we skip the redundant enforcement.
+		if req.CredentialPolicyID != "" && req.CredentialPolicyID != req.IdentityPolicyID {
+			policy, err := s.policySvc.GetPolicy(ctx, req.CredentialPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
+			}
+			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
+				log.Warn().
+					Err(err).
+					Str("identity_id", req.Identity.ID).
+					Str("policy_id", req.CredentialPolicyID).
+					Str("policy_layer", "credential").
+					Msg("Credential policy enforcement denied issuance")
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -203,9 +271,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		_ = token.Set("capabilities", req.Identity.Capabilities)
 	}
 
-	if len(req.Audience) > 0 {
-		_ = token.Set(jwt.AudienceKey, req.Audience)
+	// JWT-SVID §3 requires `aud` to be present on every issued token. Default
+	// to the issuer URL when no audience was supplied so tokens remain
+	// interoperable with spec-compliant verifiers (e.g., pkg/authjwt).
+	aud := req.Audience
+	if len(aud) == 0 {
+		aud = []string{s.issuer}
 	}
+	_ = token.Set(jwt.AudienceKey, aud)
 	if len(req.Scopes) > 0 {
 		_ = token.Set("scopes", req.Scopes)
 	}

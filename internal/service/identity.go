@@ -23,12 +23,16 @@ var ErrIdentityAlreadyExists = errors.New("identity already exists")
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
 	repo        *postgres.IdentityRepository
+	policySvc   *CredentialPolicyService
 	wimseDomain string
 }
 
-// NewIdentityService creates a new IdentityService.
-func NewIdentityService(repo *postgres.IdentityRepository, wimseDomain string) *IdentityService {
-	return &IdentityService{repo: repo, wimseDomain: wimseDomain}
+// NewIdentityService creates a new IdentityService. policySvc must be non-nil —
+// every identity is assigned the tenant's default credential policy at
+// registration time if the caller does not choose a specific one, so the
+// service cannot function without a policy resolver.
+func NewIdentityService(repo *postgres.IdentityRepository, policySvc *CredentialPolicyService, wimseDomain string) *IdentityService {
+	return &IdentityService{repo: repo, policySvc: policySvc, wimseDomain: wimseDomain}
 }
 
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
@@ -65,7 +69,7 @@ type RegisterIdentityRequest struct {
 	IdentityType  domain.IdentityType
 	SubType       domain.SubType
 	OwnerUserID   string
-	AllowedScopes []string
+	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
 	PublicKeyPEM  string
 	Framework     string
 	Version       string
@@ -75,6 +79,11 @@ type RegisterIdentityRequest struct {
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
 	CreatedBy     string
+	// CredentialPolicyID is the identity policy — the authority ceiling for
+	// every credential this identity can hold. If empty, the tenant's default
+	// policy is assigned. Must exist within the caller's tenant; cross-tenant
+	// IDs are rejected with ErrPolicyNotFound.
+	CredentialPolicyID string
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -116,30 +125,40 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		return nil, err
 	}
 
+	// Resolve the identity policy: a caller-supplied policy ID must be
+	// tenant-scoped (IDOR guard via GetPolicy). When absent, assign the
+	// tenant's default policy so every identity has a non-null authority
+	// ceiling from the moment it is created.
+	policyID, err := s.resolveIdentityPolicyID(ctx, req.AccountID, req.ProjectID, req.CredentialPolicyID)
+	if err != nil {
+		return nil, err
+	}
+
 	identity := &domain.Identity{
-		ID:            uuid.New().String(),
-		AccountID:     req.AccountID,
-		ProjectID:     req.ProjectID,
-		ExternalID:    req.ExternalID,
-		Name:          req.Name,
-		WIMSEURI:      domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID),
-		IdentityType:  req.IdentityType,
-		SubType:       req.SubType,
-		TrustLevel:    req.TrustLevel,
-		Status:        domain.IdentityStatusActive,
-		OwnerUserID:   req.OwnerUserID,
-		AllowedScopes: req.AllowedScopes,
-		PublicKeyPEM:  req.PublicKeyPEM,
-		Framework:     req.Framework,
-		Version:       req.Version,
-		Publisher:     req.Publisher,
-		Description:   req.Description,
-		Capabilities:  req.Capabilities,
-		Labels:        req.Labels,
-		Metadata:      req.Metadata,
-		CreatedBy:     req.CreatedBy,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		ID:                 uuid.New().String(),
+		AccountID:          req.AccountID,
+		ProjectID:          req.ProjectID,
+		ExternalID:         req.ExternalID,
+		Name:               req.Name,
+		WIMSEURI:           domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID),
+		IdentityType:       req.IdentityType,
+		SubType:            req.SubType,
+		TrustLevel:         req.TrustLevel,
+		Status:             domain.IdentityStatusActive,
+		OwnerUserID:        req.OwnerUserID,
+		CredentialPolicyID: policyID,
+		AllowedScopes:      req.AllowedScopes,
+		PublicKeyPEM:       req.PublicKeyPEM,
+		Framework:          req.Framework,
+		Version:            req.Version,
+		Publisher:          req.Publisher,
+		Description:        req.Description,
+		Capabilities:       req.Capabilities,
+		Labels:             req.Labels,
+		Metadata:           req.Metadata,
+		CreatedBy:          req.CreatedBy,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
 	}
 
 	if err := s.repo.Create(ctx, identity); err != nil {
@@ -193,6 +212,11 @@ type UpdateIdentityRequest struct {
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
 	Status        *domain.IdentityStatus
+	// CredentialPolicyID changes the identity policy — the authority ceiling
+	// for this identity. Pointer so callers can distinguish "not set" from
+	// "clear to tenant default". A non-empty value must exist in the caller's
+	// tenant; an empty string reassigns the tenant default.
+	CredentialPolicyID *string
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -258,6 +282,13 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.Status = *req.Status
 	}
+	if req.CredentialPolicyID != nil {
+		policyID, err := s.resolveIdentityPolicyID(ctx, identity.AccountID, identity.ProjectID, *req.CredentialPolicyID)
+		if err != nil {
+			return nil, err
+		}
+		identity.CredentialPolicyID = policyID
+	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
@@ -305,4 +336,46 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 // DeleteIdentity permanently removes an identity and cascades to related records.
 func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID string) error {
 	return s.repo.Delete(ctx, id, accountID, projectID)
+}
+
+// resolveIdentityPolicyID picks the policy to attach to an identity. When the
+// caller supplies an explicit ID, it is validated against the tenant (IDOR
+// guard via GetPolicy). When empty, the tenant's default policy is ensured
+// and its ID is returned. Never returns an empty string on success.
+func (s *IdentityService) resolveIdentityPolicyID(ctx context.Context, accountID, projectID, suppliedID string) (string, error) {
+	if s.policySvc == nil {
+		return "", fmt.Errorf("identity service is missing credential policy dependency")
+	}
+	if suppliedID == "" {
+		p, err := s.policySvc.EnsureDefaultPolicy(ctx, accountID, projectID)
+		if err != nil {
+			return "", fmt.Errorf("failed to ensure default credential policy: %w", err)
+		}
+		return p.ID, nil
+	}
+	if _, err := s.policySvc.GetPolicy(ctx, suppliedID, accountID, projectID); err != nil {
+		return "", fmt.Errorf("credential policy %s: %w", suppliedID, err)
+	}
+	return suppliedID, nil
+}
+
+// ResolveCredentialPolicy returns the credential policy that governs this
+// identity. Callers use it as the authority ceiling for scope, TTL, grant
+// type, delegation depth, trust level, and attestation checks.
+//
+// Dual-read: if the identity has a CredentialPolicyID the policy is
+// returned directly. Legacy identities written before migration 008 may
+// still have a NULL column; we lazily fall back to the tenant default in
+// that case so the OAuth flows never observe a policy-less identity.
+func (s *IdentityService) ResolveCredentialPolicy(ctx context.Context, identity *domain.Identity) (*domain.CredentialPolicy, error) {
+	if s.policySvc == nil {
+		return nil, fmt.Errorf("identity service is missing credential policy dependency")
+	}
+	if identity == nil {
+		return nil, fmt.Errorf("nil identity")
+	}
+	if identity.CredentialPolicyID != "" {
+		return s.policySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
+	}
+	return s.policySvc.EnsureDefaultPolicy(ctx, identity.AccountID, identity.ProjectID)
 }

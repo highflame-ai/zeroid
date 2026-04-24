@@ -13,15 +13,16 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
-	"strings"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,9 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/pgdialect"
+	"github.com/uptrace/bun/driver/pgdriver"
 
 	zeroid "github.com/highflame-ai/zeroid"
 )
@@ -65,6 +69,11 @@ var testZeroIDServer *zeroid.Server
 // testServerPrivKey is the server's ECDSA signing key, accessible so tests can
 // build valid assertions without going through disk files.
 var testServerPrivKey *ecdsa.PrivateKey
+
+// testDB is a bun.DB handle connected to the same postgres container the server
+// uses. Exposed so tests can exercise repository-level transactional semantics
+// directly, bypassing the HTTP surface.
+var testDB *bun.DB
 
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -173,6 +182,12 @@ func runTests(m *testing.M) int {
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 
+	// Open a separate bun.DB handle for tests that need direct repo access.
+	// Uses the same connection string the server is wired to.
+	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dbURL)))
+	testDB = bun.NewDB(sqldb, pgdialect.New())
+	defer testDB.Close() //nolint:errcheck
+
 	// Register the CLI and MCP test clients in the oauth_clients table.
 	// These are public PKCE clients — no client_secret, no linked identity.
 	registerTestOAuthClient(testCLIClientID, []string{"authorization_code"})
@@ -199,28 +214,28 @@ func writeKeyFiles(privKey *ecdsa.PrivateKey) (privPath, pubPath string, cleanup
 		return "", "", nil, err
 	}
 	if err := pem.Encode(privFile, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privDER}); err != nil {
-		privFile.Close()
-		os.Remove(privFile.Name())
+		_ = privFile.Close()
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
-	privFile.Close()
+	_ = privFile.Close()
 
 	pubFile, err := os.CreateTemp("", "zeroid-test-pub-*.pem")
 	if err != nil {
-		os.Remove(privFile.Name())
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
 	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
-		pubFile.Close()
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = pubFile.Close()
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 		return "", "", nil, err
 	}
-	pubFile.Close()
+	_ = pubFile.Close()
 
 	return privFile.Name(), pubFile.Name(), func() {
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 	}, nil
 }
 
@@ -260,7 +275,7 @@ func doRequest(t *testing.T, method, path string, body any, headers map[string]s
 // decode reads and JSON-decodes a response body, closing it after.
 func decode(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var m map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&m))
 	return m
@@ -403,28 +418,28 @@ func writeRSAKeyFiles(privKey *rsa.PrivateKey) (privPath, pubPath string, cleanu
 		return "", "", nil, err
 	}
 	if err := pem.Encode(privFile, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER}); err != nil {
-		privFile.Close()
-		os.Remove(privFile.Name())
+		_ = privFile.Close()
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
-	privFile.Close()
+	_ = privFile.Close()
 
 	pubFile, err := os.CreateTemp("", "zeroid-test-rsa-pub-*.pem")
 	if err != nil {
-		os.Remove(privFile.Name())
+		_ = os.Remove(privFile.Name())
 		return "", "", nil, err
 	}
 	if err := pem.Encode(pubFile, &pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}); err != nil {
-		pubFile.Close()
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = pubFile.Close()
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 		return "", "", nil, err
 	}
-	pubFile.Close()
+	_ = pubFile.Close()
 
 	return privFile.Name(), pubFile.Name(), func() {
-		os.Remove(privFile.Name())
-		os.Remove(pubFile.Name())
+		_ = os.Remove(privFile.Name())
+		_ = os.Remove(pubFile.Name())
 	}, nil
 }
 

@@ -24,8 +24,3 @@ func respondWithError(w http.ResponseWriter, status int, internalCode, message s
 	errResp := domain.NewErrorResponse(status, internalCode, message)
 	respondWithJSON(w, status, errResp)
 }
-
-// respondNotImplemented returns a 501 stub response.
-func respondNotImplemented(w http.ResponseWriter) {
-	respondWithError(w, http.StatusNotImplemented, domain.ErrCodeNotImplemented, "not yet implemented")
-}

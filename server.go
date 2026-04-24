@@ -160,7 +160,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
 	}
-	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
+	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, authCodeRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
 		Issuer:         cfg.Token.Issuer,
 		WIMSEDomain:    cfg.WIMSEDomain,
 		HMACSecret:     cfg.Token.HMACSecret,

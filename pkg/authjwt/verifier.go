@@ -16,16 +16,16 @@ import (
 )
 
 var (
-	ErrNoToken          = errors.New("authjwt: no token provided")
-	ErrInvalidToken     = errors.New("authjwt: invalid token")
-	ErrExpiredToken     = errors.New("authjwt: token expired")
-	ErrInvalidIssuer    = errors.New("authjwt: invalid issuer")
-	ErrInvalidAudience  = errors.New("authjwt: invalid audience")
-	ErrUnsupportedAlg   = errors.New("authjwt: unsupported signing algorithm")
-	ErrNoKeySet         = errors.New("authjwt: no JWKS available")
+	ErrNoToken           = errors.New("authjwt: no token provided")
+	ErrInvalidToken      = errors.New("authjwt: invalid token")
+	ErrExpiredToken      = errors.New("authjwt: token expired")
+	ErrInvalidIssuer     = errors.New("authjwt: invalid issuer")
+	ErrInvalidAudience   = errors.New("authjwt: invalid audience")
+	ErrUnsupportedAlg    = errors.New("authjwt: unsupported signing algorithm")
+	ErrNoKeySet          = errors.New("authjwt: no JWKS available")
 	ErrInsufficientScope = errors.New("authjwt: insufficient scope")
-	ErrTokenRevoked     = errors.New("authjwt: token revoked or inactive")
-	ErrIntrospectFailed = errors.New("authjwt: introspection request failed")
+	ErrTokenRevoked      = errors.New("authjwt: token revoked or inactive")
+	ErrIntrospectFailed  = errors.New("authjwt: introspection request failed")
 )
 
 // allowedAlgorithms restricts which signing algorithms are accepted.

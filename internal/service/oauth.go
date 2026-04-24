@@ -28,12 +28,13 @@ type OAuthService struct {
 	identitySvc     *IdentityService
 	oauthClientSvc  *OAuthClientService
 	apiKeyRepo      *postgres.APIKeyRepository
+	authCodeRepo    *postgres.AuthCodeRepository
 	jwksSvc         *signing.JWKSService
 	refreshTokenSvc *RefreshTokenService
 	issuer          string
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
-	hmacSecret     string // HS256 shared secret for auth code JWT verification
-	authCodeIssuer string // expected issuer in auth code JWTs
+	hmacSecret      string // HS256 shared secret for auth code JWT verification
+	authCodeIssuer  string // expected issuer in auth code JWTs
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -45,7 +46,7 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 
 // Default token TTLs (used when per-client TTL is not configured).
 const (
-	defaultAccessTokenTTLWithRefresh = 3600          // 1 hour when refresh tokens provide continuity
+	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
 	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
 )
 
@@ -70,10 +71,10 @@ type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, 
 
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
-	Issuer          string
-	WIMSEDomain     string
-	HMACSecret      string
-	AuthCodeIssuer  string
+	Issuer         string
+	WIMSEDomain    string
+	HMACSecret     string
+	AuthCodeIssuer string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -86,19 +87,21 @@ func NewOAuthService(
 	identitySvc *IdentityService,
 	oauthClientSvc *OAuthClientService,
 	apiKeyRepo *postgres.APIKeyRepository,
+	authCodeRepo *postgres.AuthCodeRepository,
 	jwksSvc *signing.JWKSService,
 	refreshTokenSvc *RefreshTokenService,
 	cfg OAuthServiceConfig,
 ) *OAuthService {
 	return &OAuthService{
-		credentialSvc:    credentialSvc,
-		identitySvc:      identitySvc,
-		oauthClientSvc:   oauthClientSvc,
-		apiKeyRepo:       apiKeyRepo,
-		jwksSvc:          jwksSvc,
-		refreshTokenSvc:  refreshTokenSvc,
-		issuer:           cfg.Issuer,
-		wimseDomain:      cfg.WIMSEDomain,
+		credentialSvc:           credentialSvc,
+		identitySvc:             identitySvc,
+		oauthClientSvc:          oauthClientSvc,
+		apiKeyRepo:              apiKeyRepo,
+		authCodeRepo:            authCodeRepo,
+		jwksSvc:                 jwksSvc,
+		refreshTokenSvc:         refreshTokenSvc,
+		issuer:                  cfg.Issuer,
+		wimseDomain:             cfg.WIMSEDomain,
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
@@ -138,9 +141,9 @@ type TokenRequest struct {
 	ActorToken       string // the sub-agent's JWT assertion (NHI delegation only)
 	// External principal exchange fields (RFC 8693 with subject_token_type=jwt):
 	// Populated by the trusted service (e.g. admin) that already authenticated the user.
-	UserID        string // external user ID (e.g. Clerk user ID)
-	UserEmail     string // user email
-	UserName      string // user display name
+	UserID           string         // external user ID (e.g. Clerk user ID)
+	UserEmail        string         // user email
+	UserName         string         // user display name
 	ApplicationID    string         // optional application scope
 	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
 	// authorization_code grant fields:
@@ -283,12 +286,21 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
 	}
 
-	scopes := intersectScopes(parseScopeString(req.Scope), identity.AllowedScopes)
+	// Resolve the identity policy — the authority ceiling for scopes, TTL,
+	// grant types, and trust level. The policy's allowed_scopes is the
+	// canonical restriction; identity.AllowedScopes is only read as a
+	// deprecated fallback when the policy declares no scope restriction.
+	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+	if err != nil {
+		return nil, oauthServerError("failed to resolve identity credential policy", err)
+	}
+	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		Scopes:    scopes,
-		GrantType: domain.GrantTypeJWTBearer,
+		Identity:         identity,
+		IdentityPolicyID: policy.ID,
+		Scopes:           scopes,
+		GrantType:        domain.GrantTypeJWTBearer,
 	})
 	if err != nil {
 		return nil, err
@@ -393,27 +405,52 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
 	}
 
-	// Step 3: Compute the granted scopes.
+	// Step 3: Resolve the actor's identity policy — the authority ceiling
+	// for delegation. Scopes, max_delegation_depth, required_trust_level,
+	// and the token_exchange grant type allow-list are all enforced from
+	// this policy by IssueCredential (see CredentialService).
+	actorPolicy, err := s.identitySvc.ResolveCredentialPolicy(ctx, actorIdentity)
+	if err != nil {
+		return nil, oauthServerError("failed to resolve actor credential policy", err)
+	}
+
+	// Step 4: Compute the granted scopes as the three-way intersection of
+	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes. When
+	// the policy declares no scope restriction we fall back to the legacy
+	// identity.AllowedScopes for backward compat during the deprecation
+	// window. The orchestrator's granted scopes remain authoritative for
+	// what can be delegated — a sub-agent can never receive more than its
+	// principal currently holds, per RFC 8693 intent.
 	requestedScopes := parseScopeString(req.Scope)
+	actorAllowed := effectiveAllowedScopes(actorPolicy, actorIdentity)
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
 	}
-	actorSet := make(map[string]bool, len(actorIdentity.AllowedScopes))
-	for _, s := range actorIdentity.AllowedScopes {
-		actorSet[s] = true
-	}
 	var scopes []string
-	for _, s := range requestedScopes {
-		if orchSet[s] && actorSet[s] {
-			scopes = append(scopes, s)
+	if len(actorAllowed) == 0 {
+		// Actor has no scope restriction → intersection is requested ∩ orchestrator.
+		for _, s := range requestedScopes {
+			if orchSet[s] {
+				scopes = append(scopes, s)
+			}
+		}
+	} else {
+		actorSet := make(map[string]bool, len(actorAllowed))
+		for _, s := range actorAllowed {
+			actorSet[s] = true
+		}
+		for _, s := range requestedScopes {
+			if orchSet[s] && actorSet[s] {
+				scopes = append(scopes, s)
+			}
 		}
 	}
 	if len(scopes) == 0 {
 		return nil, oauthBadRequest("invalid_scope", "requested scopes are not available for delegation")
 	}
 
-	// Step 4: Compute delegation depth (increment from orchestrator's depth).
+	// Step 5: Compute delegation depth (increment from orchestrator's depth).
 	var parentDepth int
 	if v, ok := subjectParsed.Get("delegation_depth"); ok {
 		if d, ok := v.(float64); ok {
@@ -421,14 +458,18 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 
-	// Step 5: Issue a delegated credential for the sub-agent.
+	// Step 6: Issue a delegated credential for the sub-agent. The full
+	// policy constraint set (delegation depth ceiling, required trust
+	// level, allowed grant types, max TTL) is enforced inside
+	// IssueCredential against actor.IdentityPolicyID.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        actorIdentity,
-		Scopes:          scopes,
-		GrantType:       domain.GrantTypeTokenExchange,
-		DelegatedBy:     subjectParsed.Subject(),
-		ParentJTI:       subjectJTI,
-		DelegationDepth: parentDepth + 1,
+		Identity:         actorIdentity,
+		IdentityPolicyID: actorPolicy.ID,
+		Scopes:           scopes,
+		GrantType:        domain.GrantTypeTokenExchange,
+		DelegatedBy:      subjectParsed.Subject(),
+		ParentJTI:        subjectJTI,
+		DelegationDepth:  parentDepth + 1,
 	})
 	if err != nil {
 		return nil, err
@@ -577,17 +618,53 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		}
 	}
 
-	// Resolve scopes: intersect requested with key's allowed scopes.
-	// If the key has no scopes set, fall through to the identity's allowed_scopes
-	// per RFC 6749 section 3.3 (server-defined default).
-	allowedScopes := sk.Scopes
-	if len(allowedScopes) == 0 && identity != nil {
-		allowedScopes = identity.AllowedScopes
+	// Resolve the identity policy (authority ceiling) whenever the key is
+	// linked to a real identity. api_key tokens then pass through both
+	// layers of policy enforcement: the identity policy and the key's
+	// own (optionally narrower) policy.
+	var identityPolicyID string
+	var identityPolicyScopes []string
+	if identity != nil && identity.ID != "" {
+		ip, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = ip.ID
+		identityPolicyScopes = ip.AllowedScopes
 	}
-	scopes := intersectScopes(parseScopeString(req.Scope), allowedScopes)
+
+	// Scope resolution chain (narrowest wins):
+	//   requested
+	//     ∩ key.scopes               (per-key legacy restriction, if set)
+	//     ∩ key.policy.allowed_scopes (per-credential restriction)
+	//     ∩ identity.policy.allowed_scopes (authority ceiling)
+	//     ∩ identity.allowed_scopes  (deprecated fallback when policies are wide open)
+	// intersectScopes treats an empty allowed list as "no restriction" so
+	// chaining naturally short-circuits layers that don't restrict.
+	scopes := parseScopeString(req.Scope)
+	scopes = intersectScopes(scopes, sk.Scopes)
+	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
+		// Hard fail rather than silently skip the intersection: a
+		// transient DB error during scope resolution must not widen
+		// authority. IssueCredential's own policy lookup is a separate
+		// layer — we don't want to degrade layer one on the expectation
+		// that layer two will catch the miss, especially since a DB
+		// blip would likely fail there too with a less specific error.
+		// Same-shape failure matches jwtBearer/tokenExchange above.
+		kp, err := s.credentialSvc.policySvc.GetPolicy(ctx, sk.CredentialPolicyID, sk.AccountID, sk.ProjectID)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve API key credential policy", err)
+		}
+		scopes = intersectScopes(scopes, kp.AllowedScopes)
+	}
+	scopes = intersectScopes(scopes, identityPolicyScopes)
+	if len(identityPolicyScopes) == 0 && identity != nil {
+		scopes = intersectScopes(scopes, identity.AllowedScopes)
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
 		CredentialPolicyID: sk.CredentialPolicyID,
 		Scopes:             scopes,
 		GrantType:          domain.GrantTypeAPIKey,
@@ -622,6 +699,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // Token behaviour is derived from the client's registered grant_types:
 //   - Clients with "refresh_token" grant: short-lived (1h) access token + rotating refresh token.
 //   - Clients without: long-lived (90-day) access token, no refresh token.
+//
+// Each auth code is single-use per RFC 6749 §4.1.2. On first exchange, the code
+// is atomically marked as consumed. Replays are rejected with invalid_grant and
+// all tokens issued from the original exchange are revoked.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
 		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
@@ -670,6 +751,32 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
 	}
 
+	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
+	// Placed after all validation (client, redirect_uri, PKCE) so an
+	// attacker who intercepts a code but doesn't know the verifier cannot
+	// burn it by sending a request with a wrong verifier.
+	//
+	// Consume → IssueCredential → IssueRefreshToken → UpdateTokenInfo is
+	// not transactional. A replay arriving between Consume and
+	// UpdateTokenInfo is still rejected (the critical correctness
+	// property), but revokeAuthCodeTokens may find CredentialJTI unset and
+	// leave the in-flight exchange's tokens valid. RFC 6749 §4.1.2 says
+	// "SHOULD revoke" — best-effort revocation is acceptable here.
+	consumed, err := s.authCodeRepo.Consume(ctx, &domain.AuthCode{
+		JTI:       authCode.JTI,
+		ClientID:  authCode.ClientID,
+		AccountID: authCode.AccountID,
+		ProjectID: authCode.ProjectID,
+		ExpiresAt: authCode.ExpiresAt,
+	})
+	if err != nil {
+		return nil, oauthServerError("failed to check authorization code usage", err)
+	}
+	if !consumed {
+		s.revokeAuthCodeTokens(ctx, authCode.JTI)
+		return nil, oauthBadRequest("invalid_grant", "authorization code has already been used")
+	}
+
 	// Determine access token TTL.
 	// Priority: per-client config > grant-type-based default > server default.
 	hasRefreshGrant := false
@@ -713,6 +820,8 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	accessToken.ProjectID = authCode.ProjectID
 	accessToken.UserID = authCode.UserID
 
+	var refreshFamilyID string
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
@@ -727,10 +836,50 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
 		} else {
 			accessToken.RefreshToken = rtResult.RawToken
+			refreshFamilyID = rtResult.FamilyID
 		}
 	}
 
+	// Store token info so replay detection can revoke these tokens later.
+	if updateErr := s.authCodeRepo.UpdateTokenInfo(ctx, authCode.JTI, accessToken.JTI, refreshFamilyID); updateErr != nil {
+		log.Error().Err(updateErr).Str("auth_code_jti", authCode.JTI).Msg("Failed to store auth code token info for replay revocation")
+	}
+
 	return accessToken, nil
+}
+
+// revokeAuthCodeTokens revokes the access token and refresh token family that
+// were issued when the auth code was first exchanged. Per RFC 6749 §4.1.2:
+// "the authorization server [...] SHOULD revoke all tokens previously issued
+// based on that authorization code."
+func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string) {
+	record, err := s.authCodeRepo.GetByJTI(ctx, codeJTI)
+	if err != nil {
+		log.Warn().Err(err).Str("auth_code_jti", codeJTI).Msg("Auth code replay: could not look up original exchange for revocation")
+		return
+	}
+
+	if record.CredentialJTI != nil && *record.CredentialJTI != "" {
+		cred, _, introspectErr := s.credentialSvc.IntrospectToken(ctx, *record.CredentialJTI)
+		if introspectErr != nil {
+			log.Error().Err(introspectErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to introspect access token for revocation")
+		} else if cred != nil {
+			if revokeErr := s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "auth_code_replay"); revokeErr != nil {
+				log.Error().Err(revokeErr).Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: failed to revoke access token")
+			} else {
+				log.Warn().Str("credential_jti", *record.CredentialJTI).Msg("Auth code replay: revoked access token from original exchange")
+			}
+		}
+	}
+
+	if record.RefreshFamilyID != nil && *record.RefreshFamilyID != "" && s.refreshTokenSvc != nil {
+		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID)
+		if revokeErr != nil {
+			log.Error().Err(revokeErr).Str("family_id", *record.RefreshFamilyID).Msg("Auth code replay: failed to revoke refresh token family")
+		} else if count > 0 {
+			log.Warn().Str("family_id", *record.RefreshFamilyID).Int64("count", count).Msg("Auth code replay: revoked refresh token family from original exchange")
+		}
+	}
 }
 
 // refreshToken handles the refresh_token grant (RFC 6749 section 6).
@@ -926,13 +1075,30 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	return parts[0], parts[1], nil
 }
 
-
 // parseScopeString splits a space-delimited scope string into a slice.
 func parseScopeString(scope string) []string {
 	if scope == "" {
 		return nil
 	}
 	return strings.Fields(scope)
+}
+
+// effectiveAllowedScopes returns the scope ceiling to apply for grant flows
+// that are not credential-backed (jwt_bearer, token_exchange actor). When the
+// identity's credential policy declares a non-empty allowed_scopes list, that
+// list is authoritative. When the policy does not restrict scopes, we fall
+// back to the deprecated identity.AllowedScopes field for one release cycle
+// so tenants that set scope ceilings on the identity row pre-migration-008
+// keep working. Callers should migrate restrictions onto the policy's
+// allowed_scopes and drop reliance on this fallback.
+func effectiveAllowedScopes(policy *domain.CredentialPolicy, identity *domain.Identity) []string {
+	if policy != nil && len(policy.AllowedScopes) > 0 {
+		return policy.AllowedScopes
+	}
+	if identity != nil {
+		return identity.AllowedScopes
+	}
+	return nil
 }
 
 // intersectScopes returns the subset of requested scopes that are in the allowed set.

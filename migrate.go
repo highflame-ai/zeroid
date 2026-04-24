@@ -22,7 +22,7 @@ import (
 func Migrate(databaseURL string) error {
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(databaseURL)))
 	db := bun.NewDB(sqldb, pgdialect.New())
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	if err := database.RunMigrations(db); err != nil {
 		return fmt.Errorf("zeroid migration failed: %w", err)

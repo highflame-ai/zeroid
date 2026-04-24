@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -20,9 +21,11 @@ func NewRefreshTokenRepository(db *bun.DB) *RefreshTokenRepository {
 	return &RefreshTokenRepository{db: db}
 }
 
-// Create inserts a new refresh token record.
-func (r *RefreshTokenRepository) Create(ctx context.Context, token *domain.RefreshToken) error {
-	_, err := r.db.NewInsert().Model(token).Exec(ctx)
+// Create inserts a new refresh token record. Accepts a bun.IDB so the caller
+// can pass either the DB pool (for standalone inserts) or a transaction (when
+// the insert must roll back with a related operation, e.g., rotation).
+func (r *RefreshTokenRepository) Create(ctx context.Context, db bun.IDB, token *domain.RefreshToken) error {
+	_, err := db.NewInsert().Model(token).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create refresh token: %w", err)
 	}
@@ -63,22 +66,46 @@ func (r *RefreshTokenRepository) GetByTokenHashIncludingRevoked(ctx context.Cont
 	return token, nil
 }
 
-// RevokeByID marks a single refresh token as revoked.
-func (r *RefreshTokenRepository) RevokeByID(ctx context.Context, id string) error {
+// ClaimByTokenHash atomically revokes and returns an active, non-expired
+// refresh token matching the given hash. Postgres row-level locking ensures
+// exactly one concurrent caller wins — closing the rotation race that allowed
+// two concurrent rotations to both issue successor tokens from a single input
+// (RFC 6749 §6).
+//
+// Accepts a bun.IDB so callers that pair the claim with a successor insert can
+// run both inside a single transaction. If the successor insert fails, the
+// transaction rollback restores the claimed row to active, avoiding spurious
+// reuse detection on a client retry after a transient DB error.
+//
+// Returns sql.ErrNoRows if no active non-expired token matches. Callers should
+// then look up the token including revoked state to distinguish expired/missing
+// from replay of an already-revoked token.
+func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, db bun.IDB, tokenHash string) (*domain.RefreshToken, error) {
+	token := new(domain.RefreshToken)
 	now := time.Now()
 
-	_, err := r.db.NewUpdate().
-		Model((*domain.RefreshToken)(nil)).
+	res, err := db.NewUpdate().
+		Model(token).
 		Set("state = ?", domain.RefreshTokenStateRevoked).
 		Set("revoked_at = ?", now).
-		Where("id = ?", id).
+		Where("token_hash = ?", tokenHash).
 		Where("state = ?", domain.RefreshTokenStateActive).
+		Where("expires_at > ?", now).
+		Returning("*").
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to revoke refresh token: %w", err)
+		return nil, fmt.Errorf("failed to claim refresh token: %w", err)
 	}
 
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to check claim result: %w", err)
+	}
+	if n == 0 {
+		return nil, sql.ErrNoRows
+	}
+
+	return token, nil
 }
 
 // RevokeFamily revokes all active tokens in a family (reuse detection response).
@@ -96,7 +123,10 @@ func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID stri
 		return 0, fmt.Errorf("failed to revoke refresh token family: %w", err)
 	}
 
-	count, _ := res.RowsAffected()
+	count, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to check family revocation result: %w", err)
+	}
 
 	return count, nil
 }
