@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── Attestation types ────────────────────────────────────────────────────────
@@ -106,6 +108,12 @@ func (a *API) verifyAttestationOp(ctx context.Context, input *VerifyAttestationI
 
 	result, err := a.attestationSvc.VerifyAttestation(ctx, input.Body.AttestationID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
+		// Rejection (bad proof, unconfigured verifier, no policy) is a
+		// client/config error, not a server fault — 400 with the cause.
+		if errors.Is(err, service.ErrAttestationRejected) {
+			log.Info().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification rejected")
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification failed")
 		return nil, huma.Error500InternalServerError("attestation verification failed")
 	}

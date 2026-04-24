@@ -23,6 +23,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
@@ -138,6 +139,7 @@ func NewServer(cfg Config) (*Server, error) {
 	identityRepo := postgres.NewIdentityRepository(db)
 	credentialRepo := postgres.NewCredentialRepository(db)
 	attestationRepo := postgres.NewAttestationRepository(db)
+	attestationPolicyRepo := postgres.NewAttestationPolicyRepository(db)
 	signalRepo := postgres.NewSignalRepository(db)
 	proofRepo := postgres.NewProofRepository(db)
 	oauthClientRepo := postgres.NewOAuthClientRepository(db)
@@ -145,6 +147,24 @@ func NewServer(cfg Config) (*Server, error) {
 	apiKeyRepo := postgres.NewAPIKeyRepository(db)
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
+
+	// Build the attestation verifier registry. Real verifiers are wired
+	// first (OIDC today; image_hash and TPM to follow). The dev stub only
+	// fills in for proof types without a real verifier, and only when the
+	// unsafe flag is set — so production deployments fail closed by default.
+	attestationVerifiers := attestation.NewRegistry()
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	if cfg.Attestation.AllowUnsafeDevStub {
+		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
+		for _, pt := range []domain.ProofType{
+			domain.ProofTypeImageHash,
+			domain.ProofTypeTPM,
+		} {
+			if _, err := attestationVerifiers.Get(pt); err != nil {
+				attestationVerifiers.Register(attestation.NewDevStubVerifier(pt))
+			}
+		}
+	}
 
 	// Initialize services.
 	// credentialPolicySvc must be created before identitySvc because every
@@ -154,7 +174,8 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, cfg.WIMSEDomain)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
+	attestationPolicySvc := service.NewAttestationPolicyService(attestationPolicyRepo)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
@@ -175,7 +196,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
-		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
+		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
 		signalSvc, apiKeySvc, agentSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)

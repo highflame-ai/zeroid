@@ -58,6 +58,6 @@ type AttestationRecord struct {
 	IsVerified   bool             `bun:"is_verified"                   json:"is_verified"`
 	ExpiresAt    *time.Time       `bun:"expires_at"                    json:"expires_at,omitempty"`
 	IsExpired    bool             `bun:"is_expired"                    json:"is_expired"`
-	CredentialID string           `bun:"credential_id,type:uuid"       json:"credential_id,omitempty"`
+	CredentialID string           `bun:"credential_id,type:uuid,nullzero" json:"credential_id,omitempty"`
 	CreatedAt    time.Time        `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 }
