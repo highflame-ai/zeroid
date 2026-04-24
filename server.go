@@ -687,9 +687,17 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// ParseForm reads and consumes r.Body for urlencoded POSTs and caps
-		// the read at Go's defaultMaxFormSize (10 MiB), matching the blanket
-		// 10 MiB body cap applied by requestValidationMiddleware elsewhere.
+		// Apply the same 10 MiB body cap that requestValidationMiddleware
+		// enforces on JSON bodies. Go's ParseForm already imposes an internal
+		// 10 MiB defaultMaxFormSize, but wiring MaxBytesReader here makes the
+		// limit explicit in our own code — a reader who later raises the
+		// JSON cap will see the form cap in the same spot, and ParseForm
+		// short-circuits to MaxBytesError (with limit info) instead of the
+		// opaque "http: POST too large" string.
+		const maxBodySize = 10 * 1024 * 1024
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+
+		// ParseForm reads and consumes r.Body for urlencoded POSTs.
 		if err := r.ParseForm(); err != nil {
 			writeValidationError(w, r, "malformed form body: "+err.Error())
 			return
