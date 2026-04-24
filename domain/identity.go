@@ -250,9 +250,10 @@ type Identity struct {
 	Metadata json.RawMessage `bun:"metadata,type:jsonb"          json:"metadata"`
 
 	// Lifecycle
-	CreatedBy string    `bun:"created_by,type:varchar(255)"    json:"created_by,omitempty"`
-	CreatedAt time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`
+	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
+	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
