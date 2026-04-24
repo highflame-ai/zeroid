@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +15,12 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 )
+
+// maxDiscoveryDocBytes caps how much of an OIDC discovery response we will
+// read and decode. Real-world discovery docs are a few kilobytes; a 1 MiB
+// ceiling gives generous headroom while bounding memory a malicious or
+// compromised issuer can force this process to allocate during a fetch.
+const maxDiscoveryDocBytes = 1 << 20 // 1 MiB
 
 // OIDCVerifier verifies JWTs issued by upstream OIDC providers (GitHub
 // Actions, GCP Workload Identity, Kubernetes projected SA tokens, AWS IAM
@@ -256,7 +263,10 @@ func discoverJWKSURL(ctx context.Context, httpClient *http.Client, issuerURL str
 		Issuer  string `json:"issuer"`
 		JWKSURI string `json:"jwks_uri"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+	// Bound the decode at maxDiscoveryDocBytes. Without the limit a
+	// malicious issuer could stream gigabytes into json.Decode, exhausting
+	// memory before we ever inspected a byte.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxDiscoveryDocBytes)).Decode(&doc); err != nil {
 		return "", fmt.Errorf("parse discovery doc: %w", err)
 	}
 	if doc.JWKSURI == "" {

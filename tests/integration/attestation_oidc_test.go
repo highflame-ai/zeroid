@@ -417,6 +417,54 @@ func TestAttestationPolicyRejectsNonHTTPSIssuer(t *testing.T) {
 	assertErrorBodyContains(t, resp, "https")
 }
 
+// TestAttestationOIDCDiscoveryBodyCap guards the 1 MiB body limit on
+// OIDC discovery doc fetches: a malicious or compromised issuer that serves
+// an arbitrarily large discovery response must not be able to exhaust
+// ZeroID's memory during decode. The test stands up a discovery endpoint
+// that streams padding beyond the cap, configures it as a trusted issuer,
+// and asserts the verify call fails without crashing.
+func TestAttestationOIDCDiscoveryBodyCap(t *testing.T) {
+	mux := http.NewServeMux()
+	var issuerURL string
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Preamble starts a valid JSON object; padding then pushes the
+		// response well past the 1 MiB cap. The decoder must fail before
+		// finishing the object.
+		_, _ = w.Write([]byte(`{"issuer":"` + issuerURL + `","jwks_uri":"` + issuerURL + `/jwks","padding":"`))
+		padding := make([]byte, 2*1024*1024) // 2 MiB
+		for i := range padding {
+			padding[i] = 'A'
+		}
+		_, _ = w.Write(padding)
+		_, _ = w.Write([]byte(`"}`))
+	})
+	// A trivial jwks handler — we shouldn't reach it because discovery
+	// fails, but Huma's Go client still completes the request cleanly.
+	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	issuerURL = srv.URL
+
+	reg := registerAgent(t, uid("attest-oidc-oom"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": issuerURL}},
+	})
+
+	// Any signed token will do — we never get past discovery.
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL3dyb25nIn0.signature"
+	id := submitAttestation(t, reg.AgentID, "oidc_token", bogusToken)
+
+	resp := verifyAttestation(t, id)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"oversized discovery response must be rejected, not OOM the server")
+}
+
 // flipLastByte returns the last byte of s with a single bit flipped, so
 // good[:len(good)-1] + flipLastByte(good) produces a JWT with a corrupted
 // signature byte.
