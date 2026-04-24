@@ -1,9 +1,11 @@
 package zeroid
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -191,6 +193,10 @@ func NewServer(cfg Config) (*Server, error) {
 	// Global middleware.
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
+	// oauthFormCompat must run before requestValidationMiddleware so that
+	// RFC-mandated form-encoded bodies on /oauth2/* endpoints are rewritten
+	// to JSON before the JSON-only Content-Type gate runs.
+	r.Use(oauthFormCompatMiddleware)
 	r.Use(requestValidationMiddleware)
 	r.Use(errorRecoveryMiddleware)
 	r.Use(structuredLoggingMiddleware)
@@ -629,6 +635,66 @@ func errorRecoveryMiddleware(next http.Handler) http.Handler {
 				_ = gojson.NewEncoder(w).Encode(errResp)
 			}
 		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// oauthFormEndpoints lists paths that MUST accept application/x-www-form-urlencoded
+// per RFC 6749 §4, RFC 7662 §2.1, and RFC 7009 §2.1. Clients built to the
+// RFCs (e.g. pkg/authjwt real-time introspection) post form-encoded bodies,
+// so any mismatch between the spec and our JSON-only validation gate breaks
+// interoperability silently.
+var oauthFormEndpoints = map[string]struct{}{
+	"/oauth2/token":            {},
+	"/oauth2/token/introspect": {},
+	"/oauth2/token/revoke":     {},
+}
+
+// oauthFormCompatMiddleware rewrites application/x-www-form-urlencoded bodies
+// on RFC OAuth endpoints into application/json so downstream Huma handlers
+// (which bind from JSON) and the JSON-only requestValidationMiddleware both
+// see a uniform shape. The target schemas for these endpoints are flat maps
+// of string fields, so form → JSON is a lossless flatten.
+func oauthFormCompatMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if _, ok := oauthFormEndpoints[r.URL.Path]; !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ct := r.Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// ParseForm reads and consumes r.Body for urlencoded POSTs.
+		if err := r.ParseForm(); err != nil {
+			writeValidationError(w, r, "malformed form body: "+err.Error())
+			return
+		}
+
+		flat := make(map[string]string, len(r.PostForm))
+		for k, vs := range r.PostForm {
+			if len(vs) > 0 {
+				flat[k] = vs[0]
+			}
+		}
+
+		b, err := gojson.Marshal(flat)
+		if err != nil {
+			writeValidationError(w, r, "failed to re-encode form body: "+err.Error())
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Type", "application/json")
+		// Drop the legacy Content-Length-by-form signal; the ParseForm cache
+		// stays on the request for any downstream that wants it.
 		next.ServeHTTP(w, r)
 	})
 }
