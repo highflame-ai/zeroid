@@ -297,7 +297,12 @@ func (s *AgentService) ActivateAgent(ctx context.Context, id, accountID, project
 	return &resp, nil
 }
 
-// DeactivateAgent disables an agent without deleting it.
+// DeactivateAgent disables an agent without deleting it. The underlying
+// IdentityService.UpdateIdentity sweeps linked API keys, cascade-revokes
+// active credentials, and emits a retirement CAE signal on any fresh
+// transition into the deactivated status — so this endpoint, a direct
+// PUT /identities/{id} with status=deactivated, and any programmatic
+// caller all produce the same end state.
 func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
 	status := domain.IdentityStatusDeactivated
 	identity, err := s.identitySvc.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{
@@ -306,7 +311,6 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 	if err != nil {
 		return nil, err
 	}
-
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
 	resp := identityToAgentResponse(identity, keyPrefix)
 	return &resp, nil

@@ -151,18 +151,22 @@ func NewServer(cfg Config) (*Server, error) {
 	auditRepo := postgres.NewAuditLogRepository(db)
 
 	// Initialize services.
-	// credentialPolicySvc must be created before identitySvc because every
-	// identity is assigned a credential policy at registration (authority
-	// ceiling) and the identity service needs the resolver to enforce the
-	// tenant-scoped IDOR guard on caller-supplied policy IDs.
+	// Construction order matters because identitySvc now depends on
+	// credentialSvc and signalSvc so it can sweep linked API keys, revoke
+	// active credentials, and emit a retirement signal on any status
+	// transition into deactivated. credentialPolicySvc has no service
+	// dependencies and goes first; credentialSvc and signalSvc depend only
+	// on repos; then identitySvc; then attestationSvc / apiKeySvc which
+	// need identitySvc; then oauthSvc / agentSvc last. auditSvc is
+	// dependency-free and sits alongside credentialPolicySvc at the top.
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
-	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, cfg.WIMSEDomain)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
+	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
 	if authCodeIssuer == "" {
@@ -175,7 +179,7 @@ func NewServer(cfg Config) (*Server, error) {
 		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
