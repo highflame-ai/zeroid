@@ -59,10 +59,6 @@ type RegisterAgentInput struct {
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
-		// Fields owned by highflame-admin (policy/credential management) — accepted and ignored by authn:
-		CredentialPolicyID       string   `json:"credential_policy_id,omitempty" doc:"Credential policy UUID (managed by admin)"`
-		APIKeyCredentialPolicyID string   `json:"api_key_credential_policy_id,omitempty" doc:"API key credential policy UUID (managed by admin)"`
-		AllowedScopes            []string `json:"allowed_scopes,omitempty" doc:"Allowed OAuth scopes (managed by admin)"`
 	}
 }
 

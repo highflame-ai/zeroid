@@ -144,12 +144,17 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicyRepo := postgres.NewCredentialPolicyRepository(db)
 	apiKeyRepo := postgres.NewAPIKeyRepository(db)
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
+	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
 
 	// Initialize services.
+	// credentialPolicySvc must be created before identitySvc because every
+	// identity is assigned a credential policy at registration (authority
+	// ceiling) and the identity service needs the resolver to enforce the
+	// tenant-scoped IDOR guard on caller-supplied policy IDs.
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
-	identitySvc := service.NewIdentityService(identityRepo, cfg.WIMSEDomain)
+	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, cfg.WIMSEDomain)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
