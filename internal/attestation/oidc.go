@@ -104,10 +104,17 @@ func (v *OIDCVerifier) Verify(ctx context.Context, record *domain.AttestationRec
 	// Step 4: verify signature + standard claims. jwt.Parse enforces
 	// exp/iat/nbf by default, and the KeySet option requires a matching
 	// kid — so a tampered token or one from a foreign signer will fail.
+	//
+	// Use issuerClaim (not matchedIssuer.URL) for WithIssuer because
+	// jwx's WithIssuer does a strict string compare; a trailing-slash
+	// mismatch between the configured policy URL and the token's iss
+	// claim would reject an otherwise-valid token. The iss claim was
+	// already trust-checked by findIssuer (normalized-equality against
+	// the allowlist), so feeding it back here is safe.
 	tok, err := jwt.Parse(
 		[]byte(rawToken),
 		jwt.WithKeySet(keySet),
-		jwt.WithIssuer(matchedIssuer.URL),
+		jwt.WithIssuer(issuerClaim),
 		jwt.WithValidate(true),
 		jwt.WithAcceptableSkew(30*time.Second),
 	)

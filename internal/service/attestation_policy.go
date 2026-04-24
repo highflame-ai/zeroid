@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 
@@ -129,13 +130,15 @@ func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage) error {
 // including a port) is a loopback address. Used to carve out a safe-to-
 // serve-over-HTTP exception for OIDC discovery in dev/test environments.
 func isLoopbackHost(host string) bool {
-	// Strip an optional :port suffix. Host is in URL form already so
-	// IPv6 addresses are bracketed as [::1]:port — handle both shapes.
-	if i := strings.LastIndex(host, ":"); i >= 0 && !strings.Contains(host[i+1:], "]") {
-		host = host[:i]
+	// net.SplitHostPort strips brackets from IPv6 hosts and separates the
+	// port cleanly. On hosts without a port it returns an error; fall back
+	// to the raw host string and strip any brackets that remain.
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
 	}
-	host = strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
-	switch host {
+	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	switch h {
 	case "localhost", "127.0.0.1", "::1":
 		return true
 	}
