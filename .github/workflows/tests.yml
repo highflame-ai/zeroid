@@ -3,7 +3,7 @@ name: Tests - Zeroid
 on:
   push:
    branches:
-     - "devops-test"
+     - "main"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref }}
