@@ -15,8 +15,8 @@ env:
   NODE_VER: "22"
 
 jobs:
-  go-integration:
-    name: Go tests under tests/ (integration)
+  tests:
+    name: Tests (tests/)
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -26,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Golang Version
+      - name: Setup Go
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VER }}
@@ -42,6 +42,16 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-${{ env.GO_VER }}-
 
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VER }}
+
       - name: Run Go tests in tests/
         env:
           CGO_ENABLED: 0
@@ -49,39 +59,7 @@ jobs:
         run: |-
           go test ./tests/... -v -count=1 -timeout=120s
 
-  python-sdk:
-    name: Python SDK smoke (tests/sdk)
-    permissions:
-      contents: read
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Cache Go modules
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VER }}-
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: ${{ env.PYTHON_VER }}
-
-      - name: Install test dependencies
+      - name: Install Python SDK smoke dependencies
         shell: bash
         run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
@@ -90,39 +68,7 @@ jobs:
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
 
-  typescript-sdk:
-    name: TypeScript SDK smoke (tests/sdk)
-    permissions:
-      contents: read
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Cache Go modules
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VER }}-
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: ${{ env.NODE_VER }}
-
-      - name: Install test dependencies
+      - name: Install TypeScript SDK smoke dependencies
         working-directory: tests/sdk
         shell: bash
         run: |-
