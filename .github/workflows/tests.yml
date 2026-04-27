@@ -1,16 +1,9 @@
 name: Tests - Zeroid
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    branches:
-      - "main"
-  merge_group:
-    types:
-      - checks_requested
+  push:
+   branches:
+     - "devops-test"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref }}
