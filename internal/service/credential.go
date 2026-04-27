@@ -79,6 +79,11 @@ type IssueRequest struct {
 	UseRS256 bool
 	// ApplicationID is the optional application scope (set when API key is linked to an application).
 	ApplicationID string
+	// Product is the optional product scope (e.g. `ai_gateway`, `mcp_gateway`),
+	// set when the issuance source declares which product the credential is for.
+	// Downstream services (Shield, Firehog) read the `product` claim to pick the
+	// correct Cedar action namespace at evaluation time.
+	Product string
 	// SubjectOverride, when non-empty, replaces the default WIMSE URI as the JWT "sub" claim.
 	// Used for external principal exchange (sub = external user ID) and authorization_code
 	// (sub = authenticated user ID). For NHI grants, leave empty to use the WIMSE URI.
@@ -299,6 +304,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Generic claims for RS256 tokens (api_key grant).
 	if req.ApplicationID != "" {
 		_ = token.Set("application_id", req.ApplicationID)
+	}
+	if req.Product != "" {
+		_ = token.Set("product", req.Product)
 	}
 	if req.UserEmail != "" {
 		_ = token.Set("user_email", req.UserEmail)

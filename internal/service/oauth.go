@@ -677,6 +677,11 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		Scopes:             scopes,
 		GrantType:          domain.GrantTypeAPIKey,
 		UseRS256:           true,
+		// Forward the API key's product binding so downstream services
+		// (Shield/Firehog) pick the right Cedar action namespace
+		// (`AIGateway::Action::*` vs `MCPGateway::Action::*`) instead of
+		// hardcoding one. Empty when the key wasn't tagged at creation.
+		Product: sk.Product,
 		// sub = WIMSE URI (the identity), not the creator.
 		// owner_user_id is set from Identity.OwnerUserID automatically.
 		// The creator is the acting user (the developer using the SDK right now).
