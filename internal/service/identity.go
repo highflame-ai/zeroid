@@ -137,7 +137,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		{"identity_type", string(req.IdentityType)},
 	} {
 		if err := domain.ValidateSPIFFEPathSegment(f.name, f.value); err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrInvalidIdentityField, err.Error())
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
 		}
 	}
 	if req.SubType == "" && req.IdentityType == domain.IdentityTypeAgent {
