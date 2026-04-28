@@ -177,6 +177,48 @@ func (c *Config) Validate() error {
 	if c.Database.MaxIdleConns < 0 || c.Database.MaxIdleConns > c.Database.MaxOpenConns {
 		return fmt.Errorf("database.max_idle_conns must be between 0 and max_open_conns, got %d", c.Database.MaxIdleConns)
 	}
+	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
+		return fmt.Errorf("wimse_domain: %w", err)
+	}
+	return nil
+}
+
+// validateWIMSEDomain enforces the SPIFFE §2.2 trust-domain shape — lowercase
+// RFC 1123 hostname, no scheme. Catching it at startup is the difference
+// between a clean error and minting unparseable SPIFFE IDs forever.
+func validateWIMSEDomain(s string) error {
+	if s == "" {
+		return fmt.Errorf("trust domain is required")
+	}
+	// Common misconfig: someone copies a full SPIFFE ID into the env var.
+	if strings.HasPrefix(s, "spiffe://") {
+		return fmt.Errorf("must be a bare DNS name, not a SPIFFE URI (drop the spiffe:// prefix)")
+	}
+	if len(s) > 253 {
+		return fmt.Errorf("must be at most 253 characters, got %d", len(s))
+	}
+	// Manual walk over a regex — error messages can name the offending label.
+	for _, label := range strings.Split(s, ".") {
+		if label == "" {
+			return fmt.Errorf("must not contain empty label (consecutive dots or leading/trailing dot in %q)", s)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("label %q exceeds 63 characters", label)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("label %q must not start or end with a hyphen", label)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z':
+			case c >= '0' && c <= '9':
+			case c == '-':
+			default:
+				return fmt.Errorf("label %q contains character %q (allowed: a-z 0-9 -, lowercase only)", label, c)
+			}
+		}
+	}
 	return nil
 }
 
