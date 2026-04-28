@@ -32,7 +32,7 @@ func TestJWKSEndpoint(t *testing.T) {
 
 	assert.Equal(t, "EC", ecKey["kty"])
 	assert.Equal(t, "ES256", ecKey["alg"])
-	assert.Equal(t, "sig", ecKey["use"])
+	assert.Equal(t, "jwt-svid", ecKey["use"])
 	assert.Equal(t, testKeyID, ecKey["kid"])
 	assert.Equal(t, "P-256", ecKey["crv"])
 	assert.NotEmpty(t, ecKey["x"], "EC key must have x coordinate")

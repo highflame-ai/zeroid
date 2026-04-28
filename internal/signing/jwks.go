@@ -184,6 +184,10 @@ func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.Sig
 	if err := jwkKey.Set(jwk.AlgorithmKey, alg); err != nil {
 		return fmt.Errorf("failed to set algorithm: %w", err)
 	}
+	// In-memory keys keep use=sig because lestrrat-go/jwx's verifier skips
+	// any key whose use is set to anything other than "sig". The published
+	// /.well-known/jwks.json rewrites this to "jwt-svid" at the handler so
+	// SPIFFE verifiers see the value JWT-SVID §4 requires.
 	if err := jwkKey.Set(jwk.KeyUsageKey, jwk.ForSignature); err != nil {
 		return fmt.Errorf("failed to set key usage: %w", err)
 	}
