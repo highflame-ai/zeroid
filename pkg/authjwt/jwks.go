@@ -149,11 +149,18 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 		return fmt.Errorf("fetch JWKS: %w", err)
 	}
 
+	// SPIFFE bundles publish use=jwt-svid (JWT-SVID §4). lestrrat-go/jwx's
+	// verifier treats anything other than "sig" as non-signing and skips the
+	// key, so we normalize on ingest. RFC 7517 says use is informational —
+	// rewriting it doesn't change what the key actually is.
 	kids := make(map[string]struct{}, set.Len())
 	for i := 0; i < set.Len(); i++ {
 		key, ok := set.Key(i)
 		if !ok {
 			continue
+		}
+		if key.KeyUsage() == "jwt-svid" {
+			_ = key.Set(jwk.KeyUsageKey, jwk.ForSignature)
 		}
 		kids[key.KeyID()] = struct{}{}
 	}
