@@ -157,13 +157,18 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		return nil, err
 	}
 
+	wimseURI, err := domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+
 	identity := &domain.Identity{
 		ID:                 uuid.New().String(),
 		AccountID:          req.AccountID,
 		ProjectID:          req.ProjectID,
 		ExternalID:         req.ExternalID,
 		Name:               req.Name,
-		WIMSEURI:           domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID),
+		WIMSEURI:           wimseURI,
 		IdentityType:       req.IdentityType,
 		SubType:            req.SubType,
 		TrustLevel:         req.TrustLevel,
