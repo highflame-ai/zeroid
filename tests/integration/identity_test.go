@@ -53,6 +53,36 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestRegisterIdentityRejectsForbiddenSPIFFEChars locks in the SPIFFE §2.3
+// path-segment gate on external_id. The path_traversal case is the one that
+// actually matters — without the gate it slips through into the WIMSE URI.
+func TestRegisterIdentityRejectsForbiddenSPIFFEChars(t *testing.T) {
+	cases := []struct {
+		name       string
+		externalID string
+	}{
+		{"slash", "agent/with/slash"},
+		{"at_sign", "agent@example"},
+		{"space", "agent with space"},
+		{"path_traversal", "../admin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := post(t, adminPath("/identities"), map[string]any{
+				"external_id":    tc.externalID,
+				"trust_level":    "unverified",
+				"owner_user_id":  "user-test-owner",
+				"allowed_scopes": []string{"billing:read"},
+			}, adminHeaders())
+			assert.True(t,
+				resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity,
+				"expected 400/422 for forbidden character, got %d", resp.StatusCode,
+			)
+			_ = resp.Body.Close()
+		})
+	}
+}
+
 // TestRegisterIdentityMissingExternalID verifies that omitting external_id returns 400/422.
 func TestRegisterIdentityMissingExternalID(t *testing.T) {
 	resp := post(t, adminPath("/identities"), map[string]any{

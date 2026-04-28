@@ -235,6 +235,10 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		if errors.Is(err, service.ErrPolicySubsetViolation) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
+		// SPIFFE path-segment validation failures are caller-fixable.
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register agent")
 		return nil, huma.Error500InternalServerError("failed to register agent")
 	}
