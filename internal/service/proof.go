@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v2/jwa"
+	"github.com/lestrrat-go/jwx/v2/jws"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -50,7 +51,10 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 	_ = token.Set("account_id", identity.AccountID)
 	_ = token.Set("project_id", identity.ProjectID)
 
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey()))
+	// typ=JWT per JWT-SVID §3.
+	hdrs := jws.NewHeaders()
+	_ = hdrs.Set(jws.TypeKey, "JWT")
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		return "", fmt.Errorf("failed to sign proof token: %w", err)
 	}
