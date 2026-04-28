@@ -678,6 +678,7 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
 - `zeroid` CLI
 - GitHub Actions OIDC upstream validator — stamp `environment=ci` claims verified against GitHub's JWKS
+- X.509-SVID issuance + SPIFFE Workload API — mTLS workload identity for SPIRE / Envoy SDS / Istio interop ([#49](https://github.com/highflame-ai/zeroid/issues/49))
 
 ---
 
