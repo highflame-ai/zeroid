@@ -52,4 +52,7 @@ func assertTokenTypIsJWT(t *testing.T, tokenStr string) {
 	require.NoError(t, json.Unmarshal(raw, &hdr), "header is not valid JSON")
 
 	assert.Equal(t, "JWT", hdr["typ"], "JWT-SVID §3 expects typ=JWT in the header")
+	// kid is required so verifiers can pick the right key from the JWKS.
+	// Asserted here too since this test already cracks the header open.
+	assert.NotEmpty(t, hdr["kid"], "issued tokens must carry a kid header")
 }

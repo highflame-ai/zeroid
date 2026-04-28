@@ -51,8 +51,10 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 	_ = token.Set("account_id", identity.AccountID)
 	_ = token.Set("project_id", identity.ProjectID)
 
-	// typ=JWT per JWT-SVID §3.
+	// kid lets verifiers pick the right key from the JWKS; typ=JWT per
+	// JWT-SVID §3.
 	hdrs := jws.NewHeaders()
+	_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
 	_ = hdrs.Set(jws.TypeKey, "JWT")
 	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
