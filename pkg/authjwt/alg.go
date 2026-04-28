@@ -19,11 +19,11 @@ var allowedAlgs = map[string]struct{}{
 // signature work runs. Defense-in-depth — a bundle published without per-key
 // alg shouldn't widen what the verifier will accept.
 func validateAlg(tokenStr string) error {
-	dot := strings.IndexByte(tokenStr, '.')
-	if dot <= 0 {
+	header, _, found := strings.Cut(tokenStr, ".")
+	if !found || header == "" {
 		return fmt.Errorf("%w: token is not a compact JWS", ErrInvalidToken)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(tokenStr[:dot])
+	raw, err := base64.RawURLEncoding.DecodeString(header)
 	if err != nil {
 		return fmt.Errorf("%w: header is not valid base64url: %v", ErrInvalidToken, err)
 	}

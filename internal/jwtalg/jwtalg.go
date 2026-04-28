@@ -26,11 +26,11 @@ var allowed = map[string]struct{}{
 // Validate decodes only the protected header (everything before the first
 // ".") and checks alg against the allow-list. No signature work runs.
 func Validate(tokenStr string) error {
-	dot := strings.IndexByte(tokenStr, '.')
-	if dot <= 0 {
+	header, _, found := strings.Cut(tokenStr, ".")
+	if !found || header == "" {
 		return fmt.Errorf("%w: token is not a compact JWS", ErrUnsupportedAlg)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(tokenStr[:dot])
+	raw, err := base64.RawURLEncoding.DecodeString(header)
 	if err != nil {
 		return fmt.Errorf("%w: header is not valid base64url: %v", ErrUnsupportedAlg, err)
 	}
