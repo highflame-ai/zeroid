@@ -203,6 +203,10 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
+		// SPIFFE path-segment validation failures are caller-fixable.
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
 		return nil, huma.Error500InternalServerError("failed to create identity")
 	}

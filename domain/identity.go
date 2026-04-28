@@ -345,3 +345,24 @@ func GetIdentitySchema() *IdentitySchema {
 func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) string {
 	return fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
 }
+
+// ValidateSPIFFEPathSegment rejects values that wouldn't survive a round-trip
+// through a strict SPIFFE parser (§2.3 — letters, digits, dot, dash,
+// underscore). Run this on anything destined for BuildWIMSEURI; once stored,
+// the URI is durable and we don't re-check on read.
+func ValidateSPIFFEPathSegment(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return fmt.Errorf("%s contains character %q not allowed in a SPIFFE path segment (allowed: a-z A-Z 0-9 . - _)", field, r)
+		}
+	}
+	return nil
+}

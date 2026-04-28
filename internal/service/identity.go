@@ -20,6 +20,10 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
+// ErrInvalidIdentityField marks caller-fixable input errors on registration
+// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+var ErrInvalidIdentityField = errors.New("invalid identity field")
+
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
 	repo          *postgres.IdentityRepository
@@ -111,9 +115,6 @@ type RegisterIdentityRequest struct {
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
-	if req.AccountID == "" || req.ProjectID == "" || req.ExternalID == "" {
-		return nil, fmt.Errorf("accountID, projectID, and externalID are required")
-	}
 	if req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
@@ -125,6 +126,19 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if !req.IdentityType.Valid() {
 		return nil, fmt.Errorf("invalid identity_type: %s", req.IdentityType)
+	}
+	// Anything that lands in the WIMSE URI path needs to be SPIFFE-clean —
+	// otherwise we mint URIs strict verifiers reject, and a "/" in any of
+	// these fields silently shifts the path layout when parsed back out.
+	for _, f := range []struct{ name, value string }{
+		{"account_id", req.AccountID},
+		{"project_id", req.ProjectID},
+		{"external_id", req.ExternalID},
+		{"identity_type", string(req.IdentityType)},
+	} {
+		if err := domain.ValidateSPIFFEPathSegment(f.name, f.value); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
 	}
 	if req.SubType == "" && req.IdentityType == domain.IdentityTypeAgent {
 		req.SubType = domain.SubTypeToolAgent
