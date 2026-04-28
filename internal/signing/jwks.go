@@ -184,7 +184,9 @@ func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.Sig
 	if err := jwkKey.Set(jwk.AlgorithmKey, alg); err != nil {
 		return fmt.Errorf("failed to set algorithm: %w", err)
 	}
-	if err := jwkKey.Set(jwk.KeyUsageKey, jwk.ForSignature); err != nil {
+	// use=jwt-svid (not "sig") — JWT-SVID §4. SPIFFE verifiers reject bundles
+	// that don't mark keys this way.
+	if err := jwkKey.Set(jwk.KeyUsageKey, "jwt-svid"); err != nil {
 		return fmt.Errorf("failed to set key usage: %w", err)
 	}
 	if err := set.AddKey(jwkKey); err != nil {
