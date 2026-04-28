@@ -208,14 +208,15 @@ func validateWIMSEDomain(s string) error {
 		if label[0] == '-' || label[len(label)-1] == '-' {
 			return fmt.Errorf("label %q must not start or end with a hyphen", label)
 		}
-		for i := 0; i < len(label); i++ {
-			c := label[i]
+		// Range over runes so a multi-byte UTF-8 char gets reported as itself
+		// rather than as the leading byte.
+		for _, r := range label {
 			switch {
-			case c >= 'a' && c <= 'z':
-			case c >= '0' && c <= '9':
-			case c == '-':
+			case r >= 'a' && r <= 'z':
+			case r >= '0' && r <= '9':
+			case r == '-':
 			default:
-				return fmt.Errorf("label %q contains character %q (allowed: a-z 0-9 -, lowercase only)", label, c)
+				return fmt.Errorf("label %q contains character %q (allowed: a-z 0-9 -, lowercase only)", label, r)
 			}
 		}
 	}

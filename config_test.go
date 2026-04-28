@@ -37,6 +37,9 @@ func TestValidateWIMSEDomain(t *testing.T) {
 		{"trailing_hyphen", "highflame-.ai", "must not start or end with a hyphen"},
 		{"label_too_long", strings.Repeat("a", 64) + ".ai", "exceeds 63 characters"},
 		{"total_too_long", strings.Repeat("a.", 130) + "ai", "at most 253 characters"},
+		// Non-ASCII rune — confirms the rune-aware loop reports the actual
+		// character, not just its leading UTF-8 byte.
+		{"non_ascii_rune", "café.example.com", `'é'`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
