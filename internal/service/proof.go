@@ -11,6 +11,7 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -81,6 +82,10 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 
 // VerifyProofToken parses and validates a WIMSE Proof Token, then marks it as used to prevent replay.
 func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedAudience string) (jwt.Token, error) {
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, fmt.Errorf("proof token validation failed: %w", err)
+	}
 	parsed, err := jwt.Parse([]byte(tokenStr),
 		jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()),
 		jwt.WithValidate(true),

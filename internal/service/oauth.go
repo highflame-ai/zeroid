@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -240,6 +241,11 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.Subject); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT uses an unsupported algorithm", err)
+	}
+
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
 	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
 	if err != nil {
@@ -357,6 +363,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.ActorToken); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token uses an unsupported algorithm", err)
+	}
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
@@ -1062,6 +1072,12 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // the token's kid + alg headers to the correct key automatically.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
 func (s *OAuthService) parseToken(tokenStr string, validate bool) (jwt.Token, error) {
+	// Belt-and-braces. WithKeySet trusts the key's own alg, so this isn't
+	// exploitable today — but if the bundle ever ships a key without alg,
+	// the verifier's fallback widens. Cheaper to gate up-front.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, err
+	}
 	return jwt.Parse([]byte(tokenStr),
 		jwt.WithKeySet(s.jwksSvc.KeySet()),
 		jwt.WithValidate(validate),
