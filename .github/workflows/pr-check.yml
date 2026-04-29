@@ -18,6 +18,8 @@ concurrency:
 
 env:
   GO_VER: "1.25.8"
+  PYTHON_VER: "3.12"
+  NODE_VER: "22"
   DOCKER_BUILD_RECORD_UPLOAD: false
   GH_SEC_REPORT: false
   TRIVY_SEVERITY: "HIGH,CRITICAL"
@@ -157,6 +159,72 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  highflame-regression-test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ env.GO_VER }}-
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VER }}
+
+      - name: Run Go tests in tests/
+        env:
+          CGO_ENABLED: 0
+        shell: bash
+        run: |-
+          go test ./tests/... -v -count=1 -timeout=120s
+
+      - name: Install Python SDK smoke dependencies
+        shell: bash
+        run: |-
+          pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
+          pip install --quiet highflame
+
+      - name: Run Python SDK smoke tests
+        run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
+
+      - name: Install TypeScript SDK smoke dependencies
+        working-directory: tests/sdk
+        shell: bash
+        run: |-
+          npm init -y
+          npm install --save-dev vitest typescript @testcontainers/postgresql
+          npm install @highflame/sdk
+
+      - name: Run TypeScript SDK smoke tests
+        working-directory: tests/sdk
+        shell: bash
+        run: |-
+         npx vitest run sdk-smoke.test.ts --reporter=verbose
 
   highflame-trivy-check:
     permissions:
