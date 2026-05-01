@@ -131,6 +131,17 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 		return nil, ErrNoKeySet
 	}
 
+	// JWT-SVID §3 requires explicit algorithm allowlisting BEFORE the token
+	// is handed to the JWT library. Peeking the JOSE header first means a
+	// token with alg=none or HS256 is rejected at the JWS layer, before any
+	// parse logic runs that might inadvertently trust header/claim data.
+	// This is defense-in-depth: lestrrat-go/jwx already enforces alg via
+	// WithKeySet's key-type matching, but we don't rely on that — we
+	// reject up front against our own allowlist.
+	if err := v.checkAlgorithm(tokenString); err != nil {
+		return nil, err
+	}
+
 	// Parse and validate in one step. WithKeySet uses kid+alg to select the key.
 	parseOpts := []jwt.ParseOption{
 		jwt.WithKeySet(keySet),
@@ -158,17 +169,14 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 
-	// Verify the algorithm is in our allowlist.
-	if err := v.checkAlgorithm(tokenString); err != nil {
-		return nil, err
-	}
-
 	return extractClaims(token), nil
 }
 
-// checkAlgorithm parses the JWS header to verify the algorithm is allowed.
-// This is defense-in-depth — lestrrat-go/jwx already validates the signature
-// against the key type, but we explicitly reject unexpected algorithms.
+// checkAlgorithm peeks the JWS header to verify the algorithm is in the
+// allowlist. Called BEFORE jwt.Parse so unsupported algorithms (alg=none,
+// HS256, etc.) are rejected without ever exercising the parse pipeline,
+// per JWT-SVID §3. lestrrat-go/jwx's WithKeySet would catch most of these
+// downstream — peeking up front is defense-in-depth, not a substitute.
 func (v *Verifier) checkAlgorithm(tokenString string) error {
 	msg, err := jws.Parse([]byte(tokenString))
 	if err != nil {

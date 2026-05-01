@@ -6,7 +6,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -269,6 +271,59 @@ func TestVerifyGarbageToken(t *testing.T) {
 	_, err := v.Verify(context.Background(), "not.a.jwt")
 	if err == nil {
 		t.Fatal("expected error for garbage token")
+	}
+}
+
+// TestVerifyRejectsAlgNone covers the JWT-SVID §3 / RFC 7519 §6 requirement
+// that `alg: none` MUST be rejected by any compliant verifier. The token is
+// hand-crafted (no library will sign one for you) to guarantee the JOSE
+// header carries alg=none. Pre-fix #45, this would have been parsed by
+// jwt.Parse first; after #45, the alg peek rejects it before any parse logic
+// touches the token.
+func TestVerifyRejectsAlgNone(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Build  base64url(header).base64url(payload).  with empty signature.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker","iss":"https://auth.test.com"}`))
+	token := header + "." + payload + "."
+
+	_, err := v.Verify(context.Background(), token)
+	if err == nil {
+		t.Fatal("alg=none token MUST be rejected (JWT-SVID §3)")
+	}
+	if !errors.Is(err, authjwt.ErrUnsupportedAlg) {
+		t.Errorf("expected ErrUnsupportedAlg, got: %v", err)
+	}
+}
+
+// TestVerifyRejectsHS256 covers the HS256-confusion attack class: an
+// attacker signs with HS256 using the RSA public key as the HMAC secret,
+// hoping a verifier that doesn't pin the algorithm will accept it. The
+// alg-peek added in #45 rejects HS256 outright before any signature
+// verification runs.
+func TestVerifyRejectsHS256(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Sign with HS256 using an arbitrary symmetric secret. The actual key
+	// material doesn't matter — verifier.Verify must reject before checking
+	// the signature.
+	tok := jwt.New()
+	_ = tok.Set(jwt.IssuerKey, "https://auth.test.com")
+	_ = tok.Set(jwt.SubjectKey, "attacker")
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte("any-symmetric-key-will-do")))
+	if err != nil {
+		t.Fatalf("sign HS256: %v", err)
+	}
+
+	_, err = v.Verify(context.Background(), string(signed))
+	if err == nil {
+		t.Fatal("HS256 token MUST be rejected to prevent algorithm-confusion attacks")
+	}
+	if !errors.Is(err, authjwt.ErrUnsupportedAlg) {
+		t.Errorf("expected ErrUnsupportedAlg, got: %v", err)
 	}
 }
 

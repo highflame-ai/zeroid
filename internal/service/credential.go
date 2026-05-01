@@ -323,16 +323,21 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
-	// kid is included in the JWS header so verifiers can select the correct key from JWKS.
+	// kid is included in the JWS header so verifiers can select the correct
+	// key from JWKS. typ="JWT" is set per JWT-SVID §3 (and RFC 7519 best
+	// practice) so verifiers that distinguish token types via the JOSE
+	// header can identify these as JWTs without parsing the claim set.
 	var signed []byte
 	var signErr error
 	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.RSAKeyID())
+		_ = hdrs.Set(jws.TypeKey, "JWT")
 		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	} else {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
+		_ = hdrs.Set(jws.TypeKey, "JWT")
 		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	}
 	if signErr != nil {

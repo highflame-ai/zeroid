@@ -64,7 +64,7 @@ func NewJWKSService(privateKeyPath, publicKeyPath, keyID string) (*JWKSService, 
 	}
 
 	keySet := jwk.NewSet()
-	if err := addToKeySet(keySet, pubKey, keyID, jwa.ES256); err != nil {
+	if err := addToKeySet(keySet, pubKey, keyID, jwa.ES256, "sig"); err != nil {
 		return nil, fmt.Errorf("failed to add EC key to JWKS: %w", err)
 	}
 
@@ -120,7 +120,7 @@ func (s *JWKSService) LoadRSAKeys(privateKeyPath, publicKeyPath, keyID string) e
 		return fmt.Errorf("public key is not RSA")
 	}
 
-	if err := addToKeySet(s.keySet, rsaPubKey, keyID, jwa.RS256); err != nil {
+	if err := addToKeySet(s.keySet, rsaPubKey, keyID, jwa.RS256, "sig"); err != nil {
 		return fmt.Errorf("failed to add RSA key to JWKS: %w", err)
 	}
 
@@ -172,8 +172,14 @@ func (s *JWKSService) KeySet() jwk.Set {
 	return s.keySet
 }
 
-// addToKeySet creates a JWK from a public key and adds it to the set.
-func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.SignatureAlgorithm) error {
+// addToKeySet creates a JWK from a public key and adds it to the set. The
+// use parameter is set verbatim. All current callers pass "sig" because
+// lestrrat-go/jwx's WithKeySet rejects keys with use != "" or "sig"
+// (AlgorithmsForKey check). The SPIFFE JWT-SVID §6 value "JWT-SVID" is the
+// spec-correct label for ES256 signers; we'd need to either patch jwx or
+// switch to manual key resolution before publishing it. Tracked as the
+// jwx-compatibility blocker on issue #43.
+func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.SignatureAlgorithm, use string) error {
 	jwkKey, err := jwk.FromRaw(pubKey)
 	if err != nil {
 		return fmt.Errorf("failed to create JWK from public key: %w", err)
@@ -184,7 +190,7 @@ func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.Sig
 	if err := jwkKey.Set(jwk.AlgorithmKey, alg); err != nil {
 		return fmt.Errorf("failed to set algorithm: %w", err)
 	}
-	if err := jwkKey.Set(jwk.KeyUsageKey, jwk.ForSignature); err != nil {
+	if err := jwkKey.Set(jwk.KeyUsageKey, use); err != nil {
 		return fmt.Errorf("failed to set key usage: %w", err)
 	}
 	if err := set.AddKey(jwkKey); err != nil {
