@@ -45,3 +45,11 @@ telemetry:
 
 logging:
   level: "debug"
+
+# Attestation verification. The default OIDC verifier is always wired; the
+# dev stub below is a LOCAL-DEV-ONLY backstop that accepts any submitted
+# image_hash or tpm proof so demos and smoke tests keep working before a
+# real verifier lands. MUST be false in production — flip to false (or
+# remove) before shipping. A WARN log prints on startup whenever it's true.
+attestation:
+  allow_unsafe_dev_stub: true
