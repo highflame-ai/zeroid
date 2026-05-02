@@ -129,10 +129,18 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-${{ env.GO_VER }}-
 
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         env:
-          GITHUB_TOKEN: ${{ secrets.DEVOPS_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
         with:
           distribution: goreleaser
           version: "~> v2"
