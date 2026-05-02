@@ -340,8 +340,17 @@ func GetIdentitySchema() *IdentitySchema {
 	}
 }
 
-// BuildWIMSEURI constructs the WIMSE URI for an identity.
-// Format: spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}
-func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) string {
-	return fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
+// MaxSPIFFEIDBytes is the SPIFFE §2.4 hard cap. Spec says MUST NOT exceed.
+const MaxSPIFFEIDBytes = 2048
+
+// BuildWIMSEURI constructs the WIMSE URI for an identity:
+// spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}.
+// Returns an error if the result exceeds MaxSPIFFEIDBytes — once persisted,
+// every downstream system inherits a non-conformant subject claim.
+func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) (string, error) {
+	uri := fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
+	if n := len(uri); n > MaxSPIFFEIDBytes {
+		return "", fmt.Errorf("SPIFFE ID exceeds %d bytes (got %d): %s…", MaxSPIFFEIDBytes, n, uri[:64])
+	}
+	return uri, nil
 }
