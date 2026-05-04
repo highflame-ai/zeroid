@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -52,15 +52,15 @@ func newOIDCIssuer(t *testing.T) *oidcIssuer {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 
-	signKey, err := jwk.FromRaw(priv)
+	signKey, err := jwk.Import[jwk.Key](priv)
 	require.NoError(t, err)
 	require.NoError(t, signKey.Set(jwk.KeyIDKey, "test-issuer-key-1"))
-	require.NoError(t, signKey.Set(jwk.AlgorithmKey, jwa.RS256))
+	require.NoError(t, signKey.Set(jwk.AlgorithmKey, jwa.RS256()))
 
 	pubKey, err := signKey.PublicKey()
 	require.NoError(t, err)
 	require.NoError(t, pubKey.Set(jwk.KeyIDKey, "test-issuer-key-1"))
-	require.NoError(t, pubKey.Set(jwk.AlgorithmKey, jwa.RS256))
+	require.NoError(t, pubKey.Set(jwk.AlgorithmKey, jwa.RS256()))
 	require.NoError(t, pubKey.Set(jwk.KeyUsageKey, "sig"))
 
 	jwks := jwk.NewSet()
@@ -93,7 +93,7 @@ func newOIDCIssuer(t *testing.T) *oidcIssuer {
 		for k, v := range claims {
 			require.NoError(t, tok.Set(k, v))
 		}
-		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, signKey))
+		signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), signKey))
 		require.NoError(t, err)
 		return string(signed)
 	}
@@ -260,7 +260,7 @@ func TestAttestationOIDCVerifierRejectsExpired(t *testing.T) {
 	require.NoError(t, tok.Set(jwt.IssuedAtKey, time.Now().Add(-2*time.Hour).Unix()))
 	require.NoError(t, tok.Set(jwt.ExpirationKey, time.Now().Add(-1*time.Hour).Unix()))
 	require.NoError(t, tok.Set(jwt.SubjectKey, "ci-job-1"))
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256, iss.signKey))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), iss.signKey))
 	require.NoError(t, err)
 
 	id := submitAttestation(t, reg.AgentID, "oidc_token", string(signed))
