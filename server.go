@@ -153,23 +153,16 @@ func NewServer(cfg Config) (*Server, error) {
 	auditRepo := postgres.NewAuditLogRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
-	// first (OIDC today). The dev stub — only registered when the unsafe
-	// flag is set — covers image_hash and TPM because those verifiers have
-	// not landed yet, so without the stub any submission with those proof
-	// types would fail closed. Production deployments leave the flag off
-	// and those proof types stay unimplemented (as intended).
+	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
+	// proof types have no real verifier yet, so the stub is the only way
+	// to exercise demo flows that submit them. Production deployments
+	// leave AllowUnsafeDevStub off and those proof types stay unimplemented.
 	attestationVerifiers := attestation.NewRegistry()
 	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
 	if cfg.Attestation.AllowUnsafeDevStub {
 		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
-		for _, pt := range []domain.ProofType{
-			domain.ProofTypeImageHash,
-			domain.ProofTypeTPM,
-		} {
-			if _, err := attestationVerifiers.Get(pt); err != nil {
-				attestationVerifiers.Register(attestation.NewDevStubVerifier(pt))
-			}
-		}
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeImageHash))
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeTPM))
 	}
 	log.Info().
 		Interface("proof_types", attestationVerifiers.ProofTypes()).
@@ -189,7 +182,7 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationPolicySvc := service.NewAttestationPolicyService(attestationPolicyRepo)
+	attestationPolicySvc := service.NewAttestationPolicyService(attestationPolicyRepo, attestationVerifiers)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)

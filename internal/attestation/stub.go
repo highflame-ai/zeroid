@@ -9,15 +9,12 @@ import (
 
 // DevStubVerifier accepts any submitted proof without inspecting it.
 // Registered ONLY when cfg.Attestation.AllowUnsafeDevStub is set, and
-// ONLY for proof types that do not already have a real verifier wired
-// (the registry overwrites on double-Register, but the server wires the
-// stub last per-type so it fills gaps rather than replacing real
-// verifiers).
+// ONLY for proof types that have no real verifier shipped yet
+// (image_hash, tpm). The server emits a WARN-level startup log whenever
+// the stub is installed.
 //
-// The server emits a WARN-level startup log whenever this verifier is
-// installed. Do not use in production — it exists only to preserve
-// legacy demo flows during the transition from the old "mark verified
-// unconditionally" code path.
+// Do not use in production — it exists only to keep demo flows working
+// for proof types whose real verifiers are still being implemented.
 type DevStubVerifier struct {
 	pt domain.ProofType
 }

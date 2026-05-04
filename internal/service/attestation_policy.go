@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -24,13 +25,22 @@ var ErrInvalidAttestationPolicy = errors.New("invalid attestation policy")
 // AttestationPolicyService is a thin wrapper around the policy repo. The
 // verifier registry holds the concrete verification code; this service
 // just manages the per-tenant configuration those verifiers read.
+//
+// The registry reference is also used as a write-time gate: a policy can
+// only be created for a proof type that has a registered verifier in
+// this deployment. Without the gate, operators could pre-stage policy
+// rows that nothing reads, with misconfigurations only surfacing at
+// /verify time.
 type AttestationPolicyService struct {
-	repo *postgres.AttestationPolicyRepository
+	repo      *postgres.AttestationPolicyRepository
+	verifiers *attestation.Registry
 }
 
-// NewAttestationPolicyService creates a new service.
-func NewAttestationPolicyService(repo *postgres.AttestationPolicyRepository) *AttestationPolicyService {
-	return &AttestationPolicyService{repo: repo}
+// NewAttestationPolicyService creates a new service. The verifier
+// registry is required so UpsertPolicy can reject policies for proof
+// types that have no verifier wired.
+func NewAttestationPolicyService(repo *postgres.AttestationPolicyRepository, verifiers *attestation.Registry) *AttestationPolicyService {
+	return &AttestationPolicyService{repo: repo, verifiers: verifiers}
 }
 
 // UpsertAttestationPolicyRequest captures the payload accepted by the
@@ -52,6 +62,14 @@ type UpsertAttestationPolicyRequest struct {
 func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertAttestationPolicyRequest) (*domain.AttestationPolicy, error) {
 	if !req.ProofType.Valid() {
 		return nil, fmt.Errorf("%w: invalid proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
+	}
+	// Reject policies for proof types that have no registered verifier in
+	// this deployment. Without this gate the row would persist and only
+	// surface its uselessness at /verify time. Dev deployments that need
+	// to exercise image_hash or tpm flows must enable
+	// attestation.allow_unsafe_dev_stub to register the dev stub.
+	if _, err := s.verifiers.Get(req.ProofType); err != nil {
+		return nil, fmt.Errorf("%w: no verifier registered for proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
 	}
 	if len(req.Config) == 0 {
 		return nil, fmt.Errorf("%w: config is required", ErrInvalidAttestationPolicy)
@@ -117,9 +135,11 @@ func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage) error {
 			}
 		}
 	case domain.ProofTypeImageHash, domain.ProofTypeTPM:
-		// No typed config yet — verifiers for these proof types haven't
-		// shipped. Accept the raw blob so operators can pre-configure
-		// policy rows before the verifier lands.
+		// No typed config schema yet — the only registered verifier for
+		// these proof types is the dev stub (gated by allow_unsafe_dev_stub
+		// in UpsertPolicy above), and the stub doesn't inspect config.
+		// When real verifiers ship, replace this branch with their typed
+		// validation.
 	default:
 		return fmt.Errorf("unsupported proof_type: %s", pt)
 	}
