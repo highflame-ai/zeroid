@@ -462,10 +462,16 @@ func TestAttestationOIDCDiscoveryBodyCap(t *testing.T) {
 	// silently leave the body cap uncovered. A hand-built unsigned JWT
 	// is fine because we want the verifier to fail at discovery, before
 	// any signature check.
+	//
+	// Each JWT segment is base64url. The signature segment must have a
+	// length in {4n, 4n+2, 4n+3} — anything else (e.g. the literal
+	// string "signature" at length 9 = 4n+1) makes jwx reject the token
+	// at parse time with "malformed JWT", which short-circuits before
+	// discovery and leaves the body cap unexercised. Use 8-char "A"s.
 	b64 := base64.RawURLEncoding
 	header := b64.EncodeToString([]byte(`{"alg":"RS256"}`))
 	payload := b64.EncodeToString([]byte(`{"iss":"` + issuerURL + `"}`))
-	bogusToken := header + "." + payload + ".signature"
+	bogusToken := header + "." + payload + ".AAAAAAAA"
 	id := submitAttestation(t, reg.AgentID, "oidc_token", bogusToken)
 
 	resp := verifyAttestation(t, id)
