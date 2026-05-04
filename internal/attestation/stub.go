@@ -13,8 +13,11 @@ import (
 // (image_hash, tpm). The server emits a WARN-level startup log whenever
 // the stub is installed.
 //
-// Do not use in production — it exists only to keep demo flows working
-// for proof types whose real verifiers are still being implemented.
+// Currently the flag defaults to true — until image_hash / tpm real
+// verifiers ship, this is the only way demos that submit those proof
+// types keep working. Deployments that don't need them (or that have
+// landed real verifiers) should set AllowUnsafeDevStub=false. The OIDC
+// verifier is unaffected: it's always wired and runs fail-closed.
 type DevStubVerifier struct {
 	pt domain.ProofType
 }

@@ -34,14 +34,21 @@ type Config struct {
 }
 
 // AttestationConfig governs the attestation verification subsystem. The
-// default is fail-closed: no proof type has a verifier wired until a tenant
-// configures an AttestationPolicy for it. AllowUnsafeDevStub re-enables the
-// legacy demo behaviour (any submitted proof verifies) behind an explicit
-// opt-in, so production deployments cannot accidentally inherit it.
+// real verifier path (OIDC) is always wired and fail-closed without a
+// tenant-configured AttestationPolicy. AllowUnsafeDevStub controls
+// whether a permissive stub covers the proof types whose real verifier
+// hasn't shipped yet (image_hash, tpm).
 type AttestationConfig struct {
-	// AllowUnsafeDevStub, when true, registers a stub verifier that accepts
-	// any submitted proof for any configured proof type. Prints a loud
-	// startup warning. MUST never be enabled in production.
+	// AllowUnsafeDevStub, when true, registers a stub verifier that
+	// accepts any submitted proof for image_hash and tpm. Prints a
+	// loud startup warning whenever it's installed.
+	//
+	// Default is true today: until image_hash / tpm real verifiers
+	// land, the stub is the only way demo flows that submit those
+	// proof types keep working — flipping the default to false would
+	// hard-reject them. Deployments that don't use image_hash or tpm
+	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
+	// (the only real verifier shipped) is unaffected by this flag.
 	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
 }
 
@@ -236,10 +243,11 @@ func loadDefaults(k *koanf.Koanf) error {
 		// Admin path prefix
 		"server.admin_path_prefix": DefaultAdminPathPrefix,
 
-		// Attestation — fail-closed by default. AllowUnsafeDevStub is
-		// opt-in for development only; production deployments must leave
-		// it false.
-		"attestation.allow_unsafe_dev_stub": false,
+		// Attestation — dev stub on by default until image_hash / tpm
+		// real verifiers ship. Override with
+		// ZEROID_ALLOW_UNSAFE_DEV_STUB=false for deployments that don't
+		// submit those proof types (or once real verifiers land).
+		"attestation.allow_unsafe_dev_stub": true,
 
 		// Logging
 		"logging.level": "info",
