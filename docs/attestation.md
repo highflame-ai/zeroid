@@ -240,7 +240,7 @@ Each pod requests a token with `aud=zeroid` via projected service-account volume
 
 | YAML key | Env var | Default | Effect |
 |---|---|---|---|
-| `attestation.allow_unsafe_dev_stub` | `ZEROID_ALLOW_UNSAFE_DEV_STUB` | `true` (transitional) | Registers the dev stub for `image_hash` and `tpm`. Prints a startup WARN whenever true. |
+| `attestation.allow_unsafe_dev_stub` | `ZEROID_ALLOW_UNSAFE_DEV_STUB` | `true` (transitional) | (1) Registers the dev stub for `image_hash` and `tpm`. (2) Enables the missing-policy bypass on `/verify` for **all** registered proof types — see [Permissive bypass](#permissive-bypass-during-the-rollout-transitional). Prints a startup WARN whenever true; per-request WARN whenever the bypass fires. |
 
 When the stub is active, the server logs:
 
@@ -259,10 +259,30 @@ Until real `image_hash` and `tpm` verifiers ship, fail-closing those proof types
 `/attestation/verify` rejects with HTTP 400 (and `ErrAttestationRejected` underneath) when:
 
 - The proof type has no verifier registered in this deployment.
-- The tenant has no active `AttestationPolicy` for the proof type.
+- The tenant has no active `AttestationPolicy` for the proof type **and** the permissive bypass is disabled (see below).
 - The verifier itself rejects (bad signature, untrusted issuer, claim mismatch, etc.).
 
 Re-verifying an already-verified record returns 409 `ErrAttestationAlreadyVerified`. This guards against retry-driven duplicate credential issuance.
+
+### Permissive bypass during the rollout (transitional)
+
+When `cfg.Attestation.AllowUnsafeDevStub=true` (the current default — see [Why is the default `true` today?](#why-is-the-default-true-today)), the missing-policy gate is bypassed for **any** proof type whose verifier is registered:
+
+- The registered verifier is **not** invoked (the OIDC verifier requires a non-empty policy config to mean anything; the dev stub doesn't read config).
+- The service synthesises a stub-shape `Result` so the rest of the pipeline (issue credential → promote trust → mark record verified) runs unchanged.
+- A `WARN`-level log fires per request, including `account_id`, `project_id`, `proof_type`, `attestation_id` and `identity_id` — operators use this to find tenants that still need a real policy before the flag is flipped off.
+
+The verifier-must-be-registered gate stays strict in this mode: a typo'd or unsupported proof type still rejects, so the bypass can't paper over schema bugs.
+
+Net effect on existing tenants:
+
+| Tenant state | Strict mode (`flag=false`) | Permissive mode (`flag=true`, current default) |
+|---|---|---|
+| Submits any proof, no policy | ❌ 400 "no attestation policy configured" | ✅ 200, WARN logged |
+| Submits `oidc_token`, has policy | ✅ if real OIDC verification passes | ✅ if real OIDC verification passes (bypass does not apply when policy is present) |
+| Submits proof with no registered verifier | ❌ 400 "no verifier registered" | ❌ 400 "no verifier registered" (bypass does not skip this gate) |
+
+The bypass disappears the day `AllowUnsafeDevStub` is flipped to `false`.
 
 ### Concurrent-write safety
 

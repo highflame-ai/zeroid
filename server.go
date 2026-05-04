@@ -183,7 +183,7 @@ func NewServer(cfg Config) (*Server, error) {
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
@@ -467,6 +467,16 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fn = middleware
+}
+
+// SetAttestationPermissive flips the missing-policy bypass on the attestation
+// verify path at runtime. The initial value is taken from
+// cfg.Attestation.AllowUnsafeDevStub at NewServer time; this setter is the
+// escape hatch for integration tests that need to exercise both modes against
+// the same server instance. Production deployments should set the flag via
+// configuration and never call this.
+func (s *Server) SetAttestationPermissive(enabled bool) {
+	s.attestationSvc.SetPermissive(enabled)
 }
 
 // SetTrustedServiceValidator sets the validator used during external principal

@@ -484,6 +484,101 @@ func TestAttestationOIDCDiscoveryBodyCap(t *testing.T) {
 	assertErrorBodyContains(t, resp, "JWKS fetch failed")
 }
 
+// registerAgentInTenant is a local helper for the permissive-bypass tests
+// below: registerAgent uses adminHeaders, but the bypass tests need
+// agents in tenants no other test touches so a missing-policy state
+// can be observed without races. Inlines the same call shape with
+// caller-supplied tenant headers.
+func registerAgentInTenant(t *testing.T, externalID string, tenant map[string]string) agentRegistration {
+	t.Helper()
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":        externalID,
+		"external_id": externalID,
+		"sub_type":    "orchestrator",
+		"trust_level": "first_party",
+		"created_by":  "test-user",
+	}, tenant)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerAgentInTenant expected 201")
+	raw := decode(t, resp)
+	agent := raw["identity"].(map[string]any)
+	return agentRegistration{
+		AgentID: agent["id"].(string),
+		APIKey:  raw["api_key"].(string),
+	}
+}
+
+// TestAttestationPermissiveModeAcceptsMissingPolicy covers the
+// transitional bypass that ships with the dev-stub default: when
+// allow_unsafe_dev_stub=true, /attestation/verify accepts any submitted
+// proof for a registered proof type even when the tenant has no
+// AttestationPolicy configured. Existing customers using the legacy
+// "any proof verifies" stub keep working without an upgrade-time
+// scramble to PUT a policy. A WARN log fires per-request so operators
+// can find tenants still using the bypass.
+//
+// Test flips the flag via Server.SetAttestationPermissive — the harness
+// default is false so other tests keep their fail-closed semantics.
+func TestAttestationPermissiveModeAcceptsMissingPolicy(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	// Use a tenant no other test touches; we deliberately do NOT
+	// upsertOIDCPolicy here so the missing-policy branch fires.
+	tenant := tenantHeaders("acct-permissive-"+uid(""), "proj-permissive-"+uid(""))
+	reg := registerAgentInTenant(t, uid("attest-permissive"), tenant)
+
+	// Token contents are irrelevant — the bypass synthesises a Result
+	// without invoking the OIDC verifier. A valid-shape JWT is enough
+	// to clear the SubmitAttestation handler's enum check.
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": reg.AgentID,
+		"level":       "software",
+		"proof_type":  "oidc_token",
+		"proof_value": bogusToken,
+	}, tenant)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode, "submit expected 201")
+	id := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": id,
+	}, tenant)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode, "permissive mode: missing policy should not reject")
+
+	body := decode(t, resp)
+	record := body["record"].(map[string]any)
+	assert.Equal(t, true, record["is_verified"], "record marked verified via permissive bypass")
+	assert.NotEmpty(t, body["token"], "credential auto-issued via permissive bypass")
+}
+
+// TestAttestationPermissiveModeOffStillFailsClosed pairs with the test
+// above: when the bypass is OFF (the harness default) and no policy
+// exists, /verify must reject. Catches an accidental "always permissive"
+// regression in the service-layer switch.
+func TestAttestationPermissiveModeOffStillFailsClosed(t *testing.T) {
+	// No SetAttestationPermissive(true) — harness default is false.
+	tenant := tenantHeaders("acct-strict-"+uid(""), "proj-strict-"+uid(""))
+	reg := registerAgentInTenant(t, uid("attest-strict"), tenant)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": reg.AgentID,
+		"level":       "software",
+		"proof_type":  "oidc_token",
+		"proof_value": bogusToken,
+	}, tenant)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode)
+	id := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": id,
+	}, tenant)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "strict mode rejects missing policy")
+	assertErrorBodyContains(t, resp, "no attestation policy configured")
+}
+
 // flipLastByte returns the last byte of s with a single bit flipped, so
 // good[:len(good)-1] + flipLastByte(good) produces a JWT with a corrupted
 // signature byte.

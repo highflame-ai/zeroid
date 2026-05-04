@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
@@ -22,31 +24,58 @@ var ErrAttestationRejected = errors.New("attestation proof rejected")
 // AttestationService handles attestation submission and verification. The
 // verifier registry and attestation-policy service together implement the
 // fail-closed contract: no policy + no verifier = no trust promotion.
+//
+// When allowUnsafeDevStub is true (sourced from
+// cfg.Attestation.AllowUnsafeDevStub at construction time), VerifyAttestation
+// permits a transitional bypass: if the tenant has no AttestationPolicy
+// configured but the verifier IS registered, the service synthesises a
+// stub-shape Result and continues. The verifier itself is not invoked in
+// that case (the OIDC verifier requires a non-empty policy config to mean
+// anything; the stub doesn't read config). A loud WARN logs every such
+// bypass so operators can prioritise migrating those tenants to a real
+// policy before the flag is flipped off.
 type AttestationService struct {
 	repo          *postgres.AttestationRepository
 	credentialSvc *CredentialService
 	identitySvc   *IdentityService
 	verifiers     *attestation.Registry
 	policySvc     *attestation.PolicyService
+
+	// permissive is the runtime-mutable form of cfg.Attestation.AllowUnsafeDevStub.
+	// Stored as int32 so SetPermissive can flip it without a mutex —
+	// integration tests need to toggle the bypass mid-suite.
+	permissive atomic.Bool
 }
 
 // NewAttestationService creates a new AttestationService. verifiers and
 // policySvc are required: VerifyAttestation fails closed when no verifier
-// is registered for a proof type or no tenant policy exists.
+// is registered for a proof type or no tenant policy exists, unless
+// allowUnsafeDevStub is true (transitional bypass).
 func NewAttestationService(
 	repo *postgres.AttestationRepository,
 	credentialSvc *CredentialService,
 	identitySvc *IdentityService,
 	verifiers *attestation.Registry,
 	policySvc *attestation.PolicyService,
+	allowUnsafeDevStub bool,
 ) *AttestationService {
-	return &AttestationService{
+	s := &AttestationService{
 		repo:          repo,
 		credentialSvc: credentialSvc,
 		identitySvc:   identitySvc,
 		verifiers:     verifiers,
 		policySvc:     policySvc,
 	}
+	s.permissive.Store(allowUnsafeDevStub)
+	return s
+}
+
+// SetPermissive flips the missing-policy bypass at runtime. Production
+// code should not call this; it exists so integration tests can exercise
+// both modes without standing up a second server. Server.SetAttestationPermissive
+// is the public surface.
+func (s *AttestationService) SetPermissive(enabled bool) {
+	s.permissive.Store(enabled)
 }
 
 // SubmitAttestation records a new attestation proof.
@@ -94,7 +123,9 @@ var ErrAttestationAlreadyVerified = errors.New("attestation already verified")
 //
 // Fail-closed contract:
 //   - No Verifier registered for the proof type → ErrAttestationRejected.
-//   - No AttestationPolicy for the tenant + proof type → ErrAttestationRejected.
+//   - No AttestationPolicy AND permissive bypass disabled → ErrAttestationRejected.
+//   - No AttestationPolicy AND permissive bypass enabled → synthesised Result
+//     (transitional; logs WARN per request).
 //   - Verifier.Verify returns an error → ErrAttestationRejected.
 //   - Record already verified → ErrAttestationAlreadyVerified (rejects retries).
 //
@@ -113,22 +144,46 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		return nil, fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, record.ID)
 	}
 
+	// Gate 1: verifier must be registered for this proof type. This stays
+	// strict in permissive mode too — a typo'd or unsupported proof type
+	// shouldn't auto-accept just because the dev-stub flag is on.
 	verifier, err := s.verifiers.Get(record.ProofType)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAttestationRejected, err)
 	}
 
-	policy, err := s.policySvc.GetPolicy(ctx, accountID, projectID, record.ProofType)
-	if err != nil {
-		if errors.Is(err, postgres.ErrAttestationPolicyNotFound) {
+	// Gate 2: tenant policy. Permissive mode bypasses this gate by
+	// synthesising a stub-shape Result instead of running the verifier
+	// (OIDC requires a policy to mean anything; the stub doesn't read
+	// config). Logged WARN per request so operators can find tenants
+	// that still need a real policy.
+	var result *attestation.Result
+	policy, policyErr := s.policySvc.GetPolicy(ctx, accountID, projectID, record.ProofType)
+	switch {
+	case errors.Is(policyErr, postgres.ErrAttestationPolicyNotFound):
+		if !s.permissive.Load() {
 			return nil, fmt.Errorf("%w: no attestation policy configured for proof type %s", ErrAttestationRejected, record.ProofType)
 		}
-		return nil, err
-	}
-
-	result, err := verifier.Verify(ctx, record, policy.Config)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrAttestationRejected, err)
+		log.Warn().
+			Str("identity_id", record.IdentityID).
+			Str("account_id", accountID).
+			Str("project_id", projectID).
+			Str("proof_type", string(record.ProofType)).
+			Str("attestation_id", record.ID).
+			Msg("ATTESTATION: accepting proof with no AttestationPolicy because allow_unsafe_dev_stub=true. Configure a policy for this tenant + proof_type to switch to real verification.")
+		expires := time.Now().Add(24 * time.Hour)
+		result = &attestation.Result{
+			Subject:   record.ProofValue,
+			Issuer:    "dev-stub-no-policy",
+			ExpiresAt: &expires,
+		}
+	case policyErr != nil:
+		return nil, policyErr
+	default:
+		result, err = verifier.Verify(ctx, record, policy.Config)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrAttestationRejected, err)
+		}
 	}
 
 	// Load the identity without promoting yet — IssueCredential needs a
