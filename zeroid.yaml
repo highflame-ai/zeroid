@@ -45,3 +45,13 @@ telemetry:
 
 logging:
   level: "debug"
+
+# Attestation verification. The OIDC verifier is always wired and runs
+# fail-closed. The dev stub backs up image_hash and tpm proof types
+# (whose real verifiers haven't shipped yet) so demos and smoke tests
+# that submit those keep working — a WARN log prints on startup whenever
+# it's active. Deployments that don't use those proof types, or where
+# the real verifiers have landed, should set this to false (or via
+# ZEROID_ALLOW_UNSAFE_DEV_STUB=false).
+attestation:
+  allow_unsafe_dev_stub: true
