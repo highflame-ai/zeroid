@@ -236,6 +236,11 @@ func loadDefaults(k *koanf.Koanf) error {
 		// Admin path prefix
 		"server.admin_path_prefix": DefaultAdminPathPrefix,
 
+		// Attestation — fail-closed by default. AllowUnsafeDevStub is
+		// opt-in for development only; production deployments must leave
+		// it false.
+		"attestation.allow_unsafe_dev_stub": false,
+
 		// Logging
 		"logging.level": "info",
 	}
@@ -282,6 +287,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
 
+		// Attestation
+		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
+
 		// Telemetry
 		"OTEL_EXPORTER_OTLP_ENDPOINT": "telemetry.endpoint",
 		"OTEL_ENABLED":                "telemetry.enabled",
@@ -298,7 +306,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		}
 
 		switch {
-		case strings.HasSuffix(configPath, ".enabled") || strings.HasSuffix(configPath, ".insecure"):
+		case strings.HasSuffix(configPath, ".enabled") ||
+			strings.HasSuffix(configPath, ".insecure") ||
+			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
 			if boolVal, err := strconv.ParseBool(value); err == nil {
 				_ = k.Set(configPath, boolVal)
 			}
