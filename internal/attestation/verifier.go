@@ -1,11 +1,3 @@
-// Package attestation defines the verifier plug-in interface and concrete
-// verifiers used by the attestation submission → verification pipeline.
-//
-// Design: one Verifier per domain.ProofType, discovered through a Registry.
-// If a tenant has no AttestationPolicy for a proof type, or no Verifier is
-// registered for that type, verification fails closed — the record stays
-// unverified, no trust promotion, no credential issuance. This replaces the
-// previous stub that accepted any submitted proof.
 package attestation
 
 import (
