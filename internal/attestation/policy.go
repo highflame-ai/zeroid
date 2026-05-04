@@ -1,4 +1,4 @@
-package service
+package attestation
 
 import (
 	"context"
@@ -12,40 +12,38 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/highflame-ai/zeroid/domain"
-	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// ErrInvalidAttestationPolicy is returned for caller-induced validation
-// errors on UpsertPolicy (bad proof_type, malformed config, non-https
+// ErrInvalidPolicy is returned for caller-induced validation errors on
+// PolicyService.UpsertPolicy (bad proof_type, malformed config, non-https
 // issuer URL, etc.). Distinguished from infrastructure errors so the
 // handler maps it to 400 rather than 500.
-var ErrInvalidAttestationPolicy = errors.New("invalid attestation policy")
+var ErrInvalidPolicy = errors.New("invalid attestation policy")
 
-// AttestationPolicyService is a thin wrapper around the policy repo. The
-// verifier registry holds the concrete verification code; this service
-// just manages the per-tenant configuration those verifiers read.
+// PolicyService manages per-tenant attestation policies. It lives in the
+// same package as the verifier registry because the policy is read on
+// every verify call — co-locating shortens the call graph and lets the
+// service reach the registry directly for the write-time "is this proof
+// type implemented?" gate.
 //
-// The registry reference is also used as a write-time gate: a policy can
-// only be created for a proof type that has a registered verifier in
-// this deployment. Without the gate, operators could pre-stage policy
-// rows that nothing reads, with misconfigurations only surfacing at
-// /verify time.
-type AttestationPolicyService struct {
+// Without that gate, operators could pre-stage policy rows that nothing
+// reads, with misconfigurations only surfacing at /verify time.
+type PolicyService struct {
 	repo      *postgres.AttestationPolicyRepository
-	verifiers *attestation.Registry
+	verifiers *Registry
 }
 
-// NewAttestationPolicyService creates a new service. The verifier
-// registry is required so UpsertPolicy can reject policies for proof
-// types that have no verifier wired.
-func NewAttestationPolicyService(repo *postgres.AttestationPolicyRepository, verifiers *attestation.Registry) *AttestationPolicyService {
-	return &AttestationPolicyService{repo: repo, verifiers: verifiers}
+// NewPolicyService creates a new policy service. The verifier registry
+// is required so UpsertPolicy can reject policies for proof types that
+// have no verifier wired.
+func NewPolicyService(repo *postgres.AttestationPolicyRepository, verifiers *Registry) *PolicyService {
+	return &PolicyService{repo: repo, verifiers: verifiers}
 }
 
-// UpsertAttestationPolicyRequest captures the payload accepted by the
-// admin API. Config is JSONB and its shape depends on ProofType.
-type UpsertAttestationPolicyRequest struct {
+// UpsertPolicyRequest captures the payload accepted by the admin API.
+// Config is JSONB and its shape depends on ProofType.
+type UpsertPolicyRequest struct {
 	AccountID string
 	ProjectID string
 	ProofType domain.ProofType
@@ -59,9 +57,9 @@ type UpsertAttestationPolicyRequest struct {
 // same key can't both see "not found" and race on the unique constraint —
 // an earlier read-then-write version did, producing a 500 under concurrent
 // writes.
-func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertAttestationPolicyRequest) (*domain.AttestationPolicy, error) {
+func (s *PolicyService) UpsertPolicy(ctx context.Context, req UpsertPolicyRequest) (*domain.AttestationPolicy, error) {
 	if !req.ProofType.Valid() {
-		return nil, fmt.Errorf("%w: invalid proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
+		return nil, fmt.Errorf("%w: invalid proof_type %q", ErrInvalidPolicy, req.ProofType)
 	}
 	// Reject policies for proof types that have no registered verifier in
 	// this deployment. Without this gate the row would persist and only
@@ -69,16 +67,16 @@ func (s *AttestationPolicyService) UpsertPolicy(ctx context.Context, req UpsertA
 	// to exercise image_hash or tpm flows must enable
 	// attestation.allow_unsafe_dev_stub to register the dev stub.
 	if _, err := s.verifiers.Get(req.ProofType); err != nil {
-		return nil, fmt.Errorf("%w: no verifier registered for proof_type %q", ErrInvalidAttestationPolicy, req.ProofType)
+		return nil, fmt.Errorf("%w: no verifier registered for proof_type %q", ErrInvalidPolicy, req.ProofType)
 	}
 	if len(req.Config) == 0 {
-		return nil, fmt.Errorf("%w: config is required", ErrInvalidAttestationPolicy)
+		return nil, fmt.Errorf("%w: config is required", ErrInvalidPolicy)
 	}
 	// Validate the per-proof-type config shape up front so bad configs can't
 	// sit in the DB until a /verify call finally trips on them. Catches
 	// typos, wrong types, missing issuer URLs, etc. at write time.
 	if err := validatePolicyConfig(req.ProofType, req.Config); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidAttestationPolicy, err)
+		return nil, fmt.Errorf("%w: %v", ErrInvalidPolicy, err)
 	}
 
 	active := true
@@ -167,17 +165,17 @@ func isLoopbackHost(host string) bool {
 
 // GetPolicy returns the policy for the given tenant + proof type, or
 // ErrAttestationPolicyNotFound if unset. Used by the verification path.
-func (s *AttestationPolicyService) GetPolicy(ctx context.Context, accountID, projectID string, pt domain.ProofType) (*domain.AttestationPolicy, error) {
+func (s *PolicyService) GetPolicy(ctx context.Context, accountID, projectID string, pt domain.ProofType) (*domain.AttestationPolicy, error) {
 	return s.repo.GetByTenantProofType(ctx, accountID, projectID, pt)
 }
 
 // ListPolicies returns all policies for a tenant.
-func (s *AttestationPolicyService) ListPolicies(ctx context.Context, accountID, projectID string) ([]*domain.AttestationPolicy, error) {
+func (s *PolicyService) ListPolicies(ctx context.Context, accountID, projectID string) ([]*domain.AttestationPolicy, error) {
 	return s.repo.List(ctx, accountID, projectID)
 }
 
 // DeletePolicy removes a policy by ID. Policies not belonging to the tenant
 // are silently no-op per the repo's idempotent delete semantics.
-func (s *AttestationPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
+func (s *PolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
 	return s.repo.Delete(ctx, id, accountID, projectID)
 }

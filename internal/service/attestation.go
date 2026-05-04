@@ -27,7 +27,7 @@ type AttestationService struct {
 	credentialSvc *CredentialService
 	identitySvc   *IdentityService
 	verifiers     *attestation.Registry
-	policySvc     *AttestationPolicyService
+	policySvc     *attestation.PolicyService
 }
 
 // NewAttestationService creates a new AttestationService. verifiers and
@@ -38,7 +38,7 @@ func NewAttestationService(
 	credentialSvc *CredentialService,
 	identitySvc *IdentityService,
 	verifiers *attestation.Registry,
-	policySvc *AttestationPolicyService,
+	policySvc *attestation.PolicyService,
 ) *AttestationService {
 	return &AttestationService{
 		repo:          repo,

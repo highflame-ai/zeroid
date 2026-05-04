@@ -10,8 +10,8 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
-	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── Attestation policy types ─────────────────────────────────────────────────
@@ -84,7 +84,7 @@ func (a *API) upsertAttestationPolicyOp(ctx context.Context, input *UpsertAttest
 		return nil, huma.Error400BadRequest("invalid proof_type")
 	}
 
-	policy, err := a.attestationPolicySvc.UpsertPolicy(ctx, service.UpsertAttestationPolicyRequest{
+	policy, err := a.attestationPolicySvc.UpsertPolicy(ctx, attestation.UpsertPolicyRequest{
 		AccountID: tenant.AccountID,
 		ProjectID: tenant.ProjectID,
 		ProofType: pt,
@@ -95,7 +95,7 @@ func (a *API) upsertAttestationPolicyOp(ctx context.Context, input *UpsertAttest
 		// Validation errors (bad config, non-https issuer URL, etc.) are
 		// client-fixable — return 400 with the cause so the admin can
 		// correct the payload. Everything else is infrastructure.
-		if errors.Is(err, service.ErrInvalidAttestationPolicy) {
+		if errors.Is(err, attestation.ErrInvalidPolicy) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("proof_type", input.Body.ProofType).Msg("failed to upsert attestation policy")

@@ -14,6 +14,7 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
 )
@@ -24,7 +25,7 @@ type API struct {
 	credSvc              *service.CredentialService
 	credentialPolicySvc  *service.CredentialPolicyService
 	attestationSvc       *service.AttestationService
-	attestationPolicySvc *service.AttestationPolicyService
+	attestationPolicySvc *attestation.PolicyService
 	proofSvc             *service.ProofService
 	oauthSvc             *service.OAuthService
 	oauthClientSvc       *service.OAuthClientService
@@ -45,7 +46,7 @@ func NewAPI(
 	credSvc *service.CredentialService,
 	credentialPolicySvc *service.CredentialPolicyService,
 	attestationSvc *service.AttestationService,
-	attestationPolicySvc *service.AttestationPolicyService,
+	attestationPolicySvc *attestation.PolicyService,
 	proofSvc *service.ProofService,
 	oauthSvc *service.OAuthService,
 	oauthClientSvc *service.OAuthClientService,
