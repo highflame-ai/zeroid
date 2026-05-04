@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -455,14 +456,26 @@ func TestAttestationOIDCDiscoveryBodyCap(t *testing.T) {
 		"issuers": []map[string]any{{"url": issuerURL}},
 	})
 
-	// Any signed token will do — we never get past discovery.
-	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL3dyb25nIn0.signature"
+	// Token's iss claim MUST match the configured issuer — otherwise
+	// findIssuer rejects on the allowlist and the verifier never runs
+	// discoverJWKSURL, so the test would pass for the wrong reason and
+	// silently leave the body cap uncovered. A hand-built unsigned JWT
+	// is fine because we want the verifier to fail at discovery, before
+	// any signature check.
+	b64 := base64.RawURLEncoding
+	header := b64.EncodeToString([]byte(`{"alg":"RS256"}`))
+	payload := b64.EncodeToString([]byte(`{"iss":"` + issuerURL + `"}`))
+	bogusToken := header + "." + payload + ".signature"
 	id := submitAttestation(t, reg.AgentID, "oidc_token", bogusToken)
 
 	resp := verifyAttestation(t, id)
 	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"oversized discovery response must be rejected, not OOM the server")
+	// Body assertion keeps the test honest: status alone would also
+	// pass for "issuer not in allowlist" (a no-op test). Pin to the
+	// JWKS-fetch path so a regression on the body cap is visible.
+	assertErrorBodyContains(t, resp, "JWKS fetch failed")
 }
 
 // flipLastByte returns the last byte of s with a single bit flipped, so
