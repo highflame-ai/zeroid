@@ -29,32 +29,6 @@ func NewAttestationPolicyRepository(db *bun.DB) *AttestationPolicyRepository {
 // verification hot path use this to fail closed.
 var ErrAttestationPolicyNotFound = errors.New("attestation policy not found")
 
-// Create inserts a new policy row.
-func (r *AttestationPolicyRepository) Create(ctx context.Context, p *domain.AttestationPolicy) error {
-	_, err := r.db.NewInsert().Model(p).Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create attestation policy: %w", err)
-	}
-	return nil
-}
-
-// GetByID retrieves a policy by ID, scoped to tenant.
-func (r *AttestationPolicyRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.AttestationPolicy, error) {
-	p := &domain.AttestationPolicy{}
-	err := r.db.NewSelect().Model(p).
-		Where("id = ?", id).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Scan(ctx)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrAttestationPolicyNotFound
-		}
-		return nil, fmt.Errorf("failed to get attestation policy: %w", err)
-	}
-	return p, nil
-}
-
 // GetByTenantProofType fetches the active policy for the tenant + proof
 // type. This is the verification hot path; absence is a normal condition
 // (fail-closed semantics) so we return ErrAttestationPolicyNotFound rather
@@ -118,25 +92,8 @@ func (r *AttestationPolicyRepository) List(ctx context.Context, accountID, proje
 	return policies, nil
 }
 
-// Update overwrites an existing policy's mutable fields (config, is_active).
-func (r *AttestationPolicyRepository) Update(ctx context.Context, p *domain.AttestationPolicy) error {
-	_, err := r.db.NewUpdate().Model(p).
-		Set("config = ?", p.Config).
-		Set("is_active = ?", p.IsActive).
-		Set("updated_at = NOW()").
-		Where("id = ?", p.ID).
-		Where("account_id = ?", p.AccountID).
-		Where("project_id = ?", p.ProjectID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update attestation policy: %w", err)
-	}
-	return nil
-}
-
 // Delete removes a policy by ID, scoped to tenant. Returns nil even if no
-// rows matched (idempotent delete semantics — callers that need strict
-// existence checking should GetByID first).
+// rows matched (idempotent delete semantics).
 func (r *AttestationPolicyRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
 	_, err := r.db.NewDelete().Model((*domain.AttestationPolicy)(nil)).
 		Where("id = ?", id).
