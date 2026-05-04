@@ -142,6 +142,14 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	// Step 1: issue the credential. This is the most likely failure point
 	// (policy checks, scope derivation, signing). Running it first means
 	// a failure leaves no partial state behind.
+	//
+	// GrantType is fixed to client_credentials regardless of how the
+	// identity will subsequently authenticate. Verified attestation is a
+	// workload-bootstrap event: the identity has just proven its
+	// runtime properties (image hash, OIDC claims, TPM quote) and the
+	// returned token represents that boot-time trust, not a user-driven
+	// session. Downstream flows can still token-exchange / jwt-bearer
+	// against this credential; the bootstrap shape just doesn't change.
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
 		GrantType: domain.GrantTypeClientCredentials,
