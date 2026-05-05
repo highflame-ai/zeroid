@@ -20,19 +20,46 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
+// ErrInvalidIdentityField marks caller-fixable input errors on registration
+// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+var ErrInvalidIdentityField = errors.New("invalid identity field")
+
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
-	repo        *postgres.IdentityRepository
-	policySvc   *CredentialPolicyService
-	wimseDomain string
+	repo          *postgres.IdentityRepository
+	policySvc     *CredentialPolicyService
+	apiKeyRepo    *postgres.APIKeyRepository
+	credentialSvc *CredentialService
+	signalSvc     *SignalService
+	wimseDomain   string
 }
 
 // NewIdentityService creates a new IdentityService. policySvc must be non-nil —
 // every identity is assigned the tenant's default credential policy at
 // registration time if the caller does not choose a specific one, so the
 // service cannot function without a policy resolver.
-func NewIdentityService(repo *postgres.IdentityRepository, policySvc *CredentialPolicyService, wimseDomain string) *IdentityService {
-	return &IdentityService{repo: repo, policySvc: policySvc, wimseDomain: wimseDomain}
+//
+// apiKeyRepo, credentialSvc, and signalSvc are required because status
+// transitions to "deactivated" (and identity deletion) must sweep linked API
+// keys, cascade-revoke active credentials, and emit a retirement CAE signal.
+// Centralizing that cleanup here ensures every path that deactivates or
+// deletes an identity runs the sweep — not just the dedicated agent endpoint.
+func NewIdentityService(
+	repo *postgres.IdentityRepository,
+	policySvc *CredentialPolicyService,
+	apiKeyRepo *postgres.APIKeyRepository,
+	credentialSvc *CredentialService,
+	signalSvc *SignalService,
+	wimseDomain string,
+) *IdentityService {
+	return &IdentityService{
+		repo:          repo,
+		policySvc:     policySvc,
+		apiKeyRepo:    apiKeyRepo,
+		credentialSvc: credentialSvc,
+		signalSvc:     signalSvc,
+		wimseDomain:   wimseDomain,
+	}
 }
 
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
@@ -88,9 +115,6 @@ type RegisterIdentityRequest struct {
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
-	if req.AccountID == "" || req.ProjectID == "" || req.ExternalID == "" {
-		return nil, fmt.Errorf("accountID, projectID, and externalID are required")
-	}
 	if req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
@@ -102,6 +126,19 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if !req.IdentityType.Valid() {
 		return nil, fmt.Errorf("invalid identity_type: %s", req.IdentityType)
+	}
+	// Anything that lands in the WIMSE URI path needs to be SPIFFE-clean —
+	// otherwise we mint URIs strict verifiers reject, and a "/" in any of
+	// these fields silently shifts the path layout when parsed back out.
+	for _, f := range []struct{ name, value string }{
+		{"account_id", req.AccountID},
+		{"project_id", req.ProjectID},
+		{"external_id", req.ExternalID},
+		{"identity_type", string(req.IdentityType)},
+	} {
+		if err := domain.ValidateSPIFFEPathSegment(f.name, f.value); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
 	}
 	if req.SubType == "" && req.IdentityType == domain.IdentityTypeAgent {
 		req.SubType = domain.SubTypeToolAgent
@@ -276,6 +313,9 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.Metadata != nil {
 		identity.Metadata = req.Metadata
 	}
+	// Capture prior status so we can tell whether the update is a fresh
+	// transition into deactivated (in which case cleanup must run).
+	priorStatus := identity.Status
 	if req.Status != nil {
 		if !identity.Status.CanTransitionTo(*req.Status) {
 			return nil, fmt.Errorf("invalid status transition: %s → %s", identity.Status, *req.Status)
@@ -292,6 +332,15 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
+	}
+
+	// Fresh transition into deactivated: sweep linked API keys, cascade-revoke
+	// active credentials, and emit a retirement signal. Centralized here so
+	// every update path (PUT /identities/{id}, AgentService.DeactivateAgent,
+	// or any programmatic caller) runs the same cleanup.
+	if priorStatus != domain.IdentityStatusDeactivated &&
+		identity.Status == domain.IdentityStatusDeactivated {
+		s.runDeactivationCleanup(ctx, identity, "identity_deactivated")
 	}
 	return identity, nil
 }
@@ -334,8 +383,58 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 }
 
 // DeleteIdentity permanently removes an identity and cascades to related records.
+//
+// Cleanup runs before the DB delete: API keys are revoked, active credentials
+// are cascade-revoked, and a retirement CAE signal is emitted. This ensures
+// tokens issued to the identity stop working at the same moment the identity
+// is removed, not just whenever they happen to TTL-expire (which can be up to
+// 90 days for api_key tokens).
 func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID string) error {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		// Fall through to Delete so callers get the same not-found semantics.
+		return s.repo.Delete(ctx, id, accountID, projectID)
+	}
+	s.runDeactivationCleanup(ctx, identity, "identity_deleted")
 	return s.repo.Delete(ctx, id, accountID, projectID)
+}
+
+// runDeactivationCleanup sweeps everything a deactivated or deleted identity
+// should no longer be able to use. Each step is best-effort — failures are
+// logged but do not block the surrounding operation, because the
+// authoritative outcome (status flip or row delete) has already happened and
+// the IssueCredential gate ensures no new tokens will be minted regardless.
+//
+// The reason string is carried through the revocation audit trail and the
+// CAE signal payload so subscribers can distinguish "deactivated" from
+// "deleted" cleanups.
+func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: failed to revoke linked API keys")
+	}
+
+	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: failed to revoke active credentials")
+	} else if n > 0 {
+		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
+			Msg("identity cleanup: revoked active credentials (cascade)")
+	}
+
+	if _, err := s.signalSvc.IngestSignal(
+		ctx,
+		identity.AccountID,
+		identity.ProjectID,
+		identity.ID,
+		domain.SignalTypeRetirement,
+		domain.SignalSeverityHigh,
+		"identity_lifecycle",
+		map[string]any{"reason": reason},
+	); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: failed to emit retirement CAE signal")
+	}
 }
 
 // resolveIdentityPolicyID picks the policy to attach to an identity. When the

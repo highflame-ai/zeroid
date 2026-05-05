@@ -14,27 +14,30 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.
 type API struct {
-	identitySvc         *service.IdentityService
-	credSvc             *service.CredentialService
-	credentialPolicySvc *service.CredentialPolicyService
-	attestationSvc      *service.AttestationService
-	proofSvc            *service.ProofService
-	oauthSvc            *service.OAuthService
-	oauthClientSvc      *service.OAuthClientService
-	signalSvc           *service.SignalService
-	apiKeySvc           *service.APIKeyService
-	agentSvc            *service.AgentService
-	jwksSvc             *signing.JWKSService
-	db                  *bun.DB
-	issuer              string
-	baseURL             string
-	startTime           time.Time
+	identitySvc          *service.IdentityService
+	credSvc              *service.CredentialService
+	credentialPolicySvc  *service.CredentialPolicyService
+	attestationSvc       *service.AttestationService
+	attestationPolicySvc *attestation.PolicyService
+	proofSvc             *service.ProofService
+	oauthSvc             *service.OAuthService
+	oauthClientSvc       *service.OAuthClientService
+	signalSvc            *service.SignalService
+	apiKeySvc            *service.APIKeyService
+	agentSvc             *service.AgentService
+	auditSvc             *service.AuditService
+	jwksSvc              *signing.JWKSService
+	db                   *bun.DB
+	issuer               string
+	baseURL              string
+	startTime            time.Time
 }
 
 // NewAPI creates a new API with all service dependencies.
@@ -43,32 +46,36 @@ func NewAPI(
 	credSvc *service.CredentialService,
 	credentialPolicySvc *service.CredentialPolicyService,
 	attestationSvc *service.AttestationService,
+	attestationPolicySvc *attestation.PolicyService,
 	proofSvc *service.ProofService,
 	oauthSvc *service.OAuthService,
 	oauthClientSvc *service.OAuthClientService,
 	signalSvc *service.SignalService,
 	apiKeySvc *service.APIKeyService,
 	agentSvc *service.AgentService,
+	auditSvc *service.AuditService,
 	jwksSvc *signing.JWKSService,
 	db *bun.DB,
 	issuer, baseURL string,
 ) *API {
 	return &API{
-		identitySvc:         identitySvc,
-		credSvc:             credSvc,
-		credentialPolicySvc: credentialPolicySvc,
-		attestationSvc:      attestationSvc,
-		proofSvc:            proofSvc,
-		oauthSvc:            oauthSvc,
-		oauthClientSvc:      oauthClientSvc,
-		signalSvc:           signalSvc,
-		apiKeySvc:           apiKeySvc,
-		agentSvc:            agentSvc,
-		jwksSvc:             jwksSvc,
-		db:                  db,
-		issuer:              issuer,
-		baseURL:             baseURL,
-		startTime:           time.Now(),
+		identitySvc:          identitySvc,
+		credSvc:              credSvc,
+		credentialPolicySvc:  credentialPolicySvc,
+		attestationSvc:       attestationSvc,
+		attestationPolicySvc: attestationPolicySvc,
+		proofSvc:             proofSvc,
+		oauthSvc:             oauthSvc,
+		oauthClientSvc:       oauthClientSvc,
+		signalSvc:            signalSvc,
+		apiKeySvc:            apiKeySvc,
+		agentSvc:             agentSvc,
+		auditSvc:             auditSvc,
+		jwksSvc:              jwksSvc,
+		db:                   db,
+		issuer:               issuer,
+		baseURL:              baseURL,
+		startTime:            time.Now(),
 	}
 }
 
@@ -107,11 +114,13 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerCredentialPolicyRoutes(api)
 	a.registerCredentialRoutes(api)
 	a.registerAttestationRoutes(api)
+	a.registerAttestationPolicyRoutes(api)
 	a.registerOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)
 	a.registerProofVerifyRoute(api)
+	a.registerAuditRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

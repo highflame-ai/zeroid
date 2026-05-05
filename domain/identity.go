@@ -250,9 +250,10 @@ type Identity struct {
 	Metadata json.RawMessage `bun:"metadata,type:jsonb"          json:"metadata"`
 
 	// Lifecycle
-	CreatedBy string    `bun:"created_by,type:varchar(255)"    json:"created_by,omitempty"`
-	CreatedAt time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`
+	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
+	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -343,4 +344,25 @@ func GetIdentitySchema() *IdentitySchema {
 // Format: spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}
 func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) string {
 	return fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
+}
+
+// ValidateSPIFFEPathSegment rejects values that wouldn't survive a round-trip
+// through a strict SPIFFE parser (§2.3 — letters, digits, dot, dash,
+// underscore). Run this on anything destined for BuildWIMSEURI; once stored,
+// the URI is durable and we don't re-check on read.
+func ValidateSPIFFEPathSegment(field, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '.' || r == '-' || r == '_':
+		default:
+			return fmt.Errorf("%s contains character %q not allowed in a SPIFFE path segment (allowed: a-z A-Z 0-9 . - _)", field, r)
+		}
+	}
+	return nil
 }

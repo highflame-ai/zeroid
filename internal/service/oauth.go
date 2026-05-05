@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -216,6 +217,9 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if err != nil {
 		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 	}
+	if !identity.Status.IsUsable() {
+		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
@@ -235,6 +239,11 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Subject == "" {
 		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
+	}
+
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.Subject); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT uses an unsupported algorithm", err)
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
@@ -354,6 +363,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.ActorToken); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token uses an unsupported algorithm", err)
+	}
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
@@ -526,6 +539,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		if err != nil {
 			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
 		}
+		if !resolved.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
 		identity = resolved
 	} else {
 		identity = &domain.Identity{
@@ -605,6 +621,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		if err != nil {
 			log.Warn().Str("identity_id", sk.IdentityID).Str("key_id", sk.ID).Msg("API key linked to unknown identity_id, issuing without identity")
 			identity = nil
+		} else if !identity.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 		}
 	}
 
@@ -1054,6 +1072,12 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // the token's kid + alg headers to the correct key automatically.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
 func (s *OAuthService) parseToken(tokenStr string, validate bool) (jwt.Token, error) {
+	// Belt-and-braces. WithKeySet trusts the key's own alg, so this isn't
+	// exploitable today — but if the bundle ever ships a key without alg,
+	// the verifier's fallback widens. Cheaper to gate up-front.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, err
+	}
 	return jwt.Parse([]byte(tokenStr),
 		jwt.WithKeySet(s.jwksSvc.KeySet()),
 		jwt.WithValidate(validate),

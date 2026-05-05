@@ -56,12 +56,16 @@ func (r *APIKeyRepository) UpdateLastUsed(ctx context.Context, id, ip string) er
 	return err
 }
 
-// GetByID retrieves an API key by its UUID.
-func (r *APIKeyRepository) GetByID(ctx context.Context, id string) (*domain.APIKey, error) {
+// GetByID retrieves an API key by its UUID, scoped to the given tenant.
+// Cross-tenant lookups return the same not-found error as a missing key so
+// callers cannot probe for key existence in other tenants by ID.
+func (r *APIKeyRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.APIKey, error) {
 	sk := new(domain.APIKey)
 	err := r.db.NewSelect().
 		Model(sk).
 		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("API key not found: %w", err)
@@ -110,10 +114,13 @@ func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, 
 	return keys, count, nil
 }
 
-// Revoke marks an API key as revoked.
-func (r *APIKeyRepository) Revoke(ctx context.Context, id, revokedBy, reason string) error {
+// Revoke marks an API key as revoked, scoped to the given tenant. Returns
+// the number of rows updated so callers can distinguish "key exists in
+// another tenant / already revoked" (0 rows) from "revoked now" (1 row)
+// without disclosing cross-tenant existence to end users.
+func (r *APIKeyRepository) Revoke(ctx context.Context, id, accountID, projectID, revokedBy, reason string) (int64, error) {
 	now := time.Now()
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		Model((*domain.APIKey)(nil)).
 		Set("state = ?", domain.APIKeyStateRevoked).
 		Set("revoked_at = ?", now).
@@ -121,9 +128,18 @@ func (r *APIKeyRepository) Revoke(ctx context.Context, id, revokedBy, reason str
 		Set("revoke_reason = ?", reason).
 		Set("updated_at = ?", now).
 		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
 		Where("state = ?", domain.APIKeyStateActive).
 		Exec(ctx)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // GetActiveByIdentityID retrieves the active API key for an identity.

@@ -10,6 +10,8 @@ import (
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/rs/zerolog/log"
+
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 )
 
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
@@ -46,6 +48,13 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+
+			// Reject alg=none / HS* before any further work — JWT-SVID §3.
+			if err := jwtalg.Validate(tokenStr); err != nil {
+				log.Warn().Err(err).Str("path", r.URL.Path).Msg("Agent JWT rejected: bad alg")
+				writeAgentAuthError(w, http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
 
 			parsed, err := jwt.Parse([]byte(tokenStr),
 				jwt.WithKey(jwa.ES256, cfg.PublicKey),
