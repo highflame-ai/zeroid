@@ -156,10 +156,12 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	if err != nil {
 		return nil, err
 	}
-	// Pre-tx fast-fail. Cheap rejection before we open a connection,
-	// fetch JWKS, run the verifier, etc. The authoritative check happens
-	// inside the tx with the row locked; this one just shaves work off
-	// the obvious-already-done case.
+	// Pre-tx fast-fail. The authoritative check happens inside the tx
+	// with the row locked; this one rejects the obvious already-done
+	// case before we run the verifier, open another DB connection for
+	// the tx, etc. Real saving on retry storms — failing here is one
+	// SELECT, failing inside the tx is BEGIN + SELECT FOR UPDATE +
+	// ROLLBACK plus everything between this point and the lock.
 	if record.IsVerified || record.CredentialID != "" {
 		return nil, fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, record.ID)
 	}
@@ -224,10 +226,17 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	// session. Downstream flows can still token-exchange / jwt-bearer
 	// against this credential; the bootstrap shape just doesn't change.
 	var (
-		accessToken   *domain.AccessToken
-		cred          *domain.IssuedCredential
-		updatedRecord *domain.AttestationRecord
+		accessToken    *domain.AccessToken
+		cred           *domain.IssuedCredential
+		verifiedRecord *domain.AttestationRecord
 	)
+	// Lock-order note: this tx takes the attestation_records row lock
+	// (SELECT FOR UPDATE) FIRST, then implicitly the identities row lock
+	// (via UpdateIdentity's UPDATE). Any future code path that needs to
+	// hold both locks should acquire them in the same order to avoid
+	// deadlocks. Postgres detects deadlocks (40P01) and aborts one tx,
+	// so the worst case is a transient retry, not silent corruption —
+	// but cleaner is to keep the order consistent.
 	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		ctx = postgres.WithTx(ctx, tx)
 
@@ -282,7 +291,7 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		// partial result.
 		accessToken = issued
 		cred = issuedCred
-		updatedRecord = locked
+		verifiedRecord = locked
 		return nil
 	})
 	if txErr != nil {
@@ -290,7 +299,7 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	}
 
 	return &VerifyAttestationResult{
-		Record:      updatedRecord,
+		Record:      verifiedRecord,
 		AccessToken: accessToken,
 		Credential:  cred,
 	}, nil
