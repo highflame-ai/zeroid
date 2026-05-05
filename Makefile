@@ -4,6 +4,11 @@ BINARY := zeroid
 CMD := ./cmd/zeroid
 KEYS_DIR := ./keys
 
+# jwx v4 requires the experimental encoding/json/v2 stack (Go 1.26+).
+# Exporting here so every recipe inherits it; CI does the same via GOEXPERIMENT
+# in pr-check.yml / release.yml.
+export GOEXPERIMENT = jsonv2
+
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 

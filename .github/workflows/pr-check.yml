@@ -17,7 +17,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VER: "1.25.8"
+  GO_VER: "1.26.0"
+  # jwx v4 needs the encoding/json/v2 experiment (Go 1.26+). Workflow-level
+  # so every job step that invokes go {build,test,vet} inherits it.
+  GOEXPERIMENT: "jsonv2"
   PYTHON_VER: "3.12"
   NODE_VER: "22"
   DOCKER_BUILD_RECORD_UPLOAD: false
@@ -90,7 +93,10 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.7.2
+          # v2.7.2 is built with Go 1.25 and can't load Go 1.26 modules
+          # ("the Go language version used to build golangci-lint is lower
+          # than the targeted Go version"). v2.11.4 is built with Go 1.26.
+          version: v2.11.4
           args: --timeout=5m
 
   highflame-sast-check:

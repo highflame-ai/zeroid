@@ -6,7 +6,9 @@ on:
       - published
 
 env:
-  GO_VER: "1.25.8"
+  GO_VER: "1.26.0"
+  # jwx v4 needs the encoding/json/v2 experiment (Go 1.26+).
+  GOEXPERIMENT: "jsonv2"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
   RELEASE_NAME: ${{ github.event.release.name }}
   REGISTRY: ghcr.io

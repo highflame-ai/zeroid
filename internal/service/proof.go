@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
@@ -57,7 +57,7 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 	hdrs := jws.NewHeaders()
 	_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
 	_ = hdrs.Set(jws.TypeKey, "JWT")
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		return "", fmt.Errorf("failed to sign proof token: %w", err)
 	}
@@ -93,7 +93,7 @@ func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedA
 		return nil, fmt.Errorf("proof token validation failed: %w", err)
 	}
 	parsed, err := jwt.Parse([]byte(tokenStr),
-		jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()),
+		jwt.WithKey(jwa.ES256(), s.jwksSvc.PublicKey()),
 		jwt.WithValidate(true),
 		jwt.WithAudience(expectedAudience),
 	)
@@ -101,7 +101,7 @@ func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedA
 		return nil, fmt.Errorf("proof token validation failed: %w", err)
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 
 	// Check if already used (single-use enforcement).
 	pt, err := s.proofRepo.GetByJTI(ctx, jti)

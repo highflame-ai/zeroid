@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -373,7 +373,7 @@ func buildAssertion(t *testing.T, privKey *ecdsa.PrivateKey, issuerWIMSE string)
 		Expiration(now.Add(5 * time.Minute)).
 		Build()
 	require.NoError(t, err)
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256, privKey))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), privKey))
 	require.NoError(t, err)
 	return string(signed)
 }
@@ -497,7 +497,7 @@ func buildAuthCode(t *testing.T, clientID, userID, redirectURI, codeChallenge st
 		Claim("scp", scopes).
 		Build()
 	require.NoError(t, err)
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte(testHMACSecret)))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte(testHMACSecret)))
 	require.NoError(t, err)
 	return string(signed)
 }

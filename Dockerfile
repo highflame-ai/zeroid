@@ -1,8 +1,12 @@
-FROM golang:1.25.8-alpine3.22 AS build-stage
+FROM golang:1.26.0-alpine3.22 AS build-stage
 LABEL maintainer="Highflame Team"
 
 ENV CGO_ENABLED=0
 ENV GOOS=linux
+# jwx v4 needs the encoding/json/v2 experiment (Go 1.26+). Set on the build
+# stage so go mod download / go build both compile against the right stdlib
+# variants.
+ENV GOEXPERIMENT=jsonv2
 
 RUN apk add --no-cache git ca-certificates
 

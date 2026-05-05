@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -86,7 +87,8 @@ func (v *OIDCVerifier) Verify(ctx context.Context, record *domain.AttestationRec
 	if err != nil {
 		return nil, fmt.Errorf("oidc verifier: malformed JWT: %w", err)
 	}
-	issuerClaim := peek.Issuer()
+	// jwx v4: Issuer() returns (string, present); empty/missing → reject.
+	issuerClaim, _ := peek.Issuer()
 	if issuerClaim == "" {
 		return nil, fmt.Errorf("oidc verifier: JWT has no iss claim")
 	}
@@ -126,17 +128,20 @@ func (v *OIDCVerifier) Verify(ctx context.Context, record *domain.AttestationRec
 	// aud claim contains the given string — we OR across configured
 	// audiences by trying each. Empty audiences means no audience check.
 	if len(matchedIssuer.Audiences) > 0 {
-		if !anyAudienceMatches(tok.Audience(), matchedIssuer.Audiences) {
+		// jwx v4: Audience() returns ([]string, present).
+		aud, _ := tok.Audience()
+		if !anyAudienceMatches(aud, matchedIssuer.Audiences) {
 			return nil, fmt.Errorf("oidc verifier: aud claim does not match any configured audience")
 		}
 	}
 
 	// Step 6: required claims — exact string match on each key. These are
 	// the workload-identity binders (e.g. repository, ref for GitHub).
-	allClaims, err := tok.AsMap(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("oidc verifier: unable to read token claims: %w", err)
-	}
+	//
+	// jwx v4 removed Token.AsMap; the v4-idiomatic replacement is
+	// Token.Claims() — an iter.Seq2[string, any] yielding every claim
+	// without per-key error handling.
+	allClaims := maps.Collect(tok.Claims())
 	for wantKey, wantVal := range matchedIssuer.RequiredClaims {
 		got, ok := allClaims[wantKey]
 		if !ok {
@@ -148,15 +153,18 @@ func (v *OIDCVerifier) Verify(ctx context.Context, record *domain.AttestationRec
 		}
 	}
 
+	// jwx v4: Expiration / Subject / Issuer all return (value, present).
 	var expiresAt *time.Time
-	if exp := tok.Expiration(); !exp.IsZero() {
+	if exp, ok := tok.Expiration(); ok && !exp.IsZero() {
 		e := exp
 		expiresAt = &e
 	}
+	sub, _ := tok.Subject()
+	iss, _ := tok.Issuer()
 
 	return &Result{
-		Subject:   tok.Subject(),
-		Issuer:    tok.Issuer(),
+		Subject:   sub,
+		Issuer:    iss,
 		ExpiresAt: expiresAt,
 		Claims:    allClaims,
 	}, nil
@@ -233,13 +241,45 @@ func (c *jwksCache) get(ctx context.Context, httpClient *http.Client, issuerURL 
 	if err != nil {
 		return nil, err
 	}
-	keySet, err := jwk.Fetch(ctx, jwksURL, jwk.WithHTTPClient(httpClient))
+	// jwx v4 moved jwk.Fetch / jwk.WithHTTPClient out into a separate
+	// jwx-go/jwkfetch module. Rather than pull in a companion dep just for
+	// a single GET, fetch the JWKS bytes ourselves and let jwk.Parse turn
+	// them into a Set. Bound the body at maxDiscoveryDocBytes for the same
+	// reason we do on the discovery endpoint — defend against an issuer
+	// streaming attacker-chosen volumes into our process.
+	keySet, err := fetchJWKS(ctx, httpClient, jwksURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch JWKS %s: %w", jwksURL, err)
+		return nil, err
 	}
 
 	entry.keys = keySet
 	entry.expiresAt = time.Now().Add(ttl)
+	return keySet, nil
+}
+
+// fetchJWKS performs a bounded HTTP GET against jwksURL and parses the
+// response as a jwk.Set. Replaces the v2 jwk.Fetch helper that v4 removed.
+func fetchJWKS(ctx context.Context, httpClient *http.Client, jwksURL string) (jwk.Set, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build JWKS request: %w", err)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch JWKS %s: %w", jwksURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("JWKS fetch %s returned %d", jwksURL, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryDocBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read JWKS body from %s: %w", jwksURL, err)
+	}
+	keySet, err := jwk.Parse(body)
+	if err != nil {
+		return nil, fmt.Errorf("parse JWKS %s: %w", jwksURL, err)
+	}
 	return keySet, nil
 }
 
