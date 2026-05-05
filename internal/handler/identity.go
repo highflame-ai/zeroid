@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -33,6 +34,12 @@ type CreateIdentityInput struct {
 		Description        string          `json:"description,omitempty" doc:"Human-readable description of the identity"`
 		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		// CoSAI §3.2 capability–risk classification + NIST SP 800-63 IAL.
+		// Empty string is the default ("unclassified"); future default-policy
+		// selection will key off these.
+		CapabilityTier string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
+		RiskTier       string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
+		IAL            string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
 	}
 }
 
@@ -82,6 +89,11 @@ type UpdateIdentityInput struct {
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
+		// CoSAI §3.2 + NIST SP 800-63. Pointer so callers can distinguish
+		// "not set" (omit) from "clear to unclassified" (explicit "").
+		CapabilityTier *string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
+		RiskTier       *string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
+		IAL            *string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
 	}
 }
 
@@ -193,6 +205,9 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		Labels:             input.Body.Labels,
 		CreatedBy:          createdBy,
 		CredentialPolicyID: input.Body.CredentialPolicyID,
+		CapabilityTier:     input.Body.CapabilityTier,
+		RiskTier:           input.Body.RiskTier,
+		IAL:                input.Body.IAL,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -205,6 +220,12 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		}
 		// SPIFFE path-segment validation failures are caller-fixable.
 		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		// Risk/IAL enum validation failures are caller-fixable.
+		if strings.HasPrefix(err.Error(), "invalid capability_tier") ||
+			strings.HasPrefix(err.Error(), "invalid risk_tier") ||
+			strings.HasPrefix(err.Error(), "invalid ial") {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
@@ -302,10 +323,19 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Metadata:           input.Body.Metadata,
 		Status:             status,
 		CredentialPolicyID: input.Body.CredentialPolicyID,
+		CapabilityTier:     input.Body.CapabilityTier,
+		RiskTier:           input.Body.RiskTier,
+		IAL:                input.Body.IAL,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		// Risk/IAL enum validation failures are caller-fixable.
+		if strings.HasPrefix(err.Error(), "invalid capability_tier") ||
+			strings.HasPrefix(err.Error(), "invalid risk_tier") ||
+			strings.HasPrefix(err.Error(), "invalid ial") {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")
 		return nil, huma.Error500InternalServerError("failed to update identity")
