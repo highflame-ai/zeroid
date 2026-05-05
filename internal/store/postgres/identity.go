@@ -153,15 +153,24 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 }
 
 // Delete removes an identity.
+//
+// The pre-DELETE UPDATE stamps modified_by so the AFTER DELETE trigger can
+// read the actor from OLD.modified_by. Its error is propagated rather than
+// swallowed: in Postgres, a failed statement inside a transaction aborts
+// the whole tx, so the subsequent DELETE would fail with a generic
+// "current transaction is aborted" message that loses the original cause.
+// Outside a tx the same propagation just makes a benign-looking failure
+// loud — that's still preferable to silently triggering audit gaps.
 func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
 	db := dbOrTx(ctx, r.db)
-	// Pre-stamp modified_by so the AFTER DELETE trigger can read the actor from OLD.modified_by.
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
-		_, _ = db.NewUpdate().
+		if _, err := db.NewUpdate().
 			TableExpr("identities").
 			Set("modified_by = ?", callerID).
 			Where("id = ? AND account_id = ? AND project_id = ?", id, accountID, projectID).
-			Exec(ctx)
+			Exec(ctx); err != nil {
+			return fmt.Errorf("failed to stamp modified_by before delete: %w", err)
+		}
 	}
 	_, err := db.NewDelete().
 		TableExpr("identities").
