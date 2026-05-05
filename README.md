@@ -343,7 +343,7 @@ import { ZeroIDClient } from "@highflame/sdk";
 import { SignJWT, generateKeyPair, exportJWK, importJWK } from "jose";
 import { randomUUID, createPublicKey } from "node:crypto";
 
-const ZEROID_ISSUER = "http://localhost:8899";
+const ZEROID_ISSUER = "http://localhost:8899"; // set to your ZeroID base URL
 
 // ── One-time helpers ────────────────────────────────────────────────────
 async function generateEcKeypair(): Promise<{ privateJwk: object; publicPem: string }> {
@@ -379,7 +379,7 @@ const subAgent = await client.agents.register({
   external_id: "data-fetcher",
   sub_type: "tool_agent",
   trust_level: "first_party",
-  public_key_pem: subAgentPublicKey,
+  public_key_pem: subAgentPublicKey, // required for token_exchange
 });
 
 const actorToken = await buildJwtAssertion(subAgentPrivateKey, subAgent.identity.wimse_uri);
@@ -618,7 +618,9 @@ client.agents.deactivate(monitor.identity.id)
 ```python
 # Alice authenticates via authorization_code + PKCE
 # Her user token is exchanged so the assistant can act on her behalf
-# `build_jwt_assertion` is defined in §2 of the 5-Minute Tutorial above.
+# `build_jwt_assertion` and `generate_ec_keypair` are defined in §2 above.
+# The public PEM was registered when the identity was created (pass public_key_pem=...).
+assistant_private_key, _ = generate_ec_keypair()
 assistant_token = client.tokens.issue_token_exchange(
     subject_token=alice_user_token,      # alice's authorization_code-issued token
     actor_token=build_jwt_assertion(assistant_private_key, assistant.identity.wimse_uri),
