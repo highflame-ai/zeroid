@@ -70,7 +70,7 @@ changelog:
       regexp: '^(build\(deps\)|\[Snyk\]|Bump )'
       order: 2
     - title: DevOps
-      regexp: '^devops:'
+      regexp: '^devops(\(.*\))?:'
       order: 3
     - title: Refactoring
       regexp: '^refactor(\(.*\))?:'
