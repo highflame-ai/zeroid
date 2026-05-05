@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -326,6 +327,71 @@ func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, second.StatusCode,
 		"second verify on an already-verified record must be 409 Conflict")
 	assertErrorBodyContains(t, second, "already verified")
+}
+
+// TestAttestationConcurrentVerifyMintsExactlyOneCredential pins the
+// row-lock added in the #98 transaction wrap. Without SELECT ... FOR
+// UPDATE on the attestation record, two simultaneous /verify calls
+// could each pass the IsVerified guard, each enter the tx, each
+// IssueCredential, and leave the DB with two credentials minted from
+// one proof. The lock serializes the second verify behind the first;
+// when it acquires the lock the record already has CredentialID set and
+// it bails out via ErrAttestationAlreadyVerified.
+func TestAttestationConcurrentVerifyMintsExactlyOneCredential(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	reg := registerAgent(t, uid("attest-race"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	token := iss.sign(map[string]any{"sub": "ci-job-race"})
+	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
+
+	const N = 8
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		statusCodes []int
+	)
+	wg.Add(N)
+	for range N {
+		go func() {
+			defer wg.Done()
+			resp := verifyAttestation(t, id)
+			defer func() { _ = resp.Body.Close() }()
+			mu.Lock()
+			statusCodes = append(statusCodes, resp.StatusCode)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	// Exactly one verify wins, the rest see ErrAttestationAlreadyVerified
+	// once they acquire the row lock and re-check the guard.
+	var ok, conflict int
+	for _, c := range statusCodes {
+		switch c {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Errorf("unexpected status %d (want 200 or 409)", c)
+		}
+	}
+	assert.Equal(t, 1, ok, "exactly one concurrent verify must succeed")
+	assert.Equal(t, N-1, conflict, "all other concurrent verifies must be rejected as already-verified")
+
+	// Hard guarantee: the credential count for the identity is exactly 1.
+	count, err := testDB.NewSelect().
+		Table("issued_credentials").
+		Where("identity_id = ?", reg.AgentID).
+		Count(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, count,
+		"exactly one credential must be persisted for the attested identity — the row lock must serialize concurrent verifies")
 }
 
 // TestAttestationVerifyGuardCatchesPartialFailureRetry pins the

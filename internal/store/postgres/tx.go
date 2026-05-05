@@ -25,6 +25,13 @@ type txKey struct{}
 //
 // Repo callers that don't open a transaction get the repo's own *bun.DB
 // handle and behave as before (auto-commit per statement).
+//
+// Nesting: calling WithTx on a context that already carries a tx
+// REPLACES the parent tx for any descendant ctx — there is no automatic
+// savepoint or merge. Postgres doesn't support truly nested transactions
+// anyway, and bun.RunInTx returns the existing tx when called recursively.
+// For most flows the right pattern is "open one tx at the outermost
+// service call, attach it once, do all the work inside" — don't nest.
 func WithTx(ctx context.Context, tx bun.Tx) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }

@@ -138,12 +138,17 @@ var ErrAttestationAlreadyVerified = errors.New("attestation already verified")
 //   - Verifier.Verify returns an error → ErrAttestationRejected.
 //   - Record already verified → ErrAttestationAlreadyVerified (rejects retries).
 //
-// Atomicity: the three writes (issue credential → promote trust →
-// mark record verified) run inside a single bun.RunInTx. Repos that
-// touch DB (CredentialRepository.Create, IdentityRepository.Update,
-// AttestationRepository.Update) read the in-flight tx from ctx via
-// postgres.WithTx so every statement participates. Any failure rolls
-// the lot back, so retries always see a clean slate. The
+// Atomicity + serialization: the three writes (issue credential → promote
+// trust → mark record verified) run inside a single bun.RunInTx, and the
+// transaction starts by re-fetching the attestation record with
+// SELECT ... FOR UPDATE so two concurrent /verify calls on the same record
+// serialize. Without the lock both callers would otherwise pass the
+// pre-tx guard, both enter the closure, and both INSERT a credential —
+// leaving two credentials minted from one proof. Repos that touch the DB
+// (CredentialRepository.Create, IdentityRepository.Update,
+// AttestationRepository.Update / .GetByIDForUpdate) read the in-flight tx
+// from ctx via postgres.WithTx so every statement participates. Any
+// failure rolls the lot back, so retries always see a clean slate. The
 // CredentialID-based guard at the top stays as defense-in-depth in case
 // a future code path manipulates the record outside this flow.
 func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountID, projectID string) (*VerifyAttestationResult, error) {
@@ -151,14 +156,10 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	if err != nil {
 		return nil, err
 	}
-	// Idempotency guard. The transaction wrap below already makes partial
-	// state unreachable through this flow — if any of the three writes
-	// fails, the tx rolls back and IsVerified / CredentialID stay zero.
-	// This guard is therefore defense-in-depth: it catches direct DB
-	// manipulation, a future code path that bypasses VerifyAttestation but
-	// mutates the record, or the rare commit-then-error-return failure
-	// mode where the tx committed but RunInTx still surfaces an error.
-	// Cheap belt next to the suspenders.
+	// Pre-tx fast-fail. Cheap rejection before we open a connection,
+	// fetch JWKS, run the verifier, etc. The authoritative check happens
+	// inside the tx with the row locked; this one just shaves work off
+	// the obvious-already-done case.
 	if record.IsVerified || record.CredentialID != "" {
 		return nil, fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, record.ID)
 	}
@@ -205,19 +206,15 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		}
 	}
 
-	// Load the identity without promoting yet — IssueCredential needs a
-	// valid, non-nil, usable identity and re-fetching guarantees we see
-	// the current state (another request might have deactivated it).
-	identity, err := s.identitySvc.GetIdentity(ctx, record.IdentityID, accountID, projectID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load identity for verified attestation: %w", err)
-	}
-
-	// Run the three writes atomically. RunInTx commits on a nil return,
-	// rolls back on any non-nil error or panic. The repo methods called
-	// below pick the tx up from ctx via postgres.WithTx; their bun.IDB
-	// resolver uses the tx instead of the auto-commit DB handle, so every
-	// statement lands inside the same transaction.
+	// All side-effects below happen inside RunInTx. Local closure-scoped
+	// vars hold the result; the outer return values are assigned exactly
+	// once on commit, so a rollback can't leave a partially-mutated
+	// record visible to the caller.
+	//
+	// Isolation: nil TxOptions means Postgres default (READ COMMITTED).
+	// That's sufficient because we serialize the only contended row with
+	// SELECT ... FOR UPDATE; we don't need REPEATABLE READ semantics
+	// across the whole transaction.
 	//
 	// GrantType is fixed to client_credentials regardless of how the
 	// identity will subsequently authenticate. Verified attestation is a
@@ -227,14 +224,34 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	// session. Downstream flows can still token-exchange / jwt-bearer
 	// against this credential; the bootstrap shape just doesn't change.
 	var (
-		accessToken *domain.AccessToken
-		cred        *domain.IssuedCredential
+		accessToken   *domain.AccessToken
+		cred          *domain.IssuedCredential
+		updatedRecord *domain.AttestationRecord
 	)
 	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		ctx = postgres.WithTx(ctx, tx)
 
-		var err error
-		accessToken, cred, err = s.credentialSvc.IssueCredential(ctx, IssueRequest{
+		// Re-fetch with row lock. Concurrent verifies on the same record
+		// queue here; the second one re-reads the row after the first
+		// commits, sees CredentialID set, and bails out below.
+		locked, err := s.repo.GetByIDForUpdate(ctx, id, accountID, projectID)
+		if err != nil {
+			return fmt.Errorf("failed to lock attestation record: %w", err)
+		}
+		if locked.IsVerified || locked.CredentialID != "" {
+			return fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, locked.ID)
+		}
+
+		// Re-load the identity inside the tx so we don't act on a stale
+		// snapshot from before someone deactivated it. With READ COMMITTED
+		// this read sees committed state as of the statement, so a
+		// concurrent UpdateIdentity that already finished will be visible.
+		identity, err := s.identitySvc.GetIdentity(ctx, locked.IdentityID, accountID, projectID)
+		if err != nil {
+			return fmt.Errorf("failed to load identity for verified attestation: %w", err)
+		}
+
+		issued, issuedCred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 			Identity:  identity,
 			GrantType: domain.GrantTypeClientCredentials,
 		})
@@ -242,23 +259,30 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 			return fmt.Errorf("failed to issue post-attestation credential: %w", err)
 		}
 
-		promotedTrust := trustLevelForAttestation(record.Level)
-		if _, err := s.identitySvc.UpdateIdentity(ctx, record.IdentityID, accountID, projectID, UpdateIdentityRequest{
+		promotedTrust := trustLevelForAttestation(locked.Level)
+		if _, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
 			TrustLevel: promotedTrust,
 		}); err != nil {
 			return fmt.Errorf("failed to promote identity trust level: %w", err)
 		}
 
 		now := time.Now()
-		record.IsVerified = true
-		record.VerifiedAt = &now
+		locked.IsVerified = true
+		locked.VerifiedAt = &now
 		if result.ExpiresAt != nil {
-			record.ExpiresAt = result.ExpiresAt
+			locked.ExpiresAt = result.ExpiresAt
 		}
-		record.CredentialID = cred.ID
-		if err := s.repo.Update(ctx, record); err != nil {
+		locked.CredentialID = issuedCred.ID
+		if err := s.repo.Update(ctx, locked); err != nil {
 			return fmt.Errorf("failed to update attestation record: %w", err)
 		}
+
+		// Promote local-success values to the outer scope. Last step in
+		// the closure so a return-error path above never assigns a
+		// partial result.
+		accessToken = issued
+		cred = issuedCred
+		updatedRecord = locked
 		return nil
 	})
 	if txErr != nil {
@@ -266,7 +290,7 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	}
 
 	return &VerifyAttestationResult{
-		Record:      record,
+		Record:      updatedRecord,
 		AccessToken: accessToken,
 		Credential:  cred,
 	}, nil

@@ -44,6 +44,33 @@ func (r *AttestationRepository) GetByID(ctx context.Context, id, accountID, proj
 	return record, nil
 }
 
+// GetByIDForUpdate retrieves an attestation record by its UUID and acquires
+// a row-level write lock (Postgres SELECT ... FOR UPDATE). The lock is held
+// until the surrounding transaction commits or rolls back, so this method
+// MUST be called inside a transaction (postgres.WithTx) — outside one,
+// FOR UPDATE on Postgres is a no-op (no tx, no lock to release into) and
+// the call still succeeds, which would mask the missing serialization.
+//
+// Use this in flows where the same attestation must serialize against
+// concurrent writers — most notably AttestationService.VerifyAttestation,
+// where two simultaneous /verify calls on the same record could otherwise
+// each pass the IsVerified guard, each issue a credential, and leave the
+// DB with two credentials from one proof.
+func (r *AttestationRepository) GetByIDForUpdate(ctx context.Context, id, accountID, projectID string) (*domain.AttestationRecord, error) {
+	record := &domain.AttestationRecord{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(record).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		For("UPDATE").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attestation record for update: %w", err)
+	}
+	return record, nil
+}
+
 // GetHighestVerifiedLevel returns the highest verified attestation level for an identity.
 // Returns an empty string if no verified attestation exists.
 func (r *AttestationRepository) GetHighestVerifiedLevel(ctx context.Context, identityID string) (string, error) {
