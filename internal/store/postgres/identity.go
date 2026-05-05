@@ -87,7 +87,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	if len(identityTypes) == 1 {
 		q = q.Where("identity_type = ?", identityTypes[0])
 	} else if len(identityTypes) > 1 {
-		q = q.Where("identity_type IN (?)", bun.In(identityTypes))
+		q = q.Where("identity_type IN (?)", bun.List(identityTypes))
 	}
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)
