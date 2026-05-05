@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v2/jwt"
@@ -57,7 +58,7 @@ type Claims struct {
 	// Custom holds any additional claims not mapped to typed fields.
 	// Consuming services can use this for deployment-specific claims
 	// (e.g., application_id, gateway_id, product, user_email).
-	Custom map[string]interface{} `json:"-"`
+	Custom map[string]any `json:"-"`
 }
 
 // ActorClaims represents the "act" claim in a delegated token (RFC 8693).
@@ -84,7 +85,7 @@ func (c *Claims) GetCustomString(key string) string {
 }
 
 // GetCustom returns a custom claim value as interface{}.
-func (c *Claims) GetCustom(key string) (interface{}, bool) {
+func (c *Claims) GetCustom(key string) (any, bool) {
 	if c.Custom == nil {
 		return nil, false
 	}
@@ -94,12 +95,7 @@ func (c *Claims) GetCustom(key string) (interface{}, bool) {
 
 // HasScope returns true if the token's scopes include the given scope.
 func (c *Claims) HasScope(scope string) bool {
-	for _, s := range c.Scopes {
-		if s == scope {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.Scopes, scope)
 }
 
 // RequireScope returns ErrInsufficientScope if the token does not have the
@@ -230,7 +226,7 @@ func extractClaims(token jwt.Token) *Claims {
 		switch s := v.(type) {
 		case []string:
 			return s
-		case []interface{}:
+		case []any:
 			result := make([]string, 0, len(s))
 			for _, item := range s {
 				if str, ok := item.(string); ok {
@@ -289,7 +285,7 @@ func extractClaims(token jwt.Token) *Claims {
 	}
 
 	// Collect all unrecognized claims into Custom for deployment-specific use.
-	c.Custom = make(map[string]interface{})
+	c.Custom = make(map[string]any)
 	for iter := token.Iterate(context.Background()); iter.Next(context.Background()); {
 		pair := iter.Pair()
 		key, ok := pair.Key.(string)
@@ -307,9 +303,9 @@ func extractClaims(token jwt.Token) *Claims {
 	return c
 }
 
-func parseActorClaims(raw interface{}) *ActorClaims {
+func parseActorClaims(raw any) *ActorClaims {
 	switch v := raw.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		act := &ActorClaims{}
 		if sub, ok := v["sub"].(string); ok {
 			act.Subject = sub

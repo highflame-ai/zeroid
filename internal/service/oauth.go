@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -197,13 +198,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 
 	// Ensure client_credentials grant is permitted.
-	allowed := false
-	for _, gt := range client.GrantTypes {
-		if gt == "client_credentials" {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(client.GrantTypes, "client_credentials")
 	if !allowed {
 		return nil, oauthBadRequest("unauthorized_client", "client not authorized for client_credentials grant")
 	}
@@ -750,13 +745,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	// Verify the client is authorised to use the authorization_code grant.
-	grantAllowed := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeAuthorizationCode) {
-			grantAllowed = true
-			break
-		}
-	}
+	grantAllowed := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode))
 	if !grantAllowed {
 		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
 	}
@@ -797,13 +786,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	// Determine access token TTL.
 	// Priority: per-client config > grant-type-based default > server default.
-	hasRefreshGrant := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeRefreshToken) {
-			hasRefreshGrant = true
-			break
-		}
-	}
+	hasRefreshGrant := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken))
 
 	ttl := oauthClient.AccessTokenTTL
 	if ttl <= 0 {

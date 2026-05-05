@@ -238,10 +238,7 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	offset := input.Offset
-	if offset < 0 {
-		offset = 0
-	}
+	offset := max(input.Offset, 0)
 
 	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, limit, offset)
 	if err != nil {

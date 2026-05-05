@@ -410,7 +410,7 @@ func TestListAgentsPagination(t *testing.T) {
 	paginationLabel := uid("page")
 
 	// Register 5 agents with a unique label.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		post(t, adminPath("/agents/register"), map[string]any{
 			"external_id":   uid(fmt.Sprintf("page-%d", i)),
 			"identity_type": "agent",

@@ -69,7 +69,7 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 
 	// Extract scopes array.
 	if scopesRaw, ok := token.Get("scp"); ok {
-		if scopes, ok := scopesRaw.([]interface{}); ok {
+		if scopes, ok := scopesRaw.([]any); ok {
 			for _, s := range scopes {
 				if str, ok := s.(string); ok {
 					claims.Scopes = append(claims.Scopes, str)

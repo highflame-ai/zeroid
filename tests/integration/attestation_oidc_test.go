@@ -388,14 +388,14 @@ func TestAttestationPolicyUpsertIsConcurrencySafe(t *testing.T) {
 			"issuers": []map[string]any{{"url": iss.URL}},
 		},
 	}
-	for i := 0; i < parallelism; i++ {
+	for range parallelism {
 		go func() {
 			resp := doRequest(t, http.MethodPut, adminPath("/attestation-policies"), body, tenant)
 			_ = resp.Body.Close()
 			results <- resp.StatusCode
 		}()
 	}
-	for i := 0; i < parallelism; i++ {
+	for range parallelism {
 		status := <-results
 		assert.Equal(t, http.StatusOK, status,
 			"every concurrent upsert must succeed; atomic INSERT ... ON CONFLICT has no race window")

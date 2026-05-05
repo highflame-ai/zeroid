@@ -75,7 +75,7 @@ func makeHeaders(kid string) jws.Headers {
 	return h
 }
 
-func (ks *testKeySet) signES256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signES256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
@@ -88,7 +88,7 @@ func (ks *testKeySet) signES256(t *testing.T, claims map[string]interface{}) str
 	return string(signed)
 }
 
-func (ks *testKeySet) signRS256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signRS256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
@@ -101,9 +101,9 @@ func (ks *testKeySet) signRS256(t *testing.T, claims map[string]interface{}) str
 	return string(signed)
 }
 
-func baseClaims(issuer string) map[string]interface{} {
+func baseClaims(issuer string) map[string]any {
 	now := time.Now()
-	return map[string]interface{}{
+	return map[string]any{
 		"iss":        issuer,
 		"sub":        "user-123",
 		"aud":        []string{"https://shield.example.com"},
@@ -116,7 +116,7 @@ func baseClaims(issuer string) map[string]interface{} {
 	}
 }
 
-func agentClaims(issuer string) map[string]interface{} {
+func agentClaims(issuer string) map[string]any {
 	c := baseClaims(issuer)
 	c["external_id"] = "agent-smith"
 	c["identity_type"] = "agent"
@@ -127,7 +127,7 @@ func agentClaims(issuer string) map[string]interface{} {
 	c["publisher"] = "acme-corp"
 	c["capabilities"] = []string{"read_file", "call_tool"}
 	c["delegation_depth"] = 1
-	c["act"] = map[string]interface{}{
+	c["act"] = map[string]any{
 		"sub": "orchestrator-1",
 		"iss": issuer,
 	}
