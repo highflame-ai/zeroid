@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -324,6 +325,53 @@ func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
 	defer func() { _ = second.Body.Close() }()
 	assert.Equal(t, http.StatusConflict, second.StatusCode,
 		"second verify on an already-verified record must be 409 Conflict")
+	assertErrorBodyContains(t, second, "already verified")
+}
+
+// TestAttestationVerifyGuardCatchesPartialFailureRetry pins the second
+// half of the ErrAttestationAlreadyVerified guard introduced by #98:
+// when CredentialID is set but IsVerified is false (the state left
+// behind by a failed UpdateIdentity / repo.Update after a successful
+// IssueCredential), a retry must be rejected so a second credential
+// is not minted from the same proof.
+//
+// The partial-failure state isn't reachable through the normal HTTP flow
+// — it only appears if Step 2 or Step 3 of VerifyAttestation crashes.
+// We simulate it by running a clean verify, then surgically flipping
+// is_verified back to false in the DB (leaving credential_id intact).
+// Without the CredentialID-guard, the retry returns 200 and issues a
+// second credential.
+func TestAttestationVerifyGuardCatchesPartialFailureRetry(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	reg := registerAgent(t, uid("attest-partial"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	token := iss.sign(map[string]any{"sub": "ci-job-partial"})
+	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
+
+	first := verifyAttestation(t, id)
+	require.Equal(t, http.StatusOK, first.StatusCode, "first verify expected 200")
+	_ = first.Body.Close()
+
+	// Simulate Step 2 / Step 3 failure: rewind IsVerified to false but
+	// leave CredentialID intact. This is the exact state the guard is
+	// meant to catch — a retry would mint a second credential without it.
+	_, err := testDB.NewUpdate().
+		Table("attestation_records").
+		Set("is_verified = false").
+		Set("verified_at = NULL").
+		Where("id = ?", id).
+		Exec(context.Background())
+	require.NoError(t, err, "failed to plant partial-failure state")
+
+	second := verifyAttestation(t, id)
+	defer func() { _ = second.Body.Close() }()
+	assert.Equal(t, http.StatusConflict, second.StatusCode,
+		"retry on a record with credential_id set must be rejected even when is_verified=false")
 	assertErrorBodyContains(t, second, "already verified")
 }
 
