@@ -131,6 +131,11 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 		return nil, ErrNoKeySet
 	}
 
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := validateAlg(tokenString); err != nil {
+		return nil, err
+	}
+
 	// Parse and validate in one step. WithKeySet uses kid+alg to select the key.
 	parseOpts := []jwt.ParseOption{
 		jwt.WithKeySet(keySet),

@@ -92,7 +92,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **WIMSE/SPIFFE URIs** — Stable, globally unique identity URIs: `spiffe://{domain}/{account}/{project}/{type}/{id}` for every agent. Tokens carry the WIMSE URI as `sub`, so every downstream system receives a meaningful, verifiable identity—not just a client ID.
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
 - **Continuous Access Evaluation (CAE)** — Revoke credentials in real time when risk signals fire via the OpenID Shared Signals Framework (SSF). Revoke the orchestrator's credential and the entire downstream chain is invalidated immediately—no waiting for token expiry.
-- **Attestation Framework** — Software, platform, and hardware attestation to bootstrap or elevate trust levels before credentials are issued.
+- **Attestation Framework** — Pluggable verifiers behind a fail-closed contract: software, platform, and hardware attestation elevate trust levels before credentials are issued. Ships with an OIDC verifier (GitHub Actions, GCP Workload Identity, Kubernetes projected SA tokens, etc.) plus per-tenant `AttestationPolicy` for issuer allowlisting and claim binding. Full reference: [`docs/attestation.md`](docs/attestation.md).
 - **WIMSE Proof Tokens** — Single-use, nonce-bound tokens for service-to-service verification and replay protection.
 
 ---
@@ -632,7 +632,12 @@ graph TD
 | GET | `/api/v1/credential-policies/{id}` | Get credential policy |
 | PATCH | `/api/v1/credential-policies/{id}` | Update credential policy |
 | POST | `/api/v1/credentials/{id}/revoke` | Revoke credential |
-| POST | `/api/v1/attestations` | Submit attestation |
+| POST | `/api/v1/attestation/submit` | Submit attestation proof |
+| POST | `/api/v1/attestation/verify` | Verify proof + promote trust + issue credential |
+| GET | `/api/v1/attestation/{id}` | Get attestation record |
+| PUT | `/api/v1/attestation-policies` | Upsert per-tenant attestation policy |
+| GET | `/api/v1/attestation-policies` | List attestation policies |
+| DELETE | `/api/v1/attestation-policies/{id}` | Delete attestation policy |
 | POST | `/api/v1/signals/ingest` | Ingest CAE signal |
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
