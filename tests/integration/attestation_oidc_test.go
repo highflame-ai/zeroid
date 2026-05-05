@@ -337,6 +337,13 @@ func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
 // one proof. The lock serializes the second verify behind the first;
 // when it acquires the lock the record already has CredentialID set and
 // it bails out via ErrAttestationAlreadyVerified.
+//
+// The goroutines below intentionally use raw http.NewRequest /
+// http.DefaultClient.Do rather than the verifyAttestation helper. That
+// helper's call chain ends in require.NoError, which calls t.FailNow —
+// per the testing package contract FailNow MUST be called from the
+// goroutine running the test, not workers. Doing the HTTP call inline
+// keeps every assertion on the main goroutine after wg.Wait().
 func TestAttestationConcurrentVerifyMintsExactlyOneCredential(t *testing.T) {
 	iss := newOIDCIssuer(t)
 	defer iss.close()
@@ -349,36 +356,54 @@ func TestAttestationConcurrentVerifyMintsExactlyOneCredential(t *testing.T) {
 	token := iss.sign(map[string]any{"sub": "ci-job-race"})
 	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
 
+	body, err := json.Marshal(map[string]any{"attestation_id": id})
+	require.NoError(t, err)
+	url := testServer.URL + adminPath("/attestation/verify")
+	headers := adminHeaders()
+
 	const N = 8
-	var (
-		wg          sync.WaitGroup
-		mu          sync.Mutex
-		statusCodes []int
-	)
+	results := make([]struct {
+		status int
+		err    error
+	}, N)
+
+	var wg sync.WaitGroup
 	wg.Add(N)
-	for range N {
-		go func() {
+	for i := range N {
+		go func(slot int) {
 			defer wg.Done()
-			resp := verifyAttestation(t, id)
-			defer func() { _ = resp.Body.Close() }()
-			mu.Lock()
-			statusCodes = append(statusCodes, resp.StatusCode)
-			mu.Unlock()
-		}()
+			req, reqErr := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+			if reqErr != nil {
+				results[slot].err = reqErr
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			resp, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				results[slot].err = doErr
+				return
+			}
+			results[slot].status = resp.StatusCode
+			_ = resp.Body.Close()
+		}(i)
 	}
 	wg.Wait()
 
 	// Exactly one verify wins, the rest see ErrAttestationAlreadyVerified
 	// once they acquire the row lock and re-check the guard.
 	var ok, conflict int
-	for _, c := range statusCodes {
-		switch c {
+	for slot, r := range results {
+		require.NoErrorf(t, r.err, "goroutine %d failed transport-level: %v", slot, r.err)
+		switch r.status {
 		case http.StatusOK:
 			ok++
 		case http.StatusConflict:
 			conflict++
 		default:
-			t.Errorf("unexpected status %d (want 200 or 409)", c)
+			t.Errorf("goroutine %d: unexpected status %d (want 200 or 409)", slot, r.status)
 		}
 	}
 	assert.Equal(t, 1, ok, "exactly one concurrent verify must succeed")

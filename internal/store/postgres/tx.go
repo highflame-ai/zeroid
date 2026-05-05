@@ -46,3 +46,12 @@ func dbOrTx(ctx context.Context, fallback bun.IDB) bun.IDB {
 	}
 	return fallback
 }
+
+// hasTx reports whether ctx carries an in-flight transaction attached
+// with WithTx. Repo methods that ONLY make sense inside a transaction
+// (e.g., SELECT ... FOR UPDATE callers) use this to fail fast on misuse
+// instead of silently downgrading to a per-statement implicit tx.
+func hasTx(ctx context.Context) bool {
+	_, ok := ctx.Value(txKey{}).(bun.Tx)
+	return ok
+}

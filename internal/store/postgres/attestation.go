@@ -47,9 +47,14 @@ func (r *AttestationRepository) GetByID(ctx context.Context, id, accountID, proj
 // GetByIDForUpdate retrieves an attestation record by its UUID and acquires
 // a row-level write lock (Postgres SELECT ... FOR UPDATE). The lock is held
 // until the surrounding transaction commits or rolls back, so this method
-// MUST be called inside a transaction (postgres.WithTx) — outside one,
-// FOR UPDATE on Postgres is a no-op (no tx, no lock to release into) and
-// the call still succeeds, which would mask the missing serialization.
+// MUST be called inside a transaction (postgres.WithTx).
+//
+// Outside an explicit transaction Postgres still executes the SELECT
+// successfully, but the implicit per-statement transaction commits as
+// soon as the statement returns and the lock is released — concurrent
+// callers see no useful serialization. We fail fast here rather than
+// downgrade silently: misuse should surface as a loud error, not a
+// race that only manifests under load.
 //
 // Use this in flows where the same attestation must serialize against
 // concurrent writers — most notably AttestationService.VerifyAttestation,
@@ -57,6 +62,9 @@ func (r *AttestationRepository) GetByID(ctx context.Context, id, accountID, proj
 // each pass the IsVerified guard, each issue a credential, and leave the
 // DB with two credentials from one proof.
 func (r *AttestationRepository) GetByIDForUpdate(ctx context.Context, id, accountID, projectID string) (*domain.AttestationRecord, error) {
+	if !hasTx(ctx) {
+		return nil, fmt.Errorf("GetByIDForUpdate must be called inside a postgres.WithTx context — the row lock is meaningless without one")
+	}
 	record := &domain.AttestationRecord{}
 	db := dbOrTx(ctx, r.db)
 	err := db.NewSelect().Model(record).
