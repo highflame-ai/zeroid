@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -218,14 +217,9 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
-		// SPIFFE path-segment validation failures are caller-fixable.
+		// SPIFFE path-segment + risk/IAL enum validation failures are
+		// caller-fixable. Service layer wraps both with ErrInvalidIdentityField.
 		if errors.Is(err, service.ErrInvalidIdentityField) {
-			return nil, huma.Error400BadRequest(err.Error())
-		}
-		// Risk/IAL enum validation failures are caller-fixable.
-		if strings.HasPrefix(err.Error(), "invalid capability_tier") ||
-			strings.HasPrefix(err.Error(), "invalid risk_tier") ||
-			strings.HasPrefix(err.Error(), "invalid ial") {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
@@ -331,10 +325,9 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
-		// Risk/IAL enum validation failures are caller-fixable.
-		if strings.HasPrefix(err.Error(), "invalid capability_tier") ||
-			strings.HasPrefix(err.Error(), "invalid risk_tier") ||
-			strings.HasPrefix(err.Error(), "invalid ial") {
+		// Field validation failures (SPIFFE path segments + risk/IAL enums)
+		// are caller-fixable. Service layer wraps them with ErrInvalidIdentityField.
+		if errors.Is(err, service.ErrInvalidIdentityField) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")

@@ -167,13 +167,13 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		return nil, err
 	}
 	if !domain.ValidCapabilityTier(req.CapabilityTier) {
-		return nil, fmt.Errorf("invalid capability_tier: %q (allowed: low, high, or empty)", req.CapabilityTier)
+		return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.CapabilityTier)
 	}
 	if !domain.ValidRiskTier(req.RiskTier) {
-		return nil, fmt.Errorf("invalid risk_tier: %q (allowed: low, high, or empty)", req.RiskTier)
+		return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.RiskTier)
 	}
 	if !domain.ValidIAL(req.IAL) {
-		return nil, fmt.Errorf("invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", req.IAL)
+		return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, req.IAL)
 	}
 
 	// Resolve the identity policy: a caller-supplied policy ID must be
@@ -354,19 +354,19 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	}
 	if req.CapabilityTier != nil {
 		if !domain.ValidCapabilityTier(*req.CapabilityTier) {
-			return nil, fmt.Errorf("invalid capability_tier: %q (allowed: low, high, or empty)", *req.CapabilityTier)
+			return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.CapabilityTier)
 		}
 		identity.CapabilityTier = *req.CapabilityTier
 	}
 	if req.RiskTier != nil {
 		if !domain.ValidRiskTier(*req.RiskTier) {
-			return nil, fmt.Errorf("invalid risk_tier: %q (allowed: low, high, or empty)", *req.RiskTier)
+			return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.RiskTier)
 		}
 		identity.RiskTier = *req.RiskTier
 	}
 	if req.IAL != nil {
 		if !domain.ValidIAL(*req.IAL) {
-			return nil, fmt.Errorf("invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", *req.IAL)
+			return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, *req.IAL)
 		}
 		identity.IAL = *req.IAL
 	}
