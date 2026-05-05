@@ -7,12 +7,12 @@
 package authjwt
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 )
 
 // Claims represents the verified claims extracted from a ZeroID-issued JWT.
@@ -57,7 +57,7 @@ type Claims struct {
 	// Custom holds any additional claims not mapped to typed fields.
 	// Consuming services can use this for deployment-specific claims
 	// (e.g., application_id, gateway_id, product, user_email).
-	Custom map[string]interface{} `json:"-"`
+	Custom map[string]any `json:"-"`
 }
 
 // ActorClaims represents the "act" claim in a delegated token (RFC 8693).
@@ -84,7 +84,7 @@ func (c *Claims) GetCustomString(key string) string {
 }
 
 // GetCustom returns a custom claim value as interface{}.
-func (c *Claims) GetCustom(key string) (interface{}, bool) {
+func (c *Claims) GetCustom(key string) (any, bool) {
 	if c.Custom == nil {
 		return nil, false
 	}
@@ -94,12 +94,7 @@ func (c *Claims) GetCustom(key string) (interface{}, bool) {
 
 // HasScope returns true if the token's scopes include the given scope.
 func (c *Claims) HasScope(scope string) bool {
-	for _, s := range c.Scopes {
-		if s == scope {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.Scopes, scope)
 }
 
 // RequireScope returns ErrInsufficientScope if the token does not have the
@@ -183,54 +178,54 @@ type AgentIdentity struct {
 
 // extractClaims builds Claims from a verified jwt.Token.
 func extractClaims(token jwt.Token) *Claims {
+	// jwx v4: every standard accessor returns (value, present). Treat absent
+	// as zero-value — the caller already validated the token, so this is a
+	// projection step, not a re-validation.
+	iss, _ := token.Issuer()
+	sub, _ := token.Subject()
+	aud, _ := token.Audience()
+	iat, _ := token.IssuedAt()
+	exp, _ := token.Expiration()
+	jti, _ := token.JwtID()
 	c := &Claims{
-		Issuer:    token.Issuer(),
-		Subject:   token.Subject(),
-		Audience:  token.Audience(),
-		IssuedAt:  token.IssuedAt(),
-		ExpiresAt: token.Expiration(),
-		JWTID:     token.JwtID(),
+		Issuer:    iss,
+		Subject:   sub,
+		Audience:  aud,
+		IssuedAt:  iat,
+		ExpiresAt: exp,
+		JWTID:     jti,
 	}
 
-	// Helper to extract string claims
+	// jwx v4: jwt.Get[T] is the typed accessor. Distinct getters keep call
+	// sites single-line below.
 	getString := func(key string) string {
-		v, ok := token.Get(key)
-		if !ok {
+		v, err := jwt.Get[string](token, key)
+		if err != nil {
 			return ""
 		}
-		s, ok := v.(string)
-		if !ok {
-			return ""
-		}
-		return s
+		return v
 	}
 
 	getInt := func(key string) int {
-		v, ok := token.Get(key)
-		if !ok {
-			return 0
-		}
-		switch n := v.(type) {
-		case float64:
+		// JSON numbers decode as float64; some issuers may produce int/int64
+		// directly. Try the most likely shape first, then fall back.
+		if n, err := jwt.Get[float64](token, key); err == nil {
 			return int(n)
-		case int:
+		}
+		if n, err := jwt.Get[int](token, key); err == nil {
 			return n
-		case int64:
-			return int(n)
-		default:
-			return 0
 		}
+		if n, err := jwt.Get[int64](token, key); err == nil {
+			return int(n)
+		}
+		return 0
 	}
 
 	getStringSlice := func(key string) []string {
-		v, ok := token.Get(key)
-		if !ok {
-			return nil
-		}
-		switch s := v.(type) {
-		case []string:
+		if s, err := jwt.Get[[]string](token, key); err == nil {
 			return s
-		case []interface{}:
+		}
+		if s, err := jwt.Get[[]any](token, key); err == nil {
 			result := make([]string, 0, len(s))
 			for _, item := range s {
 				if str, ok := item.(string); ok {
@@ -241,9 +236,8 @@ func extractClaims(token jwt.Token) *Claims {
 				return nil
 			}
 			return result
-		default:
-			return nil
 		}
+		return nil
 	}
 
 	// Known ZeroID claims — mapped to typed fields.
@@ -283,22 +277,23 @@ func extractClaims(token jwt.Token) *Claims {
 	c.Scopes = getStringSlice("scopes")
 	c.DelegationDepth = getInt("delegation_depth")
 
-	// RFC 8693 delegation
-	if actRaw, ok := token.Get("act"); ok {
+	// RFC 8693 delegation. The act claim is a nested object; pull it as
+	// interface{} so parseActorClaims can handle any concrete shape jwx
+	// produces (map[string]any, struct, etc.).
+	if actRaw, err := jwt.Get[any](token, "act"); err == nil {
 		c.ActorClaims = parseActorClaims(actRaw)
 	}
 
 	// Collect all unrecognized claims into Custom for deployment-specific use.
-	c.Custom = make(map[string]interface{})
-	for iter := token.Iterate(context.Background()); iter.Next(context.Background()); {
-		pair := iter.Pair()
-		key, ok := pair.Key.(string)
-		if !ok {
+	// jwx v4: Token.Claims() yields an iter.Seq2[string, any] over every
+	// claim, replacing the v2 Iterate/Pair API. Cleaner than Keys() +
+	// jwt.Get[any] in a loop.
+	c.Custom = make(map[string]any)
+	for key, v := range token.Claims() {
+		if _, known := knownKeys[key]; known {
 			continue
 		}
-		if _, known := knownKeys[key]; !known {
-			c.Custom[key] = pair.Value
-		}
+		c.Custom[key] = v
 	}
 	if len(c.Custom) == 0 {
 		c.Custom = nil
@@ -307,9 +302,9 @@ func extractClaims(token jwt.Token) *Claims {
 	return c
 }
 
-func parseActorClaims(raw interface{}) *ActorClaims {
+func parseActorClaims(raw any) *ActorClaims {
 	switch v := raw.(type) {
-	case map[string]interface{}:
+	case map[string]any:
 		act := &ActorClaims{}
 		if sub, ok := v["sub"].(string); ok {
 			act.Subject = sub

@@ -6,17 +6,19 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 )
 
 // testKeySet holds both key pairs and serves a JWKS endpoint for tests.
@@ -41,21 +43,21 @@ func newTestKeySet(t *testing.T) *testKeySet {
 
 	set := jwk.NewSet()
 
-	ecPub, err := jwk.FromRaw(ecPriv.Public())
+	ecPub, err := jwk.Import[jwk.Key](ecPriv.Public())
 	if err != nil {
 		t.Fatalf("create EC JWK: %v", err)
 	}
 	_ = ecPub.Set(jwk.KeyIDKey, "ec-key-1")
-	_ = ecPub.Set(jwk.AlgorithmKey, jwa.ES256)
+	_ = ecPub.Set(jwk.AlgorithmKey, jwa.ES256())
 	_ = ecPub.Set(jwk.KeyUsageKey, "sig")
 	_ = set.AddKey(ecPub)
 
-	rsaPub, err := jwk.FromRaw(rsaPriv.Public())
+	rsaPub, err := jwk.Import[jwk.Key](rsaPriv.Public())
 	if err != nil {
 		t.Fatalf("create RSA JWK: %v", err)
 	}
 	_ = rsaPub.Set(jwk.KeyIDKey, "rsa-key-1")
-	_ = rsaPub.Set(jwk.AlgorithmKey, jwa.RS256)
+	_ = rsaPub.Set(jwk.AlgorithmKey, jwa.RS256())
 	_ = rsaPub.Set(jwk.KeyUsageKey, "sig")
 	_ = set.AddKey(rsaPub)
 
@@ -75,35 +77,35 @@ func makeHeaders(kid string) jws.Headers {
 	return h
 }
 
-func (ks *testKeySet) signES256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signES256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
 		_ = token.Set(k, v)
 	}
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, ks.ecPriv, jws.WithProtectedHeaders(makeHeaders("ec-key-1"))))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), ks.ecPriv, jws.WithProtectedHeaders(makeHeaders("ec-key-1"))))
 	if err != nil {
 		t.Fatalf("sign ES256: %v", err)
 	}
 	return string(signed)
 }
 
-func (ks *testKeySet) signRS256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signRS256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
 		_ = token.Set(k, v)
 	}
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, ks.rsaPriv, jws.WithProtectedHeaders(makeHeaders("rsa-key-1"))))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256(), ks.rsaPriv, jws.WithProtectedHeaders(makeHeaders("rsa-key-1"))))
 	if err != nil {
 		t.Fatalf("sign RS256: %v", err)
 	}
 	return string(signed)
 }
 
-func baseClaims(issuer string) map[string]interface{} {
+func baseClaims(issuer string) map[string]any {
 	now := time.Now()
-	return map[string]interface{}{
+	return map[string]any{
 		"iss":        issuer,
 		"sub":        "user-123",
 		"aud":        []string{"https://shield.example.com"},
@@ -116,7 +118,7 @@ func baseClaims(issuer string) map[string]interface{} {
 	}
 }
 
-func agentClaims(issuer string) map[string]interface{} {
+func agentClaims(issuer string) map[string]any {
 	c := baseClaims(issuer)
 	c["external_id"] = "agent-smith"
 	c["identity_type"] = "agent"
@@ -127,7 +129,7 @@ func agentClaims(issuer string) map[string]interface{} {
 	c["publisher"] = "acme-corp"
 	c["capabilities"] = []string{"read_file", "call_tool"}
 	c["delegation_depth"] = 1
-	c["act"] = map[string]interface{}{
+	c["act"] = map[string]any{
 		"sub": "orchestrator-1",
 		"iss": issuer,
 	}
@@ -272,6 +274,61 @@ func TestVerifyGarbageToken(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsAlgNone covers the JWT-SVID §3 / RFC 7519 §6 requirement
+// that `alg: none` MUST be rejected by any compliant verifier. The token is
+// hand-crafted (no library will sign one for you) to guarantee the JOSE
+// header carries alg=none. The pre-parse alg peek (validateAlg in alg.go,
+// from #103) rejects this at the JWS layer before any parse logic runs.
+func TestVerifyRejectsAlgNone(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Build  base64url(header).base64url(payload).  with empty signature.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker","iss":"https://auth.test.com"}`))
+	token := header + "." + payload + "."
+
+	_, err := v.Verify(context.Background(), token)
+	if err == nil {
+		t.Fatal("alg=none token MUST be rejected (JWT-SVID §3)")
+	}
+	// validateAlg (alg.go) wraps with ErrInvalidToken when alg is outside
+	// the JWT-SVID allow-list. The error message also contains the offending
+	// alg value so a future maintainer can grep for it in a regression.
+	if !errors.Is(err, authjwt.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got: %v", err)
+	}
+}
+
+// TestVerifyRejectsHS256 covers the HS256-confusion attack class: an
+// attacker signs with HS256 using the RSA public key as the HMAC secret,
+// hoping a verifier that doesn't pin the algorithm will accept it.
+// validateAlg's allow-list rejects HS256 outright before any signature
+// verification runs.
+func TestVerifyRejectsHS256(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Sign with HS256 using an arbitrary symmetric secret. The actual key
+	// material doesn't matter — verifier.Verify must reject before checking
+	// the signature.
+	tok := jwt.New()
+	_ = tok.Set(jwt.IssuerKey, "https://auth.test.com")
+	_ = tok.Set(jwt.SubjectKey, "attacker")
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte("any-symmetric-key-will-do")))
+	if err != nil {
+		t.Fatalf("sign HS256: %v", err)
+	}
+
+	_, err = v.Verify(context.Background(), string(signed))
+	if err == nil {
+		t.Fatal("HS256 token MUST be rejected to prevent algorithm-confusion attacks")
+	}
+	if !errors.Is(err, authjwt.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got: %v", err)
+	}
+}
+
 func TestMiddleware(t *testing.T) {
 	ks := newTestKeySet(t)
 	issuer := "https://auth.test.com"
@@ -394,9 +451,9 @@ func TestJWKSClientRefreshOnUnknownKID(t *testing.T) {
 		callCount++
 		if callCount >= 2 {
 			// Add the key on refresh.
-			pub, _ := jwk.FromRaw(ecPriv.Public())
+			pub, _ := jwk.Import[jwk.Key](ecPriv.Public())
 			_ = pub.Set(jwk.KeyIDKey, "rotated-key")
-			_ = pub.Set(jwk.AlgorithmKey, jwa.ES256)
+			_ = pub.Set(jwk.AlgorithmKey, jwa.ES256())
 			_ = pub.Set(jwk.KeyUsageKey, "sig")
 			freshSet := jwk.NewSet()
 			_ = freshSet.AddKey(pub)
@@ -429,7 +486,7 @@ func TestJWKSClientRefreshOnUnknownKID(t *testing.T) {
 	hdrs := jws.NewHeaders()
 	_ = hdrs.Set(jws.KeyIDKey, "rotated-key")
 
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, ecPriv, jws.WithProtectedHeaders(hdrs)))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), ecPriv, jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}

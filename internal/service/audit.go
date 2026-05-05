@@ -19,17 +19,17 @@ type AuditLogFilter struct {
 // AuditLogResponse is the wire type for audit log entries returned to clients.
 // It matches the AuditLog interface in packages/registry/src/types.ts.
 type AuditLogResponse struct {
-	AuditID     string                 `json:"audit_id"`
-	AccountID   string                 `json:"account_id"`
-	TableName   string                 `json:"table_name"`
-	Action      string                 `json:"action"`
-	Status      string                 `json:"status"`
-	UserID      string                 `json:"user_id"`
-	Timestamp   string                 `json:"timestamp"`
-	OldData     map[string]interface{} `json:"old_data"`
-	NewData     map[string]interface{} `json:"new_data"`
-	ChangedData interface{}            `json:"changed_data"`
-	EntityName  string                 `json:"entity_name"`
+	AuditID     string         `json:"audit_id"`
+	AccountID   string         `json:"account_id"`
+	TableName   string         `json:"table_name"`
+	Action      string         `json:"action"`
+	Status      string         `json:"status"`
+	UserID      string         `json:"user_id"`
+	Timestamp   string         `json:"timestamp"`
+	OldData     map[string]any `json:"old_data"`
+	NewData     map[string]any `json:"new_data"`
+	ChangedData any            `json:"changed_data"`
+	EntityName  string         `json:"entity_name"`
 }
 
 // AuditService handles audit log queries.
@@ -55,7 +55,7 @@ func (s *AuditService) ListAuditLogs(ctx context.Context, accountID, projectID s
 }
 
 func toAuditLogResponse(e postgres.AuditLogEntry) AuditLogResponse {
-	var oldData, newData map[string]interface{}
+	var oldData, newData map[string]any
 	if len(e.OldData) > 0 {
 		_ = json.Unmarshal(e.OldData, &oldData)
 	}
