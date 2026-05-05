@@ -66,8 +66,11 @@ func (r *AttestationRepository) GetHighestVerifiedLevel(ctx context.Context, ide
 }
 
 // Update saves changes to an attestation record (e.g., mark as verified).
+// Participates in a caller-provided transaction via postgres.WithTx(ctx, tx);
+// falls through to a single auto-commit update otherwise.
 func (r *AttestationRepository) Update(ctx context.Context, record *domain.AttestationRecord) error {
-	_, err := r.db.NewUpdate().Model(record).
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewUpdate().Model(record).
 		Where("id = ?", record.ID).
 		Exec(ctx)
 	if err != nil {

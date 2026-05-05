@@ -132,10 +132,13 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	return identities, total, nil
 }
 
-// Update saves changes to an existing identity.
+// Update saves changes to an existing identity. Participates in a caller-
+// provided transaction via postgres.WithTx(ctx, tx); falls through to a
+// single auto-commit update otherwise.
 func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
 	identity.ModifiedBy = middleware.GetCallerName(ctx)
-	_, err := r.db.NewUpdate().Model(identity).
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewUpdate().Model(identity).
 		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
 		Exec(ctx)
 	if err != nil {

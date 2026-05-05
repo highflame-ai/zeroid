@@ -328,19 +328,16 @@ func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
 	assertErrorBodyContains(t, second, "already verified")
 }
 
-// TestAttestationVerifyGuardCatchesPartialFailureRetry pins the second
-// half of the ErrAttestationAlreadyVerified guard introduced by #98:
-// when CredentialID is set but IsVerified is false (the state left
-// behind by a failed UpdateIdentity / repo.Update after a successful
-// IssueCredential), a retry must be rejected so a second credential
-// is not minted from the same proof.
-//
-// The partial-failure state isn't reachable through the normal HTTP flow
-// — it only appears if Step 2 or Step 3 of VerifyAttestation crashes.
-// We simulate it by running a clean verify, then surgically flipping
-// is_verified back to false in the DB (leaving credential_id intact).
-// Without the CredentialID-guard, the retry returns 200 and issues a
-// second credential.
+// TestAttestationVerifyGuardCatchesPartialFailureRetry pins the
+// defense-in-depth guard added alongside the transaction wrap in #98:
+// the three writes in VerifyAttestation now run in a single bun.RunInTx,
+// so a partial-state record (CredentialID set, IsVerified=false) is
+// no longer reachable through the normal flow. But the guard at the
+// top of the function still trips on CredentialID != "" so a record
+// in that state — reachable only via direct DB manipulation, a future
+// code path that bypasses the verify flow, or a hypothetical
+// commit-then-error-return bug — does not get a second credential
+// minted. We plant the state by hand to exercise the guard.
 func TestAttestationVerifyGuardCatchesPartialFailureRetry(t *testing.T) {
 	iss := newOIDCIssuer(t)
 	defer iss.close()

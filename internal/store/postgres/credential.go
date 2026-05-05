@@ -20,9 +20,12 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 	return &CredentialRepository{db: db}
 }
 
-// Create inserts a new issued credential.
+// Create inserts a new issued credential. Participates in a caller-provided
+// transaction via postgres.WithTx(ctx, tx); falls through to a single
+// auto-commit insert otherwise.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
-	_, err := r.db.NewInsert().Model(cred).Exec(ctx)
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewInsert().Model(cred).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create credential: %w", err)
 	}

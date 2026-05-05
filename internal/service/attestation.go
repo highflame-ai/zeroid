@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
+	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
@@ -40,6 +41,10 @@ type AttestationService struct {
 	identitySvc   *IdentityService
 	verifiers     *attestation.Registry
 	policySvc     *attestation.PolicyService
+	// db is the *bun.DB handle used to open transactions in
+	// VerifyAttestation. The repo methods themselves participate via
+	// postgres.WithTx(ctx, tx); the service owns the tx lifecycle.
+	db *bun.DB
 
 	// permissive is the runtime-mutable form of cfg.Attestation.AllowUnsafeDevStub.
 	// Stored as int32 so SetPermissive can flip it without a mutex —
@@ -50,13 +55,16 @@ type AttestationService struct {
 // NewAttestationService creates a new AttestationService. verifiers and
 // policySvc are required: VerifyAttestation fails closed when no verifier
 // is registered for a proof type or no tenant policy exists, unless
-// allowUnsafeDevStub is true (transitional bypass).
+// allowUnsafeDevStub is true (transitional bypass). db is required so the
+// three writes in VerifyAttestation (issue credential, promote trust,
+// mark record verified) can be wrapped in a single transaction.
 func NewAttestationService(
 	repo *postgres.AttestationRepository,
 	credentialSvc *CredentialService,
 	identitySvc *IdentityService,
 	verifiers *attestation.Registry,
 	policySvc *attestation.PolicyService,
+	db *bun.DB,
 	allowUnsafeDevStub bool,
 ) *AttestationService {
 	s := &AttestationService{
@@ -65,6 +73,7 @@ func NewAttestationService(
 		identitySvc:   identitySvc,
 		verifiers:     verifiers,
 		policySvc:     policySvc,
+		db:            db,
 	}
 	s.permissive.Store(allowUnsafeDevStub)
 	return s
@@ -129,12 +138,14 @@ var ErrAttestationAlreadyVerified = errors.New("attestation already verified")
 //   - Verifier.Verify returns an error → ErrAttestationRejected.
 //   - Record already verified → ErrAttestationAlreadyVerified (rejects retries).
 //
-// Write ordering rationale: credential issuance runs BEFORE identity trust
-// promotion, so the most common failure (IssueCredential) leaves nothing
-// committed. Trust promotion and record update run last, in that order, so
-// a failure between them leaves trust promoted (harmless — backed by a
-// valid proof) with the record unmarked. The re-verify guard prevents a
-// second IssueCredential call in that retry window.
+// Atomicity: the three writes (issue credential → promote trust →
+// mark record verified) run inside a single bun.RunInTx. Repos that
+// touch DB (CredentialRepository.Create, IdentityRepository.Update,
+// AttestationRepository.Update) read the in-flight tx from ctx via
+// postgres.WithTx so every statement participates. Any failure rolls
+// the lot back, so retries always see a clean slate. The
+// CredentialID-based guard at the top stays as defense-in-depth in case
+// a future code path manipulates the record outside this flow.
 func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountID, projectID string) (*VerifyAttestationResult, error) {
 	record, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
@@ -201,9 +212,11 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		return nil, fmt.Errorf("failed to load identity for verified attestation: %w", err)
 	}
 
-	// Step 1: issue the credential. This is the most likely failure point
-	// (policy checks, scope derivation, signing). Running it first means
-	// a failure leaves no partial state behind.
+	// Run the three writes atomically. RunInTx commits on a nil return,
+	// rolls back on any non-nil error or panic. The repo methods called
+	// below pick the tx up from ctx via postgres.WithTx; their bun.IDB
+	// resolver uses the tx instead of the auto-commit DB handle, so every
+	// statement lands inside the same transaction.
 	//
 	// GrantType is fixed to client_credentials regardless of how the
 	// identity will subsequently authenticate. Verified attestation is a
@@ -212,33 +225,43 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	// returned token represents that boot-time trust, not a user-driven
 	// session. Downstream flows can still token-exchange / jwt-bearer
 	// against this credential; the bootstrap shape just doesn't change.
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		GrantType: domain.GrantTypeClientCredentials,
+	var (
+		accessToken *domain.AccessToken
+		cred        *domain.IssuedCredential
+	)
+	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		ctx = postgres.WithTx(ctx, tx)
+
+		var err error
+		accessToken, cred, err = s.credentialSvc.IssueCredential(ctx, IssueRequest{
+			Identity:  identity,
+			GrantType: domain.GrantTypeClientCredentials,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to issue post-attestation credential: %w", err)
+		}
+
+		promotedTrust := trustLevelForAttestation(record.Level)
+		if _, err := s.identitySvc.UpdateIdentity(ctx, record.IdentityID, accountID, projectID, UpdateIdentityRequest{
+			TrustLevel: promotedTrust,
+		}); err != nil {
+			return fmt.Errorf("failed to promote identity trust level: %w", err)
+		}
+
+		now := time.Now()
+		record.IsVerified = true
+		record.VerifiedAt = &now
+		if result.ExpiresAt != nil {
+			record.ExpiresAt = result.ExpiresAt
+		}
+		record.CredentialID = cred.ID
+		if err := s.repo.Update(ctx, record); err != nil {
+			return fmt.Errorf("failed to update attestation record: %w", err)
+		}
+		return nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to issue post-attestation credential: %w", err)
-	}
-
-	// Step 2: promote trust level. Backed by the just-verified proof.
-	promotedTrust := trustLevelForAttestation(record.Level)
-	if _, err := s.identitySvc.UpdateIdentity(ctx, record.IdentityID, accountID, projectID, UpdateIdentityRequest{
-		TrustLevel: promotedTrust,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to promote identity trust level: %w", err)
-	}
-
-	// Step 3: commit the record with verified flag, audit fields, and
-	// credential link in a single write.
-	now := time.Now()
-	record.IsVerified = true
-	record.VerifiedAt = &now
-	if result.ExpiresAt != nil {
-		record.ExpiresAt = result.ExpiresAt
-	}
-	record.CredentialID = cred.ID
-	if err := s.repo.Update(ctx, record); err != nil {
-		return nil, fmt.Errorf("failed to update attestation record: %w", err)
+	if txErr != nil {
+		return nil, txErr
 	}
 
 	return &VerifyAttestationResult{
