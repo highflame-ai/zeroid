@@ -36,12 +36,21 @@ func WithTx(ctx context.Context, tx bun.Tx) context.Context {
 	return context.WithValue(ctx, txKey{}, tx)
 }
 
+// txFromContext extracts the in-flight transaction attached by WithTx.
+// Returns the tx and true when one is set; the zero bun.Tx and false
+// otherwise. Used as the shared core of dbOrTx and hasTx so the
+// type-assertion key and shape live in exactly one place.
+func txFromContext(ctx context.Context) (bun.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(bun.Tx)
+	return tx, ok
+}
+
 // dbOrTx returns the in-flight transaction from ctx if one is set, falling
 // back to the repo's default DB handle. Repo methods that participate in
 // transactions call this once at the top and use the returned bun.IDB for
 // every statement in the method.
 func dbOrTx(ctx context.Context, fallback bun.IDB) bun.IDB {
-	if tx, ok := ctx.Value(txKey{}).(bun.Tx); ok {
+	if tx, ok := txFromContext(ctx); ok {
 		return tx
 	}
 	return fallback
@@ -52,6 +61,6 @@ func dbOrTx(ctx context.Context, fallback bun.IDB) bun.IDB {
 // (e.g., SELECT ... FOR UPDATE callers) use this to fail fast on misuse
 // instead of silently downgrading to a per-statement implicit tx.
 func hasTx(ctx context.Context) bool {
-	_, ok := ctx.Value(txKey{}).(bun.Tx)
+	_, ok := txFromContext(ctx)
 	return ok
 }

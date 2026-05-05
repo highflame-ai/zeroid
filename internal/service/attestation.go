@@ -138,19 +138,12 @@ var ErrAttestationAlreadyVerified = errors.New("attestation already verified")
 //   - Verifier.Verify returns an error → ErrAttestationRejected.
 //   - Record already verified → ErrAttestationAlreadyVerified (rejects retries).
 //
-// Atomicity + serialization: the three writes (issue credential → promote
-// trust → mark record verified) run inside a single bun.RunInTx, and the
-// transaction starts by re-fetching the attestation record with
-// SELECT ... FOR UPDATE so two concurrent /verify calls on the same record
-// serialize. Without the lock both callers would otherwise pass the
-// pre-tx guard, both enter the closure, and both INSERT a credential —
-// leaving two credentials minted from one proof. Repos that touch the DB
-// (CredentialRepository.Create, IdentityRepository.Update,
-// AttestationRepository.Update / .GetByIDForUpdate) read the in-flight tx
-// from ctx via postgres.WithTx so every statement participates. Any
-// failure rolls the lot back, so retries always see a clean slate. The
-// CredentialID-based guard at the top stays as defense-in-depth in case
-// a future code path manipulates the record outside this flow.
+// Atomicity + serialization: the three side-effecting writes run inside a
+// single bun.RunInTx whose first statement is SELECT ... FOR UPDATE on the
+// attestation row, so concurrent /verify calls on the same record
+// serialize. See the inline comments at the RunInTx site for the full
+// commentary on lock order, the in-tx guard, and why the closure-scoped
+// locals are assigned to the outer return values exactly once on success.
 func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountID, projectID string) (*VerifyAttestationResult, error) {
 	record, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
@@ -230,22 +223,28 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		cred           *domain.IssuedCredential
 		verifiedRecord *domain.AttestationRecord
 	)
-	// Lock-order note: this tx takes the attestation_records row lock
-	// (SELECT FOR UPDATE) FIRST, then implicitly the identities row lock
-	// (via UpdateIdentity's UPDATE). Any future code path that needs to
-	// hold both locks should acquire them in the same order to avoid
-	// deadlocks. Postgres detects deadlocks (40P01) and aborts one tx,
-	// so the worst case is a transient retry, not silent corruption —
-	// but cleaner is to keep the order consistent.
 	txErr := s.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		ctx = postgres.WithTx(ctx, tx)
 
 		// Re-fetch with row lock. Concurrent verifies on the same record
 		// queue here; the second one re-reads the row after the first
 		// commits, sees CredentialID set, and bails out below.
+		//
+		// Lock-order note: this acquires the attestation_records row
+		// lock FIRST, then implicitly the identities row lock (via
+		// UpdateIdentity's UPDATE below). Any future code path that
+		// needs to hold both locks should acquire them in the same order
+		// to avoid deadlocks. Postgres detects deadlocks (40P01) and
+		// aborts one tx, so the worst case is a transient retry, not
+		// silent corruption — but cleaner to keep the order consistent.
+		//
+		// The repo method's error already names what failed; no outer
+		// wrap so the operator-visible message stays accurate even when
+		// the inner error is the WithTx contract violation rather than
+		// a runtime DB problem.
 		locked, err := s.repo.GetByIDForUpdate(ctx, id, accountID, projectID)
 		if err != nil {
-			return fmt.Errorf("failed to lock attestation record: %w", err)
+			return err
 		}
 		if locked.IsVerified || locked.CredentialID != "" {
 			return fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, locked.ID)

@@ -102,6 +102,22 @@ func TestPostgresWithTxRollbackPersistsNothing(t *testing.T) {
 	assert.Zero(t, credCount, "credential row must not exist after rollback")
 }
 
+// TestGetByIDForUpdateRequiresTx pins the contract that GetByIDForUpdate
+// fails fast when called without a postgres.WithTx context. Without this
+// guard, a future caller that forgets to open a transaction would
+// silently downgrade to a per-statement implicit tx — the SELECT FOR
+// UPDATE acquires the lock and immediately releases it on the implicit
+// commit, providing no useful serialization. The bug only manifests
+// under concurrent load. Loud failure here = caught at code-review time
+// instead of in production.
+func TestGetByIDForUpdateRequiresTx(t *testing.T) {
+	repo := postgres.NewAttestationRepository(testDB)
+	_, err := repo.GetByIDForUpdate(context.Background(), uuid.NewString(), testAccountID, testProjectID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be called inside",
+		"the contract violation message must name the missing WithTx so a future debugger sees the cause")
+}
+
 // TestPostgresWithoutTxFallsBackToAutoCommit pins the other half of the
 // dbOrTx contract: when no tx is attached to ctx, repo writes use the
 // repo's default *bun.DB handle and auto-commit per statement, exactly
