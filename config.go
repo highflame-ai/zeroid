@@ -21,15 +21,35 @@ const DefaultAdminPathPrefix = "/api/v1"
 
 // Config holds the complete ZeroID service configuration.
 type Config struct {
-	Server    ServerConfig    `koanf:"server"`
-	Database  DatabaseConfig  `koanf:"database"`
-	Keys      KeysConfig      `koanf:"keys"`
-	Token     TokenConfig     `koanf:"token"`
-	Telemetry TelemetryConfig `koanf:"telemetry"`
-	Logging   LoggingConfig   `koanf:"logging"`
+	Server      ServerConfig      `koanf:"server"`
+	Database    DatabaseConfig    `koanf:"database"`
+	Keys        KeysConfig        `koanf:"keys"`
+	Token       TokenConfig       `koanf:"token"`
+	Telemetry   TelemetryConfig   `koanf:"telemetry"`
+	Logging     LoggingConfig     `koanf:"logging"`
+	Attestation AttestationConfig `koanf:"attestation"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+}
+
+// AttestationConfig governs the attestation verification subsystem. The
+// real verifier path (OIDC) is always wired and fail-closed without a
+// tenant-configured AttestationPolicy. AllowUnsafeDevStub controls
+// whether a permissive stub covers the proof types whose real verifier
+// hasn't shipped yet (image_hash, tpm).
+type AttestationConfig struct {
+	// AllowUnsafeDevStub, when true, registers a stub verifier that
+	// accepts any submitted proof for image_hash and tpm. Prints a
+	// loud startup warning whenever it's installed.
+	//
+	// Default is true today: until image_hash / tpm real verifiers
+	// land, the stub is the only way demo flows that submit those
+	// proof types keep working — flipping the default to false would
+	// hard-reject them. Deployments that don't use image_hash or tpm
+	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
+	// (the only real verifier shipped) is unaffected by this flag.
+	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -266,6 +286,12 @@ func loadDefaults(k *koanf.Koanf) error {
 		// Admin path prefix
 		"server.admin_path_prefix": DefaultAdminPathPrefix,
 
+		// Attestation — dev stub on by default until image_hash / tpm
+		// real verifiers ship. Override with
+		// ZEROID_ALLOW_UNSAFE_DEV_STUB=false for deployments that don't
+		// submit those proof types (or once real verifiers land).
+		"attestation.allow_unsafe_dev_stub": true,
+
 		// Logging
 		"logging.level": "info",
 	}
@@ -312,6 +338,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
 
+		// Attestation
+		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
+
 		// Telemetry
 		"OTEL_EXPORTER_OTLP_ENDPOINT": "telemetry.endpoint",
 		"OTEL_ENABLED":                "telemetry.enabled",
@@ -328,7 +357,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		}
 
 		switch {
-		case strings.HasSuffix(configPath, ".enabled") || strings.HasSuffix(configPath, ".insecure"):
+		case strings.HasSuffix(configPath, ".enabled") ||
+			strings.HasSuffix(configPath, ".insecure") ||
+			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
 			if boolVal, err := strconv.ParseBool(value); err == nil {
 				_ = k.Set(configPath, boolVal)
 			}
