@@ -21,7 +21,8 @@ func NewAttestationRepository(db *bun.DB) *AttestationRepository {
 
 // Create inserts a new attestation record.
 func (r *AttestationRepository) Create(ctx context.Context, record *domain.AttestationRecord) error {
-	_, err := r.db.NewInsert().Model(record).Exec(ctx)
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewInsert().Model(record).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create attestation record: %w", err)
 	}
@@ -31,7 +32,8 @@ func (r *AttestationRepository) Create(ctx context.Context, record *domain.Attes
 // GetByID retrieves an attestation record by its UUID.
 func (r *AttestationRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.AttestationRecord, error) {
 	record := &domain.AttestationRecord{}
-	err := r.db.NewSelect().Model(record).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(record).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -46,7 +48,8 @@ func (r *AttestationRepository) GetByID(ctx context.Context, id, accountID, proj
 // Returns an empty string if no verified attestation exists.
 func (r *AttestationRepository) GetHighestVerifiedLevel(ctx context.Context, identityID string) (string, error) {
 	var level string
-	err := r.db.NewSelect().
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().
 		TableExpr("attestation_records").
 		ColumnExpr("level").
 		Where("identity_id = ?", identityID).

@@ -35,7 +35,8 @@ func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCr
 // GetByID retrieves a credential by its UUID.
 func (r *CredentialRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.IssuedCredential, error) {
 	cred := &domain.IssuedCredential{}
-	err := r.db.NewSelect().Model(cred).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(cred).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -49,7 +50,8 @@ func (r *CredentialRepository) GetByID(ctx context.Context, id, accountID, proje
 // GetByJTI retrieves a credential by its JWT ID (jti claim).
 func (r *CredentialRepository) GetByJTI(ctx context.Context, jti string) (*domain.IssuedCredential, error) {
 	cred := &domain.IssuedCredential{}
-	err := r.db.NewSelect().Model(cred).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(cred).
 		Where("jti = ?", jti).
 		Scan(ctx)
 	if err != nil {
@@ -61,7 +63,8 @@ func (r *CredentialRepository) GetByJTI(ctx context.Context, jti string) (*domai
 // ListByIdentity returns all credentials for a given identity.
 func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
 	var creds []*domain.IssuedCredential
-	err := r.db.NewSelect().Model(&creds).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&creds).
 		Where("identity_id = ?", identityID).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -82,7 +85,8 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
 	now := time.Now()
 	var count int64
-	if err := r.db.NewRaw(
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewRaw(
 		"SELECT revoke_credentials_cascade(?, ?, ?)",
 		identityID, now, reason,
 	).Scan(ctx, &count); err != nil {
@@ -98,7 +102,8 @@ func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, i
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) error {
 	now := time.Now()
 	var count int64
-	if err := r.db.NewRaw(
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewRaw(
 		"SELECT revoke_credential_cascade(?, ?, ?, ?, ?)",
 		id, accountID, projectID, now, reason,
 	).Scan(ctx, &count); err != nil {

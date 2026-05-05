@@ -151,13 +151,14 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 	if err != nil {
 		return nil, err
 	}
-	// IsVerified is the post-success guard. CredentialID != "" catches the
-	// in-progress retry window: if Step 1 (IssueCredential) succeeded on a
-	// prior call but Step 2 or 3 failed, the credential link is set but
-	// IsVerified is still false. Without this second condition, retries in
-	// that window mint a second credential from the same proof. Closes one
-	// of the two failure windows tracked by #98; the full DB-transaction
-	// refactor closes the rest.
+	// Idempotency guard. The transaction wrap below already makes partial
+	// state unreachable through this flow — if any of the three writes
+	// fails, the tx rolls back and IsVerified / CredentialID stay zero.
+	// This guard is therefore defense-in-depth: it catches direct DB
+	// manipulation, a future code path that bypasses VerifyAttestation but
+	// mutates the record, or the rare commit-then-error-return failure
+	// mode where the tx committed but RunInTx still surfaces an error.
+	// Cheap belt next to the suspenders.
 	if record.IsVerified || record.CredentialID != "" {
 		return nil, fmt.Errorf("%w: record %s", ErrAttestationAlreadyVerified, record.ID)
 	}
