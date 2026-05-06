@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -324,6 +326,140 @@ func TestAttestationDoubleVerifyIsRejected(t *testing.T) {
 	defer func() { _ = second.Body.Close() }()
 	assert.Equal(t, http.StatusConflict, second.StatusCode,
 		"second verify on an already-verified record must be 409 Conflict")
+	assertErrorBodyContains(t, second, "already verified")
+}
+
+// TestAttestationConcurrentVerifyMintsExactlyOneCredential pins the
+// row-lock added in the #98 transaction wrap. Without SELECT ... FOR
+// UPDATE on the attestation record, two simultaneous /verify calls
+// could each pass the IsVerified guard, each enter the tx, each
+// IssueCredential, and leave the DB with two credentials minted from
+// one proof. The lock serializes the second verify behind the first;
+// when it acquires the lock the record already has CredentialID set and
+// it bails out via ErrAttestationAlreadyVerified.
+//
+// The goroutines below intentionally use raw http.NewRequest /
+// http.DefaultClient.Do rather than the verifyAttestation helper. That
+// helper's call chain ends in require.NoError, which calls t.FailNow —
+// per the testing package contract FailNow MUST be called from the
+// goroutine running the test, not workers. Doing the HTTP call inline
+// keeps every assertion on the main goroutine after wg.Wait().
+func TestAttestationConcurrentVerifyMintsExactlyOneCredential(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	reg := registerAgent(t, uid("attest-race"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	token := iss.sign(map[string]any{"sub": "ci-job-race"})
+	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
+
+	body, err := json.Marshal(map[string]any{"attestation_id": id})
+	require.NoError(t, err)
+	url := testServer.URL + adminPath("/attestation/verify")
+	headers := adminHeaders()
+
+	const N = 8
+	results := make([]struct {
+		status int
+		err    error
+	}, N)
+
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := range N {
+		go func(slot int) {
+			defer wg.Done()
+			req, reqErr := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+			if reqErr != nil {
+				results[slot].err = reqErr
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range headers {
+				req.Header.Set(k, v)
+			}
+			resp, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				results[slot].err = doErr
+				return
+			}
+			results[slot].status = resp.StatusCode
+			_ = resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	// Exactly one verify wins, the rest see ErrAttestationAlreadyVerified
+	// once they acquire the row lock and re-check the guard.
+	var ok, conflict int
+	for slot, r := range results {
+		require.NoErrorf(t, r.err, "goroutine %d failed transport-level: %v", slot, r.err)
+		switch r.status {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Errorf("goroutine %d: unexpected status %d (want 200 or 409)", slot, r.status)
+		}
+	}
+	assert.Equal(t, 1, ok, "exactly one concurrent verify must succeed")
+	assert.Equal(t, N-1, conflict, "all other concurrent verifies must be rejected as already-verified")
+
+	// Hard guarantee: the credential count for the identity is exactly 1.
+	count, err := testDB.NewSelect().
+		Table("issued_credentials").
+		Where("identity_id = ?", reg.AgentID).
+		Count(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, count,
+		"exactly one credential must be persisted for the attested identity — the row lock must serialize concurrent verifies")
+}
+
+// TestAttestationVerifyGuardCatchesPartialFailureRetry pins the
+// defense-in-depth guard added alongside the transaction wrap in #98:
+// the three writes in VerifyAttestation now run in a single bun.RunInTx,
+// so a partial-state record (CredentialID set, IsVerified=false) is
+// no longer reachable through the normal flow. But the guard at the
+// top of the function still trips on CredentialID != "" so a record
+// in that state — reachable only via direct DB manipulation, a future
+// code path that bypasses the verify flow, or a hypothetical
+// commit-then-error-return bug — does not get a second credential
+// minted. We plant the state by hand to exercise the guard.
+func TestAttestationVerifyGuardCatchesPartialFailureRetry(t *testing.T) {
+	iss := newOIDCIssuer(t)
+	defer iss.close()
+
+	reg := registerAgent(t, uid("attest-partial"))
+	upsertOIDCPolicy(t, map[string]any{
+		"issuers": []map[string]any{{"url": iss.URL}},
+	})
+
+	token := iss.sign(map[string]any{"sub": "ci-job-partial"})
+	id := submitAttestation(t, reg.AgentID, "oidc_token", token)
+
+	first := verifyAttestation(t, id)
+	require.Equal(t, http.StatusOK, first.StatusCode, "first verify expected 200")
+	_ = first.Body.Close()
+
+	// Simulate Step 2 / Step 3 failure: rewind IsVerified to false but
+	// leave CredentialID intact. This is the exact state the guard is
+	// meant to catch — a retry would mint a second credential without it.
+	_, err := testDB.NewUpdate().
+		Table("attestation_records").
+		Set("is_verified = false").
+		Set("verified_at = NULL").
+		Where("id = ?", id).
+		Exec(context.Background())
+	require.NoError(t, err, "failed to plant partial-failure state")
+
+	second := verifyAttestation(t, id)
+	defer func() { _ = second.Body.Close() }()
+	assert.Equal(t, http.StatusConflict, second.StatusCode,
+		"retry on a record with credential_id set must be rejected even when is_verified=false")
 	assertErrorBodyContains(t, second, "already verified")
 }
 

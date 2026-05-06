@@ -26,18 +26,62 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      # Tag format gate. The original workflow gated this on
+      # `steps.validate_branch.outputs.enable_branch_build == 'true'`,
+      # but `validate_branch` was never a real step in this job — the
+      # gate evaluated to false and the validation silently skipped on
+      # every release. Removed; the format check now actually runs.
       - name: Validate Release Tag
-        if: ${{ steps.validate_branch.outputs.enable_branch_build == 'true' }}
         id: validate_tag
         shell: bash
         run: |-
           if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
             echo "Valid version format: ${{ env.RELEASE_NAME }}"
-            echo "enable_tag_build=true" >> ${GITHUB_OUTPUT}
           else
             echo "Invalid version format: ${{ env.RELEASE_NAME }}"
-            echo "enable_tag_build=false" >> ${GITHUB_OUTPUT}
             exit 1
+          fi
+
+      - name: Setup Golang Version
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      # svu (caarlos0/svu) computes the semver bump implied by commit
+      # messages since the last `v*` tag. Highflame's commit-prefix
+      # convention maps cleanly onto Conventional Commits for the bumps:
+      # `feat:` -> minor, `fix:` -> patch, `feat!:` / `BREAKING CHANGE:`
+      # -> major. `devops:`, `build(deps)`, `[Snyk]`, `Bump` don't move
+      # version numbers in svu's model, which matches our intent (those
+      # are housekeeping, not user-visible).
+      #
+      # Behaviour: fail if the published tag is BELOW svu's
+      # recommendation -- that means a `feat:` commit was missed and
+      # we'd be silently shipping a feature as a patch. Allow tags AT
+      # OR ABOVE the recommendation so a maintainer can manually force
+      # a higher bump (e.g., release a major from a fix-only window).
+      - name: Validate semver against commit history (svu)
+        shell: bash
+        run: |-
+          go install github.com/caarlos0/svu/v3@latest
+          EXPECTED="$(svu next)"
+          ACTUAL="${{ env.RELEASE_NAME }}"
+          echo "Published tag : ${ACTUAL}"
+          echo "svu next      : ${EXPECTED}"
+          # sort -V picks the highest of the two; if EXPECTED is
+          # higher, ACTUAL is too low and a feat: was likely missed.
+          HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${ACTUAL}" | sort -V | tail -1)"
+          if [[ "${ACTUAL}" != "${EXPECTED}" && "${HIGHEST}" != "${ACTUAL}" ]]; then
+            echo "::error::Release tag ${ACTUAL} is below svu's computed next version ${EXPECTED}."
+            echo "::error::This usually means a feat: commit since the last tag implied a minor bump."
+            echo "::error::Either retag at ${EXPECTED} or higher, or audit recent commit prefixes."
+            exit 1
+          fi
+          if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+            echo "::notice::Release tag ${ACTUAL} is ahead of svu's recommendation (${EXPECTED}). Treating as an intentional manual bump."
+          else
+            echo "Release tag matches svu recommendation."
           fi
 
   tag-submodules:

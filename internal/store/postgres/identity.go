@@ -25,7 +25,8 @@ func NewIdentityRepository(db *bun.DB) *IdentityRepository {
 
 // Create inserts a new identity.
 func (r *IdentityRepository) Create(ctx context.Context, identity *domain.Identity) error {
-	_, err := r.db.NewInsert().Model(identity).Exec(ctx)
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewInsert().Model(identity).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create identity: %w", err)
 	}
@@ -35,7 +36,8 @@ func (r *IdentityRepository) Create(ctx context.Context, identity *domain.Identi
 // GetByID retrieves an identity by its UUID, scoped to account + project.
 func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
-	err := r.db.NewSelect().Model(identity).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -49,7 +51,8 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 // GetByExternalID retrieves an identity by external ID within a tenant.
 func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
-	err := r.db.NewSelect().Model(identity).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
 		Where("external_id = ?", externalID).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -63,7 +66,8 @@ func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, ac
 // GetByWIMSEURI retrieves an identity by its WIMSE URI, scoped to tenant.
 func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
-	err := r.db.NewSelect().Model(identity).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
 		Where("wimse_uri = ?", wimseURI).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -79,7 +83,8 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // and filters using JSONB containment: labels @> {"key": "value"}.
 func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
-	q := r.db.NewSelect().Model(&identities).
+	db := dbOrTx(ctx, r.db)
+	q := db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		OrderExpr("created_at DESC")
@@ -132,10 +137,13 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	return identities, total, nil
 }
 
-// Update saves changes to an existing identity.
+// Update saves changes to an existing identity. Participates in a caller-
+// provided transaction via postgres.WithTx(ctx, tx); falls through to a
+// single auto-commit update otherwise.
 func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
 	identity.ModifiedBy = middleware.GetCallerName(ctx)
-	_, err := r.db.NewUpdate().Model(identity).
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewUpdate().Model(identity).
 		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
 		Exec(ctx)
 	if err != nil {
@@ -145,16 +153,26 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 }
 
 // Delete removes an identity.
+//
+// The pre-DELETE UPDATE stamps modified_by so the AFTER DELETE trigger can
+// read the actor from OLD.modified_by. Its error is propagated rather than
+// swallowed: in Postgres, a failed statement inside a transaction aborts
+// the whole tx, so the subsequent DELETE would fail with a generic
+// "current transaction is aborted" message that loses the original cause.
+// Outside a tx the same propagation just makes a benign-looking failure
+// loud — that's still preferable to silently triggering audit gaps.
 func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
-	// Pre-stamp modified_by so the AFTER DELETE trigger can read the actor from OLD.modified_by.
+	db := dbOrTx(ctx, r.db)
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
-		_, _ = r.db.NewUpdate().
+		if _, err := db.NewUpdate().
 			TableExpr("identities").
 			Set("modified_by = ?", callerID).
 			Where("id = ? AND account_id = ? AND project_id = ?", id, accountID, projectID).
-			Exec(ctx)
+			Exec(ctx); err != nil {
+			return fmt.Errorf("failed to stamp modified_by before delete: %w", err)
+		}
 	}
-	_, err := r.db.NewDelete().
+	_, err := db.NewDelete().
 		TableExpr("identities").
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
