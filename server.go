@@ -183,7 +183,7 @@ func NewServer(cfg Config) (*Server, error) {
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, cfg.Attestation.AllowUnsafeDevStub)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
