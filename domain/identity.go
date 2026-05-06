@@ -184,6 +184,54 @@ func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 	}
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Risk + assurance metadata enums (CoSAI §3.2 capability–risk matrix +
+// NIST SP 800-63 Identity Assurance Levels referenced in CoSAI §3.5).
+// Empty string is the "unclassified" default and is always valid.
+// ──────────────────────────────────────────────────────────────────────────────
+
+const (
+	CapabilityTierLow  = "low"
+	CapabilityTierHigh = "high"
+
+	RiskTierLow  = "low"
+	RiskTierHigh = "high"
+
+	IAL1 = "ial1"
+	IAL2 = "ial2"
+	IAL3 = "ial3"
+)
+
+// ValidCapabilityTier reports whether v is a valid CapabilityTier value.
+// Empty string is allowed and means "unclassified."
+func ValidCapabilityTier(v string) bool {
+	switch v {
+	case "", CapabilityTierLow, CapabilityTierHigh:
+		return true
+	}
+	return false
+}
+
+// ValidRiskTier reports whether v is a valid RiskTier value.
+// Empty string is allowed and means "unclassified."
+func ValidRiskTier(v string) bool {
+	switch v {
+	case "", RiskTierLow, RiskTierHigh:
+		return true
+	}
+	return false
+}
+
+// ValidIAL reports whether v is a valid IAL (Identity Assurance Level).
+// Empty string is allowed and means "unclassified."
+func ValidIAL(v string) bool {
+	switch v {
+	case "", IAL1, IAL2, IAL3:
+		return true
+	}
+	return false
+}
+
 // IsUsable reports whether an identity in this status can authenticate and receive tokens.
 func (s IdentityStatus) IsUsable() bool {
 	return s == IdentityStatusActive
@@ -248,6 +296,26 @@ type Identity struct {
 	// It is never embedded in issued tokens. For authorization-relevant
 	// data, use AllowedScopes or Capabilities.
 	Metadata json.RawMessage `bun:"metadata,type:jsonb"          json:"metadata"`
+
+	// Risk + assurance metadata. Optional classification fields aligned with
+	// vendor-neutral standards bodies; consumed by future default-policy
+	// selection (e.g. shorter TTL for high-risk agents, mandatory attestation
+	// above IAL-2). Empty string means "unclassified" and is the safe default
+	// for existing rows.
+	//
+	// CapabilityTier and RiskTier follow the CoSAI Agentic IAM §3.2
+	// capability–risk matrix (low × high crossed both axes).
+	// IAL follows NIST SP 800-63 Identity Assurance Levels (referenced in
+	// CoSAI §3.5).
+	//
+	// Spec: https://github.com/cosai-oasis/ws4-secure-design-agentic-systems/blob/main/agentic-identity-and-access-control.md
+	//
+	// `nullzero` so an empty Go string round-trips as SQL NULL — the CHECK
+	// constraint on each column accepts NULL or one of the enum values, so
+	// "" would otherwise violate it.
+	CapabilityTier string `bun:"capability_tier,type:varchar(20),nullzero" json:"capability_tier,omitempty"`
+	RiskTier       string `bun:"risk_tier,type:varchar(20),nullzero"       json:"risk_tier,omitempty"`
+	IAL            string `bun:"ial,type:varchar(20),nullzero"             json:"ial,omitempty"`
 
 	// Lifecycle
 	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`

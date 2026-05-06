@@ -111,6 +111,11 @@ type RegisterIdentityRequest struct {
 	// policy is assigned. Must exist within the caller's tenant; cross-tenant
 	// IDs are rejected with ErrPolicyNotFound.
 	CredentialPolicyID string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63).
+	// Empty strings are valid and mean "unclassified."
+	CapabilityTier string
+	RiskTier       string
+	IAL            string
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -161,6 +166,15 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
 		return nil, err
 	}
+	if !domain.ValidCapabilityTier(req.CapabilityTier) {
+		return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.CapabilityTier)
+	}
+	if !domain.ValidRiskTier(req.RiskTier) {
+		return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.RiskTier)
+	}
+	if !domain.ValidIAL(req.IAL) {
+		return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, req.IAL)
+	}
 
 	// Resolve the identity policy: a caller-supplied policy ID must be
 	// tenant-scoped (IDOR guard via GetPolicy). When absent, assign the
@@ -193,6 +207,9 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		Capabilities:       req.Capabilities,
 		Labels:             req.Labels,
 		Metadata:           req.Metadata,
+		CapabilityTier:     req.CapabilityTier,
+		RiskTier:           req.RiskTier,
+		IAL:                req.IAL,
 		CreatedBy:          req.CreatedBy,
 		CreatedAt:          time.Now(),
 		UpdatedAt:          time.Now(),
@@ -254,6 +271,12 @@ type UpdateIdentityRequest struct {
 	// "clear to tenant default". A non-empty value must exist in the caller's
 	// tenant; an empty string reassigns the tenant default.
 	CredentialPolicyID *string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63). Pointer
+	// so callers can distinguish "not set" from "clear to unclassified" via
+	// an explicit empty-string assignment.
+	CapabilityTier *string
+	RiskTier       *string
+	IAL            *string
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -328,6 +351,24 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			return nil, err
 		}
 		identity.CredentialPolicyID = policyID
+	}
+	if req.CapabilityTier != nil {
+		if !domain.ValidCapabilityTier(*req.CapabilityTier) {
+			return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.CapabilityTier)
+		}
+		identity.CapabilityTier = *req.CapabilityTier
+	}
+	if req.RiskTier != nil {
+		if !domain.ValidRiskTier(*req.RiskTier) {
+			return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.RiskTier)
+		}
+		identity.RiskTier = *req.RiskTier
+	}
+	if req.IAL != nil {
+		if !domain.ValidIAL(*req.IAL) {
+			return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, *req.IAL)
+		}
+		identity.IAL = *req.IAL
 	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
