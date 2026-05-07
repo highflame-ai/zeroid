@@ -37,12 +37,23 @@ type JWKSClient struct {
 	keySet jwk.Set
 	kids   map[string]struct{} // known key IDs for fast miss detection
 
-	// loadMu serializes first-fetch attempts when the cache is cold so
-	// concurrent verify() calls don't each issue a separate JWKS request.
-	loadMu sync.Mutex
+	// loadMu guards loadInFlight so concurrent EnsureLoaded callers either
+	// elect a single leader (cold cache, no fetch in flight) or attach to
+	// an existing leader's broadcast channel.
+	loadMu       sync.Mutex
+	loadInFlight *jwksFetch
 
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// jwksFetch is the broadcast handle for an in-flight cold-cache fetch.
+// The leader runs the fetch with its own fresh context; followers wait on
+// done with their own ctx so they can return on their own deadline rather
+// than blocking on whatever timeout the leader chose.
+type jwksFetch struct {
+	done chan struct{} // closed when the fetch completes
+	err  error         // populated before close(done); read-only after
 }
 
 // JWKSOption configures a JWKSClient.
@@ -148,8 +159,12 @@ func (c *JWKSClient) HasKID(kid string) bool {
 // This is the lazy path used on the first Verify() call when the initial
 // fetch from NewJWKSClient failed (e.g., the issuer's pod was still starting).
 //
-// Concurrent callers coalesce on a single fetch via loadMu so the cold path
-// issues at most one JWKS request even under verify-storms.
+// Concurrent callers coalesce on a single fetch: exactly one leader runs the
+// network request, the rest wait on a broadcast channel. Each waiter respects
+// its own ctx — a caller with a 100ms deadline returns on its deadline rather
+// than blocking up to requestTimeout for the leader. The fetch itself runs
+// with a fresh context so one caller's cancellation doesn't break the result
+// for the others.
 //
 // Returns nil if the cache is populated (already, or by this call).
 func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
@@ -158,15 +173,48 @@ func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
 	}
 
 	c.loadMu.Lock()
-	defer c.loadMu.Unlock()
-
-	// Re-check under the lock — another goroutine may have populated the
-	// cache while we were queued.
 	if c.populated() {
+		c.loadMu.Unlock()
 		return nil
 	}
 
-	return c.refresh(ctx)
+	leader := c.loadInFlight == nil
+	if leader {
+		c.loadInFlight = &jwksFetch{done: make(chan struct{})}
+	}
+	fetch := c.loadInFlight
+	c.loadMu.Unlock()
+
+	if leader {
+		// Run with a fresh context detached from any single caller. If the
+		// caller that triggered the fetch cancels mid-flight, the result is
+		// still useful to every other waiter, so we use requestTimeout as
+		// the upper bound and let net/http handle cancellation cleanly.
+		fetchCtx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+		fetch.err = c.refresh(fetchCtx)
+		cancel()
+
+		// Clear in-flight before broadcasting so a subsequent cold-start
+		// (e.g., this fetch failed and a later caller retries) elects a
+		// fresh leader instead of attaching to the stale handle.
+		c.loadMu.Lock()
+		c.loadInFlight = nil
+		c.loadMu.Unlock()
+
+		close(fetch.done)
+		return fetch.err
+	}
+
+	// Follower path. Wait for the leader, but only as long as our own ctx
+	// allows. Returning early here does NOT cancel the leader's fetch —
+	// the leader keeps going on its detached context and serves whichever
+	// other followers are still around to consume the result.
+	select {
+	case <-fetch.done:
+		return fetch.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // populated reports whether the cache currently holds at least one key.

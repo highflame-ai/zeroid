@@ -755,6 +755,65 @@ func TestVerify_LazyFetchOnFirstUse(t *testing.T) {
 	assertEqual(t, "AccountID", claims.AccountID, "acc-001")
 }
 
+// TestEnsureLoaded_FollowersRespectContext verifies that when one caller is
+// already running the cold-cache fetch, a second caller with a tighter
+// deadline returns on its own deadline rather than blocking up to the full
+// fetch timeout.
+func TestEnsureLoaded_FollowersRespectContext(t *testing.T) {
+	// Server: first request fails fast (503) so NewJWKSClient's best-effort
+	// warmup doesn't block the test setup. Subsequent requests — the
+	// leader's lazy fetch — hang on `block` until cleanup unblocks them.
+	block := make(chan struct{})
+	served := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if served.Add(1) == 1 {
+			http.Error(w, "warming up", http.StatusServiceUnavailable)
+			return
+		}
+		<-block
+	}))
+	// Cleanups run LIFO; we register srv.Close first so close(block) runs
+	// before it — otherwise srv.Close blocks forever on the hanging handler's
+	// goroutine and the test deadlocks.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(block) })
+
+	c, err := authjwt.NewJWKSClient(srv.URL, authjwt.WithRequestTimeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("NewJWKSClient: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	// Leader: starts the (now-hanging) lazy fetch in a goroutine.
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_ = c.EnsureLoaded(context.Background())
+	}()
+
+	// Beat to let the leader actually issue its HTTP request and register
+	// loadInFlight before the follower joins.
+	time.Sleep(50 * time.Millisecond)
+
+	// Follower: 100ms deadline. Must return on its own deadline, not block
+	// for the leader's full requestTimeout (2s here, 10s in production).
+	followerCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = c.EnsureLoaded(followerCtx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got: %v", err)
+	}
+	// Generous upper bound to absorb CI jitter while still ruling out the
+	// "stuck behind leader's full fetch timeout" failure mode.
+	if elapsed > 1*time.Second {
+		t.Fatalf("follower stuck for %s; expected ~100ms (leader's fetch should not block follower's ctx)", elapsed)
+	}
+}
+
 // Helpers
 
 func assertEqual(t *testing.T, field, got, want string) {
