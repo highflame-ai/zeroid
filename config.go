@@ -338,9 +338,10 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// Attestation
 		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
 
-		// Telemetry — only OTEL_ENABLED is mapped here. OTEL_EXPORTER_OTLP_ENDPOINT
-		// and TLS settings are read directly by the OTel SDK (spec-compliant).
-		"OTEL_ENABLED": "telemetry.enabled",
+		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
+		// directly by the OTel SDK (spec-compliant).
+		"OTEL_ENABLED":            "telemetry.enabled",
+		"OTEL_TRACES_SAMPLER_ARG": "telemetry.sampling_rate",
 
 		// Logging
 		"ZEROID_LOG_LEVEL": "logging.level",
