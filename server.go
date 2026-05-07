@@ -99,8 +99,6 @@ func NewServer(cfg Config) (*Server, error) {
 	// Initialize OpenTelemetry.
 	if err := telemetry.Init(telemetry.Config{
 		Enabled:      cfg.Telemetry.Enabled,
-		Endpoint:     cfg.Telemetry.Endpoint,
-		Insecure:     cfg.Telemetry.Insecure,
 		ServiceName:  cfg.Telemetry.ServiceName,
 		SamplingRate: cfg.Telemetry.SamplingRate,
 	}); err != nil {

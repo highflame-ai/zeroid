@@ -17,15 +17,13 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Config mirrors the telemetry section of the service config.
+// Endpoint and TLS are read by the OTel SDK from standard env vars
+// (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, etc.).
 type Config struct {
 	Enabled      bool
-	Endpoint     string
-	Insecure     bool
 	ServiceName  string
 	SamplingRate float64
 }
@@ -83,16 +81,6 @@ func Init(cfg Config) error {
 
 	ctx := context.Background()
 
-	// Shared gRPC connection to the OTEL Collector.
-	var dialOpts []grpc.DialOption
-	if cfg.Insecure {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
-	conn, err := grpc.NewClient(cfg.Endpoint, dialOpts...)
-	if err != nil {
-		return fmt.Errorf("otel grpc dial: %w", err)
-	}
-
 	res, err := resource.New(ctx,
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String(cfg.ServiceName),
@@ -103,8 +91,9 @@ func Init(cfg Config) error {
 		return fmt.Errorf("otel resource: %w", err)
 	}
 
-	// Traces
-	traceExporter, err := otlptracegrpc.New(ctx, otlptracegrpc.WithGRPCConn(conn))
+	// Traces — the SDK reads OTEL_EXPORTER_OTLP_ENDPOINT (with scheme)
+	// and handles TLS negotiation per the OTel spec.
+	traceExporter, err := otlptracegrpc.New(ctx)
 	if err != nil {
 		return fmt.Errorf("otel trace exporter: %w", err)
 	}
@@ -121,8 +110,8 @@ func Init(cfg Config) error {
 	)
 	otel.SetTracerProvider(tracerProvider)
 
-	// Metrics
-	metricExporter, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithGRPCConn(conn))
+	// Metrics — same SDK-managed env var handling as traces.
+	metricExporter, err := otlpmetricgrpc.New(ctx)
 	if err != nil {
 		return fmt.Errorf("otel metric exporter: %w", err)
 	}
