@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +21,19 @@ import (
 // token. ZeroID dispatches token-exchange requests carrying this type to the
 // direct-federation path (issue #88) instead of the broker path.
 const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
+
+// ErrUnknownExternalIssuer is returned when a token-exchange request carries
+// an upstream `iss` that is not in the deployer-configured external_issuers
+// allowlist. Wrapped onto the *OAuthError so callers can branch with
+// errors.Is while the handler still maps the OAuth error code via errors.As.
+//
+// We classify this as `invalid_request` (RFC 6749 §5.2) rather than
+// `invalid_grant`: the token may be perfectly valid against its real issuer;
+// the failure is that the deployer has not configured this IdP. Per the RFC,
+// `invalid_grant` covers credentials that "are invalid, expired, revoked"
+// against a trust config the server does have — not credentials whose issuer
+// the server has never been told to trust.
+var ErrUnknownExternalIssuer = errors.New("issuer is not a configured external issuer")
 
 // SetExternalIssuerRegistry installs a registry of trusted external IdPs.
 // Must be set before /oauth2/token requests with subject_token_type=id_token
@@ -73,8 +88,14 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if entry == nil {
 		// Unknown issuer — invalid_request, not invalid_grant: the deployer
 		// has not configured this IdP, which is a configuration mismatch
-		// rather than a credential failure.
-		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("issuer %s is not a configured external issuer", upstreamIss))
+		// rather than a credential failure. Wrap ErrUnknownExternalIssuer as
+		// the cause so callers can errors.Is while the handler still picks up
+		// the OAuth error code via errors.As on *OAuthError.
+		return nil, oauthBadRequestCause(
+			"invalid_request",
+			fmt.Sprintf("issuer %s is not a configured external issuer", upstreamIss),
+			fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, upstreamIss),
+		)
 	}
 	cfg := entry.Config
 
@@ -169,10 +190,10 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	// Caller-provided AdditionalClaims pass through the same blocklist as
-	// the broker path. user_id_iss is reserved (added below the blocklist
-	// extension) so callers cannot spoof IdP provenance.
+	// the broker path. user_id_iss is in reservedClaims so callers cannot
+	// spoof IdP provenance.
 	for k, v := range req.AdditionalClaims {
-		if reservedClaims[k] || k == "user_id_iss" {
+		if reservedClaims[k] {
 			continue
 		}
 		customClaims[k] = v
@@ -250,9 +271,15 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 	case string:
 		return tv, true
 	case float64:
-		return fmt.Sprintf("%v", tv), true
+		// %v / %g switch to scientific notation for large floats
+		// (1.23e+18), which would silently corrupt large numeric subject
+		// identifiers. FormatFloat with 'f' keeps a plain decimal. Note
+		// that float64 still loses integer precision past 2^53; an IdP
+		// that mints subjects above that range is the one violating the
+		// JWT/JSON contract — we just don't add a second bug on top.
+		return strconv.FormatFloat(tv, 'f', -1, 64), true
 	case int64:
-		return fmt.Sprintf("%d", tv), true
+		return strconv.FormatInt(tv, 10), true
 	}
 	return "", false
 }

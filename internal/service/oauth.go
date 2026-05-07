@@ -68,7 +68,7 @@ var reservedClaims = map[string]bool{
 	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
-	"act": true, "token_exchange": true, "trusted_by": true,
+	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
