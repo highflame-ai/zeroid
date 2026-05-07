@@ -37,6 +37,10 @@ type JWKSClient struct {
 	keySet jwk.Set
 	kids   map[string]struct{} // known key IDs for fast miss detection
 
+	// loadMu serializes first-fetch attempts when the cache is cold so
+	// concurrent verify() calls don't each issue a separate JWKS request.
+	loadMu sync.Mutex
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -79,9 +83,20 @@ func WithLogger(logger zerolog.Logger) JWKSOption {
 }
 
 // NewJWKSClient creates a JWKS client that fetches keys from the given URL.
-// It performs an initial fetch synchronously and starts a background refresh goroutine.
-// Call Close() to stop the background refresh.
+//
+// It attempts a best-effort initial fetch with the configured request timeout,
+// but does NOT fail if the endpoint is unreachable: a transient cross-service
+// startup race (e.g., the issuer's pod hasn't bound its TCP listener yet) used
+// to crash callers and is now papered over by the background refresh loop and
+// by EnsureLoaded(), which is invoked lazily on the first Verify() call.
+//
+// Returns an error only for config-level problems (empty URL). Call Close()
+// to stop the background refresh.
 func NewJWKSClient(jwksURL string, opts ...JWKSOption) (*JWKSClient, error) {
+	if jwksURL == "" {
+		return nil, fmt.Errorf("authjwt: JWKSURL is required")
+	}
+
 	c := &JWKSClient{
 		jwksURL:         jwksURL,
 		refreshInterval: defaultRefreshInterval,
@@ -96,9 +111,15 @@ func NewJWKSClient(jwksURL string, opts ...JWKSOption) (*JWKSClient, error) {
 		opt(c)
 	}
 
-	// Initial synchronous fetch — fail fast if JWKS is unreachable.
+	// Best-effort warm-up. A failure here is not fatal: the issuer may be
+	// starting in parallel (kind/CI bootstrap, regional failover, simultaneous
+	// rolling restart). EnsureLoaded() will retry synchronously on the first
+	// Verify() and the background refresh loop will catch it on its next tick.
 	if err := c.refresh(context.Background()); err != nil {
-		return nil, fmt.Errorf("authjwt: initial JWKS fetch from %s failed: %w", jwksURL, err)
+		c.logger.Warn().
+			Err(err).
+			Str("url", jwksURL).
+			Msg("initial JWKS fetch failed; continuing — will retry on first verify and via background refresh")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -121,6 +142,38 @@ func (c *JWKSClient) HasKID(kid string) bool {
 	defer c.mu.RUnlock()
 	_, ok := c.kids[kid]
 	return ok
+}
+
+// EnsureLoaded fetches the JWKS synchronously if the local cache is empty.
+// This is the lazy path used on the first Verify() call when the initial
+// fetch from NewJWKSClient failed (e.g., the issuer's pod was still starting).
+//
+// Concurrent callers coalesce on a single fetch via loadMu so the cold path
+// issues at most one JWKS request even under verify-storms.
+//
+// Returns nil if the cache is populated (already, or by this call).
+func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
+	if c.populated() {
+		return nil
+	}
+
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+
+	// Re-check under the lock — another goroutine may have populated the
+	// cache while we were queued.
+	if c.populated() {
+		return nil
+	}
+
+	return c.refresh(ctx)
+}
+
+// populated reports whether the cache currently holds at least one key.
+func (c *JWKSClient) populated() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.keySet != nil && c.keySet.Len() > 0
 }
 
 // RefreshIfMissing triggers an immediate JWKS refresh if the given kid is not

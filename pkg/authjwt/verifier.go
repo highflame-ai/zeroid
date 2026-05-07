@@ -72,7 +72,11 @@ type VerifierConfig struct {
 }
 
 // NewVerifier creates a Verifier that validates tokens against a remote JWKS.
-// Performs an initial synchronous JWKS fetch — returns error if unreachable.
+//
+// Returns an error only for config-level problems (empty JWKSURL). The initial
+// JWKS fetch is best-effort — if the issuer is briefly unreachable at startup
+// (cross-service race during cluster bootstrap), the verifier still returns
+// successfully and the JWKS will be fetched lazily on the first Verify() call.
 // Call Close() to release resources.
 func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 	if cfg.JWKSURL == "" {
@@ -128,7 +132,17 @@ func (v *Verifier) Verify(ctx context.Context, tokenString string) (*Claims, err
 func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, error) {
 	keySet := v.jwks.KeySet()
 	if keySet == nil || keySet.Len() == 0 {
-		return nil, ErrNoKeySet
+		// Cold path: the initial fetch failed (or hasn't run yet) and no
+		// background refresh has populated the cache. Try once synchronously
+		// before failing the verification — this is the lazy fetch that lets
+		// startup races resolve themselves on first use.
+		if err := v.jwks.EnsureLoaded(ctx); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrNoKeySet, err)
+		}
+		keySet = v.jwks.KeySet()
+		if keySet == nil || keySet.Len() == 0 {
+			return nil, ErrNoKeySet
+		}
 	}
 
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.

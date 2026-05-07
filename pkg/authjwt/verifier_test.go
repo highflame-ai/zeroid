@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -687,6 +688,71 @@ func TestVerifyRealTime(t *testing.T) {
 		}
 		assertEqual(t, "AccountID", claims.AccountID, "acc-001")
 	})
+}
+
+// TestNewVerifier_StartsWithUnreachableJWKS verifies that a transient
+// startup race (issuer not yet listening) no longer crashes the caller.
+// NewVerifier must succeed; the verifier is usable once the issuer
+// comes up.
+func TestNewVerifier_StartsWithUnreachableJWKS(t *testing.T) {
+	// Stand up a server, capture its URL, then close it so the URL is dead.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	v, err := authjwt.NewVerifier(authjwt.VerifierConfig{JWKSURL: deadURL})
+	if err != nil {
+		t.Fatalf("NewVerifier with unreachable JWKS should not error, got: %v", err)
+	}
+	t.Cleanup(v.Close)
+}
+
+// TestVerify_LazyFetchOnFirstUse simulates the cluster-bootstrap race:
+// NewVerifier is called while the issuer is still starting (server returns
+// errors), then the issuer comes up and the first Verify() call must
+// succeed via lazy fetch — no restart required.
+func TestVerify_LazyFetchOnFirstUse(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+
+	// Wrap the test JWKS server in a switchable proxy: 503 until ready=true.
+	var ready atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+			return
+		}
+		// Forward to the real test JWKS server.
+		w.Header().Set("Content-Type", "application/json")
+		// Re-encode the keyset directly — cheaper than chaining through net/http.
+		_ = json.NewEncoder(w).Encode(ks.set)
+	}))
+	defer proxy.Close()
+
+	v, err := authjwt.NewVerifier(authjwt.VerifierConfig{
+		JWKSURL: proxy.URL,
+		Issuer:  issuer,
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	defer v.Close()
+
+	// Issuer is still "starting" — verify must fail cleanly with ErrNoKeySet,
+	// not crash, not hang past the request timeout.
+	token := ks.signRS256(t, baseClaims(issuer))
+	if _, err := v.Verify(context.Background(), token); !errors.Is(err, authjwt.ErrNoKeySet) {
+		t.Fatalf("expected ErrNoKeySet while issuer down, got: %v", err)
+	}
+
+	// Issuer comes up. The next Verify() must lazy-fetch and succeed
+	// without any external trigger (no Close+New, no manual refresh).
+	ready.Store(true)
+	claims, err := v.Verify(context.Background(), token)
+	if err != nil {
+		t.Fatalf("verify after issuer up: %v", err)
+	}
+	assertEqual(t, "AccountID", claims.AccountID, "acc-001")
 }
 
 // Helpers
