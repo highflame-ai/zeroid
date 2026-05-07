@@ -105,6 +105,7 @@ func runTests(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "get connection string: %v\n", err)
 		return 1
 	}
+	sharedDBURL = dbURL // used by federation-test helpers (external_idp_test.go).
 
 	// Generate the server's ECDSA P-256 key pair and write to temp files.
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

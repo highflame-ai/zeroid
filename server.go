@@ -35,6 +35,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 	"github.com/highflame-ai/zeroid/internal/telemetry"
 	"github.com/highflame-ai/zeroid/internal/worker"
+	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
 // middlewareHolder stores an optional middleware in a thread-safe way.
@@ -90,9 +91,35 @@ type Server struct {
 	globalMWState   *middlewareHolder
 }
 
+// ServerOption configures NewServer. Provided for narrow build-time
+// concerns that can't reasonably be expressed in Config (e.g. injecting a
+// custom HTTP client into the external-issuer JWKS fetch path for tests).
+type ServerOption func(*serverOptions)
+
+// serverOptions is the internal accumulator behind ServerOption.
+type serverOptions struct {
+	externalIssuerJWKSOpts []authjwt.JWKSOption
+}
+
+// WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
+// external-issuer registry built inside NewServer. Intended primarily for
+// tests that need to bypass TLS verification when pointing the registry at
+// a fake JWKS server (httptest.NewTLSServer); production deployers should
+// not need this.
+func WithExternalIssuerJWKSOption(opt authjwt.JWKSOption) ServerOption {
+	return func(o *serverOptions) {
+		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
+	}
+}
+
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
 // repositories, services, handlers, and the HTTP router.
-func NewServer(cfg Config) (*Server, error) {
+func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
+	options := serverOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	initLogging(cfg.Logging.Level)
 
 	if err := cfg.Validate(); err != nil {
@@ -209,7 +236,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// rather than the first token-exchange request.
 	var externalIssuerRegistry *service.ExternalIssuerRegistry
 	if len(cfg.ExternalIssuers) > 0 {
-		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers)
+		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers, options.externalIssuerJWKSOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize external OIDC issuer registry (issue #88): %w", err)
 		}
