@@ -12,6 +12,8 @@ import (
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -30,6 +32,13 @@ type Config struct {
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+
+	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
+	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
+	// looks up the upstream iss in this list, fetches the issuer's JWKS, and
+	// verifies the ID token before minting a ZeroID token. Empty list (default)
+	// disables direct federation — only the broker path remains available.
+	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -176,6 +185,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Database.MaxIdleConns < 0 || c.Database.MaxIdleConns > c.Database.MaxOpenConns {
 		return fmt.Errorf("database.max_idle_conns must be between 0 and max_open_conns, got %d", c.Database.MaxIdleConns)
+	}
+	seen := make(map[string]struct{}, len(c.ExternalIssuers))
+	for i := range c.ExternalIssuers {
+		c.ExternalIssuers[i].Defaults()
+		if err := c.ExternalIssuers[i].Validate(); err != nil {
+			return fmt.Errorf("external_issuers[%d]: %w", i, err)
+		}
+		iss := c.ExternalIssuers[i].Issuer
+		if _, dup := seen[iss]; dup {
+			return fmt.Errorf("external_issuers[%d]: duplicate issuer %q", i, iss)
+		}
+		seen[iss] = struct{}{}
 	}
 	return nil
 }

@@ -73,6 +73,11 @@ type Server struct {
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
 
+	// External OIDC IdP federation (issue #88). Holds a JWKS client per
+	// configured trusted upstream issuer. Nil when no external_issuers are
+	// configured.
+	externalIssuerRegistry *service.ExternalIssuerRegistry
+
 	// Cleanup
 	cleanupWorker *worker.CleanupWorker
 	workerCancel  context.CancelFunc
@@ -178,6 +183,22 @@ func NewServer(cfg Config) (*Server, error) {
 		HMACSecret:     cfg.Token.HMACSecret,
 		AuthCodeIssuer: authCodeIssuer,
 	})
+
+	// Build the external-issuer registry when the deployer has configured
+	// trusted upstream IdPs. Synchronous initial JWKS fetches happen here so
+	// a misconfigured issuer (unreachable JWKS, bad TLS) fails startup
+	// rather than the first token-exchange request.
+	var externalIssuerRegistry *service.ExternalIssuerRegistry
+	if len(cfg.ExternalIssuers) > 0 {
+		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize external OIDC issuer registry (issue #88): %w", err)
+		}
+		oauthSvc.SetExternalIssuerRegistry(registry)
+		externalIssuerRegistry = registry
+		log.Info().Int("count", len(cfg.ExternalIssuers)).Msg("Direct OIDC IdP federation enabled")
+	}
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 
@@ -295,9 +316,10 @@ func NewServer(cfg Config) (*Server, error) {
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
 		agentSvc:            agentSvc,
-		jwksSvc:             jwksSvc,
-		refreshTokenSvc:     refreshTokenSvc,
-		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
+		jwksSvc:                jwksSvc,
+		refreshTokenSvc:        refreshTokenSvc,
+		externalIssuerRegistry: externalIssuerRegistry,
+		cleanupWorker:          worker.NewCleanupWorker(db, time.Hour),
 		adminAuthState:      authState,
 		globalMWState:       globalMW,
 		http: &http.Server{
@@ -362,6 +384,10 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.workerCancel != nil {
 		s.workerCancel()
+	}
+
+	if s.externalIssuerRegistry != nil {
+		s.externalIssuerRegistry.Close()
 	}
 
 	var firstErr error

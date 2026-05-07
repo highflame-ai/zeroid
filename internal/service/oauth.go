@@ -39,6 +39,11 @@ type OAuthService struct {
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
 	customGrants map[string]CustomGrantHandler
+	// externalIssuerRegistry resolves direct-federation token-exchange
+	// requests (subject_token_type=id_token) to a configured upstream IdP.
+	// Nil when no external_issuers are configured — direct federation is
+	// disabled in that case and only the broker path remains.
+	externalIssuerRegistry *ExternalIssuerRegistry
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -330,10 +335,21 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequest("invalid_request", "subject_token is required for token_exchange grant")
 	}
 
-	// RFC 8693 defines two exchange modes:
-	//   1. NHI delegation: subject_token (orchestrator) + actor_token (sub-agent) → delegated token
-	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
-	// Mode is determined by the presence of actor_token.
+	// RFC 8693 defines several exchange modes:
+	//   1. Direct OIDC federation (issue #88): subject_token_type=id_token →
+	//      ZeroID itself verifies the upstream IdP's signature against a
+	//      configured JWKS. The TrustedServiceValidator hook is *not* used —
+	//      this path is the trust anchor. Dispatch happens before the
+	//      actor_token check because direct federation never carries one.
+	//   2. NHI delegation: subject_token (orchestrator) + actor_token
+	//      (sub-agent) → delegated token.
+	//   3. External principal exchange (broker): subject_token from a
+	//      trusted upstream service → zeroid token. ZeroID gates on the
+	//      caller via TrustedServiceValidator and trusts the relay to
+	//      have done the IdP-side verification.
+	if req.SubjectTokenType == SubjectTokenTypeIDToken {
+		return s.externalIDTokenExchange(ctx, req)
+	}
 	if req.ActorToken == "" {
 		return s.ExternalPrincipalExchange(ctx, req)
 	}
