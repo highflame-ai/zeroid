@@ -26,6 +26,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
@@ -146,6 +147,7 @@ func NewServer(cfg Config) (*Server, error) {
 	identityRepo := postgres.NewIdentityRepository(db)
 	credentialRepo := postgres.NewCredentialRepository(db)
 	attestationRepo := postgres.NewAttestationRepository(db)
+	attestationPolicyRepo := postgres.NewAttestationPolicyRepository(db)
 	signalRepo := postgres.NewSignalRepository(db)
 	proofRepo := postgres.NewProofRepository(db)
 	oauthClientRepo := postgres.NewOAuthClientRepository(db)
@@ -154,6 +156,22 @@ func NewServer(cfg Config) (*Server, error) {
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
+
+	// Build the attestation verifier registry. Real verifiers are wired
+	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
+	// proof types have no real verifier yet, so the stub is the only way
+	// to exercise demo flows that submit them. Production deployments
+	// leave AllowUnsafeDevStub off and those proof types stay unimplemented.
+	attestationVerifiers := attestation.NewRegistry()
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	if cfg.Attestation.AllowUnsafeDevStub {
+		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeImageHash))
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeTPM))
+	}
+	log.Info().
+		Interface("proof_types", attestationVerifiers.ProofTypes()).
+		Msg("Attestation verifiers registered")
 
 	// Initialize services.
 	// Construction order matters because identitySvc now depends on
@@ -169,7 +187,8 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
+	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
@@ -205,7 +224,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
-		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
+		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
 		signalSvc, apiKeySvc, agentSvc, auditSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
@@ -474,6 +493,16 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fn = middleware
+}
+
+// SetAttestationPermissive flips the missing-policy bypass on the attestation
+// verify path at runtime. The initial value is taken from
+// cfg.Attestation.AllowUnsafeDevStub at NewServer time; this setter is the
+// escape hatch for integration tests that need to exercise both modes against
+// the same server instance. Production deployments should set the flag via
+// configuration and never call this.
+func (s *Server) SetAttestationPermissive(enabled bool) {
+	s.attestationSvc.SetPermissive(enabled)
 }
 
 // SetTrustedServiceValidator sets the validator used during external principal

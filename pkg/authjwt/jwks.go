@@ -3,13 +3,19 @@ package authjwt
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog"
 )
+
+// maxJWKSBodyBytes caps the JWKS response body to prevent a malicious or
+// compromised issuer from exhausting memory during a fetch. JWKS documents
+// are typically a few KB; 1 MiB is generous headroom.
+const maxJWKSBodyBytes = 1 << 20 // 1 MiB
 
 const (
 	defaultRefreshInterval = 5 * time.Minute
@@ -144,9 +150,29 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 	fetchCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
 
-	set, err := jwk.Fetch(fetchCtx, c.jwksURL, jwk.WithHTTPClient(c.httpClient))
+	// jwx v4 dropped jwk.Fetch / jwk.WithHTTPClient (the helper moved into
+	// the optional jwx-go/jwkfetch companion module). We already manage an
+	// http.Client here, so do the GET ourselves and feed the body into
+	// jwk.Parse — keeps the dependency footprint flat.
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, c.jwksURL, nil)
+	if err != nil {
+		return fmt.Errorf("build JWKS request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("fetch JWKS: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("JWKS endpoint returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBodyBytes))
+	if err != nil {
+		return fmt.Errorf("read JWKS body: %w", err)
+	}
+	set, err := jwk.Parse(body)
+	if err != nil {
+		return fmt.Errorf("parse JWKS: %w", err)
 	}
 
 	kids := make(map[string]struct{}, set.Len())
@@ -155,7 +181,11 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		kids[key.KeyID()] = struct{}{}
+		// jwx v4: KeyID() returns (string, present); the index loop is keyed
+		// on insertion order, so this is the cleanest way to get a kid string.
+		if kid, ok := key.KeyID(); ok {
+			kids[kid] = struct{}{}
+		}
 	}
 
 	c.mu.Lock()

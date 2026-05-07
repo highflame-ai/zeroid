@@ -104,6 +104,6 @@ func (a *API) verifyProofOp(ctx context.Context, input *VerifyProofInput) (*Veri
 
 	out := &VerifyProofOutput{}
 	out.Body.Valid = true
-	out.Body.Subject = token.Subject()
+	out.Body.Subject, _ = token.Subject()
 	return out, nil
 }

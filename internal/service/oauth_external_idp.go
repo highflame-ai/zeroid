@@ -2,15 +2,17 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 )
 
 // SubjectTokenTypeIDToken is the RFC 8693 subject_token_type for an OIDC ID
@@ -62,8 +64,8 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "subject_token is malformed", err)
 	}
-	upstreamIss := peeked.Issuer()
-	if upstreamIss == "" {
+	upstreamIss, ok := peeked.Issuer()
+	if !ok || upstreamIss == "" {
 		return nil, oauthBadRequest("invalid_grant", "subject_token missing iss claim")
 	}
 
@@ -121,8 +123,8 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// Stale-token cap. exp guards future-side; iat guards past-side. We
 	// require iat present and not older than max_token_age — the upstream
 	// signed it for a fresh authentication, not a replay from days ago.
-	iat := verified.IssuedAt()
-	if iat.IsZero() {
+	iat, iatPresent := verified.IssuedAt()
+	if !iatPresent || iat.IsZero() {
 		return nil, oauthBadRequest("invalid_grant", "subject_token missing iat claim")
 	}
 	if age := time.Since(iat); age > cfg.MaxTokenAge {
@@ -130,11 +132,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	// Claim mapping. user_id is required (validated at config load); other
-	// mappings are optional. Single-level keys only in v1.
-	rawClaims, err := verified.AsMap(ctx)
-	if err != nil {
-		return nil, oauthServerError("failed to read subject_token claims", err)
-	}
+	// mappings are optional. Single-level keys only in v1. v4 dropped AsMap,
+	// so iterate Keys()/Get() to materialize a plain map.
+	rawClaims := tokenClaimsAsMap(verified)
 	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
 	if !ok || userID == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", cfg.ClaimMapping["user_id"]))
@@ -257,35 +257,18 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 	return "", false
 }
 
-// checkExternalIDTokenAlg enforces the issuer's algorithm allow-list against
-// the JWS protected header. Defense-in-depth — Parse will already reject a
-// bad-key/bad-alg combo, but reading the header explicitly lets us refuse
-// "none", HS256, or anything outside the configured RS/ES/PS family up
-// front.
+// checkExternalIDTokenAlg enforces the JWT-SVID §3 asymmetric allow-list
+// (via jwtalg.Validate — also rejects alg=none and HS*) and then narrows
+// further if the deployer configured a per-issuer allow-list. Runs before
+// any signature work so a bad alg dies up front.
 func checkExternalIDTokenAlg(tokenStr string, allowed []string) error {
-	msg, err := jws.Parse([]byte(tokenStr))
-	if err != nil {
-		return fmt.Errorf("parse JWS: %w", err)
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return err
 	}
-	sigs := msg.Signatures()
-	if len(sigs) == 0 {
-		return fmt.Errorf("subject_token has no signatures")
-	}
-	alg := string(sigs[0].ProtectedHeaders().Algorithm())
-
-	// Hard whitelist of secure asymmetric algorithms — the configured list
-	// is an additional narrowing on top, never a widening.
-	switch jwa.SignatureAlgorithm(alg) {
-	case jwa.RS256, jwa.RS384, jwa.RS512,
-		jwa.ES256, jwa.ES384, jwa.ES512,
-		jwa.PS256, jwa.PS384, jwa.PS512:
-	default:
-		return fmt.Errorf("alg %q is not a supported asymmetric signing algorithm", alg)
-	}
-
 	if len(allowed) == 0 {
 		return nil
 	}
+	alg := readJWSAlg(tokenStr)
 	for _, a := range allowed {
 		if a == alg {
 			return nil
@@ -294,18 +277,60 @@ func checkExternalIDTokenAlg(tokenStr string, allowed []string) error {
 	return fmt.Errorf("alg %q not in issuer allow-list %v", alg, allowed)
 }
 
-// extractJWSKeyID reads kid from a JWS protected header without verifying.
+// extractJWSKeyID reads kid from a JWT protected header without verifying.
 // Returns "" if the header is unreadable. Used to drive a one-shot JWKS
 // refresh after a verification failure that might be caused by upstream key
 // rotation.
 func extractJWSKeyID(tokenStr string) string {
-	msg, err := jws.Parse([]byte(tokenStr))
+	hdr, ok := decodeJWTHeader(tokenStr)
+	if !ok {
+		return ""
+	}
+	return hdr.Kid
+}
+
+// readJWSAlg returns the alg header value or "" when the header is
+// unreadable. Used by the per-issuer allow-list comparison; jwtalg.Validate
+// already guarantees alg is present and asymmetric by the time we get here.
+func readJWSAlg(tokenStr string) string {
+	hdr, ok := decodeJWTHeader(tokenStr)
+	if !ok {
+		return ""
+	}
+	return hdr.Alg
+}
+
+type jwtHeader struct {
+	Alg string `json:"alg"`
+	Kid string `json:"kid"`
+}
+
+// tokenClaimsAsMap materializes every claim on a v4 jwt.Token into a plain
+// map[string]any. v4 dropped AsMap, so we iterate Claims() (an iter.Seq2).
+// Used for claim-mapping lookups and propagation passes.
+func tokenClaimsAsMap(t jwt.Token) map[string]any {
+	out := make(map[string]any, len(t.Keys()))
+	for k, v := range t.Claims() {
+		out[k] = v
+	}
+	return out
+}
+
+// decodeJWTHeader base64url-decodes the protected header of a compact JWS
+// without doing any signature work. Mirrors the technique used in
+// internal/jwtalg so we stay independent of the jwx major version.
+func decodeJWTHeader(tokenStr string) (jwtHeader, bool) {
+	header, _, found := strings.Cut(tokenStr, ".")
+	if !found || header == "" {
+		return jwtHeader{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(header)
 	if err != nil {
-		return ""
+		return jwtHeader{}, false
 	}
-	sigs := msg.Signatures()
-	if len(sigs) == 0 {
-		return ""
+	var hdr jwtHeader
+	if err := json.Unmarshal(raw, &hdr); err != nil {
+		return jwtHeader{}, false
 	}
-	return sigs[0].ProtectedHeaders().KeyID()
+	return hdr, true
 }

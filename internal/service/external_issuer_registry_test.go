@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
@@ -48,12 +48,12 @@ func newFakeJWKSServer(t *testing.T, kid string) *fakeJWKSServer {
 		t.Fatalf("generate ec key: %v", err)
 	}
 	keySet := jwk.NewSet()
-	pub, err := jwk.FromRaw(&priv.PublicKey)
+	pub, err := jwk.Import[jwk.Key](&priv.PublicKey)
 	if err != nil {
-		t.Fatalf("jwk.FromRaw: %v", err)
+		t.Fatalf("jwk.Import: %v", err)
 	}
 	_ = pub.Set(jwk.KeyIDKey, kid)
-	_ = pub.Set(jwk.AlgorithmKey, jwa.ES256)
+	_ = pub.Set(jwk.AlgorithmKey, jwa.ES256())
 	_ = pub.Set(jwk.KeyUsageKey, jwk.ForSignature)
 	_ = keySet.AddKey(pub)
 

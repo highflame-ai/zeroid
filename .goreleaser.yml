@@ -29,12 +29,51 @@ checksum:
   name_template: checksums.txt
   algorithm: sha256
 
+# Goreleaser owns the GitHub Release body. The workflow trigger is
+# `release: published`, so a human (or `gh release create`) creates the
+# release first; goreleaser then runs and rewrites the body with the
+# grouped changelog below. `mode: replace` is required because the
+# default (`keep-existing`) leaves the human's --generate-notes content
+# in place — which is what produced the ungrouped, prefix-blind release
+# bodies on v1.1.4 → v1.1.15.
+release:
+  mode: replace
+
 changelog:
   sort: asc
+  use: git
   filters:
     exclude:
       - "^docs:"
       - "^test:"
       - "^chore:"
+      - "^style:"
+      - "^ci:"
       - "Merge pull request"
       - "Merge branch"
+      - "^Revert "
+  # Groups map our enforced commit-prefix convention
+  # (highflame-workflow's pr-check regex:
+  # `^(feat:|fix:|devops:|Merge|Revert|build\(deps\)|\[Snyk\]|Bump)`)
+  # into per-section release notes. `order` controls section order in the
+  # output; the catch-all `Other Changes` group at order 999 absorbs
+  # anything that slipped past the regex (e.g. older `refactor:` commits
+  # from before the prefix gate).
+  groups:
+    - title: Features
+      regexp: '^feat(\(.*\))?:'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^fix(\(.*\))?:'
+      order: 1
+    - title: Dependencies
+      regexp: '^(build\(deps\)|\[Snyk\]|Bump )'
+      order: 2
+    - title: DevOps
+      regexp: '^devops(\(.*\))?:'
+      order: 3
+    - title: Refactoring
+      regexp: '^refactor(\(.*\))?:'
+      order: 4
+    - title: Other Changes
+      order: 999

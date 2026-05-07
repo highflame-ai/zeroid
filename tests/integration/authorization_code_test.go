@@ -7,8 +7,8 @@ import (
 	"time"
 
 	zeroid "github.com/highflame-ai/zeroid"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -180,7 +180,7 @@ func TestAuthorizationCodeExpired(t *testing.T) {
 		Claim("scp", []string{"data:read"}).
 		Build()
 	require.NoError(t, err)
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256, []byte(testHMACSecret)))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte(testHMACSecret)))
 	require.NoError(t, err)
 	expiredCode := string(signed)
 

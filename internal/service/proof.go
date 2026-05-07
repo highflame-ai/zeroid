@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -50,7 +52,12 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 	_ = token.Set("account_id", identity.AccountID)
 	_ = token.Set("project_id", identity.ProjectID)
 
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey()))
+	// kid lets verifiers pick the right key from the JWKS; typ=JWT per
+	// JWT-SVID §3.
+	hdrs := jws.NewHeaders()
+	_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
+	_ = hdrs.Set(jws.TypeKey, "JWT")
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		return "", fmt.Errorf("failed to sign proof token: %w", err)
 	}
@@ -81,8 +88,12 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 
 // VerifyProofToken parses and validates a WIMSE Proof Token, then marks it as used to prevent replay.
 func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedAudience string) (jwt.Token, error) {
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, fmt.Errorf("proof token validation failed: %w", err)
+	}
 	parsed, err := jwt.Parse([]byte(tokenStr),
-		jwt.WithKey(jwa.ES256, s.jwksSvc.PublicKey()),
+		jwt.WithKey(jwa.ES256(), s.jwksSvc.PublicKey()),
 		jwt.WithValidate(true),
 		jwt.WithAudience(expectedAudience),
 	)
@@ -90,7 +101,7 @@ func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedA
 		return nil, fmt.Errorf("proof token validation failed: %w", err)
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 
 	// Check if already used (single-use enforcement).
 	pt, err := s.proofRepo.GetByJTI(ctx, jti)

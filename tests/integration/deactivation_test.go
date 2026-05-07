@@ -108,7 +108,7 @@ func TestDeactivationRevokesExistingCredentials(t *testing.T) {
 
 	// Mint two tokens so we can verify both get swept on deactivation.
 	tokens := make([]string, 0, 2)
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		r := post(t, "/oauth2/token", map[string]any{
 			"grant_type": "api_key",
 			"api_key":    reg.APIKey,

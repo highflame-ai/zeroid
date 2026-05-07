@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -261,7 +262,7 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 
 	// 2. Grant type in policy.allowed_grant_types (normalize for comparison)
 	normalizedGT := string(domain.NormalizeGrantType(string(req.GrantType)))
-	if !containsString(policy.AllowedGrantTypes, normalizedGT) {
+	if !slices.Contains(policy.AllowedGrantTypes, normalizedGT) {
 		return fmt.Errorf("%w: grant type %q is not permitted by policy (allowed: %v)", ErrPolicyViolation, req.GrantType, policy.AllowedGrantTypes)
 	}
 
@@ -431,13 +432,4 @@ func normalizeGrantTypes(gts []string) []string {
 		out[i] = string(domain.NormalizeGrantType(gt))
 	}
 	return out
-}
-
-func containsString(slice []string, s string) bool {
-	for _, v := range slice {
-		if v == s {
-			return true
-		}
-	}
-	return false
 }

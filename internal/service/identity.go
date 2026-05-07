@@ -20,6 +20,10 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
+// ErrInvalidIdentityField marks caller-fixable input errors on registration
+// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+var ErrInvalidIdentityField = errors.New("invalid identity field")
+
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
 	repo          *postgres.IdentityRepository
@@ -107,13 +111,15 @@ type RegisterIdentityRequest struct {
 	// policy is assigned. Must exist within the caller's tenant; cross-tenant
 	// IDs are rejected with ErrPolicyNotFound.
 	CredentialPolicyID string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63).
+	// Empty strings are valid and mean "unclassified."
+	CapabilityTier string
+	RiskTier       string
+	IAL            string
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
-	if req.AccountID == "" || req.ProjectID == "" || req.ExternalID == "" {
-		return nil, fmt.Errorf("accountID, projectID, and externalID are required")
-	}
 	if req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
@@ -125,6 +131,19 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if !req.IdentityType.Valid() {
 		return nil, fmt.Errorf("invalid identity_type: %s", req.IdentityType)
+	}
+	// Anything that lands in the WIMSE URI path needs to be SPIFFE-clean —
+	// otherwise we mint URIs strict verifiers reject, and a "/" in any of
+	// these fields silently shifts the path layout when parsed back out.
+	for _, f := range []struct{ name, value string }{
+		{"account_id", req.AccountID},
+		{"project_id", req.ProjectID},
+		{"external_id", req.ExternalID},
+		{"identity_type", string(req.IdentityType)},
+	} {
+		if err := domain.ValidateSPIFFEPathSegment(f.name, f.value); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
 	}
 	if req.SubType == "" && req.IdentityType == domain.IdentityTypeAgent {
 		req.SubType = domain.SubTypeToolAgent
@@ -146,6 +165,15 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
 		return nil, err
+	}
+	if !domain.ValidCapabilityTier(req.CapabilityTier) {
+		return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.CapabilityTier)
+	}
+	if !domain.ValidRiskTier(req.RiskTier) {
+		return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.RiskTier)
+	}
+	if !domain.ValidIAL(req.IAL) {
+		return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, req.IAL)
 	}
 
 	// Resolve the identity policy: a caller-supplied policy ID must be
@@ -179,6 +207,9 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		Capabilities:       req.Capabilities,
 		Labels:             req.Labels,
 		Metadata:           req.Metadata,
+		CapabilityTier:     req.CapabilityTier,
+		RiskTier:           req.RiskTier,
+		IAL:                req.IAL,
 		CreatedBy:          req.CreatedBy,
 		CreatedAt:          time.Now(),
 		UpdatedAt:          time.Now(),
@@ -240,6 +271,12 @@ type UpdateIdentityRequest struct {
 	// "clear to tenant default". A non-empty value must exist in the caller's
 	// tenant; an empty string reassigns the tenant default.
 	CredentialPolicyID *string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63). Pointer
+	// so callers can distinguish "not set" from "clear to unclassified" via
+	// an explicit empty-string assignment.
+	CapabilityTier *string
+	RiskTier       *string
+	IAL            *string
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -314,6 +351,24 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			return nil, err
 		}
 		identity.CredentialPolicyID = policyID
+	}
+	if req.CapabilityTier != nil {
+		if !domain.ValidCapabilityTier(*req.CapabilityTier) {
+			return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.CapabilityTier)
+		}
+		identity.CapabilityTier = *req.CapabilityTier
+	}
+	if req.RiskTier != nil {
+		if !domain.ValidRiskTier(*req.RiskTier) {
+			return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.RiskTier)
+		}
+		identity.RiskTier = *req.RiskTier
+	}
+	if req.IAL != nil {
+		if !domain.ValidIAL(*req.IAL) {
+			return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, *req.IAL)
+		}
+		identity.IAL = *req.IAL
 	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
