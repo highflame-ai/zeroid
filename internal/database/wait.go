@@ -92,8 +92,12 @@ func waitForPing(ctx context.Context, ping func(context.Context) error, opts Wai
 			Dur("next_retry", backoff).
 			Msg("dependency not yet reachable, retrying")
 
+		// time.NewTimer + Stop (not time.After) so we don't leak the
+		// underlying timer when waitCtx fires before the backoff elapses.
+		t := time.NewTimer(backoff)
 		select {
 		case <-waitCtx.Done():
+			t.Stop()
 			// Distinguish "we ran out of budget" from "caller cancelled us"
 			// for a clearer fatal log line at the call site.
 			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
@@ -101,7 +105,7 @@ func waitForPing(ctx context.Context, ping func(context.Context) error, opts Wai
 					attempt, opts.Budget, lastErr)
 			}
 			return fmt.Errorf("aborted while waiting for dependency: %w", waitCtx.Err())
-		case <-time.After(backoff):
+		case <-t.C:
 		}
 
 		backoff *= 2
