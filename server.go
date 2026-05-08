@@ -618,7 +618,11 @@ func initLogging(logLevel string) {
 func initDatabase(databaseURL string, maxOpenConns, maxIdleConns int) (*bun.DB, error) {
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(databaseURL)))
 
-	if err := sqldb.Ping(); err != nil {
+	// Tolerate transient cross-service startup races (postgres still
+	// binding 5432 while we boot in parallel) instead of fatal-quitting
+	// on first Ping. Bounded retry; genuine misconfig still surfaces
+	// after the budget elapses.
+	if err := database.WaitForReachable(context.Background(), sqldb, database.WaitOptions{}); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
