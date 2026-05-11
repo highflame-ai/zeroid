@@ -154,7 +154,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
 		}
 		if ttl > remaining {
-			log.Info().
+			// Debug level: a busy agent making frequent requests near its
+			// expiry would emit this on every issuance — that's normal
+			// near-end-of-life behavior, not something operators need
+			// flagged at Info. Enable debug logging when diagnosing
+			// surprises about shorter-than-expected token lifetimes.
+			log.Debug().
 				Str("identity_id", req.Identity.ID).
 				Int("requested_ttl", ttl).
 				Int("identity_remaining_seconds", remaining).
@@ -168,7 +173,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			return nil, nil, fmt.Errorf("%w: credential expired at %s", domain.ErrCredentialExpired, req.CredentialExpiresAt.Format(time.RFC3339))
 		}
 		if ttl > remaining {
-			log.Info().
+			log.Debug().
 				Str("identity_id", req.Identity.ID).
 				Int("requested_ttl", ttl).
 				Int("credential_remaining_seconds", remaining).

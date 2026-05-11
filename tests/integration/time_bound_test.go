@@ -562,19 +562,21 @@ func TestExpiringSoonEndpoint(t *testing.T) {
 	inSoon := uid("expiring-in-window")
 	soonReg := registerAgent(t, inSoon)
 	inTwoHrs := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
-	_, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+soonReg.AgentID), map[string]any{
+	resp, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+soonReg.AgentID), map[string]any{
 		"expires_at": inTwoHrs,
 	}, adminHeaders())
 	require.NoError(t, err)
+	_ = resp.Body.Close()
 
 	// Identity expiring in 30 days — outside the default 168h window.
 	outOfWindow := uid("expiring-far-future")
 	farReg := registerAgent(t, outOfWindow)
 	in30Days := time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	_, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+farReg.AgentID), map[string]any{
+	resp, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+farReg.AgentID), map[string]any{
 		"expires_at": in30Days,
 	}, adminHeaders())
 	require.NoError(t, err)
+	_ = resp.Body.Close()
 
 	// Identity with no expiry at all — must never appear.
 	neverExt := uid("never-expires")
