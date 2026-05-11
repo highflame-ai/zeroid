@@ -22,6 +22,12 @@ var ErrIdentityExpired = errors.New("identity_expired")
 // is suspended or deactivated. Same handler-mapping pattern.
 var ErrIdentityNotUsable = errors.New("identity is not usable")
 
+// ErrCredentialExpired is returned by IssueCredential when a per-credential
+// time bound (typically API key sk.ExpiresAt) has already passed. Same
+// handler-mapping pattern as the identity sentinels above — wrap with %w
+// at the service layer so handlers can errors.Is and map to 4xx.
+var ErrCredentialExpired = errors.New("credential_expired")
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Trust Level
 // ──────────────────────────────────────────────────────────────────────────────

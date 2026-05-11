@@ -165,7 +165,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.CredentialExpiresAt != nil {
 		remaining := int(req.CredentialExpiresAt.Sub(clampNow).Seconds())
 		if remaining <= 0 {
-			return nil, nil, fmt.Errorf("credential expired at %s", req.CredentialExpiresAt.Format(time.RFC3339))
+			return nil, nil, fmt.Errorf("%w: credential expired at %s", domain.ErrCredentialExpired, req.CredentialExpiresAt.Format(time.RFC3339))
 		}
 		if ttl > remaining {
 			log.Info().

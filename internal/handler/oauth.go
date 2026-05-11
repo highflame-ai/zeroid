@@ -84,6 +84,9 @@ func extractOAuthError(err error) (code, description string, status int) {
 	if errors.Is(err, domain.ErrIdentityNotUsable) {
 		return "invalid_grant", "identity is suspended or deactivated", http.StatusBadRequest
 	}
+	if errors.Is(err, domain.ErrCredentialExpired) {
+		return "invalid_grant", "credential_expired", http.StatusBadRequest
+	}
 	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
 }
 
