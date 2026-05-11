@@ -328,6 +328,12 @@ func NewServer(cfg Config) (*Server, error) {
 		},
 	}
 
+	// Wire the identity-expiry sweep into the cleanup worker. Done after
+	// Server construction so the worker holds a live IdentityService whose
+	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
+	// resolved.
+	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
+
 	return srv, nil
 }
 
@@ -494,6 +500,14 @@ func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
 // Router returns the chi.Router for custom route mounting.
 func (s *Server) Router() chi.Router {
 	return s.router
+}
+
+// RunCleanupOnce runs a single pass of the cleanup worker — credential /
+// proof / auth-code row deletes plus the identity-expiry sweep. Exposed so
+// integration tests can drive a deterministic sweep without spinning up
+// the periodic loop. Production callers should let Start manage timing.
+func (s *Server) RunCleanupOnce(ctx context.Context) {
+	s.cleanupWorker.RunOnce(ctx)
 }
 
 // SetHandler overrides the HTTP handler used by the server.

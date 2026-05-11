@@ -8,17 +8,38 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// CleanupWorker periodically removes expired issued_credentials and proof_tokens rows.
-// Running the cleanup prevents unbounded table growth since credentials have a finite TTL.
-// It is safe to run multiple instances concurrently — DELETE WHERE is idempotent.
+// IdentityExpirer is implemented by IdentityService.SweepExpiredIdentities.
+// Defined here so the worker package doesn't have to import service (which
+// would create a cycle: service → worker → service).
+type IdentityExpirer interface {
+	SweepExpiredIdentities(ctx context.Context) (int, error)
+}
+
+// CleanupWorker periodically removes expired issued_credentials, proof_tokens,
+// and auth_codes rows, and sweeps expired identities into status=deactivated
+// (which triggers the existing cascade in IdentityService.UpdateIdentity).
+// Running the cleanup prevents unbounded table growth since credentials have a
+// finite TTL. Safe to run multiple instances concurrently — DELETE WHERE is
+// idempotent and the identity-status transition is guarded by a fresh-
+// transition check inside UpdateIdentity.
 type CleanupWorker struct {
 	db       *bun.DB
+	expirer  IdentityExpirer
 	interval time.Duration
 }
 
 // NewCleanupWorker creates a cleanup worker with the given tick interval.
+// The identity-expiry sweep is wired separately via SetIdentityExpirer
+// after IdentityService is constructed.
 func NewCleanupWorker(db *bun.DB, interval time.Duration) *CleanupWorker {
 	return &CleanupWorker{db: db, interval: interval}
+}
+
+// SetIdentityExpirer installs the identity-expiry sweep callback. Nil
+// disables the sweep (the row-cleanup steps still run). Wired in server.go
+// after IdentityService is constructed.
+func (w *CleanupWorker) SetIdentityExpirer(e IdentityExpirer) {
+	w.expirer = e
 }
 
 // Run starts the cleanup loop and blocks until ctx is cancelled.
@@ -28,12 +49,12 @@ func (w *CleanupWorker) Run(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Run immediately on start, then on every tick.
-	w.runOnce(ctx)
+	w.RunOnce(ctx)
 
 	for {
 		select {
 		case <-ticker.C:
-			w.runOnce(ctx)
+			w.RunOnce(ctx)
 		case <-ctx.Done():
 			log.Info().Msg("Cleanup worker stopped")
 			return
@@ -41,7 +62,9 @@ func (w *CleanupWorker) Run(ctx context.Context) {
 	}
 }
 
-func (w *CleanupWorker) runOnce(ctx context.Context) {
+// RunOnce executes one cleanup pass. Exported so integration tests can
+// drive a deterministic sweep without spinning up the periodic loop.
+func (w *CleanupWorker) RunOnce(ctx context.Context) {
 	now := time.Now()
 
 	// Delete all expired credentials regardless of revocation status.
@@ -74,5 +97,14 @@ func (w *CleanupWorker) runOnce(ctx context.Context) {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired auth codes")
 	} else if n, err := authCodeRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired auth codes")
+	}
+
+	// Identity-expiry sweep. Runs after the row-deletes so that any tokens
+	// cascade-revoked by the sweep are recorded as revocations rather than
+	// being silently cleared by the credential-expiry delete above.
+	if w.expirer != nil {
+		if _, err := w.expirer.SweepExpiredIdentities(ctx); err != nil {
+			log.Error().Err(err).Msg("Cleanup: identity-expiry sweep failed")
+		}
 	}
 }

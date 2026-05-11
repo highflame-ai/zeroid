@@ -54,3 +54,12 @@ type APIKey struct {
 	CreatedAt          time.Time       `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt          time.Time       `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
+
+// IsExpired reports whether the API key has aged out. A nil ExpiresAt
+// means "no expiry" and is never expired.
+func (k *APIKey) IsExpired() bool {
+	if k == nil || k.ExpiresAt == nil {
+		return false
+	}
+	return !time.Now().Before(*k.ExpiresAt)
+}

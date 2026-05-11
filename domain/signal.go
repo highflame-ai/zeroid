@@ -17,6 +17,12 @@ const (
 	SignalTypePolicyViolation   SignalType = "policy_violation"
 	SignalTypeRetirement        SignalType = "retirement"
 	SignalTypeOwnerChange       SignalType = "owner_change"
+	// SignalTypeIdentityExpired fires when the cleanup worker deactivates
+	// an identity whose expires_at has passed. Kept distinct from
+	// SignalTypeRetirement (admin-initiated deactivation) so subscribers
+	// can filter the indexed signal_type column directly instead of
+	// destructuring the payload.
+	SignalTypeIdentityExpired SignalType = "identity_expired"
 )
 
 // SignalSeverity indicates the severity level of a CAE signal.
@@ -42,7 +48,8 @@ func (s SignalSeverity) Valid() bool {
 func (t SignalType) Valid() bool {
 	switch t {
 	case SignalTypeCredentialChange, SignalTypeSessionRevoked, SignalTypeIPChange,
-		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement, SignalTypeOwnerChange:
+		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement,
+		SignalTypeOwnerChange, SignalTypeIdentityExpired:
 		return true
 	}
 	return false

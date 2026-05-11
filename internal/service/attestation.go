@@ -258,6 +258,17 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		if err != nil {
 			return fmt.Errorf("failed to load identity for verified attestation: %w", err)
 		}
+		// Fail-fast on time-bound authority before any signing work. The
+		// chokepoint inside IssueCredential is the authoritative gate, but
+		// catching expired identities here gives operators a precise
+		// "identity_expired" error rather than a generic post-attestation
+		// issuance failure.
+		if !identity.Status.IsUsable() {
+			return fmt.Errorf("identity is not usable (status: %s)", identity.Status)
+		}
+		if identity.IsExpired() {
+			return fmt.Errorf("identity_expired: identity %s expired at %s", identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+		}
 
 		issued, issuedCred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 			Identity:  identity,

@@ -317,11 +317,37 @@ type Identity struct {
 	RiskTier       string `bun:"risk_tier,type:varchar(20),nullzero"       json:"risk_tier,omitempty"`
 	IAL            string `bun:"ial,type:varchar(20),nullzero"             json:"ial,omitempty"`
 
+	// ExpiresAt time-bounds the grant of authority itself (NOT the JWT it
+	// issues). NULL means "no expiry" — the historical default. When set,
+	// IssueCredential rejects new tokens past this time and the cleanup
+	// worker sweeps the identity into status=deactivated.
+	ExpiresAt *time.Time `bun:"expires_at" json:"expires_at,omitempty"`
+
 	// Lifecycle
 	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
 	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// IsExpired reports whether the identity's authority has aged out. A nil
+// ExpiresAt means "no expiry" and is never expired.
+func (i *Identity) IsExpired() bool {
+	if i == nil || i.ExpiresAt == nil {
+		return false
+	}
+	return !time.Now().Before(*i.ExpiresAt)
+}
+
+// IsActiveAndUnexpired is the combined gate used at every token-issuance
+// entry point: status must be usable AND the grant of authority must not
+// have expired. Both are required — either alone is insufficient because
+// the cleanup worker may not have run yet.
+func (i *Identity) IsActiveAndUnexpired() bool {
+	if i == nil {
+		return false
+	}
+	return i.Status.IsUsable() && !i.IsExpired()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

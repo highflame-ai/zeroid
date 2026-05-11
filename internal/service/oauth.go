@@ -215,6 +215,9 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 	}
+	if identity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:  identity,
@@ -265,6 +268,9 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "agent identity is suspended or deactivated")
+	}
+	if identity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
 	}
 	if identity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
@@ -390,6 +396,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 	if !actorIdentity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "actor identity is suspended or deactivated")
+	}
+	if actorIdentity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
 	}
 	if actorIdentity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
@@ -539,6 +548,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		if !resolved.Status.IsUsable() {
 			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 		}
+		if resolved.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
 		identity = resolved
 	} else {
 		identity = &domain.Identity{
@@ -606,6 +618,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
 	if err != nil {
+		// GetByKeyHash already filters on state=active and rejects keys past
+		// their expires_at — both surface as a not-found from the caller's
+		// perspective. No service-layer expiry check needed.
 		return nil, oauthBadRequestCause("invalid_grant", "invalid api key", err)
 	}
 
@@ -620,6 +635,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			identity = nil
 		} else if !identity.Status.IsUsable() {
 			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		} else if identity.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
 		}
 	}
 
@@ -799,11 +816,30 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		}
 	}
 
-	// Auth code JWT is self-contained — tenant context comes from the auth code.
+	// Resolve the carrier identity. The default is a synthetic stub (this
+	// is a human session — sub will be authCode.UserID, no identity row to
+	// gate on). When the OAuth client is explicitly bound to an agent
+	// identity via oauthClient.IdentityID, look that identity up and gate
+	// on its status + expires_at the same way jwt_bearer and api_key paths
+	// do. The link is then forwarded into RefreshTokenParams.IdentityID so
+	// the refresh path inherits the same gate without re-discovering it.
 	identity := &domain.Identity{
 		AccountID: authCode.AccountID,
 		ProjectID: authCode.ProjectID,
 		Status:    domain.IdentityStatusActive,
+	}
+	if oauthClient.IdentityID != nil && *oauthClient.IdentityID != "" {
+		linked, err := s.identitySvc.repo.GetByID(ctx, *oauthClient.IdentityID, authCode.AccountID, authCode.ProjectID)
+		if err != nil {
+			return nil, oauthBadRequestCause("invalid_grant", "oauth client linked to unknown identity", err)
+		}
+		if !linked.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
+		if linked.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
+		identity = linked
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
@@ -828,12 +864,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
-			ClientID:  req.ClientID,
-			AccountID: authCode.AccountID,
-			ProjectID: authCode.ProjectID,
-			UserID:    authCode.UserID,
-			Scopes:    strings.Join(authCode.Scopes, " "),
-			TTL:       oauthClient.RefreshTokenTTL,
+			ClientID:   req.ClientID,
+			AccountID:  authCode.AccountID,
+			ProjectID:  authCode.ProjectID,
+			UserID:     authCode.UserID,
+			IdentityID: oauthClient.IdentityID,
+			Scopes:     strings.Join(authCode.Scopes, " "),
+			TTL:        oauthClient.RefreshTokenTTL,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -918,10 +955,29 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
 	}
 
+	// Identity gate. The link came from the OAuth client at authorization_code
+	// time and was persisted on the refresh_token row. When present, the
+	// linked identity's status + expires_at gate refresh-grant issuance the
+	// same way they gate every other grant. When absent, this is a human
+	// session with no identity row to check and we fall through to the
+	// synthetic carrier.
 	identity := &domain.Identity{
 		AccountID: oldToken.AccountID,
 		ProjectID: oldToken.ProjectID,
 		Status:    domain.IdentityStatusActive,
+	}
+	if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
+		linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
+		if err != nil {
+			return nil, oauthBadRequestCause("invalid_grant", "refresh token references unknown identity", err)
+		}
+		if !linked.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
+		if linked.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
+		identity = linked
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -39,6 +40,9 @@ type CreateIdentityInput struct {
 		CapabilityTier string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
 		RiskTier       string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
 		IAL            string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
+		// ExpiresAt time-bounds the grant of authority. RFC3339. Omit for
+		// no expiry (the historical default).
+		ExpiresAt *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the identity is auto-deactivated"`
 	}
 }
 
@@ -93,6 +97,10 @@ type UpdateIdentityInput struct {
 		CapabilityTier *string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
 		RiskTier       *string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
 		IAL            *string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
+		// ExpiresAt tri-state: omit to leave unchanged, "" to clear (remove
+		// expiry), RFC3339 timestamp to set. The "Extend access" flow PATCHes
+		// a new RFC3339 value here.
+		ExpiresAt *string `json:"expires_at,omitempty" doc:"RFC3339 expiry, or empty string to clear"`
 	}
 }
 
@@ -207,6 +215,7 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		CapabilityTier:     input.Body.CapabilityTier,
 		RiskTier:           input.Body.RiskTier,
 		IAL:                input.Body.IAL,
+		ExpiresAt:          input.Body.ExpiresAt,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -320,6 +329,7 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		CapabilityTier:     input.Body.CapabilityTier,
 		RiskTier:           input.Body.RiskTier,
 		IAL:                input.Body.IAL,
+		ExpiresAt:          input.Body.ExpiresAt,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {

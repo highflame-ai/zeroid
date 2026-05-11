@@ -121,6 +121,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerSignalRoutes(api, router)
 	a.registerProofVerifyRoute(api)
 	a.registerAuditRoutes(api)
+	a.registerExpiringSoonRoute(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

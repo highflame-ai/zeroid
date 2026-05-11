@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -116,6 +117,10 @@ type RegisterIdentityRequest struct {
 	CapabilityTier string
 	RiskTier       string
 	IAL            string
+	// ExpiresAt time-bounds the grant of authority. Nil means "no expiry"
+	// (historical default). When set, the cleanup worker deactivates the
+	// identity past this time and IssueCredential fail-closes on it.
+	ExpiresAt *time.Time
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -210,6 +215,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		CapabilityTier:     req.CapabilityTier,
 		RiskTier:           req.RiskTier,
 		IAL:                req.IAL,
+		ExpiresAt:          req.ExpiresAt,
 		CreatedBy:          req.CreatedBy,
 		CreatedAt:          time.Now(),
 		UpdatedAt:          time.Now(),
@@ -248,6 +254,12 @@ func (s *IdentityService) ListIdentities(ctx context.Context, accountID, project
 	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, limit, offset)
 }
 
+// ListExpiringSoon returns active identities whose expires_at falls within
+// now..now+within. Used by GET /expiring-soon.
+func (s *IdentityService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.Identity, error) {
+	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
+}
+
 // UpdateIdentityRequest holds parameters for identity updates.
 // Zero-value fields are left unchanged. Pointer fields distinguish "not set" from "clear."
 type UpdateIdentityRequest struct {
@@ -277,6 +289,12 @@ type UpdateIdentityRequest struct {
 	CapabilityTier *string
 	RiskTier       *string
 	IAL            *string
+	// ExpiresAt uses RFC3339 string + tri-state pointer to carry the three
+	// update intents that a single *time.Time can't express:
+	//   nil pointer            → leave unchanged
+	//   pointer to ""          → clear to NULL (remove expiry, extend forever)
+	//   pointer to RFC3339 str → set new expiry
+	ExpiresAt *string
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -370,6 +388,17 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.IAL = *req.IAL
 	}
+	if req.ExpiresAt != nil {
+		if *req.ExpiresAt == "" {
+			identity.ExpiresAt = nil
+		} else {
+			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+			if err != nil {
+				return nil, fmt.Errorf("%w: invalid expires_at %q (must be RFC3339)", ErrInvalidIdentityField, *req.ExpiresAt)
+			}
+			identity.ExpiresAt = &t
+		}
+	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
@@ -423,6 +452,72 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 	return identity, nil
 }
 
+// SweepExpiredIdentities is called by the cleanup worker. It finds every
+// identity whose expires_at has passed while status is still 'active' and
+// hands each one to DeactivateExpired, which uses an atomic conditional
+// UPDATE to claim the row and then runs the existing deactivation
+// cascade (revoke API keys → revoke active credentials → emit a
+// retirement CAE signal with reason="expired").
+//
+// Idempotent and replica-safe: the atomic claim guarantees that only one
+// worker fires the cascade per identity. A second sweep finds no rows
+// because the previous run flipped status off active. Concurrent replicas
+// silently no-op when they lose the claim race.
+func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, error) {
+	expired, err := s.repo.ListExpiredActive(ctx, time.Now())
+	if err != nil {
+		return 0, fmt.Errorf("list expired identities: %w", err)
+	}
+	count := 0
+	for _, id := range expired {
+		claimed, err := s.DeactivateExpired(ctx, id.ID, id.AccountID, id.ProjectID)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("identity_id", id.ID).
+				Str("account_id", id.AccountID).
+				Str("project_id", id.ProjectID).
+				Msg("sweep: failed to deactivate expired identity")
+			continue
+		}
+		if claimed {
+			count++
+		}
+	}
+	if count > 0 {
+		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
+	}
+	return count, nil
+}
+
+// DeactivateExpired atomically claims an active identity and runs the
+// deactivation cascade with reason "expired". Returns (true, nil) when
+// this caller won the claim, (false, nil) when the row was already
+// non-active (claim lost to another replica or admin action), or an
+// error on DB failure.
+//
+// Single emission point for the "expired" CAE signal: the cascade
+// internally fires SignalTypeRetirement with the reason in payload,
+// so subscribers don't see duplicate signals (which would trigger
+// duplicate auto-revoke cascades via SignalService's high-severity
+// hook).
+//
+// The audit trigger that fires on the underlying UPDATE reads
+// modified_by from the row, which the worker has no caller context
+// for. We stamp it explicitly via the request context so the audit
+// trail names the sweep as the actor instead of the previous editor.
+func (s *IdentityService) DeactivateExpired(ctx context.Context, id, accountID, projectID string) (bool, error) {
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
+	claimed, identity, err := s.repo.DeactivateIfActive(ctx, id, accountID, projectID)
+	if err != nil {
+		return false, err
+	}
+	if !claimed {
+		return false, nil
+	}
+	s.runDeactivationCleanup(ctx, identity, "expired")
+	return true, nil
+}
+
 // DeleteIdentity permanently removes an identity and cascades to related records.
 //
 // Cleanup runs before the DB delete: API keys are revoked, active credentials
@@ -463,18 +558,36 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 			Msg("identity cleanup: revoked active credentials (cascade)")
 	}
 
+	if s.signalSvc == nil {
+		// Constructor (NewIdentityService) declares signalSvc required, so
+		// this is a programming-error guard rather than expected runtime
+		// state. Logged so a misconfigured embedder hears about it.
+		log.Warn().Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: signalSvc not wired; skipping retirement signal")
+		return
+	}
+	// Auto-expiry gets its own signal type so CAE subscribers can filter
+	// the indexed signal_type column directly (e.g. for offboarding-driven
+	// audit reports). Admin-initiated deactivation / deletion stays on
+	// SignalTypeRetirement so existing subscribers don't need to know
+	// about the split.
+	signalType := domain.SignalTypeRetirement
+	if reason == "expired" {
+		signalType = domain.SignalTypeIdentityExpired
+	}
 	if _, err := s.signalSvc.IngestSignal(
 		ctx,
 		identity.AccountID,
 		identity.ProjectID,
 		identity.ID,
-		domain.SignalTypeRetirement,
+		signalType,
 		domain.SignalSeverityHigh,
 		"identity_lifecycle",
 		map[string]any{"reason": reason},
 	); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
-			Msg("identity cleanup: failed to emit retirement CAE signal")
+			Str("signal_type", string(signalType)).
+			Msg("identity cleanup: failed to emit lifecycle CAE signal")
 	}
 }
 

@@ -55,6 +55,16 @@ type RegisterClientRequest struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
+	// AccountID + ProjectID are the tenant the IdentityID below is
+	// validated against. Required when IdentityID is non-empty.
+	AccountID string
+	ProjectID string
+	// IdentityID optionally binds this OAuth client to an agent identity.
+	// When set, authorization_code and refresh_token grants issued through
+	// this client gate on the linked identity's expires_at + status (fail-
+	// closed) and propagate the link to refresh_tokens.identity_id for
+	// downstream rotation checks. Empty = plain human-session client.
+	IdentityID string
 }
 
 // RegisterClient creates a new OAuth2 client.
@@ -119,6 +129,12 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		contacts = []string{}
 	}
 
+	var identityID *string
+	if req.IdentityID != "" {
+		id := req.IdentityID
+		identityID = &id
+	}
+
 	now := time.Now()
 	client := &domain.OAuthClient{
 		ID:                      uuid.New().String(),
@@ -139,6 +155,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		SoftwareVersion:         req.SoftwareVersion,
 		Contacts:                contacts,
 		Metadata:                req.Metadata,
+		IdentityID:              identityID,
 		IsActive:                true,
 		CreatedAt:               now,
 		UpdatedAt:               now,

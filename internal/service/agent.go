@@ -59,6 +59,9 @@ type RegisterAgentRequest struct {
 	// inside APIKeyService.CreateKey. When empty, the API key inherits the
 	// identity policy verbatim (common case).
 	APIKeyCredentialPolicyID string
+	// ExpiresAt time-bounds both the identity and (if non-nil) the auto-
+	// created API key. Nil means "no expiry".
+	ExpiresAt *time.Time
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -147,6 +150,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		CreatedBy:          req.CreatedBy,
 		PublicKeyPEM:       req.PublicKeyPEM,
 		CredentialPolicyID: req.CredentialPolicyID,
+		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
@@ -168,6 +172,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		Name:               fmt.Sprintf("Agent: %s", req.Name),
 		IdentityID:         identity.ID,
 		CredentialPolicyID: apiKeyPolicyID,
+		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.

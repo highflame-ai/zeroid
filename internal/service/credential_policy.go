@@ -95,6 +95,8 @@ type CreatePolicyRequest struct {
 	RequiredTrustLevel  string
 	RequiredAttestation string
 	MaxDelegationDepth  int
+	// ExpiresAt time-bounds the policy. Nil means "no expiry".
+	ExpiresAt *time.Time
 }
 
 // CreatePolicy creates a new credential policy.
@@ -135,6 +137,7 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		RequiredAttestation: req.RequiredAttestation,
 		MaxDelegationDepth:  req.MaxDelegationDepth,
 		IsActive:            true,
+		ExpiresAt:           req.ExpiresAt,
 		CreatedAt:           time.Now(),
 		UpdatedAt:           time.Now(),
 	}
@@ -169,6 +172,12 @@ func (s *CredentialPolicyService) ListPolicies(ctx context.Context, accountID, p
 	return s.repo.List(ctx, accountID, projectID)
 }
 
+// ListExpiringSoon returns active credential policies whose expires_at falls
+// within now..now+within. Used by GET /expiring-soon.
+func (s *CredentialPolicyService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.CredentialPolicy, error) {
+	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
+}
+
 // UpdatePolicyRequest holds parameters for updating a credential policy.
 type UpdatePolicyRequest struct {
 	Name                string
@@ -180,6 +189,11 @@ type UpdatePolicyRequest struct {
 	RequiredAttestation *string
 	MaxDelegationDepth  *int
 	IsActive            *bool
+	// ExpiresAt tri-state pointer to RFC3339 string:
+	//   nil → leave unchanged
+	//   ""  → clear to NULL (no expiry)
+	//   rfc3339 → set
+	ExpiresAt *string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -231,6 +245,17 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	if req.IsActive != nil {
 		policy.IsActive = *req.IsActive
 	}
+	if req.ExpiresAt != nil {
+		if *req.ExpiresAt == "" {
+			policy.ExpiresAt = nil
+		} else {
+			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
+			if err != nil {
+				return nil, fmt.Errorf("invalid expires_at %q (must be RFC3339)", *req.ExpiresAt)
+			}
+			policy.ExpiresAt = &t
+		}
+	}
 
 	policy.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, policy); err != nil {
@@ -253,6 +278,9 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 	}
 	if !policy.IsActive {
 		return fmt.Errorf("%w: policy %q is inactive", ErrPolicyViolation, policy.Name)
+	}
+	if policy.IsExpired() {
+		return fmt.Errorf("%w: policy %q expired at %s", ErrPolicyViolation, policy.Name, policy.ExpiresAt.Format(time.RFC3339))
 	}
 
 	// 1. TTL <= policy.max_ttl_seconds

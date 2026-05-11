@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/uptrace/bun"
 
@@ -109,4 +110,22 @@ func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, 
 		return fmt.Errorf("failed to delete credential policy: %w", err)
 	}
 	return nil
+}
+
+// ListExpiringSoon returns active credential policies whose expires_at falls
+// within now..now+within. Used by GET /expiring-soon.
+func (r *CredentialPolicyRepository) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.CredentialPolicy, error) {
+	var policies []*domain.CredentialPolicy
+	if err := r.db.NewSelect().Model(&policies).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("expires_at IS NOT NULL").
+		Where("expires_at >= ?", now).
+		Where("expires_at <= ?", now.Add(within)).
+		Where("is_active = TRUE").
+		Order("expires_at ASC").
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("list expiring credential policies: %w", err)
+	}
+	return policies, nil
 }
