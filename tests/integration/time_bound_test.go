@@ -444,6 +444,36 @@ func TestXUserIDSystemPrefixRejected(t *testing.T) {
 	}
 }
 
+// TestSweepStampsModifiedByOnAuditRow asserts that the audit trigger sees
+// a non-empty modified_by when the sweep deactivates an expired identity.
+// The audit trigger reads NEW.modified_by from the UPDATE — if the sweep
+// doesn't write that column the audit row would falsely attribute the
+// deactivation to the previous editor.
+func TestSweepStampsModifiedByOnAuditRow(t *testing.T) {
+	ext := uid("audit-stamp")
+	reg := registerAgent(t, ext)
+	stampExpiredInDB(t, reg.AgentID)
+
+	testZeroIDServer.RunCleanupOnce(context.Background())
+
+	var rows []struct {
+		Action       string `bun:"action"`
+		CallerUserID string `bun:"caller_user_id"`
+		IdentityID   string `bun:"identity_id"`
+	}
+	err := testDB.NewSelect().
+		Table("identity_audit_logs").
+		Column("action", "caller_user_id", "identity_id").
+		Where("identity_id = ?", reg.AgentID).
+		Order("created_at DESC").
+		Limit(1).
+		Scan(context.Background(), &rows)
+	require.NoError(t, err)
+	require.NotEmpty(t, rows, "sweep must produce an audit row")
+	assert.Equal(t, "system:expired_sweep", rows[0].CallerUserID,
+		"audit caller must be the sweep system caller, not the previous editor")
+}
+
 // TestExpiringSoonEndpoint verifies that GET /expiring-soon returns
 // only identities within the requested window and excludes already-
 // deactivated rows.

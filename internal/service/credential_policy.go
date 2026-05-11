@@ -23,6 +23,11 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
+// ErrInvalidPolicyField marks caller-fixable input errors on policy
+// create/update (e.g. malformed expires_at, backdated expires_at). Maps
+// to 400 at the HTTP boundary.
+var ErrInvalidPolicyField = errors.New("invalid credential policy field")
+
 // ErrPolicySubsetViolation is returned when a would-be API-key policy is
 // broader than the owning identity's policy along any axis (scopes, TTL,
 // grant types, delegation depth, trust level, attestation). Returned as a
@@ -248,7 +253,7 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	if req.ExpiresAt != nil {
 		t, cleared, err := parseExpiresAtPatch(*req.ExpiresAt)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", ErrInvalidPolicyField, err)
 		}
 		if cleared {
 			policy.ExpiresAt = nil

@@ -135,9 +135,10 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 
 func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientInput) (*OAuthClientCreatedOutput, error) {
 	// Tenant-scoped IDOR guard on identity_id: a caller who tries to bind
-	// the new client to an identity outside their tenant is rejected with
-	// 404 — the same shape GetIdentity emits for a not-found ID. Performed
-	// at the handler boundary so the service layer stays tenant-agnostic.
+	// the new client to an identity outside their tenant gets a 400 with
+	// "not found in this tenant" — same response shape we use for any
+	// caller-supplied foreign reference. Performed at the handler
+	// boundary so the service layer stays tenant-agnostic.
 	if input.Body.IdentityID != "" {
 		tenant, terr := internalMiddleware.GetTenant(ctx)
 		if terr != nil {

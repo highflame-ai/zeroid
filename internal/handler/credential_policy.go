@@ -196,6 +196,9 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error404NotFound("credential policy not found")
 		}
+		if errors.Is(err, service.ErrInvalidPolicyField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to update credential policy")
 		return nil, huma.Error500InternalServerError("failed to update credential policy")
 	}

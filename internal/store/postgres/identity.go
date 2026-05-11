@@ -200,9 +200,16 @@ func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectI
 func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, accountID, projectID string) (claimed bool, identity *domain.Identity, err error) {
 	db := dbOrTx(ctx, r.db)
 	identity = &domain.Identity{}
-	res, err := db.NewUpdate().Model(identity).
+	// modified_by must be set in the UPDATE itself — the audit trigger
+	// reads NEW.modified_by, so a caller_name on the context only reaches
+	// the audit log when it's written into this row's column.
+	q := db.NewUpdate().Model(identity).
 		Set("status = ?", string(domain.IdentityStatusDeactivated)).
-		Set("updated_at = ?", time.Now()).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).

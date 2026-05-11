@@ -17,11 +17,12 @@ type IdentityExpirer interface {
 
 // CleanupWorker periodically removes expired issued_credentials, proof_tokens,
 // and auth_codes rows, and sweeps expired identities into status=deactivated
-// (which triggers the existing cascade in IdentityService.UpdateIdentity).
-// Running the cleanup prevents unbounded table growth since credentials have a
-// finite TTL. Safe to run multiple instances concurrently — DELETE WHERE is
-// idempotent and the identity-status transition is guarded by a fresh-
-// transition check inside UpdateIdentity.
+// via IdentityService.SweepExpiredIdentities (an atomic conditional UPDATE
+// claim followed by the existing runDeactivationCleanup cascade).
+// Running the cleanup prevents unbounded table growth since credentials have
+// a finite TTL. Safe to run multiple instances concurrently — DELETE WHERE
+// is idempotent and the DeactivateIfActive claim guarantees only one worker
+// fires the cascade per expired identity.
 type CleanupWorker struct {
 	db       *bun.DB
 	expirer  IdentityExpirer

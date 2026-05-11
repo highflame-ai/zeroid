@@ -55,15 +55,13 @@ type RegisterClientRequest struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
-	// AccountID + ProjectID are the tenant the IdentityID below is
-	// validated against. Required when IdentityID is non-empty.
-	AccountID string
-	ProjectID string
 	// IdentityID optionally binds this OAuth client to an agent identity.
 	// When set, authorization_code and refresh_token grants issued through
 	// this client gate on the linked identity's expires_at + status (fail-
 	// closed) and propagate the link to refresh_tokens.identity_id for
-	// downstream rotation checks. Empty = plain human-session client.
+	// downstream rotation checks. Tenant-scoped IDOR validation happens
+	// at the handler boundary before this struct is built. Empty = plain
+	// human-session client.
 	IdentityID string
 }
 
