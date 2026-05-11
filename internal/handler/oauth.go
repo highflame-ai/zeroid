@@ -8,6 +8,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
@@ -69,6 +70,12 @@ func extractOAuthError(err error) (code, description string, status int) {
 	}
 	if errors.Is(err, service.ErrScopesNotAllowed) {
 		return "insufficient_scope", err.Error(), http.StatusBadRequest
+	}
+	// Identity gates can fire at the chokepoint after the per-grant
+	// check passed (TOCTOU window). Map them to invalid_grant so callers
+	// don't see a generic 500 server_error.
+	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+		return "invalid_grant", err.Error(), http.StatusBadRequest
 	}
 	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
 }

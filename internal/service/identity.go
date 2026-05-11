@@ -454,11 +454,12 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 
 // parseExpiresAtPatch decodes a tri-state expires_at PATCH value:
 //   - "" → cleared = true, caller should NULL the column
-//   - RFC3339 timestamp in the future → returns the parsed time
-//   - RFC3339 in the past → rejected: an admin who fat-fingers a backdated
-//     value would otherwise trigger an immediate sweep-cascade revocation
-//     of every credential issued to the affected identity / policy. Hard
-//     foot-gun; we require expires_at >= now at the PATCH boundary.
+//   - RFC3339 timestamp strictly after now → returns the parsed time
+//   - RFC3339 at or before now → rejected: an admin who fat-fingers a
+//     backdated value would otherwise trigger an immediate sweep-cascade
+//     revocation of every credential issued to the affected identity /
+//     policy. Hard foot-gun; we require expires_at > now (strict) at
+//     the PATCH boundary.
 //
 // Returns: (time, cleared, err). When cleared is true the time value is
 // zero and the caller assigns nil.

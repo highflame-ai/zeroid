@@ -41,10 +41,10 @@ func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.
 		return "", fmt.Errorf("identity is required")
 	}
 	if !identity.Status.IsUsable() {
-		return "", fmt.Errorf("identity is not usable (status: %s)", identity.Status)
+		return "", fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
 	}
 	if identity.IsExpired() {
-		return "", fmt.Errorf("identity_expired: identity %s expired at %s", identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+		return "", fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 	}
 
 	now := time.Now()

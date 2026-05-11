@@ -95,7 +95,11 @@ func (a *API) expiringSoonOp(ctx context.Context, input *ExpiringSoonInput) (*Ex
 			return nil, huma.Error400BadRequest("within must be positive")
 		}
 		if parsed > maxExpiringSoonWindow {
-			parsed = maxExpiringSoonWindow
+			// Reject (not clamp) so behavior is consistent across input
+			// formats. parseLookaheadDuration already rejects out-of-range
+			// "Nd"/"Nw"; clamping a Go duration silently would let
+			// "?within=9600h" succeed while "?within=400d" returns 400.
+			return nil, huma.Error400BadRequest(fmt.Sprintf("within exceeds maximum window (%s)", maxExpiringSoonWindow))
 		}
 		within = parsed
 	}

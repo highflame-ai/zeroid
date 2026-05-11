@@ -121,6 +121,11 @@ func (a *API) verifyAttestationOp(ctx context.Context, input *VerifyAttestationI
 			log.Info().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation already verified")
 			return nil, huma.Error409Conflict(err.Error())
 		}
+		// Identity is expired or otherwise non-usable at the post-attestation
+		// issuance step — caller-visible state, not a server fault.
+		if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("attestation_id", input.Body.AttestationID).Msg("attestation verification failed")
 		return nil, huma.Error500InternalServerError("attestation verification failed")
 	}

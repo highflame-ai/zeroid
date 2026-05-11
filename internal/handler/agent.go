@@ -22,6 +22,11 @@ func mapErr(err error) error {
 	if err == nil {
 		return nil
 	}
+	// Typed sentinels first. Service-layer callers wrap with these so
+	// callers see a 400 instead of a 500 on caller-fixable states.
+	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+		return huma.Error400BadRequest(err.Error())
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no rows in result set"), strings.Contains(msg, "not found"):
@@ -30,10 +35,6 @@ func mapErr(err error) error {
 		return huma.Error409Conflict("resource already exists")
 	case strings.Contains(msg, "invalid status transition"):
 		return huma.Error400BadRequest("invalid status transition")
-	case strings.Contains(msg, "identity_expired"), strings.Contains(msg, "identity is not usable"):
-		// Identity is past its expires_at or in a non-usable status —
-		// caller cannot proceed, but it's a 4xx not a 5xx.
-		return huma.Error400BadRequest(msg)
 	default:
 		log.Error().Err(err).Msg("unexpected agent service error")
 		return huma.Error500InternalServerError("internal server error")

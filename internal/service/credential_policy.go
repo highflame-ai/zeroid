@@ -23,9 +23,15 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
-// ErrInvalidPolicyField marks caller-fixable input errors on policy
-// create/update (e.g. malformed expires_at, backdated expires_at). Maps
-// to 400 at the HTTP boundary.
+// ErrInvalidPolicyField marks caller-fixable input errors emitted by
+// UpdatePolicy when the tri-state expires_at PATCH string fails to parse
+// (malformed RFC3339) or is backdated. Maps to 400 at the HTTP boundary.
+//
+// CreatePolicy does NOT emit this sentinel: it takes *time.Time, so
+// Huma's input binding already rejects malformed values at the request
+// boundary, and a backdated expires_at on create is intentionally
+// permitted (used by integration tests to mint an already-expired
+// policy without a sleep).
 var ErrInvalidPolicyField = errors.New("invalid credential policy field")
 
 // ErrPolicySubsetViolation is returned when a would-be API-key policy is

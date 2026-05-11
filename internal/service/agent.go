@@ -331,10 +331,10 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 		return nil, err
 	}
 	if !identity.Status.IsUsable() {
-		return nil, fmt.Errorf("identity is not usable (status: %s)", identity.Status)
+		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
 	}
 	if identity.IsExpired() {
-		return nil, fmt.Errorf("identity_expired: identity %s expired at %s", identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+		return nil, fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 	}
 
 	// Revoke existing keys.

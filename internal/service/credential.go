@@ -112,14 +112,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		return nil, nil, fmt.Errorf("identity is required")
 	}
 	if !req.Identity.Status.IsUsable() {
-		return nil, nil, fmt.Errorf("identity is not usable (status: %s)", req.Identity.Status)
+		return nil, nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, req.Identity.Status)
 	}
 	if req.Identity.IsExpired() {
 		// Fail-closed even when the cleanup worker hasn't yet swept the
 		// identity into status=deactivated. The check at this chokepoint
 		// is what guarantees no grant path can mint a token past the
 		// authority's expiry window, regardless of worker timing.
-		return nil, nil, fmt.Errorf("identity expired at %s", req.Identity.ExpiresAt.Format(time.RFC3339))
+		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
 	}
 
 	ttl := req.TTL

@@ -4,11 +4,23 @@ package domain
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/uptrace/bun"
 )
+
+// ErrIdentityExpired is returned by every issuance path (chokepoint
+// IssueCredential, GenerateProofToken, attestation post-issuance, agent
+// rotate-key) when the target identity has aged out. Service-layer
+// callers wrap with %w so handlers can errors.Is and consistently map to
+// a 4xx — OAuth flows emit invalid_grant, admin endpoints emit 400.
+var ErrIdentityExpired = errors.New("identity_expired")
+
+// ErrIdentityNotUsable is returned by the same paths when the identity
+// is suspended or deactivated. Same handler-mapping pattern.
+var ErrIdentityNotUsable = errors.New("identity is not usable")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Trust Level

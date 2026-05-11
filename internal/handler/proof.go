@@ -8,6 +8,7 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
 
+	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
@@ -81,6 +82,9 @@ func (a *API) generateProofOp(ctx context.Context, input *GenerateProofInput) (*
 
 	proofToken, err := a.proofSvc.GenerateProofToken(ctx, identity, input.Body.Audience, input.Body.Nonce)
 	if err != nil {
+		if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to generate proof token")
 		return nil, huma.Error500InternalServerError("failed to generate proof token")
 	}
