@@ -18,40 +18,30 @@ import (
 // parseLookaheadDuration extends time.ParseDuration with the human-friendly
 // "Nd" (days) and "Nw" (weeks) suffixes the spec uses (?within=7d). Plain
 // Go durations like "168h" or "30m" are passed through unchanged.
-//
-// Bounds-checks N against the unit's mathematical ceiling before
-// multiplying so a caller submitting "9999999d" gets a clean 400 instead
-// of a silently truncated int64-overflow result. The handler-side cap
-// (maxExpiringSoonWindow) trims any survivor that's still beyond the
-// product's policy window, but that cap only fires if the multiply
-// itself doesn't wrap.
 func parseLookaheadDuration(s string) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty duration")
 	}
 	last := s[len(s)-1]
-	if last == 'd' || last == 'w' {
-		n, err := strconv.Atoi(s[:len(s)-1])
-		if err != nil {
-			return 0, fmt.Errorf("invalid number before %q: %w", string(last), err)
-		}
-		if n < 0 {
-			return 0, fmt.Errorf("negative duration: %s", s)
-		}
-		unit := 24 * time.Hour
-		if last == 'w' {
-			unit = 7 * 24 * time.Hour
-		}
-		// Reject any N that would overflow int64 when multiplied by unit.
-		// Stays well clear of math.MaxInt64; the handler caps the result
-		// at maxExpiringSoonWindow regardless.
-		if int64(n) > int64(time.Duration(1<<62)/unit) {
-			return 0, fmt.Errorf("duration overflow: %s", s)
-		}
-		return time.Duration(n) * unit, nil
+	if last != 'd' && last != 'w' {
+		return time.ParseDuration(s)
 	}
-	return time.ParseDuration(s)
+	n, err := strconv.Atoi(s[:len(s)-1])
+	if err != nil {
+		return 0, fmt.Errorf("invalid number before %q: %w", string(last), err)
+	}
+	unit := 24 * time.Hour
+	if last == 'w' {
+		unit = 7 * 24 * time.Hour
+	}
+	// Reject anything past the handler's policy cap up-front. Cheaper than
+	// multiplying first and clamping after, and avoids any int64 wrap.
+	maxN := int(maxExpiringSoonWindow / unit)
+	if n < 0 || n > maxN {
+		return 0, fmt.Errorf("within %s out of range (max %d%c)", s, maxN, last)
+	}
+	return time.Duration(n) * unit, nil
 }
 
 // defaultExpiringSoonWindow is used when the caller omits ?within. One week

@@ -339,17 +339,6 @@ func (i *Identity) IsExpired() bool {
 	return !time.Now().Before(*i.ExpiresAt)
 }
 
-// IsActiveAndUnexpired is the combined gate used at every token-issuance
-// entry point: status must be usable AND the grant of authority must not
-// have expired. Both are required — either alone is insufficient because
-// the cleanup worker may not have run yet.
-func (i *Identity) IsActiveAndUnexpired() bool {
-	if i == nil {
-		return false
-	}
-	return i.Status.IsUsable() && !i.IsExpired()
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Identity Schema — describes valid types, sub-types, trust levels, and statuses.
 // Served by GET {AdminPathPrefix}/identities/schema so frontends stay in sync.

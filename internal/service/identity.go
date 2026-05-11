@@ -389,13 +389,13 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.IAL = *req.IAL
 	}
 	if req.ExpiresAt != nil {
-		if *req.ExpiresAt == "" {
+		t, cleared, err := parseExpiresAtPatch(*req.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
+		if cleared {
 			identity.ExpiresAt = nil
 		} else {
-			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
-			if err != nil {
-				return nil, fmt.Errorf("%w: invalid expires_at %q (must be RFC3339)", ErrInvalidIdentityField, *req.ExpiresAt)
-			}
 			identity.ExpiresAt = &t
 		}
 	}
@@ -452,70 +452,62 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 	return identity, nil
 }
 
-// SweepExpiredIdentities is called by the cleanup worker. It finds every
-// identity whose expires_at has passed while status is still 'active' and
-// hands each one to DeactivateExpired, which uses an atomic conditional
-// UPDATE to claim the row and then runs the existing deactivation
-// cascade (revoke API keys → revoke active credentials → emit a
-// retirement CAE signal with reason="expired").
+// parseExpiresAtPatch decodes a tri-state expires_at PATCH value:
+//   - "" → cleared = true, caller should NULL the column
+//   - RFC3339 timestamp in the future → returns the parsed time
+//   - RFC3339 in the past → rejected: an admin who fat-fingers a backdated
+//     value would otherwise trigger an immediate sweep-cascade revocation
+//     of every credential issued to the affected identity / policy. Hard
+//     foot-gun; we require expires_at >= now at the PATCH boundary.
 //
-// Idempotent and replica-safe: the atomic claim guarantees that only one
-// worker fires the cascade per identity. A second sweep finds no rows
-// because the previous run flipped status off active. Concurrent replicas
-// silently no-op when they lose the claim race.
+// Returns: (time, cleared, err). When cleared is true the time value is
+// zero and the caller assigns nil.
+func parseExpiresAtPatch(raw string) (time.Time, bool, error) {
+	if raw == "" {
+		return time.Time{}, true, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("invalid expires_at %q (must be RFC3339)", raw)
+	}
+	if !t.After(time.Now()) {
+		return time.Time{}, false, fmt.Errorf("expires_at must be in the future (got %s, now %s)", t.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	}
+	return t, false, nil
+}
+
+// SweepExpiredIdentities is called by the cleanup worker. The atomic
+// DeactivateIfActive UPDATE is the per-row claim that prevents concurrent
+// replicas from running the cascade twice for the same identity. The
+// caller_name stamp gives the audit trigger a non-empty modified_by so
+// auto-expiries are distinguishable from admin actions on the audit_log.
 func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, error) {
 	expired, err := s.repo.ListExpiredActive(ctx, time.Now())
 	if err != nil {
 		return 0, fmt.Errorf("list expired identities: %w", err)
 	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
 	count := 0
-	for _, id := range expired {
-		claimed, err := s.DeactivateExpired(ctx, id.ID, id.AccountID, id.ProjectID)
+	for _, row := range expired {
+		claimed, identity, err := s.repo.DeactivateIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
 		if err != nil {
 			log.Warn().Err(err).
-				Str("identity_id", id.ID).
-				Str("account_id", id.AccountID).
-				Str("project_id", id.ProjectID).
+				Str("identity_id", row.ID).
+				Str("account_id", row.AccountID).
+				Str("project_id", row.ProjectID).
 				Msg("sweep: failed to deactivate expired identity")
 			continue
 		}
-		if claimed {
-			count++
+		if !claimed {
+			continue
 		}
+		s.runDeactivationCleanup(ctx, identity, "expired")
+		count++
 	}
 	if count > 0 {
 		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
 	}
 	return count, nil
-}
-
-// DeactivateExpired atomically claims an active identity and runs the
-// deactivation cascade with reason "expired". Returns (true, nil) when
-// this caller won the claim, (false, nil) when the row was already
-// non-active (claim lost to another replica or admin action), or an
-// error on DB failure.
-//
-// Single emission point for the "expired" CAE signal: the cascade
-// internally fires SignalTypeRetirement with the reason in payload,
-// so subscribers don't see duplicate signals (which would trigger
-// duplicate auto-revoke cascades via SignalService's high-severity
-// hook).
-//
-// The audit trigger that fires on the underlying UPDATE reads
-// modified_by from the row, which the worker has no caller context
-// for. We stamp it explicitly via the request context so the audit
-// trail names the sweep as the actor instead of the previous editor.
-func (s *IdentityService) DeactivateExpired(ctx context.Context, id, accountID, projectID string) (bool, error) {
-	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
-	claimed, identity, err := s.repo.DeactivateIfActive(ctx, id, accountID, projectID)
-	if err != nil {
-		return false, err
-	}
-	if !claimed {
-		return false, nil
-	}
-	s.runDeactivationCleanup(ctx, identity, "expired")
-	return true, nil
 }
 
 // DeleteIdentity permanently removes an identity and cascades to related records.
@@ -558,14 +550,6 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 			Msg("identity cleanup: revoked active credentials (cascade)")
 	}
 
-	if s.signalSvc == nil {
-		// Constructor (NewIdentityService) declares signalSvc required, so
-		// this is a programming-error guard rather than expected runtime
-		// state. Logged so a misconfigured embedder hears about it.
-		log.Warn().Str("identity_id", identity.ID).Str("reason", reason).
-			Msg("identity cleanup: signalSvc not wired; skipping retirement signal")
-		return
-	}
 	// Auto-expiry gets its own signal type so CAE subscribers can filter
 	// the indexed signal_type column directly (e.g. for offboarding-driven
 	// audit reports). Admin-initiated deactivation / deletion stays on

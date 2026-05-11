@@ -13,6 +13,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// stampExpiredInDB backdates expires_at via direct repo UPDATE — the PATCH
+// endpoint rejects past timestamps as a foot-gun guard, but tests need to
+// drop an identity below the IsExpired() threshold deterministically
+// without sleeping for the smallest future TTL we could schedule.
+func stampExpiredInDB(t *testing.T, identityID string) {
+	t.Helper()
+	past := time.Now().Add(-time.Second).UTC()
+	_, err := testDB.NewUpdate().
+		TableExpr("identities").
+		Set("expires_at = ?", past).
+		Where("id = ?", identityID).
+		Exec(context.Background())
+	require.NoError(t, err, "stampExpiredInDB: direct UPDATE failed")
+}
+
 // TestExpiredIdentityDeniedAcrossGrantTypes verifies the IsExpired() gate
 // at every grant-type entry point + the chokepoint in IssueCredential. An
 // identity past its expires_at gets a 400 invalid_grant regardless of how
@@ -46,15 +61,7 @@ func TestExpiredIdentityDeniedAcrossGrantTypes(t *testing.T) {
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "client_credentials while active must succeed; body=%v", decode(t, resp))
 
-	// Stamp expires_at one second in the past via direct repo update —
-	// fastest way to age the identity without sleeping.
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode, "PATCH /identities expires_at must succeed")
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, reg.AgentID)
 
 	// api_key path: chokepoint + grant-level check both kick in. Either
 	// "identity_expired" or "api_key_expired" is acceptable — the test
@@ -104,14 +111,7 @@ func TestExpiredIdentityDeniedJWTBearer(t *testing.T) {
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "baseline jwt_bearer must succeed; body=%v", decode(t, resp))
 
-	// Expire the identity.
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+identity.ID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode)
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, identity.ID)
 
 	// jwt_bearer with a fresh assertion now blocked — both gate sites in
 	// oauth.jwtBearer (Status + IsExpired) and the chokepoint must catch.
@@ -150,14 +150,7 @@ func TestExpiredIdentityDeniedTokenExchange(t *testing.T) {
 	subExt := uid("expired-tx-sub")
 	subAgent := registerIdentity(t, subExt, []string{"data:read"}, ecPublicKeyPEM(t, subKey))
 
-	// Expire the sub-agent (the actor whose identity is the one being gated).
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+subAgent.ID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode)
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, subAgent.ID)
 
 	// token_exchange with the orchestrator's subject_token + sub-agent's
 	// actor_token must fail: oauth.tokenExchange gates actorIdentity.IsExpired.
@@ -182,12 +175,7 @@ func TestExtendAccessReactivates(t *testing.T) {
 	ext := uid("extend-access")
 	reg := registerAgent(t, ext)
 
-	// Expire it.
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	_, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
+	stampExpiredInDB(t, reg.AgentID)
 
 	// Confirm denied.
 	resp := post(t, "/oauth2/token", map[string]any{
@@ -248,14 +236,7 @@ func TestCleanupWorkerSweepsExpiredIdentities(t *testing.T) {
 	pre := introspect(t, tokenBefore)
 	require.True(t, pre["active"].(bool), "token should be active before sweep")
 
-	// Stamp expires_at in the past.
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode)
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, reg.AgentID)
 
 	// First sweep: deactivates the identity → cascade revokes the token.
 	testZeroIDServer.RunCleanupOnce(context.Background())
@@ -293,13 +274,7 @@ func TestSweepEmitsIdentityExpiredSignal(t *testing.T) {
 	ext := uid("sweep-signal-type")
 	reg := registerAgent(t, ext)
 
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode)
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, reg.AgentID)
 
 	testZeroIDServer.RunCleanupOnce(context.Background())
 
@@ -310,7 +285,7 @@ func TestSweepEmitsIdentityExpiredSignal(t *testing.T) {
 		Source     string         `bun:"source"`
 		Payload    map[string]any `bun:"payload,type:jsonb"`
 	}
-	err = testDB.NewSelect().
+	err := testDB.NewSelect().
 		Table("cae_signals").
 		Column("signal_type", "source", "payload").
 		Where("identity_id = ?", reg.AgentID).
@@ -332,6 +307,100 @@ func TestSweepEmitsIdentityExpiredSignal(t *testing.T) {
 			"payload.reason must carry the precise cause; got %v", r.Payload)
 	}
 	require.True(t, found, "no identity_lifecycle signal found; rows=%v", rows)
+}
+
+// TestExpiredIdentityCannotMintProofToken closes the WPT bypass: an
+// expired identity must not be able to generate a WIMSE proof token,
+// even though the token itself is only 5 minutes and audience-bound.
+func TestExpiredIdentityCannotMintProofToken(t *testing.T) {
+	agentKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	ext := uid("expired-proof")
+	identity := registerIdentity(t, ext, []string{"data:read"}, ecPublicKeyPEM(t, agentKey))
+
+	// Baseline: mint a ZeroID access token for the agent first (needed
+	// because the proof-generate endpoint sits behind agent-auth).
+	assertion := buildAssertion(t, agentKey, identity.WIMSEURI)
+	tokResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"subject":    assertion,
+		"scope":      "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+	accessTok := decode(t, tokResp)["access_token"].(string)
+
+	// Sanity: proof generation works while identity is unexpired.
+	authHdr := map[string]string{"Authorization": "Bearer " + accessTok}
+	proofResp := post(t, adminPath("/proof/generate"), map[string]any{
+		"identity_id": identity.ID,
+		"audience":    "https://target.example.com",
+		"nonce":       "nonce-baseline-" + ext,
+	}, authHdr)
+	require.Equal(t, http.StatusOK, proofResp.StatusCode, "baseline proof generation must succeed; body=%v", decode(t, proofResp))
+
+	// Expire the identity.
+	stampExpiredInDB(t, identity.ID)
+
+	// Proof generation must now fail. The existing access token would
+	// otherwise let the agent self-mint WPTs for the duration of the JWT.
+	proofResp = post(t, adminPath("/proof/generate"), map[string]any{
+		"identity_id": identity.ID,
+		"audience":    "https://target.example.com",
+		"nonce":       "nonce-expired-" + ext,
+	}, authHdr)
+	require.NotEqual(t, http.StatusOK, proofResp.StatusCode,
+		"expired identity must not mint WPTs; body=%v", decode(t, proofResp))
+}
+
+// TestRotateKeyOnExpiredIdentityRejected covers the foot-gun where an
+// admin rotates the API key of an expired-but-not-yet-swept identity.
+// The new key would otherwise inherit no expires_at, silently extending
+// key lifetime past the identity's authority window.
+func TestRotateKeyOnExpiredIdentityRejected(t *testing.T) {
+	ext := uid("rotate-expired-agent")
+	reg := registerAgent(t, ext)
+	stampExpiredInDB(t, reg.AgentID)
+
+	resp, err := doRaw(t, http.MethodPost, adminPath("/agents/registry/"+reg.AgentID+"/rotate-key"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.NotEqual(t, http.StatusOK, resp.StatusCode,
+		"key rotation on expired identity must fail to prevent silent extension")
+	_ = resp.Body.Close()
+}
+
+// TestPatchExpiresAtRejectsPastTimestamp guards the foot-gun where an
+// admin fat-fingers a backdated expires_at and the next sweep tick
+// cascade-revokes every credential for the identity. The PATCH endpoint
+// must reject expires_at < now at the API boundary.
+func TestPatchExpiresAtRejectsPastTimestamp(t *testing.T) {
+	ext := uid("past-patch-guard")
+	reg := registerAgent(t, ext)
+
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	resp, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
+		"expires_at": past,
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"PATCH expires_at < now must return 400 to prevent accidental sweep-cascade revocation")
+	_ = resp.Body.Close()
+
+	// Future timestamp still works.
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	resp, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
+		"expires_at": future,
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	// Empty string still clears.
+	resp, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
+		"expires_at": "",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
 }
 
 // TestXUserIDSystemPrefixRejected locks in the audit-spoof guard:
@@ -473,13 +542,7 @@ func TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh(t *testing.T) {
 	require.NotEmpty(t, refreshTok, "client is registered for refresh_token grant; must return one")
 
 	// 4. Expire the linked identity.
-	past := time.Now().Add(-time.Second).UTC().Format(time.RFC3339)
-	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+agent.AgentID), map[string]any{
-		"expires_at": past,
-	}, adminHeaders())
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, patched.StatusCode)
-	_ = patched.Body.Close()
+	stampExpiredInDB(t, agent.AgentID)
 
 	// 5. Try to exchange a fresh auth code — now blocked by the identity gate.
 	verifier2, challenge2 := buildPKCEPair(t)

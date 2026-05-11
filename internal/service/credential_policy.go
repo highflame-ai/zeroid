@@ -246,13 +246,13 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 		policy.IsActive = *req.IsActive
 	}
 	if req.ExpiresAt != nil {
-		if *req.ExpiresAt == "" {
+		t, cleared, err := parseExpiresAtPatch(*req.ExpiresAt)
+		if err != nil {
+			return nil, err
+		}
+		if cleared {
 			policy.ExpiresAt = nil
 		} else {
-			t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
-			if err != nil {
-				return nil, fmt.Errorf("invalid expires_at %q (must be RFC3339)", *req.ExpiresAt)
-			}
 			policy.ExpiresAt = &t
 		}
 	}

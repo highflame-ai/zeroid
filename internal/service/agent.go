@@ -321,23 +321,34 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 	return &resp, nil
 }
 
-// RotateKey revokes the old key and creates a new one.
+// RotateKey revokes the old key and creates a new one. Inherits the
+// identity's expires_at so a rotated key on a time-bound agent expires
+// alongside its parent — without this, rotation silently extends the
+// key's lifetime past the agent's authority window.
 func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID string) (*AgentRegistrationResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
+	if !identity.Status.IsUsable() {
+		return nil, fmt.Errorf("identity is not usable (status: %s)", identity.Status)
+	}
+	if identity.IsExpired() {
+		return nil, fmt.Errorf("identity_expired: identity %s expired at %s", identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+	}
 
 	// Revoke existing keys.
 	s.revokeKeysByIdentity(ctx, identity.ID)
 
-	// Create new key.
+	// Create new key. ExpiresAt propagates from the identity so the
+	// rotated key inherits the parent's time-bound window.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:  identity.AccountID,
 		ProjectID:  identity.ProjectID,
 		CreatedBy:  "system:key_rotation",
 		Name:       fmt.Sprintf("Agent: %s", identity.Name),
 		IdentityID: identity.ID,
+		ExpiresAt:  identity.ExpiresAt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rotated key: %w", err)
