@@ -5,6 +5,8 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -308,6 +310,59 @@ func TestSweepEmitsIdentityExpiredSignal(t *testing.T) {
 			"payload.reason must carry the precise cause; got %v", r.Payload)
 	}
 	require.True(t, found, "no identity_lifecycle signal found; rows=%v", rows)
+}
+
+// TestTokenTTLClampedByIdentityExpiry verifies the issuance-time clamp:
+// when an identity expires in N seconds and the policy allows a longer
+// TTL, the issued JWT's exp claim must be <= identity.expires_at — not
+// the longer policy/service ceiling. Without this, local verifiers
+// (tokens.verify(), which doesn't check revocation) would see the token
+// as valid past the cascade revocation.
+func TestTokenTTLClampedByIdentityExpiry(t *testing.T) {
+	ext := uid("ttl-clamp")
+	reg := registerAgent(t, ext)
+
+	// Set identity to expire in 60s.
+	future := time.Now().Add(60 * time.Second).UTC().Format(time.RFC3339)
+	patched, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
+		"expires_at": future,
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, patched.StatusCode)
+	_ = patched.Body.Close()
+
+	// Mint a token. The api_key grant defaults to defaultTTL=3600s
+	// (1h) — far longer than the 60s identity remaining lifetime.
+	issueStart := time.Now()
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    reg.APIKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	// expires_in should be clamped close to the identity's 60s remaining,
+	// not the default 3600s. Allow a few seconds of slack for clock + I/O.
+	expiresIn, ok := body["expires_in"].(float64)
+	require.True(t, ok, "expires_in must be numeric; body=%v", body)
+	assert.LessOrEqual(t, int(expiresIn), 60,
+		"token TTL must be clamped by identity expires_at; got %ds, identity has ~60s left", int(expiresIn))
+	assert.Greater(t, int(expiresIn), 50,
+		"token TTL clamp too aggressive; got %ds, expected ~60s minus call latency", int(expiresIn))
+
+	// The JWT's exp claim must mirror the clamp.
+	tokenStr := body["access_token"].(string)
+	parts := strings.Split(tokenStr, ".")
+	require.Len(t, parts, 3)
+	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	require.NoError(t, err)
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(payloadBytes, &payload))
+	expClaim := int64(payload["exp"].(float64))
+	identityExpiresAt := issueStart.Add(60 * time.Second).Unix()
+	assert.LessOrEqual(t, expClaim, identityExpiresAt+2,
+		"JWT exp must not outlive identity expires_at (slack: 2s); exp=%d, identity_expires=%d",
+		expClaim, identityExpiresAt)
 }
 
 // TestExpiredIdentityCannotMintProofToken closes the WPT bypass: an

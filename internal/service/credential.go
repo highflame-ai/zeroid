@@ -94,6 +94,12 @@ type IssueRequest struct {
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
+	// CredentialExpiresAt is the upper bound on the issued token's exp claim
+	// derived from the credential material itself — typically the API key's
+	// expires_at for api_key grants. The chokepoint clamps TTL by
+	// min(CredentialExpiresAt, Identity.ExpiresAt) so the JWT exp never
+	// outlives the authority. Nil means "no per-credential bound."
+	CredentialExpiresAt *time.Time
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -128,6 +134,47 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if ttl > s.maxTTL {
 		ttl = s.maxTTL
+	}
+	// Clamp TTL by the authority's remaining lifetime. A JWT whose exp
+	// claim outlives its authority window would still verify locally
+	// (tokens.verify() doesn't check revocation) for the gap between
+	// authority-expiry and JWT-exp. Clamping here makes time-bound
+	// authority an enforced invariant on the issued token itself, not
+	// just on the cascade-revocation side.
+	//
+	// Both bounds (identity + per-credential) are min-combined with the
+	// requested TTL. Already-expired authority short-circuits to error
+	// — the IsExpired() check above caught the identity case; here we
+	// defend against per-credential expiry that the chokepoint doesn't
+	// otherwise see.
+	clampNow := time.Now()
+	if req.Identity.ExpiresAt != nil {
+		remaining := int(req.Identity.ExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			log.Info().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("identity_remaining_seconds", remaining).
+				Msg("clamping token TTL to identity remaining lifetime")
+			ttl = remaining
+		}
+	}
+	if req.CredentialExpiresAt != nil {
+		remaining := int(req.CredentialExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("credential expired at %s", req.CredentialExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			log.Info().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("credential_remaining_seconds", remaining).
+				Msg("clamping token TTL to credential remaining lifetime")
+			ttl = remaining
+		}
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials

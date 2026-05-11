@@ -715,6 +715,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// owner_user_id is set from Identity.OwnerUserID automatically.
 		// The creator is the acting user (the developer using the SDK right now).
 		ActingUserID: sk.CreatedBy,
+		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
+		// must never mint a 30-day token even if the identity policy allows.
+		CredentialExpiresAt: sk.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
