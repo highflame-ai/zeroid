@@ -72,10 +72,17 @@ func extractOAuthError(err error) (code, description string, status int) {
 		return "insufficient_scope", err.Error(), http.StatusBadRequest
 	}
 	// Identity gates can fire at the chokepoint after the per-grant
-	// check passed (TOCTOU window). Map them to invalid_grant so callers
-	// don't see a generic 500 server_error.
-	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
-		return "invalid_grant", err.Error(), http.StatusBadRequest
+	// check passed (TOCTOU window). Map to stable error_description
+	// strings — the per-grant checks emit the exact same values, so
+	// callers see a consistent hint regardless of which code path fired.
+	// Using err.Error() here would leak the wrapped chain (which includes
+	// the literal expires_at timestamp) and produce a different string
+	// shape than the per-grant path.
+	if errors.Is(err, domain.ErrIdentityExpired) {
+		return "invalid_grant", "identity_expired", http.StatusBadRequest
+	}
+	if errors.Is(err, domain.ErrIdentityNotUsable) {
+		return "invalid_grant", "identity is suspended or deactivated", http.StatusBadRequest
 	}
 	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
 }
@@ -110,8 +117,13 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 		Method:      http.MethodPost,
 		Path:        "/oauth2/token",
 		Summary:     "OAuth 2.0 Token Endpoint (client_credentials, jwt_bearer, token_exchange)",
-		Description: "Publicly accessible — tenant is derived from credential material, not headers.",
-		Tags:        []string{"OAuth"},
+		Description: "Publicly accessible — tenant is derived from credential material, not headers.\n\n" +
+			"**TTL narrowing:** the returned `expires_in` (and the JWT `exp` claim) may be **less** than what the caller requested. " +
+			"This happens — silently, RFC 6749 §3.3-style — when the issued token's lifetime would otherwise outlive a bound that " +
+			"constrains it. Effective TTL is `min(requested_ttl, service_max_ttl, policy.max_ttl_seconds, time_until(identity.expires_at), time_until(credential.expires_at))`. " +
+			"Callers MUST use `expires_in` from the response (not the value they requested) when scheduling refresh. " +
+			"Server-side logs name the clamp reason; the chokepoint emits a structured log line with `requested_ttl` and the remaining lifetime that won.",
+		Tags: []string{"OAuth"},
 	}, a.tokenOp)
 
 	huma.Register(api, huma.Operation{

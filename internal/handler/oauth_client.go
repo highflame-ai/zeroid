@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -145,7 +146,15 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 			return nil, huma.Error401Unauthorized("missing tenant context")
 		}
 		if _, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
-			return nil, huma.Error400BadRequest("identity_id not found in this tenant")
+			// Distinguish caller-fixable not-found-in-tenant (400) from
+			// transient DB errors (500). The repo wraps sql.ErrNoRows in
+			// its "failed to get identity" string, so unwrap to get the
+			// underlying sentinel.
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, huma.Error400BadRequest("identity_id not found in this tenant")
+			}
+			log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("identity lookup failed during oauth client create")
+			return nil, huma.Error500InternalServerError("failed to validate identity_id")
 		}
 	}
 
