@@ -92,7 +92,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **WIMSE/SPIFFE URIs** — Stable, globally unique identity URIs: `spiffe://{domain}/{account}/{project}/{type}/{id}` for every agent. Tokens carry the WIMSE URI as `sub`, so every downstream system receives a meaningful, verifiable identity—not just a client ID.
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
 - **Continuous Access Evaluation (CAE)** — Revoke credentials in real time when risk signals fire via the OpenID Shared Signals Framework (SSF). Revoke the orchestrator's credential and the entire downstream chain is invalidated immediately—no waiting for token expiry.
-- **Attestation Framework** — Software, platform, and hardware attestation to bootstrap or elevate trust levels before credentials are issued.
+- **Attestation Framework** — Pluggable verifiers behind a fail-closed contract: software, platform, and hardware attestation elevate trust levels before credentials are issued. Ships with an OIDC verifier (GitHub Actions, GCP Workload Identity, Kubernetes projected SA tokens, etc.) plus per-tenant `AttestationPolicy` for issuer allowlisting and claim binding. Full reference: [`docs/attestation.md`](docs/attestation.md).
 - **WIMSE Proof Tokens** — Single-use, nonce-bound tokens for service-to-service verification and replay protection.
 
 ---
@@ -256,25 +256,66 @@ When an orchestrator needs a specialized agent to handle part of a task, it dele
 
 This is the key difference from sharing credentials: the sub-agent has its own registered identity and its own keypair. It proves it holds that keypair by signing a short-lived JWT assertion (`actor_token`). ZeroID verifies both tokens and issues a delegated token that carries both identities.
 
+The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`examples/openclaw/agent-identity-sidecar.py:450`](./examples/openclaw/agent-identity-sidecar.py).
+
 <details>
 <summary>Python</summary>
 
 ```python
-# Register the sub-agent — it has its own identity, separate from the orchestrator
+# ── One-time helpers (define once, reuse across delegate calls) ──────────
+import base64, json, time, uuid
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+ZEROID_ISSUER = "http://localhost:8899"  # set to your ZeroID base URL
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def generate_ec_keypair() -> tuple[str, str]:
+    """Generate an ES256 (P-256) keypair. Returns (private_pem, public_pem)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    public_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return private_pem, public_pem
+
+def build_jwt_assertion(private_pem: str, wimse_uri: str) -> str:
+    """Sign a 5-minute ES256 JWT assertion proving the holder of private_pem."""
+    key = serialization.load_pem_private_key(private_pem.encode(), password=None)
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "ES256", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps({
+        "iss": wimse_uri, "sub": wimse_uri, "aud": ZEROID_ISSUER,
+        "iat": now, "exp": now + 300, "jti": uuid.uuid4().hex,
+    }).encode())
+    der = key.sign(f"{header}.{payload}".encode(), ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    sig = _b64url(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+    return f"{header}.{payload}.{sig}"
+
+# ── Tutorial flow ────────────────────────────────────────────────────────
+# Generate the sub-agent's keypair. Register the public PEM with ZeroID;
+# keep the private PEM in your secret store — it never leaves the agent.
+sub_agent_private_key, sub_agent_public_key = generate_ec_keypair()
+
 sub_agent = client.agents.register(
     name="Data Fetcher",
     external_id="data-fetcher",
     sub_type="tool_agent",
     trust_level="first_party",
+    public_key_pem=sub_agent_public_key,    # required for token_exchange
 )
 
 # The sub-agent proves it holds its private key by signing a JWT assertion.
-actor_token = build_jwt_assertion(
-    iss=sub_agent.identity.wimse_uri,
-    sub=sub_agent.identity.wimse_uri,
-    aud="https://auth.highflame.ai",
-    private_key_pem=sub_agent_private_key,
-)
+actor_token = build_jwt_assertion(sub_agent_private_key, sub_agent.identity.wimse_uri)
 
 # Delegate data:read to the sub-agent.
 # ZeroID enforces scope intersection — the sub-agent can only receive scopes
@@ -290,6 +331,65 @@ delegated = client.tokens.delegate(
 #   act.sub:          spiffe://.../agent/orchestrator-1 ← which agent delegated (RFC 8693)
 #   scope:            data:read                         ← capped by intersection
 #   delegation_depth: 1
+```
+
+</details>
+
+<details>
+<summary>TypeScript</summary>
+
+```typescript
+import { ZeroIDClient } from "@highflame/sdk";
+import { SignJWT, generateKeyPair, exportJWK, importJWK } from "jose";
+import { randomUUID, createPublicKey } from "node:crypto";
+
+const ZEROID_ISSUER = "http://localhost:8899"; // set to your ZeroID base URL
+
+// ── One-time helpers ────────────────────────────────────────────────────
+async function generateEcKeypair(): Promise<{ privateJwk: object; publicPem: string }> {
+  const { privateKey, publicKey } = await generateKeyPair("ES256", { extractable: true });
+  const privateJwk = await exportJWK(privateKey);
+  const publicJwk = await exportJWK(publicKey);
+  const publicPem = createPublicKey({ key: publicJwk as never, format: "jwk" }).export({
+    type: "spki",
+    format: "pem",
+  }) as string;
+  return { privateJwk, publicPem };
+}
+
+async function buildJwtAssertion(privateJwk: object, wimseUri: string): Promise<string> {
+  const key = await importJWK(privateJwk as never, "ES256");
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "ES256", typ: "JWT" })
+    .setIssuer(wimseUri)
+    .setSubject(wimseUri)
+    .setAudience(ZEROID_ISSUER)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .setJti(randomUUID())
+    .sign(key);
+}
+
+// ── Tutorial flow ──────────────────────────────────────────────────────
+const { privateJwk: subAgentPrivateKey, publicPem: subAgentPublicKey } =
+  await generateEcKeypair();
+
+const subAgent = await client.agents.register({
+  name: "Data Fetcher",
+  external_id: "data-fetcher",
+  sub_type: "tool_agent",
+  trust_level: "first_party",
+  public_key_pem: subAgentPublicKey, // required for token_exchange
+});
+
+const actorToken = await buildJwtAssertion(subAgentPrivateKey, subAgent.identity.wimse_uri);
+
+const delegated = await client.tokens.delegate({
+  actor_token: actorToken,
+  scope: "data:read",
+});
+// delegated.access_token carries sub=data-fetcher, act.sub=orchestrator-1,
+// scope=data:read, delegation_depth=1
 ```
 
 </details>
@@ -477,20 +577,26 @@ remediator   = client.agents.register(name="Firewall Agent",
 
 # Each agent runs with its own client, initialized with its own api_key.
 # delegate() uses the client's internally managed token as the subject.
+# `build_jwt_assertion` and `generate_ec_keypair` are defined in §2 above.
 monitor_client      = ZeroIDClient(base_url="...", api_key=monitor.api_key)
 investigator_client = ZeroIDClient(base_url="...", api_key=investigator.api_key)
+
+# Each sub-agent has its own keypair; the public PEM was registered when the
+# identity was created (omitted above for brevity — pass public_key_pem=...).
+investigator_private_key, _ = generate_ec_keypair()
+remediator_private_key,   _ = generate_ec_keypair()
 
 # Monitor detects anomaly → delegates log investigation (depth 1)
 # Scope is attenuated — investigator gets read access only, not firewall:write
 investigator_token = monitor_client.tokens.delegate(
-    actor_token=build_jwt_assertion(investigator.identity.wimse_uri, investigator_private_key),
+    actor_token=build_jwt_assertion(investigator_private_key, investigator.identity.wimse_uri),
     scope="logs:read logs:query",
 )
 # investigator_token: sub=log-investigator, act.sub=sec-monitor, depth=1
 
 # Investigator confirms breach → delegates remediation (depth 2, at the cap)
 remediator_token = investigator_client.tokens.delegate(
-    actor_token=build_jwt_assertion(remediator.identity.wimse_uri, remediator_private_key),
+    actor_token=build_jwt_assertion(remediator_private_key, remediator.identity.wimse_uri),
     scope="firewall:write",
 )
 # remediator_token: sub=fw-remediator, act.sub=log-investigator, depth=2
@@ -512,9 +618,12 @@ client.agents.deactivate(monitor.identity.id)
 ```python
 # Alice authenticates via authorization_code + PKCE
 # Her user token is exchanged so the assistant can act on her behalf
+# `build_jwt_assertion` and `generate_ec_keypair` are defined in §2 above.
+# The public PEM was registered when the identity was created (pass public_key_pem=...).
+assistant_private_key, _ = generate_ec_keypair()
 assistant_token = client.tokens.issue_token_exchange(
     subject_token=alice_user_token,      # alice's authorization_code-issued token
-    actor_token=build_jwt_assertion(assistant.identity.wimse_uri, assistant_private_key),
+    actor_token=build_jwt_assertion(assistant_private_key, assistant.identity.wimse_uri),
     scope="calendar:read travel:book expenses:submit",
 )
 # assistant_token: sub=travel-assistant, act.sub=alice@company.com, depth=1
@@ -632,7 +741,12 @@ graph TD
 | GET | `/api/v1/credential-policies/{id}` | Get credential policy |
 | PATCH | `/api/v1/credential-policies/{id}` | Update credential policy |
 | POST | `/api/v1/credentials/{id}/revoke` | Revoke credential |
-| POST | `/api/v1/attestations` | Submit attestation |
+| POST | `/api/v1/attestation/submit` | Submit attestation proof |
+| POST | `/api/v1/attestation/verify` | Verify proof + promote trust + issue credential |
+| GET | `/api/v1/attestation/{id}` | Get attestation record |
+| PUT | `/api/v1/attestation-policies` | Upsert per-tenant attestation policy |
+| GET | `/api/v1/attestation-policies` | List attestation policies |
+| DELETE | `/api/v1/attestation-policies/{id}` | Delete attestation policy |
 | POST | `/api/v1/signals/ingest` | Ingest CAE signal |
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |

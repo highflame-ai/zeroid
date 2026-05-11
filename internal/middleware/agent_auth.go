@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
+
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 )
 
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
@@ -47,8 +49,15 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
+			// Reject alg=none / HS* before any further work — JWT-SVID §3.
+			if err := jwtalg.Validate(tokenStr); err != nil {
+				log.Warn().Err(err).Str("path", r.URL.Path).Msg("Agent JWT rejected: bad alg")
+				writeAgentAuthError(w, http.StatusUnauthorized, "invalid or expired token")
+				return
+			}
+
 			parsed, err := jwt.Parse([]byte(tokenStr),
-				jwt.WithKey(jwa.ES256, cfg.PublicKey),
+				jwt.WithKey(jwa.ES256(), cfg.PublicKey),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(cfg.Issuer),
 			)
@@ -84,35 +93,38 @@ func GetAgentClaims(ctx context.Context) (AgentClaims, bool) {
 }
 
 func extractAgentClaims(token jwt.Token) AgentClaims {
+	// jwx v4: Subject() / JwtID() return (value, present).
+	sub, _ := token.Subject()
+	jti, _ := token.JwtID()
 	claims := AgentClaims{
-		Subject: token.Subject(),
-		JTI:     token.JwtID(),
+		Subject: sub,
+		JTI:     jti,
 	}
 
-	if v, ok := token.Get("account_id"); ok {
-		claims.AccountID, _ = v.(string)
+	// jwx v4: jwt.Get[T](token, name) replaces token.Get(name); errors when
+	// the claim is absent or wrong-typed, so a returned err is the safe miss.
+	if v, err := jwt.Get[string](token, "account_id"); err == nil {
+		claims.AccountID = v
 	}
-	if v, ok := token.Get("project_id"); ok {
-		claims.ProjectID, _ = v.(string)
+	if v, err := jwt.Get[string](token, "project_id"); err == nil {
+		claims.ProjectID = v
 	}
-	if v, ok := token.Get("agent_id"); ok {
-		claims.AgentID, _ = v.(string)
+	if v, err := jwt.Get[string](token, "agent_id"); err == nil {
+		claims.AgentID = v
 	}
-	if v, ok := token.Get("trust_level"); ok {
-		claims.TrustLevel, _ = v.(string)
+	if v, err := jwt.Get[string](token, "trust_level"); err == nil {
+		claims.TrustLevel = v
 	}
-	if v, ok := token.Get("identity_id"); ok {
-		claims.IdentityID, _ = v.(string)
+	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
+		claims.IdentityID = v
 	}
-	if v, ok := token.Get("scopes"); ok {
-		switch s := v.(type) {
-		case []string:
-			claims.Scopes = s
-		case []any:
-			for _, item := range s {
-				if str, ok := item.(string); ok {
-					claims.Scopes = append(claims.Scopes, str)
-				}
+	// scopes can be []string or []any depending on issuance shape; try both.
+	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {
+		claims.Scopes = v
+	} else if v, err := jwt.Get[[]any](token, "scopes"); err == nil {
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				claims.Scopes = append(claims.Scopes, str)
 			}
 		}
 	}

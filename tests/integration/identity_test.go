@@ -53,6 +53,36 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestRegisterIdentityRejectsForbiddenSPIFFEChars locks in the SPIFFE §2.3
+// path-segment gate on external_id. The path_traversal case is the one that
+// actually matters — without the gate it slips through into the WIMSE URI.
+func TestRegisterIdentityRejectsForbiddenSPIFFEChars(t *testing.T) {
+	cases := []struct {
+		name       string
+		externalID string
+	}{
+		{"slash", "agent/with/slash"},
+		{"at_sign", "agent@example"},
+		{"space", "agent with space"},
+		{"path_traversal", "../admin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := post(t, adminPath("/identities"), map[string]any{
+				"external_id":    tc.externalID,
+				"trust_level":    "unverified",
+				"owner_user_id":  "user-test-owner",
+				"allowed_scopes": []string{"billing:read"},
+			}, adminHeaders())
+			assert.True(t,
+				resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity,
+				"expected 400/422 for forbidden character, got %d", resp.StatusCode,
+			)
+			_ = resp.Body.Close()
+		})
+	}
+}
+
 // TestRegisterIdentityMissingExternalID verifies that omitting external_id returns 400/422.
 func TestRegisterIdentityMissingExternalID(t *testing.T) {
 	resp := post(t, adminPath("/identities"), map[string]any{
@@ -380,7 +410,7 @@ func TestListAgentsPagination(t *testing.T) {
 	paginationLabel := uid("page")
 
 	// Register 5 agents with a unique label.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		post(t, adminPath("/agents/register"), map[string]any{
 			"external_id":   uid(fmt.Sprintf("page-%d", i)),
 			"identity_type": "agent",
@@ -466,4 +496,129 @@ func TestListIdentitiesEndpointFilters(t *testing.T) {
 	assert.NotNil(t, body["total"], "response should include total")
 	assert.NotNil(t, body["limit"], "response should include limit")
 	assert.NotNil(t, body["offset"], "response should include offset")
+}
+
+// TestRegisterIdentityWithRiskMetadata pins the optional CoSAI §3.2 +
+// NIST SP 800-63 fields added by #80: capability_tier, risk_tier, ial.
+// Valid enum values must round-trip through register → GET; invalid
+// values must surface as a structured 400 instead of a constraint error.
+func TestRegisterIdentityWithRiskMetadata(t *testing.T) {
+	externalID := uid("risk-meta-agent")
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":     externalID,
+		"trust_level":     "first_party",
+		"owner_user_id":   "user-test-owner",
+		"capability_tier": "high",
+		"risk_tier":       "high",
+		"ial":             "ial2",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	body := decode(t, resp)
+	id := body["id"].(string)
+	assert.Equal(t, "high", body["capability_tier"])
+	assert.Equal(t, "high", body["risk_tier"])
+	assert.Equal(t, "ial2", body["ial"])
+
+	// GET round-trip — values must persist.
+	getResp := get(t, adminPath("/identities/"+id), adminHeaders())
+	defer func() { _ = getResp.Body.Close() }()
+	require.Equal(t, http.StatusOK, getResp.StatusCode)
+	got := decode(t, getResp)
+	assert.Equal(t, "high", got["capability_tier"])
+	assert.Equal(t, "high", got["risk_tier"])
+	assert.Equal(t, "ial2", got["ial"])
+}
+
+// TestRegisterIdentityRiskMetadataDefaultsUnclassified verifies that
+// omitting the new fields leaves them empty rather than blowing up the
+// CHECK constraint. `nullzero` on the bun column tag is what makes "" → NULL.
+func TestRegisterIdentityRiskMetadataDefaultsUnclassified(t *testing.T) {
+	externalID := uid("risk-meta-default")
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	body := decode(t, resp)
+	// omitempty + zero string → not in response at all.
+	_, hasCap := body["capability_tier"]
+	_, hasRisk := body["risk_tier"]
+	_, hasIAL := body["ial"]
+	assert.False(t, hasCap, "capability_tier must be absent when unset")
+	assert.False(t, hasRisk, "risk_tier must be absent when unset")
+	assert.False(t, hasIAL, "ial must be absent when unset")
+}
+
+// TestRegisterIdentityRejectsInvalidRiskMetadata verifies enum validation
+// catches bad values before they reach the DB CHECK constraint. Huma's
+// `enum:` schema validator runs first and produces 422 for the OpenAPI-
+// driven path; the service-layer validator (which produces 400) is the
+// fallback for callers that skip the schema. Either is correct — what
+// matters is that a SQLSTATE 23514 never leaks back as 500.
+func TestRegisterIdentityRejectsInvalidRiskMetadata(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{"capability_tier_unknown", "capability_tier", "medium"},
+		{"risk_tier_unknown", "risk_tier", "extreme"},
+		{"ial_unknown", "ial", "ial4"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := map[string]any{
+				"external_id":   uid("bad-" + tc.field),
+				"trust_level":   "unverified",
+				"owner_user_id": "user-test-owner",
+				tc.field:        tc.value,
+			}
+			resp := post(t, adminPath("/identities"), body, adminHeaders())
+			defer func() { _ = resp.Body.Close() }()
+			ok := resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity
+			assert.Truef(t, ok,
+				"invalid %s=%q must surface as a structured 400 or 422, got %d (a 500 from a CHECK violation would mean validation skipped)",
+				tc.field, tc.value, resp.StatusCode)
+		})
+	}
+}
+
+// TestUpdateIdentityRiskMetadata verifies PATCH-style updates to the new
+// fields land via the admin API. The enum schema only admits the
+// real values (low/high, ial1/ial2/ial3); "clear back to unclassified"
+// is intentionally NOT exposed — once an operator has classified an
+// agent, the classification stays unless rotated through valid values.
+// Empty-string clear at the SQL layer is still possible via direct DB
+// manipulation, but it's not part of the API contract.
+func TestUpdateIdentityRiskMetadata(t *testing.T) {
+	externalID := uid("risk-meta-update")
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	id := decode(t, resp)["id"].(string)
+
+	updateResp := doRequest(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{
+		"capability_tier": "low",
+		"risk_tier":       "high",
+		"ial":             "ial3",
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, updateResp.StatusCode)
+	body := decode(t, updateResp)
+	assert.Equal(t, "low", body["capability_tier"])
+	assert.Equal(t, "high", body["risk_tier"])
+	assert.Equal(t, "ial3", body["ial"])
+
+	// Re-classification (low → high) must also land.
+	reclassifyResp := doRequest(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{
+		"capability_tier": "high",
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, reclassifyResp.StatusCode)
+	reclassified := decode(t, reclassifyResp)
+	assert.Equal(t, "high", reclassified["capability_tier"])
+	assert.Equal(t, "high", reclassified["risk_tier"], "risk_tier should be unchanged by capability_tier update")
+	assert.Equal(t, "ial3", reclassified["ial"], "ial should be unchanged by capability_tier update")
 }

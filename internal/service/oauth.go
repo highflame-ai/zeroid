@@ -10,14 +10,16 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -217,13 +219,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 
 	// Ensure client_credentials grant is permitted.
-	allowed := false
-	for _, gt := range client.GrantTypes {
-		if gt == "client_credentials" {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(client.GrantTypes, "client_credentials")
 	if !allowed {
 		return nil, oauthBadRequest("unauthorized_client", "client not authorized for client_credentials grant")
 	}
@@ -261,13 +257,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.Subject); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT uses an unsupported algorithm", err)
+	}
+
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
 	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT is malformed", err)
 	}
 
-	wimseURI := peeked.Issuer()
+	wimseURI, _ := peeked.Issuer()
 	if wimseURI == "" {
 		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing iss claim")
 	}
@@ -297,7 +298,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 
 	// Fully validate the assertion JWT against the agent's registered public key.
 	assertionToken, err := jwt.Parse([]byte(req.Subject),
-		jwt.WithKey(jwa.ES256, agentPubKey),
+		jwt.WithKey(jwa.ES256(), agentPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),
 	)
@@ -306,7 +307,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// iss must match the identity's WIMSE URI.
-	if assertionToken.Issuer() != identity.WIMSEURI {
+	if iss, _ := assertionToken.Issuer(); iss != identity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
 	}
 
@@ -366,7 +367,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequestCause("invalid_grant", "subject_token validation failed", err)
 	}
 
-	subjectJTI := subjectParsed.JwtID()
+	subjectJTI, _ := subjectParsed.JwtID()
 	if subjectJTI == "" {
 		return nil, oauthBadRequest("invalid_grant", "subject_token missing jti claim")
 	}
@@ -378,12 +379,16 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.ActorToken); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token uses an unsupported algorithm", err)
+	}
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
 	}
 
-	actorWIMSEURI := actorPeeked.Issuer()
+	actorWIMSEURI, _ := actorPeeked.Issuer()
 	if actorWIMSEURI == "" {
 		return nil, oauthBadRequest("invalid_grant", "actor_token missing iss claim")
 	}
@@ -418,14 +423,14 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	validatedActorToken, err := jwt.Parse([]byte(req.ActorToken),
-		jwt.WithKey(jwa.ES256, actorPubKey),
+		jwt.WithKey(jwa.ES256(), actorPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
 	}
-	if validatedActorToken.Issuer() != actorIdentity.WIMSEURI {
+	if iss, _ := validatedActorToken.Issuer(); iss != actorIdentity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
 	}
 
@@ -475,12 +480,14 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
+	// jwx v4: jwt.Get[float64] replaces the v2 Token.Get + assertion. JSON
+	// numbers decode as float64 regardless of integer intent.
 	var parentDepth int
-	if v, ok := subjectParsed.Get("delegation_depth"); ok {
-		if d, ok := v.(float64); ok {
-			parentDepth = int(d)
-		}
+	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
+		parentDepth = int(d)
 	}
+
+	delegatedBy, _ := subjectParsed.Subject()
 
 	// Step 6: Issue a delegated credential for the sub-agent. The full
 	// policy constraint set (delegation depth ceiling, required trust
@@ -491,7 +498,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		IdentityPolicyID: actorPolicy.ID,
 		Scopes:           scopes,
 		GrantType:        domain.GrantTypeTokenExchange,
-		DelegatedBy:      subjectParsed.Subject(),
+		DelegatedBy:      delegatedBy,
 		ParentJTI:        subjectJTI,
 		DelegationDepth:  parentDepth + 1,
 	})
@@ -761,13 +768,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	// Verify the client is authorised to use the authorization_code grant.
-	grantAllowed := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeAuthorizationCode) {
-			grantAllowed = true
-			break
-		}
-	}
+	grantAllowed := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode))
 	if !grantAllowed {
 		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
 	}
@@ -808,13 +809,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	// Determine access token TTL.
 	// Priority: per-client config > grant-type-based default > server default.
-	hasRefreshGrant := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeRefreshToken) {
-			hasRefreshGrant = true
-			break
-		}
-	}
+	hasRefreshGrant := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken))
 
 	ttl := oauthClient.AccessTokenTTL
 	if ttl <= 0 {
@@ -1001,7 +996,7 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 		return inactive, nil // malformed, expired, or invalid — return active:false, no error
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 	if jti == "" {
 		return inactive, nil
 	}
@@ -1016,35 +1011,31 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 
 	scopes := cred.Scopes
 
+	// jwx v4: every accessor returns (value, present). Capture once and unix
+	// only the timestamp pair; missing iat/exp falls through as zero, which
+	// is acceptable because parseToken(validate=true) already enforced exp.
+	sub, _ := parsed.Subject()
+	iss, _ := parsed.Issuer()
+	iat, _ := parsed.IssuedAt()
+	exp, _ := parsed.Expiration()
 	result := map[string]any{
 		"active":     true,
-		"sub":        parsed.Subject(),
-		"iss":        parsed.Issuer(),
+		"sub":        sub,
+		"iss":        iss,
 		"jti":        jti,
-		"iat":        parsed.IssuedAt().Unix(),
-		"exp":        parsed.Expiration().Unix(),
+		"iat":        iat.Unix(),
+		"exp":        exp.Unix(),
 		"scope":      strings.Join(scopes, " "),
 		"account_id": cred.AccountID,
 		"project_id": cred.ProjectID,
 	}
 
-	if v, ok := parsed.Get("agent_id"); ok {
-		result["agent_id"] = v
-	}
-	if v, ok := parsed.Get("trust_level"); ok {
-		result["trust_level"] = v
-	}
-	if v, ok := parsed.Get("identity_type"); ok {
-		result["identity_type"] = v
-	}
-	if v, ok := parsed.Get("external_id"); ok {
-		result["external_id"] = v
-	}
-	if v, ok := parsed.Get("delegation_depth"); ok {
-		result["delegation_depth"] = v
-	}
-	if v, ok := parsed.Get("act"); ok {
-		result["act"] = v
+	// Custom claims via the v4 generic accessor. jwt.Get[any] survives both
+	// string and structured shapes (e.g. act is a nested object).
+	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act"} {
+		if v, err := jwt.Get[any](parsed, claim); err == nil {
+			result[claim] = v
+		}
 	}
 
 	return result, nil
@@ -1060,7 +1051,7 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 		return nil // malformed or invalid — treat as not found per RFC 7009 section 2.2
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 	if jti == "" {
 		return nil
 	}
@@ -1083,6 +1074,12 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // the token's kid + alg headers to the correct key automatically.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
 func (s *OAuthService) parseToken(tokenStr string, validate bool) (jwt.Token, error) {
+	// Belt-and-braces. WithKeySet trusts the key's own alg, so this isn't
+	// exploitable today — but if the bundle ever ships a key without alg,
+	// the verifier's fallback widens. Cheaper to gate up-front.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, err
+	}
 	return jwt.Parse([]byte(tokenStr),
 		jwt.WithKeySet(s.jwksSvc.KeySet()),
 		jwt.WithValidate(validate),

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -45,7 +45,7 @@ func TestIssuedTokenHasAudClaimDefault(t *testing.T) {
 	parsed, err := jwt.ParseInsecure([]byte(accessToken))
 	require.NoError(t, err)
 
-	aud := parsed.Audience()
+	aud, _ := parsed.Audience()
 	require.NotEmpty(t, aud, "aud claim MUST be present on issued tokens (JWT-SVID §3)")
 	assert.Equal(t, []string{testIssuer}, aud,
 		"aud must default to the issuer URL when no audience was requested")
@@ -76,7 +76,8 @@ func TestIssuedTokenPreservesExplicitAudience(t *testing.T) {
 	parsed, err := jwt.ParseInsecure([]byte(accessToken))
 	require.NoError(t, err)
 
-	assert.Equal(t, explicitAud, parsed.Audience(),
+	parsedAud, _ := parsed.Audience()
+	assert.Equal(t, explicitAud, parsedAud,
 		"explicit audience must be preserved, not overwritten by the issuer default")
 }
 

@@ -33,6 +33,12 @@ type CreateIdentityInput struct {
 		Description        string          `json:"description,omitempty" doc:"Human-readable description of the identity"`
 		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		// CoSAI §3.2 capability–risk classification + NIST SP 800-63 IAL.
+		// Empty string is the default ("unclassified"); future default-policy
+		// selection will key off these.
+		CapabilityTier string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
+		RiskTier       string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
+		IAL            string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
 	}
 }
 
@@ -82,6 +88,11 @@ type UpdateIdentityInput struct {
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
+		// CoSAI §3.2 + NIST SP 800-63. Pointer so callers can distinguish
+		// "not set" (omit) from "clear to unclassified" (explicit "").
+		CapabilityTier *string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
+		RiskTier       *string `json:"risk_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 risk tier"`
+		IAL            *string `json:"ial,omitempty" enum:"ial1,ial2,ial3" doc:"NIST SP 800-63 Identity Assurance Level"`
 	}
 }
 
@@ -193,6 +204,9 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		Labels:             input.Body.Labels,
 		CreatedBy:          createdBy,
 		CredentialPolicyID: input.Body.CredentialPolicyID,
+		CapabilityTier:     input.Body.CapabilityTier,
+		RiskTier:           input.Body.RiskTier,
+		IAL:                input.Body.IAL,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -202,6 +216,11 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		// tenant is a client error, not a server error.
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		// SPIFFE path-segment + risk/IAL enum validation failures are
+		// caller-fixable. Service layer wraps both with ErrInvalidIdentityField.
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Msg("failed to register identity")
 		return nil, huma.Error500InternalServerError("failed to create identity")
@@ -234,10 +253,7 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	offset := input.Offset
-	if offset < 0 {
-		offset = 0
-	}
+	offset := max(input.Offset, 0)
 
 	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, limit, offset)
 	if err != nil {
@@ -301,10 +317,18 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		Metadata:           input.Body.Metadata,
 		Status:             status,
 		CredentialPolicyID: input.Body.CredentialPolicyID,
+		CapabilityTier:     input.Body.CapabilityTier,
+		RiskTier:           input.Body.RiskTier,
+		IAL:                input.Body.IAL,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		// Field validation failures (SPIFFE path segments + risk/IAL enums)
+		// are caller-fixable. Service layer wraps them with ErrInvalidIdentityField.
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to update identity")
 		return nil, huma.Error500InternalServerError("failed to update identity")

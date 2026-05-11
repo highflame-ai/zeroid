@@ -6,17 +6,20 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 )
 
 // testKeySet holds both key pairs and serves a JWKS endpoint for tests.
@@ -41,21 +44,21 @@ func newTestKeySet(t *testing.T) *testKeySet {
 
 	set := jwk.NewSet()
 
-	ecPub, err := jwk.FromRaw(ecPriv.Public())
+	ecPub, err := jwk.Import[jwk.Key](ecPriv.Public())
 	if err != nil {
 		t.Fatalf("create EC JWK: %v", err)
 	}
 	_ = ecPub.Set(jwk.KeyIDKey, "ec-key-1")
-	_ = ecPub.Set(jwk.AlgorithmKey, jwa.ES256)
+	_ = ecPub.Set(jwk.AlgorithmKey, jwa.ES256())
 	_ = ecPub.Set(jwk.KeyUsageKey, "sig")
 	_ = set.AddKey(ecPub)
 
-	rsaPub, err := jwk.FromRaw(rsaPriv.Public())
+	rsaPub, err := jwk.Import[jwk.Key](rsaPriv.Public())
 	if err != nil {
 		t.Fatalf("create RSA JWK: %v", err)
 	}
 	_ = rsaPub.Set(jwk.KeyIDKey, "rsa-key-1")
-	_ = rsaPub.Set(jwk.AlgorithmKey, jwa.RS256)
+	_ = rsaPub.Set(jwk.AlgorithmKey, jwa.RS256())
 	_ = rsaPub.Set(jwk.KeyUsageKey, "sig")
 	_ = set.AddKey(rsaPub)
 
@@ -75,35 +78,35 @@ func makeHeaders(kid string) jws.Headers {
 	return h
 }
 
-func (ks *testKeySet) signES256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signES256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
 		_ = token.Set(k, v)
 	}
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, ks.ecPriv, jws.WithProtectedHeaders(makeHeaders("ec-key-1"))))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), ks.ecPriv, jws.WithProtectedHeaders(makeHeaders("ec-key-1"))))
 	if err != nil {
 		t.Fatalf("sign ES256: %v", err)
 	}
 	return string(signed)
 }
 
-func (ks *testKeySet) signRS256(t *testing.T, claims map[string]interface{}) string {
+func (ks *testKeySet) signRS256(t *testing.T, claims map[string]any) string {
 	t.Helper()
 	token := jwt.New()
 	for k, v := range claims {
 		_ = token.Set(k, v)
 	}
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256, ks.rsaPriv, jws.WithProtectedHeaders(makeHeaders("rsa-key-1"))))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.RS256(), ks.rsaPriv, jws.WithProtectedHeaders(makeHeaders("rsa-key-1"))))
 	if err != nil {
 		t.Fatalf("sign RS256: %v", err)
 	}
 	return string(signed)
 }
 
-func baseClaims(issuer string) map[string]interface{} {
+func baseClaims(issuer string) map[string]any {
 	now := time.Now()
-	return map[string]interface{}{
+	return map[string]any{
 		"iss":        issuer,
 		"sub":        "user-123",
 		"aud":        []string{"https://shield.example.com"},
@@ -116,7 +119,7 @@ func baseClaims(issuer string) map[string]interface{} {
 	}
 }
 
-func agentClaims(issuer string) map[string]interface{} {
+func agentClaims(issuer string) map[string]any {
 	c := baseClaims(issuer)
 	c["external_id"] = "agent-smith"
 	c["identity_type"] = "agent"
@@ -127,7 +130,7 @@ func agentClaims(issuer string) map[string]interface{} {
 	c["publisher"] = "acme-corp"
 	c["capabilities"] = []string{"read_file", "call_tool"}
 	c["delegation_depth"] = 1
-	c["act"] = map[string]interface{}{
+	c["act"] = map[string]any{
 		"sub": "orchestrator-1",
 		"iss": issuer,
 	}
@@ -272,6 +275,61 @@ func TestVerifyGarbageToken(t *testing.T) {
 	}
 }
 
+// TestVerifyRejectsAlgNone covers the JWT-SVID §3 / RFC 7519 §6 requirement
+// that `alg: none` MUST be rejected by any compliant verifier. The token is
+// hand-crafted (no library will sign one for you) to guarantee the JOSE
+// header carries alg=none. The pre-parse alg peek (validateAlg in alg.go,
+// from #103) rejects this at the JWS layer before any parse logic runs.
+func TestVerifyRejectsAlgNone(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Build  base64url(header).base64url(payload).  with empty signature.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker","iss":"https://auth.test.com"}`))
+	token := header + "." + payload + "."
+
+	_, err := v.Verify(context.Background(), token)
+	if err == nil {
+		t.Fatal("alg=none token MUST be rejected (JWT-SVID §3)")
+	}
+	// validateAlg (alg.go) wraps with ErrInvalidToken when alg is outside
+	// the JWT-SVID allow-list. The error message also contains the offending
+	// alg value so a future maintainer can grep for it in a regression.
+	if !errors.Is(err, authjwt.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got: %v", err)
+	}
+}
+
+// TestVerifyRejectsHS256 covers the HS256-confusion attack class: an
+// attacker signs with HS256 using the RSA public key as the HMAC secret,
+// hoping a verifier that doesn't pin the algorithm will accept it.
+// validateAlg's allow-list rejects HS256 outright before any signature
+// verification runs.
+func TestVerifyRejectsHS256(t *testing.T) {
+	ks := newTestKeySet(t)
+	v := newVerifier(t, ks, "")
+
+	// Sign with HS256 using an arbitrary symmetric secret. The actual key
+	// material doesn't matter — verifier.Verify must reject before checking
+	// the signature.
+	tok := jwt.New()
+	_ = tok.Set(jwt.IssuerKey, "https://auth.test.com")
+	_ = tok.Set(jwt.SubjectKey, "attacker")
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte("any-symmetric-key-will-do")))
+	if err != nil {
+		t.Fatalf("sign HS256: %v", err)
+	}
+
+	_, err = v.Verify(context.Background(), string(signed))
+	if err == nil {
+		t.Fatal("HS256 token MUST be rejected to prevent algorithm-confusion attacks")
+	}
+	if !errors.Is(err, authjwt.ErrInvalidToken) {
+		t.Errorf("expected ErrInvalidToken, got: %v", err)
+	}
+}
+
 func TestMiddleware(t *testing.T) {
 	ks := newTestKeySet(t)
 	issuer := "https://auth.test.com"
@@ -394,9 +452,9 @@ func TestJWKSClientRefreshOnUnknownKID(t *testing.T) {
 		callCount++
 		if callCount >= 2 {
 			// Add the key on refresh.
-			pub, _ := jwk.FromRaw(ecPriv.Public())
+			pub, _ := jwk.Import[jwk.Key](ecPriv.Public())
 			_ = pub.Set(jwk.KeyIDKey, "rotated-key")
-			_ = pub.Set(jwk.AlgorithmKey, jwa.ES256)
+			_ = pub.Set(jwk.AlgorithmKey, jwa.ES256())
 			_ = pub.Set(jwk.KeyUsageKey, "sig")
 			freshSet := jwk.NewSet()
 			_ = freshSet.AddKey(pub)
@@ -429,7 +487,7 @@ func TestJWKSClientRefreshOnUnknownKID(t *testing.T) {
 	hdrs := jws.NewHeaders()
 	_ = hdrs.Set(jws.KeyIDKey, "rotated-key")
 
-	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256, ecPriv, jws.WithProtectedHeaders(hdrs)))
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.ES256(), ecPriv, jws.WithProtectedHeaders(hdrs)))
 	if err != nil {
 		t.Fatalf("sign: %v", err)
 	}
@@ -630,6 +688,130 @@ func TestVerifyRealTime(t *testing.T) {
 		}
 		assertEqual(t, "AccountID", claims.AccountID, "acc-001")
 	})
+}
+
+// TestNewVerifier_StartsWithUnreachableJWKS verifies that a transient
+// startup race (issuer not yet listening) no longer crashes the caller.
+// NewVerifier must succeed; the verifier is usable once the issuer
+// comes up.
+func TestNewVerifier_StartsWithUnreachableJWKS(t *testing.T) {
+	// Stand up a server, capture its URL, then close it so the URL is dead.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	v, err := authjwt.NewVerifier(authjwt.VerifierConfig{JWKSURL: deadURL})
+	if err != nil {
+		t.Fatalf("NewVerifier with unreachable JWKS should not error, got: %v", err)
+	}
+	t.Cleanup(v.Close)
+}
+
+// TestVerify_LazyFetchOnFirstUse simulates the cluster-bootstrap race:
+// NewVerifier is called while the issuer is still starting (server returns
+// errors), then the issuer comes up and the first Verify() call must
+// succeed via lazy fetch — no restart required.
+func TestVerify_LazyFetchOnFirstUse(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+
+	// Wrap the test JWKS server in a switchable proxy: 503 until ready=true.
+	var ready atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+			return
+		}
+		// Forward to the real test JWKS server.
+		w.Header().Set("Content-Type", "application/json")
+		// Re-encode the keyset directly — cheaper than chaining through net/http.
+		_ = json.NewEncoder(w).Encode(ks.set)
+	}))
+	defer proxy.Close()
+
+	v, err := authjwt.NewVerifier(authjwt.VerifierConfig{
+		JWKSURL: proxy.URL,
+		Issuer:  issuer,
+	})
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	defer v.Close()
+
+	// Issuer is still "starting" — verify must fail cleanly with ErrNoKeySet,
+	// not crash, not hang past the request timeout.
+	token := ks.signRS256(t, baseClaims(issuer))
+	if _, err := v.Verify(context.Background(), token); !errors.Is(err, authjwt.ErrNoKeySet) {
+		t.Fatalf("expected ErrNoKeySet while issuer down, got: %v", err)
+	}
+
+	// Issuer comes up. The next Verify() must lazy-fetch and succeed
+	// without any external trigger (no Close+New, no manual refresh).
+	ready.Store(true)
+	claims, err := v.Verify(context.Background(), token)
+	if err != nil {
+		t.Fatalf("verify after issuer up: %v", err)
+	}
+	assertEqual(t, "AccountID", claims.AccountID, "acc-001")
+}
+
+// TestEnsureLoaded_FollowersRespectContext verifies that when one caller is
+// already running the cold-cache fetch, a second caller with a tighter
+// deadline returns on its own deadline rather than blocking up to the full
+// fetch timeout.
+func TestEnsureLoaded_FollowersRespectContext(t *testing.T) {
+	// Server: first request fails fast (503) so NewJWKSClient's best-effort
+	// warmup doesn't block the test setup. Subsequent requests — the
+	// leader's lazy fetch — hang on `block` until cleanup unblocks them.
+	block := make(chan struct{})
+	served := atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if served.Add(1) == 1 {
+			http.Error(w, "warming up", http.StatusServiceUnavailable)
+			return
+		}
+		<-block
+	}))
+	// Cleanups run LIFO; we register srv.Close first so close(block) runs
+	// before it — otherwise srv.Close blocks forever on the hanging handler's
+	// goroutine and the test deadlocks.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(block) })
+
+	c, err := authjwt.NewJWKSClient(srv.URL, authjwt.WithRequestTimeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("NewJWKSClient: %v", err)
+	}
+	t.Cleanup(c.Close)
+
+	// Leader: starts the (now-hanging) lazy fetch in a goroutine.
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_ = c.EnsureLoaded(context.Background())
+	}()
+
+	// Beat to let the leader actually issue its HTTP request and register
+	// loadInFlight before the follower joins.
+	time.Sleep(50 * time.Millisecond)
+
+	// Follower: 100ms deadline. Must return on its own deadline, not block
+	// for the leader's full requestTimeout (2s here, 10s in production).
+	followerCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = c.EnsureLoaded(followerCtx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected DeadlineExceeded, got: %v", err)
+	}
+	// Generous upper bound to absorb CI jitter while still ruling out the
+	// "stuck behind leader's full fetch timeout" failure mode.
+	if elapsed > 1*time.Second {
+		t.Fatalf("follower stuck for %s; expected ~100ms (leader's fetch should not block follower's ctx)", elapsed)
+	}
 }
 
 // Helpers
