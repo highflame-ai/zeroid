@@ -15,6 +15,13 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
+// ErrInvalidBindingMessage is the sentinel returned when binding_message
+// fails validation (currently: exceeds MaxBindingMessageBytes). Service-layer
+// validation errors are wrapped via %w so handlers can use errors.Is to map
+// to 400 Bad Request consistently — see the convention used for other
+// service-layer validation sentinels (e.g. credential policy).
+var ErrInvalidBindingMessage = errors.New("invalid binding_message")
+
 // BackchannelService implements OpenID CIBA Core 1.0 server-side flow:
 // request creation, user approval / denial, polling-based token redemption.
 //
@@ -31,6 +38,15 @@ type BackchannelService struct {
 	mu                  sync.RWMutex
 	notifier            BackchannelNotifierFunc
 	notifyDispatchAsync bool // overridable for tests
+
+	// svcCtx is the long-lived context used by detached notifier goroutines.
+	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
+	// can wind down on graceful shutdown instead of leaking past the server's
+	// HTTP listener close. Initialised by Start(); ctx.Background-derived
+	// until Start is invoked so that test harnesses that never call Start
+	// still get a working notifier path.
+	svcCtx    context.Context
+	svcCancel context.CancelFunc
 }
 
 // BackchannelNotifierFunc is the internal alias for the public
@@ -102,12 +118,30 @@ func NewBackchannelService(
 	if cfg.MaxBindingMessageBytes == 0 {
 		cfg.MaxBindingMessageBytes = 280
 	}
+	svcCtx, svcCancel := context.WithCancel(context.Background())
 	return &BackchannelService{
 		repo:                repo,
 		oauthClientSvc:      oauthClientSvc,
 		credentialSvc:       credentialSvc,
 		cfg:                 cfg,
 		notifyDispatchAsync: true,
+		svcCtx:              svcCtx,
+		svcCancel:           svcCancel,
+	}
+}
+
+// Stop cancels the service's lifecycle context, signalling in-flight detached
+// notifier goroutines to wind down. Idempotent. Server.Shutdown calls this so
+// graceful shutdown does not leak goroutines past the HTTP listener close.
+// After Stop, new notifier dispatches no-op rather than launching goroutines
+// against a cancelled context.
+func (s *BackchannelService) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.svcCancel != nil {
+		s.svcCancel()
+		s.svcCancel = nil
+		s.svcCtx = nil
 	}
 }
 
@@ -177,11 +211,18 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	}
 	_ = client // reserved for ping-mode allowlist read in PR 2
 
-	// Length-cap the binding message at insertion so an oversized payload
-	// can't bloat downstream notifier payloads / logs.
+	// Reject oversized binding_message rather than silently truncating.
+	// Silent truncation produced confusing UX (the prompt the user saw didn't
+	// match what the client asked for) and risked invalid UTF-8 from cutting
+	// mid-codepoint. The wrapped sentinel lets the handler map this to 400
+	// via errors.Is.
 	bindingMsg := in.BindingMessage
 	if s.cfg.MaxBindingMessageBytes > 0 && len(bindingMsg) > s.cfg.MaxBindingMessageBytes {
-		bindingMsg = bindingMsg[:s.cfg.MaxBindingMessageBytes]
+		return nil, oauthBadRequestCause(
+			"invalid_request",
+			fmt.Sprintf("binding_message exceeds maximum length of %d bytes", s.cfg.MaxBindingMessageBytes),
+			fmt.Errorf("%w: length %d > max %d", ErrInvalidBindingMessage, len(bindingMsg), s.cfg.MaxBindingMessageBytes),
+		)
 	}
 
 	expiry := time.Duration(in.RequestedExpiry) * time.Second
@@ -365,7 +406,28 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
 
 	case domain.BackchannelStatusApproved:
-		// Happy path: mint a token, mark issued, return.
+		// Claim-first: flip approved → issued BEFORE minting the token so
+		// only one polling thread can ever reach IssueCredential. The
+		// conditional UPDATE in MarkIssued (status='approved' guard) is the
+		// at-most-once invariant; a concurrent caller gets affected=0 and
+		// is rejected with access_denied. This matches the CIBA Core
+		// "auth_req_id is single-use" requirement and prevents the
+		// previously-documented double-mint window.
+		//
+		// Trade-off: if IssueCredential fails after the row has been
+		// flipped to "issued", the user is locked out of retrying this
+		// auth_req_id and must initiate a new bc-authorize. That's
+		// preferable to silently minting two tokens — the failure is
+		// loud (HTTP 500) and the client's retry-with-new-auth-req-id
+		// path handles it cleanly.
+		affected, mErr := s.repo.MarkIssued(ctx, in.AuthReqID)
+		if mErr != nil {
+			return nil, oauthServerError("failed to mark backchannel request issued", mErr)
+		}
+		if affected == 0 {
+			return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+		}
+
 		// Synthesise an identity for the approved user. CIBA Core §10.1.2
 		// requires the issued token to identify the user; we mirror the
 		// pattern used by ExternalPrincipalExchange (the human-token path).
@@ -396,19 +458,6 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		})
 		if err != nil {
 			return nil, oauthServerError("failed to issue CIBA-grant token", err)
-		}
-
-		// Mark issued AFTER credential mint so a downstream failure doesn't
-		// orphan an "issued" row with no token. The window where the token
-		// exists but the row is still "approved" is bounded by this UPDATE;
-		// a concurrent poll in that window will mint a SECOND token. The
-		// trade-off is acceptable for PR 1 (the alternative — wrap mint and
-		// state-flip in a tx — couples credential issuance to backchannel
-		// storage and complicates rollback). Document and revisit in PR 2.
-		if affected, mErr := s.repo.MarkIssued(ctx, in.AuthReqID); mErr != nil {
-			log.Error().Err(mErr).Str("auth_req_id", in.AuthReqID).Msg("failed to mark backchannel request issued")
-		} else if affected == 0 {
-			log.Warn().Str("auth_req_id", in.AuthReqID).Msg("MarkIssued affected 0 rows — concurrent redemption?")
 		}
 
 		accessToken.AccountID = row.AccountID
@@ -457,10 +506,22 @@ func (s *BackchannelService) dispatchNotifier(ctx context.Context, row *domain.B
 		ExpiresAt:      row.ExpiresAt,
 	}
 
+	// Parent the detached context on svcCtx (cancelled by Server.Shutdown via
+	// BackchannelService.Stop) instead of context.Background — that way a
+	// graceful shutdown cancels in-flight notifier deliveries instead of
+	// letting them outlive the server. We still detach from the inbound
+	// request's ctx so a client disconnect doesn't kill the notification.
+	s.mu.RLock()
+	parent := s.svcCtx
+	s.mu.RUnlock()
+	if parent == nil {
+		// Stop() has been called; service is shutting down — drop the
+		// notification rather than firing into the void.
+		return
+	}
+
 	deliver := func() {
-		// Detach from the request context so cancellation of the inbound
-		// HTTP request does not kill the notifier delivery.
-		dctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		defer cancel()
 		if err := fn(dctx, payload); err != nil {
 			log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("backchannel notifier returned error")

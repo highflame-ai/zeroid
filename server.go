@@ -394,6 +394,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.workerCancel()
 	}
 
+	// Cancel the CIBA backchannel service's lifecycle context so detached
+	// notifier goroutines wind down with the server rather than leaking
+	// past the HTTP listener close.
+	if s.backchannelSvc != nil {
+		s.backchannelSvc.Stop()
+	}
+
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
