@@ -552,11 +552,38 @@ func TestExpiringSoonEndpoint(t *testing.T) {
 // Without the identity link, the human-session flow stays untouched
 // (TestExpiringSoonEndpoint already exercises the unlinked path).
 func TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh(t *testing.T) {
-	// 1. Register an agent identity (no expiry yet — establish baseline).
-	ext := uid("linked-client-agent")
-	agent := registerAgent(t, ext)
+	// 1. Create a credential policy that permits authorization_code +
+	// refresh_token. The default tenant policy intentionally excludes
+	// these grants (they were assumed to flow through OAuth clients,
+	// not identities) — so identity-bound PKCE flows require an
+	// explicit policy declaring the agent uses them.
+	policyResp := post(t, adminPath("/credential-policies"), map[string]any{
+		"name":                uid("agent-auth-code-policy"),
+		"allowed_grant_types": []string{"authorization_code", "refresh_token"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	policyBody := decode(t, policyResp)
+	require.Equal(t, http.StatusCreated, policyResp.StatusCode, "policy create must succeed; body=%v", policyBody)
+	policyID := policyBody["id"].(string)
 
-	// 2. Register a PKCE-style OAuth client bound to that identity. The
+	// 2. Register an agent identity with the custom policy.
+	ext := uid("linked-client-agent")
+	regResp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":                 ext,
+		"external_id":          ext,
+		"sub_type":             "orchestrator",
+		"trust_level":          "first_party",
+		"created_by":           "test-user",
+		"credential_policy_id": policyID,
+	}, adminHeaders())
+	regBody := decode(t, regResp)
+	require.Equal(t, http.StatusCreated, regResp.StatusCode, "agent register must succeed; body=%v", regBody)
+	agent := agentRegistration{
+		AgentID: regBody["identity"].(map[string]any)["id"].(string),
+		APIKey:  regBody["api_key"].(string),
+	}
+
+	// 3. Register a PKCE-style OAuth client bound to that identity. The
 	// _redirect_uri_ and _grant_types_ mark this as an agent-authorized
 	// authorization_code flow (the deployer's hypothetical "PKCE-provision
 	// my agent" scenario).
@@ -572,7 +599,7 @@ func TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh(t *testing.T) {
 	createBody := decode(t, resp)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "client create with identity_id must succeed; body=%v", createBody)
 
-	// 3. Mint a PKCE auth-code-style JWT for this client and exchange it
+	// 4. Mint a PKCE auth-code-style JWT for this client and exchange it
 	// while the identity is still active — must succeed.
 	verifier, challenge := buildPKCEPair(t)
 	code := buildAuthCode(t, clientID, "user-linked-001", testRedirectURI, challenge, []string{"data:read"})
@@ -591,10 +618,10 @@ func TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh(t *testing.T) {
 	}
 	require.NotEmpty(t, refreshTok, "client is registered for refresh_token grant; must return one")
 
-	// 4. Expire the linked identity.
+	// 5. Expire the linked identity.
 	stampExpiredInDB(t, agent.AgentID)
 
-	// 5. Try to exchange a fresh auth code — now blocked by the identity gate.
+	// 6. Try to exchange a fresh auth code — now blocked by the identity gate.
 	verifier2, challenge2 := buildPKCEPair(t)
 	code2 := buildAuthCode(t, clientID, "user-linked-002", testRedirectURI, challenge2, []string{"data:read"})
 	resp = post(t, "/oauth2/token", map[string]any{
@@ -609,7 +636,7 @@ func TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh(t *testing.T) {
 	require.Equal(t, "invalid_grant", body2["error"])
 	require.Equal(t, "identity_expired", body2["error_description"])
 
-	// 6. Refresh the existing refresh token — also blocked. This is the
+	// 7. Refresh the existing refresh token — also blocked. This is the
 	// previously-open path: pre-PR, the refresh would mint a new access
 	// token because the synthetic identity carrier bypassed the chokepoint.
 	resp = post(t, "/oauth2/token", map[string]any{

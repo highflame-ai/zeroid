@@ -100,7 +100,7 @@ func (a *API) expiringSoonOp(ctx context.Context, input *ExpiringSoonInput) (*Ex
 		within = parsed
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	identities, err := a.identitySvc.ListExpiringSoon(ctx, tenant.AccountID, tenant.ProjectID, now, within)
 	if err != nil {
 		log.Error().Err(err).Msg("expiring-soon: identity scan failed")

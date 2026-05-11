@@ -219,10 +219,20 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest("invalid_grant", "identity_expired")
 	}
 
+	// Resolve the identity policy — the authority ceiling. Without this
+	// the chokepoint can't enforce TTL, scope, delegation-depth, trust-
+	// level, or policy-expiry caps for client_credentials. Mirrors the
+	// pattern used in jwt_bearer / token_exchange / api_key.
+	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+	if err != nil {
+		return nil, oauthServerError("failed to resolve identity credential policy", err)
+	}
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		Scopes:    scopes,
-		GrantType: domain.GrantTypeClientCredentials,
+		Identity:         identity,
+		IdentityPolicyID: policy.ID,
+		Scopes:           scopes,
+		GrantType:        domain.GrantTypeClientCredentials,
 	})
 	if err != nil {
 		return nil, err
@@ -828,6 +838,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		ProjectID: authCode.ProjectID,
 		Status:    domain.IdentityStatusActive,
 	}
+	// identityPolicyID is non-empty only when the OAuth client is bound to
+	// an agent identity — synthetic-carrier human sessions have no
+	// identity row and therefore no policy to resolve.
+	var identityPolicyID string
 	if oauthClient.IdentityID != nil && *oauthClient.IdentityID != "" {
 		linked, err := s.identitySvc.repo.GetByID(ctx, *oauthClient.IdentityID, authCode.AccountID, authCode.ProjectID)
 		if err != nil {
@@ -840,16 +854,22 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			return nil, oauthBadRequest("invalid_grant", "identity_expired")
 		}
 		identity = linked
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeAuthorizationCode,
-		UseRS256:        true,
-		SubjectOverride: authCode.UserID,
-		ApplicationID:   authCode.ClientID,
-		TTL:             ttl,
-		Scopes:          authCode.Scopes,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeAuthorizationCode,
+		UseRS256:         true,
+		SubjectOverride:  authCode.UserID,
+		ApplicationID:    authCode.ClientID,
+		TTL:              ttl,
+		Scopes:           authCode.Scopes,
 	})
 	if err != nil {
 		return nil, err
@@ -966,6 +986,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		ProjectID: oldToken.ProjectID,
 		Status:    domain.IdentityStatusActive,
 	}
+	var identityPolicyID string
 	if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
 		linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
 		if err != nil {
@@ -978,15 +999,26 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			return nil, oauthBadRequest("invalid_grant", "identity_expired")
 		}
 		identity = linked
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
 	}
 
+	// Inherit scopes from the original refresh token. Without this the
+	// refreshed access token would be issued with no scopes (or default
+	// scopes), breaking the contract that refresh preserves the original
+	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeRefreshToken,
-		UseRS256:        true,
-		SubjectOverride: oldToken.UserID,
-		ApplicationID:   oldToken.ClientID,
-		TTL:             accessTTL,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeRefreshToken,
+		UseRS256:         true,
+		SubjectOverride:  oldToken.UserID,
+		ApplicationID:    oldToken.ClientID,
+		TTL:              accessTTL,
+		Scopes:           parseScopeString(oldToken.Scopes),
 	})
 	if err != nil {
 		return nil, err

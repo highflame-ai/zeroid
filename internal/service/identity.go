@@ -470,8 +470,9 @@ func parseExpiresAtPatch(raw string) (time.Time, bool, error) {
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("invalid expires_at %q (must be RFC3339)", raw)
 	}
-	if !t.After(time.Now()) {
-		return time.Time{}, false, fmt.Errorf("expires_at must be in the future (got %s, now %s)", t.Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339))
+	now := time.Now().UTC()
+	if !t.After(now) {
+		return time.Time{}, false, fmt.Errorf("expires_at must be in the future (got %s, now %s)", t.Format(time.RFC3339), now.Format(time.RFC3339))
 	}
 	return t, false, nil
 }
