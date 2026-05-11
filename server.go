@@ -70,6 +70,7 @@ type Server struct {
 	signalSvc           *service.SignalService
 	apiKeySvc           *service.APIKeyService
 	agentSvc            *service.AgentService
+	backchannelSvc      *service.BackchannelService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
 
@@ -149,6 +150,7 @@ func NewServer(cfg Config) (*Server, error) {
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
+	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
 
 	// Initialize services.
 	// Construction order matters because identitySvc now depends on
@@ -181,11 +183,19 @@ func NewServer(cfg Config) (*Server, error) {
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 
+	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
+	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
+	// dispatches from oauthSvc.Token() into BackchannelService.Redeem, which in
+	// turn calls credentialSvc.IssueCredential. Two-phase wiring breaks the
+	// otherwise-circular dependency cleanly.
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, service.DefaultBackchannelConfig())
+	oauthSvc.SetBackchannelService(backchannelSvc)
+
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
@@ -295,9 +305,10 @@ func NewServer(cfg Config) (*Server, error) {
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
 		agentSvc:            agentSvc,
+		backchannelSvc:      backchannelSvc,
 		jwksSvc:             jwksSvc,
 		refreshTokenSvc:     refreshTokenSvc,
-		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
+		cleanupWorker:       worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
 		adminAuthState:      authState,
 		globalMWState:       globalMW,
 		http: &http.Server{
@@ -448,6 +459,46 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fn = middleware
+}
+
+// SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA
+// authentication request is created. ZeroID ships no built-in notifier; pass
+// a deployer-supplied function that delivers the approval prompt out-of-band
+// (push, email, SMS, voice). The notifier is invoked on a goroutine so its
+// latency cannot block the bc-authorize response; errors are logged and
+// recorded on the request row (last_notify_error) for operator debugging.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	if fn == nil {
+		s.backchannelSvc.SetNotifier(nil)
+		return
+	}
+	s.backchannelSvc.SetNotifier(func(ctx context.Context, n service.BackchannelNotification) error {
+		return fn(ctx, BackchannelNotification{
+			AuthReqID:      n.AuthReqID,
+			AccountID:      n.AccountID,
+			ProjectID:      n.ProjectID,
+			ClientID:       n.ClientID,
+			LoginHint:      n.LoginHint,
+			Scope:          n.Scope,
+			BindingMessage: n.BindingMessage,
+			ExpiresAt:      n.ExpiresAt,
+		})
+	})
+}
+
+// SetBackchannelNotifyDispatchSync forces synchronous notifier dispatch.
+// Test-only — production must keep async dispatch (the default) so notifier
+// latency cannot block the bc-authorize response.
+func (s *Server) SetBackchannelNotifyDispatchSync(sync bool) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetNotifyDispatchSync(sync)
 }
 
 // SetTrustedServiceValidator sets the validator used during external principal
@@ -656,6 +707,7 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/token":            {},
 	"/oauth2/token/introspect": {},
 	"/oauth2/token/revoke":     {},
+	"/oauth2/bc-authorize":     {},
 }
 
 // mediaTypeEquals parses a Content-Type header and reports whether the media

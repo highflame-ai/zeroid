@@ -41,6 +41,7 @@ var allValidGrantTypes = map[GrantType]bool{
 	GrantTypeAPIKey:            true,
 	GrantTypeAuthorizationCode: true,
 	GrantTypeRefreshToken:      true,
+	GrantTypeCIBA:              true,
 }
 
 // NormalizeGrantType converts a grant type string to its canonical short form.

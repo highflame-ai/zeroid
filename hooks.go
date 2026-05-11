@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -68,3 +69,31 @@ type OAuthClientConfig struct {
 //
 // Set via Server.TrustedServiceValidator() after NewServer.
 type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)
+
+// BackchannelNotification is the payload handed to a BackchannelNotifier when
+// a new CIBA authentication request is created. The notifier is responsible
+// for delivering an approval prompt to the user out-of-band — push, email,
+// SMS, voice, anything — and must not block the request-creation response
+// (the service invokes the notifier in a goroutine).
+//
+// Fields mirror the OpenID CIBA spec's request shape so deployers can pass
+// the payload directly to their notification provider without re-mapping.
+type BackchannelNotification struct {
+	AuthReqID      string
+	AccountID      string
+	ProjectID      string
+	ClientID       string
+	LoginHint      string
+	Scope          string
+	BindingMessage string
+	ExpiresAt      time.Time
+}
+
+// BackchannelNotifier delivers a CIBA approval prompt to the end user via an
+// out-of-band channel selected by the deployer (push, email, SMS, etc.).
+//
+// ZeroID ships with no built-in notifier. Set one via Server.SetBackchannelNotifier.
+// Returning an error records last_notify_error on the request row for
+// debuggability but does not block request creation — the user may approve
+// through another channel.
+type BackchannelNotifier func(ctx context.Context, n BackchannelNotification) error

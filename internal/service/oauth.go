@@ -39,6 +39,9 @@ type OAuthService struct {
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
 	customGrants map[string]CustomGrantHandler
+	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
+	// Wired after construction via SetBackchannelService.
+	backchannelSvc *BackchannelService
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -114,6 +117,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 	s.trustedServiceValidator = v
 }
 
+// SetBackchannelService wires the CIBA service after construction. Two-phase
+// wiring avoids a circular dependency: BackchannelService needs CredentialService
+// (which OAuthService already has) but OAuthService also needs to dispatch into
+// BackchannelService for the CIBA grant.
+func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
+	s.backchannelSvc = bc
+}
+
 // RegisterGrant registers a custom grant type handler on the OAuth service.
 func (s *OAuthService) RegisterGrant(name string, handler CustomGrantHandler) {
 	if s.customGrants == nil {
@@ -155,6 +166,8 @@ type TokenRequest struct {
 	// TrustedService is true when the caller has been authenticated as a trusted
 	// internal service (via AdminAuth middleware). Required for external principal exchange.
 	TrustedService bool
+	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
+	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -172,6 +185,14 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.authorizationCode(ctx, req)
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
+	case string(domain.GrantTypeCIBA):
+		if s.backchannelSvc == nil {
+			return nil, oauthBadRequest("unsupported_grant_type", "CIBA is not enabled on this deployment")
+		}
+		return s.backchannelSvc.Redeem(ctx, RedeemInput{
+			AuthReqID: req.AuthReqID,
+			ClientID:  req.ClientID,
+		})
 	default:
 		// Check custom grant handlers registered via RegisterGrant.
 		if handler, ok := s.customGrants[req.GrantType]; ok {
