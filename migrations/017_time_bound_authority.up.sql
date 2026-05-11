@@ -13,17 +13,28 @@ ALTER TABLE identities          ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 ALTER TABLE credential_policies ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
 
 -- Partial indexes for the cleanup-worker sweep and the /expiring-soon
--- admin endpoint. WHERE clause keeps the index small — the common case
--- is unbounded grants (expires_at IS NULL) and those rows never qualify.
+-- admin endpoint. WHERE clause keeps the index *small* — but does NOT
+-- shrink the build scan. Postgres reads every row in the table to
+-- evaluate the partial-index predicate; the savings are in storage and
+-- query plans, not in build time.
 --
 -- These are plain CREATE INDEX (not CONCURRENTLY) because golang-migrate
 -- wraps each migration in a transaction and CONCURRENTLY can't run
--- inside one. The partial WHERE clauses limit the scan to rows where
--- expires_at IS NOT NULL — zero rows on first deploy, so the build is
--- effectively instant regardless of identities/credential_policies/
--- service_keys row count. Existing large deployments that later backfill
--- expires_at should expect rebuild cost proportional to the number of
--- time-bound rows, not the full table.
+-- inside one. CREATE INDEX takes ShareLock for the build duration,
+-- blocking writes (reads continue). Build cost is proportional to total
+-- row count, not just to expires_at-IS-NOT-NULL row count.
+--
+-- Concrete cost shape:
+--   identities, credential_policies: brand-new columns, every row's
+--     expires_at IS NULL, so the partial predicate excludes every row
+--     from the index payload — the build still scans, but the resulting
+--     index occupies near-zero storage. Lock window scales with table
+--     size; for tables in the millions of rows expect seconds-to-minutes.
+--   service_keys: expires_at predates this migration and may already
+--     be populated on existing deployments. The index payload reflects
+--     those rows, and the build scans the whole table. Operators with
+--     large service_keys should plan a maintenance window or move this
+--     index out of the transaction (rerun manually with CONCURRENTLY).
 --
 -- The three tables use three different "active" column names — status,
 -- is_active, state — for historical reasons. Each index mirrors its

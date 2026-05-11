@@ -171,9 +171,16 @@ func TestExpiredIdentityDeniedTokenExchange(t *testing.T) {
 	assert.Equal(t, "identity_expired", body["error_description"])
 }
 
-// TestExtendAccessReactivates exercises the "Extend access" flow: PATCH
-// expires_at to a future RFC3339 string brings an expired identity back
-// online. Cleared-to-NULL (empty string) also works.
+// TestExtendAccessReactivates exercises the "Extend access" flow on an
+// active-but-backdated identity: PATCH expires_at to a future RFC3339
+// string lifts the IsExpired() gate so the next token request succeeds.
+// Cleared-to-NULL (empty string) also works.
+//
+// This test covers extension BEFORE the cleanup-worker sweep has run.
+// Once the sweep has fired and status flipped to 'deactivated', PATCH
+// of expires_at alone does NOT auto-reactivate — callers must PATCH
+// status:"active" in the same request. That's a documented limitation,
+// not what this test exercises.
 func TestExtendAccessReactivates(t *testing.T) {
 	ext := uid("extend-access")
 	reg := registerAgent(t, ext)

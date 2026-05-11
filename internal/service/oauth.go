@@ -571,6 +571,19 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		}
 	}
 
+	// Resolve the identity policy when we have a real identity row.
+	// Without this the chokepoint can't enforce policy expiry, allowed
+	// scopes, max TTL, or any other policy axis — the synthetic carrier
+	// branch above has no identity row so no policy to resolve.
+	var identityPolicyID string
+	if identity.ID != "" {
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
+	}
+
 	// Step 4: Build custom claims for the external principal.
 	customClaims := map[string]any{
 		"token_exchange": "external_principal",
@@ -589,16 +602,17 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeTokenExchange,
-		Scopes:          scopes,
-		UseRS256:        true,
-		SubjectOverride: req.UserID,
-		UserEmail:       req.UserEmail,
-		UserName:        req.UserName,
-		ApplicationID:   req.ApplicationID,
-		TTL:             900, // 15 minutes — short-lived for external principals
-		CustomClaims:    customClaims,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeTokenExchange,
+		Scopes:           scopes,
+		UseRS256:         true,
+		SubjectOverride:  req.UserID,
+		UserEmail:        req.UserEmail,
+		UserName:         req.UserName,
+		ApplicationID:    req.ApplicationID,
+		TTL:              900, // 15 minutes — short-lived for external principals
+		CustomClaims:     customClaims,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)

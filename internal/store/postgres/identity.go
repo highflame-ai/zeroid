@@ -191,7 +191,10 @@ func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectI
 // worker's expiry sweep so that concurrent replicas don't both run the
 // deactivation cascade for the same identity — only the worker whose UPDATE
 // matched a still-active row gets back claimed=true and proceeds to fire
-// the credential / API-key revocation + retirement signal.
+// the credential / API-key revocation + lifecycle CAE signal. The signal
+// type depends on the caller's reason: the expiry sweep emits
+// SignalTypeIdentityExpired; admin-initiated deactivation emits the
+// generic SignalTypeRetirement.
 //
 // Callers that fail the claim (claimed=false) MUST silently skip; the row
 // was either already deactivated by another replica or by a parallel admin
