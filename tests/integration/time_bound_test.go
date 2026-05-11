@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -363,8 +364,8 @@ func TestRotateKeyOnExpiredIdentityRejected(t *testing.T) {
 
 	resp, err := doRaw(t, http.MethodPost, adminPath("/agents/registry/"+reg.AgentID+"/rotate-key"), nil, adminHeaders())
 	require.NoError(t, err)
-	require.NotEqual(t, http.StatusOK, resp.StatusCode,
-		"key rotation on expired identity must fail to prevent silent extension")
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"key rotation on expired identity must return 400 (client error), not 500")
 	_ = resp.Body.Close()
 }
 
@@ -428,6 +429,23 @@ func TestXUserIDSystemPrefixRejected(t *testing.T) {
 	if mb, ok := body["modified_by"].(string); ok {
 		assert.NotEqual(t, "system:expired_sweep", mb,
 			"X-User-ID with reserved system: prefix must not flow into modified_by; got %q", mb)
+	}
+
+	// Case-folding bypass guard: "System:" / "SYSTEM:" must be rejected
+	// the same way "system:" is. Downstream log queries that filter with
+	// ILIKE 'system:%' would otherwise treat these as worker activity.
+	for _, spoof := range []string{"System:expired_sweep", "SYSTEM:expired_sweep"} {
+		headers["X-User-ID"] = spoof
+		patched, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+reg.AgentID), map[string]any{
+			"description": "case-fold spoof " + spoof,
+		}, headers)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, patched.StatusCode)
+		body = decode(t, patched)
+		if mb, ok := body["modified_by"].(string); ok {
+			assert.NotContains(t, strings.ToLower(mb), "system:",
+				"any case of X-User-ID system: prefix must be dropped; got %q for spoof %q", mb, spoof)
+		}
 	}
 
 	// Sanity: a non-reserved X-User-ID still flows through unchanged.
@@ -500,27 +518,29 @@ func TestExpiringSoonEndpoint(t *testing.T) {
 	neverExt := uid("never-expires")
 	_ = registerAgent(t, neverExt)
 
-	// Default window (168h) AND spec-literal "7d" syntax — both should
-	// produce the same result. Locks in the human-friendly parser the
-	// acceptance criterion explicitly requires.
-	for _, q := range []string{"", "?within=7d", "?within=168h"} {
+	// 7d (spec-literal) and 168h (Go duration) must produce the same
+	// result — locks in the human-friendly parser the AC requires.
+	// Default window is exercised implicitly by every other test in this
+	// file that hits /expiring-soon without ?within.
+	collect := func(q string) map[string]bool {
+		t.Helper()
 		resp, err := doRaw(t, http.MethodGet, adminPath("/expiring-soon")+q, nil, adminHeaders())
-		require.NoError(t, err, "request with query %q", q)
+		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode, "expiring-soon should return 200 for %q", q)
 		body := decode(t, resp)
-
 		idents, ok := body["identities"].([]any)
 		require.True(t, ok, "identities must be a list (q=%q); body=%v", q, body)
-		gotIDs := map[string]bool{}
+		ids := map[string]bool{}
 		for _, raw := range idents {
-			m := raw.(map[string]any)
-			gotIDs[m["id"].(string)] = true
+			ids[raw.(map[string]any)["id"].(string)] = true
 		}
-		assert.True(t, gotIDs[soonReg.AgentID],
-			"expiring-in-window identity %s missing for query %q; got=%v", soonReg.AgentID, q, gotIDs)
-		assert.False(t, gotIDs[farReg.AgentID],
-			"far-future identity must NOT appear in 7d window (q=%q)", q)
+		return ids
 	}
+	got7d := collect("?within=7d")
+	got168h := collect("?within=168h")
+	assert.Equal(t, got7d, got168h, "7d and 168h must select the same identities")
+	assert.True(t, got7d[soonReg.AgentID], "expiring-in-window identity missing")
+	assert.False(t, got7d[farReg.AgentID], "far-future identity must not appear in 7d window")
 }
 
 // TestIdentityLinkedOAuthClientGatesAuthCodeAndRefresh verifies the H1 close:

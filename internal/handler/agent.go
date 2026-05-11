@@ -30,6 +30,10 @@ func mapErr(err error) error {
 		return huma.Error409Conflict("resource already exists")
 	case strings.Contains(msg, "invalid status transition"):
 		return huma.Error400BadRequest("invalid status transition")
+	case strings.Contains(msg, "identity_expired"), strings.Contains(msg, "identity is not usable"):
+		// Identity is past its expires_at or in a non-usable status —
+		// caller cannot proceed, but it's a 4xx not a 5xx.
+		return huma.Error400BadRequest(msg)
 	default:
 		log.Error().Err(err).Msg("unexpected agent service error")
 		return huma.Error500InternalServerError("internal server error")

@@ -74,7 +74,7 @@ func (a *API) registerExpiringSoonRoute(api huma.API) {
 		Method:      http.MethodGet,
 		Path:        "/expiring-soon",
 		Summary:     "List identities, policies, and API keys expiring within a window",
-		Description: "Returns active rows whose expires_at falls between now and now+within. Default window is 168h (one week).",
+		Description: "Returns active rows whose expires_at falls between now and now+within. Default window is 7d (168h).",
 		Tags:        []string{"Identities", "Credential Policies", "API Keys"},
 	}, a.expiringSoonOp)
 }
