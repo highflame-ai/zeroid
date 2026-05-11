@@ -32,9 +32,10 @@ import (
 //   - Item 2: configure one external issuer, post an Okta-shaped ID token,
 //     observe `user_id_iss` on the issued token.
 //   - Item 3: with the same server, omit subject_token_type and confirm
-//     dispatch still routes to the broker path (proven by the broker's
-//     distinctive "external principal exchange is not configured" error,
-//     which only that path emits).
+//     dispatch still routes to the broker path (proven by the broker
+//     succeeding and emitting token_exchange=external_principal on the
+//     issued JWT — a structural fingerprint that survives error-message
+//     wording changes).
 //
 // The federation server is a SECOND zeroid.NewServer instance pointed at
 // the same Postgres as the shared TestMain server — adding external_issuers
@@ -69,15 +70,15 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 		// identifier and emits `auth_time`/`amr` from the authentication event.
 		now := time.Now()
 		idToken := upstream.SignToken(t, map[string]any{
-			"iss":        upstreamIss,
-			"aud":        federationAud,
-			"sub":        "00uABCDE12345",
-			"email":      "alice@example.com",
-			"iat":        now.Unix(),
-			"exp":        now.Add(5 * time.Minute).Unix(),
-			"auth_time":  now.Add(-30 * time.Second).Unix(),
-			"amr":        []string{"pwd", "mfa"},
-			"acr":        "urn:okta:app:mfa:factor:push",
+			"iss":       upstreamIss,
+			"aud":       federationAud,
+			"sub":       "00uABCDE12345",
+			"email":     "alice@example.com",
+			"iat":       now.Unix(),
+			"exp":       now.Add(5 * time.Minute).Unix(),
+			"auth_time": now.Add(-30 * time.Second).Unix(),
+			"amr":       []string{"pwd", "mfa"},
+			"acr":       "urn:okta:app:mfa:factor:push",
 		})
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
@@ -117,41 +118,47 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 	})
 
 	t.Run("broker dispatch unchanged when subject_token_type is omitted", func(t *testing.T) {
-		// Same federation-configured server, but this request leaves
-		// subject_token_type empty. Dispatch must NOT reach the federation
-		// path; it must reach ExternalPrincipalExchange. The federation
-		// server has no TrustedServiceValidator wired, so the broker path
-		// fails with its distinctive "external principal exchange is not
-		// configured" error — a fingerprint that only the broker path
-		// produces. Different errors prove different dispatch arms.
+		// Same federation-configured server, but with a TrustedServiceValidator
+		// wired so the broker arm can actually succeed. Dispatch must NOT
+		// reach the federation path; it must reach ExternalPrincipalExchange.
+		// We assert on a *structural* fingerprint — the issued JWT's
+		// `token_exchange` claim — rather than an error-message substring,
+		// so the test cannot silently degrade if wording changes.
+		fedSrv.SetTrustedServiceValidator(func(_ context.Context) (string, error) {
+			return "test-broker", nil
+		})
+
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token": "anything-the-broker-would-not-validate",
+			"subject_token": "opaque-broker-presented-token",
 			"account_id":    fedCfg.AccountID,
 			"project_id":    fedCfg.ProjectID,
 			"user_id":       "alice",
 		})
-		require.NotEqual(t, http.StatusOK, resp.StatusCode,
-			"broker path without TrustedServiceValidator must reject; body=%s", resp.RawBody)
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"broker path with TrustedServiceValidator must succeed; body=%s", resp.RawBody)
 
-		require.Contains(t, resp.RawBody, "external principal exchange is not configured",
-			"broker fingerprint missing — dispatch may have leaked into the federation path. body=%s", resp.RawBody)
+		issuedClaims := decodeIssuedTokenClaims(t, resp.AccessToken)
 
-		// Sanity: the federation-only error string must NOT appear, since
-		// dispatch should not have entered that arm at all.
-		require.NotContains(t, resp.RawBody, "no external issuers are configured",
-			"federation-path error string leaked — dispatch routed wrong")
+		// The structural fingerprint: broker arm stamps "external_principal",
+		// federation arm stamps "external_id_token". Asserting the broker
+		// value (and explicitly *not* the federation value) proves dispatch
+		// routed to the broker even without inspecting any error message.
+		require.Equal(t, "external_principal", issuedClaims["token_exchange"],
+			"broker fingerprint missing — dispatch may have leaked into the federation path")
+		require.NotEqual(t, "external_id_token", issuedClaims["token_exchange"],
+			"federation-path token_exchange value leaked — dispatch routed wrong")
 	})
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 type fakeUpstreamIdP struct {
-	srv     *httptest.Server
-	priv    *ecdsa.PrivateKey
-	keyID   string
-	keySet  jwk.Set
-	hits    atomic.Int64
+	srv    *httptest.Server
+	priv   *ecdsa.PrivateKey
+	keyID  string
+	keySet jwk.Set
+	hits   atomic.Int64
 }
 
 func newFakeUpstreamIdP(t *testing.T) *fakeUpstreamIdP {
