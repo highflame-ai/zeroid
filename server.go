@@ -541,6 +541,25 @@ func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
 }
 
+// SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used
+// for CIBA ping callbacks. Tests inject a capturing RoundTripper here so
+// they can assert on the outbound request without standing up a real
+// httptest listener. Pass nil to restore the default transport.
+func (s *Server) SetBackchannelPingTransport(rt http.RoundTripper) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetPingTransport(rt)
+}
+
+// SetBackchannelPingDispatchSync forces synchronous ping dispatch — test-only.
+func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetPingDispatchSync(sync)
+}
+
 // SetTrustedServiceValidator sets the validator used during external principal
 // token exchange (RFC 8693) to verify the caller is a trusted internal service.
 // The validator reads from context (populated by deployer-provided global middleware
@@ -594,22 +613,23 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	if err != nil {
 		// Client doesn't exist — create it.
 		_, _, regErr := s.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
-			ClientID:                cfg.ClientID,
-			Name:                    cfg.Name,
-			Description:             cfg.Description,
-			Confidential:            cfg.Confidential,
-			TokenEndpointAuthMethod: cfg.TokenEndpointAuthMethod,
-			GrantTypes:              cfg.GrantTypes,
-			Scopes:                  cfg.Scopes,
-			RedirectURIs:            cfg.RedirectURIs,
-			AccessTokenTTL:          cfg.AccessTokenTTL,
-			RefreshTokenTTL:         cfg.RefreshTokenTTL,
-			JWKSURI:                 cfg.JWKSURI,
-			JWKS:                    cfg.JWKS,
-			SoftwareID:              cfg.SoftwareID,
-			SoftwareVersion:         cfg.SoftwareVersion,
-			Contacts:                cfg.Contacts,
-			Metadata:                cfg.Metadata,
+			ClientID:                   cfg.ClientID,
+			Name:                       cfg.Name,
+			Description:                cfg.Description,
+			Confidential:               cfg.Confidential,
+			TokenEndpointAuthMethod:    cfg.TokenEndpointAuthMethod,
+			GrantTypes:                 cfg.GrantTypes,
+			Scopes:                     cfg.Scopes,
+			RedirectURIs:               cfg.RedirectURIs,
+			AccessTokenTTL:             cfg.AccessTokenTTL,
+			RefreshTokenTTL:            cfg.RefreshTokenTTL,
+			JWKSURI:                    cfg.JWKSURI,
+			JWKS:                       cfg.JWKS,
+			SoftwareID:                 cfg.SoftwareID,
+			SoftwareVersion:            cfg.SoftwareVersion,
+			Contacts:                   cfg.Contacts,
+			Metadata:                   cfg.Metadata,
+			ClientNotificationEndpoint: cfg.ClientNotificationEndpoint,
 		})
 
 		return regErr
@@ -645,6 +665,10 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	}
 	if cfg.RefreshTokenTTL > 0 && cfg.RefreshTokenTTL != existing.RefreshTokenTTL {
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
+		updated = true
+	}
+	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
+		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
 		updated = true
 	}
 

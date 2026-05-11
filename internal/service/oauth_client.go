@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,6 +64,9 @@ type RegisterClientRequest struct {
 	// at the handler boundary before this struct is built. Empty = plain
 	// human-session client.
 	IdentityID string
+
+	// CIBA ping/push endpoint. Must be HTTPS when non-empty; validated at registration.
+	ClientNotificationEndpoint string
 }
 
 // RegisterClient creates a new OAuth2 client.
@@ -76,6 +80,14 @@ type RegisterClientRequest struct {
 func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterClientRequest) (*domain.OAuthClient, string, error) {
 	if req.ClientID == "" || req.Name == "" {
 		return nil, "", fmt.Errorf("clientID and name are required")
+	}
+	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
+	// supplied. Reject http:// / non-URL values at registration so a faulty
+	// client cannot lead the server to POST credentials over plaintext.
+	if req.ClientNotificationEndpoint != "" {
+		if err := validateNotificationEndpoint(req.ClientNotificationEndpoint); err != nil {
+			return nil, "", err
+		}
 	}
 
 	var plainSecret string
@@ -135,28 +147,29 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 
 	now := time.Now()
 	client := &domain.OAuthClient{
-		ID:                      uuid.New().String(),
-		ClientID:                req.ClientID,
-		ClientSecret:            hashedSecret,
-		Name:                    req.Name,
-		Description:             req.Description,
-		ClientType:              clientType,
-		TokenEndpointAuthMethod: authMethod,
-		GrantTypes:              grantTypes,
-		RedirectURIs:            redirectURIs,
-		Scopes:                  scopes,
-		AccessTokenTTL:          req.AccessTokenTTL,
-		RefreshTokenTTL:         req.RefreshTokenTTL,
-		JWKSURI:                 req.JWKSURI,
-		JWKS:                    req.JWKS,
-		SoftwareID:              req.SoftwareID,
-		SoftwareVersion:         req.SoftwareVersion,
-		Contacts:                contacts,
-		Metadata:                req.Metadata,
-		IdentityID:              identityID,
-		IsActive:                true,
-		CreatedAt:               now,
-		UpdatedAt:               now,
+		ID:                         uuid.New().String(),
+		ClientID:                   req.ClientID,
+		ClientSecret:               hashedSecret,
+		Name:                       req.Name,
+		Description:                req.Description,
+		ClientType:                 clientType,
+		TokenEndpointAuthMethod:    authMethod,
+		GrantTypes:                 grantTypes,
+		RedirectURIs:               redirectURIs,
+		Scopes:                     scopes,
+		AccessTokenTTL:             req.AccessTokenTTL,
+		RefreshTokenTTL:            req.RefreshTokenTTL,
+		JWKSURI:                    req.JWKSURI,
+		JWKS:                       req.JWKS,
+		SoftwareID:                 req.SoftwareID,
+		SoftwareVersion:            req.SoftwareVersion,
+		Contacts:                   contacts,
+		Metadata:                   req.Metadata,
+		IdentityID:                 identityID,
+		ClientNotificationEndpoint: req.ClientNotificationEndpoint,
+		IsActive:                   true,
+		CreatedAt:                  now,
+		UpdatedAt:                  now,
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {
@@ -269,4 +282,22 @@ func generateSecureToken(byteLen int) (string, error) {
 		return "", fmt.Errorf("failed to generate secure token: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// validateNotificationEndpoint enforces the CIBA Core §4 rule that
+// client_notification_endpoint MUST be an absolute HTTPS URL. http:// is
+// rejected so the server can never POST the per-request bearer
+// (client_notification_token) over plaintext.
+func validateNotificationEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid client_notification_endpoint: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("client_notification_endpoint must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("client_notification_endpoint must include a host")
+	}
+	return nil
 }

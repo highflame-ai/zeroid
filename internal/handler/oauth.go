@@ -285,13 +285,14 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 // (clients in ZeroID are global to all tenants).
 type BcAuthorizeInput struct {
 	Body struct {
-		ClientID        string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
-		AccountID       string `json:"account_id" required:"true" doc:"Tenant account ID"`
-		ProjectID       string `json:"project_id" required:"true" doc:"Tenant project ID"`
-		LoginHint       string `json:"login_hint" required:"true" doc:"User identifier (email, phone, user_id)"`
-		Scope           string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
-		BindingMessage  string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
-		RequestedExpiry int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
+		ClientID                string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
+		AccountID               string `json:"account_id" required:"true" doc:"Tenant account ID"`
+		ProjectID               string `json:"project_id" required:"true" doc:"Tenant project ID"`
+		LoginHint               string `json:"login_hint" required:"true" doc:"User identifier (email, phone, user_id)"`
+		Scope                   string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
+		BindingMessage          string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
+		RequestedExpiry         int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
+		ClientNotificationToken string `json:"client_notification_token,omitempty" doc:"Bearer the server echoes in the ping callback (required for ping mode)"`
 	}
 }
 
@@ -312,13 +313,14 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		}, nil
 	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
-		ClientID:        input.Body.ClientID,
-		AccountID:       input.Body.AccountID,
-		ProjectID:       input.Body.ProjectID,
-		LoginHint:       input.Body.LoginHint,
-		Scope:           input.Body.Scope,
-		BindingMessage:  input.Body.BindingMessage,
-		RequestedExpiry: input.Body.RequestedExpiry,
+		ClientID:                input.Body.ClientID,
+		AccountID:               input.Body.AccountID,
+		ProjectID:               input.Body.ProjectID,
+		LoginHint:               input.Body.LoginHint,
+		Scope:                   input.Body.Scope,
+		BindingMessage:          input.Body.BindingMessage,
+		RequestedExpiry:         input.Body.RequestedExpiry,
+		ClientNotificationToken: input.Body.ClientNotificationToken,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")

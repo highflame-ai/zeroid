@@ -56,6 +56,10 @@ type CreateOAuthClientInput struct {
 		// issuance on the linked identity's status + expires_at. The
 		// identity must exist in the caller's tenant (validated below).
 		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to — gates authorization_code and refresh_token grants on the linked identity's status and expires_at"`
+
+		// CIBA (OpenID CIBA Core 1.0) — registered callback for ping/push notifications.
+		// Must be HTTPS. Empty when the client only uses polling mode.
+		ClientNotificationEndpoint string `json:"client_notification_endpoint,omitempty" doc:"HTTPS callback URL for CIBA ping mode"`
 	}
 }
 
@@ -159,23 +163,24 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 	}
 
 	client, plainSecret, err := a.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
-		ClientID:                input.Body.ClientID,
-		Name:                    input.Body.Name,
-		Description:             input.Body.Description,
-		Confidential:            input.Body.Confidential,
-		TokenEndpointAuthMethod: input.Body.TokenEndpointAuthMethod,
-		GrantTypes:              input.Body.GrantTypes,
-		Scopes:                  input.Body.Scopes,
-		RedirectURIs:            input.Body.RedirectURIs,
-		AccessTokenTTL:          input.Body.AccessTokenTTL,
-		RefreshTokenTTL:         input.Body.RefreshTokenTTL,
-		JWKSURI:                 input.Body.JWKSURI,
-		JWKS:                    input.Body.JWKS,
-		SoftwareID:              input.Body.SoftwareID,
-		SoftwareVersion:         input.Body.SoftwareVersion,
-		Contacts:                input.Body.Contacts,
-		Metadata:                input.Body.Metadata,
-		IdentityID:              input.Body.IdentityID,
+		ClientID:                   input.Body.ClientID,
+		Name:                       input.Body.Name,
+		Description:                input.Body.Description,
+		Confidential:               input.Body.Confidential,
+		TokenEndpointAuthMethod:    input.Body.TokenEndpointAuthMethod,
+		GrantTypes:                 input.Body.GrantTypes,
+		Scopes:                     input.Body.Scopes,
+		RedirectURIs:               input.Body.RedirectURIs,
+		AccessTokenTTL:             input.Body.AccessTokenTTL,
+		RefreshTokenTTL:            input.Body.RefreshTokenTTL,
+		JWKSURI:                    input.Body.JWKSURI,
+		JWKS:                       input.Body.JWKS,
+		SoftwareID:                 input.Body.SoftwareID,
+		SoftwareVersion:            input.Body.SoftwareVersion,
+		Contacts:                   input.Body.Contacts,
+		Metadata:                   input.Body.Metadata,
+		IdentityID:                 input.Body.IdentityID,
+		ClientNotificationEndpoint: input.Body.ClientNotificationEndpoint,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {

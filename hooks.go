@@ -60,6 +60,9 @@ type OAuthClientConfig struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
+	// ClientNotificationEndpoint is the HTTPS callback CIBA ping mode posts to.
+	// Empty for clients that only use polling mode.
+	ClientNotificationEndpoint string
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted

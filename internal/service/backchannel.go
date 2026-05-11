@@ -1,11 +1,15 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"time"
 
@@ -47,6 +51,13 @@ type BackchannelService struct {
 	// still get a working notifier path.
 	svcCtx    context.Context
 	svcCancel context.CancelFunc
+
+	// Ping mode (PR 2) — bounded outbound HTTP client. The RoundTripper is
+	// swappable so tests can capture POSTs without standing up an httptest
+	// listener; production should leave it nil (uses http.DefaultTransport
+	// with a 10-second timeout enforced by pingClient.Timeout).
+	pingClient        *http.Client
+	pingDispatchAsync bool // overridable for tests
 }
 
 // BackchannelNotifierFunc is the internal alias for the public
@@ -83,6 +94,10 @@ type BackchannelServiceConfig struct {
 	MinPollInterval        time.Duration
 	DefaultPollInterval    int
 	MaxBindingMessageBytes int
+	// Ping-mode tunables (PR 2).
+	PingTimeout    time.Duration // per-attempt HTTP timeout
+	PingMaxRetries int           // additional attempts on transient failure; 0 → no retries
+	PingBaseDelay  time.Duration // first-retry backoff; doubled per attempt with jitter
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -93,6 +108,9 @@ func DefaultBackchannelConfig() BackchannelServiceConfig {
 		MinPollInterval:        2 * time.Second,
 		DefaultPollInterval:    5,
 		MaxBindingMessageBytes: 280,
+		PingTimeout:            10 * time.Second,
+		PingMaxRetries:         3,
+		PingBaseDelay:          500 * time.Millisecond,
 	}
 }
 
@@ -118,6 +136,12 @@ func NewBackchannelService(
 	if cfg.MaxBindingMessageBytes == 0 {
 		cfg.MaxBindingMessageBytes = 280
 	}
+	if cfg.PingTimeout == 0 {
+		cfg.PingTimeout = 10 * time.Second
+	}
+	if cfg.PingBaseDelay == 0 {
+		cfg.PingBaseDelay = 500 * time.Millisecond
+	}
 	svcCtx, svcCancel := context.WithCancel(context.Background())
 	return &BackchannelService{
 		repo:                repo,
@@ -127,6 +151,8 @@ func NewBackchannelService(
 		notifyDispatchAsync: true,
 		svcCtx:              svcCtx,
 		svcCancel:           svcCancel,
+		pingClient:          &http.Client{Timeout: cfg.PingTimeout},
+		pingDispatchAsync:   true,
 	}
 }
 
@@ -164,6 +190,23 @@ func (s *BackchannelService) SetNotifyDispatchSync(sync bool) {
 	s.notifyDispatchAsync = !sync
 }
 
+// SetPingTransport overrides the outbound HTTP transport used for CIBA ping
+// dispatch. Tests inject a capturing RoundTripper here so they don't have to
+// stand up a real httptest listener. Pass nil to restore the default
+// http.Transport.
+func (s *BackchannelService) SetPingTransport(rt http.RoundTripper) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pingClient = &http.Client{Timeout: s.cfg.PingTimeout, Transport: rt}
+}
+
+// SetPingDispatchSync forces synchronous ping dispatch — test-only.
+func (s *BackchannelService) SetPingDispatchSync(sync bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pingDispatchAsync = !sync
+}
+
 // CreateAuthRequest input for POST /oauth2/bc-authorize.
 type CreateAuthRequestInput struct {
 	ClientID        string
@@ -173,6 +216,11 @@ type CreateAuthRequestInput struct {
 	Scope           string
 	BindingMessage  string
 	RequestedExpiry int // seconds; 0 → DefaultExpiry
+	// ClientNotificationToken triggers ping-mode dispatch when non-empty.
+	// CIBA Core §7.1: the server includes this verbatim as the bearer
+	// credential in the ping callback's Authorization header. The client
+	// uses it to authenticate the inbound notification.
+	ClientNotificationToken string
 }
 
 // CreateAuthRequestOutput is returned to the client on success.
@@ -209,7 +257,28 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_client", fmt.Sprintf("unknown client %s", in.ClientID), err)
 	}
-	_ = client // reserved for ping-mode allowlist read in PR 2
+
+	// Ping mode: when the client supplies a client_notification_token, the
+	// client MUST have a registered client_notification_endpoint on its
+	// record. The endpoint is the per-client allowlist — we never accept a
+	// per-request URL because that would let a compromised token redirect
+	// notifications.
+	notificationMode := domain.BackchannelNotificationPoll
+	notificationEndpoint := ""
+	if in.ClientNotificationToken != "" {
+		if client.ClientNotificationEndpoint == "" {
+			return nil, oauthBadRequest("invalid_request",
+				"client_notification_token requires the client to have a registered client_notification_endpoint")
+		}
+		// Defence-in-depth: re-validate the registered endpoint is HTTPS even
+		// though RegisterClient already enforced it. A future bypass at
+		// registration must not silently degrade ping mode to http.
+		if err := validateNotificationEndpoint(client.ClientNotificationEndpoint); err != nil {
+			return nil, oauthBadRequestCause("invalid_request", "client_notification_endpoint is invalid", err)
+		}
+		notificationMode = domain.BackchannelNotificationPing
+		notificationEndpoint = client.ClientNotificationEndpoint
+	}
 
 	// Reject oversized binding_message rather than silently truncating.
 	// Silent truncation produced confusing UX (the prompt the user saw didn't
@@ -240,18 +309,20 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 
 	now := time.Now()
 	row := &domain.BackchannelAuthRequest{
-		AuthReqID:        authReqID,
-		AccountID:        in.AccountID,
-		ProjectID:        in.ProjectID,
-		ClientID:         in.ClientID,
-		LoginHint:        in.LoginHint,
-		Scope:            in.Scope,
-		BindingMessage:   bindingMsg,
-		NotificationMode: domain.BackchannelNotificationPoll,
-		Status:           domain.BackchannelStatusPending,
-		IntervalSeconds:  s.cfg.DefaultPollInterval,
-		ExpiresAt:        now.Add(expiry),
-		CreatedAt:        now,
+		AuthReqID:                  authReqID,
+		AccountID:                  in.AccountID,
+		ProjectID:                  in.ProjectID,
+		ClientID:                   in.ClientID,
+		LoginHint:                  in.LoginHint,
+		Scope:                      in.Scope,
+		BindingMessage:             bindingMsg,
+		NotificationMode:           notificationMode,
+		ClientNotificationEndpoint: notificationEndpoint,
+		ClientNotificationToken:    in.ClientNotificationToken,
+		Status:                     domain.BackchannelStatusPending,
+		IntervalSeconds:            s.cfg.DefaultPollInterval,
+		ExpiresAt:                  now.Add(expiry),
+		CreatedAt:                  now,
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)
@@ -313,6 +384,11 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 		// Lost a race against expiry sweep or a concurrent deny.
 		return oauthBadRequest("access_denied", "request could not be approved (concurrent modification or expiry)")
 	}
+	// Ping mode: notify the client that the request resolved. The client
+	// then polls /oauth2/token to receive the access token. We do this
+	// after the row transition so a successful ping always reflects a
+	// successful state change.
+	s.dispatchPing(ctx, row)
 	return nil
 }
 
@@ -348,6 +424,7 @@ func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 	if affected == 0 {
 		return oauthBadRequest("access_denied", "request could not be denied (concurrent modification or expiry)")
 	}
+	s.dispatchPing(ctx, row)
 	return nil
 }
 
@@ -546,4 +623,136 @@ func mintAuthReqID() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+// dispatchPing POSTs the CIBA ping callback (Core §10.2) to the client's
+// registered client_notification_endpoint. The payload is the minimal
+// {"auth_req_id": "..."} JSON; the access token is NOT included (that's push
+// mode, which is PR 3). The Authorization header carries the client_notification_token
+// the client supplied at bc-authorize so the client can authenticate the
+// inbound notification.
+//
+// No-ops when:
+//   - notification_mode is "poll"
+//   - client_notification_endpoint is empty (defence-in-depth; CreateAuthRequest
+//     already enforces this)
+//   - client_notification_token is empty (same reason)
+//
+// On retryable failure (network error, 5xx) the dispatcher retries with
+// exponential backoff up to PingMaxRetries; the final error is recorded on
+// the row's last_notify_error column for operator debugging. Non-2xx 4xx
+// responses are treated as terminal (client misconfiguration; retrying
+// won't fix it).
+func (s *BackchannelService) dispatchPing(ctx context.Context, row *domain.BackchannelAuthRequest) {
+	if row == nil || row.NotificationMode != domain.BackchannelNotificationPing {
+		return
+	}
+	if row.ClientNotificationEndpoint == "" || row.ClientNotificationToken == "" {
+		return
+	}
+
+	s.mu.RLock()
+	client := s.pingClient
+	async := s.pingDispatchAsync
+	maxRetries := s.cfg.PingMaxRetries
+	baseDelay := s.cfg.PingBaseDelay
+	parent := s.svcCtx
+	s.mu.RUnlock()
+	if parent == nil {
+		// Stop() has been called; service is shutting down — drop the
+		// ping rather than firing into the void.
+		return
+	}
+
+	endpoint := row.ClientNotificationEndpoint
+	bearer := row.ClientNotificationToken
+	authReqID := row.AuthReqID
+
+	deliver := func() {
+		// Detach from the inbound request's ctx (so a client disconnect doesn't
+		// kill the delivery — the user has already approved) but parent on
+		// svcCtx so Server.Shutdown → Stop() cancels in-flight retries on
+		// graceful shutdown instead of letting them outlive the server.
+		dctx, cancel := context.WithTimeout(parent, s.cfg.PingTimeout*time.Duration(maxRetries+1)+baseDelay*time.Duration(maxRetries+1))
+		defer cancel()
+
+		payload, _ := json.Marshal(map[string]string{"auth_req_id": authReqID})
+
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				// Exponential backoff with mild jitter. Jitter prevents
+				// retry storms when many requests resolve simultaneously.
+				delay := baseDelay << (attempt - 1)
+				jitter := time.Duration(jitterMillis()) * time.Millisecond
+				select {
+				case <-time.After(delay + jitter):
+				case <-dctx.Done():
+					lastErr = dctx.Err()
+					goto done
+				}
+			}
+
+			req, err := http.NewRequestWithContext(dctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+			if err != nil {
+				lastErr = err
+				goto done // non-retryable: bad URL etc.
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+bearer)
+			req.Header.Set("User-Agent", "zeroid-ciba-ping/1.0")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				continue // network error — retry
+			}
+			// Drain + close so the underlying TCP connection can be reused
+			// across retries / future requests. HTTP/1.1 keepalive requires
+			// the body to be fully read before the connection returns to the pool.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				// Clear any previous last_notify_error so operators see
+				// "succeeded after retry" rather than a stale failure.
+				_ = s.repo.SetLastNotifyError(dctx, authReqID, "")
+				return
+			}
+			lastErr = fmt.Errorf("ping callback returned HTTP %d", resp.StatusCode)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				// 4xx is terminal — client rejected the callback, retrying
+				// won't change the outcome. Examples: bad bearer, wrong path.
+				goto done
+			}
+		}
+
+	done:
+		log.Warn().
+			Err(lastErr).
+			Str("auth_req_id", authReqID).
+			Str("endpoint", endpoint).
+			Msg("CIBA ping dispatch failed")
+		if lastErr != nil {
+			if rerr := s.repo.SetLastNotifyError(dctx, authReqID, lastErr.Error()); rerr != nil {
+				log.Warn().Err(rerr).Str("auth_req_id", authReqID).Msg("failed to record ping last_notify_error")
+			}
+		}
+	}
+
+	if async {
+		go deliver()
+		return
+	}
+	deliver()
+}
+
+// jitterMillis returns a random 0–250 ms jitter value for retry backoff.
+// Sourced from crypto/rand so we don't depend on math/rand seeding.
+func jitterMillis() int {
+	var b [1]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	// b[0] ∈ [0,255]; scale to roughly [0, 250].
+	return int(b[0]) * 250 / 255
 }

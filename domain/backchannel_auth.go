@@ -59,6 +59,7 @@ type BackchannelAuthRequest struct {
 	BindingMessage             string                      `bun:"binding_message,type:text"                    json:"binding_message,omitempty"`
 	NotificationMode           BackchannelNotificationMode `bun:"notification_mode,type:varchar(16)"           json:"notification_mode"`
 	ClientNotificationEndpoint string                      `bun:"client_notification_endpoint,type:text"       json:"client_notification_endpoint,omitempty"`
+	ClientNotificationToken    string                      `bun:"client_notification_token,type:varchar(1024)" json:"-"`
 	Status                     BackchannelStatus           `bun:"status,type:varchar(16)"                      json:"status"`
 	ApprovedSubjectID          string                      `bun:"approved_subject_id,type:varchar(255)"        json:"approved_subject_id,omitempty"`
 	ApprovedSubjectEmail       string                      `bun:"approved_subject_email,type:varchar(255)"     json:"approved_subject_email,omitempty"`
