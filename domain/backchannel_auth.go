@@ -23,16 +23,31 @@ const (
 )
 
 // BackchannelNotificationMode is how the server informs the client that the
-// request has been resolved. PR 1 only implements "poll".
+// request has been resolved.
 type BackchannelNotificationMode string
 
 const (
 	// BackchannelNotificationPoll — client polls /oauth2/token with the auth_req_id.
 	BackchannelNotificationPoll BackchannelNotificationMode = "poll"
 	// BackchannelNotificationPing — server POSTs to client_notification_endpoint when the
-	// status transitions to approved/denied; client then polls. Implemented in PR 2.
+	// status transitions to approved/denied; client then polls.
 	BackchannelNotificationPing BackchannelNotificationMode = "ping"
+	// BackchannelNotificationPush — server POSTs the full token response to
+	// client_notification_endpoint on approval (or the OAuth error body on
+	// denial); the client never polls. Implemented in PR 3.
+	BackchannelNotificationPush BackchannelNotificationMode = "push"
 )
+
+// IsValidBackchannelDeliveryMode reports whether the given string is a
+// recognised CIBA delivery mode. Empty is treated as the implicit default
+// ("poll") and accepted.
+func IsValidBackchannelDeliveryMode(mode string) bool {
+	switch BackchannelNotificationMode(mode) {
+	case "", BackchannelNotificationPoll, BackchannelNotificationPing, BackchannelNotificationPush:
+		return true
+	}
+	return false
+}
 
 // GrantTypeCIBA is the OpenID CIBA Core 1.0 grant type identifier (§10.1).
 // Clients submit this at /oauth2/token along with auth_req_id to poll for a token.

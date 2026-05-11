@@ -59,7 +59,10 @@ type CreateOAuthClientInput struct {
 
 		// CIBA (OpenID CIBA Core 1.0) — registered callback for ping/push notifications.
 		// Must be HTTPS. Empty when the client only uses polling mode.
-		ClientNotificationEndpoint string `json:"client_notification_endpoint,omitempty" doc:"HTTPS callback URL for CIBA ping mode"`
+		ClientNotificationEndpoint string `json:"client_notification_endpoint,omitempty" doc:"HTTPS callback URL for CIBA ping/push mode"`
+		// CIBA token delivery mode: poll (default), ping, or push. ping/push
+		// require client_notification_endpoint.
+		BackchannelTokenDeliveryMode string `json:"backchannel_token_delivery_mode,omitempty" enum:"poll,ping,push" doc:"CIBA token delivery mode"`
 	}
 }
 
@@ -163,24 +166,25 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 	}
 
 	client, plainSecret, err := a.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
-		ClientID:                   input.Body.ClientID,
-		Name:                       input.Body.Name,
-		Description:                input.Body.Description,
-		Confidential:               input.Body.Confidential,
-		TokenEndpointAuthMethod:    input.Body.TokenEndpointAuthMethod,
-		GrantTypes:                 input.Body.GrantTypes,
-		Scopes:                     input.Body.Scopes,
-		RedirectURIs:               input.Body.RedirectURIs,
-		AccessTokenTTL:             input.Body.AccessTokenTTL,
-		RefreshTokenTTL:            input.Body.RefreshTokenTTL,
-		JWKSURI:                    input.Body.JWKSURI,
-		JWKS:                       input.Body.JWKS,
-		SoftwareID:                 input.Body.SoftwareID,
-		SoftwareVersion:            input.Body.SoftwareVersion,
-		Contacts:                   input.Body.Contacts,
-		Metadata:                   input.Body.Metadata,
-		IdentityID:                 input.Body.IdentityID,
-		ClientNotificationEndpoint: input.Body.ClientNotificationEndpoint,
+		ClientID:                     input.Body.ClientID,
+		Name:                         input.Body.Name,
+		Description:                  input.Body.Description,
+		Confidential:                 input.Body.Confidential,
+		TokenEndpointAuthMethod:      input.Body.TokenEndpointAuthMethod,
+		GrantTypes:                   input.Body.GrantTypes,
+		Scopes:                       input.Body.Scopes,
+		RedirectURIs:                 input.Body.RedirectURIs,
+		AccessTokenTTL:               input.Body.AccessTokenTTL,
+		RefreshTokenTTL:              input.Body.RefreshTokenTTL,
+		JWKSURI:                      input.Body.JWKSURI,
+		JWKS:                         input.Body.JWKS,
+		SoftwareID:                   input.Body.SoftwareID,
+		SoftwareVersion:              input.Body.SoftwareVersion,
+		Contacts:                     input.Body.Contacts,
+		Metadata:                     input.Body.Metadata,
+		IdentityID:                   input.Body.IdentityID,
+		ClientNotificationEndpoint:   input.Body.ClientNotificationEndpoint,
+		BackchannelTokenDeliveryMode: input.Body.BackchannelTokenDeliveryMode,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {

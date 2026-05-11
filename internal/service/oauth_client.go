@@ -67,6 +67,9 @@ type RegisterClientRequest struct {
 
 	// CIBA ping/push endpoint. Must be HTTPS when non-empty; validated at registration.
 	ClientNotificationEndpoint string
+	// CIBA Core §10 token delivery mode: "poll" (default), "ping", or "push".
+	// Validated against the domain enum at registration.
+	BackchannelTokenDeliveryMode string
 }
 
 // RegisterClient creates a new OAuth2 client.
@@ -88,6 +91,21 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		if err := validateNotificationEndpoint(req.ClientNotificationEndpoint); err != nil {
 			return nil, "", err
 		}
+	}
+
+	// CIBA Core §10: validate the declared delivery mode. ping/push require
+	// a registered notification endpoint — refuse the registration outright
+	// rather than letting it fail at bc-authorize time. Empty defaults to "poll".
+	deliveryMode := req.BackchannelTokenDeliveryMode
+	if deliveryMode == "" {
+		deliveryMode = string(domain.BackchannelNotificationPoll)
+	}
+	if !domain.IsValidBackchannelDeliveryMode(deliveryMode) {
+		return nil, "", fmt.Errorf("invalid backchannel_token_delivery_mode %q", deliveryMode)
+	}
+	if (deliveryMode == string(domain.BackchannelNotificationPing) || deliveryMode == string(domain.BackchannelNotificationPush)) &&
+		req.ClientNotificationEndpoint == "" {
+		return nil, "", fmt.Errorf("backchannel_token_delivery_mode=%s requires client_notification_endpoint", deliveryMode)
 	}
 
 	var plainSecret string
@@ -147,29 +165,30 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 
 	now := time.Now()
 	client := &domain.OAuthClient{
-		ID:                         uuid.New().String(),
-		ClientID:                   req.ClientID,
-		ClientSecret:               hashedSecret,
-		Name:                       req.Name,
-		Description:                req.Description,
-		ClientType:                 clientType,
-		TokenEndpointAuthMethod:    authMethod,
-		GrantTypes:                 grantTypes,
-		RedirectURIs:               redirectURIs,
-		Scopes:                     scopes,
-		AccessTokenTTL:             req.AccessTokenTTL,
-		RefreshTokenTTL:            req.RefreshTokenTTL,
-		JWKSURI:                    req.JWKSURI,
-		JWKS:                       req.JWKS,
-		SoftwareID:                 req.SoftwareID,
-		SoftwareVersion:            req.SoftwareVersion,
-		Contacts:                   contacts,
-		Metadata:                   req.Metadata,
-		IdentityID:                 identityID,
-		ClientNotificationEndpoint: req.ClientNotificationEndpoint,
-		IsActive:                   true,
-		CreatedAt:                  now,
-		UpdatedAt:                  now,
+		ID:                           uuid.New().String(),
+		ClientID:                     req.ClientID,
+		ClientSecret:                 hashedSecret,
+		Name:                         req.Name,
+		Description:                  req.Description,
+		ClientType:                   clientType,
+		TokenEndpointAuthMethod:      authMethod,
+		GrantTypes:                   grantTypes,
+		RedirectURIs:                 redirectURIs,
+		Scopes:                       scopes,
+		AccessTokenTTL:               req.AccessTokenTTL,
+		RefreshTokenTTL:              req.RefreshTokenTTL,
+		JWKSURI:                      req.JWKSURI,
+		JWKS:                         req.JWKS,
+		SoftwareID:                   req.SoftwareID,
+		SoftwareVersion:              req.SoftwareVersion,
+		Contacts:                     contacts,
+		Metadata:                     req.Metadata,
+		IdentityID:                   identityID,
+		ClientNotificationEndpoint:   req.ClientNotificationEndpoint,
+		BackchannelTokenDeliveryMode: deliveryMode,
+		IsActive:                     true,
+		CreatedAt:                    now,
+		UpdatedAt:                    now,
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {

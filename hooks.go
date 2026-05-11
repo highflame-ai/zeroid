@@ -63,6 +63,10 @@ type OAuthClientConfig struct {
 	// ClientNotificationEndpoint is the HTTPS callback CIBA ping mode posts to.
 	// Empty for clients that only use polling mode.
 	ClientNotificationEndpoint string
+	// BackchannelTokenDeliveryMode declares which CIBA delivery mode the client
+	// supports: "poll" (default), "ping", or "push". ping/push require a
+	// non-empty ClientNotificationEndpoint.
+	BackchannelTokenDeliveryMode string
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted

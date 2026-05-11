@@ -87,8 +87,14 @@ type OAuthClient struct {
 
 	// CIBA Core 1.0 — ping/push notification endpoint. Registered HTTPS URL
 	// the server POSTs to when a backchannel authentication request resolves.
-	// Empty when the client doesn't support ping mode (polling-only).
+	// Empty when the client doesn't support ping/push mode (polling-only).
 	ClientNotificationEndpoint string `bun:"client_notification_endpoint" json:"client_notification_endpoint,omitempty"`
+
+	// CIBA Core 1.0 §10 — declared token delivery mode for this client.
+	// "poll" (default), "ping", or "push". Determines how a CIBA-issued
+	// token reaches the client: by polling /oauth2/token, by ping callback +
+	// poll, or by push callback (token delivered directly).
+	BackchannelTokenDeliveryMode string `bun:"backchannel_token_delivery_mode" json:"backchannel_token_delivery_mode,omitempty"`
 
 	// Token lifetime (per-client, 0 = use server default)
 	AccessTokenTTL  int `bun:"access_token_ttl"  json:"access_token_ttl,omitempty"`

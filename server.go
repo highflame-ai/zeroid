@@ -613,23 +613,24 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	if err != nil {
 		// Client doesn't exist — create it.
 		_, _, regErr := s.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
-			ClientID:                   cfg.ClientID,
-			Name:                       cfg.Name,
-			Description:                cfg.Description,
-			Confidential:               cfg.Confidential,
-			TokenEndpointAuthMethod:    cfg.TokenEndpointAuthMethod,
-			GrantTypes:                 cfg.GrantTypes,
-			Scopes:                     cfg.Scopes,
-			RedirectURIs:               cfg.RedirectURIs,
-			AccessTokenTTL:             cfg.AccessTokenTTL,
-			RefreshTokenTTL:            cfg.RefreshTokenTTL,
-			JWKSURI:                    cfg.JWKSURI,
-			JWKS:                       cfg.JWKS,
-			SoftwareID:                 cfg.SoftwareID,
-			SoftwareVersion:            cfg.SoftwareVersion,
-			Contacts:                   cfg.Contacts,
-			Metadata:                   cfg.Metadata,
-			ClientNotificationEndpoint: cfg.ClientNotificationEndpoint,
+			ClientID:                     cfg.ClientID,
+			Name:                         cfg.Name,
+			Description:                  cfg.Description,
+			Confidential:                 cfg.Confidential,
+			TokenEndpointAuthMethod:      cfg.TokenEndpointAuthMethod,
+			GrantTypes:                   cfg.GrantTypes,
+			Scopes:                       cfg.Scopes,
+			RedirectURIs:                 cfg.RedirectURIs,
+			AccessTokenTTL:               cfg.AccessTokenTTL,
+			RefreshTokenTTL:              cfg.RefreshTokenTTL,
+			JWKSURI:                      cfg.JWKSURI,
+			JWKS:                         cfg.JWKS,
+			SoftwareID:                   cfg.SoftwareID,
+			SoftwareVersion:              cfg.SoftwareVersion,
+			Contacts:                     cfg.Contacts,
+			Metadata:                     cfg.Metadata,
+			ClientNotificationEndpoint:   cfg.ClientNotificationEndpoint,
+			BackchannelTokenDeliveryMode: cfg.BackchannelTokenDeliveryMode,
 		})
 
 		return regErr
@@ -669,6 +670,10 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	}
 	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
 		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
+		updated = true
+	}
+	if cfg.BackchannelTokenDeliveryMode != "" && cfg.BackchannelTokenDeliveryMode != existing.BackchannelTokenDeliveryMode {
+		existing.BackchannelTokenDeliveryMode = cfg.BackchannelTokenDeliveryMode
 		updated = true
 	}
 

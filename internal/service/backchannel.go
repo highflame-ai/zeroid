@@ -258,26 +258,39 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		return nil, oauthBadRequestCause("invalid_client", fmt.Sprintf("unknown client %s", in.ClientID), err)
 	}
 
-	// Ping mode: when the client supplies a client_notification_token, the
-	// client MUST have a registered client_notification_endpoint on its
-	// record. The endpoint is the per-client allowlist — we never accept a
-	// per-request URL because that would let a compromised token redirect
-	// notifications.
+	// Determine notification mode. CIBA Core §10 makes the delivery mode a
+	// property of the client registration, not the per-request — so we read
+	// the row off the client and let the per-request client_notification_token
+	// presence act only as a gate (ping/push without a bearer the server can
+	// echo isn't useful).
+	declared := domain.BackchannelNotificationMode(client.BackchannelTokenDeliveryMode)
+	if declared == "" {
+		declared = domain.BackchannelNotificationPoll
+	}
 	notificationMode := domain.BackchannelNotificationPoll
 	notificationEndpoint := ""
-	if in.ClientNotificationToken != "" {
+	switch declared {
+	case domain.BackchannelNotificationPing, domain.BackchannelNotificationPush:
+		if in.ClientNotificationToken == "" {
+			return nil, oauthBadRequest("invalid_request",
+				fmt.Sprintf("backchannel_token_delivery_mode=%s requires client_notification_token on bc-authorize", declared))
+		}
 		if client.ClientNotificationEndpoint == "" {
 			return nil, oauthBadRequest("invalid_request",
 				"client_notification_token requires the client to have a registered client_notification_endpoint")
 		}
 		// Defence-in-depth: re-validate the registered endpoint is HTTPS even
 		// though RegisterClient already enforced it. A future bypass at
-		// registration must not silently degrade ping mode to http.
+		// registration must not silently degrade callbacks to plaintext.
 		if err := validateNotificationEndpoint(client.ClientNotificationEndpoint); err != nil {
 			return nil, oauthBadRequestCause("invalid_request", "client_notification_endpoint is invalid", err)
 		}
-		notificationMode = domain.BackchannelNotificationPing
+		notificationMode = declared
 		notificationEndpoint = client.ClientNotificationEndpoint
+	default:
+		// Poll mode. If the client passed a notification_token despite being
+		// poll-mode, accept it but ignore — clients shouldn't conditionally
+		// branch and we'd rather degrade gracefully than reject.
 	}
 
 	// Reject oversized binding_message rather than silently truncating.
@@ -384,11 +397,14 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 		// Lost a race against expiry sweep or a concurrent deny.
 		return oauthBadRequest("access_denied", "request could not be approved (concurrent modification or expiry)")
 	}
-	// Ping mode: notify the client that the request resolved. The client
-	// then polls /oauth2/token to receive the access token. We do this
-	// after the row transition so a successful ping always reflects a
-	// successful state change.
-	s.dispatchPing(ctx, row)
+	// Re-load so callbacks see the persisted approved_subject_* fields and
+	// the updated status. Ping/push dispatchers consume these.
+	persisted, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
+	if err == nil {
+		s.dispatchResolution(ctx, persisted, resolutionApproved)
+	} else {
+		log.Warn().Err(err).Str("auth_req_id", in.AuthReqID).Msg("approved row reload failed; dispatch skipped")
+	}
 	return nil
 }
 
@@ -424,8 +440,49 @@ func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 	if affected == 0 {
 		return oauthBadRequest("access_denied", "request could not be denied (concurrent modification or expiry)")
 	}
-	s.dispatchPing(ctx, row)
+	persisted, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
+	if err == nil {
+		s.dispatchResolution(ctx, persisted, resolutionDenied)
+	} else {
+		log.Warn().Err(err).Str("auth_req_id", in.AuthReqID).Msg("denied row reload failed; dispatch skipped")
+	}
 	return nil
+}
+
+// resolutionOutcome is the post-transition state used by dispatchResolution
+// to select the right ping/push payload.
+type resolutionOutcome int
+
+const (
+	resolutionApproved resolutionOutcome = iota
+	resolutionDenied
+)
+
+// dispatchResolution selects the right callback path for the row's
+// notification mode and the outcome (approved/denied):
+//
+//	mode=poll  → no callback; client must poll
+//	mode=ping  → POST {auth_req_id} to client_notification_endpoint
+//	mode=push  → on approved, mint the access token and POST the full
+//	             token response; on denied, POST the OAuth error body.
+//
+// Push-mode minting happens HERE rather than inside Redeem so that the
+// token is delivered exactly once — either via push or, for ping/poll,
+// via a subsequent /oauth2/token call. Redeem refuses push-mode rows.
+func (s *BackchannelService) dispatchResolution(ctx context.Context, row *domain.BackchannelAuthRequest, outcome resolutionOutcome) {
+	if row == nil {
+		return
+	}
+	switch row.NotificationMode {
+	case domain.BackchannelNotificationPing:
+		s.dispatchPing(ctx, row)
+	case domain.BackchannelNotificationPush:
+		if outcome == resolutionApproved {
+			s.dispatchPushApproval(ctx, row)
+		} else {
+			s.dispatchPushDenial(ctx, row)
+		}
+	}
 }
 
 // RedeemInput is the polling-side input the CIBA grant handler hands over.
@@ -451,6 +508,13 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	if in.ClientID != "" && row.ClientID != in.ClientID {
 		// Mismatch means a different client is polling — refuse without leaking detail.
 		return nil, oauthBadRequest("invalid_grant", "auth_req_id was not issued to this client")
+	}
+
+	// Push mode never permits polling — the token is delivered via the
+	// callback exactly once. Allowing both would double-deliver and break
+	// single-use semantics.
+	if row.NotificationMode == domain.BackchannelNotificationPush {
+		return nil, oauthBadRequest("access_denied", "auth_req_id is delivered via push callback; polling is not permitted")
 	}
 
 	now := time.Now()
@@ -483,67 +547,78 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
 
 	case domain.BackchannelStatusApproved:
-		// Claim-first: flip approved → issued BEFORE minting the token so
-		// only one polling thread can ever reach IssueCredential. The
-		// conditional UPDATE in MarkIssued (status='approved' guard) is the
-		// at-most-once invariant; a concurrent caller gets affected=0 and
-		// is rejected with access_denied. This matches the CIBA Core
-		// "auth_req_id is single-use" requirement and prevents the
-		// previously-documented double-mint window.
-		//
-		// Trade-off: if IssueCredential fails after the row has been
-		// flipped to "issued", the user is locked out of retrying this
-		// auth_req_id and must initiate a new bc-authorize. That's
-		// preferable to silently minting two tokens — the failure is
-		// loud (HTTP 500) and the client's retry-with-new-auth-req-id
-		// path handles it cleanly.
-		affected, mErr := s.repo.MarkIssued(ctx, in.AuthReqID)
-		if mErr != nil {
-			return nil, oauthServerError("failed to mark backchannel request issued", mErr)
-		}
-		if affected == 0 {
-			return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
-		}
-
-		// Synthesise an identity for the approved user. CIBA Core §10.1.2
-		// requires the issued token to identify the user; we mirror the
-		// pattern used by ExternalPrincipalExchange (the human-token path).
-		identity := &domain.Identity{
-			AccountID:    row.AccountID,
-			ProjectID:    row.ProjectID,
-			IdentityType: domain.IdentityTypeService,
-			Status:       domain.IdentityStatusActive,
-		}
-		customClaims := map[string]any{
-			"token_exchange":        "ciba",
-			"backchannel_client_id": row.ClientID,
-		}
-		if row.BindingMessage != "" {
-			customClaims["binding_message"] = row.BindingMessage
-		}
-
-		accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-			Identity:        identity,
-			Scopes:          parseScopeString(row.Scope),
-			GrantType:       domain.GrantTypeCIBA,
-			TTL:             900, // 15 minutes — short-lived; matches ExternalPrincipalExchange
-			UseRS256:        true,
-			SubjectOverride: row.ApprovedSubjectID,
-			UserEmail:       row.ApprovedSubjectEmail,
-			UserName:        row.ApprovedSubjectName,
-			CustomClaims:    customClaims,
-		})
-		if err != nil {
-			return nil, oauthServerError("failed to issue CIBA-grant token", err)
-		}
-
-		accessToken.AccountID = row.AccountID
-		accessToken.ProjectID = row.ProjectID
-		return accessToken, nil
+		return s.issueTokenForApprovedRow(ctx, row)
 
 	default:
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("unexpected request status %q", row.Status))
 	}
+}
+
+// issueTokenForApprovedRow mints the CIBA access token for an approved row
+// and atomically flips the row to status='issued'. Shared between Redeem
+// (poll/ping modes — client pulls via /oauth2/token) and dispatchPushApproval
+// (push mode — server delivers via callback).
+//
+// Caller MUST hold the invariant that row.Status == approved. The MarkIssued
+// guard provides the actual at-most-once gate; on a lost race the second
+// caller gets affected=0 and an *OAuthError signalling the duplication.
+func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *domain.BackchannelAuthRequest) (*domain.AccessToken, error) {
+	// Claim-first: flip approved → issued BEFORE minting the token so only
+	// one caller can ever reach IssueCredential. The conditional UPDATE in
+	// MarkIssued (status='approved' guard) is the at-most-once invariant;
+	// a concurrent caller gets affected=0 and is rejected with access_denied.
+	// This matches the CIBA Core "auth_req_id is single-use" requirement
+	// and prevents the double-mint window that mint-first would expose.
+	//
+	// Trade-off: if IssueCredential fails after the row has been flipped to
+	// "issued", the user is locked out of retrying this auth_req_id and must
+	// initiate a new bc-authorize. That's preferable to silently minting two
+	// tokens — the failure is loud (HTTP 500) and the client's
+	// retry-with-new-auth-req-id path handles it cleanly.
+	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID)
+	if mErr != nil {
+		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
+		return nil, oauthServerError("failed to commit issuance state", mErr)
+	}
+	if affected == 0 {
+		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+	}
+
+	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
+	// the issued token to identify the user; we mirror ExternalPrincipalExchange
+	// (the human-token path).
+	identity := &domain.Identity{
+		AccountID:    row.AccountID,
+		ProjectID:    row.ProjectID,
+		IdentityType: domain.IdentityTypeService,
+		Status:       domain.IdentityStatusActive,
+	}
+	customClaims := map[string]any{
+		"token_exchange":        "ciba",
+		"backchannel_client_id": row.ClientID,
+	}
+	if row.BindingMessage != "" {
+		customClaims["binding_message"] = row.BindingMessage
+	}
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+		Identity:        identity,
+		Scopes:          parseScopeString(row.Scope),
+		GrantType:       domain.GrantTypeCIBA,
+		TTL:             900, // 15 minutes — short-lived; matches ExternalPrincipalExchange
+		UseRS256:        true,
+		SubjectOverride: row.ApprovedSubjectID,
+		UserEmail:       row.ApprovedSubjectEmail,
+		UserName:        row.ApprovedSubjectName,
+		CustomClaims:    customClaims,
+	})
+	if err != nil {
+		return nil, oauthServerError("failed to issue CIBA-grant token", err)
+	}
+
+	accessToken.AccountID = row.AccountID
+	accessToken.ProjectID = row.ProjectID
+	return accessToken, nil
 }
 
 // SweepExpired and DeleteExpired are wired by the cleanup worker; surfaced
@@ -604,6 +679,181 @@ func (s *BackchannelService) dispatchNotifier(ctx context.Context, row *domain.B
 			log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("backchannel notifier returned error")
 			if rerr := s.repo.SetLastNotifyError(dctx, row.AuthReqID, err.Error()); rerr != nil {
 				log.Warn().Err(rerr).Str("auth_req_id", row.AuthReqID).Msg("failed to record last_notify_error")
+			}
+		}
+	}
+
+	if async {
+		go deliver()
+		return
+	}
+	deliver()
+}
+
+// dispatchPushApproval mints the access token for an approved push-mode
+// request and POSTs the full token-endpoint response (CIBA Core §10.3.1)
+// to the client's registered notification endpoint. The bearer header carries
+// the per-request client_notification_token so the client can authenticate
+// the inbound delivery.
+//
+// At-most-once delivery is guaranteed by issueTokenForApprovedRow's MarkIssued
+// gate — a parallel call gets access_denied and we don't double-post. On
+// transport failure, the row stays issued (single-use is sacrificed for
+// retry simplicity: a client that registered push mode trusts the server's
+// delivery; if the callback host is unreachable, the deployer operationalises
+// retry through the admin API or, more realistically, falls back to ping mode).
+//
+// Network retry uses the same exponential-backoff + jitter loop as
+// dispatchPing. 4xx is terminal, 5xx is retried. last_notify_error is
+// recorded so operators see why a token never landed.
+func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *domain.BackchannelAuthRequest) {
+	if row == nil || row.NotificationMode != domain.BackchannelNotificationPush {
+		return
+	}
+	if row.ClientNotificationEndpoint == "" || row.ClientNotificationToken == "" {
+		return
+	}
+
+	accessToken, err := s.issueTokenForApprovedRow(ctx, row)
+	if err != nil {
+		// Most likely an OAuthError("access_denied") from a lost race against
+		// a concurrent dispatch. Log and exit — the first dispatcher will
+		// have delivered (or will deliver).
+		log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("push approval mint failed")
+		_ = s.repo.SetLastNotifyError(ctx, row.AuthReqID, err.Error())
+		return
+	}
+
+	// Build the CIBA Core §10.3.1 push notification body. Mirrors the
+	// /oauth2/token success response shape so clients can reuse their
+	// existing token-response parser.
+	tokenType := accessToken.TokenType
+	if tokenType == "" {
+		tokenType = "Bearer"
+	}
+	payload := map[string]any{
+		"access_token": accessToken.AccessToken,
+		"token_type":   tokenType,
+		"expires_in":   accessToken.ExpiresIn,
+		"auth_req_id":  row.AuthReqID,
+	}
+	if accessToken.Scope != "" {
+		payload["scope"] = accessToken.Scope
+	}
+	if accessToken.RefreshToken != "" {
+		payload["refresh_token"] = accessToken.RefreshToken
+	}
+
+	s.postCallback(ctx, row, payload)
+}
+
+// dispatchPushDenial POSTs the OAuth error body (CIBA Core §10.3.2) to the
+// client's notification endpoint when the user denies a push-mode request.
+// No token is minted. Mirrors RFC 6749 §5.2 error shape so clients can reuse
+// their existing token-error parser.
+func (s *BackchannelService) dispatchPushDenial(ctx context.Context, row *domain.BackchannelAuthRequest) {
+	if row == nil || row.NotificationMode != domain.BackchannelNotificationPush {
+		return
+	}
+	if row.ClientNotificationEndpoint == "" || row.ClientNotificationToken == "" {
+		return
+	}
+	payload := map[string]any{
+		"error":             "access_denied",
+		"error_description": "the user denied the authentication request",
+		"auth_req_id":       row.AuthReqID,
+	}
+	s.postCallback(ctx, row, payload)
+}
+
+// postCallback is the shared outbound POST machinery for push approval/denial.
+// Detached context, exponential backoff + jitter, 4xx terminal / 5xx retried,
+// last_notify_error recorded. Shared with dispatchPing's retry loop pattern
+// but takes an arbitrary JSON-serializable payload.
+func (s *BackchannelService) postCallback(ctx context.Context, row *domain.BackchannelAuthRequest, payload map[string]any) {
+	s.mu.RLock()
+	client := s.pingClient
+	async := s.pingDispatchAsync
+	maxRetries := s.cfg.PingMaxRetries
+	baseDelay := s.cfg.PingBaseDelay
+	parent := s.svcCtx
+	s.mu.RUnlock()
+	if parent == nil {
+		// Stop() has been called; service is shutting down — drop the
+		// push rather than firing into the void.
+		return
+	}
+
+	endpoint := row.ClientNotificationEndpoint
+	bearer := row.ClientNotificationToken
+	authReqID := row.AuthReqID
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Error().Err(err).Str("auth_req_id", authReqID).Msg("failed to marshal push callback payload")
+		return
+	}
+
+	deliver := func() {
+		// Parent on svcCtx (cancelled by Server.Shutdown via Stop) instead
+		// of context.Background — graceful shutdown cancels in-flight push
+		// retries instead of letting them outlive the server. Still detached
+		// from the inbound request's ctx so a client disconnect doesn't kill
+		// the outbound delivery.
+		dctx, cancel := context.WithTimeout(parent,
+			s.cfg.PingTimeout*time.Duration(maxRetries+1)+baseDelay*time.Duration(maxRetries+1))
+		defer cancel()
+
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				delay := baseDelay << (attempt - 1)
+				jitter := time.Duration(jitterMillis()) * time.Millisecond
+				select {
+				case <-time.After(delay + jitter):
+				case <-dctx.Done():
+					lastErr = dctx.Err()
+					goto done
+				}
+			}
+
+			req, err := http.NewRequestWithContext(dctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				lastErr = err
+				goto done
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+bearer)
+			req.Header.Set("User-Agent", "zeroid-ciba-push/1.0")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			// Drain + close so the underlying TCP connection can be reused
+			// across retries. HTTP/1.1 keepalive requires the body fully read.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				_ = s.repo.SetLastNotifyError(dctx, authReqID, "")
+				return
+			}
+			lastErr = fmt.Errorf("push callback returned HTTP %d", resp.StatusCode)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				goto done
+			}
+		}
+
+	done:
+		log.Warn().
+			Err(lastErr).
+			Str("auth_req_id", authReqID).
+			Str("endpoint", endpoint).
+			Msg("CIBA push dispatch failed")
+		if lastErr != nil {
+			if rerr := s.repo.SetLastNotifyError(dctx, authReqID, lastErr.Error()); rerr != nil {
+				log.Warn().Err(rerr).Str("auth_req_id", authReqID).Msg("failed to record push last_notify_error")
 			}
 		}
 	}
