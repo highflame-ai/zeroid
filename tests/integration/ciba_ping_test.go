@@ -32,14 +32,17 @@ func TestCIBA_PingMode_HappyPath(t *testing.T) {
 	clientID := uid("ciba-ping-client")
 	const pingEndpoint = "https://ping.example.test/callback"
 
-	// Register the client *with* the notification endpoint — without it,
-	// bc-authorize must reject ping mode (defence-in-depth check below).
+	// Register the client *with* the notification endpoint AND declared
+	// delivery mode = ping. CIBA Core §10 routes on the registration field,
+	// not on per-request token presence — without this, the request falls
+	// through to poll mode and dispatchPing is never invoked.
 	require.NoError(t, testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
-		ClientID:                   clientID,
-		Name:                       clientID + "-ping",
-		GrantTypes:                 []string{"client_credentials"},
-		RedirectURIs:               []string{testRedirectURI},
-		ClientNotificationEndpoint: pingEndpoint,
+		ClientID:                     clientID,
+		Name:                         clientID + "-ping",
+		GrantTypes:                   []string{"client_credentials"},
+		RedirectURIs:                 []string{testRedirectURI},
+		ClientNotificationEndpoint:   pingEndpoint,
+		BackchannelTokenDeliveryMode: "ping",
 	}))
 
 	capt := newCapturingRoundTripper()
@@ -103,26 +106,23 @@ func TestCIBA_PingMode_HappyPath(t *testing.T) {
 }
 
 // TestCIBA_PingMode_RequiresRegisteredEndpoint guards the allowlist invariant:
-// a client that supplies client_notification_token but has NO registered
-// client_notification_endpoint must be rejected at bc-authorize. This is the
-// allowlist's whole point — a compromised client_notification_token cannot
-// redirect the server's outbound POSTs.
+// a client declaring backchannel_token_delivery_mode=ping (or push) MUST have
+// a registered client_notification_endpoint. This is the allowlist's whole
+// point — a compromised client_notification_token cannot redirect the
+// server's outbound POSTs. Per CIBA Core §10 the delivery mode is registration
+// metadata, so we enforce this at RegisterClient rather than waiting for
+// bc-authorize.
 func TestCIBA_PingMode_RequiresRegisteredEndpoint(t *testing.T) {
-	clientID := uid("ciba-ping-noendpoint")
-	registerTestOAuthClient(clientID, []string{"client_credentials"}) // no notification endpoint
-
-	resp := post(t, "/oauth2/bc-authorize", map[string]any{
-		"client_id":                 clientID,
-		"account_id":                testAccountID,
-		"project_id":                testProjectID,
-		"login_hint":                "carol@example.com",
-		"client_notification_token": "any-token",
-	}, nil)
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	body := decode(t, resp)
-	require.Equal(t, "invalid_request", body["error"])
-	require.Contains(t, body["error_description"], "client_notification_endpoint",
-		"error must point at the missing registration field")
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:                     uid("ciba-ping-noendpoint"),
+		Name:                         "ciba-ping-noendpoint",
+		GrantTypes:                   []string{"client_credentials"},
+		BackchannelTokenDeliveryMode: "ping",
+		// ClientNotificationEndpoint intentionally omitted.
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "client_notification_endpoint",
+		"rejection must point at the missing registration field")
 }
 
 // TestCIBA_RegisterClient_RejectsHTTPNotificationEndpoint guards CIBA Core §4:

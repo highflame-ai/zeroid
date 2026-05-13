@@ -63,9 +63,9 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
 		// let CIBA-aware clients auto-discover that this AS supports
 		// backchannel authentication and which delivery modes are wired.
-		"backchannel_authentication_endpoint":         a.baseURL + "/oauth2/bc-authorize",
-		"backchannel_token_delivery_modes_supported":  []string{"poll", "ping", "push"},
-		"backchannel_user_code_parameter_supported":   false,
+		"backchannel_authentication_endpoint":        a.baseURL + "/oauth2/bc-authorize",
+		"backchannel_token_delivery_modes_supported": []string{"poll", "ping", "push"},
+		"backchannel_user_code_parameter_supported":  false,
 		// We don't accept signed bc-authorize requests in v1 — clients
 		// authenticate via standard client_secret_basic/post against the
 		// backchannel endpoint. An empty array signals "no signing algs
