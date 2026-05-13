@@ -28,9 +28,28 @@ type Config struct {
 	Telemetry   TelemetryConfig   `koanf:"telemetry"`
 	Logging     LoggingConfig     `koanf:"logging"`
 	Attestation AttestationConfig `koanf:"attestation"`
+	Backchannel BackchannelConfig `koanf:"backchannel"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+}
+
+// BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
+// are optional; defaults are applied in service.DefaultBackchannelConfig().
+type BackchannelConfig struct {
+	// AllowPrivateNotificationEndpoints relaxes the SSRF guard on CIBA
+	// outbound notification destinations. Default false (production-safe).
+	//
+	// When false, registered client_notification_endpoint hosts are resolved
+	// and rejected if they (or any of their resolved IPs) fall in private,
+	// loopback, link-local, multicast, CGN, or unspecified ranges. Re-checked
+	// at request time as DNS-rebinding defense.
+	//
+	// When true, the guard is disabled — only HTTPS scheme + non-empty host
+	// are enforced. Use ONLY in single-tenant test/dev deployments that
+	// register endpoints like https://localhost:9000/. Production deployments
+	// MUST keep this false (see GHSA-599q-j34m-33vc).
+	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
 }
 
 // AttestationConfig governs the attestation verification subsystem. The

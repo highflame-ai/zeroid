@@ -205,7 +205,13 @@ func NewServer(cfg Config) (*Server, error) {
 	// dispatches from oauthSvc.Token() into BackchannelService.Redeem, which in
 	// turn calls credentialSvc.IssueCredential. Two-phase wiring breaks the
 	// otherwise-circular dependency cleanly.
-	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, service.DefaultBackchannelConfig())
+	backchannelCfg := service.DefaultBackchannelConfig()
+	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
+	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
+	// registration-time check (in OAuthClientService.RegisterClient) and the
+	// request-time check (in BackchannelService.CreateAuthRequest) agree.
+	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
 	// Create shared API handler.

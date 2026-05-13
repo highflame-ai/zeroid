@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"time"
 
@@ -30,11 +31,26 @@ var ErrInvalidClientSecret = errors.New("invalid client secret")
 // OAuthClientService manages OAuth2 client registration.
 type OAuthClientService struct {
 	repo *postgres.OAuthClientRepository
+	// allowPrivateNotificationEndpoints relaxes the SSRF guard on
+	// client_notification_endpoint registration when true. Defaults to
+	// false (production-safe). Flipped via SetAllowPrivateNotificationEndpoints
+	// in test / single-tenant dev deployments that need to register
+	// loopback-style endpoints like https://localhost:9000/.
+	allowPrivateNotificationEndpoints bool
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
 func NewOAuthClientService(repo *postgres.OAuthClientRepository) *OAuthClientService {
 	return &OAuthClientService{repo: repo}
+}
+
+// SetAllowPrivateNotificationEndpoints toggles the SSRF guard on
+// client_notification_endpoint registration. Production must keep this false
+// (the default). Tests + single-tenant dev deployments needing loopback
+// endpoints flip to true. Mirrors BackchannelServiceConfig's same-named
+// field; both should be set from the same source in server.go.
+func (s *OAuthClientService) SetAllowPrivateNotificationEndpoints(allow bool) {
+	s.allowPrivateNotificationEndpoints = allow
 }
 
 // RegisterClientRequest holds all fields for creating an OAuth2 client.
@@ -83,9 +99,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	}
 	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
 	// supplied. Reject http:// / non-URL values at registration so a faulty
-	// client cannot lead the server to POST credentials over plaintext.
+	// client cannot lead the server to POST credentials over plaintext. The
+	// SSRF guard (resolved-IP check against private ranges) also fires here
+	// unless allowPrivateNotificationEndpoints is set for test/dev.
 	if req.ClientNotificationEndpoint != "" {
-		if err := validateNotificationEndpoint(req.ClientNotificationEndpoint); err != nil {
+		if err := validateNotificationEndpoint(req.ClientNotificationEndpoint, s.allowPrivateNotificationEndpoints); err != nil {
 			return nil, "", err
 		}
 	}
@@ -284,11 +302,29 @@ func generateSecureToken(byteLen int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// ErrPrivateNotificationEndpoint is the sentinel returned when an outbound
+// destination resolves to a private / loopback / link-local / multicast /
+// CGN / unspecified IP range. Service-layer validation errors are wrapped via
+// %w so callers (registration handler, request-time dispatch checks) can use
+// errors.Is to recognise the SSRF-guard rejection consistently.
+//
+// Mitigation for GHSA-599q-j34m-33vc — unguarded outbound HTTPS from CIBA
+// notification dispatch could be used as an SSRF primitive to scan internal
+// networks or hit cloud-metadata services from inside the zeroid process.
+var ErrPrivateNotificationEndpoint = errors.New("client_notification_endpoint resolves to a private or reserved IP range")
+
 // validateNotificationEndpoint enforces the CIBA Core §4 rule that
 // client_notification_endpoint MUST be an absolute HTTPS URL. http:// is
 // rejected so the server can never POST the per-request bearer
 // (client_notification_token) over plaintext.
-func validateNotificationEndpoint(raw string) error {
+//
+// When allowPrivate is false (production default), the host is resolved and
+// every returned IP is checked against a private/reserved-range blocklist.
+// If ANY resolved IP is blocked, the registration is rejected — DNS-rebinding
+// defense (a hostname pointing at both public and private IPs is treated as
+// hostile). Pass allowPrivate=true ONLY in test/dev contexts where you
+// register endpoints like https://localhost:8080/.
+func validateNotificationEndpoint(raw string, allowPrivate bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid client_notification_endpoint: %w", err)
@@ -299,5 +335,74 @@ func validateNotificationEndpoint(raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("client_notification_endpoint must include a host")
 	}
+	if !allowPrivate {
+		if err := assertNotPrivate(u.Hostname()); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// assertNotPrivate resolves host and rejects if ANY returned IP is in a
+// private / loopback / link-local / multicast / CGN / unspecified range.
+// All resolved IPs are checked so that DNS-rebinding (rotating A records
+// between resolution attempts) cannot bypass the guard by returning a public
+// IP at registration and a private IP at request-time.
+//
+// Pure-IP hostnames are also handled — net.LookupIP returns a single-element
+// slice with the literal IP, so the blocklist check applies to direct
+// IP-as-host registrations like https://10.0.0.5/.
+func assertNotPrivate(host string) error {
+	ips, err := lookupIPs(host)
+	if err != nil {
+		return fmt.Errorf("client_notification_endpoint host %q does not resolve: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("client_notification_endpoint host %q returned no IPs", host)
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("%w: %s → %s", ErrPrivateNotificationEndpoint, host, ip.String())
+		}
+	}
+	return nil
+}
+
+// lookupIPs is a package-level var so tests can inject a stubbed resolver
+// without touching real DNS. Production uses net.LookupIP which goes through
+// the OS resolver (honours /etc/hosts, /etc/resolv.conf, etc.).
+var lookupIPs = func(host string) ([]net.IP, error) {
+	return net.LookupIP(host)
+}
+
+// isBlockedIP returns true for any IP that should not be reachable as a
+// CIBA notification target. Covers:
+//
+//   - RFC 1918 IPv4 private (10/8, 172.16/12, 192.168/16) — net.IP.IsPrivate
+//   - RFC 4193 IPv6 ULA (fc00::/7) — net.IP.IsPrivate, also catches Azure
+//     IMDS at fd00:ec2::254 which sits inside fc00::/7
+//   - Loopback (127/8, ::1) — net.IP.IsLoopback
+//   - Link-local unicast (169.254/16, fe80::/10) — net.IP.IsLinkLocalUnicast.
+//     Catches AWS/GCP IMDS at 169.254.169.254 and OpenStack at 169.254.169.254.
+//   - Link-local multicast (224.0.0/24, ff02::/16) — net.IP.IsLinkLocalMulticast
+//   - Multicast (224/4, ff00::/8) — net.IP.IsMulticast
+//   - Unspecified (0.0.0.0, ::) — net.IP.IsUnspecified
+//   - RFC 6598 Carrier-Grade NAT (100.64/10) — not exposed by stdlib;
+//     checked manually below
+func isBlockedIP(ip net.IP) bool {
+	if ip.IsPrivate() ||
+		ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+	// RFC 6598 CGN: 100.64.0.0/10
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 100 && v4[1]&0xC0 == 0x40 {
+			return true
+		}
+	}
+	return false
 }
