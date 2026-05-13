@@ -103,7 +103,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	// SSRF guard (resolved-IP check against private ranges) also fires here
 	// unless allowPrivateNotificationEndpoints is set for test/dev.
 	if req.ClientNotificationEndpoint != "" {
-		if err := validateNotificationEndpoint(req.ClientNotificationEndpoint, s.allowPrivateNotificationEndpoints); err != nil {
+		if err := validateNotificationEndpoint(ctx, req.ClientNotificationEndpoint, s.allowPrivateNotificationEndpoints); err != nil {
 			return nil, "", err
 		}
 	}
@@ -304,27 +304,38 @@ func generateSecureToken(byteLen int) (string, error) {
 
 // ErrPrivateNotificationEndpoint is the sentinel returned when an outbound
 // destination resolves to a private / loopback / link-local / multicast /
-// CGN / unspecified IP range. Service-layer validation errors are wrapped via
+// CGN / unspecified address. Service-layer validation errors wrap this via
 // %w so callers (registration handler, request-time dispatch checks) can use
-// errors.Is to recognise the SSRF-guard rejection consistently.
+// errors.Is to recognise the SSRF-guard rejection consistently. The error
+// deliberately does NOT echo the resolved IP back to the caller — leaking
+// our internal DNS view of the client's hostname is not a useful diagnostic
+// for the client and could expose split-horizon DNS topology.
 //
 // Mitigation for GHSA-599q-j34m-33vc — unguarded outbound HTTPS from CIBA
 // notification dispatch could be used as an SSRF primitive to scan internal
 // networks or hit cloud-metadata services from inside the zeroid process.
-var ErrPrivateNotificationEndpoint = errors.New("client_notification_endpoint resolves to a private or reserved IP range")
+var ErrPrivateNotificationEndpoint = errors.New("client_notification_endpoint resolves to a private or reserved address")
+
+// dnsLookupTimeout caps each resolve call so a slow / hanging DNS server
+// cannot stall a registration or dispatch indefinitely. 2 seconds is well
+// above typical resolver latency and leaves headroom inside the surrounding
+// HTTP request budget.
+const dnsLookupTimeout = 2 * time.Second
 
 // validateNotificationEndpoint enforces the CIBA Core §4 rule that
 // client_notification_endpoint MUST be an absolute HTTPS URL. http:// is
 // rejected so the server can never POST the per-request bearer
 // (client_notification_token) over plaintext.
 //
-// When allowPrivate is false (production default), the host is resolved and
-// every returned IP is checked against a private/reserved-range blocklist.
-// If ANY resolved IP is blocked, the registration is rejected — DNS-rebinding
-// defense (a hostname pointing at both public and private IPs is treated as
-// hostile). Pass allowPrivate=true ONLY in test/dev contexts where you
-// register endpoints like https://localhost:8080/.
-func validateNotificationEndpoint(raw string, allowPrivate bool) error {
+// When allowPrivate is false (production default), the host is resolved with
+// a 2-second timeout and every returned IP is checked against a
+// private/reserved-range blocklist. If ANY resolved IP is blocked, the
+// registration is rejected — DNS-rebinding defence (a hostname pointing at
+// both public and private IPs is treated as hostile). Pass allowPrivate=true
+// ONLY in test/dev contexts where you register endpoints like
+// https://localhost:8080/; in that mode DNS resolution is skipped entirely
+// so synthetic RFC 6761 .test/.example/.invalid fixtures don't hard-fail.
+func validateNotificationEndpoint(ctx context.Context, raw string, allowPrivate bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid client_notification_endpoint: %w", err)
@@ -335,25 +346,31 @@ func validateNotificationEndpoint(raw string, allowPrivate bool) error {
 	if u.Host == "" {
 		return fmt.Errorf("client_notification_endpoint must include a host")
 	}
-	if !allowPrivate {
-		if err := assertNotPrivate(u.Hostname()); err != nil {
-			return err
-		}
-	}
-	return nil
+	return resolveAndCheckHost(ctx, u.Hostname(), allowPrivate)
 }
 
-// assertNotPrivate resolves host and rejects if ANY returned IP is in a
-// private / loopback / link-local / multicast / CGN / unspecified range.
-// All resolved IPs are checked so that DNS-rebinding (rotating A records
-// between resolution attempts) cannot bypass the guard by returning a public
-// IP at registration and a private IP at request-time.
+// resolveAndCheckHost performs a timeout-bounded DNS lookup for host and
+// rejects if ANY returned IP is in the private/reserved blocklist (DNS-
+// rebinding defence: a hostname that mixes public and private A records is
+// treated as hostile). When allowPrivate is true, DNS resolution is skipped
+// entirely — synthetic RFC 6761 .test/.example/.invalid fixtures in
+// integration tests would otherwise hard-fail under NXDOMAIN.
 //
-// Pure-IP hostnames are also handled — net.LookupIP returns a single-element
+// The resolved IP is logged at debug level for operator triage but NOT
+// echoed back to the caller — leaking our internal DNS view of the client's
+// hostname is not a useful diagnostic for the client and could expose
+// split-horizon DNS topology.
+//
+// Pure-IP hostnames are also handled — the resolver returns a single-entry
 // slice with the literal IP, so the blocklist check applies to direct
 // IP-as-host registrations like https://10.0.0.5/.
-func assertNotPrivate(host string) error {
-	ips, err := lookupIPs(host)
+func resolveAndCheckHost(ctx context.Context, host string, allowPrivate bool) error {
+	if allowPrivate {
+		return nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+	defer cancel()
+	ips, err := lookupIPs(lookupCtx, host)
 	if err != nil {
 		return fmt.Errorf("client_notification_endpoint host %q does not resolve: %w", host, err)
 	}
@@ -362,17 +379,30 @@ func assertNotPrivate(host string) error {
 	}
 	for _, ip := range ips {
 		if isBlockedIP(ip) {
-			return fmt.Errorf("%w: %s → %s", ErrPrivateNotificationEndpoint, host, ip.String())
+			log.Debug().
+				Str("host", host).
+				Str("blocked_ip", ip.String()).
+				Msg("SSRF guard rejected notification endpoint")
+			return ErrPrivateNotificationEndpoint
 		}
 	}
 	return nil
 }
 
 // lookupIPs is a package-level var so tests can inject a stubbed resolver
-// without touching real DNS. Production uses net.LookupIP which goes through
-// the OS resolver (honours /etc/hosts, /etc/resolv.conf, etc.).
-var lookupIPs = func(host string) ([]net.IP, error) {
-	return net.LookupIP(host)
+// without touching real DNS. Production uses net.DefaultResolver.LookupIPAddr
+// which honours the supplied context (so the dnsLookupTimeout actually
+// bounds the call — net.LookupIP does not respect context).
+var lookupIPs = func(ctx context.Context, host string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		ips[i] = a.IP
+	}
+	return ips, nil
 }
 
 // isBlockedIP returns true for any IP that should not be reachable as a
@@ -383,9 +413,10 @@ var lookupIPs = func(host string) ([]net.IP, error) {
 //     IMDS at fd00:ec2::254 which sits inside fc00::/7
 //   - Loopback (127/8, ::1) — net.IP.IsLoopback
 //   - Link-local unicast (169.254/16, fe80::/10) — net.IP.IsLinkLocalUnicast.
-//     Catches AWS/GCP IMDS at 169.254.169.254 and OpenStack at 169.254.169.254.
-//   - Link-local multicast (224.0.0/24, ff02::/16) — net.IP.IsLinkLocalMulticast
-//   - Multicast (224/4, ff00::/8) — net.IP.IsMulticast
+//     Catches AWS/GCP IMDS at 169.254.169.254.
+//   - Multicast (224/4, ff00::/8) — net.IP.IsMulticast. This is a strict
+//     superset of IsLinkLocalMulticast (224.0.0/24, ff02::/16), so the
+//     link-local-multicast check is implied and not repeated.
 //   - Unspecified (0.0.0.0, ::) — net.IP.IsUnspecified
 //   - RFC 6598 Carrier-Grade NAT (100.64/10) — not exposed by stdlib;
 //     checked manually below
@@ -393,7 +424,6 @@ func isBlockedIP(ip net.IP) bool {
 	if ip.IsPrivate() ||
 		ip.IsLoopback() ||
 		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() ||
 		ip.IsUnspecified() {
 		return true

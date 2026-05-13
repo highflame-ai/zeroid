@@ -287,7 +287,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		//   2. Re-resolve the host against the SSRF blocklist. The registered
 		//      hostname might have been DNS-rebound to point at a private IP
 		//      since registration — this catches that (GHSA-599q-j34m-33vc).
-		if err := validateNotificationEndpoint(client.ClientNotificationEndpoint, s.cfg.AllowPrivateNotificationEndpoints); err != nil {
+		if err := validateNotificationEndpoint(ctx, client.ClientNotificationEndpoint, s.cfg.AllowPrivateNotificationEndpoints); err != nil {
 			return nil, oauthBadRequestCause("invalid_request", "client_notification_endpoint is invalid", err)
 		}
 		notificationMode = domain.BackchannelNotificationPing

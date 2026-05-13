@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"net"
 	"testing"
@@ -43,9 +44,11 @@ func TestIsBlockedIP(t *testing.T) {
 		{"link-local IPv4 — generic", "169.254.0.1", true, "link-local"},
 		{"link-local IPv6", "fe80::1", true, "IPv6 link-local"},
 
-		// Multicast
-		{"multicast IPv4", "224.0.0.1", true, "multicast"},
-		{"multicast IPv6", "ff02::1", true, "IPv6 multicast"},
+		// Multicast — IsMulticast covers link-local multicast as a subset
+		{"link-local multicast IPv4", "224.0.0.1", true, "multicast (link-local subset)"},
+		{"link-local multicast IPv6", "ff02::1", true, "IPv6 multicast (link-local subset)"},
+		{"global multicast IPv4", "239.255.0.1", true, "multicast"},
+		{"global multicast IPv6", "ff0e::1", true, "IPv6 multicast"},
 
 		// Unspecified
 		{"unspecified IPv4", "0.0.0.0", true, "unspecified"},
@@ -78,7 +81,7 @@ func TestIsBlockedIP(t *testing.T) {
 func TestValidateNotificationEndpoint_HTTPS(t *testing.T) {
 	for _, allowPrivate := range []bool{false, true} {
 		t.Run("allowPrivate="+boolStr(allowPrivate), func(t *testing.T) {
-			err := validateNotificationEndpoint("http://example.com/cb", allowPrivate)
+			err := validateNotificationEndpoint(context.Background(), "http://example.com/cb", allowPrivate)
 			if err == nil {
 				t.Fatal("expected http:// to be rejected; got nil")
 			}
@@ -105,7 +108,7 @@ func TestValidateNotificationEndpoint_PrivateIP(t *testing.T) {
 	// "localhost", return 127.0.0.1.
 	prev := lookupIPs
 	defer func() { lookupIPs = prev }()
-	lookupIPs = func(host string) ([]net.IP, error) {
+	lookupIPs = func(_ context.Context, host string) ([]net.IP, error) {
 		if host == "localhost" {
 			return []net.IP{net.ParseIP("127.0.0.1")}, nil
 		}
@@ -117,7 +120,7 @@ func TestValidateNotificationEndpoint_PrivateIP(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateNotificationEndpoint(tc.url, false)
+			err := validateNotificationEndpoint(context.Background(), tc.url, false)
 			if err == nil {
 				t.Fatalf("expected SSRF rejection for %q; got nil", tc.url)
 			}
@@ -136,16 +139,15 @@ func TestValidateNotificationEndpoint_PrivateIP(t *testing.T) {
 func TestValidateNotificationEndpoint_DNSRebinding(t *testing.T) {
 	prev := lookupIPs
 	defer func() { lookupIPs = prev }()
-	lookupIPs = func(host string) ([]net.IP, error) {
-		// Simulate a DNS-rebinding attack: hostname resolves to one public
-		// IP and one private IP. The guard must reject on the basis of the
-		// private one.
+	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
+		// Hostname resolves to one public and one private IP. The guard
+		// must reject on the basis of the private one.
 		return []net.IP{
 			net.ParseIP("8.8.8.8"),
 			net.ParseIP("10.0.0.5"),
 		}, nil
 	}
-	err := validateNotificationEndpoint("https://rebound.example.com/cb", false)
+	err := validateNotificationEndpoint(context.Background(), "https://rebound.example.com/cb", false)
 	if err == nil {
 		t.Fatal("expected DNS-rebinding split-IP host to be rejected; got nil")
 	}
@@ -154,17 +156,51 @@ func TestValidateNotificationEndpoint_DNSRebinding(t *testing.T) {
 	}
 }
 
+// TestValidateNotificationEndpoint_RequestTimeRebinding exercises the
+// defence against a hostname that passes at registration (resolver returns a
+// public IP) but is rebound by the time bc-authorize re-validates. Both code
+// paths route through validateNotificationEndpoint, so the second pass must
+// reject even when the first passed.
+func TestValidateNotificationEndpoint_RequestTimeRebinding(t *testing.T) {
+	prev := lookupIPs
+	defer func() { lookupIPs = prev }()
+
+	var calls int
+	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
+		calls++
+		if calls == 1 {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil // RFC 5737 docs IP
+		}
+		return []net.IP{net.ParseIP("169.254.169.254")}, nil // AWS IMDS
+	}
+
+	ctx := context.Background()
+	if err := validateNotificationEndpoint(ctx, "https://flip.example.com/cb", false); err != nil {
+		t.Fatalf("first call (simulated registration) should pass; got %v", err)
+	}
+	err := validateNotificationEndpoint(ctx, "https://flip.example.com/cb", false)
+	if err == nil {
+		t.Fatal("second call (simulated bc-authorize re-validation) should reject after DNS flip; got nil")
+	}
+	if !errors.Is(err, ErrPrivateNotificationEndpoint) {
+		t.Fatalf("expected ErrPrivateNotificationEndpoint sentinel; got %v", err)
+	}
+}
+
 // TestValidateNotificationEndpoint_AllowPrivate confirms the opt-out flag
-// works in test/dev environments. With allowPrivate=true the loopback
-// registration must succeed despite resolving to 127.0.0.1.
+// works in test/dev environments. With allowPrivate=true the SSRF check is
+// skipped entirely — no DNS resolution at all — so synthetic RFC 6761
+// test fixtures like https://*.example.test don't hard-fail under a
+// host-resolver that returns NXDOMAIN.
 func TestValidateNotificationEndpoint_AllowPrivate(t *testing.T) {
 	prev := lookupIPs
 	defer func() { lookupIPs = prev }()
-	lookupIPs = func(host string) ([]net.IP, error) {
-		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
+		t.Fatal("lookupIPs must not be called when allowPrivate=true")
+		return nil, nil
 	}
-	if err := validateNotificationEndpoint("https://localhost:9000/cb", true); err != nil {
-		t.Fatalf("expected allowPrivate=true to permit loopback; got %v", err)
+	if err := validateNotificationEndpoint(context.Background(), "https://localhost:9000/cb", true); err != nil {
+		t.Fatalf("expected allowPrivate=true to short-circuit DNS; got %v", err)
 	}
 }
 
@@ -173,10 +209,10 @@ func TestValidateNotificationEndpoint_AllowPrivate(t *testing.T) {
 func TestValidateNotificationEndpoint_PublicHostPasses(t *testing.T) {
 	prev := lookupIPs
 	defer func() { lookupIPs = prev }()
-	lookupIPs = func(host string) ([]net.IP, error) {
+	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("203.0.113.10")}, nil // RFC 5737 docs IP
 	}
-	if err := validateNotificationEndpoint("https://callback.example.com/cb", false); err != nil {
+	if err := validateNotificationEndpoint(context.Background(), "https://callback.example.com/cb", false); err != nil {
 		t.Fatalf("expected public-IP registration to pass; got %v", err)
 	}
 }
