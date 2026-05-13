@@ -52,11 +52,24 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
 			"urn:ietf:params:oauth:grant-type:token-exchange",
 			"api_key",
+			"urn:openid:params:grant-type:ciba",
 		},
 		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
 		"introspection_endpoint":   a.baseURL + "/oauth2/token/introspect",
 		"revocation_endpoint":      a.baseURL + "/oauth2/token/revoke",
 		"response_types_supported": []string{"token"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
+
+		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
+		// let CIBA-aware clients auto-discover that this AS supports
+		// backchannel authentication and which delivery modes are wired.
+		"backchannel_authentication_endpoint":         a.baseURL + "/oauth2/bc-authorize",
+		"backchannel_token_delivery_modes_supported":  []string{"poll", "ping", "push"},
+		"backchannel_user_code_parameter_supported":   false,
+		// We don't accept signed bc-authorize requests in v1 — clients
+		// authenticate via standard client_secret_basic/post against the
+		// backchannel endpoint. An empty array signals "no signing algs
+		// supported" per the spec's MAY clause.
+		"backchannel_authentication_request_signing_alg_values_supported": []string{},
 	}}, nil
 }

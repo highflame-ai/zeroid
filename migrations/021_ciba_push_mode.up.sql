@@ -1,4 +1,4 @@
--- 016_ciba_push_mode.up.sql
+-- 021_ciba_push_mode.up.sql
 -- OpenID CIBA Core 1.0 §10: token delivery modes.
 --
 -- A client declares its supported delivery mode at registration:

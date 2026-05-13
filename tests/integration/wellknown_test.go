@@ -62,6 +62,21 @@ func TestOAuthServerMetadata(t *testing.T) {
 	assert.True(t, grantSet["client_credentials"], "must support client_credentials")
 	assert.True(t, grantSet["urn:ietf:params:oauth:grant-type:jwt-bearer"], "must support jwt_bearer")
 	assert.True(t, grantSet["urn:ietf:params:oauth:grant-type:token-exchange"], "must support token_exchange")
+	assert.True(t, grantSet["urn:openid:params:grant-type:ciba"], "must support CIBA grant")
+
+	// CIBA (OpenID CIBA Core 1.0) discovery fields.
+	assert.NotEmpty(t, body["backchannel_authentication_endpoint"],
+		"must advertise backchannel_authentication_endpoint for CIBA-aware clients")
+
+	deliveryModes, ok := body["backchannel_token_delivery_modes_supported"].([]any)
+	require.True(t, ok, "must declare backchannel_token_delivery_modes_supported")
+	modeSet := make(map[string]bool, len(deliveryModes))
+	for _, m := range deliveryModes {
+		modeSet[m.(string)] = true
+	}
+	assert.True(t, modeSet["poll"], "must advertise poll delivery mode")
+	assert.True(t, modeSet["ping"], "must advertise ping delivery mode")
+	assert.True(t, modeSet["push"], "must advertise push delivery mode")
 }
 
 // TestHealthEndpoint verifies that /health returns 200.
