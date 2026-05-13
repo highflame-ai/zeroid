@@ -37,6 +37,16 @@ func NewProofService(jwksSvc *signing.JWKSService, proofRepo *postgres.ProofRepo
 // The nonce must be unique; duplicate nonces are rejected. The uniqueness guarantee is enforced
 // atomically by the database UNIQUE constraint on the nonce column — no pre-check is needed.
 func (s *ProofService) GenerateProofToken(ctx context.Context, identity *domain.Identity, audience, nonce string) (string, error) {
+	if identity == nil {
+		return "", fmt.Errorf("identity is required")
+	}
+	if !identity.Status.IsUsable() {
+		return "", fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
+	}
+	if identity.IsExpired() {
+		return "", fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+	}
+
 	now := time.Now()
 	expiresAt := now.Add(5 * time.Minute)
 	jti := uuid.New().String()

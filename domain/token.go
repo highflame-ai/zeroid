@@ -106,6 +106,14 @@ type OAuthClient struct {
 	// Extensibility
 	Metadata json.RawMessage `bun:"metadata,type:jsonb" json:"metadata,omitempty"`
 
+	// IdentityID optionally binds this OAuth client to an agent identity.
+	// When set, authorization_code and refresh_token grants issued through
+	// this client carry the identity_id forward (refresh_tokens.identity_id
+	// already exists) and gate token issuance on the linked identity's
+	// status + expires_at — same fail-closed semantics jwt_bearer and
+	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
+
 	// Lifecycle
 	IsActive  bool      `bun:"is_active"   json:"is_active"`
 	CreatedAt time.Time `bun:"created_at"  json:"created_at"`

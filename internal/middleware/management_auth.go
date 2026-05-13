@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strings"
 )
 
 type adminContextKey string
@@ -13,6 +14,12 @@ const (
 	HeaderUserID    = "X-User-ID"
 
 	callerNameKey adminContextKey = "caller_name"
+
+	// SystemCallerPrefix is reserved for server-internal actors that need
+	// to stamp audit records (e.g. the cleanup worker's expired-identity
+	// sweep). Caller-supplied X-User-ID values with this prefix are
+	// silently dropped so an admin can't forge attribution to a worker.
+	SystemCallerPrefix = "system:"
 )
 
 // TenantContextMiddleware extracts tenant context (X-Account-ID, X-Project-ID)
@@ -33,8 +40,15 @@ func TenantContextMiddleware(next http.Handler) http.Handler {
 			ctx = SetTenant(ctx, accountID, projectID)
 		}
 
+		// X-User-ID is informational and flows into audit modified_by stamps.
+		// Reserved system:* prefix is silently dropped so an authenticated
+		// admin caller can't impersonate the cleanup worker or any other
+		// server-internal actor in the audit trail. Case-insensitive match
+		// so "System:" / "SYSTEM:" can't sneak past a downstream log query
+		// that filters with ILIKE 'system:%'. SetCallerName from server-
+		// side code (via context, not headers) bypasses this filter.
 		userID := r.Header.Get(HeaderUserID)
-		if userID != "" {
+		if userID != "" && !strings.HasPrefix(strings.ToLower(userID), SystemCallerPrefix) {
 			ctx = SetCallerName(ctx, userID)
 		}
 

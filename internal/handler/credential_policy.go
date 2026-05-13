@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -17,14 +18,15 @@ import (
 
 type CreatePolicyInput struct {
 	Body struct {
-		Name                string   `json:"name" required:"true" minLength:"1" doc:"Policy name (unique per tenant)"`
-		Description         string   `json:"description,omitempty" doc:"Policy description"`
-		MaxTTLSeconds       int      `json:"max_ttl_seconds,omitempty" doc:"Maximum token TTL in seconds"`
-		AllowedGrantTypes   []string `json:"allowed_grant_types,omitempty" doc:"Permitted OAuth grant types"`
-		AllowedScopes       []string `json:"allowed_scopes,omitempty" doc:"Permitted OAuth scopes"`
-		RequiredTrustLevel  string   `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
-		RequiredAttestation string   `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
-		MaxDelegationDepth  int      `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth"`
+		Name                string     `json:"name" required:"true" minLength:"1" doc:"Policy name (unique per tenant)"`
+		Description         string     `json:"description,omitempty" doc:"Policy description"`
+		MaxTTLSeconds       int        `json:"max_ttl_seconds,omitempty" doc:"Maximum token TTL in seconds"`
+		AllowedGrantTypes   []string   `json:"allowed_grant_types,omitempty" doc:"Permitted OAuth grant types"`
+		AllowedScopes       []string   `json:"allowed_scopes,omitempty" doc:"Permitted OAuth scopes"`
+		RequiredTrustLevel  string     `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
+		RequiredAttestation string     `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
+		MaxDelegationDepth  int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth"`
+		ExpiresAt           *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
 	}
 }
 
@@ -55,6 +57,9 @@ type UpdatePolicyInput struct {
 		RequiredAttestation *string  `json:"required_attestation,omitempty" doc:"Required attestation level"`
 		MaxDelegationDepth  *int     `json:"max_delegation_depth,omitempty" doc:"Max delegation depth"`
 		IsActive            *bool    `json:"is_active,omitempty" doc:"Active status"`
+		// ExpiresAt tri-state: omit to leave unchanged, "" to clear (no expiry),
+		// RFC3339 string to set.
+		ExpiresAt *string `json:"expires_at,omitempty" doc:"RFC3339 expiry, or empty string to clear"`
 	}
 }
 
@@ -121,6 +126,7 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 		RequiredTrustLevel:  input.Body.RequiredTrustLevel,
 		RequiredAttestation: input.Body.RequiredAttestation,
 		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
+		ExpiresAt:           input.Body.ExpiresAt,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNameConflict) {
@@ -184,10 +190,14 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 		RequiredAttestation: input.Body.RequiredAttestation,
 		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
 		IsActive:            input.Body.IsActive,
+		ExpiresAt:           input.Body.ExpiresAt,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error404NotFound("credential policy not found")
+		}
+		if errors.Is(err, service.ErrInvalidPolicyField) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to update credential policy")
 		return nil, huma.Error500InternalServerError("failed to update credential policy")

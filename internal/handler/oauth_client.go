@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
@@ -48,6 +50,12 @@ type CreateOAuthClientInput struct {
 
 		// Extensibility
 		Metadata json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata"`
+
+		// IdentityID optionally binds this client to an agent identity.
+		// When set, authorization_code and refresh_token grants gate token
+		// issuance on the linked identity's status + expires_at. The
+		// identity must exist in the caller's tenant (validated below).
+		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to — gates authorization_code and refresh_token grants on the linked identity's status and expires_at"`
 	}
 }
 
@@ -127,6 +135,29 @@ func (a *API) registerOAuthClientRoutes(api huma.API) {
 }
 
 func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientInput) (*OAuthClientCreatedOutput, error) {
+	// Tenant-scoped IDOR guard on identity_id: a caller who tries to bind
+	// the new client to an identity outside their tenant gets a 400 with
+	// "not found in this tenant" — same response shape we use for any
+	// caller-supplied foreign reference. Performed at the handler
+	// boundary so the service layer stays tenant-agnostic.
+	if input.Body.IdentityID != "" {
+		tenant, terr := internalMiddleware.GetTenant(ctx)
+		if terr != nil {
+			return nil, huma.Error401Unauthorized("missing tenant context")
+		}
+		if _, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
+			// Distinguish caller-fixable not-found-in-tenant (400) from
+			// transient DB errors (500). The repo wraps sql.ErrNoRows in
+			// its "failed to get identity" string, so unwrap to get the
+			// underlying sentinel.
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, huma.Error400BadRequest("identity_id not found in this tenant")
+			}
+			log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("identity lookup failed during oauth client create")
+			return nil, huma.Error500InternalServerError("failed to validate identity_id")
+		}
+	}
+
 	client, plainSecret, err := a.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
 		ClientID:                input.Body.ClientID,
 		Name:                    input.Body.Name,
@@ -144,6 +175,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
 		Metadata:                input.Body.Metadata,
+		IdentityID:              input.Body.IdentityID,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {

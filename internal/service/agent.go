@@ -59,6 +59,9 @@ type RegisterAgentRequest struct {
 	// inside APIKeyService.CreateKey. When empty, the API key inherits the
 	// identity policy verbatim (common case).
 	APIKeyCredentialPolicyID string
+	// ExpiresAt time-bounds both the identity and (if non-nil) the auto-
+	// created API key. Nil means "no expiry".
+	ExpiresAt *time.Time
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -147,6 +150,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		CreatedBy:          req.CreatedBy,
 		PublicKeyPEM:       req.PublicKeyPEM,
 		CredentialPolicyID: req.CredentialPolicyID,
+		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
@@ -168,6 +172,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		Name:               fmt.Sprintf("Agent: %s", req.Name),
 		IdentityID:         identity.ID,
 		CredentialPolicyID: apiKeyPolicyID,
+		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
 		// Compensating action — deactivate the identity if key creation fails.
@@ -316,23 +321,34 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 	return &resp, nil
 }
 
-// RotateKey revokes the old key and creates a new one.
+// RotateKey revokes the old key and creates a new one. Inherits the
+// identity's expires_at so a rotated key on a time-bound agent expires
+// alongside its parent — without this, rotation silently extends the
+// key's lifetime past the agent's authority window.
 func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID string) (*AgentRegistrationResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
+	if !identity.Status.IsUsable() {
+		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
+	}
+	if identity.IsExpired() {
+		return nil, fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
+	}
 
 	// Revoke existing keys.
 	s.revokeKeysByIdentity(ctx, identity.ID)
 
-	// Create new key.
+	// Create new key. ExpiresAt propagates from the identity so the
+	// rotated key inherits the parent's time-bound window.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:  identity.AccountID,
 		ProjectID:  identity.ProjectID,
 		CreatedBy:  "system:key_rotation",
 		Name:       fmt.Sprintf("Agent: %s", identity.Name),
 		IdentityID: identity.ID,
+		ExpiresAt:  identity.ExpiresAt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rotated key: %w", err)

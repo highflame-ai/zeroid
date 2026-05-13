@@ -4,11 +4,29 @@ package domain
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/uptrace/bun"
 )
+
+// ErrIdentityExpired is returned by every issuance path (chokepoint
+// IssueCredential, GenerateProofToken, attestation post-issuance, agent
+// rotate-key) when the target identity has aged out. Service-layer
+// callers wrap with %w so handlers can errors.Is and consistently map to
+// a 4xx — OAuth flows emit invalid_grant, admin endpoints emit 400.
+var ErrIdentityExpired = errors.New("identity_expired")
+
+// ErrIdentityNotUsable is returned by the same paths when the identity
+// is suspended or deactivated. Same handler-mapping pattern.
+var ErrIdentityNotUsable = errors.New("identity is not usable")
+
+// ErrCredentialExpired is returned by IssueCredential when a per-credential
+// time bound (typically API key sk.ExpiresAt) has already passed. Same
+// handler-mapping pattern as the identity sentinels above — wrap with %w
+// at the service layer so handlers can errors.Is and map to 4xx.
+var ErrCredentialExpired = errors.New("credential_expired")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Trust Level
@@ -317,11 +335,26 @@ type Identity struct {
 	RiskTier       string `bun:"risk_tier,type:varchar(20),nullzero"       json:"risk_tier,omitempty"`
 	IAL            string `bun:"ial,type:varchar(20),nullzero"             json:"ial,omitempty"`
 
+	// ExpiresAt time-bounds the grant of authority itself (NOT the JWT it
+	// issues). NULL means "no expiry" — the historical default. When set,
+	// IssueCredential rejects new tokens past this time and the cleanup
+	// worker sweeps the identity into status=deactivated.
+	ExpiresAt *time.Time `bun:"expires_at" json:"expires_at,omitempty"`
+
 	// Lifecycle
 	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
 	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// IsExpired reports whether the identity's authority has aged out. A nil
+// ExpiresAt means "no expiry" and is never expired.
+func (i *Identity) IsExpired() bool {
+	if i == nil || i.ExpiresAt == nil {
+		return false
+	}
+	return !time.Now().Before(*i.ExpiresAt)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
