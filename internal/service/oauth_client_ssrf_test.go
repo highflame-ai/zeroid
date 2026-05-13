@@ -54,11 +54,34 @@ func TestIsBlockedIP(t *testing.T) {
 		{"unspecified IPv4", "0.0.0.0", true, "unspecified"},
 		{"unspecified IPv6", "::", true, "unspecified"},
 
+		// RFC 1122 "this network" — 0.0.0.0/8. IsUnspecified only catches
+		// the all-zeros address; the rest of the /8 is reserved.
+		{"this network — 0/8 low", "0.0.0.1", true, "RFC 1122 this network"},
+		{"this network — 0/8 high", "0.255.255.254", true, "RFC 1122 this network"},
+
 		// CGN (RFC 6598) — not exposed by stdlib helpers; manual check
 		{"CGN — 100.64/10 low", "100.64.0.1", true, "carrier-grade NAT"},
 		{"CGN — 100.64/10 high", "100.127.255.254", true, "carrier-grade NAT"},
 		{"just outside CGN", "100.128.0.1", false, "100.128+ is public"},
 		{"just before CGN", "100.63.255.254", false, "100.0-63 is public"},
+
+		// RFC 5737 documentation — never publicly routed; defense-in-depth
+		{"RFC 5737 TEST-NET-1", "192.0.2.5", true, "documentation"},
+		{"RFC 5737 TEST-NET-2", "198.51.100.5", true, "documentation"},
+		{"RFC 5737 TEST-NET-3", "203.0.113.5", true, "documentation"},
+		{"just outside TEST-NET-1", "192.0.3.5", false, "192.0.3 is public"},
+		{"just before TEST-NET-3", "203.0.112.5", false, "203.0.112 is public"},
+
+		// RFC 2544 benchmarking — 198.18.0.0/15
+		{"RFC 2544 — 198.18/15 low", "198.18.0.1", true, "benchmarking"},
+		{"RFC 2544 — 198.18/15 high", "198.19.255.254", true, "benchmarking"},
+		{"just outside RFC 2544", "198.20.0.1", false, "198.20+ is public"},
+		{"just before RFC 2544", "198.17.255.254", false, "198.17 is public"},
+
+		// RFC 1112 / RFC 6890 reserved — 240.0.0.0/4
+		{"reserved /4 — 240", "240.0.0.1", true, "reserved class E"},
+		{"reserved /4 — 254", "254.255.255.254", true, "reserved class E"},
+		{"just before reserved /4", "239.255.255.254", true, "still multicast"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -169,7 +192,8 @@ func TestValidateNotificationEndpoint_RequestTimeRebinding(t *testing.T) {
 	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
 		calls++
 		if calls == 1 {
-			return []net.IP{net.ParseIP("203.0.113.10")}, nil // RFC 5737 docs IP
+			// example.com — public IP, no SSRF risk
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
 		}
 		return []net.IP{net.ParseIP("169.254.169.254")}, nil // AWS IMDS
 	}
@@ -210,7 +234,8 @@ func TestValidateNotificationEndpoint_PublicHostPasses(t *testing.T) {
 	prev := lookupIPs
 	defer func() { lookupIPs = prev }()
 	lookupIPs = func(_ context.Context, _ string) ([]net.IP, error) {
-		return []net.IP{net.ParseIP("203.0.113.10")}, nil // RFC 5737 docs IP
+		// example.com — public IP, no SSRF risk
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
 	}
 	if err := validateNotificationEndpoint(context.Background(), "https://callback.example.com/cb", false); err != nil {
 		t.Fatalf("expected public-IP registration to pass; got %v", err)

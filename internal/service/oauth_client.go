@@ -406,20 +406,31 @@ var lookupIPs = func(ctx context.Context, host string) ([]net.IP, error) {
 }
 
 // isBlockedIP returns true for any IP that should not be reachable as a
-// CIBA notification target. Covers:
+// CIBA notification target. Covers, in order:
 //
+// Via stdlib helpers:
 //   - RFC 1918 IPv4 private (10/8, 172.16/12, 192.168/16) — net.IP.IsPrivate
 //   - RFC 4193 IPv6 ULA (fc00::/7) — net.IP.IsPrivate, also catches Azure
 //     IMDS at fd00:ec2::254 which sits inside fc00::/7
 //   - Loopback (127/8, ::1) — net.IP.IsLoopback
 //   - Link-local unicast (169.254/16, fe80::/10) — net.IP.IsLinkLocalUnicast.
 //     Catches AWS/GCP IMDS at 169.254.169.254.
-//   - Multicast (224/4, ff00::/8) — net.IP.IsMulticast. This is a strict
-//     superset of IsLinkLocalMulticast (224.0.0/24, ff02::/16), so the
-//     link-local-multicast check is implied and not repeated.
+//   - Multicast (224/4, ff00::/8) — net.IP.IsMulticast. Strict superset of
+//     IsLinkLocalMulticast (224.0.0/24, ff02::/16), so the link-local check
+//     is implied and not repeated.
 //   - Unspecified (0.0.0.0, ::) — net.IP.IsUnspecified
-//   - RFC 6598 Carrier-Grade NAT (100.64/10) — not exposed by stdlib;
-//     checked manually below
+//
+// Manual ranges not exposed by stdlib:
+//   - RFC 1122 "this network" (0.0.0.0/8) — IsUnspecified only catches the
+//     single address 0.0.0.0; the rest of the /8 should also never appear
+//     as a destination.
+//   - RFC 6598 Carrier-Grade NAT (100.64.0.0/10)
+//   - RFC 5737 documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) —
+//     not publicly routed; could be hijacked locally.
+//   - RFC 2544 benchmarking (198.18.0.0/15) — for network-device testing,
+//     never publicly routed.
+//   - RFC 1112 / RFC 6890 reserved (240.0.0.0/4) — class E reserved, never
+//     allocated for routing.
 func isBlockedIP(ip net.IP) bool {
 	if ip.IsPrivate() ||
 		ip.IsLoopback() ||
@@ -428,11 +439,35 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsUnspecified() {
 		return true
 	}
-	// RFC 6598 CGN: 100.64.0.0/10
-	if v4 := ip.To4(); v4 != nil {
-		if v4[0] == 100 && v4[1]&0xC0 == 0x40 {
-			return true
-		}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	switch {
+	case v4[0] == 0:
+		// RFC 1122 "this network": 0.0.0.0/8
+		return true
+	case v4[0] == 100 && v4[1]&0xC0 == 0x40:
+		// RFC 6598 CGN: 100.64.0.0/10
+		return true
+	case v4[0] == 192 && v4[1] == 0 && v4[2] == 2:
+		// RFC 5737 TEST-NET-1: 192.0.2.0/24
+		return true
+	case v4[0] == 198 && v4[1] == 51 && v4[2] == 100:
+		// RFC 5737 TEST-NET-2: 198.51.100.0/24
+		return true
+	case v4[0] == 203 && v4[1] == 0 && v4[2] == 113:
+		// RFC 5737 TEST-NET-3: 203.0.113.0/24
+		return true
+	case v4[0] == 198 && v4[1]&0xFE == 18:
+		// RFC 2544 benchmarking: 198.18.0.0/15
+		return true
+	case v4[0]&0xF0 == 0xF0:
+		// RFC 1112 / RFC 6890 reserved: 240.0.0.0/4. Excludes 255.255.255.255
+		// only in the broadcast sense — that's caught by IsLinkLocalUnicast/
+		// IsLoopback for typical interfaces, and would be hostile as a
+		// destination either way.
+		return true
 	}
 	return false
 }
