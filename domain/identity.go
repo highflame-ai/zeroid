@@ -441,10 +441,28 @@ func GetIdentitySchema() *IdentitySchema {
 	}
 }
 
-// BuildWIMSEURI constructs the WIMSE URI for an identity.
-// Format: spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}
-func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) string {
-	return fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
+// MaxSPIFFEIDBytes is the SPIFFE §2.4 hard cap. The spec says SPIFFE IDs
+// MUST NOT exceed 2048 bytes. Today's varchar(255) schema caps the
+// assembled URI at ~1080 bytes so this is unreachable through the API
+// surface, but the invariant belongs at the construction site so a future
+// schema relaxation can't silently mint non-conformant SPIFFE IDs.
+const MaxSPIFFEIDBytes = 2048
+
+// ErrSPIFFEIDTooLong is returned by BuildWIMSEURI when the assembled URI
+// exceeds MaxSPIFFEIDBytes. Callers can branch on this with errors.Is to
+// distinguish the cap-exceeded case from generic build failures.
+var ErrSPIFFEIDTooLong = errors.New("SPIFFE ID exceeds maximum length")
+
+// BuildWIMSEURI constructs the WIMSE URI for an identity:
+// spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}.
+// Returns ErrSPIFFEIDTooLong if the result exceeds MaxSPIFFEIDBytes — once
+// persisted, every downstream system inherits a non-conformant subject claim.
+func BuildWIMSEURI(wimseDomain, accountID, projectID string, identityType IdentityType, externalID string) (string, error) {
+	uri := fmt.Sprintf("spiffe://%s/%s/%s/%s/%s", wimseDomain, accountID, projectID, identityType, externalID)
+	if n := len(uri); n > MaxSPIFFEIDBytes {
+		return "", fmt.Errorf("%w: got %d bytes, max %d: %.64q", ErrSPIFFEIDTooLong, n, MaxSPIFFEIDBytes, uri)
+	}
+	return uri, nil
 }
 
 // ValidateSPIFFEPathSegment rejects values that wouldn't survive a round-trip
