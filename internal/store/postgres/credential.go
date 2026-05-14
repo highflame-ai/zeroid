@@ -76,6 +76,25 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 	return creds, nil
 }
 
+// ListByMissionID returns every credential in the delegation tree for the
+// given mission_id, ordered root → leaves (delegation_depth ASC, then
+// issued_at ASC for ties at the same depth). Issue #81. The partial
+// index added in migration 017 makes this an indexed equality lookup.
+func (r *CredentialRepository) ListByMissionID(ctx context.Context, missionID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
+	var creds []*domain.IssuedCredential
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&creds).
+		Where("mission_id = ?", missionID).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		OrderExpr("delegation_depth ASC, issued_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list credentials by mission: %w", err)
+	}
+	return creds, nil
+}
+
 // RevokeAllActiveForIdentity revokes all non-expired, non-revoked credentials for an
 // identity and cascades the revocation to every downstream delegated credential in the
 // parent_jti chain (RFC 8693 token_exchange descendants), regardless of which identity

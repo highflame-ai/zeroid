@@ -508,6 +508,16 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 
 	delegatedBy, _ := subjectParsed.Subject()
 
+	// Resolve mission_id from the subject_token (issue #81). Prefer the
+	// explicit mission_id claim; fall back to the subject_token's own jti
+	// for credentials issued before the denormalisation landed (the subject
+	// IS a mission root by definition). Either way, the new credential
+	// inherits the same mission so the whole tree shares one identifier.
+	missionID, _ := jwt.Get[string](subjectParsed, "mission_id")
+	if missionID == "" {
+		missionID = subjectJTI
+	}
+
 	// Step 6: Issue a delegated credential for the sub-agent. The full
 	// policy constraint set (delegation depth ceiling, required trust
 	// level, allowed grant types, max TTL) is enforced inside
@@ -520,6 +530,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		DelegatedBy:      delegatedBy,
 		ParentJTI:        subjectJTI,
 		DelegationDepth:  parentDepth + 1,
+		MissionID:        missionID,
 	})
 	if err != nil {
 		return nil, err

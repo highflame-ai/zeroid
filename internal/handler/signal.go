@@ -33,6 +33,10 @@ type SignalOutput struct {
 
 type SignalListInput struct {
 	Limit int `query:"limit" default:"50" minimum:"1" maximum:"500" doc:"Maximum number of signals to return"`
+	// MissionID, when set, narrows the result to signals carrying the
+	// same delegation-tree-scoped identifier (issue #81). When empty, the
+	// default "recent N signals across the tenant" list is returned.
+	MissionID string `query:"mission_id" doc:"Filter by mission_id (delegation-tree-scoped opaque identifier)"`
 }
 
 type SignalListOutput struct {
@@ -113,9 +117,17 @@ func (a *API) listSignalsOp(ctx context.Context, input *SignalListInput) (*Signa
 		limit = 50
 	}
 
-	signals, err := a.signalSvc.ListSignals(ctx, tenant.AccountID, tenant.ProjectID, limit)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to list signals")
+	var (
+		signals []*domain.CAESignal
+		err2    error
+	)
+	if input.MissionID != "" {
+		signals, err2 = a.signalSvc.ListSignalsByMission(ctx, input.MissionID, tenant.AccountID, tenant.ProjectID)
+	} else {
+		signals, err2 = a.signalSvc.ListSignals(ctx, tenant.AccountID, tenant.ProjectID, limit)
+	}
+	if err2 != nil {
+		log.Error().Err(err2).Str("mission_id", input.MissionID).Msg("failed to list signals")
 		return nil, huma.Error500InternalServerError("failed to list signals")
 	}
 

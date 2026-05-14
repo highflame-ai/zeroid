@@ -137,3 +137,10 @@ func (s *SignalService) Unsubscribe(subscriberID string) {
 func (s *SignalService) ListSignals(ctx context.Context, accountID, projectID string, limit int) ([]*domain.CAESignal, error) {
 	return s.repo.List(ctx, accountID, projectID, limit)
 }
+
+// ListSignalsByMission returns every signal under the given delegation
+// tree (issue #81), ordered by created_at ASC so events read in the
+// order they fired. The repo uses the partial index from migration 017.
+func (s *SignalService) ListSignalsByMission(ctx context.Context, missionID, accountID, projectID string) ([]*domain.CAESignal, error) {
+	return s.repo.ListByMissionID(ctx, missionID, accountID, projectID)
+}

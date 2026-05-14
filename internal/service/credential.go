@@ -100,6 +100,12 @@ type IssueRequest struct {
 	// min(CredentialExpiresAt, Identity.ExpiresAt) so the JWT exp never
 	// outlives the authority. Nil means "no per-credential bound."
 	CredentialExpiresAt *time.Time
+	// MissionID is the delegation-tree-scoped opaque identifier (issue #81).
+	// Empty on first issuance — IssueCredential will default it to the new
+	// credential's own JTI (this credential becomes the root of a new
+	// mission). Non-empty on token_exchange — the caller has resolved the
+	// subject_token's mission and is propagating it down the chain.
+	MissionID string
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -293,6 +299,16 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	jti := uuid.New().String()
 
+	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
+	// from the subject_token; first-issuance grants leave it empty and we
+	// default to this credential's own JTI — making this credential the
+	// root of a new delegation tree. The value is opaque to consumers; the
+	// "happens to be a JTI" detail must not leak through any API.
+	missionID := req.MissionID
+	if missionID == "" {
+		missionID = jti
+	}
+
 	// Build JWT
 	token := jwt.New()
 	_ = token.Set(jwt.IssuerKey, s.issuer)
@@ -307,6 +323,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	_ = token.Set("account_id", req.Identity.AccountID)
 	_ = token.Set("project_id", req.Identity.ProjectID)
 	_ = token.Set("grant_type", string(req.GrantType))
+	_ = token.Set("mission_id", missionID)
 
 	// Identity claims.
 	_ = token.Set("external_id", req.Identity.ExternalID)
@@ -417,6 +434,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		DelegationDepth:     req.DelegationDepth,
 		ParentJTI:           req.ParentJTI,
 		DelegatedByWIMSEURI: req.DelegatedBy,
+		MissionID:           missionID,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
@@ -426,6 +444,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	log.Info().
 		Str("jti", jti).
 		Str("identity_id", req.Identity.ID).
+		Str("mission_id", missionID).
 		Int("ttl_seconds", ttl).
 		Msg("Credential issued")
 
@@ -449,6 +468,14 @@ func (s *CredentialService) GetCredential(ctx context.Context, id, accountID, pr
 // ListCredentials returns credentials for a given identity.
 func (s *CredentialService) ListCredentials(ctx context.Context, identityID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
 	return s.repo.ListByIdentity(ctx, identityID, accountID, projectID)
+}
+
+// ListCredentialsByMission returns every credential in the delegation tree
+// keyed by missionID, ordered by delegation_depth ASC then created_at ASC
+// so the chain reads from root to leaves. Issue #81: O(1) replacement for
+// the recursive parent_jti walk.
+func (s *CredentialService) ListCredentialsByMission(ctx context.Context, missionID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
+	return s.repo.ListByMissionID(ctx, missionID, accountID, projectID)
 }
 
 // RevokeCredential revokes a credential by ID.

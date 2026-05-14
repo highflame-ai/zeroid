@@ -51,6 +51,12 @@ type Claims struct {
 	Scopes          []string `json:"scopes,omitempty"`
 	DelegationDepth int      `json:"delegation_depth,omitempty"`
 
+	// MissionID groups every credential in a delegation tree under one
+	// stable opaque identifier. Treat as opaque — callers MUST NOT try to
+	// look up a credential by this value, even though it is currently
+	// populated with the root JTI. See zeroid issue #81.
+	MissionID string `json:"mission_id,omitempty"`
+
 	// RFC 8693 delegation
 	ActorClaims *ActorClaims `json:"act,omitempty"`
 
@@ -249,7 +255,8 @@ func extractClaims(token jwt.Token) *Claims {
 		"status": {}, "name": {}, "framework": {}, "version": {}, "publisher": {},
 		"capabilities": {},
 		"grant_type":   {}, "scopes": {}, "delegation_depth": {},
-		"act": {},
+		"act":        {},
+		"mission_id": {},
 	}
 
 	// Tenant
@@ -276,6 +283,7 @@ func extractClaims(token jwt.Token) *Claims {
 	c.GrantType = getString("grant_type")
 	c.Scopes = getStringSlice("scopes")
 	c.DelegationDepth = getInt("delegation_depth")
+	c.MissionID = getString("mission_id")
 
 	// RFC 8693 delegation. The act claim is a nested object; pull it as
 	// interface{} so parseActorClaims can handle any concrete shape jwx

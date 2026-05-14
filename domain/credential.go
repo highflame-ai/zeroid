@@ -83,4 +83,10 @@ type IssuedCredential struct {
 	ParentJTI       string     `bun:"parent_jti,type:varchar(255)"  json:"parent_jti,omitempty"`
 	// DelegatedByWIMSEURI records the orchestrator that delegated authority (RFC 8693 token_exchange).
 	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text" json:"delegated_by_wimse_uri,omitempty"`
+	// MissionID is a stable, opaque identifier for a delegation tree —
+	// equal to the root credential's JTI today; consumers MUST treat it
+	// as opaque so the population scheme can evolve. Denormalised onto
+	// every credential in the tree so workflow-scoped audit queries are
+	// O(1) instead of walking the parent_jti chain. Issue #81.
+	MissionID string `bun:"mission_id,type:varchar(255),nullzero" json:"mission_id,omitempty"`
 }

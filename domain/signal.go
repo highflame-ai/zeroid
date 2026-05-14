@@ -69,4 +69,7 @@ type CAESignal struct {
 	Payload     map[string]any `bun:"payload,type:jsonb" json:"payload,omitempty"`
 	ProcessedAt *time.Time     `bun:"processed_at" json:"processed_at,omitempty"`
 	CreatedAt   time.Time      `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	// MissionID groups this signal under the same delegation-tree
+	// identifier as the credentials it relates to. Opaque value (issue #81).
+	MissionID string `bun:"mission_id,type:varchar(255),nullzero" json:"mission_id,omitempty"`
 }
