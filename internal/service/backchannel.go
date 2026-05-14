@@ -98,6 +98,16 @@ type BackchannelServiceConfig struct {
 	PingTimeout    time.Duration // per-attempt HTTP timeout
 	PingMaxRetries int           // additional attempts on transient failure; 0 → no retries
 	PingBaseDelay  time.Duration // first-retry backoff; doubled per attempt with jitter
+
+	// AllowPrivateNotificationEndpoints relaxes the SSRF guard on
+	// outbound CIBA notification destinations when true. Defaults to false
+	// (production-safe). Production deployments must keep this false — see
+	// GHSA-599q-j34m-33vc. Flip to true ONLY in single-tenant test/dev
+	// environments that need to register loopback-style endpoints like
+	// https://localhost:9000/. Mirrors OAuthClientService's same-named
+	// setter; both should be set from the same source in the deployer's
+	// server construction code.
+	AllowPrivateNotificationEndpoints bool
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -279,10 +289,14 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 			return nil, oauthBadRequest("invalid_request",
 				"client_notification_token requires the client to have a registered client_notification_endpoint")
 		}
-		// Defence-in-depth: re-validate the registered endpoint is HTTPS even
-		// though RegisterClient already enforced it. A future bypass at
-		// registration must not silently degrade callbacks to plaintext.
-		if err := validateNotificationEndpoint(client.ClientNotificationEndpoint); err != nil {
+		// Defence-in-depth: re-validate the registered endpoint at request time.
+		// Two reasons:
+		//   1. Re-confirm HTTPS so a future registration-side bypass cannot
+		//      silently degrade ping/push to plaintext.
+		//   2. Re-resolve the host against the SSRF blocklist. The registered
+		//      hostname might have been DNS-rebound to point at a private IP
+		//      since registration — this catches that (GHSA-599q-j34m-33vc).
+		if err := validateNotificationEndpoint(ctx, client.ClientNotificationEndpoint, s.cfg.AllowPrivateNotificationEndpoints); err != nil {
 			return nil, oauthBadRequestCause("invalid_request", "client_notification_endpoint is invalid", err)
 		}
 		notificationMode = declared

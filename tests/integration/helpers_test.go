@@ -168,6 +168,14 @@ func runTests(m *testing.M) int {
 		Logging: zeroid.LoggingConfig{
 			Level: "warn",
 		},
+		// Integration tests register CIBA notification endpoints under the
+		// RFC 6761 reserved `.example.test` TLD (e.g. https://ping.example.test/cb)
+		// which never resolves. Disable the SSRF guard so the resolver-failure
+		// path doesn't reject test fixtures. Production deployments keep this
+		// false — see GHSA-599q-j34m-33vc.
+		Backchannel: zeroid.BackchannelConfig{
+			AllowPrivateNotificationEndpoints: true,
+		},
 		WIMSEDomain: testWIMSE,
 	}
 
