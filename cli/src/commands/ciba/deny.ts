@@ -3,7 +3,7 @@
  */
 
 import { Command } from "commander";
-import { makeTenantClient } from "../../lib/client.js";
+import { requireTenantContext } from "../../lib/config.js";
 import { handleError, printJSON, printSuccess } from "../../lib/output.js";
 import { type CibaResolveResponse, postTenantJSON } from "./api.js";
 
@@ -20,9 +20,9 @@ export function registerCibaDeny(cibaCmd: Command): void {
     )
     .action(async (authReqID: string, opts) => {
       try {
-        const client = makeTenantClient(opts.profile as string | undefined, "zeroid ciba deny");
+        const context = requireTenantContext(opts.profile as string | undefined, "zeroid ciba deny");
         const response = await postTenantJSON<CibaResolveResponse>(
-          client,
+          context,
           `/api/v1/oauth2/bc-authorize/${encodeURIComponent(authReqID)}/deny`,
           { reason: nonEmpty(opts.reason as string | undefined) },
         );

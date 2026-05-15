@@ -9,7 +9,7 @@ import { createServer } from "node:https";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
-import { handleError, printSuccess } from "../../lib/output.js";
+import { handleError, printError, printSuccess } from "../../lib/output.js";
 
 interface ListenEvent {
   event: "listening" | "notification";
@@ -22,6 +22,9 @@ interface ListenEvent {
   raw_body?: string;
   received_at?: string;
 }
+
+const CALLBACK_CERT_DIR = join(homedir(), ".config", "zeroid", "ciba-cert");
+const MAX_CALLBACK_BODY_BYTES = 1024 * 1024;
 
 export function registerCibaListen(cibaCmd: Command): void {
   cibaCmd
@@ -40,22 +43,16 @@ export function registerCibaListen(cibaCmd: Command): void {
         const host = opts.host as string;
         const cert = ensureSelfSignedCert();
         const server = createServer(cert, (req, res) => {
-          void handleNotification(req, res, Boolean(opts.json));
+          handleNotification(req, res, Boolean(opts.json)).catch((err) => {
+            printError(`CIBA callback handler failed: ${messageForError(err)}`);
+            writeNotificationErrorResponse(res, err);
+          });
         });
 
-        await new Promise<void>((resolve) => {
-          server.listen(port, host, resolve);
-        });
+        await listen(server, port, host);
 
         const url = `https://${host}:${port}/cb`;
         printEvent({ event: "listening", url }, Boolean(opts.json));
-
-        process.on("SIGINT", () => {
-          server.close(() => process.exit(0));
-        });
-        process.on("SIGTERM", () => {
-          server.close(() => process.exit(0));
-        });
       } catch (err) {
         handleError(err);
       }
@@ -93,6 +90,41 @@ async function handleNotification(
   res.end(JSON.stringify({ ok: true }) + "\n");
 }
 
+function listen(server: ReturnType<typeof createServer>, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      reject(err);
+    };
+
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+}
+
+function writeNotificationErrorResponse(res: ServerResponse, err: unknown): void {
+  if (res.destroyed || res.writableEnded) {
+    return;
+  }
+
+  const tooLarge = err instanceof RequestBodyLimitError;
+  const status = tooLarge ? 413 : 500;
+  const body = {
+    error: tooLarge ? "payload_too_large" : "internal_server_error",
+    message: messageForError(err),
+  };
+
+  if (!res.headersSent) {
+    res.writeHead(status, {
+      "Content-Type": "application/json",
+      Connection: "close",
+    });
+  }
+  res.end(JSON.stringify(body) + "\n");
+}
+
 function printEvent(event: ListenEvent, json: boolean): void {
   if (json) {
     console.log(JSON.stringify(event));
@@ -119,7 +151,7 @@ function printEvent(event: ListenEvent, json: boolean): void {
 }
 
 function ensureSelfSignedCert(): { key: Buffer; cert: Buffer } {
-  const dir = join(homedir(), ".zid", "ciba-cert");
+  const dir = CALLBACK_CERT_DIR;
   const keyPath = join(dir, "localhost-key.pem");
   const certPath = join(dir, "localhost-cert.pem");
 
@@ -150,7 +182,7 @@ function ensureSelfSignedCert(): { key: Buffer; cert: Buffer } {
 
     if (result.status !== 0) {
       throw new Error(
-        "Failed to generate a self-signed certificate with openssl. Install openssl or create ~/.zid/ciba-cert/localhost-key.pem and localhost-cert.pem manually.",
+        "Failed to generate a self-signed certificate with openssl. Install openssl or create ~/.config/zeroid/ciba-cert/localhost-key.pem and localhost-cert.pem manually.",
       );
     }
   }
@@ -164,10 +196,51 @@ function ensureSelfSignedCert(): { key: Buffer; cert: Buffer } {
 function readRequestBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
+    let length = 0;
+    let settled = false;
+
+    const fail = (err: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(err);
+    };
+
+    req.on("data", (chunk: Buffer) => {
+      if (settled) {
+        return;
+      }
+
+      length += chunk.length;
+      if (length > MAX_CALLBACK_BODY_BYTES) {
+        fail(new RequestBodyLimitError(MAX_CALLBACK_BODY_BYTES));
+        req.destroy();
+        return;
+      }
+
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", fail);
   });
+}
+
+class RequestBodyLimitError extends Error {
+  constructor(limitBytes: number) {
+    super(`Request body exceeds ${Math.floor(limitBytes / 1024 / 1024)}MB limit`);
+    this.name = "RequestBodyLimitError";
+  }
+}
+
+function messageForError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function parsePort(value: string): number {

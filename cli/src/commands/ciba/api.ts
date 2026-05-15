@@ -1,6 +1,10 @@
-import { ZeroIDAPIError, ZeroIDClient } from "@highflame/sdk";
-
 export const CIBA_GRANT_TYPE = "urn:openid:params:grant-type:ciba";
+
+export interface CibaTenantContext {
+  base_url: string;
+  account_id: string;
+  project_id: string;
+}
 
 export interface CibaInitResponse {
   auth_req_id: string;
@@ -32,8 +36,20 @@ export interface CibaOAuthError {
   status?: number;
 }
 
+export class CibaHTTPError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly title: string,
+    public readonly detail?: string,
+    public readonly code?: string,
+  ) {
+    super(detail ? `[${status}] ${title}: ${detail}` : `[${status}] ${title}`);
+    this.name = "CibaHTTPError";
+  }
+}
+
 export function toCibaOAuthError(err: unknown): CibaOAuthError {
-  if (err instanceof ZeroIDAPIError) {
+  if (err instanceof CibaHTTPError) {
     return {
       error: err.code || err.title,
       error_description: err.detail || undefined,
@@ -51,17 +67,98 @@ export function isNonTerminalPollError(error: string): boolean {
 }
 
 export async function postPublicJSON<T>(
-  client: ZeroIDClient,
+  baseUrl: string,
   path: string,
   body: Record<string, unknown>,
 ): Promise<T> {
-  return client._postJSON<T>(path, body, undefined, false);
+  return postJSON<T>(baseUrl, path, body);
 }
 
 export async function postTenantJSON<T>(
-  client: ZeroIDClient,
+  context: CibaTenantContext,
   path: string,
   body: Record<string, unknown>,
 ): Promise<T> {
-  return client._postJSON<T>(path, body);
+  return postJSON<T>(context.base_url, path, body, {
+    "X-Account-ID": context.account_id,
+    "X-Project-ID": context.project_id,
+  });
+}
+
+async function postJSON<T>(
+  baseUrl: string,
+  path: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<T> {
+  const response = await fetch(`${trimTrailingSlash(baseUrl)}${ensureLeadingSlash(path)}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw await parseErrorResponse(response);
+  }
+
+  if (response.status === 204) {
+    return {} as T;
+  }
+
+  const text = await response.text();
+  if (!text.trim()) {
+    return {} as T;
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new CibaHTTPError(response.status, "Invalid JSON response", text);
+  }
+}
+
+async function parseErrorResponse(response: Response): Promise<CibaHTTPError> {
+  const text = await response.text();
+  let title = response.statusText || "Request failed";
+  let detail: string | undefined;
+  let code: string | undefined;
+
+  if (text.trim()) {
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (isRecord(parsed)) {
+        code = readString(parsed, "error") ?? readString(parsed, "code");
+        title = code ?? readString(parsed, "title") ?? readString(parsed, "message") ?? title;
+        detail =
+          readString(parsed, "error_description") ??
+          readString(parsed, "detail") ??
+          readString(parsed, "message");
+      }
+    } catch {
+      detail = text;
+    }
+  }
+
+  return new CibaHTTPError(response.status, title, detail, code);
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+function ensureLeadingSlash(value: string): string {
+  return value.startsWith("/") ? value : `/${value}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
 }

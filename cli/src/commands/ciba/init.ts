@@ -3,7 +3,6 @@
  */
 
 import { Command } from "commander";
-import { makeClientFromContext } from "../../lib/client.js";
 import { requireTenantContext } from "../../lib/config.js";
 import { handleError, printJSON, printSuccess } from "../../lib/output.js";
 import { type CibaInitResponse, postPublicJSON } from "./api.js";
@@ -27,10 +26,9 @@ export function registerCibaInit(cibaCmd: Command): void {
     .action(async (opts) => {
       try {
         const context = requireTenantContext(opts.profile as string | undefined, "zeroid ciba init");
-        const client = makeClientFromContext(context);
         const requestedExpiry = parsePositiveInt(opts.requestedExpiry as string | undefined);
 
-        const response = await postPublicJSON<CibaInitResponse>(client, "/oauth2/bc-authorize", {
+        const response = await postPublicJSON<CibaInitResponse>(context.base_url, "/oauth2/bc-authorize", {
           client_id: opts.clientId as string,
           account_id: context.account_id,
           project_id: context.project_id,

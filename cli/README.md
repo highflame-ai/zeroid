@@ -305,7 +305,7 @@ On success, the command prints the access token. Without `--watch`, OAuth pollin
 
 ### `zeroid ciba listen`
 
-Run a local HTTPS callback capture endpoint for CIBA ping and push testing. The command creates a self-signed localhost certificate in `~/.zid/ciba-cert/` on first run.
+Run a local HTTPS callback capture endpoint for CIBA ping and push testing. The command creates a self-signed localhost certificate in `~/.config/zeroid/ciba-cert/` on first run.
 
 ```bash
 zeroid ciba listen --port 8888

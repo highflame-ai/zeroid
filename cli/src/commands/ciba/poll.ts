@@ -3,7 +3,7 @@
  */
 
 import { Command } from "commander";
-import { makeBaseUrlClient } from "../../lib/client.js";
+import { requireBaseURL } from "../../lib/config.js";
 import { printError, printJSON, printSuccess, printWarning } from "../../lib/output.js";
 import {
   CIBA_GRANT_TYPE,
@@ -28,11 +28,11 @@ export function registerCibaPoll(cibaCmd: Command): void {
       "\nCIBA Core references: §10.1 Token Request Using CIBA Grant Type, §11 Polling Error Responses.",
     )
     .action(async (authReqID: string, opts) => {
-      const client = makeBaseUrlClient(opts.profile as string | undefined);
+      const baseUrl = requireBaseURL(opts.profile as string | undefined);
       let intervalSeconds = parseInterval(opts.interval as string);
 
       for (;;) {
-        const result = await pollOnce(client, authReqID, opts.clientId as string);
+        const result = await pollOnce(baseUrl, authReqID, opts.clientId as string);
         if ("access_token" in result) {
           printToken(result, Boolean(opts.json));
           return;
@@ -59,12 +59,12 @@ export function registerCibaPoll(cibaCmd: Command): void {
 }
 
 async function pollOnce(
-  client: ReturnType<typeof makeBaseUrlClient>,
+  baseUrl: string,
   authReqID: string,
   clientID: string,
 ): Promise<CibaTokenResponse | CibaOAuthError> {
   try {
-    return await postPublicJSON<CibaTokenResponse>(client, "/oauth2/token", {
+    return await postPublicJSON<CibaTokenResponse>(baseUrl, "/oauth2/token", {
       grant_type: CIBA_GRANT_TYPE,
       auth_req_id: authReqID,
       client_id: clientID,
