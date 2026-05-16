@@ -104,3 +104,21 @@ type BackchannelNotification struct {
 // debuggability but does not block request creation — the user may approve
 // through another channel.
 type BackchannelNotifier func(ctx context.Context, n BackchannelNotification) error
+
+// RateLimiter gates an /oauth2/bc-authorize request keyed by an opaque
+// string. ZeroID ships with an in-memory implementation; multi-replica
+// deployments should plug in a shared-store backend (Redis, Memcached,
+// hosted KV) via Server.SetBackchannelRateLimiters to avoid the per-replica
+// bypass where each instance enforces independently.
+//
+// Implementations must be safe for concurrent use. Result shape:
+//   - (true, 0, nil)            request permitted
+//   - (false, retryAfter, nil)  request rejected; retryAfter is surfaced
+//     via the Retry-After header, rounded up to whole seconds (RFC 7231 §7.1.3)
+//   - (_, _, err)               backend failed; ZeroID fails open and logs
+//     a WARN event so the operator notices the degraded posture
+type RateLimiter interface {
+	Allow(ctx context.Context, key string) (allowed bool, retryAfter time.Duration, err error)
+	// Stop releases resources held by the limiter. Idempotent.
+	Stop()
+}

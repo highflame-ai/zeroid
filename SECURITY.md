@@ -61,3 +61,35 @@
   
   We thank everyone who has reported issues responsibly. Confirmed reporters who
   opt in are listed in the published advisory and our release notes.
+
+  ## Production hardening notes
+
+  ### Backchannel (CIBA) rate limiting
+
+  `/oauth2/bc-authorize` is rate-limited per `(client_id, tenant)` and
+  per `(login_hint, tenant)` to prevent end-user notification spam,
+  `backchannel_auth_requests` table flooding, and `login_hint`
+  enumeration (issue #139).
+
+  The default implementation is an **in-process, in-memory token bucket**.
+  This is correct for single-instance deployments. **Multi-replica
+  deployments need a shared-store backend** — without one, each replica
+  enforces the limit independently and a fleet of N replicas effectively
+  permits N× the documented cap.
+
+  - **Default config:** 10 req/min per client, 5 req/min per user. Tunable
+    via `BackchannelConfig.PerClientRateLimitPerMinute` and
+    `PerUserRateLimitPerMinute` (set to `0` to disable a dimension).
+  - **Multi-replica:** implement `zeroid.RateLimiter` against your shared
+    store (Redis, Memcached, hosted KV) and install via
+    `Server.SetBackchannelRateLimiters(perClient, perUser)`. The interface
+    has two methods (`Allow`, `Stop`); the fail-open contract is documented
+    on the interface.
+  - **Defense-in-depth:** run an edge limiter (CDN, nginx, Envoy) for
+    per-IP throttling regardless. The in-process limiter exists for
+    per-tenant semantic enforcement that an edge limiter cannot express.
+  - **Detection:** rate-limit rejections emit a structured WARN log with
+    `event=bc_authorize_rate_limited`, `reason`, `client_id`, tenant IDs,
+    and a `login_hint_hash` (SHA-256 prefix, no PII). Backend failures
+    (which trigger fail-open) emit `event=bc_authorize_rate_limiter_backend_error`.
+    Both events are designed for log-aggregation alerting.

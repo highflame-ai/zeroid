@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +61,12 @@ type BackchannelService struct {
 	// with a 10-second timeout enforced by pingClient.Timeout).
 	pingClient        *http.Client
 	pingDispatchAsync bool // overridable for tests
+
+	// Rate limiters for /oauth2/bc-authorize. Nil disables the dimension.
+	// Held as the interface so a shared-store backend can be plugged in via
+	// SetRateLimiters.
+	perClientLimiter RateLimiter
+	perUserLimiter   RateLimiter
 }
 
 // BackchannelNotifierFunc is the internal alias for the public
@@ -108,6 +117,15 @@ type BackchannelServiceConfig struct {
 	// setter; both should be set from the same source in the deployer's
 	// server construction code.
 	AllowPrivateNotificationEndpoints bool
+
+	// PerClientRateLimit caps /oauth2/bc-authorize requests per minute keyed
+	// on (client_id, account_id, project_id). 0 disables; default 10.
+	PerClientRateLimit int
+	// PerUserRateLimit caps /oauth2/bc-authorize requests per minute keyed
+	// on (login_hint, account_id, project_id). 0 disables; default 5.
+	// Prevents one user being spammed across multiple clients in the same
+	// tenant.
+	PerUserRateLimit int
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -121,6 +139,8 @@ func DefaultBackchannelConfig() BackchannelServiceConfig {
 		PingTimeout:            10 * time.Second,
 		PingMaxRetries:         3,
 		PingBaseDelay:          500 * time.Millisecond,
+		PerClientRateLimit:     10,
+		PerUserRateLimit:       5,
 	}
 }
 
@@ -163,7 +183,18 @@ func NewBackchannelService(
 		svcCancel:           svcCancel,
 		pingClient:          &http.Client{Timeout: cfg.PingTimeout},
 		pingDispatchAsync:   true,
+		perClientLimiter:    newPerMinuteLimiter(cfg.PerClientRateLimit),
+		perUserLimiter:      newPerMinuteLimiter(cfg.PerUserRateLimit),
 	}
+}
+
+// newPerMinuteLimiter builds the default in-memory limiter: capacity=n
+// (burst), refill=n/60 tokens/sec. Returns nil when n <= 0.
+func newPerMinuteLimiter(n int) RateLimiter {
+	if n <= 0 {
+		return nil
+	}
+	return NewTokenBucketLimiter(float64(n), float64(n)/60.0)
 }
 
 // Stop cancels the service's lifecycle context, signalling in-flight detached
@@ -179,6 +210,39 @@ func (s *BackchannelService) Stop() {
 		s.svcCancel = nil
 		s.svcCtx = nil
 	}
+	if s.perClientLimiter != nil {
+		s.perClientLimiter.Stop()
+	}
+	if s.perUserLimiter != nil {
+		s.perUserLimiter.Stop()
+	}
+}
+
+// SetRateLimits swaps in fresh in-memory limiters at the supplied
+// requests-per-minute; 0 disables a dimension. For non-default backends,
+// use SetRateLimiters.
+func (s *BackchannelService) SetRateLimits(perClientRPM, perUserRPM int) {
+	s.SetRateLimiters(newPerMinuteLimiter(perClientRPM), newPerMinuteLimiter(perUserRPM))
+	s.mu.Lock()
+	s.cfg.PerClientRateLimit = perClientRPM
+	s.cfg.PerUserRateLimit = perUserRPM
+	s.mu.Unlock()
+}
+
+// SetRateLimiters installs RateLimiter implementations for the per-client
+// and per-user dimensions. Nil disables a dimension. Previously-installed
+// limiters are stopped.
+func (s *BackchannelService) SetRateLimiters(perClient, perUser RateLimiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.perClientLimiter != nil {
+		s.perClientLimiter.Stop()
+	}
+	if s.perUserLimiter != nil {
+		s.perUserLimiter.Stop()
+	}
+	s.perClientLimiter = perClient
+	s.perUserLimiter = perUser
 }
 
 // SetNotifier wires the deployer's BackchannelNotifier. Safe to call any time
@@ -266,6 +330,15 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	client, err := s.oauthClientSvc.GetClientByClientID(ctx, in.ClientID)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_client", fmt.Sprintf("unknown client %s", in.ClientID), err)
+	}
+
+	// Rate-limit BEFORE notifier dispatch and BEFORE persistence: rejecting
+	// after the notifier would still spam the user; rejecting after
+	// persistence would still flood backchannel_auth_requests. Tenant is
+	// part of the key because clients in ZeroID are global — keying on
+	// client_id alone would be a cross-tenant key.
+	if err := s.checkRateLimit(ctx, in); err != nil {
+		return nil, err
 	}
 
 	// Determine notification mode. CIBA Core §10 makes the delivery mode a
@@ -362,6 +435,85 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		ExpiresIn: int(expiry.Seconds()),
 		Interval:  s.cfg.DefaultPollInterval,
 	}, nil
+}
+
+// checkRateLimit applies the per-client and per-user limiters. On reject,
+// returns 429 + error="slow_down" + Retry-After (CIBA Core §11 polling-side
+// semantics). On a limiter backend error the call fails open — a
+// malfunctioning limiter must not DoS the auth service it is protecting —
+// and a distinct WARN event records the degraded posture.
+func (s *BackchannelService) checkRateLimit(ctx context.Context, in CreateAuthRequestInput) error {
+	s.mu.RLock()
+	perClient := s.perClientLimiter
+	perUser := s.perUserLimiter
+	s.mu.RUnlock()
+
+	if perClient != nil {
+		key := rateLimitKey(in.ClientID, in.AccountID, in.ProjectID)
+		ok, retryAfter, err := perClient.Allow(ctx, key)
+		if err != nil {
+			logRateLimitBackendError("per_client", in, err)
+		} else if !ok {
+			logRateLimitRejection("per_client", in, retryAfter)
+			return oauthTooManyRequests(
+				"slow_down",
+				"too many bc-authorize requests for this client; retry after Retry-After seconds",
+				retryAfter,
+			)
+		}
+	}
+	if perUser != nil {
+		key := rateLimitKey(in.LoginHint, in.AccountID, in.ProjectID)
+		ok, retryAfter, err := perUser.Allow(ctx, key)
+		if err != nil {
+			logRateLimitBackendError("per_user", in, err)
+		} else if !ok {
+			logRateLimitRejection("per_user", in, retryAfter)
+			return oauthTooManyRequests(
+				"slow_down",
+				"too many bc-authorize requests for this user; retry after Retry-After seconds",
+				retryAfter,
+			)
+		}
+	}
+	return nil
+}
+
+// rateLimitKey joins parts with NUL — a byte that cannot appear in
+// client_id, login_hint, or tenant IDs — so concatenation is unambiguous.
+func rateLimitKey(parts ...string) string {
+	return strings.Join(parts, "\x00")
+}
+
+func logRateLimitRejection(reason string, in CreateAuthRequestInput, retryAfter time.Duration) {
+	log.Warn().
+		Str("event", "bc_authorize_rate_limited").
+		Str("reason", reason).
+		Str("client_id", in.ClientID).
+		Str("account_id", in.AccountID).
+		Str("project_id", in.ProjectID).
+		Str("login_hint_hash", hashedLoginHint(in.LoginHint)).
+		Dur("retry_after", retryAfter).
+		Msg("bc-authorize rate limit exceeded")
+}
+
+func logRateLimitBackendError(reason string, in CreateAuthRequestInput, err error) {
+	log.Warn().
+		Err(err).
+		Str("event", "bc_authorize_rate_limiter_backend_error").
+		Str("reason", reason).
+		Str("client_id", in.ClientID).
+		Str("account_id", in.AccountID).
+		Str("project_id", in.ProjectID).
+		Str("login_hint_hash", hashedLoginHint(in.LoginHint)).
+		Msg("bc-authorize rate limiter backend error; failing open")
+}
+
+// hashedLoginHint returns a 16-hex-char SHA-256 prefix — enough to cluster
+// events by victim without leaking the raw login_hint (often PII) to logs.
+func hashedLoginHint(hint string) string {
+	sum := sha256.Sum256([]byte(hint))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 // ApproveInput resolves a pending request positively.

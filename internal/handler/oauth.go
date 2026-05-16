@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
+	"strconv"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -91,6 +93,21 @@ func extractOAuthError(err error) (code, description string, status int) {
 		return "invalid_grant", "credential_expired", http.StatusBadRequest
 	}
 	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
+}
+
+// retryAfterHeader formats an *OAuthError's RetryAfter as integer
+// delta-seconds (RFC 7231 §7.1.3). Returns "" when the error carries no
+// hint. Rounds up so the advertised wait is never shorter than the refill.
+func retryAfterHeader(err error) string {
+	var oauthErr *service.OAuthError
+	if !errors.As(err, &oauthErr) || oauthErr.RetryAfter <= 0 {
+		return ""
+	}
+	secs := int(math.Ceil(oauthErr.RetryAfter.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	return strconv.Itoa(secs)
 }
 
 type IntrospectInput struct {
@@ -297,9 +314,12 @@ type BcAuthorizeInput struct {
 }
 
 // BcAuthorizeOutput mirrors the success response in CIBA Core §7.3.
+// RetryAfter is set on rate-limit rejections; Huma renders it as the
+// Retry-After header.
 type BcAuthorizeOutput struct {
-	Status int
-	Body   any // service.CreateAuthRequestOutput on success; oauthErrorBody on error
+	Status     int
+	RetryAfter string `header:"Retry-After"`
+	Body       any    // service.CreateAuthRequestOutput on success; oauthErrorBody on error
 }
 
 func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAuthorizeOutput, error) {
@@ -323,9 +343,18 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		ClientNotificationToken: input.Body.ClientNotificationToken,
 	})
 	if err != nil {
-		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")
 		code, desc, status := extractOAuthError(err)
-		return &BcAuthorizeOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}, nil
+		// 429s are an expected signal already logged at Warn in the service;
+		// skip the Error-level handler line so error-rate alerts aren't
+		// noisy under sustained rate-limited traffic.
+		if status != http.StatusTooManyRequests {
+			log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")
+		}
+		return &BcAuthorizeOutput{
+			Status:     status,
+			RetryAfter: retryAfterHeader(err),
+			Body:       oauthErrorBody{Error: code, ErrorDescription: desc},
+		}, nil
 	}
 	return &BcAuthorizeOutput{Status: http.StatusOK, Body: out}, nil
 }
