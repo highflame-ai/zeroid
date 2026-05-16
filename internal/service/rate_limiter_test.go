@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -206,3 +207,82 @@ func TestRateLimiterInterface_Compatibility(t *testing.T) {
 	var _ RateLimiter = (*TokenBucketLimiter)(nil)
 	var _ RateLimiter = (*failingLimiter)(nil)
 }
+
+// TestTokenBucketLimiter_MaxBucketsFailsOpen proves the limiter fails open
+// at capacity rather than allocating memory without bound. Critical when
+// keys come from attacker-controllable input (login_hint).
+func TestTokenBucketLimiter_MaxBucketsFailsOpen(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	l := newTestLimiter(t, 1, 1.0, clock)
+	l.MaxBuckets = 3
+
+	// Fill the map up to the cap with three distinct keys.
+	for _, k := range []string{"a", "b", "c"} {
+		ok, _, err := l.Allow(context.Background(), k)
+		if err != nil || !ok {
+			t.Fatalf("first request for key %q must be allowed; got (%v, _, %v)", k, ok, err)
+		}
+	}
+	if got := l.BucketCount(); got != 3 {
+		t.Fatalf("BucketCount = %d; want 3", got)
+	}
+
+	// A fourth distinct key cannot be tracked. The limiter must fail
+	// open rather than allocating — and the bucket count must not grow.
+	ok, retry, err := l.Allow(context.Background(), "d")
+	if err != nil {
+		t.Fatalf("at-capacity Allow must not error; got %v", err)
+	}
+	if !ok {
+		t.Fatalf("at-capacity Allow must fail open (return true); got false")
+	}
+	if retry != 0 {
+		t.Fatalf("at-capacity Allow retryAfter must be 0; got %v", retry)
+	}
+	if got := l.BucketCount(); got != 3 {
+		t.Fatalf("BucketCount after at-capacity request = %d; want 3 (no growth)", got)
+	}
+
+	// Existing keys must continue to be rate-limited normally.
+	if ok, _, _ := l.Allow(context.Background(), "a"); ok {
+		t.Fatal("existing key 'a' must still be rate-limited (its bucket is empty)")
+	}
+}
+
+// TestTokenBucketLimiter_ReapIsBounded proves reap caps its per-pass work
+// so a very large bucket map cannot stall Allow callers for an unbounded
+// duration. Successive ticks pick up where the previous left off.
+func TestTokenBucketLimiter_ReapIsBounded(t *testing.T) {
+	clock := newFakeClock(time.Unix(0, 0))
+	l := newTestLimiter(t, 1, 1.0, clock)
+	l.MaxBuckets = maxReapBatch * 3 // populate well past the per-pass cap
+
+	// Populate maxReapBatch*2 buckets (well above the per-pass cap).
+	total := maxReapBatch * 2
+	for i := 0; i < total; i++ {
+		key := keyN(i)
+		if _, _, err := l.Allow(context.Background(), key); err != nil {
+			t.Fatalf("populate iter %d: %v", i, err)
+		}
+	}
+	if got := l.BucketCount(); got != total {
+		t.Fatalf("BucketCount = %d; want %d", got, total)
+	}
+
+	// Age every bucket past IdleTTL so reap considers them all expired.
+	clock.advance(l.IdleTTL + time.Second)
+
+	// One reap pass must scan at most maxReapBatch entries — so the count
+	// drops by at most that many, regardless of map size.
+	l.reap()
+	dropped := total - l.BucketCount()
+	if dropped > maxReapBatch {
+		t.Fatalf("single reap pass dropped %d entries; per-pass cap is %d",
+			dropped, maxReapBatch)
+	}
+	if dropped == 0 {
+		t.Fatal("reap dropped nothing — expected at least some entries to expire")
+	}
+}
+
+func keyN(i int) string { return "k-" + strconv.Itoa(i) }

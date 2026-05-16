@@ -66,10 +66,18 @@
 
   ### Backchannel (CIBA) rate limiting
 
-  `/oauth2/bc-authorize` is rate-limited per `(client_id, tenant)` and
-  per `(login_hint, tenant)` to prevent end-user notification spam,
+  `/oauth2/bc-authorize` is rate-limited per `client_id` and per
+  `login_hint` to prevent end-user notification spam,
   `backchannel_auth_requests` table flooding, and `login_hint`
-  enumeration (issue #139).
+  enumeration.
+
+  **Bucket key composition.** Buckets are keyed on `client_id` and
+  `login_hint` alone — NOT on `(client_id, tenant)` or
+  `(login_hint, tenant)`. `account_id` / `project_id` arrive in the
+  request body and are not bound to the client (clients in ZeroID are
+  global). Including them in the bucket key would let an attacker
+  bypass the cap by supplying random tenant values per request. Tenant
+  fields are still included in the WARN log event for forensics.
 
   The default implementation is an **in-process, in-memory token bucket**.
   This is correct for single-instance deployments. **Multi-replica
@@ -80,6 +88,11 @@
   - **Default config:** 10 req/min per client, 5 req/min per user. Tunable
     via `BackchannelConfig.PerClientRateLimitPerMinute` and
     `PerUserRateLimitPerMinute` (set to `0` to disable a dimension).
+  - **Memory bound.** The in-memory limiter caps tracked keys at 100k by
+    default; beyond that, requests for new keys fail open. Operators can
+    inspect `TokenBucketLimiter.BucketCount()` and alert before the cap
+    is reached. The cap exists because `login_hint` is attacker-supplied
+    and otherwise unbounded.
   - **Multi-replica:** implement `zeroid.RateLimiter` against your shared
     store (Redis, Memcached, hosted KV) and install via
     `Server.SetBackchannelRateLimiters(perClient, perUser)`. The interface
@@ -87,7 +100,7 @@
     on the interface.
   - **Defense-in-depth:** run an edge limiter (CDN, nginx, Envoy) for
     per-IP throttling regardless. The in-process limiter exists for
-    per-tenant semantic enforcement that an edge limiter cannot express.
+    per-actor semantic enforcement that an edge limiter cannot express.
   - **Detection:** rate-limit rejections emit a structured WARN log with
     `event=bc_authorize_rate_limited`, `reason`, `client_id`, tenant IDs,
     and a `login_hint_hash` (SHA-256 prefix, no PII). Backend failures

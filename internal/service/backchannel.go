@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -219,26 +218,39 @@ func (s *BackchannelService) Stop() {
 }
 
 // SetRateLimits swaps in fresh in-memory limiters at the supplied
-// requests-per-minute; 0 disables a dimension. For non-default backends,
+// requests-per-minute; 0 disables a dimension. Atomic with the cfg update
+// so concurrent callers can't see torn state. For non-default backends,
 // use SetRateLimiters.
 func (s *BackchannelService) SetRateLimits(perClientRPM, perUserRPM int) {
-	s.SetRateLimiters(newPerMinuteLimiter(perClientRPM), newPerMinuteLimiter(perUserRPM))
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.cfg.PerClientRateLimit = perClientRPM
 	s.cfg.PerUserRateLimit = perUserRPM
-	s.mu.Unlock()
+	s.replaceLimitersLocked(
+		newPerMinuteLimiter(perClientRPM),
+		newPerMinuteLimiter(perUserRPM),
+	)
 }
 
 // SetRateLimiters installs RateLimiter implementations for the per-client
 // and per-user dimensions. Nil disables a dimension. Previously-installed
-// limiters are stopped.
+// limiters are stopped — except when the new instance equals the existing
+// one (calling Stop() on the default in-memory impl kills its reaper
+// goroutine, which cannot be restarted).
 func (s *BackchannelService) SetRateLimiters(perClient, perUser RateLimiter) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.perClientLimiter != nil {
+	s.replaceLimitersLocked(perClient, perUser)
+}
+
+// replaceLimitersLocked swaps limiters in atomically. Caller holds s.mu.
+// Skips Stop() when the new instance equals the existing one to avoid
+// rendering the supplied limiter non-functional.
+func (s *BackchannelService) replaceLimitersLocked(perClient, perUser RateLimiter) {
+	if s.perClientLimiter != nil && s.perClientLimiter != perClient {
 		s.perClientLimiter.Stop()
 	}
-	if s.perUserLimiter != nil {
+	if s.perUserLimiter != nil && s.perUserLimiter != perUser {
 		s.perUserLimiter.Stop()
 	}
 	s.perClientLimiter = perClient
@@ -442,6 +454,12 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 // semantics). On a limiter backend error the call fails open — a
 // malfunctioning limiter must not DoS the auth service it is protecting —
 // and a distinct WARN event records the degraded posture.
+//
+// Bucket keys are the raw client_id and login_hint — tenant fields are NOT
+// in the key because they are caller-supplied JSON-body strings unbound to
+// the client; including them would let an attacker bypass the cap by
+// varying tenant per request. Tenant remains in the WARN event for
+// forensics.
 func (s *BackchannelService) checkRateLimit(ctx context.Context, in CreateAuthRequestInput) error {
 	s.mu.RLock()
 	perClient := s.perClientLimiter
@@ -449,8 +467,7 @@ func (s *BackchannelService) checkRateLimit(ctx context.Context, in CreateAuthRe
 	s.mu.RUnlock()
 
 	if perClient != nil {
-		key := rateLimitKey(in.ClientID, in.AccountID, in.ProjectID)
-		ok, retryAfter, err := perClient.Allow(ctx, key)
+		ok, retryAfter, err := perClient.Allow(ctx, in.ClientID)
 		if err != nil {
 			logRateLimitBackendError("per_client", in, err)
 		} else if !ok {
@@ -463,8 +480,7 @@ func (s *BackchannelService) checkRateLimit(ctx context.Context, in CreateAuthRe
 		}
 	}
 	if perUser != nil {
-		key := rateLimitKey(in.LoginHint, in.AccountID, in.ProjectID)
-		ok, retryAfter, err := perUser.Allow(ctx, key)
+		ok, retryAfter, err := perUser.Allow(ctx, in.LoginHint)
 		if err != nil {
 			logRateLimitBackendError("per_user", in, err)
 		} else if !ok {
@@ -477,12 +493,6 @@ func (s *BackchannelService) checkRateLimit(ctx context.Context, in CreateAuthRe
 		}
 	}
 	return nil
-}
-
-// rateLimitKey joins parts with NUL — a byte that cannot appear in
-// client_id, login_hint, or tenant IDs — so concatenation is unambiguous.
-func rateLimitKey(parts ...string) string {
-	return strings.Join(parts, "\x00")
 }
 
 func logRateLimitRejection(reason string, in CreateAuthRequestInput, retryAfter time.Duration) {

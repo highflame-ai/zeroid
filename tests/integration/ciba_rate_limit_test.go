@@ -212,6 +212,73 @@ func TestCIBA_BcAuthorize_CustomRateLimiter(t *testing.T) {
 	require.Equal(t, int64(1), stub.calls(), "custom limiter must be invoked exactly once per request")
 }
 
+// TestCIBA_BcAuthorize_TenantBypassClosed proves that varying tenant IDs in
+// the request body does NOT reset the per-client rate-limit bucket. The
+// previous design keyed buckets on (client_id, account_id, project_id),
+// which let an attacker bypass the cap by supplying random tenant values.
+// The bucket key is now just client_id.
+func TestCIBA_BcAuthorize_TenantBypassClosed(t *testing.T) {
+	clientID := uid("ciba-rl-tenant-bypass")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+
+	const allowed = 3
+	testZeroIDServer.SetBackchannelRateLimits(allowed, 1000)
+	t.Cleanup(func() { testZeroIDServer.SetBackchannelRateLimits(10, 5) })
+
+	// Fire `allowed+3` requests, each with a unique account_id + project_id
+	// pair. If the limiter keyed on the tenant tuple, every request would
+	// look like a fresh bucket and all would succeed (the bypass). With the
+	// fix, only the first `allowed` succeed.
+	successes := 0
+	rejections := 0
+	for i := 0; i < allowed+3; i++ {
+		resp := post(t, "/oauth2/bc-authorize", map[string]any{
+			"client_id":  clientID,
+			"account_id": "acct-bypass-" + strconv.Itoa(i),
+			"project_id": "proj-bypass-" + strconv.Itoa(i),
+			"login_hint": "victim-" + strconv.Itoa(i) + "@example.com",
+		}, nil)
+		switch resp.StatusCode {
+		case http.StatusOK:
+			successes++
+		case http.StatusTooManyRequests:
+			rejections++
+		default:
+			t.Fatalf("unexpected status %d on iteration %d", resp.StatusCode, i)
+		}
+		_ = resp.Body.Close()
+	}
+
+	require.Equal(t, allowed, successes,
+		"per-client cap must hold even when account_id/project_id vary per request")
+	require.Equal(t, 3, rejections)
+}
+
+// TestCIBA_BcAuthorize_SetRateLimitersSelfStop proves the limiter passed
+// into Server.SetBackchannelRateLimiters is NOT stopped when it equals the
+// existing instance. The default in-memory impl's reaper goroutine cannot
+// be restarted, so an unconditional Stop would brick a re-installed limiter.
+func TestCIBA_BcAuthorize_SetRateLimitersSelfStop(t *testing.T) {
+	stub := &recordingLimiter{
+		decide: func(_ context.Context, _ string) (bool, time.Duration, error) {
+			return true, 0, nil
+		},
+	}
+
+	testZeroIDServer.SetBackchannelRateLimiters(stub, nil)
+	t.Cleanup(func() { testZeroIDServer.SetBackchannelRateLimits(10, 5) })
+
+	// Install the same instance again. The implementation must NOT call
+	// Stop() on a limiter it's reinstalling.
+	testZeroIDServer.SetBackchannelRateLimiters(stub, nil)
+
+	stub.mu.Lock()
+	stopped := stub.stopped
+	stub.mu.Unlock()
+	require.False(t, stopped,
+		"limiter must not be Stop()ped when SetBackchannelRateLimiters reinstalls the same instance")
+}
+
 // TestCIBA_BcAuthorize_CustomRateLimiter_FailOpen proves the documented
 // fail-open contract: when a deployer-supplied RateLimiter returns a
 // backend error (e.g. Redis unreachable), the service permits the request

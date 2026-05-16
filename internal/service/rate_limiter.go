@@ -23,9 +23,20 @@ type RateLimiter interface {
 	Stop()
 }
 
+// DefaultMaxBuckets is the default cap on tracked keys. Bounds memory
+// against unbounded-key inputs (e.g. attacker-supplied login_hints) at the
+// cost of failing open once the cap is reached. Operators can raise via
+// the MaxBuckets field on a custom-constructed limiter.
+const DefaultMaxBuckets = 100_000
+
+// maxReapBatch caps the number of map entries scanned per reap pass.
+// Bounds the worst-case lock-hold time so a large bucket map cannot block
+// concurrent Allow calls for an unbounded duration; successive ticks pick
+// up where the previous left off (Go randomises map iteration order).
+const maxReapBatch = 4096
+
 // TokenBucketLimiter is an in-process token-bucket RateLimiter. Buckets are
-// keyed by string and self-pruning so unbounded keyspaces (e.g. login_hint)
-// cannot grow memory without bound. Per-instance only — multi-replica
+// keyed by string and self-pruning. Per-instance only — multi-replica
 // deployments should plug a shared-store implementation in via
 // Server.SetBackchannelRateLimiters.
 type TokenBucketLimiter struct {
@@ -39,8 +50,13 @@ type TokenBucketLimiter struct {
 	// bucket cannot be reaped while it would still observe drained state
 	// on the next request.
 	IdleTTL time.Duration
+	// MaxBuckets caps the number of distinct keys tracked. When the map
+	// reaches this size, requests for new keys are silently allowed
+	// (fail-open) — the alternative is allocating memory without bound on
+	// attacker-supplied keys. 0 disables the cap; default DefaultMaxBuckets.
+	MaxBuckets int
 
-	// now is overridable for deterministic tests; defaults to time.Now.
+	// now is overridable for deterministic tests; defaults to time.Now().UTC().
 	now func() time.Time
 
 	mu      sync.Mutex
@@ -76,7 +92,8 @@ func NewTokenBucketLimiter(capacity, refillPerSec float64) *TokenBucketLimiter {
 		Capacity:     capacity,
 		RefillPerSec: refillPerSec,
 		IdleTTL:      idleTTL,
-		now:          time.Now,
+		MaxBuckets:   DefaultMaxBuckets,
+		now:          func() time.Time { return time.Now().UTC() },
 		buckets:      make(map[string]*bucketState),
 		stop:         make(chan struct{}),
 	}
@@ -98,6 +115,12 @@ func (l *TokenBucketLimiter) Allow(_ context.Context, key string) (bool, time.Du
 
 	b, ok := l.buckets[key]
 	if !ok {
+		// Fail open at capacity — refusing to track a new key is safer
+		// than allocating without bound when an attacker can supply
+		// arbitrary keys.
+		if l.MaxBuckets > 0 && len(l.buckets) >= l.MaxBuckets {
+			return true, 0, nil
+		}
 		// Start full so a legitimate first request isn't punished.
 		b = &bucketState{tokens: l.Capacity, lastRefill: now}
 		l.buckets[key] = b
@@ -130,6 +153,17 @@ func (l *TokenBucketLimiter) Allow(_ context.Context, key string) (bool, time.Du
 	return false, retryAfter, nil
 }
 
+// BucketCount returns the current number of tracked keys. Exposed for
+// operator observability — alert when this approaches MaxBuckets.
+func (l *TokenBucketLimiter) BucketCount() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
+}
+
 // Stop is idempotent and nil-safe.
 func (l *TokenBucketLimiter) Stop() {
 	if l == nil {
@@ -160,7 +194,15 @@ func (l *TokenBucketLimiter) reap() {
 	cutoff := l.now().Add(-l.IdleTTL)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Bound the per-pass work so a large map cannot stall Allow callers
+	// for an unbounded duration. Go's randomised map iteration order
+	// means successive passes cover what this pass misses.
+	scanned := 0
 	for k, b := range l.buckets {
+		if scanned >= maxReapBatch {
+			return
+		}
+		scanned++
 		if b.lastSeen.Before(cutoff) {
 			delete(l.buckets, k)
 		}
