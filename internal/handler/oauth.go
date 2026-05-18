@@ -132,7 +132,11 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 			"This happens — silently, RFC 6749 §3.3-style — when the issued token's lifetime would otherwise outlive a bound that " +
 			"constrains it. Effective TTL is `min(requested_ttl, service_max_ttl, policy.max_ttl_seconds, time_until(identity.expires_at), time_until(credential.expires_at))`. " +
 			"Callers MUST use `expires_in` from the response (not the value they requested) when scheduling refresh. " +
-			"Server-side logs name the clamp reason; the chokepoint emits a structured log line with `requested_ttl` and the remaining lifetime that won.",
+			"Server-side logs name the clamp reason; the chokepoint emits a structured log line with `requested_ttl` and the remaining lifetime that won.\n\n" +
+			"**DPoP (RFC 9449):** Clients may attach a `DPoP` header carrying a proof JWT to bind the issued token to a key. " +
+			"When the proof validates, the response sets `token_type: \"DPoP\"` (instead of `\"Bearer\"`) and the issued JWT carries " +
+			"a `cnf.jkt` claim equal to the proof key's JWK thumbprint. Resource servers retrieve `cnf` via introspection and " +
+			"validate the caller's per-request DPoP proof themselves. Proof JTIs are single-use within a 60s freshness window.",
 		Tags: []string{"OAuth"},
 	}, a.tokenOp)
 
