@@ -45,6 +45,10 @@ const (
 	testAccountID = "acct-test-001"
 	testProjectID = "proj-test-001"
 	testWIMSE     = "zeroid.dev"
+	// testSigningJWKSName is the branded well-known suffix this test
+	// deployment configures; the verification JWKS is served at
+	// /.well-known/<testSigningJWKSName>.
+	testSigningJWKSName = "test-receipt-keys"
 
 	// authorization_code / refresh_token test constants.
 	testHMACSecret  = "test-hmac-secret-zeroid-32bytes!!"
@@ -175,6 +179,16 @@ func runTests(m *testing.M) int {
 		// false — see GHSA-599q-j34m-33vc.
 		Backchannel: zeroid.BackchannelConfig{
 			AllowPrivateNotificationEndpoints: true,
+		},
+		// Opt this test deployment into workload-attested signing with a
+		// branded well-known name + purpose allowlist — exactly what a
+		// product deployer supplies. ZeroID itself ships product-agnostic.
+		SigningCreds: zeroid.SigningCredsConfig{
+			MaxTTLSeconds:      3600,
+			AuditRetentionDays: 400,
+			AllowedPurposes:    []string{"receipt", "authz_audit"},
+			JWKSPurpose:        "receipt",
+			WellKnownJWKSName:  testSigningJWKSName,
 		},
 		WIMSEDomain: testWIMSE,
 	}

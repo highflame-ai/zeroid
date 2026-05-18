@@ -151,6 +151,7 @@ func NewServer(cfg Config) (*Server, error) {
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
+	signingCredRepo := postgres.NewSigningCredentialRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
 	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
@@ -181,6 +182,14 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	signingCredSvc := service.NewSigningCredentialService(
+		signingCredRepo,
+		cfg.SigningCreds.MaxTTLSeconds,
+		cfg.SigningCreds.AuditRetentionDays,
+		cfg.SigningCreds.AllowedPurposes,
+		cfg.SigningCreds.JWKSPurpose,
+		cfg.SigningCreds.WellKnownJWKSName,
+	)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
@@ -218,7 +227,8 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc,
+		signingCredSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
