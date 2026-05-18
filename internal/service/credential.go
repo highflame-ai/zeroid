@@ -94,6 +94,15 @@ type IssueRequest struct {
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
+	// Governance binding (issue #59). When non-empty, these values are
+	// embedded as reserved claims (drm_*/constraint_catalog_*) on the
+	// issued JWT and persisted on the credential row for policy_drift
+	// signal fan-out. Set by OAuthService.tokenExchange and
+	// authorizationCode after a successful DRM authorization check.
+	DRMVersion            string
+	DRMHash               string
+	ConstraintCatalogVer  string
+	ConstraintCatalogHash string
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -312,6 +321,18 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		_ = token.Set(k, v)
 	}
 
+	// Governance binding (issue #59). Set after CustomClaims so deployer
+	// hooks cannot spoof these values — OAuthService also rejects them
+	// at the reservedClaims gate, but this is defence-in-depth.
+	if req.DRMHash != "" {
+		_ = token.Set("drm_hash", req.DRMHash)
+		_ = token.Set("drm_version", req.DRMVersion)
+	}
+	if req.ConstraintCatalogHash != "" {
+		_ = token.Set("constraint_catalog_hash", req.ConstraintCatalogHash)
+		_ = token.Set("constraint_catalog_version", req.ConstraintCatalogVer)
+	}
+
 	// RFC 8693 "act" claim — two use cases:
 	//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
 	//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
@@ -341,20 +362,22 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 
 	// Persist credential record
 	cred := &domain.IssuedCredential{
-		ID:                  uuid.New().String(),
-		IdentityID:          stringPtrOrNil(req.Identity.ID),
-		AccountID:           req.Identity.AccountID,
-		ProjectID:           req.Identity.ProjectID,
-		JTI:                 jti,
-		Subject:             req.Identity.WIMSEURI,
-		IssuedAt:            now,
-		ExpiresAt:           expiresAt,
-		TTLSeconds:          ttl,
-		Scopes:              coalesceScopeSlice(req.Scopes),
-		GrantType:           req.GrantType,
-		DelegationDepth:     req.DelegationDepth,
-		ParentJTI:           req.ParentJTI,
-		DelegatedByWIMSEURI: req.DelegatedBy,
+		ID:                    uuid.New().String(),
+		IdentityID:            stringPtrOrNil(req.Identity.ID),
+		AccountID:             req.Identity.AccountID,
+		ProjectID:             req.Identity.ProjectID,
+		JTI:                   jti,
+		Subject:               req.Identity.WIMSEURI,
+		IssuedAt:              now,
+		ExpiresAt:             expiresAt,
+		TTLSeconds:            ttl,
+		Scopes:                coalesceScopeSlice(req.Scopes),
+		GrantType:             req.GrantType,
+		DelegationDepth:       req.DelegationDepth,
+		ParentJTI:             req.ParentJTI,
+		DelegatedByWIMSEURI:   req.DelegatedBy,
+		DRMHash:               req.DRMHash,
+		ConstraintCatalogHash: req.ConstraintCatalogHash,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {

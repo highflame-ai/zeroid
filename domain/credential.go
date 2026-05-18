@@ -82,4 +82,12 @@ type IssuedCredential struct {
 	ParentJTI       string     `bun:"parent_jti,type:varchar(255)"  json:"parent_jti,omitempty"`
 	// DelegatedByWIMSEURI records the orchestrator that delegated authority (RFC 8693 token_exchange).
 	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text" json:"delegated_by_wimse_uri,omitempty"`
+	// DRMHash binds the credential to the SHA-256 of the DRM document
+	// active at issuance (issue #59). Empty when no DRM is configured for
+	// the tenant. Indexed for policy_drift detection.
+	DRMHash string `bun:"drm_hash,type:varchar(80)" json:"drm_hash,omitempty"`
+	// ConstraintCatalogHash binds the credential to the SHA-256 of the
+	// Constraint Catalog document active at issuance (issue #59). Empty
+	// when no catalog is configured for the tenant.
+	ConstraintCatalogHash string `bun:"constraint_catalog_hash,type:varchar(80)" json:"constraint_catalog_hash,omitempty"`
 }

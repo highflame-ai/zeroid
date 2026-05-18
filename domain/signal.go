@@ -17,6 +17,11 @@ const (
 	SignalTypePolicyViolation   SignalType = "policy_violation"
 	SignalTypeRetirement        SignalType = "retirement"
 	SignalTypeOwnerChange       SignalType = "owner_change"
+	// SignalTypePolicyDrift is emitted when the active DRM or Constraint
+	// Catalog hash diverges from the hash bound into outstanding tokens.
+	// Enforcement points use this signal to schedule re-evaluation on
+	// next use rather than immediate revocation — see issue #59.
+	SignalTypePolicyDrift SignalType = "policy_drift"
 )
 
 // SignalSeverity indicates the severity level of a CAE signal.
@@ -42,7 +47,8 @@ func (s SignalSeverity) Valid() bool {
 func (t SignalType) Valid() bool {
 	switch t {
 	case SignalTypeCredentialChange, SignalTypeSessionRevoked, SignalTypeIPChange,
-		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement, SignalTypeOwnerChange:
+		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement, SignalTypeOwnerChange,
+		SignalTypePolicyDrift:
 		return true
 	}
 	return false
