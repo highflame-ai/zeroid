@@ -127,7 +127,7 @@ func (a *API) registerDynamicRegistrationRoutes(api huma.API) {
 		Method:      http.MethodDelete,
 		Path:        "/oauth2/register/{client_id}",
 		Summary:     "Delete Client Registration (RFC 7592)",
-		Tags:       []string{"OAuth"},
+		Tags:        []string{"OAuth"},
 	}, a.dcrDeleteOp)
 }
 
