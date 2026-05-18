@@ -6,6 +6,19 @@ export interface CibaTenantContext {
   project_id: string;
 }
 
+export interface CibaAdminCommandOptions {
+  adminBaseUrl?: string;
+  adminPrefix?: string;
+  internalService?: string;
+  internalServiceSecret?: string;
+}
+
+export interface CibaAdminRequestConfig {
+  baseUrl: string;
+  prefix: string;
+  headers: Record<string, string>;
+}
+
 export interface CibaInitResponse {
   auth_req_id: string;
   expires_in: number;
@@ -78,11 +91,41 @@ export async function postTenantJSON<T>(
   context: CibaTenantContext,
   path: string,
   body: Record<string, unknown>,
+  options: { baseUrl?: string; headers?: Record<string, string | undefined> } = {},
 ): Promise<T> {
-  return postJSON<T>(context.base_url, path, body, {
+  return postJSON<T>(options.baseUrl ?? context.base_url, path, body, cleanHeaders({
     "X-Account-ID": context.account_id,
     "X-Project-ID": context.project_id,
-  });
+    ...options.headers,
+  }));
+}
+
+export function resolveCibaAdminRequest(
+  context: CibaTenantContext,
+  opts: CibaAdminCommandOptions,
+): CibaAdminRequestConfig {
+  const internalService = nonEmpty(opts.internalService) ?? readEnv("ZID_INTERNAL_SERVICE");
+  const internalServiceSecret =
+    nonEmpty(opts.internalServiceSecret) ?? readEnv("ZID_INTERNAL_SERVICE_SECRET");
+
+  if (internalServiceSecret && !internalService) {
+    throw new Error(
+      "--internal-service-secret requires --internal-service or ZID_INTERNAL_SERVICE",
+    );
+  }
+
+  return {
+    baseUrl: nonEmpty(opts.adminBaseUrl) ?? readEnv("ZID_ADMIN_BASE_URL") ?? context.base_url,
+    prefix: readOptionOrEnvAllowEmpty(opts.adminPrefix, "ZID_ADMIN_PREFIX") ?? "/api/v1",
+    headers: cleanHeaders({
+      "X-Internal-Service": internalService,
+      "X-Internal-Service-Secret": internalServiceSecret,
+    }),
+  };
+}
+
+export function buildCibaAdminPath(config: CibaAdminRequestConfig, path: string): string {
+  return joinPath(config.prefix, path);
 }
 
 async function postJSON<T>(
@@ -154,6 +197,24 @@ function ensureLeadingSlash(value: string): string {
   return value.startsWith("/") ? value : `/${value}`;
 }
 
+function joinPath(prefix: string, path: string): string {
+  const cleanPrefix = prefix.trim().replace(/\/+$/, "");
+  if (!cleanPrefix) {
+    return ensureLeadingSlash(path);
+  }
+  return `${ensureLeadingSlash(cleanPrefix)}${ensureLeadingSlash(path)}`;
+}
+
+function cleanHeaders(headers: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value !== undefined && value !== "") {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -161,4 +222,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function readString(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function readEnv(name: string): string | undefined {
+  return nonEmpty(process.env[name]);
+}
+
+function readOptionOrEnvAllowEmpty(value: string | undefined, envName: string): string | undefined {
+  if (value !== undefined) {
+    return value;
+  }
+  if (Object.prototype.hasOwnProperty.call(process.env, envName)) {
+    return process.env[envName] ?? "";
+  }
+  return undefined;
 }

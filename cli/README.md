@@ -253,6 +253,11 @@ zeroid ciba approve ari_... \
   --subject-id user@example.com \
   --subject-email user@example.com \
   --subject-name "Alice User"
+
+# Highflame AuthN-style deployments with admin routes mounted at the base URL:
+ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE_SECRET=... \
+zeroid ciba approve ari_... --subject-id user@example.com --admin-prefix ""
 ```
 
 | Flag | Description |
@@ -260,8 +265,14 @@ zeroid ciba approve ari_... \
 | `--subject-id <id>` | Approved end-user identifier; becomes the token `sub` |
 | `--subject-email <email>` | Approved user's email |
 | `--subject-name <name>` | Approved user's display name |
+| `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
+| `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |
 | `--json` | Output raw JSON |
+
+Use `--admin-prefix ""` for deployers such as Highflame AuthN that mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID keeps the default `/api/v1` prefix.
 
 ---
 
@@ -271,11 +282,19 @@ Admin-side helper to deny a pending CIBA request.
 
 ```bash
 zeroid ciba deny ari_... --reason "user rejected"
+
+ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE_SECRET=... \
+zeroid ciba deny ari_... --reason "user rejected" --admin-prefix ""
 ```
 
 | Flag | Description |
 |---|---|
 | `--reason <text>` | Operator note sent when supported by the server |
+| `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
+| `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |
 | `--json` | Output raw JSON |
 

@@ -123,6 +123,47 @@ describe("zeroid ciba approve", () => {
     expect(captured["subject_name"]).toBe("Alice User");
     expect(stdout.join("")).toMatch(/approved/i);
   });
+
+  it("supports AuthN-mounted approval routes with internal service headers", async () => {
+    let captured: Record<string, unknown> = {};
+    let accountHeader = "";
+    let projectHeader = "";
+    let internalServiceHeader = "";
+    let internalSecretHeader = "";
+
+    server.use(
+      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/approve`, async ({ request }) => {
+        captured = (await request.json()) as Record<string, unknown>;
+        accountHeader = request.headers.get("x-account-id") ?? "";
+        projectHeader = request.headers.get("x-project-id") ?? "";
+        internalServiceHeader = request.headers.get("x-internal-service") ?? "";
+        internalSecretHeader = request.headers.get("x-internal-service-secret") ?? "";
+        return HttpResponse.json({ auth_req_id: "ari_test_123", status: "approved" });
+      }),
+    );
+
+    const { stdout, exitCode } = await runCLI([
+      "ciba",
+      "approve",
+      "ari_test_123",
+      "--subject-id",
+      "user@example.com",
+      "--admin-prefix",
+      "",
+      "--internal-service",
+      "highflame-admin",
+      "--internal-service-secret",
+      "dev-secret",
+    ]);
+
+    expect(exitCode).toBeUndefined();
+    expect(accountHeader).toBe("acct_test");
+    expect(projectHeader).toBe("proj_test");
+    expect(internalServiceHeader).toBe("highflame-admin");
+    expect(internalSecretHeader).toBe("dev-secret");
+    expect(captured["subject_id"]).toBe("user@example.com");
+    expect(stdout.join("")).toMatch(/approved/i);
+  });
 });
 
 describe("zeroid ciba deny", () => {
@@ -149,6 +190,45 @@ describe("zeroid ciba deny", () => {
     expect(exitCode).toBeUndefined();
     expect(accountHeader).toBe("acct_test");
     expect(captured["reason"]).toBe("user rejected");
+    expect(stdout.join("")).toMatch(/denied/i);
+  });
+
+  it("honors admin prefix and internal service headers from env", async () => {
+    let accountHeader = "";
+    let projectHeader = "";
+    let internalServiceHeader = "";
+    let internalSecretHeader = "";
+
+    server.use(
+      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/deny`, async ({ request }) => {
+        accountHeader = request.headers.get("x-account-id") ?? "";
+        projectHeader = request.headers.get("x-project-id") ?? "";
+        internalServiceHeader = request.headers.get("x-internal-service") ?? "";
+        internalSecretHeader = request.headers.get("x-internal-service-secret") ?? "";
+        return HttpResponse.json({ auth_req_id: "ari_test_123", status: "denied" });
+      }),
+    );
+
+    const { stdout, exitCode } = await runCLI(
+      [
+        "ciba",
+        "deny",
+        "ari_test_123",
+        "--reason",
+        "user rejected",
+      ],
+      {
+        ZID_ADMIN_PREFIX: "",
+        ZID_INTERNAL_SERVICE: "highflame-admin",
+        ZID_INTERNAL_SERVICE_SECRET: "dev-secret",
+      },
+    );
+
+    expect(exitCode).toBeUndefined();
+    expect(accountHeader).toBe("acct_test");
+    expect(projectHeader).toBe("proj_test");
+    expect(internalServiceHeader).toBe("highflame-admin");
+    expect(internalSecretHeader).toBe("dev-secret");
     expect(stdout.join("")).toMatch(/denied/i);
   });
 });
