@@ -10,6 +10,14 @@
 --
 -- token_endpoint_auth_method already exists from migration 003 (default 'none');
 -- DCR-registered clients persist their declared method on registration.
+--
+-- Lock posture: PG 11+ fast-path for ADD COLUMN with a constant scalar default
+-- (no full table rewrite, metadata-only catalog update). AccessExclusive lock
+-- held for sub-millisecond duration regardless of row count. lock_timeout
+-- below makes the migration fail fast if the lock can't be acquired quickly,
+-- so a startup auto-apply doesn't wedge behind a long-running token query.
+
+SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE oauth_clients
     ADD COLUMN IF NOT EXISTS registration_source       VARCHAR(50) NOT NULL DEFAULT 'internal',

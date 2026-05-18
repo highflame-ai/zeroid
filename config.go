@@ -132,6 +132,14 @@ type ServerConfig struct {
 	//
 	// Set to empty string ("") to register admin routes at the router root.
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
+
+	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
+	// X-Forwarded-Host when reconstructing the effective request URL for
+	// DPoP htu validation (RFC 9449 §4.3). Production deployers behind a
+	// trusted edge proxy (nginx, AWS ALB, GCP LB) flip this on; deployers
+	// that terminate TLS at the service itself leave it false so spoofed
+	// proxy headers cannot move the htu goalposts.
+	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
 // GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"

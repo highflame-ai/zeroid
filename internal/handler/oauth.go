@@ -243,7 +243,15 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: "DPoP is not enabled on this deployment"},
 			}, nil
 		}
-		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, a.baseURL+"/oauth2/token", input.DPoPProof)
+		// htu must match what the client signed. Prefer the request's effective URL
+		// (recorded by RequestURLMiddleware) so reverse-proxied deployments work
+		// transparently; fall back to the configured baseURL only when the
+		// middleware was not installed (defensive, should not happen in production).
+		htu := internalMiddleware.EffectiveRequestURL(ctx)
+		if htu == "" {
+			htu = a.baseURL + "/oauth2/token"
+		}
+		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, htu, input.DPoPProof)
 		if dpopErr != nil {
 			if errors.Is(dpopErr, service.ErrDPoPStorageFailure) {
 				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")

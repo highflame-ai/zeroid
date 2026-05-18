@@ -196,8 +196,9 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 			return nil, oauthBadRequest("unsupported_grant_type", "CIBA is not enabled on this deployment")
 		}
 		return s.backchannelSvc.Redeem(ctx, RedeemInput{
-			AuthReqID: req.AuthReqID,
-			ClientID:  req.ClientID,
+			AuthReqID:         req.AuthReqID,
+			ClientID:          req.ClientID,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
 		// Check custom grant handlers registered via RegisterGrant.

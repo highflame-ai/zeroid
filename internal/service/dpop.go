@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
@@ -29,6 +28,11 @@ const dpopFreshnessWindow = 60 * time.Second
 // dpopClockSkewTolerance allows proofs whose iat is slightly in the future
 // to compensate for minor clock differences between client and server.
 const dpopClockSkewTolerance = 5 * time.Second
+
+// dpopMaxJTILen caps the JTI claim at the database column width so an oversized
+// jti from a malicious client surfaces as a 4xx proof-invalid error rather than
+// a Postgres "value too long for type" that consumeJTI would mis-map to a 5xx.
+const dpopMaxJTILen = 512
 
 // dpopJTIRecord is the bun model for the dpop_jti replay-prevention table.
 type dpopJTIRecord struct {
@@ -115,10 +119,12 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 		return "", fmt.Errorf("dpop proof: payload is malformed: %w", err)
 	}
 
-	// 7. htm MUST match the HTTP method of the request. RFC 9110 method names are
-	//    case-sensitive uppercase; we compare case-insensitively for client tolerance.
+	// 7. htm MUST match the HTTP method of the request. RFC 9110 §9.1 says method
+	//    names are case-sensitive uppercase, and RFC 9449 §4.2 inherits that —
+	//    we compare exactly so a lowercase htm cannot slip past on a server that
+	//    later adds DPoP-protected resources with case-collision-sensitive methods.
 	htm, _ := jwt.Get[string](parsed, "htm")
-	if !strings.EqualFold(htm, method) {
+	if htm != method {
 		return "", fmt.Errorf("dpop proof: htm mismatch (expected %s, got %s)", method, htm)
 	}
 
@@ -147,7 +153,16 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 	if jti == "" {
 		return "", errors.New("dpop proof: jti claim is required")
 	}
-	if err := s.consumeJTI(ctx, jti, iat.Add(dpopFreshnessWindow)); err != nil {
+	if len(jti) > dpopMaxJTILen {
+		// Bounded at the column width; oversized JTIs are a 4xx (malformed
+		// proof), not a 5xx storage failure.
+		return "", fmt.Errorf("dpop proof: jti exceeds %d bytes", dpopMaxJTILen)
+	}
+	// Replay-coverage runs on wall clock (now + freshness + skew), not on the
+	// client-supplied iat. iat-relative expiry would let a client backdate
+	// iat to shorten the row's lifetime in the JTI store; clock-relative
+	// expiry decouples replay-defence from anything the client controls.
+	if err := s.consumeJTI(ctx, jti, time.Now().Add(dpopFreshnessWindow+dpopClockSkewTolerance)); err != nil {
 		return "", fmt.Errorf("dpop proof: %w", err)
 	}
 

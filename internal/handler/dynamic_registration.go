@@ -17,11 +17,14 @@ import (
 // allowedDCRGrantTypes are the only grant types permitted for dynamically
 // registered clients. authorization_code is intentionally excluded — this is
 // a machine-to-machine server and DCR-registered clients can't run an
-// interactive consent flow.
+// interactive consent flow. token-exchange (RFC 8693) is intentionally excluded
+// too — DCR-registered clients have no IdentityID binding and so cannot
+// legitimately act as a delegation actor; allowing the grant type at
+// registration time creates a sharp edge for no benefit. Add it back when
+// DCR-clients-as-actors becomes a real use case with explicit identity binding.
 var allowedDCRGrantTypes = map[string]bool{
-	"client_credentials":                              true,
-	"urn:ietf:params:oauth:grant-type:jwt-bearer":     true,
-	"urn:ietf:params:oauth:grant-type:token-exchange": true,
+	"client_credentials":                          true,
+	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
 }
 
 // dcrClientRegisterScope is the scope an initial access token must carry to
@@ -131,7 +134,8 @@ func (a *API) registerDynamicRegistrationRoutes(api huma.API) {
 // ── DCR ops ──────────────────────────────────────────────────────────────────
 
 func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCROutput, error) {
-	if err := a.validateInitialAccessToken(input.Authorization); err != nil {
+	iatClaims, err := a.validateInitialAccessToken(input.Authorization)
+	if err != nil {
 		return dcrErr(err), nil
 	}
 
@@ -191,6 +195,16 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 		log.Error().Err(err).Msg("dynamic client registration failed")
 		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to register client"}), nil
 	}
+
+	// Audit log: who minted what. registered_by_* claims are derived from the
+	// initial access token; clients themselves remain global per zeroid's
+	// design but the registrant's tenant context is preserved here for ops.
+	log.Info().
+		Str("client_id", client.ClientID).
+		Str("registered_by_sub", iatClaims.Subject).
+		Str("registered_by_account_id", iatClaims.AccountID).
+		Str("registered_by_project_id", iatClaims.ProjectID).
+		Msg("DCR: dynamic client registered")
 
 	return &DCROutput{
 		Status: http.StatusCreated,
@@ -310,12 +324,27 @@ func dcrErr(err error) *DCROutput {
 	return &DCROutput{Status: http.StatusInternalServerError, Body: oauthErrorBody{Error: "server_error", ErrorDescription: "unexpected error"}}
 }
 
+// initialAccessTokenClaims captures the tenant-relevant claims of a successfully
+// validated initial access token. Used for audit logging only — DCR-registered
+// OAuth clients are global (no tenant column) by design.
+type initialAccessTokenClaims struct {
+	Subject   string
+	AccountID string
+	ProjectID string
+}
+
 // validateInitialAccessToken parses the Authorization header as `Bearer <jwt>`,
-// verifies against the server's JWKS, and requires the `client:register` scope.
-// Returns nil on success or a *dcrError on failure.
-func (a *API) validateInitialAccessToken(authHeader string) error {
+// verifies against the server's JWKS, and requires:
+//   - iss equal to the configured issuer (defense against tokens from another AS),
+//   - aud containing the configured issuer (defense against tokens minted for a
+//     different protected resource being replayed at /oauth2/register; per
+//     RFC 9068 §3, ZeroID-issued access tokens default to aud=[issuer]),
+//   - the `client:register` scope present in the scopes claim.
+//
+// Returns the extracted tenant claims on success or a *dcrError on failure.
+func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessTokenClaims, error) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer initial access token is required"}
+		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer initial access token is required"}
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
@@ -323,9 +352,11 @@ func (a *API) validateInitialAccessToken(authHeader string) error {
 		jwt.WithKeySet(a.jwksSvc.KeySet()),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(a.issuer),
+		jwt.WithAudience(a.issuer),
 	)
 	if err != nil {
-		return &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "initial access token is invalid or expired"}
+		log.Info().Err(err).Msg("DCR: initial access token rejected")
+		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "initial access token is invalid or expired"}
 	}
 
 	scopes, _ := jwt.Get[[]any](parsed, "scopes")
@@ -337,9 +368,15 @@ func (a *API) validateInitialAccessToken(authHeader string) error {
 		}
 	}
 	if !hasRegisterScope {
-		return &dcrError{status: http.StatusForbidden, code: "insufficient_scope", desc: "initial access token must have '" + dcrClientRegisterScope + "' scope"}
+		log.Info().Msg("DCR: initial access token rejected — insufficient scope")
+		return nil, &dcrError{status: http.StatusForbidden, code: "insufficient_scope", desc: "initial access token must have '" + dcrClientRegisterScope + "' scope"}
 	}
-	return nil
+
+	claims := &initialAccessTokenClaims{}
+	claims.Subject, _ = parsed.Subject()
+	claims.AccountID, _ = jwt.Get[string](parsed, "account_id")
+	claims.ProjectID, _ = jwt.Get[string](parsed, "project_id")
+	return claims, nil
 }
 
 // authorizeDCRManagement verifies the registration_access_token in the
