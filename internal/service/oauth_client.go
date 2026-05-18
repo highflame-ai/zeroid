@@ -320,6 +320,41 @@ func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error 
 // management bearer that survives a single registration call.
 const dcrBcryptCost = 12
 
+// dcrAllowedAuthMethods are the only token_endpoint_auth_method values
+// dynamically-registered clients may declare. Enforced at the service layer
+// as defense-in-depth so a direct call to DynamicRegisterClient or
+// UpdateDynamicClient (bypassing the handler) cannot smuggle in "none" or
+// an unsupported value.
+var dcrAllowedAuthMethods = map[string]bool{
+	"client_secret_post":  true,
+	"client_secret_basic": true,
+}
+
+// dcrAllowedGrantTypes mirrors the handler-layer allow-list. Service-layer
+// enforcement guards against direct service-method callers.
+var dcrAllowedGrantTypes = map[string]bool{
+	"client_credentials":                          true,
+	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
+}
+
+// validateDCRSubmittedFields runs the service-layer defense for grant_types
+// and token_endpoint_auth_method. Returns the normalised auth method (with
+// the default applied for empty input) or an error.
+func validateDCRSubmittedFields(grantTypes []string, authMethod string) (string, error) {
+	for _, gt := range grantTypes {
+		if !dcrAllowedGrantTypes[gt] {
+			return "", fmt.Errorf("grant_type %q is not permitted for dynamically-registered clients", gt)
+		}
+	}
+	if authMethod == "" {
+		return "client_secret_post", nil
+	}
+	if !dcrAllowedAuthMethods[authMethod] {
+		return "", fmt.Errorf("token_endpoint_auth_method %q is not permitted for dynamically-registered clients", authMethod)
+	}
+	return authMethod, nil
+}
+
 // DynamicRegisterClientRequest is the input shape for RFC 7591 dynamic registration.
 // Mirrors RegisterClientRequest's confidential-client subset — DCR-issued clients
 // are always confidential (they get a client_secret and an opaque registration token).
@@ -372,6 +407,10 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"client_credentials"}
 	}
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	if err != nil {
+		return nil, "", "", err
+	}
 	scopes := req.Scopes
 	if scopes == nil {
 		scopes = []string{}
@@ -383,10 +422,6 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 	contacts := req.Contacts
 	if contacts == nil {
 		contacts = []string{}
-	}
-	authMethod := req.TokenEndpointAuthMethod
-	if authMethod == "" {
-		authMethod = "client_secret_post"
 	}
 
 	now := time.Now()
@@ -473,6 +508,10 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	if grantTypes == nil {
 		grantTypes = []string{"client_credentials"}
 	}
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	if err != nil {
+		return nil, err
+	}
 	scopes := req.Scopes
 	if scopes == nil {
 		scopes = []string{}
@@ -484,10 +523,6 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	contacts := req.Contacts
 	if contacts == nil {
 		contacts = []string{}
-	}
-	authMethod := req.TokenEndpointAuthMethod
-	if authMethod == "" {
-		authMethod = "client_secret_post"
 	}
 
 	client.Name = req.Name

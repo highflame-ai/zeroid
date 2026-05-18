@@ -162,7 +162,7 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 	// client-supplied iat. iat-relative expiry would let a client backdate
 	// iat to shorten the row's lifetime in the JTI store; clock-relative
 	// expiry decouples replay-defence from anything the client controls.
-	if err := s.consumeJTI(ctx, jti, time.Now().Add(dpopFreshnessWindow+dpopClockSkewTolerance)); err != nil {
+	if err := s.consumeJTI(ctx, jti, now.Add(dpopFreshnessWindow+dpopClockSkewTolerance)); err != nil {
 		return "", fmt.Errorf("dpop proof: %w", err)
 	}
 

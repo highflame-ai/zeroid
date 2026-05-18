@@ -139,51 +139,16 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 		return dcrErr(err), nil
 	}
 
-	if input.Body.ClientName == "" {
-		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}), nil
-	}
-
-	grantTypes := input.Body.GrantTypes
-	if len(grantTypes) == 0 {
-		grantTypes = []string{"client_credentials"}
-	}
-	for _, gt := range grantTypes {
-		if !allowedDCRGrantTypes[gt] {
-			return dcrErr(&dcrError{
-				status: http.StatusBadRequest, code: "invalid_client_metadata",
-				desc: "unsupported grant_type: " + gt,
-			}), nil
-		}
-	}
-
-	authMethod := input.Body.TokenEndpointAuthMethod
-	switch authMethod {
-	case "", "client_secret_post", "client_secret_basic":
-		// accepted
-	case "none":
-		return dcrErr(&dcrError{
-			status: http.StatusBadRequest, code: "invalid_client_metadata",
-			desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication",
-		}), nil
-	default:
-		return dcrErr(&dcrError{
-			status: http.StatusBadRequest, code: "invalid_client_metadata",
-			desc: "unsupported token_endpoint_auth_method: " + authMethod,
-		}), nil
-	}
-
-	var scopes []string
-	if input.Body.Scope != "" {
-		scopes = strings.Fields(input.Body.Scope)
-	} else {
-		scopes = []string{}
+	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
+	if err != nil {
+		return dcrErr(err), nil
 	}
 
 	client, plainSecret, plainRegToken, err := a.oauthClientSvc.DynamicRegisterClient(ctx, service.DynamicRegisterClientRequest{
 		Name:                    input.Body.ClientName,
-		GrantTypes:              grantTypes,
-		Scopes:                  scopes,
-		TokenEndpointAuthMethod: authMethod,
+		GrantTypes:              v.GrantTypes,
+		Scopes:                  v.Scopes,
+		TokenEndpointAuthMethod: v.AuthMethod,
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
@@ -236,41 +201,16 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		return dcrErr(err), nil
 	}
 
-	if input.Body.ClientName == "" {
-		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}), nil
-	}
-
-	grantTypes := input.Body.GrantTypes
-	if len(grantTypes) == 0 {
-		grantTypes = []string{"client_credentials"}
-	}
-	for _, gt := range grantTypes {
-		if !allowedDCRGrantTypes[gt] {
-			return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported grant_type: " + gt}), nil
-		}
-	}
-
-	authMethod := input.Body.TokenEndpointAuthMethod
-	switch authMethod {
-	case "", "client_secret_post", "client_secret_basic":
-	case "none":
-		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "token_endpoint_auth_method 'none' is not supported"}), nil
-	default:
-		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported token_endpoint_auth_method: " + authMethod}), nil
-	}
-
-	var scopes []string
-	if input.Body.Scope != "" {
-		scopes = strings.Fields(input.Body.Scope)
-	} else {
-		scopes = []string{}
+	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
+	if err != nil {
+		return dcrErr(err), nil
 	}
 
 	updated, err := a.oauthClientSvc.UpdateDynamicClient(ctx, input.ClientID, service.DynamicRegisterClientRequest{
 		Name:                    input.Body.ClientName,
-		GrantTypes:              grantTypes,
-		Scopes:                  scopes,
-		TokenEndpointAuthMethod: authMethod,
+		GrantTypes:              v.GrantTypes,
+		Scopes:                  v.Scopes,
+		TokenEndpointAuthMethod: v.AuthMethod,
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
@@ -279,19 +219,7 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client update failed")
 		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to update client registration"}), nil
 	}
-	return &DCROutput{
-		Status: http.StatusOK,
-		Body: map[string]any{
-			"client_id":                  updated.ClientID,
-			"client_id_issued_at":        updated.CreatedAt.Unix(),
-			"client_secret_expires_at":   0,
-			"client_name":                updated.Name,
-			"grant_types":                updated.GrantTypes,
-			"scope":                      strings.Join(updated.Scopes, " "),
-			"token_endpoint_auth_method": updated.TokenEndpointAuthMethod,
-			"registration_client_uri":    a.baseURL + "/oauth2/register/" + updated.ClientID,
-		},
-	}, nil
+	return &DCROutput{Status: http.StatusOK, Body: a.dcrClientResponse(updated)}, nil
 }
 
 func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutput, error) {
@@ -306,6 +234,49 @@ func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutpu
 }
 
 // ── DCR helpers ──────────────────────────────────────────────────────────────
+
+// dcrValidatedFields collects the post-validation client metadata shared by
+// register + update.
+type dcrValidatedFields struct {
+	GrantTypes []string
+	Scopes     []string
+	AuthMethod string
+}
+
+// validateDCRClientMetadata applies RFC 7591/7592 input rules: client_name
+// required, grant_types subset of allowedDCRGrantTypes, token_endpoint_auth_method
+// constrained to client_secret_post / client_secret_basic. Defaults are filled
+// in. Returns the normalised fields or a *dcrError ready for dcrErr().
+func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantTypesIn []string) (*dcrValidatedFields, error) {
+	if clientName == "" {
+		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}
+	}
+	grantTypes := grantTypesIn
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"client_credentials"}
+	}
+	for _, gt := range grantTypes {
+		if !allowedDCRGrantTypes[gt] {
+			return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported grant_type: " + gt}
+		}
+	}
+	authMethod := authMethodIn
+	switch authMethod {
+	case "", "client_secret_post", "client_secret_basic":
+		// accepted
+	case "none":
+		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication"}
+	default:
+		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported token_endpoint_auth_method: " + authMethod}
+	}
+	var scopes []string
+	if scopeStr != "" {
+		scopes = strings.Fields(scopeStr)
+	} else {
+		scopes = []string{}
+	}
+	return &dcrValidatedFields{GrantTypes: grantTypes, Scopes: scopes, AuthMethod: authMethod}, nil
+}
 
 // dcrError is the structured error a DCR op returns to the dispatch layer.
 type dcrError struct {

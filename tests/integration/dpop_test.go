@@ -69,8 +69,10 @@ func TestDPoPClientCredentialsFlow(t *testing.T) {
 	dpopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
-	// htu must match the baseURL the handler uses (testIssuer), not testServer.URL.
-	proof := buildDPoPProof(t, dpopKey, http.MethodPost, testIssuer+"/oauth2/token", uuid.New().String())
+	// htu must match the URL the request actually reaches —
+	// testServer.URL (httptest's loopback listener), not testIssuer (the
+	// configured iss/baseURL value used only for JWT iss claims).
+	proof := buildDPoPProof(t, dpopKey, http.MethodPost, testServer.URL+"/oauth2/token", uuid.New().String())
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
@@ -133,7 +135,7 @@ func TestDPoPReplayRejected(t *testing.T) {
 	dpopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	jti := uuid.New().String()
-	proof := buildDPoPProof(t, dpopKey, http.MethodPost, testIssuer+"/oauth2/token", jti)
+	proof := buildDPoPProof(t, dpopKey, http.MethodPost, testServer.URL+"/oauth2/token", jti)
 
 	body := map[string]any{
 		"grant_type":    "client_credentials",
@@ -164,7 +166,7 @@ func TestDPoPRejectsHTMMismatch(t *testing.T) {
 	dpopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	// Build a proof claiming GET, then send POST.
-	proof := buildDPoPProof(t, dpopKey, http.MethodGet, testIssuer+"/oauth2/token", uuid.New().String())
+	proof := buildDPoPProof(t, dpopKey, http.MethodGet, testServer.URL+"/oauth2/token", uuid.New().String())
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
