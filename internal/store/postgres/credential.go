@@ -20,9 +20,12 @@ func NewCredentialRepository(db *bun.DB) *CredentialRepository {
 	return &CredentialRepository{db: db}
 }
 
-// Create inserts a new issued credential.
+// Create inserts a new issued credential. Participates in a caller-provided
+// transaction via postgres.WithTx(ctx, tx); falls through to a single
+// auto-commit insert otherwise.
 func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCredential) error {
-	_, err := r.db.NewInsert().Model(cred).Exec(ctx)
+	db := dbOrTx(ctx, r.db)
+	_, err := db.NewInsert().Model(cred).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create credential: %w", err)
 	}
@@ -32,7 +35,8 @@ func (r *CredentialRepository) Create(ctx context.Context, cred *domain.IssuedCr
 // GetByID retrieves a credential by its UUID.
 func (r *CredentialRepository) GetByID(ctx context.Context, id, accountID, projectID string) (*domain.IssuedCredential, error) {
 	cred := &domain.IssuedCredential{}
-	err := r.db.NewSelect().Model(cred).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(cred).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -46,7 +50,8 @@ func (r *CredentialRepository) GetByID(ctx context.Context, id, accountID, proje
 // GetByJTI retrieves a credential by its JWT ID (jti claim).
 func (r *CredentialRepository) GetByJTI(ctx context.Context, jti string) (*domain.IssuedCredential, error) {
 	cred := &domain.IssuedCredential{}
-	err := r.db.NewSelect().Model(cred).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(cred).
 		Where("jti = ?", jti).
 		Scan(ctx)
 	if err != nil {
@@ -58,7 +63,8 @@ func (r *CredentialRepository) GetByJTI(ctx context.Context, jti string) (*domai
 // ListByIdentity returns all credentials for a given identity.
 func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
 	var creds []*domain.IssuedCredential
-	err := r.db.NewSelect().Model(&creds).
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&creds).
 		Where("identity_id = ?", identityID).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -66,6 +72,25 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list credentials: %w", err)
+	}
+	return creds, nil
+}
+
+// ListByMissionID returns every credential in the delegation tree for the
+// given mission_id, ordered root → leaves (delegation_depth ASC, then
+// issued_at ASC for ties at the same depth). Issue #81. The partial
+// index added in migration 017 makes this an indexed equality lookup.
+func (r *CredentialRepository) ListByMissionID(ctx context.Context, missionID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
+	var creds []*domain.IssuedCredential
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&creds).
+		Where("mission_id = ?", missionID).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		OrderExpr("delegation_depth ASC, issued_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list credentials by mission: %w", err)
 	}
 	return creds, nil
 }
@@ -79,7 +104,8 @@ func (r *CredentialRepository) ListByIdentity(ctx context.Context, identityID, a
 func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
 	now := time.Now()
 	var count int64
-	if err := r.db.NewRaw(
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewRaw(
 		"SELECT revoke_credentials_cascade(?, ?, ?)",
 		identityID, now, reason,
 	).Scan(ctx, &count); err != nil {
@@ -95,7 +121,8 @@ func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, i
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) error {
 	now := time.Now()
 	var count int64
-	if err := r.db.NewRaw(
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewRaw(
 		"SELECT revoke_credential_cascade(?, ?, ?, ?, ?)",
 		id, accountID, projectID, now, reason,
 	).Scan(ctx, &count); err != nil {

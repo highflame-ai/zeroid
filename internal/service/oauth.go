@@ -10,14 +10,16 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -44,6 +46,9 @@ type OAuthService struct {
 	// governance binding is not configured for this deployment — every
 	// existing flow then behaves identically to pre-#59 ZeroID.
 	governanceSvc *GovernanceService
+	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
+	// Wired after construction via SetBackchannelService.
+	backchannelSvc *BackchannelService
 }
 
 // SetGovernanceService attaches a GovernanceService so that token_exchange
@@ -131,6 +136,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 	s.trustedServiceValidator = v
 }
 
+// SetBackchannelService wires the CIBA service after construction. Two-phase
+// wiring avoids a circular dependency: BackchannelService needs CredentialService
+// (which OAuthService already has) but OAuthService also needs to dispatch into
+// BackchannelService for the CIBA grant.
+func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
+	s.backchannelSvc = bc
+}
+
 // RegisterGrant registers a custom grant type handler on the OAuth service.
 func (s *OAuthService) RegisterGrant(name string, handler CustomGrantHandler) {
 	if s.customGrants == nil {
@@ -172,6 +185,8 @@ type TokenRequest struct {
 	// TrustedService is true when the caller has been authenticated as a trusted
 	// internal service (via AdminAuth middleware). Required for external principal exchange.
 	TrustedService bool
+	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
+	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -189,6 +204,14 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.authorizationCode(ctx, req)
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
+	case string(domain.GrantTypeCIBA):
+		if s.backchannelSvc == nil {
+			return nil, oauthBadRequest("unsupported_grant_type", "CIBA is not enabled on this deployment")
+		}
+		return s.backchannelSvc.Redeem(ctx, RedeemInput{
+			AuthReqID: req.AuthReqID,
+			ClientID:  req.ClientID,
+		})
 	default:
 		// Check custom grant handlers registered via RegisterGrant.
 		if handler, ok := s.customGrants[req.GrantType]; ok {
@@ -213,13 +236,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 
 	// Ensure client_credentials grant is permitted.
-	allowed := false
-	for _, gt := range client.GrantTypes {
-		if gt == "client_credentials" {
-			allowed = true
-			break
-		}
-	}
+	allowed := slices.Contains(client.GrantTypes, "client_credentials")
 	if !allowed {
 		return nil, oauthBadRequest("unauthorized_client", "client not authorized for client_credentials grant")
 	}
@@ -236,11 +253,24 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 	}
+	if identity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+	}
+
+	// Resolve the identity policy — the authority ceiling. Without this
+	// the chokepoint can't enforce TTL, scope, delegation-depth, trust-
+	// level, or policy-expiry caps for client_credentials. Mirrors the
+	// pattern used in jwt_bearer / token_exchange / api_key.
+	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+	if err != nil {
+		return nil, oauthServerError("failed to resolve identity credential policy", err)
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		Scopes:    scopes,
-		GrantType: domain.GrantTypeClientCredentials,
+		Identity:         identity,
+		IdentityPolicyID: policy.ID,
+		Scopes:           scopes,
+		GrantType:        domain.GrantTypeClientCredentials,
 	})
 	if err != nil {
 		return nil, err
@@ -257,13 +287,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.Subject); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT uses an unsupported algorithm", err)
+	}
+
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
 	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT is malformed", err)
 	}
 
-	wimseURI := peeked.Issuer()
+	wimseURI, _ := peeked.Issuer()
 	if wimseURI == "" {
 		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing iss claim")
 	}
@@ -282,6 +317,9 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "agent identity is suspended or deactivated")
 	}
+	if identity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+	}
 	if identity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
 	}
@@ -293,7 +331,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 
 	// Fully validate the assertion JWT against the agent's registered public key.
 	assertionToken, err := jwt.Parse([]byte(req.Subject),
-		jwt.WithKey(jwa.ES256, agentPubKey),
+		jwt.WithKey(jwa.ES256(), agentPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),
 	)
@@ -302,7 +340,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// iss must match the identity's WIMSE URI.
-	if assertionToken.Issuer() != identity.WIMSEURI {
+	if iss, _ := assertionToken.Issuer(); iss != identity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
 	}
 
@@ -362,7 +400,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequestCause("invalid_grant", "subject_token validation failed", err)
 	}
 
-	subjectJTI := subjectParsed.JwtID()
+	subjectJTI, _ := subjectParsed.JwtID()
 	if subjectJTI == "" {
 		return nil, oauthBadRequest("invalid_grant", "subject_token missing jti claim")
 	}
@@ -374,12 +412,16 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := jwtalg.Validate(req.ActorToken); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", "actor_token uses an unsupported algorithm", err)
+	}
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
 	}
 
-	actorWIMSEURI := actorPeeked.Issuer()
+	actorWIMSEURI, _ := actorPeeked.Issuer()
 	if actorWIMSEURI == "" {
 		return nil, oauthBadRequest("invalid_grant", "actor_token missing iss claim")
 	}
@@ -403,6 +445,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if !actorIdentity.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "actor identity is suspended or deactivated")
 	}
+	if actorIdentity.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+	}
 	if actorIdentity.PublicKeyPEM == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
 	}
@@ -414,14 +459,14 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	validatedActorToken, err := jwt.Parse([]byte(req.ActorToken),
-		jwt.WithKey(jwa.ES256, actorPubKey),
+		jwt.WithKey(jwa.ES256(), actorPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
 	}
-	if validatedActorToken.Issuer() != actorIdentity.WIMSEURI {
+	if iss, _ := validatedActorToken.Issuer(); iss != actorIdentity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
 	}
 
@@ -471,11 +516,23 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
+	// jwx v4: jwt.Get[float64] replaces the v2 Token.Get + assertion. JSON
+	// numbers decode as float64 regardless of integer intent.
 	var parentDepth int
-	if v, ok := subjectParsed.Get("delegation_depth"); ok {
-		if d, ok := v.(float64); ok {
-			parentDepth = int(d)
-		}
+	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
+		parentDepth = int(d)
+	}
+
+	delegatedBy, _ := subjectParsed.Subject()
+
+	// Resolve mission_id from the subject_token (issue #81). Prefer the
+	// explicit mission_id claim; fall back to the subject_token's own jti
+	// for credentials issued before the denormalisation landed (the subject
+	// IS a mission root by definition). Either way, the new credential
+	// inherits the same mission so the whole tree shares one identifier.
+	missionID, _ := jwt.Get[string](subjectParsed, "mission_id")
+	if missionID == "" {
+		missionID = subjectJTI
 	}
 
 	// Step 6: Governance binding (issue #59). If a DRM is configured for
@@ -483,7 +540,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// pair is permitted by the active DRM. Bind drm_hash + catalog_hash
 	// into the issued credential so post-hoc audit can identify which
 	// governance version authorized the delegation.
-	govReq, err := s.resolveGovernance(ctx, accountID, projectID, subjectParsed.Subject(), actorIdentity.WIMSEURI)
+	govReq, err := s.resolveGovernance(ctx, accountID, projectID, delegatedBy, actorIdentity.WIMSEURI)
 	if err != nil {
 		return nil, err
 	}
@@ -497,9 +554,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		IdentityPolicyID:      actorPolicy.ID,
 		Scopes:                scopes,
 		GrantType:             domain.GrantTypeTokenExchange,
-		DelegatedBy:           subjectParsed.Subject(),
+		DelegatedBy:           delegatedBy,
 		ParentJTI:             subjectJTI,
 		DelegationDepth:       parentDepth + 1,
+		MissionID:             missionID,
 		DRMVersion:            govReq.DRMVersion,
 		DRMHash:               govReq.DRMHash,
 		ConstraintCatalogVer:  govReq.CatalogVersion,
@@ -605,6 +663,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		if !resolved.Status.IsUsable() {
 			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
 		}
+		if resolved.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
 		identity = resolved
 	} else {
 		identity = &domain.Identity{
@@ -613,6 +674,19 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			IdentityType: domain.IdentityTypeService,
 			Status:       domain.IdentityStatusActive,
 		}
+	}
+
+	// Resolve the identity policy when we have a real identity row.
+	// Without this the chokepoint can't enforce policy expiry, allowed
+	// scopes, max TTL, or any other policy axis — the synthetic carrier
+	// branch above has no identity row so no policy to resolve.
+	var identityPolicyID string
+	if identity.ID != "" {
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
 	}
 
 	// Step 4: Build custom claims for the external principal.
@@ -633,16 +707,17 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeTokenExchange,
-		Scopes:          scopes,
-		UseRS256:        true,
-		SubjectOverride: req.UserID,
-		UserEmail:       req.UserEmail,
-		UserName:        req.UserName,
-		ApplicationID:   req.ApplicationID,
-		TTL:             900, // 15 minutes — short-lived for external principals
-		CustomClaims:    customClaims,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeTokenExchange,
+		Scopes:           scopes,
+		UseRS256:         true,
+		SubjectOverride:  req.UserID,
+		UserEmail:        req.UserEmail,
+		UserName:         req.UserName,
+		ApplicationID:    req.ApplicationID,
+		TTL:              900, // 15 minutes — short-lived for external principals
+		CustomClaims:     customClaims,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
@@ -672,6 +747,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
 	if err != nil {
+		// GetByKeyHash already filters on state=active and rejects keys past
+		// their expires_at — both surface as a not-found from the caller's
+		// perspective. No service-layer expiry check needed.
 		return nil, oauthBadRequestCause("invalid_grant", "invalid api key", err)
 	}
 
@@ -686,6 +764,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			identity = nil
 		} else if !identity.Status.IsUsable() {
 			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		} else if identity.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
 		}
 	}
 
@@ -754,6 +834,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// owner_user_id is set from Identity.OwnerUserID automatically.
 		// The creator is the acting user (the developer using the SDK right now).
 		ActingUserID: sk.CreatedBy,
+		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
+		// must never mint a 30-day token even if the identity policy allows.
+		CredentialExpiresAt: sk.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
@@ -813,13 +896,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	// Verify the client is authorised to use the authorization_code grant.
-	grantAllowed := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeAuthorizationCode) {
-			grantAllowed = true
-			break
-		}
-	}
+	grantAllowed := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode))
 	if !grantAllowed {
 		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
 	}
@@ -860,13 +937,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	// Determine access token TTL.
 	// Priority: per-client config > grant-type-based default > server default.
-	hasRefreshGrant := false
-	for _, g := range oauthClient.GrantTypes {
-		if g == string(domain.GrantTypeRefreshToken) {
-			hasRefreshGrant = true
-			break
-		}
-	}
+	hasRefreshGrant := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken))
 
 	ttl := oauthClient.AccessTokenTTL
 	if ttl <= 0 {
@@ -877,11 +948,39 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		}
 	}
 
-	// Auth code JWT is self-contained — tenant context comes from the auth code.
+	// Resolve the carrier identity. The default is a synthetic stub (this
+	// is a human session — sub will be authCode.UserID, no identity row to
+	// gate on). When the OAuth client is explicitly bound to an agent
+	// identity via oauthClient.IdentityID, look that identity up and gate
+	// on its status + expires_at the same way jwt_bearer and api_key paths
+	// do. The link is then forwarded into RefreshTokenParams.IdentityID so
+	// the refresh path inherits the same gate without re-discovering it.
 	identity := &domain.Identity{
 		AccountID: authCode.AccountID,
 		ProjectID: authCode.ProjectID,
 		Status:    domain.IdentityStatusActive,
+	}
+	// identityPolicyID is non-empty only when the OAuth client is bound to
+	// an agent identity — synthetic-carrier human sessions have no
+	// identity row and therefore no policy to resolve.
+	var identityPolicyID string
+	if oauthClient.IdentityID != nil && *oauthClient.IdentityID != "" {
+		linked, err := s.identitySvc.repo.GetByID(ctx, *oauthClient.IdentityID, authCode.AccountID, authCode.ProjectID)
+		if err != nil {
+			return nil, oauthBadRequestCause("invalid_grant", "oauth client linked to unknown identity", err)
+		}
+		if !linked.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
+		if linked.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
+		identity = linked
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
 	}
 
 	// Governance binding (issue #59). authorization_code represents
@@ -904,6 +1003,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:              identity,
+		IdentityPolicyID:      identityPolicyID,
 		GrantType:             domain.GrantTypeAuthorizationCode,
 		UseRS256:              true,
 		SubjectOverride:       authCode.UserID,
@@ -928,12 +1028,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
-			ClientID:  req.ClientID,
-			AccountID: authCode.AccountID,
-			ProjectID: authCode.ProjectID,
-			UserID:    authCode.UserID,
-			Scopes:    strings.Join(authCode.Scopes, " "),
-			TTL:       oauthClient.RefreshTokenTTL,
+			ClientID:   req.ClientID,
+			AccountID:  authCode.AccountID,
+			ProjectID:  authCode.ProjectID,
+			UserID:     authCode.UserID,
+			IdentityID: oauthClient.IdentityID,
+			Scopes:     strings.Join(authCode.Scopes, " "),
+			TTL:        oauthClient.RefreshTokenTTL,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -1018,19 +1119,50 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
 	}
 
+	// Identity gate. The link came from the OAuth client at authorization_code
+	// time and was persisted on the refresh_token row. When present, the
+	// linked identity's status + expires_at gate refresh-grant issuance the
+	// same way they gate every other grant. When absent, this is a human
+	// session with no identity row to check and we fall through to the
+	// synthetic carrier.
 	identity := &domain.Identity{
 		AccountID: oldToken.AccountID,
 		ProjectID: oldToken.ProjectID,
 		Status:    domain.IdentityStatusActive,
 	}
+	var identityPolicyID string
+	if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
+		linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
+		if err != nil {
+			return nil, oauthBadRequestCause("invalid_grant", "refresh token references unknown identity", err)
+		}
+		if !linked.Status.IsUsable() {
+			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		}
+		if linked.IsExpired() {
+			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		}
+		identity = linked
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
+	}
 
+	// Inherit scopes from the original refresh token. Without this the
+	// refreshed access token would be issued with no scopes (or default
+	// scopes), breaking the contract that refresh preserves the original
+	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeRefreshToken,
-		UseRS256:        true,
-		SubjectOverride: oldToken.UserID,
-		ApplicationID:   oldToken.ClientID,
-		TTL:             accessTTL,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeRefreshToken,
+		UseRS256:         true,
+		SubjectOverride:  oldToken.UserID,
+		ApplicationID:    oldToken.ClientID,
+		TTL:              accessTTL,
+		Scopes:           parseScopeString(oldToken.Scopes),
 	})
 	if err != nil {
 		return nil, err
@@ -1075,7 +1207,7 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 		return inactive, nil // malformed, expired, or invalid — return active:false, no error
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 	if jti == "" {
 		return inactive, nil
 	}
@@ -1090,41 +1222,37 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 
 	scopes := cred.Scopes
 
+	// jwx v4: every accessor returns (value, present). Capture once and unix
+	// only the timestamp pair; missing iat/exp falls through as zero, which
+	// is acceptable because parseToken(validate=true) already enforced exp.
+	sub, _ := parsed.Subject()
+	iss, _ := parsed.Issuer()
+	iat, _ := parsed.IssuedAt()
+	exp, _ := parsed.Expiration()
 	result := map[string]any{
 		"active":     true,
-		"sub":        parsed.Subject(),
-		"iss":        parsed.Issuer(),
+		"sub":        sub,
+		"iss":        iss,
 		"jti":        jti,
-		"iat":        parsed.IssuedAt().Unix(),
-		"exp":        parsed.Expiration().Unix(),
+		"iat":        iat.Unix(),
+		"exp":        exp.Unix(),
 		"scope":      strings.Join(scopes, " "),
 		"account_id": cred.AccountID,
 		"project_id": cred.ProjectID,
 	}
 
-	if v, ok := parsed.Get("agent_id"); ok {
-		result["agent_id"] = v
-	}
-	if v, ok := parsed.Get("trust_level"); ok {
-		result["trust_level"] = v
-	}
-	if v, ok := parsed.Get("identity_type"); ok {
-		result["identity_type"] = v
-	}
-	if v, ok := parsed.Get("external_id"); ok {
-		result["external_id"] = v
-	}
-	if v, ok := parsed.Get("delegation_depth"); ok {
-		result["delegation_depth"] = v
-	}
-	if v, ok := parsed.Get("act"); ok {
-		result["act"] = v
+	// Custom claims via the v4 generic accessor. jwt.Get[any] survives both
+	// string and structured shapes (e.g. act is a nested object).
+	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act"} {
+		if v, err := jwt.Get[any](parsed, claim); err == nil {
+			result[claim] = v
+		}
 	}
 	// Governance binding claims (issue #59). Pass through only when
 	// present — every existing introspection response keeps its shape
 	// for tokens that pre-date governance binding.
 	for _, claim := range []string{"drm_version", "drm_hash", "constraint_catalog_version", "constraint_catalog_hash"} {
-		if v, ok := parsed.Get(claim); ok {
+		if v, err := jwt.Get[string](parsed, claim); err == nil && v != "" {
 			result[claim] = v
 		}
 	}
@@ -1142,7 +1270,7 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 		return nil // malformed or invalid — treat as not found per RFC 7009 section 2.2
 	}
 
-	jti := parsed.JwtID()
+	jti, _ := parsed.JwtID()
 	if jti == "" {
 		return nil
 	}
@@ -1165,6 +1293,12 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // the token's kid + alg headers to the correct key automatically.
 // If validate is true, expiry/nbf checks are enforced; if false, only signature is checked.
 func (s *OAuthService) parseToken(tokenStr string, validate bool) (jwt.Token, error) {
+	// Belt-and-braces. WithKeySet trusts the key's own alg, so this isn't
+	// exploitable today — but if the bundle ever ships a key without alg,
+	// the verifier's fallback widens. Cheaper to gate up-front.
+	if err := jwtalg.Validate(tokenStr); err != nil {
+		return nil, err
+	}
 	return jwt.Parse([]byte(tokenStr),
 		jwt.WithKeySet(s.jwksSvc.KeySet()),
 		jwt.WithValidate(validate),

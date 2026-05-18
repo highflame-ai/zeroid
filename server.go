@@ -26,6 +26,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
@@ -70,6 +71,7 @@ type Server struct {
 	signalSvc           *service.SignalService
 	apiKeySvc           *service.APIKeyService
 	agentSvc            *service.AgentService
+	backchannelSvc      *service.BackchannelService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
 
@@ -102,8 +104,6 @@ func NewServer(cfg Config) (*Server, error) {
 	// Initialize OpenTelemetry.
 	if err := telemetry.Init(telemetry.Config{
 		Enabled:      cfg.Telemetry.Enabled,
-		Endpoint:     cfg.Telemetry.Endpoint,
-		Insecure:     cfg.Telemetry.Insecure,
 		ServiceName:  cfg.Telemetry.ServiceName,
 		SamplingRate: cfg.Telemetry.SamplingRate,
 	}); err != nil {
@@ -145,6 +145,7 @@ func NewServer(cfg Config) (*Server, error) {
 	identityRepo := postgres.NewIdentityRepository(db)
 	credentialRepo := postgres.NewCredentialRepository(db)
 	attestationRepo := postgres.NewAttestationRepository(db)
+	attestationPolicyRepo := postgres.NewAttestationPolicyRepository(db)
 	signalRepo := postgres.NewSignalRepository(db)
 	proofRepo := postgres.NewProofRepository(db)
 	oauthClientRepo := postgres.NewOAuthClientRepository(db)
@@ -153,6 +154,23 @@ func NewServer(cfg Config) (*Server, error) {
 	refreshTokenRepo := postgres.NewRefreshTokenRepository(db)
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
+	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
+
+	// Build the attestation verifier registry. Real verifiers are wired
+	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
+	// proof types have no real verifier yet, so the stub is the only way
+	// to exercise demo flows that submit them. Production deployments
+	// leave AllowUnsafeDevStub off and those proof types stay unimplemented.
+	attestationVerifiers := attestation.NewRegistry()
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	if cfg.Attestation.AllowUnsafeDevStub {
+		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeImageHash))
+		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeTPM))
+	}
+	log.Info().
+		Interface("proof_types", attestationVerifiers.ProofTypes()).
+		Msg("Attestation verifiers registered")
 
 	// Initialize services.
 	// Construction order matters because identitySvc now depends on
@@ -168,7 +186,8 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc)
+	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
+	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
@@ -194,11 +213,25 @@ func NewServer(cfg Config) (*Server, error) {
 	governanceSvc := service.NewGovernanceService(drmRepo, catalogRepo, credentialRepo, signalSvc, jwksSvc)
 	oauthSvc.SetGovernanceService(governanceSvc)
 
+	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
+	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
+	// dispatches from oauthSvc.Token() into BackchannelService.Redeem, which in
+	// turn calls credentialSvc.IssueCredential. Two-phase wiring breaks the
+	// otherwise-circular dependency cleanly.
+	backchannelCfg := service.DefaultBackchannelConfig()
+	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
+	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
+	// registration-time check (in OAuthClientService.RegisterClient) and the
+	// request-time check (in BackchannelService.CreateAuthRequest) agree.
+	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
+	oauthSvc.SetBackchannelService(backchannelSvc)
+
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
-		attestationSvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, governanceSvc, jwksSvc, db,
+		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, governanceSvc, jwksSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
@@ -308,10 +341,11 @@ func NewServer(cfg Config) (*Server, error) {
 		signalSvc:           signalSvc,
 		apiKeySvc:           apiKeySvc,
 		agentSvc:            agentSvc,
+		backchannelSvc:      backchannelSvc,
 		jwksSvc:             jwksSvc,
 		refreshTokenSvc:     refreshTokenSvc,
 		governanceSvc:       governanceSvc,
-		cleanupWorker:       worker.NewCleanupWorker(db, time.Hour),
+		cleanupWorker:       worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
 		catalogSignerWorker: worker.NewCatalogSignerWorker(catalogRepo, governanceSvc, 24*time.Hour),
 		adminAuthState:      authState,
 		globalMWState:       globalMW,
@@ -323,6 +357,12 @@ func NewServer(cfg Config) (*Server, error) {
 			IdleTimeout:  idleTimeout,
 		},
 	}
+
+	// Wire the identity-expiry sweep into the cleanup worker. Done after
+	// Server construction so the worker holds a live IdentityService whose
+	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
+	// resolved.
+	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
 
 	return srv, nil
 }
@@ -380,6 +420,13 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.workerCancel != nil {
 		s.workerCancel()
+	}
+
+	// Cancel the CIBA backchannel service's lifecycle context so detached
+	// notifier goroutines wind down with the server rather than leaking
+	// past the HTTP listener close.
+	if s.backchannelSvc != nil {
+		s.backchannelSvc.Stop()
 	}
 
 	var firstErr error
@@ -468,6 +515,75 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.fn = middleware
 }
 
+// SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA
+// authentication request is created. ZeroID ships no built-in notifier; pass
+// a deployer-supplied function that delivers the approval prompt out-of-band
+// (push, email, SMS, voice). The notifier is invoked on a goroutine so its
+// latency cannot block the bc-authorize response; errors are logged and
+// recorded on the request row (last_notify_error) for operator debugging.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	if fn == nil {
+		s.backchannelSvc.SetNotifier(nil)
+		return
+	}
+	s.backchannelSvc.SetNotifier(func(ctx context.Context, n service.BackchannelNotification) error {
+		return fn(ctx, BackchannelNotification{
+			AuthReqID:      n.AuthReqID,
+			AccountID:      n.AccountID,
+			ProjectID:      n.ProjectID,
+			ClientID:       n.ClientID,
+			LoginHint:      n.LoginHint,
+			Scope:          n.Scope,
+			BindingMessage: n.BindingMessage,
+			ExpiresAt:      n.ExpiresAt,
+		})
+	})
+}
+
+// SetBackchannelNotifyDispatchSync forces synchronous notifier dispatch.
+// Test-only — production must keep async dispatch (the default) so notifier
+// latency cannot block the bc-authorize response.
+func (s *Server) SetBackchannelNotifyDispatchSync(sync bool) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetNotifyDispatchSync(sync)
+}
+
+// SetAttestationPermissive flips the missing-policy bypass on the attestation
+// verify path at runtime. The initial value is taken from
+// cfg.Attestation.AllowUnsafeDevStub at NewServer time; this setter is the
+// escape hatch for integration tests that need to exercise both modes against
+// the same server instance. Production deployments should set the flag via
+// configuration and never call this.
+func (s *Server) SetAttestationPermissive(enabled bool) {
+	s.attestationSvc.SetPermissive(enabled)
+}
+
+// SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used
+// for CIBA ping callbacks. Tests inject a capturing RoundTripper here so
+// they can assert on the outbound request without standing up a real
+// httptest listener. Pass nil to restore the default transport.
+func (s *Server) SetBackchannelPingTransport(rt http.RoundTripper) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetPingTransport(rt)
+}
+
+// SetBackchannelPingDispatchSync forces synchronous ping dispatch — test-only.
+func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetPingDispatchSync(sync)
+}
+
 // SetTrustedServiceValidator sets the validator used during external principal
 // token exchange (RFC 8693) to verify the caller is a trusted internal service.
 // The validator reads from context (populated by deployer-provided global middleware
@@ -483,6 +599,14 @@ func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
 // Router returns the chi.Router for custom route mounting.
 func (s *Server) Router() chi.Router {
 	return s.router
+}
+
+// RunCleanupOnce runs a single pass of the cleanup worker — credential /
+// proof / auth-code row deletes plus the identity-expiry sweep. Exposed so
+// integration tests can drive a deterministic sweep without spinning up
+// the periodic loop. Production callers should let Start manage timing.
+func (s *Server) RunCleanupOnce(ctx context.Context) {
+	s.cleanupWorker.RunOnce(ctx)
 }
 
 // SetHandler overrides the HTTP handler used by the server.
@@ -513,22 +637,24 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	if err != nil {
 		// Client doesn't exist — create it.
 		_, _, regErr := s.oauthClientSvc.RegisterClient(ctx, service.RegisterClientRequest{
-			ClientID:                cfg.ClientID,
-			Name:                    cfg.Name,
-			Description:             cfg.Description,
-			Confidential:            cfg.Confidential,
-			TokenEndpointAuthMethod: cfg.TokenEndpointAuthMethod,
-			GrantTypes:              cfg.GrantTypes,
-			Scopes:                  cfg.Scopes,
-			RedirectURIs:            cfg.RedirectURIs,
-			AccessTokenTTL:          cfg.AccessTokenTTL,
-			RefreshTokenTTL:         cfg.RefreshTokenTTL,
-			JWKSURI:                 cfg.JWKSURI,
-			JWKS:                    cfg.JWKS,
-			SoftwareID:              cfg.SoftwareID,
-			SoftwareVersion:         cfg.SoftwareVersion,
-			Contacts:                cfg.Contacts,
-			Metadata:                cfg.Metadata,
+			ClientID:                     cfg.ClientID,
+			Name:                         cfg.Name,
+			Description:                  cfg.Description,
+			Confidential:                 cfg.Confidential,
+			TokenEndpointAuthMethod:      cfg.TokenEndpointAuthMethod,
+			GrantTypes:                   cfg.GrantTypes,
+			Scopes:                       cfg.Scopes,
+			RedirectURIs:                 cfg.RedirectURIs,
+			AccessTokenTTL:               cfg.AccessTokenTTL,
+			RefreshTokenTTL:              cfg.RefreshTokenTTL,
+			JWKSURI:                      cfg.JWKSURI,
+			JWKS:                         cfg.JWKS,
+			SoftwareID:                   cfg.SoftwareID,
+			SoftwareVersion:              cfg.SoftwareVersion,
+			Contacts:                     cfg.Contacts,
+			Metadata:                     cfg.Metadata,
+			ClientNotificationEndpoint:   cfg.ClientNotificationEndpoint,
+			BackchannelTokenDeliveryMode: cfg.BackchannelTokenDeliveryMode,
 		})
 
 		return regErr
@@ -564,6 +690,14 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	}
 	if cfg.RefreshTokenTTL > 0 && cfg.RefreshTokenTTL != existing.RefreshTokenTTL {
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
+		updated = true
+	}
+	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
+		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
+		updated = true
+	}
+	if cfg.BackchannelTokenDeliveryMode != "" && cfg.BackchannelTokenDeliveryMode != existing.BackchannelTokenDeliveryMode {
+		existing.BackchannelTokenDeliveryMode = cfg.BackchannelTokenDeliveryMode
 		updated = true
 	}
 
@@ -607,7 +741,11 @@ func initLogging(logLevel string) {
 func initDatabase(databaseURL string, maxOpenConns, maxIdleConns int) (*bun.DB, error) {
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(databaseURL)))
 
-	if err := sqldb.Ping(); err != nil {
+	// Tolerate transient cross-service startup races (postgres still
+	// binding 5432 while we boot in parallel) instead of fatal-quitting
+	// on first Ping. Bounded retry; genuine misconfig still surfaces
+	// after the budget elapses.
+	if err := database.WaitForReachable(context.Background(), sqldb, database.WaitOptions{}); err != nil {
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
@@ -674,6 +812,7 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/token":            {},
 	"/oauth2/token/introspect": {},
 	"/oauth2/token/revoke":     {},
+	"/oauth2/bc-authorize":     {},
 }
 
 // mediaTypeEquals parses a Content-Type header and reports whether the media

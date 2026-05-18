@@ -41,7 +41,13 @@ type CredentialOutput struct {
 }
 
 type CredentialListInput struct {
-	IdentityID string `query:"identity_id" required:"true" doc:"Filter by identity UUID"`
+	// Either IdentityID or MissionID must be supplied. IdentityID returns
+	// every credential held by an identity. MissionID returns every
+	// credential in a delegation tree (issue #81), ordered by
+	// delegation_depth ASC then created_at ASC so the chain reads from
+	// root to leaves.
+	IdentityID string `query:"identity_id" doc:"Filter by identity UUID"`
+	MissionID  string `query:"mission_id"  doc:"Filter by mission_id (delegation-tree-scoped opaque identifier; see issue #81)"`
 }
 
 type CredentialListOutput struct {
@@ -167,9 +173,25 @@ func (a *API) listCredentialsOp(ctx context.Context, input *CredentialListInput)
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	creds, err := a.credSvc.ListCredentials(ctx, input.IdentityID, tenant.AccountID, tenant.ProjectID)
+	hasIdentity := input.IdentityID != ""
+	hasMission := input.MissionID != ""
+	if hasIdentity == hasMission {
+		// Either both empty (no filter — refuse to dump every credential)
+		// or both set (ambiguous intent).
+		return nil, huma.Error400BadRequest("exactly one of identity_id or mission_id is required")
+	}
+
+	var creds []*domain.IssuedCredential
+	if hasMission {
+		creds, err = a.credSvc.ListCredentialsByMission(ctx, input.MissionID, tenant.AccountID, tenant.ProjectID)
+	} else {
+		creds, err = a.credSvc.ListCredentials(ctx, input.IdentityID, tenant.AccountID, tenant.ProjectID)
+	}
 	if err != nil {
-		log.Error().Err(err).Str("identity_id", input.IdentityID).Msg("failed to list credentials")
+		log.Error().Err(err).
+			Str("identity_id", input.IdentityID).
+			Str("mission_id", input.MissionID).
+			Msg("failed to list credentials")
 		return nil, huma.Error500InternalServerError("failed to list credentials")
 	}
 

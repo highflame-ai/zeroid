@@ -41,6 +41,7 @@ var allValidGrantTypes = map[GrantType]bool{
 	GrantTypeAPIKey:            true,
 	GrantTypeAuthorizationCode: true,
 	GrantTypeRefreshToken:      true,
+	GrantTypeCIBA:              true,
 }
 
 // NormalizeGrantType converts a grant type string to its canonical short form.
@@ -90,4 +91,10 @@ type IssuedCredential struct {
 	// Constraint Catalog document active at issuance (issue #59). Empty
 	// when no catalog is configured for the tenant.
 	ConstraintCatalogHash string `bun:"constraint_catalog_hash,type:varchar(80)" json:"constraint_catalog_hash,omitempty"`
+	// MissionID is a stable, opaque identifier for a delegation tree —
+	// equal to the root credential's JTI today; consumers MUST treat it
+	// as opaque so the population scheme can evolve. Denormalised onto
+	// every credential in the tree so workflow-scoped audit queries are
+	// O(1) instead of walking the parent_jti chain. Issue #81.
+	MissionID string `bun:"mission_id,type:varchar(255),nullzero" json:"mission_id,omitempty"`
 }

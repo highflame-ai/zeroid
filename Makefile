@@ -1,8 +1,13 @@
-.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test
+.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
 KEYS_DIR := ./keys
+
+# jwx v4 requires the experimental encoding/json/v2 stack (Go 1.26+).
+# Exporting here so every recipe inherits it; CI does the same via GOEXPERIMENT
+# in pr-check.yml / release.yml.
+export GOEXPERIMENT = jsonv2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -52,6 +57,14 @@ cli-dev: cli-install ## Run CLI from source (no build needed)
 
 cli-test: cli-install ## Run CLI tests
 	cd cli && npm test
+
+next-version: ## Print svu-computed next semver from commits since last v* tag
+	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
+	@echo "current : $$(svu current)"
+	@echo "next    : $$(svu next)"
+	@echo
+	@echo "Use 'gh release create \$$(svu next) --generate-notes' to cut the release."
+	@echo "(Workflow guardrail in release.yml will fail any tag below this value.)"
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)

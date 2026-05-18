@@ -87,12 +87,13 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 ## Features
 
 - **Agent Identity Registry** — Register agents, MCP servers, services, and applications as first-class entities. Classify by role (`orchestrator`, `autonomous`, `tool_agent`), enrich with metadata (`framework`, `version`, `publisher`, `capabilities`), assign trust levels, and manage the full lifecycle: register → activate → deactivate → de-provision.
-- **OAuth 2.1 Token Issuance** — Full OAuth 2.1 support: `client_credentials`, `jwt_bearer` (RFC 7523), `token_exchange` (RFC 8693) for delegation, `api_key`, `authorization_code` (PKCE), `refresh_token`.
+- **OAuth 2.1 Token Issuance** — Full OAuth 2.1 support: `client_credentials`, `jwt_bearer` (RFC 7523), `token_exchange` (RFC 8693) for delegation, `api_key`, `authorization_code` (PKCE), `refresh_token`, `urn:openid:params:grant-type:ciba` (OpenID CIBA Core 1.0).
+- **CIBA Backchannel Approval** — OpenID Client-Initiated Backchannel Authentication (CIBA Core 1.0). Agent posts to `/oauth2/bc-authorize` with a `binding_message`; the deployer's `BackchannelNotifier` prompts the end user out-of-band (email, Slack, mobile push); user approves or denies; agent receives the resulting token via poll, ping callback, or push delivery. SSRF-guarded outbound callbacks, per-tenant audit, single-use `auth_req_id`s.
 - **On-Behalf-Of (OBO) Delegation** — RFC 8693 token exchange with automatic scope attenuation at each hop, delegation depth tracking, and cascade revocation when any upstream credential is revoked. The `act` claim carries the full chain per RFC 8693, closing the auditability gap that plagues shared service accounts.
 - **WIMSE/SPIFFE URIs** — Stable, globally unique identity URIs: `spiffe://{domain}/{account}/{project}/{type}/{id}` for every agent. Tokens carry the WIMSE URI as `sub`, so every downstream system receives a meaningful, verifiable identity—not just a client ID.
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
 - **Continuous Access Evaluation (CAE)** — Revoke credentials in real time when risk signals fire via the OpenID Shared Signals Framework (SSF). Revoke the orchestrator's credential and the entire downstream chain is invalidated immediately—no waiting for token expiry.
-- **Attestation Framework** — Software, platform, and hardware attestation to bootstrap or elevate trust levels before credentials are issued.
+- **Attestation Framework** — Pluggable verifiers behind a fail-closed contract: software, platform, and hardware attestation elevate trust levels before credentials are issued. Ships with an OIDC verifier (GitHub Actions, GCP Workload Identity, Kubernetes projected SA tokens, etc.) plus per-tenant `AttestationPolicy` for issuer allowlisting and claim binding. Full reference: [`docs/attestation.md`](docs/attestation.md).
 - **WIMSE Proof Tokens** — Single-use, nonce-bound tokens for service-to-service verification and replay protection.
 
 ---
@@ -110,6 +111,7 @@ ZeroID covers every agentic deployment pattern — from a single autonomous agen
 | **Multi-hop agent chain** | `token_exchange` chained | No | Sub-agent delegates further to a tool agent (depth 2), and so on. `delegation_depth` increments at each hop. `CredentialPolicy.max_delegation_depth` caps how far the chain can go. The full `act` claim chain is preserved at every level. |
 | **Service-to-service (no user context)** | `client_credentials` | No | Agent authenticates as itself with no user association. Used for background jobs, scheduled tasks, and internal services where no human delegation chain exists. |
 | **Long-running / async agent** | `refresh_token` | No | Agent refreshes its access token without re-authenticating. Used for agents executing multi-day workflows where the original access token would otherwise expire. |
+| **Out-of-band user approval** | `urn:openid:params:grant-type:ciba` (OpenID CIBA Core 1.0) | Yes, asynchronous | Agent calls `/oauth2/bc-authorize` with `login_hint` + `binding_message`. The deployer's `BackchannelNotifier` prompts the user out-of-band (email, Slack, mobile push). User approves or denies. Agent retrieves the token via poll, ping callback, or push delivery. Token `sub` = approving user; `backchannel_client_id` identifies the initiating agent. |
 
 **Revocation works across all flows.** A single `revoke` call on any token in a chain invalidates it and everything downstream, in real time.
 
@@ -256,25 +258,66 @@ When an orchestrator needs a specialized agent to handle part of a task, it dele
 
 This is the key difference from sharing credentials: the sub-agent has its own registered identity and its own keypair. It proves it holds that keypair by signing a short-lived JWT assertion (`actor_token`). ZeroID verifies both tokens and issues a delegated token that carries both identities.
 
+The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`examples/openclaw/agent-identity-sidecar.py:450`](./examples/openclaw/agent-identity-sidecar.py).
+
 <details>
 <summary>Python</summary>
 
 ```python
-# Register the sub-agent — it has its own identity, separate from the orchestrator
+# ── One-time helpers (define once, reuse across delegate calls) ──────────
+import base64, json, time, uuid
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+ZEROID_ISSUER = "http://localhost:8899"  # set to your ZeroID base URL
+
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def generate_ec_keypair() -> tuple[str, str]:
+    """Generate an ES256 (P-256) keypair. Returns (private_pem, public_pem)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    private_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    public_pem = key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+    return private_pem, public_pem
+
+def build_jwt_assertion(private_pem: str, wimse_uri: str) -> str:
+    """Sign a 5-minute ES256 JWT assertion proving the holder of private_pem."""
+    key = serialization.load_pem_private_key(private_pem.encode(), password=None)
+    now = int(time.time())
+    header = _b64url(json.dumps({"alg": "ES256", "typ": "JWT"}).encode())
+    payload = _b64url(json.dumps({
+        "iss": wimse_uri, "sub": wimse_uri, "aud": ZEROID_ISSUER,
+        "iat": now, "exp": now + 300, "jti": uuid.uuid4().hex,
+    }).encode())
+    der = key.sign(f"{header}.{payload}".encode(), ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    sig = _b64url(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+    return f"{header}.{payload}.{sig}"
+
+# ── Tutorial flow ────────────────────────────────────────────────────────
+# Generate the sub-agent's keypair. Register the public PEM with ZeroID;
+# keep the private PEM in your secret store — it never leaves the agent.
+sub_agent_private_key, sub_agent_public_key = generate_ec_keypair()
+
 sub_agent = client.agents.register(
     name="Data Fetcher",
     external_id="data-fetcher",
     sub_type="tool_agent",
     trust_level="first_party",
+    public_key_pem=sub_agent_public_key,    # required for token_exchange
 )
 
 # The sub-agent proves it holds its private key by signing a JWT assertion.
-actor_token = build_jwt_assertion(
-    iss=sub_agent.identity.wimse_uri,
-    sub=sub_agent.identity.wimse_uri,
-    aud="https://auth.highflame.ai",
-    private_key_pem=sub_agent_private_key,
-)
+actor_token = build_jwt_assertion(sub_agent_private_key, sub_agent.identity.wimse_uri)
 
 # Delegate data:read to the sub-agent.
 # ZeroID enforces scope intersection — the sub-agent can only receive scopes
@@ -290,6 +333,65 @@ delegated = client.tokens.delegate(
 #   act.sub:          spiffe://.../agent/orchestrator-1 ← which agent delegated (RFC 8693)
 #   scope:            data:read                         ← capped by intersection
 #   delegation_depth: 1
+```
+
+</details>
+
+<details>
+<summary>TypeScript</summary>
+
+```typescript
+import { ZeroIDClient } from "@highflame/sdk";
+import { SignJWT, generateKeyPair, exportJWK, importJWK } from "jose";
+import { randomUUID, createPublicKey } from "node:crypto";
+
+const ZEROID_ISSUER = "http://localhost:8899"; // set to your ZeroID base URL
+
+// ── One-time helpers ────────────────────────────────────────────────────
+async function generateEcKeypair(): Promise<{ privateJwk: object; publicPem: string }> {
+  const { privateKey, publicKey } = await generateKeyPair("ES256", { extractable: true });
+  const privateJwk = await exportJWK(privateKey);
+  const publicJwk = await exportJWK(publicKey);
+  const publicPem = createPublicKey({ key: publicJwk as never, format: "jwk" }).export({
+    type: "spki",
+    format: "pem",
+  }) as string;
+  return { privateJwk, publicPem };
+}
+
+async function buildJwtAssertion(privateJwk: object, wimseUri: string): Promise<string> {
+  const key = await importJWK(privateJwk as never, "ES256");
+  return new SignJWT({})
+    .setProtectedHeader({ alg: "ES256", typ: "JWT" })
+    .setIssuer(wimseUri)
+    .setSubject(wimseUri)
+    .setAudience(ZEROID_ISSUER)
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .setJti(randomUUID())
+    .sign(key);
+}
+
+// ── Tutorial flow ──────────────────────────────────────────────────────
+const { privateJwk: subAgentPrivateKey, publicPem: subAgentPublicKey } =
+  await generateEcKeypair();
+
+const subAgent = await client.agents.register({
+  name: "Data Fetcher",
+  external_id: "data-fetcher",
+  sub_type: "tool_agent",
+  trust_level: "first_party",
+  public_key_pem: subAgentPublicKey, // required for token_exchange
+});
+
+const actorToken = await buildJwtAssertion(subAgentPrivateKey, subAgent.identity.wimse_uri);
+
+const delegated = await client.tokens.delegate({
+  actor_token: actorToken,
+  scope: "data:read",
+});
+// delegated.access_token carries sub=data-fetcher, act.sub=orchestrator-1,
+// scope=data:read, delegation_depth=1
 ```
 
 </details>
@@ -477,20 +579,26 @@ remediator   = client.agents.register(name="Firewall Agent",
 
 # Each agent runs with its own client, initialized with its own api_key.
 # delegate() uses the client's internally managed token as the subject.
+# `build_jwt_assertion` and `generate_ec_keypair` are defined in §2 above.
 monitor_client      = ZeroIDClient(base_url="...", api_key=monitor.api_key)
 investigator_client = ZeroIDClient(base_url="...", api_key=investigator.api_key)
+
+# Each sub-agent has its own keypair; the public PEM was registered when the
+# identity was created (omitted above for brevity — pass public_key_pem=...).
+investigator_private_key, _ = generate_ec_keypair()
+remediator_private_key,   _ = generate_ec_keypair()
 
 # Monitor detects anomaly → delegates log investigation (depth 1)
 # Scope is attenuated — investigator gets read access only, not firewall:write
 investigator_token = monitor_client.tokens.delegate(
-    actor_token=build_jwt_assertion(investigator.identity.wimse_uri, investigator_private_key),
+    actor_token=build_jwt_assertion(investigator_private_key, investigator.identity.wimse_uri),
     scope="logs:read logs:query",
 )
 # investigator_token: sub=log-investigator, act.sub=sec-monitor, depth=1
 
 # Investigator confirms breach → delegates remediation (depth 2, at the cap)
 remediator_token = investigator_client.tokens.delegate(
-    actor_token=build_jwt_assertion(remediator.identity.wimse_uri, remediator_private_key),
+    actor_token=build_jwt_assertion(remediator_private_key, remediator.identity.wimse_uri),
     scope="firewall:write",
 )
 # remediator_token: sub=fw-remediator, act.sub=log-investigator, depth=2
@@ -512,9 +620,12 @@ client.agents.deactivate(monitor.identity.id)
 ```python
 # Alice authenticates via authorization_code + PKCE
 # Her user token is exchanged so the assistant can act on her behalf
+# `build_jwt_assertion` and `generate_ec_keypair` are defined in §2 above.
+# The public PEM was registered when the identity was created (pass public_key_pem=...).
+assistant_private_key, _ = generate_ec_keypair()
 assistant_token = client.tokens.issue_token_exchange(
     subject_token=alice_user_token,      # alice's authorization_code-issued token
-    actor_token=build_jwt_assertion(assistant.identity.wimse_uri, assistant_private_key),
+    actor_token=build_jwt_assertion(assistant_private_key, assistant.identity.wimse_uri),
     scope="calendar:read travel:book expenses:submit",
 )
 # assistant_token: sub=travel-assistant, act.sub=alice@company.com, depth=1
@@ -551,6 +662,50 @@ def handle_query_database(request_headers: dict, query: str) -> dict:
 
 ---
 
+### Pattern 6: Agent pauses for out-of-band user approval (CIBA)
+
+**Scenario:** An autonomous agent needs to perform a high-trust action — read a user's email, transfer money, deploy to production — and must obtain real-time consent from the human owner before proceeding. The agent and the human are not in the same session; the human may not even be online when the agent starts.
+
+**The problem without ZeroID:** There is no standard way for a backend agent to request "ask the user" without standing up a custom approval queue, push-notification pipeline, and reconciliation logic. Most teams hand-roll this and end up with no audit trail.
+
+**With ZeroID:** OpenID CIBA Core 1.0 is the standard for this. The agent posts to `/oauth2/bc-authorize` with a `binding_message` describing the action. The deployer's `BackchannelNotifier` delivers the prompt out-of-band (email, Slack, mobile push). When the user approves, the agent retrieves a scoped, audit-trailed token via poll, ping callback, or push delivery.
+
+```bash
+# 1. Agent initiates the request — supplies the user identifier (login_hint),
+#    requested scope, and a human-readable binding_message the user will see
+#    in the approval prompt.
+curl -s -X POST https://auth.highflame.ai/oauth2/bc-authorize \
+  -d 'client_id=alice-agent' \
+  -d 'login_hint=alice@example.com' \
+  -d 'scope=gmail:read' \
+  -d 'binding_message=alice-agent wants to read your unread Gmail'
+# → {"auth_req_id":"…","expires_in":300,"interval":5}
+
+# 2. Deployer's BackchannelNotifier (configured via Server.SetBackchannelNotifier)
+#    pushes an approval prompt to Alice — typically email or Slack with
+#    one-click Approve / Deny buttons.
+
+# 3. Agent polls /oauth2/token until the user resolves the request. Poll
+#    returns one of: authorization_pending, slow_down, access_denied,
+#    expired_token, or — on approval — the access token.
+curl -s -X POST https://auth.highflame.ai/oauth2/token \
+  -d 'grant_type=urn:openid:params:grant-type:ciba' \
+  -d 'auth_req_id=<auth_req_id>' \
+  -d 'client_id=alice-agent'
+# After Alice approves:
+# {
+#   "access_token": "...",       ← sub = alice@example.com, backchannel_client_id = alice-agent
+#   "token_type": "Bearer",
+#   "expires_in": 900
+# }
+```
+
+**Ping mode** delivers a callback to the client's registered `client_notification_endpoint` the moment the user resolves — agents that don't want to poll can wait for the ping and then call `/oauth2/token` once. **Push mode** delivers the full access token to the callback directly. Both modes require `backchannel_token_delivery_mode` set on the client at registration; the callback endpoint is SSRF-guarded.
+
+**Why this matters:** Every CIBA approval produces a token whose `sub` is the approving user and whose `backchannel_client_id` claim identifies the agent that asked. Downstream systems get a real, attributable consent trail — "alice-agent acted with Alice's explicit approval at 14:32, with binding message X" — without you building approval infrastructure.
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -558,7 +713,7 @@ graph TD
     subgraph ZEROID ["ZeroID"]
         direction TB
         IR[Identity Registry] --> CS[Credential Service<br/><i>ES256 signing · Policy enforcement · Audit</i>]
-        OG[OAuth2 Grants<br/><i>client_credentials · jwt_bearer · api_key<br/>authorization_code · refresh_token</i>] --> CS
+        OG[OAuth2 Grants<br/><i>client_credentials · jwt_bearer · api_key<br/>authorization_code · refresh_token · ciba</i>] --> CS
         DL[Delegation Engine<br/><i>RFC 8693 token_exchange</i>] --> CS
 
         CS --> AT[Attestation]
@@ -594,6 +749,7 @@ graph TD
 | Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI | `act.sub` = orchestrator URI |
 | CLI (`authorization_code`) | RS256 | 90 days | User ID | — |
 | MCP (`authorization_code` + refresh) | RS256 | 1 hour | User ID | — |
+| CIBA (`urn:openid:params:grant-type:ciba`) | RS256 | 15 min | Approving user ID | `email`, `name`, `backchannel_client_id`, `token_exchange="ciba"` |
 
 ---
 
@@ -607,12 +763,15 @@ graph TD
 | GET | `/ready` | Readiness check |
 | GET | `/.well-known/jwks.json` | JWKS public keys |
 | GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata |
-| POST | `/oauth2/token` | Issue token (6 grant types) |
+| POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
 | POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
+| POST | `/oauth2/bc-authorize` | CIBA backchannel authorization request (OpenID CIBA Core §7) |
 | GET | `/oauth2/token/verify` | Forward-auth endpoint for reverse proxies (nginx `auth_request`, Caddy `forward_auth`) |
 
-### Admin (`/api/v1/*` — protect at network layer)
+### Admin (protect at network layer)
+
+Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit under `/oauth2/bc-authorize/{auth_req_id}/*` because the deployer's user-auth gateway authenticates the end user before forwarding to them.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -632,11 +791,18 @@ graph TD
 | GET | `/api/v1/credential-policies/{id}` | Get credential policy |
 | PATCH | `/api/v1/credential-policies/{id}` | Update credential policy |
 | POST | `/api/v1/credentials/{id}/revoke` | Revoke credential |
-| POST | `/api/v1/attestations` | Submit attestation |
+| POST | `/api/v1/attestation/submit` | Submit attestation proof |
+| POST | `/api/v1/attestation/verify` | Verify proof + promote trust + issue credential |
+| GET | `/api/v1/attestation/{id}` | Get attestation record |
+| PUT | `/api/v1/attestation-policies` | Upsert per-tenant attestation policy |
+| GET | `/api/v1/attestation-policies` | List attestation policies |
+| DELETE | `/api/v1/attestation-policies/{id}` | Delete attestation policy |
 | POST | `/api/v1/signals/ingest` | Ingest CAE signal |
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
 | POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
+| POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
+| POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
 Full interactive docs at `GET /docs` when running.
 
@@ -660,6 +826,7 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |
+| CIBA | OpenID CIBA Core 1.0 | Out-of-band user approval for agent-initiated actions (poll / ping / push) |
 
 ---
 
@@ -672,9 +839,9 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Structured errors — `ZeroIDError.code` / `.message` / `.status` with OAuth2 error codes across all three SDKs
 - Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
 - Ecosystem integrations (LangGraph, CrewAI, Strands)
+- **CIBA (Client-Initiated Backchannel Authentication)** — full OpenID CIBA Core 1.0 server-side flow with poll, ping, and push delivery modes; deployer-pluggable `BackchannelNotifier` for out-of-band user prompts (email, Slack, push); SSRF-guarded outbound callbacks
 
 **Planned**
-- CIBA (Client-Initiated Backchannel Authentication) — agents pause long-running workflows and request out-of-band user authorization without blocking
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
 - `zeroid` CLI
 - GitHub Actions OIDC upstream validator — stamp `environment=ci` claims verified against GitHub's JWKS

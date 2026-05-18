@@ -1,4 +1,4 @@
--- 014_governance_artifacts.up.sql
+-- 023_governance_artifacts.up.sql
 -- Adds Decision-Rights Matrix (DRM) and Constraint Catalog version tables
 -- per issue #59. Both artifacts are append-only governance records whose
 -- SHA-256 hashes are bound into delegation tokens at issuance time so that

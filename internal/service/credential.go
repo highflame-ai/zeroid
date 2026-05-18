@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -103,6 +103,18 @@ type IssueRequest struct {
 	DRMHash               string
 	ConstraintCatalogVer  string
 	ConstraintCatalogHash string
+	// CredentialExpiresAt is the upper bound on the issued token's exp claim
+	// derived from the credential material itself — typically the API key's
+	// expires_at for api_key grants. The chokepoint clamps TTL by
+	// min(CredentialExpiresAt, Identity.ExpiresAt) so the JWT exp never
+	// outlives the authority. Nil means "no per-credential bound."
+	CredentialExpiresAt *time.Time
+	// MissionID is the delegation-tree-scoped opaque identifier (issue #81).
+	// Empty on first issuance — IssueCredential will default it to the new
+	// credential's own JTI (this credential becomes the root of a new
+	// mission). Non-empty on token_exchange — the caller has resolved the
+	// subject_token's mission and is propagating it down the chain.
+	MissionID string
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -121,7 +133,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		return nil, nil, fmt.Errorf("identity is required")
 	}
 	if !req.Identity.Status.IsUsable() {
-		return nil, nil, fmt.Errorf("identity is not usable (status: %s)", req.Identity.Status)
+		return nil, nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, req.Identity.Status)
+	}
+	if req.Identity.IsExpired() {
+		// Fail-closed even when the cleanup worker hasn't yet swept the
+		// identity into status=deactivated. The check at this chokepoint
+		// is what guarantees no grant path can mint a token past the
+		// authority's expiry window, regardless of worker timing.
+		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
 	}
 
 	ttl := req.TTL
@@ -130,6 +149,52 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if ttl > s.maxTTL {
 		ttl = s.maxTTL
+	}
+	// Clamp TTL by the authority's remaining lifetime. A JWT whose exp
+	// claim outlives its authority window would still verify locally
+	// (tokens.verify() doesn't check revocation) for the gap between
+	// authority-expiry and JWT-exp. Clamping here makes time-bound
+	// authority an enforced invariant on the issued token itself, not
+	// just on the cascade-revocation side.
+	//
+	// Both bounds (identity + per-credential) are min-combined with the
+	// requested TTL. Already-expired authority short-circuits to error
+	// — the IsExpired() check above caught the identity case; here we
+	// defend against per-credential expiry that the chokepoint doesn't
+	// otherwise see.
+	clampNow := time.Now()
+	if req.Identity.ExpiresAt != nil {
+		remaining := int(req.Identity.ExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			// Debug level: a busy agent making frequent requests near its
+			// expiry would emit this on every issuance — that's normal
+			// near-end-of-life behavior, not something operators need
+			// flagged at Info. Enable debug logging when diagnosing
+			// surprises about shorter-than-expected token lifetimes.
+			log.Debug().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("identity_remaining_seconds", remaining).
+				Msg("clamping token TTL to identity remaining lifetime")
+			ttl = remaining
+		}
+	}
+	if req.CredentialExpiresAt != nil {
+		remaining := int(req.CredentialExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return nil, nil, fmt.Errorf("%w: credential expired at %s", domain.ErrCredentialExpired, req.CredentialExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			log.Debug().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("credential_remaining_seconds", remaining).
+				Msg("clamping token TTL to credential remaining lifetime")
+			ttl = remaining
+		}
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
@@ -243,6 +308,16 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	jti := uuid.New().String()
 
+	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
+	// from the subject_token; first-issuance grants leave it empty and we
+	// default to this credential's own JTI — making this credential the
+	// root of a new delegation tree. The value is opaque to consumers; the
+	// "happens to be a JTI" detail must not leak through any API.
+	missionID := req.MissionID
+	if missionID == "" {
+		missionID = jti
+	}
+
 	// Build JWT
 	token := jwt.New()
 	_ = token.Set(jwt.IssuerKey, s.issuer)
@@ -257,6 +332,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	_ = token.Set("account_id", req.Identity.AccountID)
 	_ = token.Set("project_id", req.Identity.ProjectID)
 	_ = token.Set("grant_type", string(req.GrantType))
+	_ = token.Set("mission_id", missionID)
 
 	// Identity claims.
 	_ = token.Set("external_id", req.Identity.ExternalID)
@@ -344,17 +420,20 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
-	// kid is included in the JWS header so verifiers can select the correct key from JWKS.
+	// kid lets verifiers pick the right key from the JWKS; typ=JWT is per
+	// JWT-SVID §3 (jwx doesn't default it).
 	var signed []byte
 	var signErr error
 	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.RSAKeyID())
-		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256, s.jwksSvc.RSAPrivateKey(), jws.WithProtectedHeaders(hdrs)))
+		_ = hdrs.Set(jws.TypeKey, "JWT")
+		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256(), s.jwksSvc.RSAPrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	} else {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
-		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256, s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
+		_ = hdrs.Set(jws.TypeKey, "JWT")
+		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256(), s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	}
 	if signErr != nil {
 		return nil, nil, fmt.Errorf("failed to sign JWT: %w", signErr)
@@ -378,6 +457,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		DelegatedByWIMSEURI:   req.DelegatedBy,
 		DRMHash:               req.DRMHash,
 		ConstraintCatalogHash: req.ConstraintCatalogHash,
+		MissionID:             missionID,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
@@ -387,6 +467,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	log.Info().
 		Str("jti", jti).
 		Str("identity_id", req.Identity.ID).
+		Str("mission_id", missionID).
 		Int("ttl_seconds", ttl).
 		Msg("Credential issued")
 
@@ -410,6 +491,14 @@ func (s *CredentialService) GetCredential(ctx context.Context, id, accountID, pr
 // ListCredentials returns credentials for a given identity.
 func (s *CredentialService) ListCredentials(ctx context.Context, identityID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
 	return s.repo.ListByIdentity(ctx, identityID, accountID, projectID)
+}
+
+// ListCredentialsByMission returns every credential in the delegation tree
+// keyed by missionID, ordered by delegation_depth ASC then created_at ASC
+// so the chain reads from root to leaves. Issue #81: O(1) replacement for
+// the recursive parent_jti walk.
+func (s *CredentialService) ListCredentialsByMission(ctx context.Context, missionID, accountID, projectID string) ([]*domain.IssuedCredential, error) {
+	return s.repo.ListByMissionID(ctx, missionID, accountID, projectID)
 }
 
 // RevokeCredential revokes a credential by ID.

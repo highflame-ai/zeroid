@@ -1,4 +1,4 @@
--- 014_governance_artifacts.down.sql
+-- 023_governance_artifacts.down.sql
 
 DROP INDEX IF EXISTS idx_issued_credentials_catalog_hash;
 DROP INDEX IF EXISTS idx_issued_credentials_drm_hash;

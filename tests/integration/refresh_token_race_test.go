@@ -56,10 +56,8 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 	)
 	start := make(chan struct{})
 
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range concurrency {
+		wg.Go(func() {
 			<-start
 			status, body := rotateRaw(t, refreshToken)
 			if status == http.StatusOK {
@@ -76,7 +74,7 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 			} else {
 				atomic.AddInt32(&failures, 1)
 			}
-		}()
+		})
 	}
 
 	close(start)

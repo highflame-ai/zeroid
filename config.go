@@ -21,15 +21,54 @@ const DefaultAdminPathPrefix = "/api/v1"
 
 // Config holds the complete ZeroID service configuration.
 type Config struct {
-	Server    ServerConfig    `koanf:"server"`
-	Database  DatabaseConfig  `koanf:"database"`
-	Keys      KeysConfig      `koanf:"keys"`
-	Token     TokenConfig     `koanf:"token"`
-	Telemetry TelemetryConfig `koanf:"telemetry"`
-	Logging   LoggingConfig   `koanf:"logging"`
+	Server      ServerConfig      `koanf:"server"`
+	Database    DatabaseConfig    `koanf:"database"`
+	Keys        KeysConfig        `koanf:"keys"`
+	Token       TokenConfig       `koanf:"token"`
+	Telemetry   TelemetryConfig   `koanf:"telemetry"`
+	Logging     LoggingConfig     `koanf:"logging"`
+	Attestation AttestationConfig `koanf:"attestation"`
+	Backchannel BackchannelConfig `koanf:"backchannel"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+}
+
+// BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
+// are optional; defaults are applied in service.DefaultBackchannelConfig().
+type BackchannelConfig struct {
+	// AllowPrivateNotificationEndpoints relaxes the SSRF guard on CIBA
+	// outbound notification destinations. Default false (production-safe).
+	//
+	// When false, registered client_notification_endpoint hosts are resolved
+	// and rejected if they (or any of their resolved IPs) fall in private,
+	// loopback, link-local, multicast, CGN, or unspecified ranges. Re-checked
+	// at request time as DNS-rebinding defense.
+	//
+	// When true, the guard is disabled — only HTTPS scheme + non-empty host
+	// are enforced. Use ONLY in single-tenant test/dev deployments that
+	// register endpoints like https://localhost:9000/. Production deployments
+	// MUST keep this false (see GHSA-599q-j34m-33vc).
+	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+}
+
+// AttestationConfig governs the attestation verification subsystem. The
+// real verifier path (OIDC) is always wired and fail-closed without a
+// tenant-configured AttestationPolicy. AllowUnsafeDevStub controls
+// whether a permissive stub covers the proof types whose real verifier
+// hasn't shipped yet (image_hash, tpm).
+type AttestationConfig struct {
+	// AllowUnsafeDevStub, when true, registers a stub verifier that
+	// accepts any submitted proof for image_hash and tpm. Prints a
+	// loud startup warning whenever it's installed.
+	//
+	// Default is true today: until image_hash / tpm real verifiers
+	// land, the stub is the only way demo flows that submit those
+	// proof types keep working — flipping the default to false would
+	// hard-reject them. Deployments that don't use image_hash or tpm
+	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
+	// (the only real verifier shipped) is unaffected by this flag.
+	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -107,10 +146,9 @@ type TokenConfig struct {
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
+// Endpoint and TLS are delegated to the OTel SDK via standard env vars
 type TelemetryConfig struct {
 	Enabled      bool    `koanf:"enabled"`
-	Endpoint     string  `koanf:"endpoint"`
-	Insecure     bool    `koanf:"insecure"`
 	ServiceName  string  `koanf:"service_name"`
 	SamplingRate float64 `koanf:"sampling_rate"`
 }
@@ -177,6 +215,49 @@ func (c *Config) Validate() error {
 	if c.Database.MaxIdleConns < 0 || c.Database.MaxIdleConns > c.Database.MaxOpenConns {
 		return fmt.Errorf("database.max_idle_conns must be between 0 and max_open_conns, got %d", c.Database.MaxIdleConns)
 	}
+	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
+		return fmt.Errorf("wimse_domain: %w", err)
+	}
+	return nil
+}
+
+// validateWIMSEDomain enforces the SPIFFE §2.2 trust-domain shape — lowercase
+// RFC 1123 hostname, no scheme. Catching it at startup is the difference
+// between a clean error and minting unparseable SPIFFE IDs forever.
+func validateWIMSEDomain(s string) error {
+	if s == "" {
+		return fmt.Errorf("trust domain is required")
+	}
+	// Common misconfig: someone copies a full SPIFFE ID into the env var.
+	if strings.HasPrefix(s, "spiffe://") {
+		return fmt.Errorf("must be a bare DNS name, not a SPIFFE URI (drop the spiffe:// prefix)")
+	}
+	if len(s) > 253 {
+		return fmt.Errorf("must be at most 253 characters, got %d", len(s))
+	}
+	// Manual walk over a regex — error messages can name the offending label.
+	for _, label := range strings.Split(s, ".") {
+		if label == "" {
+			return fmt.Errorf("must not contain empty label (consecutive dots or leading/trailing dot in %q)", s)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("label %q exceeds 63 characters", label)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("label %q must not start or end with a hyphen", label)
+		}
+		// Range over runes so a multi-byte UTF-8 char gets reported as itself
+		// rather than as the leading byte.
+		for _, r := range label {
+			switch {
+			case r >= 'a' && r <= 'z':
+			case r >= '0' && r <= '9':
+			case r == '-':
+			default:
+				return fmt.Errorf("label %q contains character %q (allowed: a-z 0-9 -, lowercase only)", label, r)
+			}
+		}
+	}
 	return nil
 }
 
@@ -215,13 +296,17 @@ func loadDefaults(k *koanf.Koanf) error {
 
 		// Telemetry
 		"telemetry.enabled":       false,
-		"telemetry.endpoint":      "localhost:4317",
-		"telemetry.insecure":      true,
 		"telemetry.service_name":  "zeroid",
 		"telemetry.sampling_rate": 1.0,
 
 		// Admin path prefix
 		"server.admin_path_prefix": DefaultAdminPathPrefix,
+
+		// Attestation — dev stub on by default until image_hash / tpm
+		// real verifiers ship. Override with
+		// ZEROID_ALLOW_UNSAFE_DEV_STUB=false for deployments that don't
+		// submit those proof types (or once real verifiers land).
+		"attestation.allow_unsafe_dev_stub": true,
 
 		// Logging
 		"logging.level": "info",
@@ -269,10 +354,13 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
 
-		// Telemetry
-		"OTEL_EXPORTER_OTLP_ENDPOINT": "telemetry.endpoint",
-		"OTEL_ENABLED":                "telemetry.enabled",
-		"OTEL_INSECURE":               "telemetry.insecure",
+		// Attestation
+		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
+
+		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
+		// directly by the OTel SDK (spec-compliant).
+		"OTEL_ENABLED":            "telemetry.enabled",
+		"OTEL_TRACES_SAMPLER_ARG": "telemetry.sampling_rate",
 
 		// Logging
 		"ZEROID_LOG_LEVEL": "logging.level",
@@ -285,7 +373,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		}
 
 		switch {
-		case strings.HasSuffix(configPath, ".enabled") || strings.HasSuffix(configPath, ".insecure"):
+		case strings.HasSuffix(configPath, ".enabled") ||
+			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
 			if boolVal, err := strconv.ParseBool(value); err == nil {
 				_ = k.Set(configPath, boolVal)
 			}

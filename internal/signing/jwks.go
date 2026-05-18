@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 )
 
@@ -64,7 +64,7 @@ func NewJWKSService(privateKeyPath, publicKeyPath, keyID string) (*JWKSService, 
 	}
 
 	keySet := jwk.NewSet()
-	if err := addToKeySet(keySet, pubKey, keyID, jwa.ES256); err != nil {
+	if err := addToKeySet(keySet, pubKey, keyID, jwa.ES256(), "sig"); err != nil {
 		return nil, fmt.Errorf("failed to add EC key to JWKS: %w", err)
 	}
 
@@ -120,7 +120,7 @@ func (s *JWKSService) LoadRSAKeys(privateKeyPath, publicKeyPath, keyID string) e
 		return fmt.Errorf("public key is not RSA")
 	}
 
-	if err := addToKeySet(s.keySet, rsaPubKey, keyID, jwa.RS256); err != nil {
+	if err := addToKeySet(s.keySet, rsaPubKey, keyID, jwa.RS256(), "sig"); err != nil {
 		return fmt.Errorf("failed to add RSA key to JWKS: %w", err)
 	}
 
@@ -172,9 +172,19 @@ func (s *JWKSService) KeySet() jwk.Set {
 	return s.keySet
 }
 
-// addToKeySet creates a JWK from a public key and adds it to the set.
-func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.SignatureAlgorithm) error {
-	jwkKey, err := jwk.FromRaw(pubKey)
+// addToKeySet creates a JWK from a public key and adds it to the set. The
+// use parameter is set verbatim. All current callers pass "sig" because
+// lestrrat-go/jwx's keySetProvider.selectKey (jws/key_provider.go:115-121
+// in v4) hardcodes a check that rejects keys whose use is anything other
+// than "" or "sig". The SPIFFE JWT-SVID §6 value "JWT-SVID" remains
+// unreachable until either jwx relaxes the check upstream or we switch
+// our verifier off WithKeySet to manual per-kid key lookup. Tracked as
+// the jwx-compatibility blocker on issue #43.
+func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.SignatureAlgorithm, use string) error {
+	// jwx v4: Import[T Key] replaces the v2 FromRaw constructor. Using the
+	// Key interface as T yields a generic jwk.Key whose concrete type is
+	// chosen by the import dispatcher based on the raw key's Go type.
+	jwkKey, err := jwk.Import[jwk.Key](pubKey)
 	if err != nil {
 		return fmt.Errorf("failed to create JWK from public key: %w", err)
 	}
@@ -184,7 +194,13 @@ func addToKeySet(set jwk.Set, pubKey crypto.PublicKey, keyID string, alg jwa.Sig
 	if err := jwkKey.Set(jwk.AlgorithmKey, alg); err != nil {
 		return fmt.Errorf("failed to set algorithm: %w", err)
 	}
-	if err := jwkKey.Set(jwk.KeyUsageKey, jwk.ForSignature); err != nil {
+	// In-memory keys keep use=sig because lestrrat-go/jwx's verifier skips
+	// any key whose use is set to anything other than "sig". The standard
+	// /.well-known/jwks.json publishes them unchanged (RFC 7517 §4.2, the
+	// value stock OIDC / JWT libraries accept); the separate
+	// /.well-known/spiffe-trust-bundle.json handler rewrites use to
+	// "JWT-SVID" so SPIFFE-strict consumers see the value JWT-SVID §4 requires.
+	if err := jwkKey.Set(jwk.KeyUsageKey, use); err != nil {
 		return fmt.Errorf("failed to set key usage: %w", err)
 	}
 	if err := set.AddKey(jwkKey); err != nil {

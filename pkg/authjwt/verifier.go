@@ -9,9 +9,9 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/lestrrat-go/jwx/v2/jwa"
-	"github.com/lestrrat-go/jwx/v2/jws"
-	"github.com/lestrrat-go/jwx/v2/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog"
 )
 
@@ -31,8 +31,8 @@ var (
 // allowedAlgorithms restricts which signing algorithms are accepted.
 // Prevents algorithm confusion attacks.
 var allowedAlgorithms = map[jwa.SignatureAlgorithm]struct{}{
-	jwa.RS256: {},
-	jwa.ES256: {},
+	jwa.RS256(): {},
+	jwa.ES256(): {},
 }
 
 // Verifier validates ZeroID-issued JWTs using a remote JWKS.
@@ -72,7 +72,11 @@ type VerifierConfig struct {
 }
 
 // NewVerifier creates a Verifier that validates tokens against a remote JWKS.
-// Performs an initial synchronous JWKS fetch — returns error if unreachable.
+//
+// Returns an error only for config-level problems (empty JWKSURL). The initial
+// JWKS fetch is best-effort — if the issuer is briefly unreachable at startup
+// (cross-service race during cluster bootstrap), the verifier still returns
+// successfully and the JWKS will be fetched lazily on the first Verify() call.
 // Call Close() to release resources.
 func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 	if cfg.JWKSURL == "" {
@@ -128,7 +132,22 @@ func (v *Verifier) Verify(ctx context.Context, tokenString string) (*Claims, err
 func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, error) {
 	keySet := v.jwks.KeySet()
 	if keySet == nil || keySet.Len() == 0 {
-		return nil, ErrNoKeySet
+		// Cold path: the initial fetch failed (or hasn't run yet) and no
+		// background refresh has populated the cache. Try once synchronously
+		// before failing the verification — this is the lazy fetch that lets
+		// startup races resolve themselves on first use.
+		if err := v.jwks.EnsureLoaded(ctx); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrNoKeySet, err)
+		}
+		keySet = v.jwks.KeySet()
+		if keySet == nil || keySet.Len() == 0 {
+			return nil, ErrNoKeySet
+		}
+	}
+
+	// Reject alg=none / HS* before any further work — JWT-SVID §3.
+	if err := validateAlg(tokenString); err != nil {
+		return nil, err
 	}
 
 	// Parse and validate in one step. WithKeySet uses kid+alg to select the key.
@@ -146,13 +165,15 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 
 	token, err := jwt.Parse([]byte(tokenString), parseOpts...)
 	if err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired()) {
+		// jwx v4 swapped the function-style sentinels (ErrTokenExpired() etc.)
+		// for typed error structs that satisfy errors.Is via their (*Is) method.
+		if errors.Is(err, jwt.TokenExpiredError{}) {
 			return nil, fmt.Errorf("%w: %v", ErrExpiredToken, err)
 		}
-		if errors.Is(err, jwt.ErrInvalidIssuer()) {
+		if errors.Is(err, jwt.InvalidIssuerError{}) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidIssuer, err)
 		}
-		if errors.Is(err, jwt.ErrInvalidAudience()) {
+		if errors.Is(err, jwt.InvalidAudienceError{}) {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidAudience, err)
 		}
 		return nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
@@ -178,8 +199,13 @@ func (v *Verifier) checkAlgorithm(tokenString string) error {
 	if len(sigs) == 0 {
 		return fmt.Errorf("%w: no signatures", ErrInvalidToken)
 	}
-	alg := sigs[0].ProtectedHeaders().Algorithm()
-	if _, ok := allowedAlgorithms[alg]; !ok {
+	// jwx v4: Headers.Algorithm() returns (alg, present); a header without
+	// alg is rejected here so we never let a malformed JOSE through.
+	alg, ok := sigs[0].ProtectedHeaders().Algorithm()
+	if !ok {
+		return fmt.Errorf("%w: missing alg header", ErrInvalidToken)
+	}
+	if _, allowed := allowedAlgorithms[alg]; !allowed {
 		return fmt.Errorf("%w: %s", ErrUnsupportedAlg, alg)
 	}
 	return nil
@@ -260,5 +286,7 @@ func extractKID(tokenString string) string {
 	if len(sigs) == 0 {
 		return ""
 	}
-	return sigs[0].ProtectedHeaders().KeyID()
+	// jwx v4: KeyID() returns (string, present); absent kid → empty.
+	kid, _ := sigs[0].ProtectedHeaders().KeyID()
+	return kid
 }

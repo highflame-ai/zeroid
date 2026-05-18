@@ -32,9 +32,13 @@
     "tsx": "^4",
     "typescript": "^5.4",
     "typescript-eslint": "^8",
-    "vitest": "^2"
+    "vitest": "^3"
   },
   "engines": {
     "node": ">=18"
+  },
+  "overrides": {
+    "vite": "^6.4.2",
+    "postcss": "^8.5.10"
   }
 }

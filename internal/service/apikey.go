@@ -45,8 +45,14 @@ type CreateAPIKeyRequest struct {
 	Product            string
 	Scopes             []string
 	Environment        string
-	ExpiresInDays      *int
-	Metadata           json.RawMessage
+	// ExpiresInDays sets expires_at = now + N days. Mutually exclusive with
+	// ExpiresAt — when both are set, ExpiresAt wins. ExpiresInDays kept for
+	// backward compat with existing callers.
+	ExpiresInDays *int
+	// ExpiresAt sets the absolute expiry. Used by the time-bound authority
+	// flow so agent + linked key expire at the same moment.
+	ExpiresAt *time.Time
+	Metadata  json.RawMessage
 }
 
 // CreateAPIKeyResponse is returned once on creation — contains the full key (shown once).
@@ -149,6 +155,12 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		t := time.Now().AddDate(0, 0, *req.ExpiresInDays)
 		expiresAt = &t
 	}
+	// ExpiresAt wins when both are supplied — callers using the absolute
+	// form (time-bound authority flow) usually want the key to expire at
+	// the same instant as its identity, not after a rounded N-day window.
+	if req.ExpiresAt != nil {
+		expiresAt = req.ExpiresAt
+	}
 
 	scopes := req.Scopes
 	if scopes == nil {
@@ -201,6 +213,12 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ExpiresAt:   expiresAt,
 		CreatedAt:   sk.CreatedAt,
 	}, nil
+}
+
+// ListExpiringSoon returns active API keys whose expires_at falls within
+// now..now+within. Used by GET /expiring-soon.
+func (s *APIKeyService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.APIKey, error) {
+	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
 }
 
 // ListKeys returns paginated API keys for an account/project.

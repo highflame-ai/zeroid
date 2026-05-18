@@ -14,11 +14,16 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
+
+// ErrInvalidIdentityField marks caller-fixable input errors on registration
+// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+var ErrInvalidIdentityField = errors.New("invalid identity field")
 
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
@@ -107,13 +112,19 @@ type RegisterIdentityRequest struct {
 	// policy is assigned. Must exist within the caller's tenant; cross-tenant
 	// IDs are rejected with ErrPolicyNotFound.
 	CredentialPolicyID string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63).
+	// Empty strings are valid and mean "unclassified."
+	CapabilityTier string
+	RiskTier       string
+	IAL            string
+	// ExpiresAt time-bounds the grant of authority. Nil means "no expiry"
+	// (historical default). When set, the cleanup worker deactivates the
+	// identity past this time and IssueCredential fail-closes on it.
+	ExpiresAt *time.Time
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
-	if req.AccountID == "" || req.ProjectID == "" || req.ExternalID == "" {
-		return nil, fmt.Errorf("accountID, projectID, and externalID are required")
-	}
 	if req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
@@ -125,6 +136,19 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 	if !req.IdentityType.Valid() {
 		return nil, fmt.Errorf("invalid identity_type: %s", req.IdentityType)
+	}
+	// Anything that lands in the WIMSE URI path needs to be SPIFFE-clean —
+	// otherwise we mint URIs strict verifiers reject, and a "/" in any of
+	// these fields silently shifts the path layout when parsed back out.
+	for _, f := range []struct{ name, value string }{
+		{"account_id", req.AccountID},
+		{"project_id", req.ProjectID},
+		{"external_id", req.ExternalID},
+		{"identity_type", string(req.IdentityType)},
+	} {
+		if err := domain.ValidateSPIFFEPathSegment(f.name, f.value); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
 	}
 	if req.SubType == "" && req.IdentityType == domain.IdentityTypeAgent {
 		req.SubType = domain.SubTypeToolAgent
@@ -147,6 +171,15 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
 		return nil, err
 	}
+	if !domain.ValidCapabilityTier(req.CapabilityTier) {
+		return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.CapabilityTier)
+	}
+	if !domain.ValidRiskTier(req.RiskTier) {
+		return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, req.RiskTier)
+	}
+	if !domain.ValidIAL(req.IAL) {
+		return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, req.IAL)
+	}
 
 	// Resolve the identity policy: a caller-supplied policy ID must be
 	// tenant-scoped (IDOR guard via GetPolicy). When absent, assign the
@@ -157,13 +190,18 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		return nil, err
 	}
 
+	wimseURI, err := domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+
 	identity := &domain.Identity{
 		ID:                 uuid.New().String(),
 		AccountID:          req.AccountID,
 		ProjectID:          req.ProjectID,
 		ExternalID:         req.ExternalID,
 		Name:               req.Name,
-		WIMSEURI:           domain.BuildWIMSEURI(s.wimseDomain, req.AccountID, req.ProjectID, req.IdentityType, req.ExternalID),
+		WIMSEURI:           wimseURI,
 		IdentityType:       req.IdentityType,
 		SubType:            req.SubType,
 		TrustLevel:         req.TrustLevel,
@@ -179,6 +217,10 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		Capabilities:       req.Capabilities,
 		Labels:             req.Labels,
 		Metadata:           req.Metadata,
+		CapabilityTier:     req.CapabilityTier,
+		RiskTier:           req.RiskTier,
+		IAL:                req.IAL,
+		ExpiresAt:          req.ExpiresAt,
 		CreatedBy:          req.CreatedBy,
 		CreatedAt:          time.Now(),
 		UpdatedAt:          time.Now(),
@@ -217,6 +259,12 @@ func (s *IdentityService) ListIdentities(ctx context.Context, accountID, project
 	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, limit, offset)
 }
 
+// ListExpiringSoon returns active identities whose expires_at falls within
+// now..now+within. Used by GET /expiring-soon.
+func (s *IdentityService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.Identity, error) {
+	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
+}
+
 // UpdateIdentityRequest holds parameters for identity updates.
 // Zero-value fields are left unchanged. Pointer fields distinguish "not set" from "clear."
 type UpdateIdentityRequest struct {
@@ -240,6 +288,18 @@ type UpdateIdentityRequest struct {
 	// "clear to tenant default". A non-empty value must exist in the caller's
 	// tenant; an empty string reassigns the tenant default.
 	CredentialPolicyID *string
+	// Risk + assurance classification (CoSAI §3.2 / NIST SP 800-63). Pointer
+	// so callers can distinguish "not set" from "clear to unclassified" via
+	// an explicit empty-string assignment.
+	CapabilityTier *string
+	RiskTier       *string
+	IAL            *string
+	// ExpiresAt uses RFC3339 string + tri-state pointer to carry the three
+	// update intents that a single *time.Time can't express:
+	//   nil pointer            → leave unchanged
+	//   pointer to ""          → clear to NULL (remove expiry, extend forever)
+	//   pointer to RFC3339 str → set new expiry
+	ExpiresAt *string
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -315,6 +375,35 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.CredentialPolicyID = policyID
 	}
+	if req.CapabilityTier != nil {
+		if !domain.ValidCapabilityTier(*req.CapabilityTier) {
+			return nil, fmt.Errorf("%w: invalid capability_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.CapabilityTier)
+		}
+		identity.CapabilityTier = *req.CapabilityTier
+	}
+	if req.RiskTier != nil {
+		if !domain.ValidRiskTier(*req.RiskTier) {
+			return nil, fmt.Errorf("%w: invalid risk_tier: %q (allowed: low, high, or empty)", ErrInvalidIdentityField, *req.RiskTier)
+		}
+		identity.RiskTier = *req.RiskTier
+	}
+	if req.IAL != nil {
+		if !domain.ValidIAL(*req.IAL) {
+			return nil, fmt.Errorf("%w: invalid ial: %q (allowed: ial1, ial2, ial3, or empty)", ErrInvalidIdentityField, *req.IAL)
+		}
+		identity.IAL = *req.IAL
+	}
+	if req.ExpiresAt != nil {
+		t, cleared, err := parseExpiresAtPatch(*req.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidIdentityField, err)
+		}
+		if cleared {
+			identity.ExpiresAt = nil
+		} else {
+			identity.ExpiresAt = &t
+		}
+	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
@@ -368,6 +457,66 @@ func (s *IdentityService) EnsureServiceIdentity(ctx context.Context, accountID, 
 	return identity, nil
 }
 
+// parseExpiresAtPatch decodes a tri-state expires_at PATCH value:
+//   - "" → cleared = true, caller should NULL the column
+//   - RFC3339 timestamp strictly after now → returns the parsed time
+//   - RFC3339 at or before now → rejected: an admin who fat-fingers a
+//     backdated value would otherwise trigger an immediate sweep-cascade
+//     revocation of every credential issued to the affected identity /
+//     policy. Hard foot-gun; we require expires_at > now (strict) at
+//     the PATCH boundary.
+//
+// Returns: (time, cleared, err). When cleared is true the time value is
+// zero and the caller assigns nil.
+func parseExpiresAtPatch(raw string) (time.Time, bool, error) {
+	if raw == "" {
+		return time.Time{}, true, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("invalid expires_at %q (must be RFC3339)", raw)
+	}
+	now := time.Now().UTC()
+	if !t.After(now) {
+		return time.Time{}, false, fmt.Errorf("expires_at must be in the future (got %s, now %s)", t.Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	return t, false, nil
+}
+
+// SweepExpiredIdentities is called by the cleanup worker. The atomic
+// DeactivateIfActive UPDATE is the per-row claim that prevents concurrent
+// replicas from running the cascade twice for the same identity. The
+// caller_name stamp gives the audit trigger a non-empty modified_by so
+// auto-expiries are distinguishable from admin actions on the audit_log.
+func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, error) {
+	expired, err := s.repo.ListExpiredActive(ctx, time.Now())
+	if err != nil {
+		return 0, fmt.Errorf("list expired identities: %w", err)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
+	count := 0
+	for _, row := range expired {
+		claimed, identity, err := s.repo.DeactivateIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("identity_id", row.ID).
+				Str("account_id", row.AccountID).
+				Str("project_id", row.ProjectID).
+				Msg("sweep: failed to deactivate expired identity")
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		s.runDeactivationCleanup(ctx, identity, "expired")
+		count++
+	}
+	if count > 0 {
+		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
+	}
+	return count, nil
+}
+
 // DeleteIdentity permanently removes an identity and cascades to related records.
 //
 // Cleanup runs before the DB delete: API keys are revoked, active credentials
@@ -408,18 +557,28 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 			Msg("identity cleanup: revoked active credentials (cascade)")
 	}
 
+	// Auto-expiry gets its own signal type so CAE subscribers can filter
+	// the indexed signal_type column directly (e.g. for offboarding-driven
+	// audit reports). Admin-initiated deactivation / deletion stays on
+	// SignalTypeRetirement so existing subscribers don't need to know
+	// about the split.
+	signalType := domain.SignalTypeRetirement
+	if reason == "expired" {
+		signalType = domain.SignalTypeIdentityExpired
+	}
 	if _, err := s.signalSvc.IngestSignal(
 		ctx,
 		identity.AccountID,
 		identity.ProjectID,
 		identity.ID,
-		domain.SignalTypeRetirement,
+		signalType,
 		domain.SignalSeverityHigh,
 		"identity_lifecycle",
 		map[string]any{"reason": reason},
 	); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
-			Msg("identity cleanup: failed to emit retirement CAE signal")
+			Str("signal_type", string(signalType)).
+			Msg("identity cleanup: failed to emit lifecycle CAE signal")
 	}
 }
 
