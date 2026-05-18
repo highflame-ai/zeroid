@@ -170,6 +170,10 @@ type TokenRequest struct {
 	TrustedService bool
 	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
+	// DPoPKeyThumbprint is the base64url JWK thumbprint of the client's DPoP key.
+	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
+	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
+	DPoPKeyThumbprint string
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -250,10 +254,11 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: policy.ID,
-		Scopes:           scopes,
-		GrantType:        domain.GrantTypeClientCredentials,
+		Identity:          identity,
+		IdentityPolicyID:  policy.ID,
+		Scopes:            scopes,
+		GrantType:         domain.GrantTypeClientCredentials,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -338,10 +343,11 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: policy.ID,
-		Scopes:           scopes,
-		GrantType:        domain.GrantTypeJWTBearer,
+		Identity:          identity,
+		IdentityPolicyID:  policy.ID,
+		Scopes:            scopes,
+		GrantType:         domain.GrantTypeJWTBearer,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -523,14 +529,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// level, allowed grant types, max TTL) is enforced inside
 	// IssueCredential against actor.IdentityPolicyID.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         actorIdentity,
-		IdentityPolicyID: actorPolicy.ID,
-		Scopes:           scopes,
-		GrantType:        domain.GrantTypeTokenExchange,
-		DelegatedBy:      delegatedBy,
-		ParentJTI:        subjectJTI,
-		DelegationDepth:  parentDepth + 1,
-		MissionID:        missionID,
+		Identity:          actorIdentity,
+		IdentityPolicyID:  actorPolicy.ID,
+		Scopes:            scopes,
+		GrantType:         domain.GrantTypeTokenExchange,
+		DelegatedBy:       delegatedBy,
+		ParentJTI:         subjectJTI,
+		DelegationDepth:   parentDepth + 1,
+		MissionID:         missionID,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -634,17 +641,18 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		GrantType:        domain.GrantTypeTokenExchange,
-		Scopes:           scopes,
-		UseRS256:         true,
-		SubjectOverride:  req.UserID,
-		UserEmail:        req.UserEmail,
-		UserName:         req.UserName,
-		ApplicationID:    req.ApplicationID,
-		TTL:              900, // 15 minutes — short-lived for external principals
-		CustomClaims:     customClaims,
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeTokenExchange,
+		Scopes:            scopes,
+		UseRS256:          true,
+		SubjectOverride:   req.UserID,
+		UserEmail:         req.UserEmail,
+		UserName:          req.UserName,
+		ApplicationID:     req.ApplicationID,
+		TTL:               900, // 15 minutes — short-lived for external principals
+		CustomClaims:      customClaims,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
@@ -764,6 +772,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
+		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -911,14 +920,15 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		GrantType:        domain.GrantTypeAuthorizationCode,
-		UseRS256:         true,
-		SubjectOverride:  authCode.UserID,
-		ApplicationID:    authCode.ClientID,
-		TTL:              ttl,
-		Scopes:           authCode.Scopes,
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeAuthorizationCode,
+		UseRS256:          true,
+		SubjectOverride:   authCode.UserID,
+		ApplicationID:     authCode.ClientID,
+		TTL:               ttl,
+		Scopes:            authCode.Scopes,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -1060,14 +1070,15 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// scopes), breaking the contract that refresh preserves the original
 	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		GrantType:        domain.GrantTypeRefreshToken,
-		UseRS256:         true,
-		SubjectOverride:  oldToken.UserID,
-		ApplicationID:    oldToken.ClientID,
-		TTL:              accessTTL,
-		Scopes:           parseScopeString(oldToken.Scopes),
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeRefreshToken,
+		UseRS256:          true,
+		SubjectOverride:   oldToken.UserID,
+		ApplicationID:     oldToken.ClientID,
+		TTL:               accessTTL,
+		Scopes:            parseScopeString(oldToken.Scopes),
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -1147,8 +1158,10 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	}
 
 	// Custom claims via the v4 generic accessor. jwt.Get[any] survives both
-	// string and structured shapes (e.g. act is a nested object).
-	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act"} {
+	// string and structured shapes (e.g. act and cnf are nested objects).
+	// cnf is surfaced so resource servers see the RFC 9449 jkt binding and
+	// can validate the caller's DPoP proof against the expected thumbprint.
+	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf"} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v
 		}

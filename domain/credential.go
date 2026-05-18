@@ -89,4 +89,9 @@ type IssuedCredential struct {
 	// every credential in the tree so workflow-scoped audit queries are
 	// O(1) instead of walking the parent_jti chain. Issue #81.
 	MissionID string `bun:"mission_id,type:varchar(255),nullzero" json:"mission_id,omitempty"`
+	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
+	// the DPoP key bound to this credential (RFC 9449 §6.1). Empty for plain
+	// Bearer tokens. When non-empty, the access token carries a cnf.jkt claim
+	// and must be presented with a valid DPoP proof at the protected resource.
+	DPoPKeyThumbprint string `bun:"dpop_key_thumbprint,type:text" json:"dpop_key_thumbprint,omitempty"`
 }

@@ -16,7 +16,11 @@ import (
 // ── OAuth types ──────────────────────────────────────────────────────────────
 
 type TokenInput struct {
-	Body struct {
+	// DPoPProof carries the RFC 9449 proof-of-possession JWT. When non-empty,
+	// the issued token is bound to the proof key (cnf.jkt) and token_type is
+	// returned as "DPoP" instead of "Bearer".
+	DPoPProof string `header:"DPoP" doc:"DPoP proof JWT (RFC 9449)"`
+	Body      struct {
 		GrantType    string `json:"grant_type" required:"true" doc:"OAuth grant type"`
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret"`
@@ -225,28 +229,56 @@ func advertiseFormContentType(api huma.API, paths ...string) {
 }
 
 func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, error) {
+	// DPoP: optional. When a proof is present the issued token is bound to the
+	// proof key via cnf.jkt and token_type is returned as "DPoP" (RFC 9449).
+	var dpopThumbprint string
+	if input.DPoPProof != "" {
+		if a.dpopSvc == nil {
+			return &TokenOutput{
+				Status: http.StatusBadRequest,
+				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: "DPoP is not enabled on this deployment"},
+			}, nil
+		}
+		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, a.baseURL+"/oauth2/token", input.DPoPProof)
+		if dpopErr != nil {
+			if errors.Is(dpopErr, service.ErrDPoPStorageFailure) {
+				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")
+				return &TokenOutput{
+					Status: http.StatusInternalServerError,
+					Body:   oauthErrorBody{Error: "server_error", ErrorDescription: "failed to validate DPoP proof"},
+				}, nil
+			}
+			return &TokenOutput{
+				Status: http.StatusBadRequest,
+				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: dpopErr.Error()},
+			}, nil
+		}
+		dpopThumbprint = tp
+	}
+
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
-		GrantType:        input.Body.GrantType,
-		ClientID:         input.Body.ClientID,
-		ClientSecret:     input.Body.ClientSecret,
-		Scope:            input.Body.Scope,
-		AccountID:        input.Body.AccountID,
-		ProjectID:        input.Body.ProjectID,
-		Subject:          input.Body.Subject,
-		APIKey:           input.Body.APIKey,
-		SubjectToken:     input.Body.SubjectToken,
-		SubjectTokenType: input.Body.SubjectTokenType,
-		ActorToken:       input.Body.ActorToken,
-		UserID:           input.Body.UserID,
-		UserEmail:        input.Body.UserEmail,
-		UserName:         input.Body.UserName,
-		ApplicationID:    input.Body.ApplicationID,
-		AdditionalClaims: input.Body.AdditionalClaims,
-		Code:             input.Body.Code,
-		CodeVerifier:     input.Body.CodeVerifier,
-		RedirectURI:      input.Body.RedirectURI,
-		RefreshTokenStr:  input.Body.RefreshToken,
-		AuthReqID:        input.Body.AuthReqID,
+		GrantType:         input.Body.GrantType,
+		ClientID:          input.Body.ClientID,
+		ClientSecret:      input.Body.ClientSecret,
+		Scope:             input.Body.Scope,
+		AccountID:         input.Body.AccountID,
+		ProjectID:         input.Body.ProjectID,
+		Subject:           input.Body.Subject,
+		APIKey:            input.Body.APIKey,
+		SubjectToken:      input.Body.SubjectToken,
+		SubjectTokenType:  input.Body.SubjectTokenType,
+		ActorToken:        input.Body.ActorToken,
+		UserID:            input.Body.UserID,
+		UserEmail:         input.Body.UserEmail,
+		UserName:          input.Body.UserName,
+		ApplicationID:     input.Body.ApplicationID,
+		AdditionalClaims:  input.Body.AdditionalClaims,
+		Code:              input.Body.Code,
+		CodeVerifier:      input.Body.CodeVerifier,
+		RedirectURI:       input.Body.RedirectURI,
+		RefreshTokenStr:   input.Body.RefreshToken,
+		AuthReqID:         input.Body.AuthReqID,
+		DPoPKeyThumbprint: dpopThumbprint,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")

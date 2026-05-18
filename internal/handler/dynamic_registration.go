@@ -1,0 +1,374 @@
+package handler
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/lestrrat-go/jwx/v4/jwt"
+	"github.com/rs/zerolog/log"
+
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
+)
+
+// allowedDCRGrantTypes are the only grant types permitted for dynamically
+// registered clients. authorization_code is intentionally excluded — this is
+// a machine-to-machine server and DCR-registered clients can't run an
+// interactive consent flow.
+var allowedDCRGrantTypes = map[string]bool{
+	"client_credentials":                              true,
+	"urn:ietf:params:oauth:grant-type:jwt-bearer":     true,
+	"urn:ietf:params:oauth:grant-type:token-exchange": true,
+}
+
+// dcrClientRegisterScope is the scope an initial access token must carry to
+// be allowed to call POST /oauth2/register.
+const dcrClientRegisterScope = "client:register"
+
+// ── DCR types ────────────────────────────────────────────────────────────────
+
+// DCRRegisterInput is the RFC 7591 §3.1 registration request, with the
+// initial access token presented as a Bearer header.
+type DCRRegisterInput struct {
+	Authorization string `header:"Authorization" required:"true" doc:"Initial access token: Bearer <jwt>"`
+	Body          struct {
+		ClientName              string   `json:"client_name" required:"true" doc:"Human-readable client name"`
+		GrantTypes              []string `json:"grant_types,omitempty" doc:"OAuth grant types (defaults to client_credentials)"`
+		Scope                   string   `json:"scope,omitempty" doc:"Space-separated scope list"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty" doc:"client_secret_post or client_secret_basic"`
+		SoftwareID              string   `json:"software_id,omitempty" doc:"Software identifier (RFC 7591)"`
+		SoftwareVersion         string   `json:"software_version,omitempty" doc:"Software version (RFC 7591)"`
+		Contacts                []string `json:"contacts,omitempty" doc:"Operator contact emails"`
+		// RedirectURIs is accepted for spec compliance but ignored —
+		// this server has no interactive flows.
+		RedirectURIs []string `json:"redirect_uris,omitempty" doc:"Accepted but ignored (no interactive flows)"`
+	}
+}
+
+// DCROutput is the polymorphic response body. RFC 7591/7592 success bodies are
+// dynamic-shape; error bodies are oauthErrorBody.
+type DCROutput struct {
+	Status int
+	Body   any
+}
+
+// DCRGetInput / DCRUpdateInput / DCRDeleteInput share the same auth shape:
+// the registration_access_token in the Authorization header, and client_id in
+// the path.
+type DCRGetInput struct {
+	Authorization string `header:"Authorization" required:"true" doc:"Bearer registration_access_token"`
+	ClientID      string `path:"client_id" required:"true" doc:"OAuth client_id from registration"`
+}
+
+type DCRUpdateInput struct {
+	Authorization string `header:"Authorization" required:"true" doc:"Bearer registration_access_token"`
+	ClientID      string `path:"client_id" required:"true" doc:"OAuth client_id from registration"`
+	Body          struct {
+		ClientName              string   `json:"client_name" required:"true"`
+		GrantTypes              []string `json:"grant_types,omitempty"`
+		Scope                   string   `json:"scope,omitempty"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
+		SoftwareID              string   `json:"software_id,omitempty"`
+		SoftwareVersion         string   `json:"software_version,omitempty"`
+		Contacts                []string `json:"contacts,omitempty"`
+		RedirectURIs            []string `json:"redirect_uris,omitempty"`
+	}
+}
+
+type DCRDeleteInput struct {
+	Authorization string `header:"Authorization" required:"true" doc:"Bearer registration_access_token"`
+	ClientID      string `path:"client_id" required:"true" doc:"OAuth client_id from registration"`
+}
+
+// ── DCR routes ───────────────────────────────────────────────────────────────
+
+// registerDynamicRegistrationRoutes mounts the RFC 7591/7592 endpoints on the
+// public group. Authentication is intrinsic to each request:
+//   - POST                       — initial access token JWT with client:register scope.
+//   - GET / PUT / DELETE         — registration_access_token issued at registration.
+func (a *API) registerDynamicRegistrationRoutes(api huma.API) {
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-register",
+		Method:      http.MethodPost,
+		Path:        "/oauth2/register",
+		Summary:     "Dynamic Client Registration (RFC 7591)",
+		Description: "Registers a new OAuth2 client. Requires an initial access token JWT " +
+			"with the `client:register` scope in its scopes claim — issued out-of-band " +
+			"to authorised registrants. Returns the new client_id, client_secret, and a " +
+			"registration_access_token that authenticates subsequent RFC 7592 management calls.",
+		Tags: []string{"OAuth"},
+	}, a.dcrRegisterOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-registration-get",
+		Method:      http.MethodGet,
+		Path:        "/oauth2/register/{client_id}",
+		Summary:     "Read Client Registration (RFC 7592)",
+		Tags:        []string{"OAuth"},
+	}, a.dcrGetOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-registration-update",
+		Method:      http.MethodPut,
+		Path:        "/oauth2/register/{client_id}",
+		Summary:     "Update Client Registration (RFC 7592)",
+		Description: "Full replacement, not partial update (RFC 7592 §3). Omitted fields revert to RFC 7591 defaults.",
+		Tags:        []string{"OAuth"},
+	}, a.dcrUpdateOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-registration-delete",
+		Method:      http.MethodDelete,
+		Path:        "/oauth2/register/{client_id}",
+		Summary:     "Delete Client Registration (RFC 7592)",
+		Tags:       []string{"OAuth"},
+	}, a.dcrDeleteOp)
+}
+
+// ── DCR ops ──────────────────────────────────────────────────────────────────
+
+func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCROutput, error) {
+	if err := a.validateInitialAccessToken(input.Authorization); err != nil {
+		return dcrErr(err), nil
+	}
+
+	if input.Body.ClientName == "" {
+		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}), nil
+	}
+
+	grantTypes := input.Body.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"client_credentials"}
+	}
+	for _, gt := range grantTypes {
+		if !allowedDCRGrantTypes[gt] {
+			return dcrErr(&dcrError{
+				status: http.StatusBadRequest, code: "invalid_client_metadata",
+				desc: "unsupported grant_type: " + gt,
+			}), nil
+		}
+	}
+
+	authMethod := input.Body.TokenEndpointAuthMethod
+	switch authMethod {
+	case "", "client_secret_post", "client_secret_basic":
+		// accepted
+	case "none":
+		return dcrErr(&dcrError{
+			status: http.StatusBadRequest, code: "invalid_client_metadata",
+			desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication",
+		}), nil
+	default:
+		return dcrErr(&dcrError{
+			status: http.StatusBadRequest, code: "invalid_client_metadata",
+			desc: "unsupported token_endpoint_auth_method: " + authMethod,
+		}), nil
+	}
+
+	var scopes []string
+	if input.Body.Scope != "" {
+		scopes = strings.Fields(input.Body.Scope)
+	} else {
+		scopes = []string{}
+	}
+
+	client, plainSecret, plainRegToken, err := a.oauthClientSvc.DynamicRegisterClient(ctx, service.DynamicRegisterClientRequest{
+		Name:                    input.Body.ClientName,
+		GrantTypes:              grantTypes,
+		Scopes:                  scopes,
+		TokenEndpointAuthMethod: authMethod,
+		SoftwareID:              input.Body.SoftwareID,
+		SoftwareVersion:         input.Body.SoftwareVersion,
+		Contacts:                input.Body.Contacts,
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
+			return dcrErr(&dcrError{status: http.StatusConflict, code: "invalid_client_metadata", desc: "client already exists"}), nil
+		}
+		log.Error().Err(err).Msg("dynamic client registration failed")
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to register client"}), nil
+	}
+
+	return &DCROutput{
+		Status: http.StatusCreated,
+		Body: map[string]any{
+			"client_id":                  client.ClientID,
+			"client_secret":              plainSecret,
+			"client_id_issued_at":        client.CreatedAt.Unix(),
+			"client_secret_expires_at":   0, // non-expiring per RFC 7591 §3.2.1
+			"client_name":                client.Name,
+			"grant_types":                client.GrantTypes,
+			"scope":                      strings.Join(client.Scopes, " "),
+			"token_endpoint_auth_method": client.TokenEndpointAuthMethod,
+			"registration_access_token":  plainRegToken,
+			"registration_client_uri":    a.baseURL + "/oauth2/register/" + client.ClientID,
+		},
+	}, nil
+}
+
+func (a *API) dcrGetOp(ctx context.Context, input *DCRGetInput) (*DCROutput, error) {
+	cl, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID)
+	if err != nil {
+		return dcrErr(err), nil
+	}
+	return &DCROutput{Status: http.StatusOK, Body: a.dcrClientResponse(cl)}, nil
+}
+
+func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutput, error) {
+	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
+		return dcrErr(err), nil
+	}
+
+	if input.Body.ClientName == "" {
+		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}), nil
+	}
+
+	grantTypes := input.Body.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"client_credentials"}
+	}
+	for _, gt := range grantTypes {
+		if !allowedDCRGrantTypes[gt] {
+			return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported grant_type: " + gt}), nil
+		}
+	}
+
+	authMethod := input.Body.TokenEndpointAuthMethod
+	switch authMethod {
+	case "", "client_secret_post", "client_secret_basic":
+	case "none":
+		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "token_endpoint_auth_method 'none' is not supported"}), nil
+	default:
+		return dcrErr(&dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported token_endpoint_auth_method: " + authMethod}), nil
+	}
+
+	var scopes []string
+	if input.Body.Scope != "" {
+		scopes = strings.Fields(input.Body.Scope)
+	} else {
+		scopes = []string{}
+	}
+
+	updated, err := a.oauthClientSvc.UpdateDynamicClient(ctx, input.ClientID, service.DynamicRegisterClientRequest{
+		Name:                    input.Body.ClientName,
+		GrantTypes:              grantTypes,
+		Scopes:                  scopes,
+		TokenEndpointAuthMethod: authMethod,
+		SoftwareID:              input.Body.SoftwareID,
+		SoftwareVersion:         input.Body.SoftwareVersion,
+		Contacts:                input.Body.Contacts,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client update failed")
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to update client registration"}), nil
+	}
+	return &DCROutput{
+		Status: http.StatusOK,
+		Body: map[string]any{
+			"client_id":                  updated.ClientID,
+			"client_id_issued_at":        updated.CreatedAt.Unix(),
+			"client_secret_expires_at":   0,
+			"client_name":                updated.Name,
+			"grant_types":                updated.GrantTypes,
+			"scope":                      strings.Join(updated.Scopes, " "),
+			"token_endpoint_auth_method": updated.TokenEndpointAuthMethod,
+			"registration_client_uri":    a.baseURL + "/oauth2/register/" + updated.ClientID,
+		},
+	}, nil
+}
+
+func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutput, error) {
+	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
+		return dcrErr(err), nil
+	}
+	if err := a.oauthClientSvc.DeleteDynamicClient(ctx, input.ClientID); err != nil {
+		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client delete failed")
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to delete client registration"}), nil
+	}
+	return &DCROutput{Status: http.StatusNoContent, Body: nil}, nil
+}
+
+// ── DCR helpers ──────────────────────────────────────────────────────────────
+
+// dcrError is the structured error a DCR op returns to the dispatch layer.
+type dcrError struct {
+	status int
+	code   string
+	desc   string
+}
+
+func (e *dcrError) Error() string { return e.code + ": " + e.desc }
+
+func dcrErr(err error) *DCROutput {
+	var de *dcrError
+	if errors.As(err, &de) {
+		return &DCROutput{Status: de.status, Body: oauthErrorBody{Error: de.code, ErrorDescription: de.desc}}
+	}
+	return &DCROutput{Status: http.StatusInternalServerError, Body: oauthErrorBody{Error: "server_error", ErrorDescription: "unexpected error"}}
+}
+
+// validateInitialAccessToken parses the Authorization header as `Bearer <jwt>`,
+// verifies against the server's JWKS, and requires the `client:register` scope.
+// Returns nil on success or a *dcrError on failure.
+func (a *API) validateInitialAccessToken(authHeader string) error {
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer initial access token is required"}
+	}
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+
+	parsed, err := jwt.Parse([]byte(tokenStr),
+		jwt.WithKeySet(a.jwksSvc.KeySet()),
+		jwt.WithValidate(true),
+		jwt.WithIssuer(a.issuer),
+	)
+	if err != nil {
+		return &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "initial access token is invalid or expired"}
+	}
+
+	scopes, _ := jwt.Get[[]any](parsed, "scopes")
+	hasRegisterScope := false
+	for _, sc := range scopes {
+		if str, ok := sc.(string); ok && str == dcrClientRegisterScope {
+			hasRegisterScope = true
+			break
+		}
+	}
+	if !hasRegisterScope {
+		return &dcrError{status: http.StatusForbidden, code: "insufficient_scope", desc: "initial access token must have '" + dcrClientRegisterScope + "' scope"}
+	}
+	return nil
+}
+
+// authorizeDCRManagement verifies the registration_access_token in the
+// Authorization header against the stored bcrypt hash for the path's client_id.
+func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID string) (*domain.OAuthClient, error) {
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer registration_access_token is required"}
+	}
+	regToken := strings.TrimPrefix(authHeader, "Bearer ")
+
+	client, err := a.oauthClientSvc.VerifyRegistrationToken(ctx, clientID, regToken)
+	if err != nil {
+		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "invalid or unknown registration_access_token"}
+	}
+	return client, nil
+}
+
+// dcrClientResponse returns the RFC 7591 §3.2.1 / RFC 7592 §3 representation of a
+// registered client. Used for GET/PUT responses (secrets are not re-revealed
+// after the initial registration).
+func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
+	return map[string]any{
+		"client_id":                  cl.ClientID,
+		"client_id_issued_at":        cl.CreatedAt.Unix(),
+		"client_secret_expires_at":   0,
+		"client_name":                cl.Name,
+		"grant_types":                cl.GrantTypes,
+		"scope":                      strings.Join(cl.Scopes, " "),
+		"token_endpoint_auth_method": cl.TokenEndpointAuthMethod,
+		"registration_client_uri":    a.baseURL + "/oauth2/register/" + cl.ClientID,
+	}
+}
