@@ -30,6 +30,8 @@ type Config struct {
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
 
+	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
+
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
 }
@@ -69,6 +71,21 @@ type AttestationConfig struct {
 	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
 	// (the only real verifier shipped) is unaffected by this flag.
 	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
+}
+
+// SigningCredsConfig governs workload-attested ephemeral signing
+// credentials. The two clocks are deliberately decoupled: MaxTTLSeconds
+// bounds how long an attested key may SIGN; AuditRetentionDays bounds how
+// long its public key stays resolvable for VERIFYING historical
+// attestations (>> MaxTTLSeconds). See domain/signing_credential.go.
+type SigningCredsConfig struct {
+	// MaxTTLSeconds caps the operational signing window an attestation
+	// may request (default 1h — keys are ephemeral, rotated often).
+	MaxTTLSeconds int `koanf:"max_ttl_seconds"`
+	// AuditRetentionDays is how long a non-revoked public key remains
+	// verifiable after attestation (default 400 — covers a >1y audit
+	// window so historical receipts verify long after key rotation).
+	AuditRetentionDays int `koanf:"audit_retention_days"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -308,6 +325,13 @@ func loadDefaults(k *koanf.Koanf) error {
 		// submit those proof types (or once real verifiers land).
 		"attestation.allow_unsafe_dev_stub": true,
 
+		// Workload-attested signing credentials. Operational signing
+		// window is short (1h, keys are ephemeral + rotated); the public
+		// key stays verifiable for a long audit window (400d) so
+		// historical attestations verify long after rotation.
+		"signing_credentials.max_ttl_seconds":      3600,
+		"signing_credentials.audit_retention_days": 400,
+
 		// Logging
 		"logging.level": "info",
 	}
@@ -344,6 +368,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_RSA_PRIVATE_KEY_PATH": "keys.rsa_private_key_path",
 		"ZEROID_RSA_PUBLIC_KEY_PATH":  "keys.rsa_public_key_path",
 		"ZEROID_RSA_KEY_ID":           "keys.rsa_key_id",
+
+		"ZEROID_SIGNING_CREDS_MAX_TTL_SECONDS":      "signing_credentials.max_ttl_seconds",
+		"ZEROID_SIGNING_CREDS_AUDIT_RETENTION_DAYS": "signing_credentials.audit_retention_days",
 
 		// Token
 		"ZEROID_ISSUER":                "token.issuer",
