@@ -29,12 +29,10 @@ type SigningCredential struct {
 	CreatedAt           time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 }
 
-// SigningCredentialPurposes is the launch allowlist of purposes a
-// workload may attest a key for. Mirrors the design doc.
-const (
-	SigningPurposeReceipt    = "receipt"
-	SigningPurposeAuthZAudit = "authz_audit"
-)
+// Purpose is an opaque, deployer-defined string (e.g. what the attested
+// key signs). ZeroID does not enumerate purposes — it is product-
+// agnostic; the accepted set comes from SigningCredsConfig.AllowedPurposes
+// supplied by the deployment, not from constants here.
 
 // SigningAlgorithmEdDSA is the only supported signing algorithm at launch.
 const SigningAlgorithmEdDSA = "EdDSA"
@@ -42,8 +40,8 @@ const SigningAlgorithmEdDSA = "EdDSA"
 // VerifiableNow reports whether this credential's public key may still be
 // used to VERIFY an attestation right now. The rule is the correctness
 // crux: a merely-expired key (past NotAfter) still verifies historical
-// receipts while inside the audit-retention window; only a *revoked* key
-// is rejected outright.
+// attestations while inside the audit-retention window; only a *revoked*
+// key is rejected outright.
 func (c *SigningCredential) VerifiableNow(now time.Time) bool {
 	if c.Revoked {
 		return false

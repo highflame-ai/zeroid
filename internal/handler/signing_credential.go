@@ -33,7 +33,7 @@ type attestSigningKeyInput struct {
 	Body     struct {
 		PublicKey  string `json:"public_key"  doc:"base64url Ed25519 public key (32 bytes)"`
 		Algorithm  string `json:"algorithm"   doc:"EdDSA"`
-		Purpose    string `json:"purpose"     doc:"receipt | authz_audit"`
+		Purpose    string `json:"purpose"     doc:"one of the deployment's configured signing purposes"`
 		TTLSeconds int    `json:"ttl_seconds" doc:"requested operational signing window"`
 	}
 }
@@ -79,14 +79,21 @@ func (a *API) registerSigningCredentialRoutes(api huma.API) {
 	}, a.revokeSigningKeyOp)
 }
 
-// registerSigningJWKSRoute is PUBLIC (no auth) — registered on the public
-// group so AuthN exposes it unauthenticated for offline verification.
+// registerSigningJWKSRoute is PUBLIC (no auth) — the verification JWKS is
+// meant to be fetched unauthenticated for offline verification. The path
+// is deployer-configured (SigningCredsConfig.WellKnownJWKSName); the
+// route is only registered when a JWKS purpose is configured, so a
+// default product-agnostic ZeroID exposes nothing here.
 func (a *API) registerSigningJWKSRoute(api huma.API) {
+	if !a.signingCredSvc.JWKSEnabled() {
+		return
+	}
+
 	huma.Register(api, huma.Operation{
-		OperationID: "receipt-jwks",
+		OperationID: "signing-credential-jwks",
 		Method:      http.MethodGet,
-		Path:        "/.well-known/highflame-receipt-keys",
-		Summary:     "Receipt verification JWKS (non-revoked, audit-retained)",
+		Path:        a.signingCredSvc.WellKnownPath(),
+		Summary:     "Workload-attested signing verification JWKS (non-revoked, audit-retained)",
 		Tags:        []string{"Discovery"},
 	}, a.signingJWKSOp)
 }
@@ -148,9 +155,9 @@ func (a *API) revokeSigningKeyOp(ctx context.Context, in *revokeSigningKeyInput)
 }
 
 func (a *API) signingJWKSOp(ctx context.Context, _ *struct{}) (*signingJWKSOutput, error) {
-	set, err := a.signingCredSvc.VerificationJWKS(ctx, "receipt")
+	set, err := a.signingCredSvc.VerificationJWKS(ctx)
 	if err != nil {
-		return nil, huma.Error500InternalServerError("failed to build receipt JWKS")
+		return nil, huma.Error500InternalServerError("failed to build verification JWKS")
 	}
 
 	return &signingJWKSOutput{Body: set}, nil

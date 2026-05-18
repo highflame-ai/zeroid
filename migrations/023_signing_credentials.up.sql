@@ -1,6 +1,6 @@
 -- Workload-attested ephemeral signing credentials.
 --
--- A workload (e.g. Shield) generates an ephemeral Ed25519 keypair in
+-- A workload generates an ephemeral Ed25519 keypair in
 -- memory and attests the PUBLIC half here. ZeroID owns the kid namespace,
 -- publishes the verification JWKS, and revokes via CAE. The private key
 -- is never sent or stored.
@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS signing_credentials (
     account_id            VARCHAR(255) NOT NULL DEFAULT '',
     project_id            VARCHAR(255) NOT NULL DEFAULT '',
     kid                   VARCHAR(255) NOT NULL,
-    workload              VARCHAR(255) NOT NULL,  -- trusted-service identity, e.g. highflame-shield
-    purpose               VARCHAR(64)  NOT NULL,  -- receipt | authz_audit
+    workload              VARCHAR(255) NOT NULL,  -- trusted-service identity (deployer-defined)
+    purpose               VARCHAR(64)  NOT NULL,  -- deployer-configured signing purpose
     algorithm             VARCHAR(32)  NOT NULL,  -- EdDSA
     public_key            TEXT         NOT NULL,  -- base64 raw-url Ed25519 public key (32 bytes)
     not_after             TIMESTAMPTZ  NOT NULL,  -- operational signing expiry

@@ -182,7 +182,14 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
-	signingCredSvc := service.NewSigningCredentialService(signingCredRepo, cfg.SigningCreds.MaxTTLSeconds, cfg.SigningCreds.AuditRetentionDays)
+	signingCredSvc := service.NewSigningCredentialService(
+		signingCredRepo,
+		cfg.SigningCreds.MaxTTLSeconds,
+		cfg.SigningCreds.AuditRetentionDays,
+		cfg.SigningCreds.AllowedPurposes,
+		cfg.SigningCreds.JWKSPurpose,
+		cfg.SigningCreds.WellKnownJWKSName,
+	)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)

@@ -117,7 +117,7 @@ func TestMintKID(t *testing.T) {
 func TestAttest_RejectsInvalidInput(t *testing.T) {
 	// Validation happens before any repo call, so a nil repo is safe here
 	// and proves these requests never reach persistence.
-	s := NewSigningCredentialService(nil, 3600, 400)
+	s := NewSigningCredentialService(nil, 3600, 400, []string{"receipt"}, "receipt", "")
 	ctx := t.Context()
 
 	valid := func() AttestRequest {
@@ -125,7 +125,7 @@ func TestAttest_RejectsInvalidInput(t *testing.T) {
 			Workload:  "highflame-shield",
 			PublicKey: strings.Repeat("A", 43), // 32 bytes base64url ≈ 43 chars
 			Algorithm: domain.SigningAlgorithmEdDSA,
-			Purpose:   domain.SigningPurposeReceipt,
+			Purpose:   "receipt", // in the test service's AllowedPurposes
 		}
 	}
 

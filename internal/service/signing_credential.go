@@ -26,6 +26,10 @@ const (
 	defaultSigningMaxTTL          = time.Hour
 	defaultSigningRetentionWindow = 400 * 24 * time.Hour
 	kidRandomBytes                = 8
+	// defaultSigningJWKSName mirrors zeroid.DefaultSigningJWKSName for the
+	// blank-name fallback (the root config package can't be imported here
+	// without an import cycle; the config layer normally supplies it).
+	defaultSigningJWKSName = "signing-keys"
 )
 
 // SigningCredentialService attests workload-supplied Ed25519 public keys,
@@ -35,11 +39,18 @@ type SigningCredentialService struct {
 	repo            *postgres.SigningCredentialRepository
 	maxTTL          time.Duration
 	retentionWindow time.Duration
+	allowedPurposes map[string]bool
+	jwksPurpose     string
+	wellKnownName   string
 }
 
 // NewSigningCredentialService builds the service. ttlSeconds /
-// retentionDays come from zeroid.Config (sane defaults applied).
-func NewSigningCredentialService(repo *postgres.SigningCredentialRepository, ttlSeconds, retentionDays int) *SigningCredentialService {
+// retentionDays / allowedPurposes / jwksPurpose / wellKnownName all come
+// from zeroid.Config (deployer-supplied). ZeroID is product-agnostic:
+// allowedPurposes is empty unless the deployment opts in, so a default
+// ZeroID accepts no attestations until configured. wellKnownName
+// defaults to DefaultSigningJWKSName when blank.
+func NewSigningCredentialService(repo *postgres.SigningCredentialRepository, ttlSeconds, retentionDays int, allowedPurposes []string, jwksPurpose, wellKnownName string) *SigningCredentialService {
 	maxTTL := time.Duration(ttlSeconds) * time.Second
 	if maxTTL <= 0 {
 		maxTTL = defaultSigningMaxTTL
@@ -50,7 +61,36 @@ func NewSigningCredentialService(repo *postgres.SigningCredentialRepository, ttl
 		retention = defaultSigningRetentionWindow
 	}
 
-	return &SigningCredentialService{repo: repo, maxTTL: maxTTL, retentionWindow: retention}
+	allow := make(map[string]bool, len(allowedPurposes))
+	for _, p := range allowedPurposes {
+		if p != "" {
+			allow[p] = true
+		}
+	}
+
+	if wellKnownName == "" {
+		wellKnownName = defaultSigningJWKSName
+	}
+
+	return &SigningCredentialService{
+		repo:            repo,
+		maxTTL:          maxTTL,
+		retentionWindow: retention,
+		allowedPurposes: allow,
+		jwksPurpose:     jwksPurpose,
+		wellKnownName:   wellKnownName,
+	}
+}
+
+// WellKnownPath is the public route the verification JWKS is served at.
+func (s *SigningCredentialService) WellKnownPath() string {
+	return "/.well-known/" + s.wellKnownName
+}
+
+// JWKSEnabled reports whether a verification JWKS purpose is configured;
+// when false the public JWKS route is not registered (feature dormant).
+func (s *SigningCredentialService) JWKSEnabled() bool {
+	return s.jwksPurpose != ""
 }
 
 // AttestRequest is a workload's request to register an ephemeral public
@@ -62,7 +102,7 @@ type AttestRequest struct {
 	ProjectID  string
 	PublicKey  string // base64 raw-url Ed25519 public key (32 bytes)
 	Algorithm  string // must be EdDSA
-	Purpose    string // receipt | authz_audit
+	Purpose    string // must be in the deployer's AllowedPurposes
 	TTLSeconds int
 }
 
@@ -72,11 +112,6 @@ type AttestRequest struct {
 type AttestResult struct {
 	KID      string    `json:"kid"`
 	NotAfter time.Time `json:"not_after"`
-}
-
-var allowedPurposes = map[string]bool{
-	domain.SigningPurposeReceipt:    true,
-	domain.SigningPurposeAuthZAudit: true,
 }
 
 // Attest validates and records an ephemeral public key. NotAfter bounds
@@ -91,7 +126,7 @@ func (s *SigningCredentialService) Attest(ctx context.Context, req AttestRequest
 		return nil, fmt.Errorf("%w: unsupported algorithm %q (only EdDSA)", ErrSigningCredInvalid, req.Algorithm)
 	}
 
-	if !allowedPurposes[req.Purpose] {
+	if !s.allowedPurposes[req.Purpose] {
 		return nil, fmt.Errorf("%w: purpose %q not permitted", ErrSigningCredInvalid, req.Purpose)
 	}
 
@@ -156,12 +191,13 @@ type JWKS struct {
 	Keys []JWK `json:"keys"`
 }
 
-// VerificationJWKS returns every key that may currently VERIFY a receipt
-// for the purpose: non-revoked AND inside the audit-retention window —
-// deliberately including operationally-expired keys so attestations
-// signed before a rotation still verify. Kid-sorted for a stable doc.
-func (s *SigningCredentialService) VerificationJWKS(ctx context.Context, purpose string) (*JWKS, error) {
-	creds, err := s.repo.ListVerifiable(ctx, purpose, time.Now())
+// VerificationJWKS returns every key that may currently VERIFY an
+// attestation for the configured JWKS purpose: non-revoked AND inside the
+// audit-retention window — deliberately including operationally-expired
+// keys so attestations signed before a rotation still verify. Kid-sorted
+// for a stable doc.
+func (s *SigningCredentialService) VerificationJWKS(ctx context.Context) (*JWKS, error) {
+	creds, err := s.repo.ListVerifiable(ctx, s.jwksPurpose, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +241,7 @@ func (s *SigningCredentialService) RevokeWorkload(ctx context.Context, workload,
 // mintKID returns a collision-safe, sanitized, informative key id.
 // Opaque to verifiers (they only match it); encoding purpose+workload
 // aids audit. Hostile workload/purpose strings are neutralized — the kid
-// is echoed into receipts and the JWKS.
+// is echoed into signed artifacts and the JWKS.
 func mintKID(purpose, workload string) (string, error) {
 	var b [kidRandomBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {

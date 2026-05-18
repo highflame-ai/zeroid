@@ -61,7 +61,7 @@ func (r *SigningCredentialRepository) GetByKID(ctx context.Context, kid, account
 // verify an attestation for a purpose: non-revoked AND inside the
 // audit-retention window (independent of not_after). This is the JWKS
 // source — it intentionally includes operationally-expired keys so
-// already-emitted receipts keep verifying after key rotation.
+// already-emitted attestations keep verifying after key rotation.
 func (r *SigningCredentialRepository) ListVerifiable(ctx context.Context, purpose string, now time.Time) ([]*domain.SigningCredential, error) {
 	var creds []*domain.SigningCredential
 

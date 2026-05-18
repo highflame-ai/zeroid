@@ -64,7 +64,7 @@ func attestKey(t *testing.T, purpose string, ttlSeconds int) (kid string, priv e
 func jwksKey(t *testing.T, kid string) ed25519.PublicKey {
 	t.Helper()
 
-	resp := get(t, "/.well-known/highflame-receipt-keys", nil)
+	resp := get(t, "/.well-known/"+testSigningJWKSName, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	doc := decode(t, resp)
