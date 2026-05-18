@@ -152,6 +152,7 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
+		RedirectURIs:            input.Body.RedirectURIs,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
@@ -214,6 +215,7 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
+		RedirectURIs:            input.Body.RedirectURIs,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client update failed")
@@ -373,7 +375,13 @@ func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID s
 
 	client, err := a.oauthClientSvc.VerifyRegistrationToken(ctx, clientID, regToken)
 	if err != nil {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "invalid or unknown registration_access_token"}
+		// 401 for genuine not-found / bad token; 500 for DB / infra failures so an
+		// outage isn't masked as an auth rejection.
+		if errors.Is(err, service.ErrOAuthClientNotFound) {
+			return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "invalid or unknown registration_access_token"}
+		}
+		log.Error().Err(err).Str("client_id", clientID).Msg("DCR: registration-token verification failed")
+		return nil, &dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to verify registration token"}
 	}
 	return client, nil
 }

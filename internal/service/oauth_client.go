@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -347,7 +348,11 @@ func validateDCRSubmittedFields(grantTypes []string, authMethod string) (string,
 		}
 	}
 	if authMethod == "" {
-		return "client_secret_post", nil
+		// RFC 7591 §2 default. Older drafts and some examples used
+		// client_secret_post; we conform to the published spec for
+		// interoperability with standards-compliant clients that omit
+		// the field expecting the spec default.
+		return "client_secret_basic", nil
 	}
 	if !dcrAllowedAuthMethods[authMethod] {
 		return "", fmt.Errorf("token_endpoint_auth_method %q is not permitted for dynamically-registered clients", authMethod)
@@ -439,11 +444,17 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		SoftwareVersion:         req.SoftwareVersion,
 		Contacts:                contacts,
 		Metadata:                req.Metadata,
-		RegistrationSource:      "dynamic",
-		RegistrationAccessToken: string(hashedRegToken),
-		IsActive:                true,
-		CreatedAt:               now,
-		UpdatedAt:               now,
+		// backchannel_token_delivery_mode has a NOT NULL DEFAULT 'poll' + a CHECK
+		// constraint (migration 021). Bun inserts the Go zero value rather than
+		// letting the DB default fire, so DCR clients must set this explicitly or
+		// the INSERT fails the CHECK with SQLSTATE 23514 (a 500 at the handler).
+		// DCR clients don't use CIBA, so 'poll' is the safe baseline.
+		BackchannelTokenDeliveryMode: string(domain.BackchannelNotificationPoll),
+		RegistrationSource:           "dynamic",
+		RegistrationAccessToken:      string(hashedRegToken),
+		IsActive:                     true,
+		CreatedAt:                    now,
+		UpdatedAt:                    now,
 	}
 
 	if err := s.repo.Create(ctx, client); err != nil {
@@ -479,9 +490,24 @@ func init() {
 //
 // Always runs a bcrypt comparison regardless of whether the client_id exists, so that
 // response time does not leak client_id existence to an attacker.
+//
+// Errors are distinguished:
+//   - ErrOAuthClientNotFound: row absent or row is not a dynamic client or hash mismatch.
+//     Callers map this to 401 invalid_token.
+//   - any other error: a DB or infrastructure failure. Callers must map this to 5xx,
+//     not 401, so an outage is not masquerading as an auth failure.
 func (s *OAuthClientService) VerifyRegistrationToken(ctx context.Context, clientID, regToken string) (*domain.OAuthClient, error) {
 	client, err := s.repo.GetByClientID(ctx, clientID)
-	if err != nil || client.RegistrationSource != "dynamic" {
+	if err != nil {
+		// sql.ErrNoRows is the genuine not-found; equalise timing and return 401.
+		// Anything else is a DB/infra failure that the handler must propagate as 500.
+		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword(dummyRegistrationTokenHash, []byte(regToken))
+			return nil, ErrOAuthClientNotFound
+		}
+		return nil, fmt.Errorf("verify registration token: %w", err)
+	}
+	if client.RegistrationSource != "dynamic" {
 		_ = bcrypt.CompareHashAndPassword(dummyRegistrationTokenHash, []byte(regToken))
 		return nil, ErrOAuthClientNotFound
 	}

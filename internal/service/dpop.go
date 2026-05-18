@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
@@ -148,6 +149,20 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 		return "", errors.New("dpop proof: iat is outside the freshness window (proof has expired)")
 	}
 
+	// 9a. If the proof carries optional exp / nbf claims (jwt.ParseInsecure
+	//     does NOT validate them; jwx v4's WithKey-based jwt.Parse path is
+	//     unavailable here because the signing key is the embedded jwk
+	//     header rather than a pre-known KeySet), enforce them ourselves.
+	//     RFC 9449 §4.2 permits but does not require exp; if a client
+	//     provides it, ignoring it would let an explicitly-expired proof
+	//     succeed on the iat freshness check alone.
+	if exp, ok := parsed.Expiration(); ok && !exp.IsZero() && now.After(exp.Add(dpopClockSkewTolerance)) {
+		return "", errors.New("dpop proof: exp has passed")
+	}
+	if nbf, ok := parsed.NotBefore(); ok && !nbf.IsZero() && now.Add(dpopClockSkewTolerance).Before(nbf) {
+		return "", errors.New("dpop proof: nbf is in the future")
+	}
+
 	// 10. jti MUST be unique within the freshness window — consumed atomically via DB INSERT.
 	jti, _ := parsed.JwtID()
 	if jti == "" {
@@ -201,12 +216,18 @@ func (s *DPoPService) consumeJTI(ctx context.Context, jti string, expiresAt time
 	return fmt.Errorf("%w: %w", ErrDPoPStorageFailure, err)
 }
 
-// normalizeHTU strips the query and fragment from a URL per RFC 9449 §4.2.
+// normalizeHTU strips the query and fragment from a URL per RFC 9449 §4.2,
+// and lowercases scheme + host per RFC 3986 §3.1 / §3.2.2 (both components are
+// case-insensitive). Without the case normalisation a client signing
+// `https://Example.com/...` and a server seeing `https://example.com/...`
+// (or vice-versa via proxy rewrite) would fail an otherwise-valid proof.
 func normalizeHTU(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String()

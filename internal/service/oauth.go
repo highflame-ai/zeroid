@@ -949,13 +949,14 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
-			ClientID:   req.ClientID,
-			AccountID:  authCode.AccountID,
-			ProjectID:  authCode.ProjectID,
-			UserID:     authCode.UserID,
-			IdentityID: oauthClient.IdentityID,
-			Scopes:     strings.Join(authCode.Scopes, " "),
-			TTL:        oauthClient.RefreshTokenTTL,
+			ClientID:          req.ClientID,
+			AccountID:         authCode.AccountID,
+			ProjectID:         authCode.ProjectID,
+			UserID:            authCode.UserID,
+			IdentityID:        oauthClient.IdentityID,
+			Scopes:            strings.Join(authCode.Scopes, " "),
+			TTL:               oauthClient.RefreshTokenTTL,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -1031,8 +1032,15 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		accessTTL = defaultAccessTokenTTLWithRefresh
 	}
 
-	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL)
+	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL, req.DPoPKeyThumbprint)
 	if err != nil {
+		// A DPoP binding mismatch is a proof failure, not an invalid refresh
+		// token. The token row is untouched (the rotation transaction rolled
+		// back) so the legitimate caller's next request still works. RFC 9449
+		// §5 carriage: the AS rejects the request without revoking the token.
+		if errors.Is(err, ErrDPoPBindingMismatch) {
+			return nil, oauthBadRequest("invalid_dpop_proof", "refresh token is DPoP-bound; the presented proof does not match the original key")
+		}
 		return nil, oauthBadRequestCause("invalid_grant", "invalid or expired refresh token", err)
 	}
 

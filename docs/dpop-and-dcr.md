@@ -127,11 +127,25 @@ CREATE TABLE dpop_jti (
 
 ZeroID does not gate its **own** endpoints on a downstream DPoP proof — `/oauth2/token/introspect` and `/oauth2/token/revoke` accept the access token under either auth scheme. The proof check is the resource server's job, and resource servers reach for `ValidateProofForToken` (passes `accessToken` so the `ath` check fires) rather than `ValidateProof`.
 
+### Refresh-token binding (RFC 9449 §5)
+
+When a refresh token is issued in conjunction with a DPoP-bound access token (via the `authorization_code` grant whose `/oauth2/token` call carried a proof), the refresh token itself is bound to the same public key. Implementation:
+
+- `refresh_tokens.dpop_key_thumbprint` (added in migration 026) records the thumbprint.
+- `RotateRefreshToken` accepts the presented proof's thumbprint as a parameter; the comparison runs **inside the rotation transaction**, so a bound refresh token that's presented with a wrong key / no proof:
+  - returns `invalid_dpop_proof`, **not** `invalid_grant`,
+  - does **not** consume the refresh token (the transaction rolls back),
+  - leaves the legitimate caller's next request with the correct key still working.
+- The successor row carries the same thumbprint, so binding survives the rotation chain indefinitely.
+
+An **unbound** refresh token (issued without DPoP) is not retroactively bound — even if a later rotation request presents a proof. That decision could change later; today it preserves the explicit user opt-in to DPoP.
+
 ### Limitations / future work
 
 - **CIBA push mode**: the CIBA push delivery path mints a token server-side with no client proof available; those tokens come out as Bearer regardless. CIBA poll mode is fully DPoP-capable today (the poll's `/oauth2/token` call carries the proof normally).
 - **Resource-server SDKs**: the in-tree SDK helpers do not yet implement client-side proof generation. Tracking issue: future work.
 - **PS256 / EdDSA**: only ES256 and RS256 are advertised today via `dpop_signing_alg_values_supported`. Adding more is a one-line allow-list change.
+- **Unbound → bound upgrade on rotation**: today an unbound refresh token stays unbound across rotation even if the new request carries a proof. Upgrading on first proof is a small extension once we agree it's the desired UX.
 
 ---
 
@@ -308,4 +322,5 @@ No DCR-specific config knobs — the feature is governed by which clients hold `
 | Repo guard | [`internal/store/postgres/oauth_client.go`](../internal/store/postgres/oauth_client.go) (`DeleteByClientID`) |
 | Cleanup worker (sweeps `dpop_jti`) | [`internal/worker/cleanup.go`](../internal/worker/cleanup.go) |
 | Discovery (well-known) | [`internal/handler/wellknown.go`](../internal/handler/wellknown.go) |
-| Migrations | [`migrations/024_dynamic_client_registration.up.sql`](../migrations/024_dynamic_client_registration.up.sql), [`migrations/025_dpop.up.sql`](../migrations/025_dpop.up.sql) |
+| Migrations | [`migrations/024_dynamic_client_registration.up.sql`](../migrations/024_dynamic_client_registration.up.sql), [`migrations/025_dpop.up.sql`](../migrations/025_dpop.up.sql), [`migrations/026_refresh_token_dpop_binding.up.sql`](../migrations/026_refresh_token_dpop_binding.up.sql) |
+| Refresh-token rotation w/ binding | [`internal/service/refresh_token.go`](../internal/service/refresh_token.go) (`RotateRefreshToken`, `ErrDPoPBindingMismatch`) |

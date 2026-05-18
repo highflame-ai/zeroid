@@ -42,7 +42,18 @@ type RefreshTokenParams struct {
 	IdentityID *string
 	Scopes     string
 	TTL        int // seconds, 0 = use default (90 days)
+	// DPoPKeyThumbprint binds the refresh token to a DPoP key (RFC 9449 §5).
+	// Set non-empty when the issuing /oauth2/token call carried a valid DPoP
+	// proof; every later rotation must present a proof signed by the same
+	// key. Empty ⇒ unbound (Bearer).
+	DPoPKeyThumbprint string
 }
+
+// ErrDPoPBindingMismatch is returned when a refresh-token rotation presents a
+// DPoP proof whose key thumbprint differs from the one persisted with the
+// token. Callers MUST map this to invalid_dpop_proof / 4xx — it is the proof
+// that failed, not the refresh token. The token itself is NOT consumed.
+var ErrDPoPBindingMismatch = errors.New("refresh token's DPoP binding does not match the presented proof")
 
 // RefreshTokenResult contains both the raw token (returned to client) and stored metadata.
 type RefreshTokenResult struct {
@@ -63,16 +74,17 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 	expiresAt := time.Now().Add(refreshTokenTTL(params.TTL))
 
 	record := &domain.RefreshToken{
-		TokenHash:  tokenHash,
-		ClientID:   params.ClientID,
-		AccountID:  params.AccountID,
-		ProjectID:  params.ProjectID,
-		UserID:     params.UserID,
-		IdentityID: params.IdentityID,
-		Scopes:     params.Scopes,
-		FamilyID:   familyID,
-		State:      domain.RefreshTokenStateActive,
-		ExpiresAt:  expiresAt,
+		TokenHash:         tokenHash,
+		ClientID:          params.ClientID,
+		AccountID:         params.AccountID,
+		ProjectID:         params.ProjectID,
+		UserID:            params.UserID,
+		IdentityID:        params.IdentityID,
+		Scopes:            params.Scopes,
+		FamilyID:          familyID,
+		State:             domain.RefreshTokenStateActive,
+		ExpiresAt:         expiresAt,
+		DPoPKeyThumbprint: params.DPoPKeyThumbprint,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -100,7 +112,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 //     leave the original token revoked with no successor, and the client's
 //     retry would trip reuse detection and nuke the whole family — turning a
 //     transient glitch into a forced re-auth across all sessions.
-func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int) (*domain.RefreshToken, *RefreshTokenResult, error) {
+func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int, presentedDPoPThumbprint string) (*domain.RefreshToken, *RefreshTokenResult, error) {
 	tokenHash := hashRefreshToken(rawToken)
 
 	newRawToken, err := generateRefreshToken()
@@ -116,23 +128,35 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 		if err != nil {
 			return err
 		}
+		// DPoP binding check (RFC 9449 §5). A refresh token issued under
+		// DPoP must rotate only when the presented proof carries the same
+		// public key. Mismatch rolls back the transaction — the original
+		// row stays active, so a failed-proof attempt does NOT consume
+		// the token (no DoS via spamming bad proofs).
+		if c.DPoPKeyThumbprint != "" && c.DPoPKeyThumbprint != presentedDPoPThumbprint {
+			return ErrDPoPBindingMismatch
+		}
 		claimed = c
 
 		successor := &domain.RefreshToken{
-			TokenHash:  newTokenHash,
-			ClientID:   c.ClientID,
-			AccountID:  c.AccountID,
-			ProjectID:  c.ProjectID,
-			UserID:     c.UserID,
-			IdentityID: c.IdentityID,
-			Scopes:     c.Scopes,
-			FamilyID:   c.FamilyID, // Same family — rotation chain.
-			State:      domain.RefreshTokenStateActive,
-			ExpiresAt:  expiresAt,
+			TokenHash:         newTokenHash,
+			ClientID:          c.ClientID,
+			AccountID:         c.AccountID,
+			ProjectID:         c.ProjectID,
+			UserID:            c.UserID,
+			IdentityID:        c.IdentityID,
+			Scopes:            c.Scopes,
+			FamilyID:          c.FamilyID, // Same family — rotation chain.
+			State:             domain.RefreshTokenStateActive,
+			ExpiresAt:         expiresAt,
+			DPoPKeyThumbprint: c.DPoPKeyThumbprint, // Bound tokens stay bound across rotation.
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})
 	if txErr != nil {
+		if errors.Is(txErr, ErrDPoPBindingMismatch) {
+			return nil, nil, ErrDPoPBindingMismatch
+		}
 		if errors.Is(txErr, sql.ErrNoRows) {
 			return nil, nil, s.handleFailedClaim(ctx, tokenHash)
 		}
