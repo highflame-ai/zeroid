@@ -1,4 +1,4 @@
--- 023_dynamic_client_registration.up.sql
+-- 024_dynamic_client_registration.up.sql
 -- Adds dynamic client registration support per RFC 7591/7592.
 --
 -- registration_source: 'internal' for clients registered via the admin/internal

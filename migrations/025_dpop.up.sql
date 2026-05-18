@@ -1,4 +1,4 @@
--- 024_dpop.up.sql
+-- 025_dpop.up.sql
 -- DPoP — Demonstrating Proof of Possession (RFC 9449).
 --
 -- dpop_jti: proof JTI replay-prevention store.
