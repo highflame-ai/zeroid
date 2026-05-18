@@ -32,16 +32,20 @@ func (r *SigningCredentialRepository) Create(ctx context.Context, c *domain.Sign
 	return nil
 }
 
-// GetByKID resolves a credential by kid for VERIFICATION. It deliberately
-// does NOT filter on not_after — an expired (rotated / pod-gone) key must
-// still resolve so historical attestations verify within the
-// audit-retention window. Revoked/retention semantics are the caller's
-// (domain.SigningCredential.VerifiableNow). Returns (nil, nil) when no
-// such kid exists.
-func (r *SigningCredentialRepository) GetByKID(ctx context.Context, kid string) (*domain.SigningCredential, error) {
+// GetByKID resolves a credential by kid within a tenant for
+// VERIFICATION. It deliberately does NOT filter on not_after — an expired
+// (rotated / pod-gone) key must still resolve so historical attestations
+// verify within the audit-retention window. Revoked/retention semantics
+// are the caller's (domain.SigningCredential.VerifiableNow). Returns
+// (nil, nil) when no such kid exists for the tenant.
+func (r *SigningCredentialRepository) GetByKID(ctx context.Context, kid, accountID, projectID string) (*domain.SigningCredential, error) {
 	c := &domain.SigningCredential{}
 
-	err := r.db.NewSelect().Model(c).Where("kid = ?", kid).Scan(ctx)
+	err := r.db.NewSelect().Model(c).
+		Where("kid = ?", kid).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Scan(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -74,16 +78,18 @@ func (r *SigningCredentialRepository) ListVerifiable(ctx context.Context, purpos
 	return creds, nil
 }
 
-// RevokeWorkload revokes every non-revoked credential for a workload —
-// the CAE entry point. A revoked key fails verification immediately,
-// regardless of its retention window.
-func (r *SigningCredentialRepository) RevokeWorkload(ctx context.Context, workload, reason string, at time.Time) (int64, error) {
+// RevokeWorkload revokes every non-revoked credential for a workload
+// within a tenant — the CAE entry point. A revoked key fails
+// verification immediately, regardless of its retention window.
+func (r *SigningCredentialRepository) RevokeWorkload(ctx context.Context, workload, accountID, projectID, reason string, at time.Time) (int64, error) {
 	res, err := r.db.NewUpdate().
 		Model((*domain.SigningCredential)(nil)).
 		Set("revoked = ?", true).
 		Set("revoked_reason = ?", reason).
 		Set("revoked_at = ?", at).
 		Where("workload = ?", workload).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
 		Where("revoked = ?", false).
 		Exec(ctx)
 	if err != nil {
@@ -95,9 +101,10 @@ func (r *SigningCredentialRepository) RevokeWorkload(ctx context.Context, worklo
 	return n, nil
 }
 
-// RevokeKID revokes a single credential by kid, scoped to its attesting
-// workload (no cross-workload revocation through this path).
-func (r *SigningCredentialRepository) RevokeKID(ctx context.Context, kid, workload, reason string, at time.Time) (int64, error) {
+// RevokeKID revokes a single credential by kid within a tenant, scoped
+// to its attesting workload (no cross-tenant or cross-workload
+// revocation through this path).
+func (r *SigningCredentialRepository) RevokeKID(ctx context.Context, kid, workload, accountID, projectID, reason string, at time.Time) (int64, error) {
 	res, err := r.db.NewUpdate().
 		Model((*domain.SigningCredential)(nil)).
 		Set("revoked = ?", true).
@@ -105,6 +112,8 @@ func (r *SigningCredentialRepository) RevokeKID(ctx context.Context, kid, worklo
 		Set("revoked_at = ?", at).
 		Where("kid = ?", kid).
 		Where("workload = ?", workload).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
 		Where("revoked = ?", false).
 		Exec(ctx)
 	if err != nil {

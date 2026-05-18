@@ -7,24 +7,30 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 
+	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ── Workload-attested ephemeral signing credentials ──────────────────────────
 //
-// Attest + revoke are ADMIN routes: the deployer's admin-auth middleware
-// (AuthN's InternalServiceAuth) only lets trusted internal services
-// reach them and validates X-Internal-Service against the shared secret,
-// so by the time these handlers run the caller is a proven trusted
-// service and X-Internal-Service is its identity. The verification JWKS
-// is a PUBLIC route — offline verification by any party is the point;
-// only non-secret public keys are exposed.
+// Attest + revoke are ADMIN routes. ZeroID's admin surface performs no
+// authentication of its own: it is operator-protected at the network
+// layer (separate port, not externally exposed; VPN / service mesh /
+// reverse proxy, or the deployer's optional admin-auth hook) — see
+// TenantContextMiddleware. Authorization within that surface is tenant
+// isolation: every read/write is scoped to the (account_id, project_id)
+// derived from the validated tenant context (GetTenant, fail-closed),
+// exactly like every other ZeroID admin handler. `X-Internal-Service` is
+// a logical workload label (e.g. which signer attested this key) that is
+// only ever trusted within an already tenant-scoped, operator-protected
+// request — never as a standalone cross-tenant principal. The
+// verification JWKS is a PUBLIC route: offline verification by any party
+// is the point, and only non-secret public keys, keyed by a globally
+// unique kid, are exposed.
 
 type attestSigningKeyInput struct {
-	Workload  string `header:"X-Internal-Service" doc:"Attesting workload (validated by admin auth)"`
-	AccountID string `header:"X-Account-ID"`
-	ProjectID string `header:"X-Project-ID"`
-	Body      struct {
+	Workload string `header:"X-Internal-Service" doc:"Attesting workload label (tenant-scoped)"`
+	Body     struct {
 		PublicKey  string `json:"public_key"  doc:"base64url Ed25519 public key (32 bytes)"`
 		Algorithm  string `json:"algorithm"   doc:"EdDSA"`
 		Purpose    string `json:"purpose"     doc:"receipt | authz_audit"`
@@ -86,10 +92,19 @@ func (a *API) registerSigningJWKSRoute(api huma.API) {
 }
 
 func (a *API) attestSigningKeyOp(ctx context.Context, in *attestSigningKeyInput) (*attestSigningKeyOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	if in.Workload == "" {
+		return nil, huma.Error401Unauthorized("caller is not a trusted internal service")
+	}
+
 	res, err := a.signingCredSvc.Attest(ctx, service.AttestRequest{
 		Workload:   in.Workload,
-		AccountID:  in.AccountID,
-		ProjectID:  in.ProjectID,
+		AccountID:  tenant.AccountID,
+		ProjectID:  tenant.ProjectID,
 		PublicKey:  in.Body.PublicKey,
 		Algorithm:  in.Body.Algorithm,
 		Purpose:    in.Body.Purpose,
@@ -107,11 +122,16 @@ func (a *API) attestSigningKeyOp(ctx context.Context, in *attestSigningKeyInput)
 }
 
 func (a *API) revokeSigningKeyOp(ctx context.Context, in *revokeSigningKeyInput) (*revokeSigningKeyOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
 	if in.Workload == "" {
 		return nil, huma.Error401Unauthorized("caller is not a trusted internal service")
 	}
 
-	revoked, err := a.signingCredSvc.RevokeKID(ctx, in.KID, in.Workload, in.Body.Reason)
+	revoked, err := a.signingCredSvc.RevokeKID(ctx, in.KID, in.Workload, tenant.AccountID, tenant.ProjectID, in.Body.Reason)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("failed to revoke signing credential")
 	}

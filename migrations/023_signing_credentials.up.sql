@@ -37,9 +37,11 @@ CREATE TABLE IF NOT EXISTS signing_credentials (
 CREATE INDEX IF NOT EXISTS idx_signing_credentials_verify
     ON signing_credentials (kid, revoked, audit_retention_until);
 
--- CAE revocation sweep + operational lookups for a workload.
+-- CAE revocation sweep + operational lookups for a workload, tenant-
+-- scoped: every admin read/revoke is bounded by (account_id, project_id)
+-- derived from the validated tenant context.
 CREATE INDEX IF NOT EXISTS idx_signing_credentials_workload
-    ON signing_credentials (workload, purpose, created_at);
+    ON signing_credentials (account_id, project_id, workload, purpose, created_at);
 
 -- Retention pruning (delete only past the retention window).
 CREATE INDEX IF NOT EXISTS idx_signing_credentials_retention

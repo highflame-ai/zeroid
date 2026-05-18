@@ -183,10 +183,11 @@ func (s *SigningCredentialService) VerificationJWKS(ctx context.Context, purpose
 	return out, nil
 }
 
-// RevokeKID revokes one credential (the attesting workload only). A
-// revoked key fails verification immediately, regardless of retention.
-func (s *SigningCredentialService) RevokeKID(ctx context.Context, kid, workload, reason string) (bool, error) {
-	n, err := s.repo.RevokeKID(ctx, kid, workload, reason, time.Now())
+// RevokeKID revokes one credential within the caller's tenant, scoped to
+// the attesting workload. A revoked key fails verification immediately,
+// regardless of retention.
+func (s *SigningCredentialService) RevokeKID(ctx context.Context, kid, workload, accountID, projectID, reason string) (bool, error) {
+	n, err := s.repo.RevokeKID(ctx, kid, workload, accountID, projectID, reason, time.Now())
 	if err != nil {
 		return false, err
 	}
@@ -194,10 +195,11 @@ func (s *SigningCredentialService) RevokeKID(ctx context.Context, kid, workload,
 	return n > 0, nil
 }
 
-// RevokeWorkload revokes every active key for a workload — the CAE entry
-// point (call on a credential_compromise / trust_level_downgrade signal).
-func (s *SigningCredentialService) RevokeWorkload(ctx context.Context, workload, reason string) (int64, error) {
-	return s.repo.RevokeWorkload(ctx, workload, reason, time.Now())
+// RevokeWorkload revokes every active key for a workload within a tenant
+// — the CAE entry point (call on a credential_compromise /
+// trust_level_downgrade signal).
+func (s *SigningCredentialService) RevokeWorkload(ctx context.Context, workload, accountID, projectID, reason string) (int64, error) {
+	return s.repo.RevokeWorkload(ctx, workload, accountID, projectID, reason, time.Now())
 }
 
 // mintKID returns a collision-safe, sanitized, informative key id.
