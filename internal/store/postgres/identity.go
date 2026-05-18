@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/uptrace/bun"
 
@@ -182,4 +183,89 @@ func (r *IdentityRepository) Delete(ctx context.Context, id, accountID, projectI
 		return fmt.Errorf("failed to delete identity: %w", err)
 	}
 	return nil
+}
+
+// DeactivateIfActive atomically flips status to 'deactivated' iff the row
+// is still 'active', returning the post-update identity row and a boolean
+// indicating whether this caller won the claim. Used by the cleanup
+// worker's expiry sweep so that concurrent replicas don't both run the
+// deactivation cascade for the same identity — only the worker whose UPDATE
+// matched a still-active row gets back claimed=true and proceeds to fire
+// the credential / API-key revocation + lifecycle CAE signal. The signal
+// type depends on the caller's reason: the expiry sweep emits
+// SignalTypeIdentityExpired; admin-initiated deactivation emits the
+// generic SignalTypeRetirement.
+//
+// Callers that fail the claim (claimed=false) MUST silently skip; the row
+// was either already deactivated by another replica or by a parallel admin
+// action, and the cascade for that transition has already run (or is
+// running) on that other path.
+func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, accountID, projectID string) (claimed bool, identity *domain.Identity, err error) {
+	db := dbOrTx(ctx, r.db)
+	identity = &domain.Identity{}
+	// modified_by must be set in the UPDATE itself — the audit trigger
+	// reads NEW.modified_by, so a caller_name on the context only reaches
+	// the audit log when it's written into this row's column.
+	q := db.NewUpdate().Model(identity).
+		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status = ?", string(domain.IdentityStatusActive)).
+		Returning("*").
+		Exec(ctx)
+	if err != nil {
+		return false, nil, fmt.Errorf("deactivate-if-active: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, nil, fmt.Errorf("deactivate-if-active rows: %w", err)
+	}
+	if n == 0 {
+		return false, nil, nil
+	}
+	return true, identity, nil
+}
+
+// ListExpiredActive returns identities whose expires_at has passed while
+// their status is still 'active'. Used by the cleanup worker's identity
+// sweep. The partial index on (expires_at) WHERE status='active' makes
+// this scan O(expired-rows), not O(all-identities).
+func (r *IdentityRepository) ListExpiredActive(ctx context.Context, now time.Time) ([]*domain.Identity, error) {
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewSelect().Model(&identities).
+		Where("expires_at IS NOT NULL").
+		Where("expires_at < ?", now).
+		Where("status = ?", string(domain.IdentityStatusActive)).
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("list expired identities: %w", err)
+	}
+	return identities, nil
+}
+
+// ListExpiringSoon returns identities whose expires_at falls within the given
+// window (now..now+within). Used by GET /expiring-soon. Excludes already-
+// deactivated identities so the result reflects what is *about to* expire,
+// not what already has.
+func (r *IdentityRepository) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.Identity, error) {
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("expires_at IS NOT NULL").
+		Where("expires_at >= ?", now).
+		Where("expires_at <= ?", now.Add(within)).
+		Where("status = ?", string(domain.IdentityStatusActive)).
+		Order("expires_at ASC").
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("list expiring identities: %w", err)
+	}
+	return identities, nil
 }

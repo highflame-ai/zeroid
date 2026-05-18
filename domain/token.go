@@ -85,6 +85,17 @@ type OAuthClient struct {
 	RedirectURIs []string `bun:"redirect_uris,array" json:"redirect_uris"`
 	Scopes       []string `bun:"scopes,array"       json:"scopes"`
 
+	// CIBA Core 1.0 — ping/push notification endpoint. Registered HTTPS URL
+	// the server POSTs to when a backchannel authentication request resolves.
+	// Empty when the client doesn't support ping/push mode (polling-only).
+	ClientNotificationEndpoint string `bun:"client_notification_endpoint" json:"client_notification_endpoint,omitempty"`
+
+	// CIBA Core 1.0 §10 — declared token delivery mode for this client.
+	// "poll" (default), "ping", or "push". Determines how a CIBA-issued
+	// token reaches the client: by polling /oauth2/token, by ping callback +
+	// poll, or by push callback (token delivered directly).
+	BackchannelTokenDeliveryMode string `bun:"backchannel_token_delivery_mode" json:"backchannel_token_delivery_mode,omitempty"`
+
 	// Token lifetime (per-client, 0 = use server default)
 	AccessTokenTTL  int `bun:"access_token_ttl"  json:"access_token_ttl,omitempty"`
 	RefreshTokenTTL int `bun:"refresh_token_ttl" json:"refresh_token_ttl,omitempty"`
@@ -105,6 +116,14 @@ type OAuthClient struct {
 
 	// Extensibility
 	Metadata json.RawMessage `bun:"metadata,type:jsonb" json:"metadata,omitempty"`
+
+	// IdentityID optionally binds this OAuth client to an agent identity.
+	// When set, authorization_code and refresh_token grants issued through
+	// this client carry the identity_id forward (refresh_tokens.identity_id
+	// already exists) and gate token issuance on the linked identity's
+	// status + expires_at — same fail-closed semantics jwt_bearer and
+	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
 
 	// Lifecycle
 	IsActive  bool      `bun:"is_active"   json:"is_active"`

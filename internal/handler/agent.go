@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -20,6 +21,11 @@ import (
 func mapErr(err error) error {
 	if err == nil {
 		return nil
+	}
+	// Typed sentinels first. Service-layer callers wrap with these so
+	// callers see a 400 instead of a 500 on caller-fixable states.
+	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+		return huma.Error400BadRequest(err.Error())
 	}
 	msg := err.Error()
 	switch {
@@ -56,6 +62,9 @@ type RegisterAgentInput struct {
 		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
 		APIKeyCredentialPolicyID string          `json:"api_key_credential_policy_id,omitempty" doc:"Optional narrower policy for the auto-created API key. Must be a subset of the identity policy (scopes, TTL, grant types, delegation depth, trust level, attestation). When empty, the API key inherits the identity policy."`
+		// ExpiresAt time-bounds the grant of authority and propagates to the
+		// auto-created API key. RFC3339. Omit for no expiry.
+		ExpiresAt *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the agent and its bootstrap API key are auto-deactivated"`
 		// Fields injected by management API from trusted headers (overridden server-side):
 		AccountID string `json:"account_id,omitempty"`
 		ProjectID string `json:"project_id,omitempty"`
@@ -220,6 +229,7 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		PublicKeyPEM:             input.Body.PublicKeyPEM,
 		CredentialPolicyID:       input.Body.CredentialPolicyID,
 		APIKeyCredentialPolicyID: input.Body.APIKeyCredentialPolicyID,
+		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {

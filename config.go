@@ -30,6 +30,7 @@ type Config struct {
 	Telemetry   TelemetryConfig   `koanf:"telemetry"`
 	Logging     LoggingConfig     `koanf:"logging"`
 	Attestation AttestationConfig `koanf:"attestation"`
+	Backchannel BackchannelConfig `koanf:"backchannel"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
@@ -40,6 +41,24 @@ type Config struct {
 	// verifies the ID token before minting a ZeroID token. Empty list (default)
 	// disables direct federation — only the broker path remains available.
 	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
+}
+
+// BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
+// are optional; defaults are applied in service.DefaultBackchannelConfig().
+type BackchannelConfig struct {
+	// AllowPrivateNotificationEndpoints relaxes the SSRF guard on CIBA
+	// outbound notification destinations. Default false (production-safe).
+	//
+	// When false, registered client_notification_endpoint hosts are resolved
+	// and rejected if they (or any of their resolved IPs) fall in private,
+	// loopback, link-local, multicast, CGN, or unspecified ranges. Re-checked
+	// at request time as DNS-rebinding defense.
+	//
+	// When true, the guard is disabled — only HTTPS scheme + non-empty host
+	// are enforced. Use ONLY in single-tenant test/dev deployments that
+	// register endpoints like https://localhost:9000/. Production deployments
+	// MUST keep this false (see GHSA-599q-j34m-33vc).
+	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
 }
 
 // AttestationConfig governs the attestation verification subsystem. The
@@ -136,10 +155,9 @@ type TokenConfig struct {
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
+// Endpoint and TLS are delegated to the OTel SDK via standard env vars
 type TelemetryConfig struct {
 	Enabled      bool    `koanf:"enabled"`
-	Endpoint     string  `koanf:"endpoint"`
-	Insecure     bool    `koanf:"insecure"`
 	ServiceName  string  `koanf:"service_name"`
 	SamplingRate float64 `koanf:"sampling_rate"`
 }
@@ -299,8 +317,6 @@ func loadDefaults(k *koanf.Koanf) error {
 
 		// Telemetry
 		"telemetry.enabled":       false,
-		"telemetry.endpoint":      "localhost:4317",
-		"telemetry.insecure":      true,
 		"telemetry.service_name":  "zeroid",
 		"telemetry.sampling_rate": 1.0,
 
@@ -362,10 +378,10 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// Attestation
 		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
 
-		// Telemetry
-		"OTEL_EXPORTER_OTLP_ENDPOINT": "telemetry.endpoint",
-		"OTEL_ENABLED":                "telemetry.enabled",
-		"OTEL_INSECURE":               "telemetry.insecure",
+		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
+		// directly by the OTel SDK (spec-compliant).
+		"OTEL_ENABLED":            "telemetry.enabled",
+		"OTEL_TRACES_SAMPLER_ARG": "telemetry.sampling_rate",
 
 		// Logging
 		"ZEROID_LOG_LEVEL": "logging.level",
@@ -379,7 +395,6 @@ func loadEnvVars(k *koanf.Koanf) error {
 
 		switch {
 		case strings.HasSuffix(configPath, ".enabled") ||
-			strings.HasSuffix(configPath, ".insecure") ||
 			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
 			if boolVal, err := strconv.ParseBool(value); err == nil {
 				_ = k.Set(configPath, boolVal)

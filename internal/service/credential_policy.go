@@ -23,6 +23,17 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
+// ErrInvalidPolicyField marks caller-fixable input errors emitted by
+// UpdatePolicy when the tri-state expires_at PATCH string fails to parse
+// (malformed RFC3339) or is backdated. Maps to 400 at the HTTP boundary.
+//
+// CreatePolicy does NOT emit this sentinel: it takes *time.Time, so
+// Huma's input binding already rejects malformed values at the request
+// boundary, and a backdated expires_at on create is intentionally
+// permitted (used by integration tests to mint an already-expired
+// policy without a sleep).
+var ErrInvalidPolicyField = errors.New("invalid credential policy field")
+
 // ErrPolicySubsetViolation is returned when a would-be API-key policy is
 // broader than the owning identity's policy along any axis (scopes, TTL,
 // grant types, delegation depth, trust level, attestation). Returned as a
@@ -95,6 +106,8 @@ type CreatePolicyRequest struct {
 	RequiredTrustLevel  string
 	RequiredAttestation string
 	MaxDelegationDepth  int
+	// ExpiresAt time-bounds the policy. Nil means "no expiry".
+	ExpiresAt *time.Time
 }
 
 // CreatePolicy creates a new credential policy.
@@ -135,6 +148,7 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		RequiredAttestation: req.RequiredAttestation,
 		MaxDelegationDepth:  req.MaxDelegationDepth,
 		IsActive:            true,
+		ExpiresAt:           req.ExpiresAt,
 		CreatedAt:           time.Now(),
 		UpdatedAt:           time.Now(),
 	}
@@ -169,6 +183,12 @@ func (s *CredentialPolicyService) ListPolicies(ctx context.Context, accountID, p
 	return s.repo.List(ctx, accountID, projectID)
 }
 
+// ListExpiringSoon returns active credential policies whose expires_at falls
+// within now..now+within. Used by GET /expiring-soon.
+func (s *CredentialPolicyService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.CredentialPolicy, error) {
+	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
+}
+
 // UpdatePolicyRequest holds parameters for updating a credential policy.
 type UpdatePolicyRequest struct {
 	Name                string
@@ -180,6 +200,11 @@ type UpdatePolicyRequest struct {
 	RequiredAttestation *string
 	MaxDelegationDepth  *int
 	IsActive            *bool
+	// ExpiresAt tri-state pointer to RFC3339 string:
+	//   nil → leave unchanged
+	//   ""  → clear to NULL (no expiry)
+	//   rfc3339 → set
+	ExpiresAt *string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -231,6 +256,17 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	if req.IsActive != nil {
 		policy.IsActive = *req.IsActive
 	}
+	if req.ExpiresAt != nil {
+		t, cleared, err := parseExpiresAtPatch(*req.ExpiresAt)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidPolicyField, err)
+		}
+		if cleared {
+			policy.ExpiresAt = nil
+		} else {
+			policy.ExpiresAt = &t
+		}
+	}
 
 	policy.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, policy); err != nil {
@@ -253,6 +289,9 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 	}
 	if !policy.IsActive {
 		return fmt.Errorf("%w: policy %q is inactive", ErrPolicyViolation, policy.Name)
+	}
+	if policy.IsExpired() {
+		return fmt.Errorf("%w: policy %q expired at %s", ErrPolicyViolation, policy.Name, policy.ExpiresAt.Format(time.RFC3339))
 	}
 
 	// 1. TTL <= policy.max_ttl_seconds

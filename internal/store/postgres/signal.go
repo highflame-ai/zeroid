@@ -58,3 +58,22 @@ func (r *SignalRepository) ListByIdentity(ctx context.Context, identityID, accou
 	}
 	return signals, nil
 }
+
+// ListByMissionID returns every signal carrying the given mission_id,
+// ordered by created_at ASC so events read in the order they fired.
+// Issue #81. The partial index from migration 017 makes this an indexed
+// equality lookup.
+func (r *SignalRepository) ListByMissionID(ctx context.Context, missionID, accountID, projectID string) ([]*domain.CAESignal, error) {
+	var signals []*domain.CAESignal
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&signals).
+		Where("mission_id = ?", missionID).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		OrderExpr("created_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list signals by mission: %w", err)
+	}
+	return signals, nil
+}

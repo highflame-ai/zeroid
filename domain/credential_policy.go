@@ -49,18 +49,31 @@ func DefaultAllowedGrantTypes() []string {
 type CredentialPolicy struct {
 	bun.BaseModel `bun:"table:credential_policies,alias:cp"`
 
-	ID                  string    `bun:"id,pk,type:uuid"                  json:"id"`
-	AccountID           string    `bun:"account_id,type:varchar(255)"     json:"account_id"`
-	ProjectID           string    `bun:"project_id,type:varchar(255)"     json:"project_id"`
-	Name                string    `bun:"name,type:varchar(255)"           json:"name"`
-	Description         string    `bun:"description,type:text"            json:"description,omitempty"`
-	MaxTTLSeconds       int       `bun:"max_ttl_seconds"                  json:"max_ttl_seconds"`
-	AllowedGrantTypes   []string  `bun:"allowed_grant_types,array"        json:"allowed_grant_types"`
-	AllowedScopes       []string  `bun:"allowed_scopes,array"             json:"allowed_scopes,omitempty"`
-	RequiredTrustLevel  string    `bun:"required_trust_level,type:varchar(50)"  json:"required_trust_level,omitempty"`
-	RequiredAttestation string    `bun:"required_attestation,type:varchar(50)"  json:"required_attestation,omitempty"`
-	MaxDelegationDepth  int       `bun:"max_delegation_depth"             json:"max_delegation_depth"`
-	IsActive            bool      `bun:"is_active"                        json:"is_active"`
-	CreatedAt           time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt           time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	ID                  string   `bun:"id,pk,type:uuid"                  json:"id"`
+	AccountID           string   `bun:"account_id,type:varchar(255)"     json:"account_id"`
+	ProjectID           string   `bun:"project_id,type:varchar(255)"     json:"project_id"`
+	Name                string   `bun:"name,type:varchar(255)"           json:"name"`
+	Description         string   `bun:"description,type:text"            json:"description,omitempty"`
+	MaxTTLSeconds       int      `bun:"max_ttl_seconds"                  json:"max_ttl_seconds"`
+	AllowedGrantTypes   []string `bun:"allowed_grant_types,array"        json:"allowed_grant_types"`
+	AllowedScopes       []string `bun:"allowed_scopes,array"             json:"allowed_scopes,omitempty"`
+	RequiredTrustLevel  string   `bun:"required_trust_level,type:varchar(50)"  json:"required_trust_level,omitempty"`
+	RequiredAttestation string   `bun:"required_attestation,type:varchar(50)"  json:"required_attestation,omitempty"`
+	MaxDelegationDepth  int      `bun:"max_delegation_depth"             json:"max_delegation_depth"`
+	IsActive            bool     `bun:"is_active"                        json:"is_active"`
+	// ExpiresAt time-bounds the policy. EnforcePolicy treats an expired
+	// policy the same as an inactive one — identity policy, per-key policy,
+	// or both. NULL means "no expiry".
+	ExpiresAt *time.Time `bun:"expires_at"                       json:"expires_at,omitempty"`
+	CreatedAt time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt time.Time  `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// IsExpired reports whether the policy has aged out. A nil ExpiresAt
+// means "no expiry" and is never expired.
+func (p *CredentialPolicy) IsExpired() bool {
+	if p == nil || p.ExpiresAt == nil {
+		return false
+	}
+	return !time.Now().Before(*p.ExpiresAt)
 }

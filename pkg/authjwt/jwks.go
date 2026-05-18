@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -276,11 +277,19 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 		return fmt.Errorf("parse JWKS: %w", err)
 	}
 
+	// SPIFFE bundles publish use=JWT-SVID (JWT-SVID §4). lestrrat-go/jwx's
+	// verifier treats anything other than "sig" as non-signing and skips the
+	// key, so we normalize on ingest. The spec value is "JWT-SVID" but match
+	// case-insensitively in case an upstream emits lowercase. RFC 7517 says
+	// use is informational — rewriting it doesn't change what the key is.
 	kids := make(map[string]struct{}, set.Len())
 	for i := 0; i < set.Len(); i++ {
 		key, ok := set.Key(i)
 		if !ok {
 			continue
+		}
+		if use, ok := key.KeyUsage(); ok && strings.EqualFold(use, "JWT-SVID") {
+			_ = key.Set(jwk.KeyUsageKey, jwk.ForSignature)
 		}
 		// jwx v4: KeyID() returns (string, present); the index loop is keyed
 		// on insertion order, so this is the cleanest way to get a kid string.

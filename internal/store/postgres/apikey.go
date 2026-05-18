@@ -182,3 +182,21 @@ func (r *APIKeyRepository) Create(ctx context.Context, sk *domain.APIKey) error 
 	}
 	return nil
 }
+
+// ListExpiringSoon returns active API keys whose expires_at falls within
+// now..now+within. Used by GET /expiring-soon.
+func (r *APIKeyRepository) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.APIKey, error) {
+	var keys []*domain.APIKey
+	if err := r.db.NewSelect().Model(&keys).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("expires_at IS NOT NULL").
+		Where("expires_at >= ?", now).
+		Where("expires_at <= ?", now.Add(within)).
+		Where("state = ?", domain.APIKeyStateActive).
+		Order("expires_at ASC").
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("list expiring api keys: %w", err)
+	}
+	return keys, nil
+}

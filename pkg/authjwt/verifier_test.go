@@ -229,6 +229,50 @@ func TestCustomClaims(t *testing.T) {
 	assertEqual(t, "AccountID", claims.AccountID, "acc-001")
 }
 
+// TestMissionIDClaim pins the mission_id (issue #81) extraction. The
+// claim must populate Claims.MissionID directly rather than landing in
+// Custom — downstream services log/filter via the typed accessor and
+// MUST NOT have to fish through Custom for it.
+func TestMissionIDClaim(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+	v := newVerifier(t, ks, issuer)
+
+	const mid = "11111111-2222-3333-4444-555555555555"
+
+	c := baseClaims(issuer)
+	c["mission_id"] = mid
+
+	token := ks.signRS256(t, c)
+	claims, err := v.Verify(context.Background(), token)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	assertEqual(t, "MissionID typed field", claims.MissionID, mid)
+	// Must NOT also leak into Custom — known claim, typed home.
+	if got := claims.GetCustomString("mission_id"); got != "" {
+		t.Errorf("mission_id leaked into Custom: %q (should be empty — claim is typed)", got)
+	}
+}
+
+// TestMissionIDClaimAbsent verifies that a token with no mission_id
+// claim leaves MissionID as the zero value and does not error out.
+func TestMissionIDClaimAbsent(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+	v := newVerifier(t, ks, issuer)
+
+	c := baseClaims(issuer) // no mission_id
+	token := ks.signRS256(t, c)
+	claims, err := v.Verify(context.Background(), token)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+
+	assertEqual(t, "MissionID empty when absent", claims.MissionID, "")
+}
+
 func TestVerifyExpiredToken(t *testing.T) {
 	ks := newTestKeySet(t)
 	issuer := "https://auth.test.com"
