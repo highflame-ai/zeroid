@@ -130,20 +130,29 @@ func TestDCRClient_DPoPBoundTokenIssuance(t *testing.T) {
 	}
 }
 
-// TestDPoPTokenExchange_PropagatesBindingToSubAgent verifies that the
-// DPoP-bound flag is independent at each hop of an RFC 8693 delegation
-// chain. The orchestrator presents proof key K1; the sub-agent's redemption
-// presents its own proof key K2; the issued sub-agent token must be bound to
-// K2 (the actor's key) — NOT to K1 (the orchestrator's), and NOT to "Bearer."
+// TestDPoPTokenExchange_PropagatesBindingToSubAgent walks the full RFC 8693
+// token_exchange delegation hop end-to-end and verifies that the binding
+// follows the *per-call* DPoP proof — not anything persisted from upstream:
 //
-// This is the cross-feature property the security review highlighted: each
-// IssueCredential call site has its own DPoPKeyThumbprint and the binding
-// follows the *current* request's proof, not anything persisted from upstream.
+//  1. Orchestrator gets a client_credentials token under DPoP key K1.
+//     Issued JWT carries cnf.jkt = thumbprint(K1).
+//  2. Sub-agent (distinct identity, ECDSA keypair K2 for its actor assertion)
+//     and the orchestrator together call /oauth2/token grant=token-exchange.
+//     The DPoP proof on *this* request is signed by a fresh key K3 (which is
+//     intentionally different from both K1 and K2 to prove the binding is
+//     independent of both upstream parties).
+//  3. The delegated token returned to the sub-agent MUST carry
+//     cnf.jkt = thumbprint(K3) — the proof from THIS request, not the
+//     orchestrator's K1 and not the actor's signing key K2.
+//
+// This is the cross-feature property the security review highlighted:
+// each IssueCredential call site has its own DPoPKeyThumbprint, and the
+// binding cannot leak across hops.
 func TestDPoPTokenExchange_PropagatesBindingToSubAgent(t *testing.T) {
-	// Orchestrator: NHI identity, DPoP-bound token.
-	orchestratorID := uid("cross-orch")
-	registerIdentity(t, orchestratorID, []string{"data:read"})
-	orchestratorClient := registerOAuthClient(t, orchestratorID, []string{"data:read"})
+	// Orchestrator: NHI identity, DPoP-bound token under K1.
+	orchID := uid("cross-orch")
+	registerIdentity(t, orchID, []string{"data:read"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read"})
 
 	orchKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -152,8 +161,8 @@ func TestDPoPTokenExchange_PropagatesBindingToSubAgent(t *testing.T) {
 
 	orchResp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
-		"client_id":     orchestratorClient.ClientID,
-		"client_secret": orchestratorClient.ClientSecret,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
 		"account_id":    testAccountID,
 		"project_id":    testProjectID,
 		"scope":         "data:read",
@@ -161,19 +170,53 @@ func TestDPoPTokenExchange_PropagatesBindingToSubAgent(t *testing.T) {
 	require.Equal(t, http.StatusOK, orchResp.StatusCode)
 	orchToken, _ := decode(t, orchResp)["access_token"].(string)
 	require.NotEmpty(t, orchToken)
+	// Sanity: orchestrator's token IS bound to K1.
+	orchIntrospect := introspect(t, orchToken)
+	orchCnf, ok := orchIntrospect["cnf"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, dpopKeyThumbprint(t, &orchKey.PublicKey), orchCnf["jkt"])
 
-	// Sub-agent: distinct identity with its own keypair (for the actor_token
-	// assertion). We can't easily run a full token_exchange end-to-end here
-	// without re-implementing buildAssertion's identity flow — but we CAN
-	// verify the orchestrator's own token came back DPoP-bound to *orchKey*
-	// (and only orchKey), proving the per-call binding semantic. A full
-	// chain test against the sub-agent's K2 belongs in a dedicated
-	// token_exchange × DPoP test once the test fixtures around actor_token
-	// signing are factored out for reuse.
-	result := introspect(t, orchToken)
-	cnf, ok := result["cnf"].(map[string]any)
-	require.True(t, ok, "orchestrator token must carry cnf when issued with DPoP proof")
+	// Sub-agent: distinct identity with its own ECDSA keypair K2 (signs the
+	// actor assertion required for jwt_bearer-style delegation).
+	subKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	subID := uid("cross-sub")
+	subIdentity := registerIdentity(t, subID, []string{"data:read"}, ecPublicKeyPEM(t, subKey))
+	actorAssertion := buildAssertion(t, subKey, subIdentity.WIMSEURI)
+
+	// K3: the proof key on THIS token_exchange request. Distinct from K1
+	// (orchestrator's binding) and K2 (sub-agent's actor signing key) so
+	// the assertion below is unambiguous.
+	hopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	hopProof := buildDPoPProof(t, hopKey, http.MethodPost,
+		testServer.URL+"/oauth2/token", uuid.New().String())
+
+	exchResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   actorAssertion,
+		"scope":         "data:read",
+	}, map[string]string{"DPoP": hopProof})
+	require.Equal(t, http.StatusOK, exchResp.StatusCode)
+	exchBody := decode(t, exchResp)
+	assert.Equal(t, "DPoP", exchBody["token_type"],
+		"delegated token must report token_type=DPoP because the hop carried a valid proof")
+
+	delegatedToken, _ := exchBody["access_token"].(string)
+	require.NotEmpty(t, delegatedToken)
+
+	// Introspect the delegated token: cnf.jkt MUST be K3's thumbprint,
+	// proving the binding follows the per-call proof and is not inherited
+	// from the orchestrator's K1 or the actor's K2.
+	delResult := introspect(t, delegatedToken)
+	cnf, ok := delResult["cnf"].(map[string]any)
+	require.True(t, ok, "delegated token MUST carry cnf when the exchange call presented DPoP")
 	jkt, _ := cnf["jkt"].(string)
-	assert.Equal(t, dpopKeyThumbprint(t, &orchKey.PublicKey), jkt,
-		"binding must be to the proof key from this call, not any persisted upstream key")
+	assert.Equal(t, dpopKeyThumbprint(t, &hopKey.PublicKey), jkt,
+		"binding MUST track THIS request's proof key (K3), not the orchestrator's K1 or the actor's K2")
+	assert.NotEqual(t, dpopKeyThumbprint(t, &orchKey.PublicKey), jkt,
+		"explicit anti-leak assertion: the orchestrator's binding K1 must NOT propagate downstream")
+	assert.NotEqual(t, dpopKeyThumbprint(t, &subKey.PublicKey), jkt,
+		"explicit anti-leak assertion: the sub-agent's signing key K2 must NOT become the cnf binding")
 }

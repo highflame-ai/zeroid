@@ -45,9 +45,12 @@ type DCRRegisterInput struct {
 		SoftwareID              string   `json:"software_id,omitempty" doc:"Software identifier (RFC 7591)"`
 		SoftwareVersion         string   `json:"software_version,omitempty" doc:"Software version (RFC 7591)"`
 		Contacts                []string `json:"contacts,omitempty" doc:"Operator contact emails"`
-		// RedirectURIs is accepted for spec compliance but ignored —
-		// this server has no interactive flows.
-		RedirectURIs []string `json:"redirect_uris,omitempty" doc:"Accepted but ignored (no interactive flows)"`
+		// RedirectURIs is accepted, persisted, and echoed back on GET/PUT
+		// for RFC 7591/7592 metadata-roundtrip fidelity, but it is not
+		// consulted at /oauth2/token time — DCR clients have no
+		// authorization_code grant in the allow-list and therefore no
+		// redirect-URI step in any code path. Stored, not used.
+		RedirectURIs []string `json:"redirect_uris,omitempty" doc:"Stored on the client record but unused at token time (no interactive flows are allowed for DCR clients)"`
 	}
 }
 
