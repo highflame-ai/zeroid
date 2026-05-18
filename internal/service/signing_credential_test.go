@@ -108,7 +108,7 @@ func TestMintKID(t *testing.T) {
 	}
 
 	for _, r := range bad {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-') {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
 			t.Fatalf("kid %q has illegal rune %q", bad, r)
 		}
 	}
