@@ -152,6 +152,7 @@ func NewServer(cfg Config) (*Server, error) {
 	auditRepo := postgres.NewAuditLogRepository(db)
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
 	signingCredRepo := postgres.NewSigningCredentialRepository(db)
+	delegationRepo := postgres.NewDelegationRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
 	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
@@ -227,11 +228,15 @@ func NewServer(cfg Config) (*Server, error) {
 	// via the dpop_jti table. Stateless beyond the DB it reads/writes.
 	dpopSvc := service.NewDPoPService(db)
 
+	// DelegationService is read-only over credentialRepo / delegationRepo /
+	// identityRepo and has no service dependencies of its own.
+	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
+
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, jwksSvc,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, delegationSvc, jwksSvc,
 		signingCredSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)

@@ -260,7 +260,7 @@ When an orchestrator needs a specialized agent to handle part of a task, it dele
 
 This is the key difference from sharing credentials: the sub-agent has its own registered identity and its own keypair. It proves it holds that keypair by signing a short-lived JWT assertion (`actor_token`). ZeroID verifies both tokens and issues a delegated token that carries both identities.
 
-The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`examples/openclaw/agent-identity-sidecar.py:450`](./examples/openclaw/agent-identity-sidecar.py).
+The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`integrations/openclaw/sidecar/agent-identity-sidecar.py:450`](./integrations/openclaw/sidecar/agent-identity-sidecar.py).
 
 <details>
 <summary>Python</summary>
@@ -908,6 +908,9 @@ Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
 | POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
+| GET | `/api/v1/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
+| GET | `/api/v1/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
+| GET | `/api/v1/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
@@ -951,6 +954,7 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
 - Ecosystem integrations (LangGraph, CrewAI, Strands)
 - **CIBA (Client-Initiated Backchannel Authentication)** — full OpenID CIBA Core 1.0 server-side flow with poll, ping, and push delivery modes; deployer-pluggable `BackchannelNotifier` for out-of-band user prompts (email, Slack, push); SSRF-guarded outbound callbacks
+- **Delegation Explorer** — three read-only endpoints that expose the delegation graph stored in `issued_credentials`: `/delegations/graph` (depth-bounded subgraph centered on any identity, with per-edge scope attenuation), `/delegations/by-jti/{jti}` (forensic lineage walk root → leaf), and `/delegations/chains` (mission summary list with time-window filtering). All three are tenant-scoped and driven by `parent_jti` recursive CTEs — no dependency on `mission_id` for correctness.
 
 **Planned**
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
