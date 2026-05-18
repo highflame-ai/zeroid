@@ -113,6 +113,14 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 	switch embeddedKey.(type) {
 	case jwk.ECDSAPrivateKey, jwk.RSAPrivateKey, jwk.OKPPrivateKey:
 		return "", errors.New("dpop proof: jwk header must not contain a private key")
+	case jwk.SymmetricKey:
+		// Defence-in-depth: an oct JWK in the jwk header is a private key
+		// (a shared secret). The alg-asymmetric gate at step 3 already
+		// rejects HS256-shaped proofs whose signature would require this,
+		// but enumerating the type explicitly keeps the policy honest if
+		// a future jwx version adds another asymmetric alg that some
+		// implementer wires to a symmetric key.
+		return "", errors.New("dpop proof: jwk header must not contain a symmetric key")
 	}
 
 	// 5. Verify the proof signature using the embedded public key.
@@ -144,7 +152,7 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 
 	// 9. iat MUST be present, not too far in the future (clock skew), and within the freshness window.
 	iat, ok := parsed.IssuedAt()
-	if !ok || iat.IsZero() {
+	if !ok {
 		return "", errors.New("dpop proof: iat claim is required")
 	}
 	now := time.Now()
@@ -161,15 +169,16 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 	//     header rather than a pre-known KeySet), enforce them ourselves.
 	//     RFC 9449 §4.2 permits but does not require exp; if a client
 	//     provides it, ignoring it would let an explicitly-expired proof
-	//     succeed on the iat freshness check alone.
-	if exp, ok := parsed.Expiration(); ok && !exp.IsZero() && now.After(exp.Add(dpopClockSkewTolerance)) {
+	//     succeed on the iat freshness check alone. jwx's `ok` bool already
+	//     signals presence, so an `IsZero()` follow-up would be redundant.
+	if exp, ok := parsed.Expiration(); ok && now.After(exp.Add(dpopClockSkewTolerance)) {
 		return "", errors.New("dpop proof: exp has passed")
 	}
-	if nbf, ok := parsed.NotBefore(); ok && !nbf.IsZero() && now.Add(dpopClockSkewTolerance).Before(nbf) {
+	if nbf, ok := parsed.NotBefore(); ok && now.Add(dpopClockSkewTolerance).Before(nbf) {
 		return "", errors.New("dpop proof: nbf is in the future")
 	}
 
-	// 10. jti MUST be unique within the freshness window — consumed atomically via DB INSERT.
+	// 10. jti MUST be present and bounded at the column width.
 	jti, _ := parsed.JwtID()
 	if jti == "" {
 		return "", errors.New("dpop proof: jti claim is required")
@@ -179,16 +188,11 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 		// proof), not a 5xx storage failure.
 		return "", fmt.Errorf("dpop proof: jti exceeds %d bytes", dpopMaxJTILen)
 	}
-	// Replay-coverage runs on wall clock (now + freshness + skew), not on the
-	// client-supplied iat. iat-relative expiry would let a client backdate
-	// iat to shorten the row's lifetime in the JTI store; clock-relative
-	// expiry decouples replay-defence from anything the client controls.
-	if err := s.consumeJTI(ctx, jti, now.Add(dpopFreshnessWindow+dpopClockSkewTolerance)); err != nil {
-		return "", fmt.Errorf("dpop proof: %w", err)
-	}
 
 	// 11. ath MUST be present and correct when the proof is for a bound access token (RFC 9449 §4.2).
-	if accessToken != nil {
+	//     Checked BEFORE consumeJTI so an ath mismatch doesn't burn the proof's
+	//     jti — the legitimate client can retry with a corrected ath value.
+	if len(accessToken) > 0 {
 		ath, err := jwt.Get[string](parsed, "ath")
 		if err != nil || ath == "" {
 			return "", errors.New("dpop proof: ath claim is required when presenting a bound access token")
@@ -199,11 +203,30 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 	}
 
 	// 12. Compute the JWK thumbprint (RFC 7638 SHA-256) — this becomes the cnf.jkt claim value.
+	//     Done BEFORE consumeJTI so a thumbprint-computation failure (vanishingly
+	//     unlikely on an ES256/RS256 key that already passed jws.Verify) doesn't
+	//     leave the jti consumed but the response a 5xx.
 	thumbprintBytes, err := embeddedKey.Thumbprint(crypto.SHA256)
 	if err != nil {
 		return "", fmt.Errorf("dpop proof: failed to compute key thumbprint: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(thumbprintBytes), nil
+	thumbprint := base64.RawURLEncoding.EncodeToString(thumbprintBytes)
+
+	// 13. Consume the jti atomically. This is the last side-effecting step;
+	//     anything that can reject the proof on its own merits has already
+	//     run, so a successful consume → valid proof and we hand back the
+	//     thumbprint with confidence the row in dpop_jti will outlive the
+	//     freshness window.
+	//
+	//     Replay-coverage runs on wall clock (now + freshness + skew), not on
+	//     the client-supplied iat. iat-relative expiry would let a client
+	//     backdate iat to shorten the row's lifetime in the JTI store;
+	//     clock-relative expiry decouples replay-defence from anything the
+	//     client controls.
+	if err := s.consumeJTI(ctx, jti, now.Add(dpopFreshnessWindow+dpopClockSkewTolerance)); err != nil {
+		return "", fmt.Errorf("dpop proof: %w", err)
+	}
+	return thumbprint, nil
 }
 
 // consumeJTI atomically inserts a JTI into the replay-prevention table.
@@ -223,20 +246,41 @@ func (s *DPoPService) consumeJTI(ctx context.Context, jti string, expiresAt time
 }
 
 // normalizeHTU strips the query and fragment from a URL per RFC 9449 §4.2,
-// and lowercases scheme + host per RFC 3986 §3.1 / §3.2.2 (both components are
-// case-insensitive). Without the case normalisation a client signing
-// `https://Example.com/...` and a server seeing `https://example.com/...`
-// (or vice-versa via proxy rewrite) would fail an otherwise-valid proof.
+// lowercases scheme + host per RFC 3986 §3.1 / §3.2.2 (both components are
+// case-insensitive), and strips the scheme's default port per §3.2.3
+// (`http://example.com:80` and `http://example.com` are URI-equivalent).
+// Without these normalisations a client signing one form and a server seeing
+// the other — common when a reverse proxy rewrites either case or default
+// port — would fail an otherwise-valid proof.
 func normalizeHTU(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && !isDefaultPort(u.Scheme, port) {
+		u.Host = host + ":" + port
+	} else {
+		u.Host = host
+	}
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String()
+}
+
+// isDefaultPort reports whether port is the IANA default for scheme.
+// Used by normalizeHTU to fold `https://a.com:443` into `https://a.com`
+// (and the http/80 equivalent) before comparison.
+func isDefaultPort(scheme, port string) bool {
+	switch {
+	case scheme == "https" && port == "443":
+		return true
+	case scheme == "http" && port == "80":
+		return true
+	}
+	return false
 }
 
 // computeATH computes the base64url-encoded SHA-256 hash of an access token,

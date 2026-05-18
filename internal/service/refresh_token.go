@@ -139,17 +139,24 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 		claimed = c
 
 		successor := &domain.RefreshToken{
-			TokenHash:         newTokenHash,
-			ClientID:          c.ClientID,
-			AccountID:         c.AccountID,
-			ProjectID:         c.ProjectID,
-			UserID:            c.UserID,
-			IdentityID:        c.IdentityID,
-			Scopes:            c.Scopes,
-			FamilyID:          c.FamilyID, // Same family — rotation chain.
-			State:             domain.RefreshTokenStateActive,
-			ExpiresAt:         expiresAt,
-			DPoPKeyThumbprint: c.DPoPKeyThumbprint, // Bound tokens stay bound across rotation.
+			TokenHash:  newTokenHash,
+			ClientID:   c.ClientID,
+			AccountID:  c.AccountID,
+			ProjectID:  c.ProjectID,
+			UserID:     c.UserID,
+			IdentityID: c.IdentityID,
+			Scopes:     c.Scopes,
+			FamilyID:   c.FamilyID, // Same family — rotation chain.
+			State:      domain.RefreshTokenStateActive,
+			ExpiresAt:  expiresAt,
+			// Bound tokens stay bound; UNBOUND tokens stay unbound, even if
+			// the new rotation request carried a DPoP proof. Retroactive
+			// binding-on-first-proof is a deliberate non-decision today —
+			// the consequence is that a stolen unbound refresh can be
+			// rotated with any DPoP key, but binding requires explicit
+			// opt-in at original issuance. See docs/dpop-and-dcr.md
+			// "Refresh-token binding" for the full rationale.
+			DPoPKeyThumbprint: c.DPoPKeyThumbprint,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})

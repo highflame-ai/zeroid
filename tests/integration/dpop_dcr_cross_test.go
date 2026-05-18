@@ -44,14 +44,21 @@ func registerDCRClient(t *testing.T, clientName string, grantTypes []string, sco
 // pre-merge blocker: a DCR-registered client was 500-ing on
 // /oauth2/register because the OAuthClient row violated the
 // backchannel_token_delivery_mode CHECK constraint. The full POST →
-// register → /oauth2/token chain proves the row is valid AND that the
-// resulting client can actually mint tokens, end-to-end.
+// register → /oauth2/token chain proves the row is valid AND surfaces the
+// specific OAuth error that today distinguishes "DCR client exists, ZeroID
+// can't issue tokens to it" from infrastructure failures.
+//
+// Current behaviour (pinned by this test): DCR-registered clients are NOT
+// linked to a zeroid Identity at registration time (the platform issues
+// no identity-binding contract through DCR), so /oauth2/token rejects
+// with HTTP 401 and `error: invalid_client` carrying an error_description
+// that names the missing-identity cause. If the platform ever decides to
+// support identity-less DCR clients (or to require identity binding at
+// registration), this test pins the contract that today's behaviour is.
 func TestDCRClient_ClientCredentialsRoundTrip(t *testing.T) {
 	clientID, clientSecret := registerDCRClient(t,
 		"cross-dcr-cc-roundtrip", []string{"client_credentials"}, "data:read")
 
-	// The DCR client has no IdentityID — client_credentials should fail at
-	// the identity-resolution step with a clean OAuth error, NOT a 500.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "client_credentials",
 		"client_id":     clientID,
@@ -61,21 +68,14 @@ func TestDCRClient_ClientCredentialsRoundTrip(t *testing.T) {
 		"scope":         "data:read",
 	}, nil)
 
-	// We accept any 4xx error response here — the contract is that the
-	// /oauth2/register call produced a valid, queryable row and the
-	// /oauth2/token dispatcher reached a proper error handler instead of
-	// 500'ing on a malformed client row.
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"DCR client without identity binding gets 401 invalid_client, not 5xx (regression guard for the migration-021 CHECK-constraint blocker)")
 	body := decode(t, resp)
-	if resp.StatusCode == http.StatusOK {
-		// If ZeroID ever wires up identity-less DCR clients to issue tokens,
-		// this branch will exercise the happy path instead.
-		assert.NotEmpty(t, body["access_token"])
-	} else {
-		assert.Less(t, resp.StatusCode, 500,
-			"DCR-registered client must produce a 4xx OAuth error, not a 5xx — "+
-				"a 5xx here would mean the registration left a broken row")
-		assert.NotEmpty(t, body["error"], "OAuth error response must carry an error field")
-	}
+	assert.Equal(t, "invalid_client", body["error"],
+		"OAuth error code for identity-less DCR client must be invalid_client")
+	desc, _ := body["error_description"].(string)
+	assert.Contains(t, desc, "no identity found",
+		"error_description must name the cause — proves the dispatcher reached the identity-resolution step, i.e. the registration row is valid")
 }
 
 // TestDCRClient_TokenExchangeRejected verifies the policy boundary end-to-end:
@@ -96,9 +96,20 @@ func TestDCRClient_TokenExchangeRejected(t *testing.T) {
 }
 
 // TestDCRClient_DPoPBoundTokenIssuance exercises the full DPoP × DCR loop:
-// self-register, then immediately use that client to obtain a DPoP-bound
-// access token. The DCR client_id and client_secret are the only state the
-// caller persists; the DPoP key is held only in process memory.
+// self-register, then immediately use that client to obtain a token while
+// presenting a DPoP proof. The DCR client_id and client_secret are the only
+// state the caller persists; the DPoP key is held only in process memory.
+//
+// Pins the cross-feature property: DPoP validation runs cleanly first
+// (proof is well-formed, jti recorded, thumbprint computed) and only then
+// does the request reach the grant dispatcher. Because today's
+// DCR-registered clients have no identity binding, the dispatcher returns
+// invalid_client — same as TestDCRClient_ClientCredentialsRoundTrip. The
+// presence of a valid DPoP proof must not change THAT outcome (a stolen
+// secret presenting a perfect DPoP proof still can't unlock an
+// identity-less client) and must not 5xx through the proof-validation path
+// either (regression guard for any path that might have leaked DPoP
+// failures as 500s).
 func TestDCRClient_DPoPBoundTokenIssuance(t *testing.T) {
 	clientID, clientSecret := registerDCRClient(t,
 		"cross-dcr-dpop", []string{"client_credentials"}, "data:read")
@@ -117,17 +128,14 @@ func TestDCRClient_DPoPBoundTokenIssuance(t *testing.T) {
 		"scope":         "data:read",
 	}, map[string]string{"DPoP": proof})
 
-	// As with the round-trip test above, identity-less DCR clients may not
-	// be allowed to mint tokens today. The cross-feature assertion is that
-	// no 5xx fires — DPoP validation runs cleanly and the dispatcher hands
-	// off to a proper OAuth error if the grant isn't allowed.
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"DCR+DPoP composition must reach the identity-resolution step (401 invalid_client), not 5xx through DPoP validation")
 	body := decode(t, resp)
-	if resp.StatusCode == http.StatusOK {
-		assert.Equal(t, "DPoP", body["token_type"],
-			"successful DCR+DPoP issuance must report token_type=DPoP")
-	} else {
-		assert.Less(t, resp.StatusCode, 500, "DCR+DPoP composition must not 5xx")
-	}
+	assert.Equal(t, "invalid_client", body["error"],
+		"a valid DPoP proof does not unlock an identity-less client; the underlying invalid_client error stands")
+	desc, _ := body["error_description"].(string)
+	assert.Contains(t, desc, "no identity found",
+		"error_description must come from the identity-resolution step — proves DPoP validation completed without short-circuiting")
 }
 
 // TestDPoPTokenExchange_PropagatesBindingToSubAgent walks the full RFC 8693

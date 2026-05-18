@@ -203,4 +203,9 @@ func TestDPoPRejectsBadHTU(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "htu mismatch must be rejected")
 	errBody := decode(t, resp)
 	assert.Equal(t, "invalid_dpop_proof", errBody["error"])
+	// Pin the cause — if a future regression made a different check fire
+	// (e.g. iat or jti), the test would still see invalid_dpop_proof and
+	// silently lose its grip. The error_description carries the reason.
+	desc, _ := errBody["error_description"].(string)
+	assert.Contains(t, desc, "htu", "error_description must identify htu as the mismatch cause")
 }
