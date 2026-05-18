@@ -124,7 +124,9 @@ func TestOAuthServerMetadata(t *testing.T) {
 	require.True(t, ok, "must declare dpop_signing_alg_values_supported for RFC 9449")
 	algSet := make(map[string]bool, len(dpopAlgs))
 	for _, a := range dpopAlgs {
-		algSet[a.(string)] = true
+		s, ok := a.(string)
+		require.True(t, ok, "dpop_signing_alg_values_supported entries must be strings")
+		algSet[s] = true
 	}
 	assert.True(t, algSet["ES256"], "DPoP must advertise ES256")
 	assert.True(t, algSet["RS256"], "DPoP must advertise RS256")

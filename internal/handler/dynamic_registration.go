@@ -330,12 +330,25 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "initial access token is invalid or expired"}
 	}
 
-	scopes, _ := jwt.Get[[]any](parsed, "scopes")
+	// The scopes claim may decode as []string (when jwx preserves the issuance
+	// shape) or []any (when JSON-parsed without type hints). Mirror the
+	// AgentAuthMiddleware pattern: try []string first, then []any. Without
+	// this, ZeroID-issued tokens (which set scopes as []string at issuance)
+	// would never appear to have the client:register scope.
 	hasRegisterScope := false
-	for _, sc := range scopes {
-		if str, ok := sc.(string); ok && str == dcrClientRegisterScope {
-			hasRegisterScope = true
-			break
+	if scopes, err := jwt.Get[[]string](parsed, "scopes"); err == nil {
+		for _, sc := range scopes {
+			if sc == dcrClientRegisterScope {
+				hasRegisterScope = true
+				break
+			}
+		}
+	} else if scopes, err := jwt.Get[[]any](parsed, "scopes"); err == nil {
+		for _, sc := range scopes {
+			if str, ok := sc.(string); ok && str == dcrClientRegisterScope {
+				hasRegisterScope = true
+				break
+			}
 		}
 	}
 	if !hasRegisterScope {

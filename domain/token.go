@@ -130,8 +130,11 @@ type OAuthClient struct {
 	// API path, "dynamic" for clients created via POST /oauth2/register.
 	RegistrationSource string `bun:"registration_source" json:"registration_source,omitempty"`
 	// RegistrationAccessToken is a bcrypt hash of the management bearer token
-	// returned at RFC 7591 registration. NULL for internal clients. Never JSON-serialized.
-	RegistrationAccessToken string `bun:"registration_access_token" json:"-"`
+	// returned at RFC 7591 registration. NULL for internal clients (the column
+	// is NULL-able in the schema; `nullzero` ensures bun INSERTs NULL when the
+	// field is the Go zero value instead of persisting an empty string that
+	// would defeat `IS NULL` queries). Never JSON-serialized.
+	RegistrationAccessToken string `bun:"registration_access_token,nullzero" json:"-"`
 
 	// Lifecycle
 	IsActive  bool      `bun:"is_active"   json:"is_active"`
