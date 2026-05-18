@@ -39,8 +39,12 @@ func (w *CatalogSignerWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	// First re-sign happens after one full interval, not at startup —
-	// avoids a spurious re-sign every restart.
+	// Initial run at startup so a server that's restarted more often
+	// than the re-sign interval still produces fresh signed_at rows.
+	// runOnce is short — ListTenants + one Create per active tenant —
+	// so this isn't load-bearing on cold start.
+	w.runOnce(ctx)
+
 	for {
 		select {
 		case <-ticker.C:

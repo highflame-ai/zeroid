@@ -131,11 +131,16 @@ func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projec
 	return nil
 }
 
-// ListIdentitiesByGovernanceHash returns the distinct identity_ids of
-// non-revoked, non-expired credentials whose governance hash column
-// (drm_hash or constraint_catalog_hash, selected by `kind`) matches
-// `hash`. Used by policy_drift signal fan-out (issue #59).
-func (r *CredentialRepository) ListIdentitiesByGovernanceHash(ctx context.Context, accountID, projectID, kind, hash string) ([]string, error) {
+// ListIdentitiesByGovernanceHashPage returns one page of distinct
+// identity_ids of non-revoked, non-expired credentials whose governance
+// hash column (drm_hash or constraint_catalog_hash, selected by `kind`)
+// matches `hash`. Keyset paginated by identity_id ascending: pass
+// afterID="" on the first call, then the largest returned identity_id
+// on each subsequent call until an empty slice comes back. Used by
+// policy_drift signal fan-out (issue #59) so a single hash transition
+// touching millions of credentials doesn't materialise the full id
+// list in memory.
+func (r *CredentialRepository) ListIdentitiesByGovernanceHashPage(ctx context.Context, accountID, projectID, kind, hash, afterID string, limit int) ([]string, error) {
 	var column string
 	switch kind {
 	case "drm":
@@ -145,8 +150,10 @@ func (r *CredentialRepository) ListIdentitiesByGovernanceHash(ctx context.Contex
 	default:
 		return nil, fmt.Errorf("unknown governance hash kind: %s", kind)
 	}
-	var ids []string
-	err := r.db.NewSelect().
+	if limit <= 0 {
+		limit = 500
+	}
+	q := r.db.NewSelect().
 		TableExpr("issued_credentials").
 		ColumnExpr("DISTINCT identity_id").
 		Where("account_id = ?", accountID).
@@ -155,8 +162,13 @@ func (r *CredentialRepository) ListIdentitiesByGovernanceHash(ctx context.Contex
 		Where("expires_at > NOW()").
 		Where("identity_id IS NOT NULL").
 		Where("? = ?", bun.Ident(column), hash).
-		Scan(ctx, &ids)
-	if err != nil {
+		OrderExpr("identity_id ASC").
+		Limit(limit)
+	if afterID != "" {
+		q = q.Where("identity_id > ?", afterID)
+	}
+	var ids []string
+	if err := q.Scan(ctx, &ids); err != nil {
 		return nil, fmt.Errorf("failed to enumerate identities by %s: %w", column, err)
 	}
 	return ids, nil

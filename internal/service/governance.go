@@ -9,8 +9,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +32,18 @@ type GovernanceService struct {
 	credRepo    *postgres.CredentialRepository
 	signalSvc   *SignalService
 	jwksSvc     *signing.JWKSService
+
+	// svcCtx is the long-lived context used by detached policy_drift
+	// fan-out goroutines. Parented on context.Background() at
+	// construction; Server.Shutdown calls Stop() to cancel in-flight
+	// drift fan-outs so they don't outlive the listener close.
+	mu        sync.Mutex
+	svcCtx    context.Context
+	svcCancel context.CancelFunc
+	// driftPageSize bounds memory for a single fan-out by paginating
+	// the affected-identity scan. Configurable mainly so tests can
+	// exercise the multi-page path.
+	driftPageSize int
 }
 
 func NewGovernanceService(
@@ -41,12 +53,28 @@ func NewGovernanceService(
 	signalSvc *SignalService,
 	jwksSvc *signing.JWKSService,
 ) *GovernanceService {
+	svcCtx, svcCancel := context.WithCancel(context.Background())
 	return &GovernanceService{
-		drmRepo:     drmRepo,
-		catalogRepo: catalogRepo,
-		credRepo:    credRepo,
-		signalSvc:   signalSvc,
-		jwksSvc:     jwksSvc,
+		drmRepo:       drmRepo,
+		catalogRepo:   catalogRepo,
+		credRepo:      credRepo,
+		signalSvc:     signalSvc,
+		jwksSvc:       jwksSvc,
+		svcCtx:        svcCtx,
+		svcCancel:     svcCancel,
+		driftPageSize: 500,
+	}
+}
+
+// Stop cancels the service lifecycle context so detached drift fan-out
+// goroutines wind down. Idempotent. Server.Shutdown calls this so a
+// large drift fan-out doesn't keep work running past listener close.
+func (g *GovernanceService) Stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.svcCancel != nil {
+		g.svcCancel()
+		g.svcCancel = nil
 	}
 }
 
@@ -63,57 +91,22 @@ func HashSHA256(v any) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// canonicalJSON re-encodes v with object keys sorted lexicographically
-// at every level. Round-trips through encoding/json into a
-// map[string]any/[]any tree first, then walks it.
+// canonicalJSON returns a deterministic JSON encoding of v: keys are
+// sorted lexicographically at every level. We achieve this by first
+// marshaling v (collapsing structs/typed maps), then unmarshaling into
+// `any` so every object becomes `map[string]any`, then re-marshaling —
+// encoding/json's Marshal sorts string-keyed map keys, so the second
+// pass produces canonical output without a hand-rolled encoder.
 func canonicalJSON(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
-		return nil, fmt.Errorf("canonical json: marshal: %w", err)
+		return nil, err
 	}
 	var generic any
 	if err := json.Unmarshal(raw, &generic); err != nil {
-		return nil, fmt.Errorf("canonical json: unmarshal: %w", err)
+		return nil, err
 	}
-	return canonicalEncode(generic), nil
-}
-
-func canonicalEncode(v any) []byte {
-	switch t := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		var b strings.Builder
-		b.WriteByte('{')
-		for i, k := range keys {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			kb, _ := json.Marshal(k)
-			b.Write(kb)
-			b.WriteByte(':')
-			b.Write(canonicalEncode(t[k]))
-		}
-		b.WriteByte('}')
-		return []byte(b.String())
-	case []any:
-		var b strings.Builder
-		b.WriteByte('[')
-		for i, el := range t {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			b.Write(canonicalEncode(el))
-		}
-		b.WriteByte(']')
-		return []byte(b.String())
-	default:
-		out, _ := json.Marshal(t)
-		return out
-	}
+	return json.Marshal(generic)
 }
 
 // PublishDRM validates, hashes, and inserts a new DRM. If a prior active
@@ -129,7 +122,14 @@ func (g *GovernanceService) PublishDRM(ctx context.Context, accountID, projectID
 		return nil, err
 	}
 
-	previous, _ := g.drmRepo.GetActive(ctx, accountID, projectID)
+	// Look up the previously active DRM for drift detection. A lookup
+	// failure here is non-fatal — the new DRM still gets written and
+	// the only consequence is missed policy_drift signals for tokens
+	// minted under the old hash. Log so this doesn't go silent.
+	previous, prevErr := g.drmRepo.GetActive(ctx, accountID, projectID)
+	if prevErr != nil {
+		log.Warn().Err(prevErr).Msg("PublishDRM: failed to look up previous active DRM for drift detection")
+	}
 
 	row := &domain.DecisionRightsMatrix{
 		ID:          uuid.New().String(),
@@ -211,7 +211,12 @@ func (g *GovernanceService) PublishCatalog(ctx context.Context, accountID, proje
 	if err != nil {
 		return nil, err
 	}
-	previous, _ := g.catalogRepo.GetActive(ctx, accountID, projectID)
+	// Same drift-detection lookup as PublishDRM — non-fatal but noisy
+	// on failure so missed policy_drift signals are visible.
+	previous, prevErr := g.catalogRepo.GetActive(ctx, accountID, projectID)
+	if prevErr != nil {
+		log.Warn().Err(prevErr).Msg("PublishCatalog: failed to look up previous active catalog for drift detection")
+	}
 
 	signedAt := time.Now().UTC()
 	sig, err := g.signCatalog(hash, signedAt)
@@ -298,29 +303,69 @@ func hashRawJSON(raw json.RawMessage) (string, error) {
 	return HashSHA256(v)
 }
 
-// emitDriftSignals best-effort-fans-out policy_drift signals for every
-// identity holding an outstanding credential bound to oldHash. Errors
-// are logged and swallowed — the new DRM/catalog write must remain
-// durable even if signal fan-out partially fails.
-func (g *GovernanceService) emitDriftSignals(ctx context.Context, accountID, projectID, kind, oldHash, newHash string) {
+// emitDriftSignals fires policy_drift signals for every identity
+// holding an outstanding credential bound to oldHash. The fan-out runs
+// on a background goroutine parented on the service lifecycle context
+// (svcCtx) so a hash transition affecting many identities does not
+// block the admin POST that triggered it, but also does not outlive
+// the server: Server.Shutdown -> GovernanceService.Stop cancels svcCtx
+// and in-flight pagination winds down. Errors are logged and swallowed
+// — the new DRM/catalog row write must remain durable even if signal
+// fan-out partially fails.
+func (g *GovernanceService) emitDriftSignals(_ context.Context, accountID, projectID, kind, oldHash, newHash string) {
 	if g.signalSvc == nil || g.credRepo == nil {
 		return
 	}
-	identities, err := g.credRepo.ListIdentitiesByGovernanceHash(ctx, accountID, projectID, kind, oldHash)
-	if err != nil {
-		log.Warn().Err(err).Str("kind", kind).Msg("policy_drift: failed to enumerate affected identities")
+	g.mu.Lock()
+	parent := g.svcCtx
+	g.mu.Unlock()
+	if parent == nil {
+		// Stop() already called — no detached work after shutdown.
 		return
 	}
-	for _, identityID := range identities {
-		_, err := g.signalSvc.IngestSignal(ctx, accountID, projectID, identityID,
-			domain.SignalTypePolicyDrift, domain.SignalSeverityMedium, "governance",
-			map[string]any{
-				"kind":     kind,
-				"old_hash": oldHash,
-				"new_hash": newHash,
-			})
+	pageSize := g.driftPageSize
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	go g.runDriftFanout(parent, accountID, projectID, kind, oldHash, newHash, pageSize)
+}
+
+func (g *GovernanceService) runDriftFanout(ctx context.Context, accountID, projectID, kind, oldHash, newHash string, pageSize int) {
+	afterID := ""
+	for {
+		if ctx.Err() != nil {
+			log.Info().Str("kind", kind).Msg("policy_drift: fan-out cancelled by shutdown")
+			return
+		}
+		ids, err := g.credRepo.ListIdentitiesByGovernanceHashPage(ctx, accountID, projectID, kind, oldHash, afterID, pageSize)
 		if err != nil {
-			log.Warn().Err(err).Str("identity_id", identityID).Msg("policy_drift: signal emit failed")
+			log.Warn().Err(err).Str("kind", kind).Msg("policy_drift: failed to enumerate affected identities")
+			return
+		}
+		if len(ids) == 0 {
+			return
+		}
+		for _, identityID := range ids {
+			if ctx.Err() != nil {
+				return
+			}
+			_, emitErr := g.signalSvc.IngestSignal(ctx, accountID, projectID, identityID,
+				domain.SignalTypePolicyDrift, domain.SignalSeverityMedium, "governance",
+				map[string]any{
+					"kind":     kind,
+					"old_hash": oldHash,
+					"new_hash": newHash,
+				})
+			if emitErr != nil {
+				log.Warn().Err(emitErr).Str("identity_id", identityID).Msg("policy_drift: signal emit failed")
+			}
+		}
+		// Advance keyset cursor. ListIdentitiesByGovernanceHashPage
+		// returns rows ordered by identity_id ASC, so the last id is
+		// the high-water mark.
+		afterID = ids[len(ids)-1]
+		if len(ids) < pageSize {
+			return
 		}
 	}
 }

@@ -429,6 +429,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.backchannelSvc.Stop()
 	}
 
+	// Cancel policy_drift fan-out goroutines for the same reason
+	// (issue #59).
+	if s.governanceSvc != nil {
+		s.governanceSvc.Stop()
+	}
+
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
