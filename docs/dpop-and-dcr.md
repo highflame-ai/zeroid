@@ -248,7 +248,7 @@ Validated by `validateDCRClientMetadata`:
 - `grant_types` defaults to `["client_credentials"]`. The allow-list for DCR-registered clients is **`client_credentials`** and **`urn:ietf:params:oauth:grant-type:jwt-bearer`** only. Notably absent:
   - `authorization_code` — no interactive consent flow exists for self-registered clients.
   - `urn:ietf:params:oauth:grant-type:token-exchange` — DCR clients have no `IdentityID` binding and so cannot legitimately act as a delegation actor. Re-enable once that binding exists.
-- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, or empty (defaults to `client_secret_post`). `"none"` is explicitly rejected — this server requires client authentication.
+- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, or empty (defaults to `client_secret_basic` per RFC 7591 §2). `"none"` is explicitly rejected — this server requires client authentication.
 - `redirect_uris` is accepted for spec compliance but ignored.
 
 #### On the registration_access_token

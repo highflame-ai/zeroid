@@ -75,8 +75,14 @@ func (s *DPoPService) validate(ctx context.Context, method, htu, proofJWT string
 		return "", fmt.Errorf("dpop proof is malformed: %w", err)
 	}
 	sigs := msg.Signatures()
-	if len(sigs) == 0 {
-		return "", errors.New("dpop proof: no signatures present")
+	// RFC 9449 §4.2 defines a DPoP proof as a JWT (compact JWS), which has
+	// exactly one signature. JWS JSON Serialization allows multiple, and
+	// blindly reading sigs[0] would let a forger attach a benign signature
+	// at index 0 alongside an attacker-controlled one at index 1 — only the
+	// first set of protected headers would be inspected. Reject anything
+	// that isn't a single-signature compact JWS.
+	if len(sigs) != 1 {
+		return "", fmt.Errorf("dpop proof: expected single-signature compact JWS, got %d signatures", len(sigs))
 	}
 	hdr := sigs[0].ProtectedHeaders()
 

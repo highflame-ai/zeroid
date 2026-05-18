@@ -523,7 +523,14 @@ func (s *OAuthClientService) VerifyRegistrationToken(ctx context.Context, client
 func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID string, req DynamicRegisterClientRequest) (*domain.OAuthClient, error) {
 	client, err := s.repo.GetByClientID(ctx, clientID)
 	if err != nil {
-		return nil, ErrOAuthClientNotFound
+		// Distinguish genuine not-found from infra failure so the handler
+		// can return 401 vs 5xx appropriately. Same pattern as
+		// VerifyRegistrationToken — a DB outage must not look like "no
+		// such client".
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOAuthClientNotFound
+		}
+		return nil, fmt.Errorf("update dynamic client: lookup failed: %w", err)
 	}
 	if client.RegistrationSource != "dynamic" {
 		return nil, ErrOAuthClientNotFound

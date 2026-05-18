@@ -218,6 +218,12 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		RedirectURIs:            input.Body.RedirectURIs,
 	})
 	if err != nil {
+		// Race window between authorizeDCRManagement and Update: client may
+		// have been deleted in between. Map ErrOAuthClientNotFound to the
+		// same 401 the auth path uses; other errors are infra failures.
+		if errors.Is(err, service.ErrOAuthClientNotFound) {
+			return dcrErr(&dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "client no longer exists"}), nil
+		}
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client update failed")
 		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to update client registration"}), nil
 	}
@@ -264,7 +270,13 @@ func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantT
 	}
 	authMethod := authMethodIn
 	switch authMethod {
-	case "", "client_secret_post", "client_secret_basic":
+	case "":
+		// RFC 7591 §2 default. Applying it here makes the validator's
+		// "normalised fields" contract honest — the response body's
+		// token_endpoint_auth_method will report the effective value
+		// even when the caller omitted the field.
+		authMethod = "client_secret_basic"
+	case "client_secret_post", "client_secret_basic":
 		// accepted
 	case "none":
 		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication"}
