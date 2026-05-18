@@ -1,0 +1,304 @@
+# 32-agent cascade-revocation demo hierarchy.
+# Single source of truth consumed by provision.py and docker-compose.yml.
+#
+# Revocation target: spec-legal (specialist-3)
+# Firing `zeroid signal --agent <spec-legal identity_id>` revokes spec-legal
+# and its 3 tool agents (contract-reviewer, compliance-checker, ip-tracker)
+# while the other 28 agents continue unaffected.
+
+all_scopes:
+  - finance:read
+  - finance:write
+  - payroll:write
+  - reports:read
+  - hr:read
+  - hr:write
+  - recruiting:write
+  - legal:read
+  - legal:write
+  - contracts:write
+  - sales:read
+  - sales:write
+  - crm:read
+  - crm:write
+  - code:read
+  - code:write
+  - deploy:read
+  - deploy:write
+  - security:read
+  - security:write
+  - audit:read
+  - audit:write
+  - data:read
+  - data:write
+  - ops:read
+  - ops:write
+  - infra:write
+
+agents:
+  # ── Tier 1: Orchestrators ────────────────────────────────────────────────
+  - name: orch-business
+    tier: 1
+    external_id: orch-business
+    display_name: Business Orchestrator
+    sub_type: orchestrator
+    scopes: all        # placeholder — provision.py substitutes the full scope list
+    parent: null
+
+  - name: orch-platform
+    tier: 1
+    external_id: orch-platform
+    display_name: Platform Orchestrator
+    sub_type: orchestrator
+    scopes: all
+    parent: null
+
+  # ── Tier 2: Specialists ──────────────────────────────────────────────────
+  - name: spec-finance
+    tier: 2
+    external_id: spec-finance
+    display_name: Finance Specialist
+    sub_type: autonomous
+    scopes: [finance:read, finance:write, payroll:write, reports:read]
+    parent: orch-business
+
+  - name: spec-hr
+    tier: 2
+    external_id: spec-hr
+    display_name: HR Specialist
+    sub_type: autonomous
+    scopes: [hr:read, hr:write, recruiting:write]
+    parent: orch-business
+
+  - name: spec-legal           # ← revocation target (specialist-3)
+    tier: 2
+    external_id: spec-legal
+    display_name: Legal Specialist
+    sub_type: autonomous
+    scopes: [legal:read, legal:write, contracts:write]
+    parent: orch-business
+
+  - name: spec-sales
+    tier: 2
+    external_id: spec-sales
+    display_name: Sales Specialist
+    sub_type: autonomous
+    scopes: [sales:read, sales:write, crm:read, crm:write]
+    parent: orch-business
+
+  - name: spec-engineering
+    tier: 2
+    external_id: spec-engineering
+    display_name: Engineering Specialist
+    sub_type: autonomous
+    scopes: [code:read, code:write, deploy:read, deploy:write]
+    parent: orch-platform
+
+  - name: spec-security
+    tier: 2
+    external_id: spec-security
+    display_name: Security Specialist
+    sub_type: autonomous
+    scopes: [security:read, security:write, audit:read, audit:write]
+    parent: orch-platform
+
+  - name: spec-data
+    tier: 2
+    external_id: spec-data
+    display_name: Data Specialist
+    sub_type: autonomous
+    scopes: [data:read, data:write]
+    parent: orch-platform
+
+  - name: spec-operations
+    tier: 2
+    external_id: spec-operations
+    display_name: Operations Specialist
+    sub_type: autonomous
+    scopes: [ops:read, ops:write, infra:write, deploy:read, deploy:write]
+    parent: orch-platform
+
+  # ── Tier 3: Tool Agents ──────────────────────────────────────────────────
+  # Finance tools (3)
+  - name: tool-invoice-processor
+    tier: 3
+    external_id: tool-invoice-processor
+    display_name: Invoice Processor
+    sub_type: tool_agent
+    scopes: [finance:read, finance:write]
+    parent: spec-finance
+
+  - name: tool-budget-tracker
+    tier: 3
+    external_id: tool-budget-tracker
+    display_name: Budget Tracker
+    sub_type: tool_agent
+    scopes: [finance:read, reports:read]
+    parent: spec-finance
+
+  - name: tool-payroll-agent
+    tier: 3
+    external_id: tool-payroll-agent
+    display_name: Payroll Agent
+    sub_type: tool_agent
+    scopes: [finance:read, payroll:write]
+    parent: spec-finance
+
+  # HR tools (3)
+  - name: tool-recruiter
+    tier: 3
+    external_id: tool-recruiter
+    display_name: Recruiter
+    sub_type: tool_agent
+    scopes: [hr:read, recruiting:write]
+    parent: spec-hr
+
+  - name: tool-performance-tracker
+    tier: 3
+    external_id: tool-performance-tracker
+    display_name: Performance Tracker
+    sub_type: tool_agent
+    scopes: [hr:read, hr:write]
+    parent: spec-hr
+
+  - name: tool-onboarding-agent
+    tier: 3
+    external_id: tool-onboarding-agent
+    display_name: Onboarding Agent
+    sub_type: tool_agent
+    scopes: [hr:read, hr:write]
+    parent: spec-hr
+
+  # Legal tools (3) — these get revoked when spec-legal is signaled
+  - name: tool-contract-reviewer
+    tier: 3
+    external_id: tool-contract-reviewer
+    display_name: Contract Reviewer
+    sub_type: tool_agent
+    scopes: [legal:read, contracts:write]
+    parent: spec-legal
+
+  - name: tool-compliance-checker
+    tier: 3
+    external_id: tool-compliance-checker
+    display_name: Compliance Checker
+    sub_type: tool_agent
+    scopes: [legal:read, legal:write]
+    parent: spec-legal
+
+  - name: tool-ip-tracker
+    tier: 3
+    external_id: tool-ip-tracker
+    display_name: IP Tracker
+    sub_type: tool_agent
+    scopes: [legal:read]
+    parent: spec-legal
+
+  # Sales tools (2)
+  - name: tool-crm-syncer
+    tier: 3
+    external_id: tool-crm-syncer
+    display_name: CRM Syncer
+    sub_type: tool_agent
+    scopes: [sales:read, crm:read, crm:write]
+    parent: spec-sales
+
+  - name: tool-lead-scorer
+    tier: 3
+    external_id: tool-lead-scorer
+    display_name: Lead Scorer
+    sub_type: tool_agent
+    scopes: [sales:read, sales:write]
+    parent: spec-sales
+
+  # Engineering tools (3)
+  - name: tool-code-reviewer
+    tier: 3
+    external_id: tool-code-reviewer
+    display_name: Code Reviewer
+    sub_type: tool_agent
+    scopes: [code:read]
+    parent: spec-engineering
+
+  - name: tool-dependency-scanner
+    tier: 3
+    external_id: tool-dependency-scanner
+    display_name: Dependency Scanner
+    sub_type: tool_agent
+    scopes: [code:read]
+    parent: spec-engineering
+
+  - name: tool-test-runner
+    tier: 3
+    external_id: tool-test-runner
+    display_name: Test Runner
+    sub_type: tool_agent
+    scopes: [code:read, deploy:read]
+    parent: spec-engineering
+
+  # Security tools (3)
+  - name: tool-siem-collector
+    tier: 3
+    external_id: tool-siem-collector
+    display_name: SIEM Collector
+    sub_type: tool_agent
+    scopes: [security:read, security:write]
+    parent: spec-security
+
+  - name: tool-threat-intel
+    tier: 3
+    external_id: tool-threat-intel
+    display_name: Threat Intel
+    sub_type: tool_agent
+    scopes: [security:read, audit:read]
+    parent: spec-security
+
+  - name: tool-audit-logger
+    tier: 3
+    external_id: tool-audit-logger
+    display_name: Audit Logger
+    sub_type: tool_agent
+    scopes: [audit:read, audit:write]
+    parent: spec-security
+
+  # Data tools (3)
+  - name: tool-pipeline-runner
+    tier: 3
+    external_id: tool-pipeline-runner
+    display_name: Pipeline Runner
+    sub_type: tool_agent
+    scopes: [data:read, data:write]
+    parent: spec-data
+
+  - name: tool-schema-validator
+    tier: 3
+    external_id: tool-schema-validator
+    display_name: Schema Validator
+    sub_type: tool_agent
+    scopes: [data:read]
+    parent: spec-data
+
+  - name: tool-reporting-agent
+    tier: 3
+    external_id: tool-reporting-agent
+    display_name: Reporting Agent
+    sub_type: tool_agent
+    scopes: [data:read]
+    parent: spec-data
+
+  # Operations tools (2)
+  - name: tool-deploy-agent
+    tier: 3
+    external_id: tool-deploy-agent
+    display_name: Deploy Agent
+    sub_type: tool_agent
+    scopes: [ops:read, deploy:read, deploy:write]
+    parent: spec-operations
+
+  - name: tool-infra-monitor
+    tier: 3
+    external_id: tool-infra-monitor
+    display_name: Infra Monitor
+    sub_type: tool_agent
+    scopes: [ops:read, infra:write]
+    parent: spec-operations
