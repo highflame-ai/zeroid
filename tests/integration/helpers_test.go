@@ -384,12 +384,15 @@ func ecPublicKeyPEM(t *testing.T, key *ecdsa.PrivateKey) string {
 }
 
 // buildAssertion creates a self-signed ES256 JWT assertion for jwt_bearer and token_exchange flows.
-// issuerWIMSE is the agent's WIMSE URI used as the iss claim.
+// issuerWIMSE is the agent's WIMSE URI used as both the iss and sub claims —
+// for self-asserting agents, RFC 7523 §3 (2) requires sub to identify the
+// principal, which is the same agent the assertion is for.
 func buildAssertion(t *testing.T, privKey *ecdsa.PrivateKey, issuerWIMSE string) string {
 	t.Helper()
 	now := time.Now()
 	tok, err := jwt.NewBuilder().
 		Issuer(issuerWIMSE).
+		Subject(issuerWIMSE).
 		Audience([]string{testIssuer}).
 		IssuedAt(now).
 		Expiration(now.Add(5 * time.Minute)).
