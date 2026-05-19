@@ -125,6 +125,17 @@ type OAuthClient struct {
 	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
 
+	// Dynamic Client Registration (RFC 7591/7592)
+	// RegistrationSource is "internal" for clients created via the admin/internal
+	// API path, "dynamic" for clients created via POST /oauth2/register.
+	RegistrationSource string `bun:"registration_source" json:"registration_source,omitempty"`
+	// RegistrationAccessToken is a bcrypt hash of the management bearer token
+	// returned at RFC 7591 registration. NULL for internal clients (the column
+	// is NULL-able in the schema; `nullzero` ensures bun INSERTs NULL when the
+	// field is the Go zero value instead of persisting an empty string that
+	// would defeat `IS NULL` queries). Never JSON-serialized.
+	RegistrationAccessToken string `bun:"registration_access_token,nullzero" json:"-"`
+
 	// Lifecycle
 	IsActive  bool      `bun:"is_active"   json:"is_active"`
 	CreatedAt time.Time `bun:"created_at"  json:"created_at"`

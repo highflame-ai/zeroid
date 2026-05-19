@@ -39,4 +39,9 @@ type RefreshToken struct {
 	ExpiresAt  time.Time  `bun:"type:timestamptz,notnull"                  json:"expires_at"`
 	RevokedAt  *time.Time `bun:"revoked_at"                                json:"revoked_at,omitempty"`
 	CreatedAt  time.Time  `bun:"type:timestamptz,notnull,default:current_timestamp" json:"created_at"`
+	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638) of the
+	// DPoP key the refresh token is bound to. NULL/empty ⇒ unbound (Bearer).
+	// Copied verbatim onto every successor row on rotation; checked against
+	// the presented proof inside the rotation transaction (RFC 9449 §5).
+	DPoPKeyThumbprint string `bun:"dpop_key_thumbprint,nullzero" json:"-"`
 }

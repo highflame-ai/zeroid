@@ -114,6 +114,14 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"response_types_supported": []string{"token"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
+		// RFC 7591 dynamic client registration.
+		"registration_endpoint": a.baseURL + "/oauth2/register",
+
+		// RFC 9449 — Demonstrating Proof of Possession (DPoP). Algorithms the
+		// token endpoint will accept on the DPoP header. Symmetric algs are
+		// excluded by spec.
+		"dpop_signing_alg_values_supported": []string{"ES256", "RS256"},
+
 		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
 		// let CIBA-aware clients auto-discover that this AS supports
 		// backchannel authentication and which delivery modes are wired.
