@@ -502,8 +502,15 @@ var ErrInvalidWIMSEURI = errors.New("invalid wimse uri")
 // Rules (SPIFFE §2):
 //   - scheme is "spiffe"
 //   - non-empty host (the trust domain)
-//   - non-empty path
-//   - no query, no fragment, no user-info
+//   - host must not include a port
+//   - non-empty workload path (a bare trust-domain URI is the trust-domain ID,
+//     not a workload ID — reject)
+//   - path must not have a trailing slash or empty segments
+//   - path segments must conform to SPIFFE §2.3 character set (delegated to
+//     ValidateSPIFFEPathSegment so the read-side validator agrees with
+//     BuildWIMSEURI on what's a legal segment)
+//   - no query (including a trailing "?" with empty value), no fragment, no
+//     user-info
 //   - total length within MaxSPIFFEIDBytes
 //
 // Returns a wrapped ErrInvalidWIMSEURI on failure.
@@ -529,16 +536,37 @@ func ValidateWIMSEURI(uri string) error {
 	if u.Host == "" {
 		return fmt.Errorf("%w: missing trust domain (host)", ErrInvalidWIMSEURI)
 	}
+	// SPIFFE §2.2: the trust domain is a DNS name without a port.
+	// url.Host carries the host[:port] form; reject any colon to forbid ports.
+	if strings.Contains(u.Host, ":") {
+		return fmt.Errorf("%w: trust domain must not contain a port", ErrInvalidWIMSEURI)
+	}
 	if u.User != nil {
 		return fmt.Errorf("%w: user-info not allowed", ErrInvalidWIMSEURI)
 	}
-	if u.RawQuery != "" || u.Fragment != "" {
+	// ForceQuery catches a trailing "?" even when RawQuery is empty.
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return fmt.Errorf("%w: query/fragment not allowed", ErrInvalidWIMSEURI)
 	}
 	// SPIFFE IDs always have a workload path. A bare trust-domain URI like
 	// "spiffe://example.org" is a trust domain identifier, not a workload ID.
 	if u.Path == "" || u.Path == "/" {
 		return fmt.Errorf("%w: missing workload path", ErrInvalidWIMSEURI)
+	}
+	if strings.HasSuffix(u.Path, "/") {
+		return fmt.Errorf("%w: path must not end with a slash", ErrInvalidWIMSEURI)
+	}
+	if strings.Contains(u.Path, "//") {
+		return fmt.Errorf("%w: path must not contain empty segments", ErrInvalidWIMSEURI)
+	}
+	// Validate each path segment against the same character set BuildWIMSEURI
+	// enforces. The read-side validator must agree with the write-side
+	// constructor on what's legal — otherwise a stored URI could fail
+	// validation on lookup.
+	for _, seg := range strings.Split(strings.TrimPrefix(u.Path, "/"), "/") {
+		if err := ValidateSPIFFEPathSegment("path segment", seg); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidWIMSEURI, err)
+		}
 	}
 	return nil
 }

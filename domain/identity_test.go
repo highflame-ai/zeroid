@@ -29,8 +29,14 @@ func TestValidateWIMSEURI(t *testing.T) {
 			{"bare trust domain", "spiffe://highflame.dev"},
 			{"trust domain with empty path", "spiffe://highflame.dev/"},
 			{"with query", "spiffe://highflame.dev/acct/proj/agent/x?foo=bar"},
+			{"with trailing question mark", "spiffe://highflame.dev/acct/proj/agent/x?"},
 			{"with fragment", "spiffe://highflame.dev/acct/proj/agent/x#frag"},
 			{"with user-info", "spiffe://user:pass@highflame.dev/acct/proj/agent/x"},
+			{"trust domain with port", "spiffe://highflame.dev:443/acct/proj/agent/x"},
+			{"path with trailing slash", "spiffe://highflame.dev/acct/proj/agent/x/"},
+			{"path with empty segment", "spiffe://highflame.dev/acct//agent/x"},
+			{"path segment with space", "spiffe://highflame.dev/acct/proj/agent/my agent"},
+			{"path segment with special char", "spiffe://highflame.dev/acct/proj/agent/my$agent"},
 			{"too long", "spiffe://highflame.dev/" + strings.Repeat("a", MaxSPIFFEIDBytes)},
 		}
 		for _, tc := range cases {
