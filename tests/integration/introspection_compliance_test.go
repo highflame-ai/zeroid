@@ -73,20 +73,19 @@ func TestRFC7662_S2_2_InactiveResponseShouldNotIncludeOtherClaims(t *testing.T) 
 	// fingerprint surface. The test pins our implementation choice to
 	// "stricter than the RFC requires"; if a future change ever surfaces
 	// extra claims on the inactive path, this catches it.
+	//
+	// Implementation note: the whitelist check (`Len(body, 1)`) is more
+	// robust than enumerating known claim names. A future custom claim
+	// (e.g. trust_level, identity_type, delegation_depth) added to the
+	// active-token response would otherwise leak into the inactive path by
+	// default, and a name-based denylist would silently miss it.
 	body := decode(t, post(t, "/oauth2/token/introspect", map[string]any{
 		"token": "definitely-not-a-real-token",
 	}, nil))
 
-	// active=false is the only claim that should appear.
 	assert.Equal(t, false, body["active"])
-
-	// Forbidden claim names — none should leak on an inactive response.
-	for _, claim := range []string{"sub", "iss", "aud", "exp", "iat", "jti",
-		"scope", "account_id", "project_id", "agent_id", "cnf", "act"} {
-		_, present := body[claim]
-		assert.False(t, present,
-			"inactive response SHOULD NOT include %q (RFC 7662 §2.2 — no leakage)", claim)
-	}
+	assert.Len(t, body, 1,
+		"inactive response SHOULD NOT include any additional information (RFC 7662 §2.2) — only the `active` field is allowed")
 }
 
 func TestRFC7662_S2_2_RevokedTokenIsInactive(t *testing.T) {
