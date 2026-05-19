@@ -64,7 +64,7 @@ func (r *IdentityRepository) GetByIDs(ctx context.Context, ids []string, account
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	err := db.NewSelect().Model(&identities).
-		Where("id IN (?)", bun.In(ids)).
+		Where("id IN (?)", bun.List(ids)).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		Scan(ctx)

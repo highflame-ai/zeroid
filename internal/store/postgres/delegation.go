@@ -46,11 +46,11 @@ func NewDelegationRepository(db *bun.DB) *DelegationRepository {
 // each row as its own chain. The two cases are indistinguishable to
 // callers — both are opaque chain handles.
 type ChainSummary struct {
-	ChainID          string    `bun:"chain_id"          json:"chain_id"`
-	StartedAt        time.Time `bun:"started_at"        json:"started_at"`
-	LastActivityAt   time.Time `bun:"last_activity_at"  json:"last_activity_at"`
-	CredentialCount  int       `bun:"credential_count"  json:"credential_count"`
-	MaxDepth         int       `bun:"max_depth"         json:"max_depth"`
+	ChainID         string    `bun:"chain_id"          json:"chain_id"`
+	StartedAt       time.Time `bun:"started_at"        json:"started_at"`
+	LastActivityAt  time.Time `bun:"last_activity_at"  json:"last_activity_at"`
+	CredentialCount int       `bun:"credential_count"  json:"credential_count"`
+	MaxDepth        int       `bun:"max_depth"         json:"max_depth"`
 }
 
 // WalkUp returns the credential identified by startJTI plus its ancestors

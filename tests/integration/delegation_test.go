@@ -686,7 +686,7 @@ func TestDelegationGraph_MalformedIdentityID_Rejected(t *testing.T) {
 		"123",
 		"abc-def-ghi",
 		"00000000-0000-0000-0000-00000000000Z", // invalid hex char
-		"",                                      // empty string (required)
+		"",                                     // empty string (required)
 	} {
 		path := adminPath("/delegations/graph?identity_id=" + bad + "&depth=2")
 		if bad == "" {
