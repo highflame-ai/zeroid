@@ -38,6 +38,8 @@ func TestRFC8414_S2_IssuerRequired(t *testing.T) {
 	assert.NotEmpty(t, iss)
 	assert.NotContains(t, iss, "?", "issuer URL MUST NOT have a query component")
 	assert.NotContains(t, iss, "#", "issuer URL MUST NOT have a fragment component")
+	assert.True(t, strings.HasPrefix(iss, "https://"),
+		"issuer URL MUST use the https scheme (RFC 8414 §2) — caught a mis-configured BaseURL")
 }
 
 func TestRFC8414_S2_TokenEndpointRequired(t *testing.T) {
@@ -54,11 +56,13 @@ func TestRFC8414_S2_TokenEndpointRequired(t *testing.T) {
 
 func TestRFC8414_S2_JwksUriRequiredWhenSigning(t *testing.T) {
 	// RFC 8414 §2: "jwks_uri OPTIONAL. URL of the authorization server's JWK
-	//   Set [JWK] document." Required in practice for any AS that signs
-	//   tokens — verifiers need the keys.
+	//   Set [JWK] document." ZeroID's policy is stricter — every deployment
+	//   signs tokens, so jwks_uri MUST be advertised or downstream
+	//   verifiers can't find the keys to verify with. The assertion
+	//   enforces our policy.
 	body := fetchASMetadata(t)
 	jwks, _ := body["jwks_uri"].(string)
-	assert.NotEmpty(t, jwks, "jwks_uri MUST be advertised — verifiers need the public keys")
+	assert.NotEmpty(t, jwks, "ZeroID policy: jwks_uri required (exceeds RFC OPTIONAL)")
 	assert.Contains(t, jwks, "/.well-known/jwks.json")
 }
 
@@ -115,14 +119,10 @@ func TestRFC8414_S2_TokenEndpointAuthMethodsSupportedListed(t *testing.T) {
 
 func TestRFC8414_S3_WellKnownPathIsExact(t *testing.T) {
 	// RFC 8414 §3: "The path component of the [metadata URL] is
-	//   /.well-known/oauth-authorization-server." A request to that exact
-	//   path MUST return the metadata; the suffix style "/.well-known/
-	//   oauth-authorization-server/<resource>" is NOT how the spec wires
-	//   issuer paths (per RFC 8414 §3.1's spec text and the IETF errata
-	//   that disambiguated this), but ZeroID lives at a single root.
+	//   /.well-known/oauth-authorization-server."
 	resp := get(t, "/.well-known/oauth-authorization-server", nil)
 	assert.Equal(t, http.StatusOK, resp.StatusCode,
-		"GET /.well-known/oauth-authorization-server MUST return 200 with the metadata document")
+		"GET /.well-known/oauth-authorization-server MUST return 200")
 	contentType := resp.Header.Get("Content-Type")
 	assert.True(t, strings.HasPrefix(contentType, "application/json"),
 		"AS metadata MUST be served as application/json; got %q", contentType)

@@ -68,11 +68,12 @@ func TestRFC7517_S4_2_UseIsSigForSigningKeys(t *testing.T) {
 
 func TestRFC7517_S4_4_AlgRecommended(t *testing.T) {
 	// RFC 7517 §4.4: "The 'alg' (algorithm) parameter ... is RECOMMENDED."
-	// ZeroID sets it on every key so verifiers can pick the right algorithm
-	// without inspecting kty.
+	// ZeroID's policy is stricter than the RFC — every key carries alg so
+	// verifiers can pick the algorithm without inspecting kty + curve. The
+	// assertion enforces our policy.
 	for _, k := range fetchJWKSKeys(t) {
 		alg, _ := k["alg"].(string)
-		assert.NotEmpty(t, alg, "alg SHOULD be set on every JWKS key (ZeroID makes it required)")
+		assert.NotEmpty(t, alg, "ZeroID policy: alg required on every JWKS key (exceeds RFC SHOULD)")
 		assert.Contains(t, []string{"ES256", "RS256"}, alg,
 			"ZeroID publishes only ES256 and RS256 keys")
 	}

@@ -44,12 +44,14 @@ func issueAccessToken(t *testing.T) string {
 // ── RFC 7519 §4.1 — Registered Claim Names ──────────────────────────────────
 
 func TestRFC7519_S4_1_IssClaimPresent(t *testing.T) {
-	// RFC 7519 §4.1.1: "The 'iss' (issuer) claim identifies the principal
-	//   that issued the JWT."
+	// RFC 7519 §4.1.1: "The 'iss' (issuer) claim ... The use of this claim
+	//   is OPTIONAL." ZeroID's policy is stricter than the RFC — every
+	//   issued token carries iss so downstream verifiers can pin the
+	//   authority. This test enforces our policy, exceeding the RFC.
 	parsed, err := jwt.ParseInsecure([]byte(issueAccessToken(t)))
 	require.NoError(t, err)
 	iss, ok := parsed.Issuer()
-	assert.True(t, ok, "iss claim REQUIRED for tokens that name an issuer authority")
+	assert.True(t, ok, "ZeroID-issued token MUST carry iss (policy, not RFC MUST)")
 	assert.NotEmpty(t, iss, "iss MUST NOT be empty")
 }
 
@@ -120,14 +122,20 @@ func TestRFC7519_S4_1_JtiClaimUniquePerToken(t *testing.T) {
 func TestRFC7519_S5_TokenHasThreeBase64UrlSegments(t *testing.T) {
 	// RFC 7519 §3 / RFC 7515 §3.1: a JWT in compact serialization is
 	// `BASE64URL(JOSE Header) || '.' || BASE64URL(Payload) || '.' || BASE64URL(Signature)`.
+	// RFC 4648 §5 base64url alphabet: A–Z, a–z, 0–9, '-', '_'. No padding ('=')
+	// in compact JOSE per RFC 7515 §2.
 	tok := issueAccessToken(t)
 	parts := strings.Split(tok, ".")
-	assert.Len(t, parts, 3, "JWT compact serialization MUST have exactly three dot-separated parts")
+	require.Len(t, parts, 3, "JWT compact serialization MUST have exactly three dot-separated parts")
 	for i, p := range parts {
 		assert.NotEmpty(t, p, "segment %d MUST be non-empty", i)
-		// base64url chars only — no =, no +, no /
-		assert.NotContains(t, p, "+", "segment %d uses base64url, NOT base64 (forbids '+')", i)
-		assert.NotContains(t, p, "/", "segment %d uses base64url, NOT base64 (forbids '/')", i)
-		assert.NotContains(t, p, "=", "segment %d MUST omit base64url padding ('=')", i)
+		for _, c := range p {
+			isBase64URL := (c >= 'A' && c <= 'Z') ||
+				(c >= 'a' && c <= 'z') ||
+				(c >= '0' && c <= '9') ||
+				c == '-' || c == '_'
+			assert.Truef(t, isBase64URL,
+				"segment %d contains non-base64url char %q (allowed: A-Z a-z 0-9 - _ per RFC 4648 §5)", i, c)
+		}
 	}
 }

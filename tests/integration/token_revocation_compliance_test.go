@@ -80,22 +80,8 @@ func TestRFC7009_S2_2_RevokeIsIdempotent(t *testing.T) {
 	_ = r2.Body.Close()
 }
 
-// ── Post-condition: revoked token is `active=false` ─────────────────────────
-
-func TestRFC7009_RevocationCausesIntrospectionInactive(t *testing.T) {
-	// RFC 7009 §2 / RFC 7662 §2.2: revocation is the inverse of issuance.
-	// A revoked token MUST introspect as `active=false` going forward.
-	token := issueRevokeTestToken(t)
-
-	// Sanity: active=true before revocation.
-	before := introspect(t, token)
-	require.Equal(t, true, before["active"], "freshly-issued token must be active")
-
-	revoke := post(t, "/oauth2/token/revoke", map[string]any{"token": token}, nil)
-	require.Equal(t, http.StatusOK, revoke.StatusCode)
-	_ = revoke.Body.Close()
-
-	after := introspect(t, token)
-	assert.Equal(t, false, after["active"],
-		"introspection of a revoked token MUST report active=false")
-}
+// The post-condition that a revoked token introspects as `active=false`
+// lives in RFC 7662 §2.2's compliance suite — see
+// `TestRFC7662_S2_2_RevokedTokenIsInactive` in
+// introspection_compliance_test.go. It's the introspection contract that's
+// being asserted, not RFC 7009's contract.

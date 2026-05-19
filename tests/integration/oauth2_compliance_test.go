@@ -130,12 +130,17 @@ func TestRFC6749_S5_2_ErrorResponseShape(t *testing.T) {
 	// RFC 6749 §5.2: "the authorization server responds with an HTTP 400
 	//   ... and includes the following parameters: error REQUIRED,
 	//   error_description OPTIONAL, error_uri OPTIONAL."
+	// §5.2 also permits 401 specifically for invalid_client — which is what
+	// a nonexistent client_id triggers — so the assertion accepts both
+	// 400 and 401.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "client_credentials",
 		"client_id":  uid("nonexistent-client"),
 		"account_id": testAccountID,
 		"project_id": testProjectID,
 	}, nil)
+	assert.Contains(t, []int{http.StatusBadRequest, http.StatusUnauthorized}, resp.StatusCode,
+		"error response MUST use 400 (or 401 for invalid_client per §5.2)")
 	body := decode(t, resp)
 	assert.NotEmpty(t, body["error"], "error field REQUIRED in error response")
 	_, isStr := body["error"].(string)
@@ -158,11 +163,11 @@ func TestRFC6749_S5_2_InvalidRequestOnMissingRequiredField(t *testing.T) {
 		"missing required field MUST map to invalid_request, not invalid_grant or invalid_client")
 }
 
-func TestRFC6749_S5_2_JwtBearerInvalidGrantOnMissingSubject(t *testing.T) {
-	// RFC 6749 §5.2: "invalid_grant ... The provided authorization grant
-	//   ... is invalid, expired, revoked, [or] does not match." We use
-	//   invalid_request when the request shape itself is malformed (no
-	//   subject field at all); §5.2 distinguishes these.
+func TestRFC6749_S5_2_JwtBearerInvalidRequestOnMissingSubject(t *testing.T) {
+	// RFC 6749 §5.2: "invalid_request ... The request is missing a required
+	//   parameter ...". §5.2 also defines invalid_grant for grants that are
+	//   "invalid, expired, revoked, [or] do not match" — but the assertion
+	//   itself missing is a request-shape error, not a grant-validity error.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
 		// subject (the assertion JWT) deliberately omitted

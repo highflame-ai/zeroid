@@ -63,18 +63,21 @@ func TestRFC7662_S2_2_AlwaysReturns200(t *testing.T) {
 		"unknown token MUST introspect as active=false")
 }
 
-func TestRFC7662_S2_2_InactiveResponseOmitsOtherClaims(t *testing.T) {
-	// RFC 7662 §2.2: "If the introspection call is properly authorized but
-	//   the token is not active ... the authorization server MUST return an
-	//   introspection response with the 'active' field set to 'false'.
-	//   Note that to avoid disclosing too much of the authorization server's
-	//   state to a third party, the authorization server SHOULD NOT include
-	//   any additional information about an inactive token."
+func TestRFC7662_S2_2_InactiveResponseShouldNotIncludeOtherClaims(t *testing.T) {
+	// RFC 7662 §2.2: "the authorization server SHOULD NOT include any
+	//   additional information about an inactive token."
+	//
+	// Per RFC 2119 a SHOULD NOT is normative but weaker than MUST NOT —
+	// ZeroID enforces the stricter posture (MUST NOT in practice) because
+	// any leaked claim on a deliberate-junk introspection probe is a
+	// fingerprint surface. The test pins our implementation choice to
+	// "stricter than the RFC requires"; if a future change ever surfaces
+	// extra claims on the inactive path, this catches it.
 	body := decode(t, post(t, "/oauth2/token/introspect", map[string]any{
 		"token": "definitely-not-a-real-token",
 	}, nil))
 
-	// active=false is the only claim that may appear.
+	// active=false is the only claim that should appear.
 	assert.Equal(t, false, body["active"])
 
 	// Forbidden claim names — none should leak on an inactive response.
@@ -82,7 +85,7 @@ func TestRFC7662_S2_2_InactiveResponseOmitsOtherClaims(t *testing.T) {
 		"scope", "account_id", "project_id", "agent_id", "cnf", "act"} {
 		_, present := body[claim]
 		assert.False(t, present,
-			"inactive response MUST NOT include %q (RFC 7662 §2.2 — no leakage)", claim)
+			"inactive response SHOULD NOT include %q (RFC 7662 §2.2 — no leakage)", claim)
 	}
 }
 

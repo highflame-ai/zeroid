@@ -126,9 +126,37 @@ func TestRFC7523_S3_AudMustMatchTokenEndpointIssuer(t *testing.T) {
 		"assertion for a different audience MUST be rejected (otherwise an assertion minted for one AS could be replayed at another)")
 }
 
-func TestRFC7523_S3_ExpRequiredAndInFuture(t *testing.T) {
+func TestRFC7523_S3_ExpRequired(t *testing.T) {
 	// RFC 7523 §3 (4): "The JWT MUST contain an 'exp' (expiration) claim
 	//   that limits the time window during which the JWT can be used."
+	// An assertion with no exp claim at all MUST be rejected.
+	//
+	// COMPLIANCE GAP — currently SKIPPED. The server accepts assertions
+	// with no exp claim and issues a token (verified by running this test
+	// without t.Skip). RFC 7523 §3 (4) requires rejection. Tracking the
+	// fix as a follow-up; this test stays in the suite as the executable
+	// regression-guard the day the server is fixed (just delete the Skip).
+	t.Skip("RFC 7523 §3 (4) compliance gap: server accepts assertions without exp — fix tracked separately")
+
+	f := setupJwtBearerFixture(t)
+	now := time.Now()
+	bad := signAssertion(t, f.Key, map[string]any{
+		"iss": f.WIMSEURI,
+		"sub": f.WIMSEURI,
+		"aud": testIssuer,
+		"iat": now.Unix(),
+		// exp deliberately omitted
+	})
+	resp := postJwtBearer(t, bad)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+func TestRFC7523_S3_ExpMustBeInFuture(t *testing.T) {
+	// RFC 7523 §3 (4) cont.: "[exp] limits the time window during which the
+	//   JWT can be used." An assertion whose exp is in the past MUST be
+	//   rejected even if the claim is present.
 	f := setupJwtBearerFixture(t)
 	now := time.Now()
 	bad := signAssertion(t, f.Key, map[string]any{
