@@ -17,6 +17,11 @@ const (
 	SignalTypePolicyViolation   SignalType = "policy_violation"
 	SignalTypeRetirement        SignalType = "retirement"
 	SignalTypeOwnerChange       SignalType = "owner_change"
+	// SignalTypePolicyDrift is emitted when the active DRM or Constraint
+	// Catalog hash diverges from the hash bound into outstanding tokens.
+	// Enforcement points use this signal to schedule re-evaluation on
+	// next use rather than immediate revocation — see issue #59.
+	SignalTypePolicyDrift SignalType = "policy_drift"
 	// SignalTypeIdentityExpired fires when the cleanup worker deactivates
 	// an identity whose expires_at has passed. Kept distinct from
 	// SignalTypeRetirement (admin-initiated deactivation) so subscribers
@@ -49,7 +54,7 @@ func (t SignalType) Valid() bool {
 	switch t {
 	case SignalTypeCredentialChange, SignalTypeSessionRevoked, SignalTypeIPChange,
 		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement,
-		SignalTypeOwnerChange, SignalTypeIdentityExpired:
+		SignalTypeOwnerChange, SignalTypePolicyDrift, SignalTypeIdentityExpired:
 		return true
 	}
 	return false

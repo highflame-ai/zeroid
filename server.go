@@ -76,8 +76,12 @@ type Server struct {
 	refreshTokenSvc     *service.RefreshTokenService
 
 	// Cleanup
-	cleanupWorker *worker.CleanupWorker
-	workerCancel  context.CancelFunc
+	cleanupWorker       *worker.CleanupWorker
+	catalogSignerWorker *worker.CatalogSignerWorker
+	workerCancel        context.CancelFunc
+
+	// Governance (issue #59) — DRM + Constraint Catalog binding.
+	governanceSvc *service.GovernanceService
 
 	// Extensibility
 	mu              sync.RWMutex
@@ -209,6 +213,15 @@ func NewServer(cfg Config) (*Server, error) {
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
 
+	// Governance binding (issue #59). Wires Decision-Rights Matrix +
+	// Constraint Catalog hash binding into delegation grants. The service
+	// is no-op for any tenant that has not published a DRM/catalog row, so
+	// existing flows behave identically.
+	drmRepo := postgres.NewDRMRepository(db)
+	catalogRepo := postgres.NewConstraintCatalogRepository(db)
+	governanceSvc := service.NewGovernanceService(drmRepo, catalogRepo, credentialRepo, signalSvc, jwksSvc)
+	oauthSvc.SetGovernanceService(governanceSvc)
+
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
 	// dispatches from oauthSvc.Token() into BackchannelService.Redeem, which in
@@ -227,8 +240,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc,
-		signingCredSvc, db,
+ttsignalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc,nttgovernanceSvc, signingCredSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
@@ -341,7 +353,9 @@ func NewServer(cfg Config) (*Server, error) {
 		backchannelSvc:      backchannelSvc,
 		jwksSvc:             jwksSvc,
 		refreshTokenSvc:     refreshTokenSvc,
+		governanceSvc:       governanceSvc,
 		cleanupWorker:       worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
+		catalogSignerWorker: worker.NewCatalogSignerWorker(catalogRepo, governanceSvc, 24*time.Hour),
 		adminAuthState:      authState,
 		globalMWState:       globalMW,
 		http: &http.Server{
@@ -369,6 +383,9 @@ func (s *Server) Start() error {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	s.workerCancel = workerCancel
 	go s.cleanupWorker.Run(workerCtx)
+	if s.catalogSignerWorker != nil {
+		go s.catalogSignerWorker.Run(workerCtx)
+	}
 
 	// Start HTTP server.
 	errCh := make(chan error, 1)
@@ -419,6 +436,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// past the HTTP listener close.
 	if s.backchannelSvc != nil {
 		s.backchannelSvc.Stop()
+	}
+
+	// Cancel policy_drift fan-out goroutines for the same reason
+	// (issue #59).
+	if s.governanceSvc != nil {
+		s.governanceSvc.Stop()
 	}
 
 	var firstErr error
