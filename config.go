@@ -132,6 +132,14 @@ type ServerConfig struct {
 	//
 	// Set to empty string ("") to register admin routes at the router root.
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
+
+	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
+	// X-Forwarded-Host when reconstructing the effective request URL for
+	// DPoP htu validation (RFC 9449 §4.3). Production deployers behind a
+	// trusted edge proxy (nginx, AWS ALB, GCP LB) flip this on; deployers
+	// that terminate TLS at the service itself leave it false so spoofed
+	// proxy headers cannot move the htu goalposts.
+	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
 // GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"
@@ -175,7 +183,27 @@ type KeysConfig struct {
 
 // TokenConfig holds JWT issuance settings.
 type TokenConfig struct {
-	Issuer     string `koanf:"issuer"`
+	Issuer string `koanf:"issuer"`
+	// BaseURL is the publicly-visible URL clients use to reach this server.
+	// It seeds every URI returned in responses (`registration_endpoint` and
+	// `registration_client_uri` in DCR responses, the JWT `iss` claim's
+	// authority for verification, and the well-known discovery doc).
+	//
+	// MUST be the URL clients actually hit — including any reverse-proxy
+	// rewrites or path prefixes the deployment adds. If a proxy fronts
+	// zeroid at https://auth.example.com/v1 and forwards to a backend on
+	// http://10.0.0.5:8080, set BaseURL = "https://auth.example.com/v1"
+	// (the public form), NOT the backend URL. A wrong value here doesn't
+	// break token signing — JWTs continue to verify against jwks_uri — but
+	// every URI the server PUBLISHES (DCR responses, discovery) becomes
+	// unreachable from outside. Validate() will reject empty values; format
+	// validity is the deployer's responsibility.
+	//
+	// Note: DPoP `htu` validation does NOT depend on BaseURL — it compares
+	// against the request's effective URL (via RequestURLMiddleware) so
+	// reverse-proxied deployments don't need to keep BaseURL and the proxy
+	// in lock-step for token issuance to work. BaseURL is purely about the
+	// shape of URIs the server hands BACK to clients.
 	BaseURL    string `koanf:"base_url"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
@@ -260,6 +288,9 @@ func (c *Config) Validate() error {
 	}
 	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
 		return fmt.Errorf("wimse_domain: %w", err)
+	}
+	if c.Token.BaseURL == "" {
+		return fmt.Errorf("token.base_url is required: every URI the server hands back (DCR registration_client_uri, well-known discovery) derives from it; see TokenConfig.BaseURL")
 	}
 	return nil
 }

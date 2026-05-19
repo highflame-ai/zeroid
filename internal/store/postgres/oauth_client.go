@@ -98,3 +98,21 @@ func (r *OAuthClientRepository) Delete(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// DeleteByClientID removes a dynamically registered client by its OAuth2 client_id.
+// Used by RFC 7592 DELETE /oauth2/register/{client_id} where auth is the
+// registration_access_token, not an admin UUID.
+// The registration_source = 'dynamic' guard is defense-in-depth — the service layer
+// also checks this before calling, but the repo must never delete internal clients
+// regardless of how it is called.
+func (r *OAuthClientRepository) DeleteByClientID(ctx context.Context, clientID string) error {
+	_, err := r.db.NewDelete().
+		TableExpr("oauth_clients").
+		Where("client_id = ?", clientID).
+		Where("registration_source = 'dynamic'").
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to delete oauth client: %w", err)
+	}
+	return nil
+}

@@ -106,6 +106,19 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired auth codes")
 	}
 
+	// DPoP JTIs are only needed within the freshness window (RFC 9449 §4.2).
+	// Purge expired rows to prevent unbounded table growth under high
+	// token-request volume.
+	dpopRes, err := w.db.NewDelete().
+		TableExpr("dpop_jti").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired dpop jti records")
+	} else if n, err := dpopRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired dpop jti records")
+	}
+
 	// CIBA backchannel requests:
 	//   1. Flip pending → expired so an in-flight poll sees expired_token.
 	//   2. Reap rows in a resolved terminal state past expires_at.

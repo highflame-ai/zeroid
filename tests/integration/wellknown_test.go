@@ -115,6 +115,21 @@ func TestOAuthServerMetadata(t *testing.T) {
 	assert.True(t, modeSet["poll"], "must advertise poll delivery mode")
 	assert.True(t, modeSet["ping"], "must advertise ping delivery mode")
 	assert.True(t, modeSet["push"], "must advertise push delivery mode")
+
+	// RFC 7591 dynamic client registration endpoint.
+	assert.NotEmpty(t, body["registration_endpoint"], "must advertise registration_endpoint for RFC 7591")
+
+	// RFC 9449 DPoP signing alg advertisement.
+	dpopAlgs, ok := body["dpop_signing_alg_values_supported"].([]any)
+	require.True(t, ok, "must declare dpop_signing_alg_values_supported for RFC 9449")
+	algSet := make(map[string]bool, len(dpopAlgs))
+	for _, a := range dpopAlgs {
+		s, ok := a.(string)
+		require.True(t, ok, "dpop_signing_alg_values_supported entries must be strings")
+		algSet[s] = true
+	}
+	assert.True(t, algSet["ES256"], "DPoP must advertise ES256")
+	assert.True(t, algSet["RS256"], "DPoP must advertise RS256")
 }
 
 // TestHealthEndpoint verifies that /health returns 200.

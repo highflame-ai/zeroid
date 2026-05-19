@@ -34,6 +34,7 @@ type API struct {
 	agentSvc             *service.AgentService
 	auditSvc             *service.AuditService
 	backchannelSvc       *service.BackchannelService
+	dpopSvc              *service.DPoPService
 	jwksSvc              *signing.JWKSService
 	signingCredSvc       *service.SigningCredentialService
 	db                   *bun.DB
@@ -57,6 +58,7 @@ func NewAPI(
 	agentSvc *service.AgentService,
 	auditSvc *service.AuditService,
 	backchannelSvc *service.BackchannelService,
+	dpopSvc *service.DPoPService,
 	jwksSvc *signing.JWKSService,
 	signingCredSvc *service.SigningCredentialService,
 	db *bun.DB,
@@ -76,6 +78,7 @@ func NewAPI(
 		agentSvc:             agentSvc,
 		auditSvc:             auditSvc,
 		backchannelSvc:       backchannelSvc,
+		dpopSvc:              dpopSvc,
 		jwksSvc:              jwksSvc,
 		signingCredSvc:       signingCredSvc,
 		db:                   db,
@@ -105,11 +108,15 @@ func NewHumaAPI(router chi.Router) huma.API {
 
 // RegisterPublic registers endpoints that require no authentication:
 // health, well-known, OAuth2 endpoints (token, revoke), and forward-auth verify.
+// The /oauth2/register endpoints (RFC 7591/7592) live here too — they enforce
+// their own intrinsic auth (initial-access-token or registration_access_token)
+// per request, so they are not gated by the admin middleware.
 func (a *API) RegisterPublic(api huma.API, router chi.Router) {
 	a.registerHealthRoutes(api)
 	a.registerWellKnownRoutes(api)
 	a.registerSigningJWKSRoute(api)
 	a.registerOAuthRoutes(api)
+	a.registerDynamicRegistrationRoutes(api)
 	a.registerAuthVerifyRoute(router)
 }
 
