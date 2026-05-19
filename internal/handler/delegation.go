@@ -42,7 +42,6 @@ type DelegationChainsInput struct {
 type DelegationChainsOutput struct {
 	Body struct {
 		Chains []*postgres.ChainSummary `json:"chains"`
-		Total  int                      `json:"total"`
 	}
 }
 
@@ -125,6 +124,5 @@ func (a *API) delegationChainsOp(ctx context.Context, input *DelegationChainsInp
 
 	out := &DelegationChainsOutput{}
 	out.Body.Chains = chains
-	out.Body.Total = len(chains)
 	return out, nil
 }
