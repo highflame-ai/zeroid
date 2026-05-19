@@ -21,6 +21,7 @@ import { registerDeactivate } from "../src/commands/agents/deactivate.js";
 import { registerCredsList } from "../src/commands/creds/list.js";
 import { registerSignal } from "../src/commands/signal.js";
 import { registerConfig } from "../src/commands/config.js";
+import { registerCiba } from "../src/commands/ciba/index.js";
 
 export const BASE_URL = "http://zeroid.test";
 
@@ -47,6 +48,7 @@ export function makeProgram(): Command {
   registerInit(program);
   registerSignal(program);
   registerConfig(program);
+  registerCiba(program);
 
   const tokenCmd = program.command("token");
   registerIssue(tokenCmd);

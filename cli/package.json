@@ -4,7 +4,8 @@
   "description": "CLI for ZeroID — agent identity for AI systems",
   "type": "module",
   "bin": {
-    "zeroid": "./dist/index.js"
+    "zeroid": "./dist/index.js",
+    "zid": "./dist/index.js"
   },
   "files": [
     "dist"
