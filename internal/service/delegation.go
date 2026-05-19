@@ -109,7 +109,7 @@ func NewDelegationService(credRepo *postgres.CredentialRepository, delegRepo *po
 // When the identity has issued no credentials yet, returns a one-node
 // graph (just the identity, no edges). When the credential count
 // exceeds MaxGraphNodes after the walk, Truncated is set on the
-// response; nodes are kept but edges are capped at MaxGraphNodes-1.
+// response; credentials are capped at MaxGraphNodes.
 func (s *DelegationService) GetGraph(ctx context.Context, identityID string, depth int, accountID, projectID string) (*Graph, error) {
 	if depth < 1 {
 		depth = 1
