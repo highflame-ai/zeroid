@@ -131,17 +131,6 @@ make setup-keys
 
 Docker and Docker Compose v2 are the only other dependencies.
 
-Add the `cascade-demo` profile to `~/.config/zid/config.json` so CLI commands
-target the demo tenant:
-
-```json
-"cascade-demo": {
-  "base_url": "http://localhost:8899",
-  "account_id": "default",
-  "project_id": "default"
-}
-```
-
 ---
 
 ## Run the demo
@@ -174,9 +163,12 @@ Open Grafana at **http://localhost:3100** (login: admin / admin) and navigate to
 ## Trigger cascade revocation
 
 ```bash
+export ZID_BASE_URL=http://localhost:8899
+export ZID_ACCOUNT_ID=default
+export ZID_PROJECT_ID=default
+
 zid signal \
-  --profile cascade-demo \
-  --agent "$(zid agents list --profile cascade-demo --json | jq -r '.[] | select(.external_id == "spec-legal") | .id')" \
+  --agent "$(zid agents list --json | jq -r '.[] | select(.external_id == "spec-legal") | .id')" \
   --type anomalous_behavior \
   --severity high \
   --source security-monitor \
