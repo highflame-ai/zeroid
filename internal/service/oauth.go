@@ -322,6 +322,14 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT validation failed", err)
 	}
 
+	// RFC 7523 §3 (4): "The JWT MUST contain an 'exp' (expiration) claim that
+	// limits the time window during which the JWT can be used." jwx's
+	// WithValidate(true) honors exp when present but does not require it —
+	// supplement here.
+	if _, ok := assertionToken.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing required exp claim")
+	}
+
 	// iss must match the identity's WIMSE URI.
 	if iss, _ := assertionToken.Issuer(); iss != identity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
@@ -448,6 +456,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
+	}
+	// RFC 7523 §3 (4) applies to the actor_token too (RFC 8693 §1.2 inherits
+	// the JWT-bearer assertion contract). Require exp explicitly — jwx's
+	// validator honors exp when present but does not require it.
+	if _, ok := validatedActorToken.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "actor_token missing required exp claim")
 	}
 	if iss, _ := validatedActorToken.Issuer(); iss != actorIdentity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
