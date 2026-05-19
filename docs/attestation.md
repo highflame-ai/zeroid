@@ -2,7 +2,7 @@
 
 > Cryptographic proof that an identity actually runs in the environment it claims — used to elevate trust before issuing a credential.
 
-Until PR #93 the attestation path was a stub: any submitted proof flipped the identity's `is_verified` flag and promoted its trust level. This document is the reference for the replacement — a pluggable verifier framework with per-tenant policy, fail-closed by default, and the OIDC verifier as the first implementation.
+Earlier versions of the attestation path were a stub: any submitted proof flipped the identity's `is_verified` flag and promoted its trust level. This document is the reference for the replacement — a pluggable verifier framework with per-tenant policy, fail-closed by default, and the OIDC verifier as the first implementation.
 
 ---
 
