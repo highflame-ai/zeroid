@@ -8,6 +8,8 @@ npm install -g @highflame/zeroid
 npx @highflame/zeroid <command>
 ```
 
+The package also installs `zid` as a short alias for `zeroid`.
+
 ---
 
 ## Quick start
@@ -196,6 +198,145 @@ zeroid token revoke eyJhbGc...
 |---|---|
 | `--profile <name>` | Profile to use |
 | `--json` | Output raw JSON response |
+
+---
+
+### `zeroid ciba init`
+
+Initiate an OpenID CIBA backchannel authentication request. The CLI sends tenant context in the request body because `/oauth2/bc-authorize` is a public OAuth endpoint.
+
+```bash
+zeroid ciba init \
+  --client-id my-ciba-client \
+  --login-hint user@example.com \
+  --scope "openid profile" \
+  --binding-message "Approve login on Production?" \
+  --requested-expiry 600
+```
+
+For ping or push clients, include the per-request bearer token:
+
+```bash
+zeroid ciba init \
+  --client-id my-ciba-client \
+  --login-hint user@example.com \
+  --client-notification-token opaque-token
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `--client-id <id>` | OAuth client initiating the request | required |
+| `--login-hint <hint>` | User identifier for the out-of-band prompt | required |
+| `--scope <scopes>` | Space-separated scopes to request | — |
+| `--binding-message <text>` | Context shown to the approving user | — |
+| `--requested-expiry <seconds>` | Requested auth request lifetime | server default |
+| `--client-notification-token <token>` | Required for ping/push delivery clients | — |
+| `--profile <name>` | Profile to use for tenant/base URL | active profile |
+| `--json` | Output raw JSON | — |
+
+**Output:**
+```
+✓  CIBA request initiated
+  auth_req_id: ari_...
+  expires_in:  300s
+  interval:    5s
+```
+
+---
+
+### `zeroid ciba approve <auth_req_id>`
+
+Admin-side helper to approve a pending CIBA request in local demos and test environments.
+
+```bash
+zeroid ciba approve ari_... \
+  --subject-id user@example.com \
+  --subject-email user@example.com \
+  --subject-name "Alice User"
+
+# Highflame AuthN-style deployments with admin routes mounted at the base URL:
+ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE_SECRET=... \
+zeroid ciba approve ari_... --subject-id user@example.com --admin-prefix ""
+```
+
+| Flag | Description |
+|---|---|
+| `--subject-id <id>` | Approved end-user identifier; becomes the token `sub` |
+| `--subject-email <email>` | Approved user's email |
+| `--subject-name <name>` | Approved user's display name |
+| `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
+| `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
+| `--profile <name>` | Profile to use |
+| `--json` | Output raw JSON |
+
+Use `--admin-prefix ""` for deployers such as Highflame AuthN that mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID keeps the default `/api/v1` prefix.
+
+---
+
+### `zeroid ciba deny <auth_req_id>`
+
+Admin-side helper to deny a pending CIBA request.
+
+```bash
+zeroid ciba deny ari_... --reason "user rejected"
+
+ZID_INTERNAL_SERVICE=highflame-admin \
+ZID_INTERNAL_SERVICE_SECRET=... \
+zeroid ciba deny ari_... --reason "user rejected" --admin-prefix ""
+```
+
+| Flag | Description |
+|---|---|
+| `--reason <text>` | Operator note sent when supported by the server |
+| `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
+| `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
+| `--profile <name>` | Profile to use |
+| `--json` | Output raw JSON |
+
+---
+
+### `zeroid ciba poll <auth_req_id>`
+
+Poll `/oauth2/token` with the CIBA grant type until the user approves or denies.
+
+```bash
+zeroid ciba poll ari_... --client-id my-ciba-client
+zeroid ciba poll ari_... --client-id my-ciba-client --watch --interval 5
+zeroid ciba poll ari_... --client-id my-ciba-client --json
+```
+
+| Flag | Description | Default |
+|---|---|---|
+| `--client-id <id>` | OAuth client that initiated the request | required |
+| `--watch` | Keep polling through `authorization_pending` / `slow_down` | off |
+| `--interval <seconds>` | Polling interval for `--watch` | `5` |
+| `--profile <name>` | Profile to use for base URL | active profile |
+| `--json` | Output raw JSON | — |
+
+On success, the command prints the access token. Without `--watch`, OAuth polling errors such as `authorization_pending`, `slow_down`, `access_denied`, and `expired_token` are printed and return exit code `1`.
+
+---
+
+### `zeroid ciba listen`
+
+Run a local HTTPS callback capture endpoint for CIBA ping and push testing. The command creates a self-signed localhost certificate in `~/.config/zeroid/ciba-cert/` on first run.
+
+```bash
+zeroid ciba listen --port 8888
+```
+
+Use `https://localhost:8888/cb` as the OAuth client's `client_notification_endpoint` while developing locally. Localhost callbacks require the ZeroID server to allow private notification endpoints in its backchannel configuration.
+
+| Flag | Description | Default |
+|---|---|---|
+| `--port <port>` | HTTPS port to listen on | `8888` |
+| `--host <host>` | Host to bind | `localhost` |
+| `--json` | Output newline-delimited JSON events | off |
 
 ---
 

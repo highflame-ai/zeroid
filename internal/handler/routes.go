@@ -36,6 +36,7 @@ type API struct {
 	backchannelSvc       *service.BackchannelService
 	governanceSvc        *service.GovernanceService
 	jwksSvc              *signing.JWKSService
+	signingCredSvc       *service.SigningCredentialService
 	db                   *bun.DB
 	issuer               string
 	baseURL              string
@@ -59,6 +60,7 @@ func NewAPI(
 	backchannelSvc *service.BackchannelService,
 	governanceSvc *service.GovernanceService,
 	jwksSvc *signing.JWKSService,
+	signingCredSvc *service.SigningCredentialService,
 	db *bun.DB,
 	issuer, baseURL string,
 ) *API {
@@ -78,6 +80,7 @@ func NewAPI(
 		backchannelSvc:       backchannelSvc,
 		governanceSvc:        governanceSvc,
 		jwksSvc:              jwksSvc,
+		signingCredSvc:       signingCredSvc,
 		db:                   db,
 		issuer:               issuer,
 		baseURL:              baseURL,
@@ -108,6 +111,7 @@ func NewHumaAPI(router chi.Router) huma.API {
 func (a *API) RegisterPublic(api huma.API, router chi.Router) {
 	a.registerHealthRoutes(api)
 	a.registerWellKnownRoutes(api)
+	a.registerSigningJWKSRoute(api)
 	a.registerOAuthRoutes(api)
 	a.registerAuthVerifyRoute(router)
 }
@@ -129,7 +133,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerAuditRoutes(api)
 	a.registerBackchannelAdminRoutes(api)
 	a.registerExpiringSoonRoute(api)
-	a.registerGovernanceRoutes(api)
+ta.registerGovernanceRoutes(api)nta.registerSigningCredentialRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).
