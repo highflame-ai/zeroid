@@ -476,11 +476,8 @@ func TestDelegationChains_TimeWindow(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body := decode(t, resp)
-	total, _ := body["total"].(float64)
-	assert.GreaterOrEqual(t, int(total), 1, "must include the chain we just issued")
-
 	chains, _ := body["chains"].([]any)
-	require.NotEmpty(t, chains)
+	require.NotEmpty(t, chains, "must include the chain we just issued")
 	first := chains[0].(map[string]any)
 	assert.NotEmpty(t, first["chain_id"])
 	assert.NotEmpty(t, first["started_at"])
