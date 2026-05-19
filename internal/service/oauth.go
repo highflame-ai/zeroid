@@ -333,6 +333,17 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT validation failed", err)
 	}
 
+	// RFC 7523 §3 mandatory claims. jwx's WithValidate(true) honors them
+	// when present but does not require them — supplement here.
+	//   §3 (2): "The JWT MUST contain a 'sub' (subject) claim ..."
+	//   §3 (4): "The JWT MUST contain an 'exp' (expiration) claim ..."
+	if _, ok := assertionToken.Subject(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing required sub claim")
+	}
+	if _, ok := assertionToken.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing required exp claim")
+	}
+
 	// iss must match the identity's WIMSE URI.
 	if iss, _ := assertionToken.Issuer(); iss != identity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
@@ -460,6 +471,17 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	)
 	if err != nil {
 		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
+	}
+	// RFC 7523 §3 mandatory claims apply to the actor_token too (RFC 8693
+	// §1.2 inherits the JWT-bearer assertion contract). jwx's validator
+	// honors them when present but does not require them — supplement here.
+	//   §3 (2): sub REQUIRED
+	//   §3 (4): exp REQUIRED
+	if _, ok := validatedActorToken.Subject(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "actor_token missing required sub claim")
+	}
+	if _, ok := validatedActorToken.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "actor_token missing required exp claim")
 	}
 	if iss, _ := validatedActorToken.Issuer(); iss != actorIdentity.WIMSEURI {
 		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
