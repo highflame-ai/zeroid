@@ -223,11 +223,15 @@ func NewServer(cfg Config) (*Server, error) {
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
+	// DPoP service — validates RFC 9449 proofs and enforces JTI replay protection
+	// via the dpop_jti table. Stateless beyond the DB it reads/writes.
+	dpopSvc := service.NewDPoPService(db)
+
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, jwksSvc,
 		signingCredSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
@@ -271,6 +275,10 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Public routes — no auth.
 	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke, /oauth2/token/verify
+	// RequestURLMiddleware records the request's effective URL on context.Context
+	// so DPoP htu validation (RFC 9449 §4.3) compares against what the client
+	// actually hit, not against the static config value.
+	r.Use(internalMiddleware.RequestURLMiddleware(cfg.Server.TrustForwardedHeaders))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
