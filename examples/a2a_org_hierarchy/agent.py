@@ -14,6 +14,7 @@ is alive without touching any inference API.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import random
@@ -68,22 +69,54 @@ MY_PARENT = MY_ENTRY.get("parent") or "root"
 TOKEN_ACTIVE.labels(agent=AGENT_NAME, parent=MY_PARENT).set(1)
 TOKEN_REVOKED_AT.labels(agent=AGENT_NAME, parent=MY_PARENT).set(0)
 
-# ── ZeroID introspection (sync, called from middleware via run_in_executor) ───
-def _introspect_sync(token: str) -> bool:
+# ── Shared async HTTP clients (initialised by lifespan) ──────────────────────
+# _introspect_client: persistent connection pool for ZeroID introspection calls.
+# _delegation_client: persistent connection pool for outbound task delegation.
+# Both are set to module-level variables so middleware and background tasks can
+# reference them without being passed the client explicitly.
+_introspect_client: httpx.AsyncClient | None = None
+_delegation_client: httpx.AsyncClient | None = None
+
+
+# ── ZeroID introspection (async, uses shared client) ─────────────────────────
+async def _introspect(token: str) -> bool:
     try:
-        r = httpx.post(
+        r = await _introspect_client.post(
             f"{ZEROID_URL}/oauth2/token/introspect",
             json={"token": token},
-            timeout=5.0,
         )
         return r.json().get("active", False)
     except Exception:
         return False  # fail closed
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title=AGENT_NAME)
 
+# ── FastAPI app ───────────────────────────────────────────────────────────────
 _first_revoked_at: float = 0.0  # module-level state for revocation timestamp
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _introspect_client, _delegation_client
+    _introspect_client = httpx.AsyncClient(timeout=5.0)
+    _delegation_client = httpx.AsyncClient(timeout=5.0)
+    print(
+        f"[{AGENT_NAME}] starting (tier={MY_ENTRY['tier']}, children={len(CHILD_URLS)})",
+        flush=True,
+    )
+    tasks = [
+        asyncio.create_task(_self_introspect_loop()),
+        asyncio.create_task(_task_delegation_loop()),
+    ]
+    try:
+        yield
+    finally:
+        for t in tasks:
+            t.cancel()
+        await _introspect_client.aclose()
+        await _delegation_client.aclose()
+
+
+app = FastAPI(title=AGENT_NAME, lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -97,8 +130,7 @@ async def zeroid_auth_middleware(request: Request, call_next):
     if not token:
         return JSONResponse({"error": "missing bearer token"}, status_code=401)
 
-    loop = asyncio.get_event_loop()
-    active = await loop.run_in_executor(None, _introspect_sync, token)
+    active = await _introspect(token)
     if not active:
         return JSONResponse({"error": "credential revoked by ZeroID"}, status_code=401)
     return await call_next(request)
@@ -132,8 +164,7 @@ async def _self_introspect_loop():
     global _first_revoked_at
     while True:
         await asyncio.sleep(2)
-        loop = asyncio.get_event_loop()
-        active = await loop.run_in_executor(None, _introspect_sync, MY_TOKEN)
+        active = await _introspect(MY_TOKEN)
         TOKEN_ACTIVE.labels(agent=AGENT_NAME, parent=MY_PARENT).set(1 if active else 0)
         if not active and _first_revoked_at == 0.0:
             _first_revoked_at = time.time()
@@ -156,12 +187,11 @@ async def _task_delegation_loop():
                 "ts":   time.time(),
             }
             try:
-                async with httpx.AsyncClient(timeout=5.0) as c:
-                    r = await c.post(
-                        f"{target}/task",
-                        json=task_payload,
-                        headers={"Authorization": f"Bearer {MY_TOKEN}"},
-                    )
+                r = await _delegation_client.post(
+                    f"{target}/task",
+                    json=task_payload,
+                    headers={"Authorization": f"Bearer {MY_TOKEN}"},
+                )
                 if r.status_code == 401:
                     print(
                         f"[{AGENT_NAME}] → {target}: 401 UNAUTHORIZED "
@@ -178,10 +208,3 @@ async def _task_delegation_loop():
             except Exception as e:
                 print(f"[{AGENT_NAME}] → {target}: error ({e})", flush=True)
         await asyncio.sleep(5)
-
-
-@app.on_event("startup")
-async def startup():
-    print(f"[{AGENT_NAME}] starting (tier={MY_ENTRY['tier']}, children={len(CHILD_URLS)})", flush=True)
-    asyncio.create_task(_self_introspect_loop())
-    asyncio.create_task(_task_delegation_loop())
