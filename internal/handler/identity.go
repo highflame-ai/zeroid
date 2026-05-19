@@ -54,6 +54,15 @@ type IdentityIDInput struct {
 	ID string `path:"id" doc:"Identity UUID"`
 }
 
+// GetIdentityByWIMSEInput is the query for GET /identities/by-wimse.
+// The URI is supplied as a query param (rather than a path segment) because
+// SPIFFE URIs contain slashes that would conflict with route segmentation
+// and the trust-domain host that wouldn't survive path encoding without
+// loss-of-fidelity surprises.
+type GetIdentityByWIMSEInput struct {
+	URI string `query:"uri" required:"true" doc:"WIMSE/SPIFFE URI to resolve (e.g. spiffe://highflame.io/acme/prod/agent/claude-bot)"`
+}
+
 type ListIdentitiesInput struct {
 	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
 	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
@@ -127,6 +136,19 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Tags:          []string{"Identities"},
 		DefaultStatus: http.StatusCreated,
 	}, a.createIdentityOp)
+
+	// Registered before /identities/{id} so the literal `by-wimse` segment
+	// is matched before falling into the {id} wildcard. chi handles this
+	// fine in either order, but keeping the literal first makes the
+	// precedence obvious from the registration order.
+	huma.Register(api, huma.Operation{
+		OperationID: "get-identity-by-wimse",
+		Method:      http.MethodGet,
+		Path:        "/identities/by-wimse",
+		Summary:     "Resolve an identity by its WIMSE/SPIFFE URI",
+		Description: "Lookup endpoint used by downstream gateways to verify a JWT's sub claim still resolves to an active identity row in the caller's tenant before forwarding the request.",
+		Tags:        []string{"Identities"},
+	}, a.getIdentityByWIMSEOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "get-identity",
@@ -247,6 +269,46 @@ func (a *API) getIdentityOp(ctx context.Context, input *IdentityIDInput) (*Ident
 	identity, err := a.identitySvc.GetIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		return nil, huma.Error404NotFound("identity not found")
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+// getIdentityByWIMSEOp resolves an identity by its WIMSE/SPIFFE URI within
+// the caller's tenant. Used by downstream gateways (firehog) to gate
+// forwarding on identity status — a signature-valid, unexpired JWT for a
+// deactivated identity must still be rejected, and only the identity row
+// carries that signal.
+//
+// On 400 / 404 the body follows huma's RFC 9457 ProblemDetails shape with
+// the failure code in `detail` ("invalid_wimse_uri" / "identity_not_found")
+// and the offending URI echoed back in `errors[0].value` so callers can log
+// it without round-tripping the query string.
+func (a *API) getIdentityByWIMSEOp(ctx context.Context, input *GetIdentityByWIMSEInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	if vErr := domain.ValidateWIMSEURI(input.URI); vErr != nil {
+		return nil, huma.Error400BadRequest("invalid_wimse_uri", &huma.ErrorDetail{
+			Message:  vErr.Error(),
+			Location: "query.uri",
+			Value:    input.URI,
+		})
+	}
+
+	identity, err := a.identitySvc.GetIdentityByWIMSEURI(ctx, input.URI, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityNotFound) {
+			return nil, huma.Error404NotFound("identity_not_found", &huma.ErrorDetail{
+				Message:  "no identity matches the supplied WIMSE URI in this tenant",
+				Location: "query.uri",
+				Value:    input.URI,
+			})
+		}
+		log.Error().Err(err).Str("wimse_uri", input.URI).Msg("failed to resolve identity by wimse uri")
+		return nil, huma.Error500InternalServerError("failed to resolve identity")
 	}
 
 	return &IdentityOutput{Body: identity}, nil
