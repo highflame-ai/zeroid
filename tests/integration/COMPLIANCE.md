@@ -34,13 +34,13 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 7517 (JWKS) | `jwks_compliance_test.go` | Covered |
 | RFC 7519 (JWT) | `jwt_compliance_test.go` | Covered |
 | RFC 7523 (JWT Bearer grant) | `jwt_bearer_compliance_test.go` | Covered |
-| RFC 7591 / 7592 (Dynamic Client Registration) | `dcr_compliance_test.go` | Covered (PR #152) |
+| RFC 7591 / 7592 (Dynamic Client Registration) | `dcr_compliance_test.go` | Covered |
 | RFC 7636 (PKCE) | `pkce_compliance_test.go` | Covered |
-| RFC 7638 (JWK Thumbprint) | exercised by `dpop_compliance_test.go` | Covered (PR #152) |
+| RFC 7638 (JWK Thumbprint) | exercised by `dpop_compliance_test.go` | Covered |
 | RFC 7662 (Introspection) | `introspection_compliance_test.go` | Covered |
 | RFC 8414 (AS Metadata) | `discovery_compliance_test.go` | Covered |
 | RFC 8693 (Token Exchange) | `token_exchange_compliance_test.go` | Covered |
-| RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered (PR #152) |
+| RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
 | OpenID CIBA Core 1.0 | `ciba_compliance_test.go` | Covered |
 | SPIFFE ID + JWT-SVID | `spiffe_compliance_test.go` | Covered |
 | OpenID SSF / CAEP | `cae_test.go` (behavioral) | Partial — see note |
