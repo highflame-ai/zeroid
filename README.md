@@ -260,7 +260,7 @@ When an orchestrator needs a specialized agent to handle part of a task, it dele
 
 This is the key difference from sharing credentials: the sub-agent has its own registered identity and its own keypair. It proves it holds that keypair by signing a short-lived JWT assertion (`actor_token`). ZeroID verifies both tokens and issues a delegated token that carries both identities.
 
-The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`integrations/openclaw/sidecar/agent-identity-sidecar.py:450`](./integrations/openclaw/sidecar/agent-identity-sidecar.py).
+The SDK does not currently ship a JWT-assertion helper, so the snippets below define `generate_ec_keypair` and `build_jwt_assertion` inline. A production-grade Python reference (with the same DER → IEEE P1363 signature conversion required by ES256) lives at [`examples/openclaw/agent-identity-sidecar.py:450`](./examples/openclaw/agent-identity-sidecar.py).
 
 <details>
 <summary>Python</summary>
