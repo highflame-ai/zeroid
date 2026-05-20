@@ -1,6 +1,9 @@
 package service
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // OAuthError is the structured error type returned by OAuthService methods.
 //
@@ -14,8 +17,11 @@ type OAuthError struct {
 	Code string
 	// Description is the human-readable message returned in error_description.
 	Description string
-	// HTTPStatus is the HTTP response status code (400, 401, or 500).
+	// HTTPStatus is the HTTP response status code (400, 401, 429, or 500).
 	HTTPStatus int
+	// RetryAfter, when non-zero, is surfaced as the Retry-After response
+	// header (RFC 7231 §7.1.3).
+	RetryAfter time.Duration
 	// err is the underlying cause; preserved for logging, not sent to clients.
 	err error
 }
@@ -54,4 +60,15 @@ func oauthUnauthorized(description string, cause error) *OAuthError {
 // oauthServerError returns an *OAuthError for server_error with HTTP 500.
 func oauthServerError(description string, cause error) *OAuthError {
 	return &OAuthError{Code: "server_error", Description: description, HTTPStatus: http.StatusInternalServerError, err: cause}
+}
+
+// oauthTooManyRequests returns an *OAuthError for HTTP 429 with the given
+// Retry-After hint.
+func oauthTooManyRequests(code, description string, retryAfter time.Duration) *OAuthError {
+	return &OAuthError{
+		Code:        code,
+		Description: description,
+		HTTPStatus:  http.StatusTooManyRequests,
+		RetryAfter:  retryAfter,
+	}
 }

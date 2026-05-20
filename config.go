@@ -60,6 +60,17 @@ type BackchannelConfig struct {
 	// register endpoints like https://localhost:9000/. Production deployments
 	// MUST keep this false (see GHSA-599q-j34m-33vc).
 	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+
+	// PerClientRateLimitPerMinute caps /oauth2/bc-authorize per
+	// (client_id, account_id, project_id). nil uses the service default
+	// (10/min); 0 explicitly disables. Pointer because 0 is meaningful.
+	PerClientRateLimitPerMinute *int `koanf:"per_client_rate_limit_per_minute"`
+
+	// PerUserRateLimitPerMinute caps /oauth2/bc-authorize per
+	// (login_hint, account_id, project_id). nil uses the service default
+	// (5/min); 0 explicitly disables. Prevents one user being spammed
+	// across multiple clients in the same tenant.
+	PerUserRateLimitPerMinute *int `koanf:"per_user_rate_limit_per_minute"`
 }
 
 // AttestationConfig governs the attestation verification subsystem. The

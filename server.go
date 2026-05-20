@@ -216,6 +216,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// otherwise-circular dependency cleanly.
 	backchannelCfg := service.DefaultBackchannelConfig()
 	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
+	if cfg.Backchannel.PerClientRateLimitPerMinute != nil {
+		backchannelCfg.PerClientRateLimit = *cfg.Backchannel.PerClientRateLimitPerMinute
+	}
+	if cfg.Backchannel.PerUserRateLimitPerMinute != nil {
+		backchannelCfg.PerUserRateLimit = *cfg.Backchannel.PerUserRateLimitPerMinute
+	}
 	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
@@ -583,6 +589,59 @@ func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
 	}
 	s.backchannelSvc.SetPingDispatchSync(sync)
 }
+
+// SetBackchannelRateLimits replaces the in-memory bc-authorize limit
+// thresholds at runtime; 0 disables a dimension. Production deployments
+// should set these via cfg.Backchannel at NewServer time. For non-default
+// backends, use SetBackchannelRateLimiters.
+func (s *Server) SetBackchannelRateLimits(perClientRPM, perUserRPM int) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetRateLimits(perClientRPM, perUserRPM)
+}
+
+// SetBackchannelRateLimiters installs deployer-supplied RateLimiter
+// implementations for the per-client and per-user dimensions. Nil disables
+// a dimension. Previously-installed limiters are stopped.
+//
+// This is the extension point for multi-replica deployments — see the
+// RateLimiter doc for the interface contract.
+func (s *Server) SetBackchannelRateLimiters(perClient, perUser RateLimiter) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetRateLimiters(
+		wrapRateLimiter(perClient),
+		wrapRateLimiter(perUser),
+	)
+}
+
+// wrapRateLimiter adapts a public RateLimiter to the internal
+// service.RateLimiter. Pass-through when the caller already supplies the
+// internal type (e.g. *service.TokenBucketLimiter) to skip the wrapper.
+func wrapRateLimiter(l RateLimiter) service.RateLimiter {
+	if l == nil {
+		return nil
+	}
+	if inner, ok := l.(service.RateLimiter); ok {
+		return inner
+	}
+	return rateLimiterAdapter{inner: l}
+}
+
+// rateLimiterAdapter bridges the public and internal RateLimiter
+// interfaces. They are signature-identical today; the adapter exists so
+// either side can evolve independently.
+type rateLimiterAdapter struct {
+	inner RateLimiter
+}
+
+func (a rateLimiterAdapter) Allow(ctx context.Context, key string) (bool, time.Duration, error) {
+	return a.inner.Allow(ctx, key)
+}
+
+func (a rateLimiterAdapter) Stop() { a.inner.Stop() }
 
 // SetTrustedServiceValidator sets the validator used during external principal
 // token exchange (RFC 8693) to verify the caller is a trusted internal service.
