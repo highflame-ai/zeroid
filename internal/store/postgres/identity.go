@@ -49,6 +49,31 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 	return identity, nil
 }
 
+// GetByIDs returns identities with the given UUIDs, scoped to a tenant.
+// Used for batch node enrichment in graph endpoints (issue #153) so a
+// single query loads every identity referenced by a delegation chain
+// instead of issuing one GetByID per node.
+//
+// Returns the rows that matched; missing IDs are silently dropped (the
+// caller may filter ids belonging to other tenants, or pass IDs that
+// have since been deleted — both are non-errors for graph rendering).
+func (r *IdentityRepository) GetByIDs(ctx context.Context, ids []string, accountID, projectID string) ([]*domain.Identity, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&identities).
+		Where("id IN (?)", bun.List(ids)).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identities by ids: %w", err)
+	}
+	return identities, nil
+}
+
 // GetByExternalID retrieves an identity by external ID within a tenant.
 func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
