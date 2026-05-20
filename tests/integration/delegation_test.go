@@ -784,7 +784,6 @@ func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
 		"B2 is a sibling branch under the same mission as B1; must NOT appear in B1's graph")
 }
 
-
 // TestDelegationGraph_CrossMissionBoundary is the test that drives the
 // SQL change. It pins that the new recursive-step predicate prunes the
 // walker at a mission boundary: a credential linked by parent_jti to a
