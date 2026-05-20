@@ -19,6 +19,14 @@ import (
 // this via ServerConfig.AdminPathPrefix.
 const DefaultAdminPathPrefix = "/api/v1"
 
+// DefaultSigningJWKSName is the default suffix for the workload-attested
+// signing-credential verification JWKS, served at
+// /.well-known/<name>. It is intentionally generic: ZeroID is
+// product-agnostic. Deployers brand it via
+// SigningCredsConfig.WellKnownJWKSName (e.g. a product publishes its
+// receipt-verification keys at /.well-known/<product>-receipt-keys).
+const DefaultSigningJWKSName = "signing-keys"
+
 // Config holds the complete ZeroID service configuration.
 type Config struct {
 	Server      ServerConfig      `koanf:"server"`
@@ -29,6 +37,8 @@ type Config struct {
 	Logging     LoggingConfig     `koanf:"logging"`
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
+
+	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
@@ -82,6 +92,39 @@ type AttestationConfig struct {
 	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
 }
 
+// SigningCredsConfig governs workload-attested ephemeral signing
+// credentials. The two clocks are deliberately decoupled: MaxTTLSeconds
+// bounds how long an attested key may SIGN; AuditRetentionDays bounds how
+// long its public key stays resolvable for VERIFYING historical
+// attestations (>> MaxTTLSeconds). See domain/signing_credential.go.
+type SigningCredsConfig struct {
+	// MaxTTLSeconds caps the operational signing window an attestation
+	// may request (default 1h — keys are ephemeral, rotated often).
+	MaxTTLSeconds int `koanf:"max_ttl_seconds"`
+	// AuditRetentionDays is how long a non-revoked public key remains
+	// verifiable after attestation (default 400 — covers a >1y audit
+	// window so historical receipts verify long after key rotation).
+	AuditRetentionDays int `koanf:"audit_retention_days"`
+	// AllowedPurposes is the deployer-supplied allowlist of purpose
+	// strings a workload may attest a key for. ZeroID is
+	// product-agnostic: it ships EMPTY (no purpose accepted) so a
+	// deployment must explicitly opt in and name its own purposes
+	// (e.g. a product allows "receipt", "authz_audit"). An attest
+	// request whose purpose is not in this list is rejected.
+	AllowedPurposes []string `koanf:"allowed_purposes"`
+	// JWKSPurpose selects which purpose's keys the well-known
+	// verification JWKS publishes. The well-known path is inherently
+	// purpose-specific (it is the verification endpoint for one class
+	// of receipts), so a deployer that publishes more than one purpose
+	// runs more than one ZeroID-fronting alias. Empty ⇒ the JWKS route
+	// is not registered (feature dormant).
+	JWKSPurpose string `koanf:"jwks_purpose"`
+	// WellKnownJWKSName is the /.well-known/<name> suffix the
+	// verification JWKS is served at. Defaults to DefaultSigningJWKSName
+	// ("signing-keys"); deployers brand it (e.g. "<product>-receipt-keys").
+	WellKnownJWKSName string `koanf:"well_known_jwks_name"`
+}
+
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
 	Port                   string `koanf:"port"`
@@ -100,6 +143,14 @@ type ServerConfig struct {
 	//
 	// Set to empty string ("") to register admin routes at the router root.
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
+
+	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
+	// X-Forwarded-Host when reconstructing the effective request URL for
+	// DPoP htu validation (RFC 9449 §4.3). Production deployers behind a
+	// trusted edge proxy (nginx, AWS ALB, GCP LB) flip this on; deployers
+	// that terminate TLS at the service itself leave it false so spoofed
+	// proxy headers cannot move the htu goalposts.
+	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
 // GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"
@@ -143,7 +194,27 @@ type KeysConfig struct {
 
 // TokenConfig holds JWT issuance settings.
 type TokenConfig struct {
-	Issuer     string `koanf:"issuer"`
+	Issuer string `koanf:"issuer"`
+	// BaseURL is the publicly-visible URL clients use to reach this server.
+	// It seeds every URI returned in responses (`registration_endpoint` and
+	// `registration_client_uri` in DCR responses, the JWT `iss` claim's
+	// authority for verification, and the well-known discovery doc).
+	//
+	// MUST be the URL clients actually hit — including any reverse-proxy
+	// rewrites or path prefixes the deployment adds. If a proxy fronts
+	// zeroid at https://auth.example.com/v1 and forwards to a backend on
+	// http://10.0.0.5:8080, set BaseURL = "https://auth.example.com/v1"
+	// (the public form), NOT the backend URL. A wrong value here doesn't
+	// break token signing — JWTs continue to verify against jwks_uri — but
+	// every URI the server PUBLISHES (DCR responses, discovery) becomes
+	// unreachable from outside. Validate() will reject empty values; format
+	// validity is the deployer's responsibility.
+	//
+	// Note: DPoP `htu` validation does NOT depend on BaseURL — it compares
+	// against the request's effective URL (via RequestURLMiddleware) so
+	// reverse-proxied deployments don't need to keep BaseURL and the proxy
+	// in lock-step for token issuance to work. BaseURL is purely about the
+	// shape of URIs the server hands BACK to clients.
 	BaseURL    string `koanf:"base_url"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
@@ -228,6 +299,9 @@ func (c *Config) Validate() error {
 	}
 	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
 		return fmt.Errorf("wimse_domain: %w", err)
+	}
+	if c.Token.BaseURL == "" {
+		return fmt.Errorf("token.base_url is required: every URI the server hands back (DCR registration_client_uri, well-known discovery) derives from it; see TokenConfig.BaseURL")
 	}
 	return nil
 }
@@ -319,6 +393,17 @@ func loadDefaults(k *koanf.Koanf) error {
 		// submit those proof types (or once real verifiers land).
 		"attestation.allow_unsafe_dev_stub": true,
 
+		// Workload-attested signing credentials. Operational signing
+		// window is short (1h, keys are ephemeral + rotated); the public
+		// key stays verifiable for a long audit window (400d) so
+		// historical attestations verify long after rotation.
+		"signing_credentials.max_ttl_seconds":      3600,
+		"signing_credentials.audit_retention_days": 400,
+		// Product-agnostic by default: no purpose accepted and the
+		// generic well-known name. A deployment opts in by configuring
+		// allowed_purposes + jwks_purpose (+ optionally branding the name).
+		"signing_credentials.well_known_jwks_name": DefaultSigningJWKSName,
+
 		// Logging
 		"logging.level": "info",
 	}
@@ -355,6 +440,11 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_RSA_PRIVATE_KEY_PATH": "keys.rsa_private_key_path",
 		"ZEROID_RSA_PUBLIC_KEY_PATH":  "keys.rsa_public_key_path",
 		"ZEROID_RSA_KEY_ID":           "keys.rsa_key_id",
+
+		"ZEROID_SIGNING_CREDS_MAX_TTL_SECONDS":      "signing_credentials.max_ttl_seconds",
+		"ZEROID_SIGNING_CREDS_AUDIT_RETENTION_DAYS": "signing_credentials.audit_retention_days",
+		"ZEROID_SIGNING_CREDS_JWKS_PURPOSE":         "signing_credentials.jwks_purpose",
+		"ZEROID_SIGNING_CREDS_WELL_KNOWN_JWKS_NAME": "signing_credentials.well_known_jwks_name",
 
 		// Token
 		"ZEROID_ISSUER":                "token.issuer",

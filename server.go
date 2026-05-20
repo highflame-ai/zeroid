@@ -151,6 +151,7 @@ func NewServer(cfg Config) (*Server, error) {
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
+	signingCredRepo := postgres.NewSigningCredentialRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
 	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
@@ -181,6 +182,14 @@ func NewServer(cfg Config) (*Server, error) {
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
 	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	signingCredSvc := service.NewSigningCredentialService(
+		signingCredRepo,
+		cfg.SigningCreds.MaxTTLSeconds,
+		cfg.SigningCreds.AuditRetentionDays,
+		cfg.SigningCreds.AllowedPurposes,
+		cfg.SigningCreds.JWKSPurpose,
+		cfg.SigningCreds.WellKnownJWKSName,
+	)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
 	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
@@ -220,11 +229,16 @@ func NewServer(cfg Config) (*Server, error) {
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
+	// DPoP service — validates RFC 9449 proofs and enforces JTI replay protection
+	// via the dpop_jti table. Stateless beyond the DB it reads/writes.
+	dpopSvc := service.NewDPoPService(db)
+
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, jwksSvc, db,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, jwksSvc,
+		signingCredSvc, db,
 		cfg.Token.Issuer, cfg.Token.BaseURL,
 	)
 
@@ -267,6 +281,10 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Public routes — no auth.
 	// /health, /ready, /.well-known/*, /oauth2/token, /oauth2/token/introspect, /oauth2/token/revoke, /oauth2/token/verify
+	// RequestURLMiddleware records the request's effective URL on context.Context
+	// so DPoP htu validation (RFC 9449 §4.3) compares against what the client
+	// actually hit, not against the static config value.
+	r.Use(internalMiddleware.RequestURLMiddleware(cfg.Server.TrustForwardedHeaders))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 

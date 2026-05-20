@@ -18,6 +18,7 @@ import { registerDeactivate } from "./commands/agents/deactivate.js";
 import { registerCredsList } from "./commands/creds/list.js";
 import { registerSignal } from "./commands/signal.js";
 import { registerConfig } from "./commands/config.js";
+import { registerCiba } from "./commands/ciba/index.js";
 
 const program = new Command();
 
@@ -29,6 +30,7 @@ program
 registerInit(program);
 registerSignal(program);
 registerConfig(program);
+registerCiba(program);
 
 const tokenCmd = program.command("token").description("Token operations");
 registerIssue(tokenCmd);

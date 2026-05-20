@@ -106,6 +106,11 @@ type IssueRequest struct {
 	// mission). Non-empty on token_exchange — the caller has resolved the
 	// subject_token's mission and is propagating it down the chain.
 	MissionID string
+	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
+	// the client's DPoP public key. When non-empty, the issued JWT carries a
+	// cnf.jkt claim binding the token to that key, and token_type is returned
+	// as "DPoP" instead of "Bearer" (RFC 9449 §6.1).
+	DPoPKeyThumbprint string
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -398,6 +403,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
 	}
 
+	// DPoP binding: embed cnf.jkt so resource servers can match the proof key (RFC 9449 §6.1).
+	if req.DPoPKeyThumbprint != "" {
+		_ = token.Set("cnf", map[string]string{"jkt": req.DPoPKeyThumbprint})
+	}
+
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
 	// kid lets verifiers pick the right key from the JWKS; typ=JWT is per
 	// JWT-SVID §3 (jwx doesn't default it).
@@ -435,6 +445,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		ParentJTI:           req.ParentJTI,
 		DelegatedByWIMSEURI: req.DelegatedBy,
 		MissionID:           missionID,
+		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
@@ -448,9 +459,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Int("ttl_seconds", ttl).
 		Msg("Credential issued")
 
+	tokenType := "Bearer"
+	if req.DPoPKeyThumbprint != "" {
+		tokenType = "DPoP"
+	}
 	accessToken := &domain.AccessToken{
 		AccessToken: string(signed),
-		TokenType:   "Bearer",
+		TokenType:   tokenType,
 		ExpiresIn:   ttl,
 		Scope:       strings.Join(req.Scopes, " "),
 		JTI:         jti,
