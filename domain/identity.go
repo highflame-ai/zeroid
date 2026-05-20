@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -481,6 +483,89 @@ func ValidateSPIFFEPathSegment(field, value string) error {
 		case r == '.' || r == '-' || r == '_':
 		default:
 			return fmt.Errorf("%s contains character %q not allowed in a SPIFFE path segment (allowed: a-z A-Z 0-9 . - _)", field, r)
+		}
+	}
+	return nil
+}
+
+// ErrInvalidWIMSEURI is returned by ValidateWIMSEURI when the caller-supplied
+// URI cannot be a SPIFFE ID. Callers branch on this with errors.Is to map to
+// a 400 at the HTTP boundary.
+var ErrInvalidWIMSEURI = errors.New("invalid wimse uri")
+
+// ValidateWIMSEURI checks the shape of a caller-supplied WIMSE/SPIFFE URI
+// without binding it to a specific trust domain. Used by lookup endpoints
+// (e.g. GET /identities/by-wimse) that need to reject obviously malformed
+// input before hitting the store, but cannot reject by trust-domain because
+// the caller's tenant determines which trust domain is in play.
+//
+// Rules (SPIFFE §2):
+//   - scheme is "spiffe"
+//   - non-empty host (the trust domain)
+//   - host must not include a port
+//   - non-empty workload path (a bare trust-domain URI is the trust-domain ID,
+//     not a workload ID — reject)
+//   - path must not have a trailing slash or empty segments
+//   - path segments must conform to SPIFFE §2.3 character set (delegated to
+//     ValidateSPIFFEPathSegment so the read-side validator agrees with
+//     BuildWIMSEURI on what's a legal segment)
+//   - no query (including a trailing "?" with empty value), no fragment, no
+//     user-info
+//   - total length within MaxSPIFFEIDBytes
+//
+// Returns a wrapped ErrInvalidWIMSEURI on failure.
+func ValidateWIMSEURI(uri string) error {
+	if uri == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidWIMSEURI)
+	}
+	if len(uri) > MaxSPIFFEIDBytes {
+		return fmt.Errorf("%w: exceeds %d bytes", ErrInvalidWIMSEURI, MaxSPIFFEIDBytes)
+	}
+	// Reject obvious scheme mismatches before url.Parse so the error reason
+	// is more useful than "missing scheme".
+	if !strings.HasPrefix(uri, "spiffe://") {
+		return fmt.Errorf("%w: scheme must be spiffe://", ErrInvalidWIMSEURI)
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidWIMSEURI, err)
+	}
+	if u.Scheme != "spiffe" {
+		return fmt.Errorf("%w: scheme must be spiffe (got %q)", ErrInvalidWIMSEURI, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%w: missing trust domain (host)", ErrInvalidWIMSEURI)
+	}
+	// SPIFFE §2.2: the trust domain is a DNS name without a port.
+	// url.Host carries the host[:port] form; reject any colon to forbid ports.
+	if strings.Contains(u.Host, ":") {
+		return fmt.Errorf("%w: trust domain must not contain a port", ErrInvalidWIMSEURI)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%w: user-info not allowed", ErrInvalidWIMSEURI)
+	}
+	// ForceQuery catches a trailing "?" even when RawQuery is empty.
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("%w: query/fragment not allowed", ErrInvalidWIMSEURI)
+	}
+	// SPIFFE IDs always have a workload path. A bare trust-domain URI like
+	// "spiffe://example.org" is a trust domain identifier, not a workload ID.
+	if u.Path == "" || u.Path == "/" {
+		return fmt.Errorf("%w: missing workload path", ErrInvalidWIMSEURI)
+	}
+	if strings.HasSuffix(u.Path, "/") {
+		return fmt.Errorf("%w: path must not end with a slash", ErrInvalidWIMSEURI)
+	}
+	if strings.Contains(u.Path, "//") {
+		return fmt.Errorf("%w: path must not contain empty segments", ErrInvalidWIMSEURI)
+	}
+	// Validate each path segment against the same character set BuildWIMSEURI
+	// enforces. The read-side validator must agree with the write-side
+	// constructor on what's legal — otherwise a stored URI could fail
+	// validation on lookup.
+	for _, seg := range strings.Split(strings.TrimPrefix(u.Path, "/"), "/") {
+		if err := ValidateSPIFFEPathSegment("path segment", seg); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidWIMSEURI, err)
 		}
 	}
 	return nil

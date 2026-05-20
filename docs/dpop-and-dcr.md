@@ -157,6 +157,19 @@ OAuth clients are normally provisioned by an admin via a console. That works whe
 
 RFC 7591 defines a standard registration endpoint; RFC 7592 defines the per-client management endpoints that follow it.
 
+### Choosing between agent identity registration and OAuth DCR
+
+ZeroID has two registration paths; the right one depends on what you're registering.
+
+| Use case | Endpoint | Auth shape |
+|---|---|---|
+| **Agent identity** participating in delegation chains (`token_exchange`, multi-hop `jwt-bearer`) | `POST /api/v1/agents/register` with `public_key_pem` | Keypair owned by the agent; public PEM uploaded to the broker at registration. Self-signed JWT assertions verify against the stored key. |
+| **Confidential OAuth client** — vendor MCP server, installer bootstrap, single-hop tool — that does not participate in delegation chains | `POST /oauth2/register` (this doc) with `client_secret_basic` / `client_secret_post`, optionally inline `jwks` for jwt-bearer assertions | Client secret minted at registration; assertion-signing keys (if used) held at the broker. |
+
+The split is deliberate. DCR-registered clients are **explicitly blocked from `token_exchange`** (enforced at the grant-type allow-list — see "What ZeroID enforces" below) because they have no `IdentityID` binding and cannot legitimately act as a delegation actor. Agents that need to participate in chains must register through the agent identity path. See the [agent registration walkthrough in the README](../README.md#1-register-an-agent) for that side of the API.
+
+**Both paths hold public keys at the broker, not behind the agent.** `public_key_pem` (agent path) and inline `jwks` (DCR path) are the recommended shapes. `jwks_uri` (broker fetches keys from a URL the client publishes) is accepted for RFC 7591 spec compliance, but it requires every registered client to operate an internet-reachable HTTPS endpoint solely for key publication — and is not the recommended pattern for self-hosted ZeroID deployments. Broker-held keys remove an entire class of operational concerns (tunneling, NAT, certificate provisioning for client hosts) and limit internet-exposed surface area to ZeroID itself.
+
 ### Wire shape
 
 #### 1. Mint an initial access token (one-time, per registrant)
@@ -223,6 +236,63 @@ curl -X DELETE https://auth.example/oauth2/register/9f43b1c2 \
 ```
 
 GET and PUT responses re-include the public client metadata but **never** re-reveal `client_secret` or `registration_access_token`.
+
+#### 4. Register a client that signs JWT assertions (jwt-bearer grant, inline `jwks`)
+
+For clients that will use the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant — typically a service-account-style integration whose downstream calls are authorized by a signed JWT assertion — register an inline JWKS at registration time so the broker can verify those assertions:
+
+```bash
+# 1. Generate a P-256 keypair locally (one-time per client).
+openssl ecparam -name prime256v1 -genkey -noout -out client-private.pem
+openssl ec -in client-private.pem -pubout -out client-public.pem
+
+# 2. Convert client-public.pem into JWK form (kty/crv/x/y). Any small helper
+#    works — Python's `cryptography` + `python-jose`, Go's `lestrrat-go/jwx`,
+#    or the `mkjwk` CLI. The shape below assumes you've already produced it.
+
+# 3. Register, embedding the JWK inline.
+curl -s -X POST https://auth.example/oauth2/register \
+  -H "Authorization: Bearer $IAT" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "client_name": "Acme Notebook MCP",
+        "grant_types": [
+          "urn:ietf:params:oauth:grant-type:jwt-bearer",
+          "client_credentials"
+        ],
+        "scope": "notebook:read notebook:write",
+        "token_endpoint_auth_method": "client_secret_basic",
+        "jwks": {
+          "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": "client-key-1",
+            "x":   "<base64url of public x coordinate>",
+            "y":   "<base64url of public y coordinate>"
+          }]
+        },
+        "software_id":      "com.acme.notebook",
+        "software_version": "2.4.0"
+      }'
+```
+
+When this client later presents a jwt-bearer grant:
+
+```bash
+curl -s -X POST https://auth.example/oauth2/token \
+  -u "<client_id>:<client_secret>" \
+  -d 'grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer' \
+  -d 'assertion=<JWT signed by client-key-1>' \
+  -d 'scope=notebook:read'
+```
+
+…the client authenticates **to the token endpoint** with HTTP Basic (its `client_secret`), and the `assertion` JWT is verified against the JWKS uploaded at registration. The two checks are independent: `token_endpoint_auth_method` governs how the client identifies itself to the endpoint; the `jwks` governs how its assertion signature is verified.
+
+**Why inline `jwks` rather than `jwks_uri`**: RFC 7591 §2 accepts both. Inline `jwks` uploads the keys to the broker once at registration time, the broker stores them, and verification is local. `jwks_uri` requires the broker to fetch keys from a URL the client publishes, which means the client must run an internet-reachable HTTPS endpoint solely for key publication — workable when client and broker live in different security domains, but unnecessary friction for self-hosted ZeroID deployments. For key rotation, use an RFC 7592 `PUT` to swap the inline JWKS (single round-trip, no DNS or TLS dependency).
+
+> **`private_key_jwt` is not currently accepted** as `token_endpoint_auth_method` for DCR-registered clients (see "What ZeroID enforces" below). DCR clients authenticate to the token endpoint with their client secret; the jwt-bearer **grant** is the path where signed assertions and JWKS come into play.
 
 ### What ZeroID enforces
 

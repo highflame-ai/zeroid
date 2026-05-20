@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -24,6 +25,12 @@ var ErrIdentityAlreadyExists = errors.New("identity already exists")
 // ErrInvalidIdentityField marks caller-fixable input errors on registration
 // (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
+
+// ErrIdentityNotFound is returned by lookup methods when no identity matches
+// the supplied selector within the caller's tenant. Wraps sql.ErrNoRows from
+// the store layer so handlers can errors.Is and map to 404 without coupling
+// to the database driver.
+var ErrIdentityNotFound = errors.New("identity not found")
 
 // IdentityService handles identity lifecycle operations.
 type IdentityService struct {
@@ -252,6 +259,26 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 // GetIdentityByExternalID retrieves an identity by its external_id within a tenant.
 func (s *IdentityService) GetIdentityByExternalID(ctx context.Context, externalID, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByExternalID(ctx, externalID, accountID, projectID)
+}
+
+// GetIdentityByWIMSEURI resolves an identity by its WIMSE/SPIFFE URI within a
+// tenant. Used by the /identities/by-wimse lookup endpoint that downstream
+// gateways (firehog) hit to confirm a JWT's sub claim still resolves to an
+// active identity row before forwarding the request.
+//
+// Tenant isolation is enforced at the store layer: the same URI in a
+// different tenant returns ErrIdentityNotFound, not the other tenant's row.
+// A sql.ErrNoRows from the store is normalised to ErrIdentityNotFound so the
+// handler stays decoupled from the database driver.
+func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, accountID, projectID string) (*domain.Identity, error) {
+	identity, err := s.repo.GetByWIMSEURI(ctx, wimseURI, accountID, projectID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrIdentityNotFound
+		}
+		return nil, err
+	}
+	return identity, nil
 }
 
 // ListIdentities returns identities for a tenant, optionally filtered by identity_type(s) and label.
