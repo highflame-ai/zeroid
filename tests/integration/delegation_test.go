@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -745,4 +746,128 @@ func TestDelegationChains_InvalidParams_Rejected(t *testing.T) {
 		assert.Less(t, resp.StatusCode, 500,
 			"param %s must NOT 500", bad)
 	}
+}
+
+// TestDelegationGraph_BranchedMissionIsolation pins the lineage-segmentation
+// invariant that motivated rsharath's review: within a single mission, two
+// sibling branches must not bleed into each other's graph. Sibling branches
+// share mission_id but live in different parent_jti lineages, so a walker
+// that joined purely on mission_id (instead of parent_jti) would silently
+// mix them.
+//
+// This test passes against both the pre-change and post-change SQL — it's a
+// regression guard. The new mission_id predicate in WalkUp / WalkDown is an
+// AND (not an OR) against the existing parent_jti join, so sibling rows in
+// the same mission are still excluded by the parent_jti edge.
+//
+// Shape:
+//
+//	orch (root, mission M)
+//	  ├── B1  (parent_jti = orch.jti, mission M)
+//	  └── B2  (parent_jti = orch.jti, mission M)  ← must NOT show up in B1's graph
+func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
+	policyID := delegationPolicy(t, uid("branched-policy"), []string{"data:read"})
+
+	_, _, orchTok := issueRootCredential(t, policyID, "branched-orch", []string{"data:read"})
+	b1ID, _, _ := exchangeToken(t, policyID, "branched-b1",
+		[]string{"data:read"}, []string{"data:read"}, orchTok)
+	b2ID, _, _ := exchangeToken(t, policyID, "branched-b2",
+		[]string{"data:read"}, []string{"data:read"}, orchTok)
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+b1ID+"&depth=2"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, b1ID, "B1 (focal) must be in its own graph")
+	assert.NotContains(t, ids, b2ID,
+		"B2 is a sibling branch under the same mission as B1; must NOT appear in B1's graph")
+}
+
+// TestDelegationGraph_LegacyNullMissionID pins the legacy-row fallback:
+// credentials with mission_id = NULL (issued before migration 022) must
+// still walk correctly. This is the reason the new recursive predicate
+// uses `IS NOT DISTINCT FROM` instead of `=` — `NULL = NULL` is falsy in
+// SQL and would silently terminate the recursion on the first step for
+// any pre-migration anchor.
+//
+// Setup: build a normal A → B chain via OAuth, then UPDATE both rows to
+// NULL mission_id to simulate the pre-migration state. Walk from B and
+// confirm A is still reachable. Passes against both pre-change code
+// (no mission filter at all) and post-change code (NULL IS NOT DISTINCT
+// FROM NULL is TRUE, recursion proceeds).
+func TestDelegationGraph_LegacyNullMissionID(t *testing.T) {
+	policyID := delegationPolicy(t, uid("legacy-null-policy"), []string{"data:read"})
+
+	orchID, orchJTI, orchTok := issueRootCredential(t, policyID, "legacy-null-orch",
+		[]string{"data:read"})
+	bID, bJTI, _ := exchangeToken(t, policyID, "legacy-null-b",
+		[]string{"data:read"}, []string{"data:read"}, orchTok)
+
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = NULL").
+		Where("jti IN (?, ?)", orchJTI, bJTI).
+		Exec(ctx)
+	require.NoError(t, err, "simulate pre-migration NULL mission_id")
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+bID+"&depth=2"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, bID, "B (focal) must appear in its own graph")
+	assert.Contains(t, ids, orchID,
+		"legacy NULL-mission anchor must still walk to its parent via parent_jti — IS NOT DISTINCT FROM lets NULL chains through")
+}
+
+// TestDelegationGraph_CrossMissionBoundary is the test that drives the
+// SQL change. It pins that the new recursive-step predicate prunes the
+// walker at a mission boundary: a credential linked by parent_jti to a
+// credential in a different mission must not be reached.
+//
+// This shouldn't happen in practice — mission_id is propagated on every
+// token_exchange — but the test simulates the scenario by UPDATEing one
+// row's mission_id to a different value. It is the primary correctness
+// claim of the new predicate.
+//
+// Expected:
+//   - Pre-change (no mission filter on recursive step): FAILS — A is
+//     reachable from B via parent_jti and gets included in the graph.
+//   - Post-change (IS NOT DISTINCT FROM): PASSES — the recursive step
+//     prunes A because A.mission_id != B.mission_id.
+//
+// If this test passes against the pre-change code, the test isn't
+// actually exercising the predicate — fix it before touching SQL.
+func TestDelegationGraph_CrossMissionBoundary(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-mission-policy"), []string{"data:read"})
+
+	orchID, orchJTI, orchTok := issueRootCredential(t, policyID, "cross-orch",
+		[]string{"data:read"})
+	bID, _, _ := exchangeToken(t, policyID, "cross-b",
+		[]string{"data:read"}, []string{"data:read"}, orchTok)
+
+	// Rewrite the orchestrator's mission_id so it no longer matches B's.
+	// B's mission_id was propagated from the orch token at exchange time;
+	// flipping orch's value after the fact creates the synthetic
+	// cross-mission boundary the predicate must catch. Using a literal
+	// distinct value (not NULL) ensures the IS NOT DISTINCT FROM check
+	// evaluates to FALSE on the recursive step.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "synthetic-other-mission-"+uid("")).
+		Where("jti = ?", orchJTI).
+		Exec(ctx)
+	require.NoError(t, err, "simulate cross-mission parent_jti link")
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+bID+"&depth=2"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, bID, "B (focal) must always appear in its own graph")
+	assert.NotContains(t, ids, orchID,
+		"orch lives in a different mission than B; the recursive predicate must prune it")
 }
