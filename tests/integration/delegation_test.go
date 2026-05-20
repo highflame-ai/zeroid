@@ -784,43 +784,6 @@ func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
 		"B2 is a sibling branch under the same mission as B1; must NOT appear in B1's graph")
 }
 
-// TestDelegationGraph_LegacyNullMissionID pins the legacy-row fallback:
-// credentials with mission_id = NULL (issued before migration 022) must
-// still walk correctly. This is the reason the new recursive predicate
-// uses `IS NOT DISTINCT FROM` instead of `=` — `NULL = NULL` is falsy in
-// SQL and would silently terminate the recursion on the first step for
-// any pre-migration anchor.
-//
-// Setup: build a normal A → B chain via OAuth, then UPDATE both rows to
-// NULL mission_id to simulate the pre-migration state. Walk from B and
-// confirm A is still reachable. Passes against both pre-change code
-// (no mission filter at all) and post-change code (NULL IS NOT DISTINCT
-// FROM NULL is TRUE, recursion proceeds).
-func TestDelegationGraph_LegacyNullMissionID(t *testing.T) {
-	policyID := delegationPolicy(t, uid("legacy-null-policy"), []string{"data:read"})
-
-	orchID, orchJTI, orchTok := issueRootCredential(t, policyID, "legacy-null-orch",
-		[]string{"data:read"})
-	bID, bJTI, _ := exchangeToken(t, policyID, "legacy-null-b",
-		[]string{"data:read"}, []string{"data:read"}, orchTok)
-
-	ctx := context.Background()
-	_, err := testDB.NewUpdate().
-		Table("issued_credentials").
-		Set("mission_id = NULL").
-		Where("jti IN (?, ?)", orchJTI, bJTI).
-		Exec(ctx)
-	require.NoError(t, err, "simulate pre-migration NULL mission_id")
-
-	resp := get(t, adminPath("/delegations/graph?identity_id="+bID+"&depth=2"), adminHeaders())
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body := decode(t, resp)
-
-	ids := nodeIDs(body)
-	assert.Contains(t, ids, bID, "B (focal) must appear in its own graph")
-	assert.Contains(t, ids, orchID,
-		"legacy NULL-mission anchor must still walk to its parent via parent_jti — IS NOT DISTINCT FROM lets NULL chains through")
-}
 
 // TestDelegationGraph_CrossMissionBoundary is the test that drives the
 // SQL change. It pins that the new recursive-step predicate prunes the

@@ -68,16 +68,13 @@ type ChainSummary struct {
 // would not be reachable because the recursive step filters on
 // `ic.account_id` / `ic.project_id`.
 //
-// The recursive step also constrains `(chain.mission_id IS NULL OR
-// ic.mission_id = chain.mission_id)` so the planner prunes to a single
-// mission's rows via idx_issued_credentials_mission_id instead of scanning
-// the tenant slice on every iteration. parent_jti still drives lineage
-// segmentation — branched missions (sibling token_exchanges off the same
-// parent) share mission_id but live in different parent_jti chains, and the
-// join on `ic.jti = chain.parent_jti` keeps them apart. The IS NULL branch
-// short-circuits for legacy pre-022 rows with NULL mission_id so the walk
-// proceeds unfiltered; the `=` branch on the non-NULL path is more
-// index-friendly than IS NOT DISTINCT FROM.
+// The recursive step also constrains `ic.mission_id = chain.mission_id` so
+// the planner prunes to a single mission's rows via
+// idx_issued_credentials_mission_id instead of scanning the tenant slice on
+// every iteration. parent_jti still drives lineage segmentation — branched
+// missions (sibling token_exchanges off the same parent) share mission_id
+// but live in different parent_jti chains, and the join on
+// `ic.jti = chain.parent_jti` keeps them apart.
 func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
@@ -98,7 +95,7 @@ func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, 
 			JOIN chain ON ic.jti = chain.parent_jti
 			WHERE ic.account_id = ?
 			  AND ic.project_id = ?
-			  AND (chain.mission_id IS NULL OR ic.mission_id = chain.mission_id)
+			  AND ic.mission_id = chain.mission_id
 			  AND chain.depth < ?
 		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
 		SELECT ic.*
@@ -120,8 +117,8 @@ func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, 
 // The recursive step joins `ic.parent_jti = chain.jti` to find the
 // children of each row in the chain. Same CYCLE + depth-cap safety as
 // WalkUp. Same tenant scoping on every join. The
-// `(chain.mission_id IS NULL OR ic.mission_id = chain.mission_id)` predicate
-// plays the same role here as in WalkUp — see that function for the rationale.
+// `ic.mission_id = chain.mission_id` predicate plays the same role here as
+// in WalkUp — see that function for the rationale.
 func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
@@ -141,7 +138,7 @@ func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID
 			JOIN chain ON ic.parent_jti = chain.jti
 			WHERE ic.account_id = ?
 			  AND ic.project_id = ?
-			  AND (chain.mission_id IS NULL OR ic.mission_id = chain.mission_id)
+			  AND ic.mission_id = chain.mission_id
 			  AND chain.depth < ?
 		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
 		SELECT ic.*
