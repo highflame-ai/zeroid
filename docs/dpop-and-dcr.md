@@ -356,7 +356,7 @@ A standards-conformant client walks two documents to find the registration endpo
    - `registration_endpoint` — set to `{baseURL}/oauth2/register` when DCR is wired (it always is in this build; the endpoint exists but every request 401s if the deployer doesn't mint `client:register`-scoped tokens).
    - `dpop_signing_alg_values_supported: ["ES256", "RS256"]`.
 
-The two-hop chain is what every standards-track agent-auth draft (ID-JAG, identity-chaining, WIMSE) assumes; conforming to RFC 9728 here is what lets those clients work without ZeroID-specific shimming.
+The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. Publishing both documents lets stock OAuth clients work without ZeroID-specific shimming.
 
 ### Limitations / future work
 

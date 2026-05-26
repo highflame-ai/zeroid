@@ -4,10 +4,10 @@
 //
 // Happy-path coverage of /.well-known/oauth-protected-resource is folded into
 // the §2 required-fields tests below — the document is small enough that the
-// compliance suite doubles as smoke coverage. RFC 9728 is the discovery
-// substrate every standards-track agent-auth draft (ID-JAG, identity-chaining,
-// WIMSE workload identity) assumes: a 401 from the resource server points
-// clients here, this document points them at the authorization server.
+// compliance suite doubles as smoke coverage. RFC 9728 is the first hop of
+// the OAuth discovery chain: a 401 from the resource server with
+// WWW-Authenticate: Bearer resource_metadata="…" points clients here, and
+// this document then points them at the authorization server metadata.
 
 package integration_test
 

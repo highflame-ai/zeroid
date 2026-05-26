@@ -936,7 +936,7 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
 | OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
-| OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — discovery substrate for agent-auth flows (ID-JAG, identity-chaining); points clients at AS metadata |
+| OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |
