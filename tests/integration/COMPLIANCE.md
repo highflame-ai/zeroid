@@ -40,6 +40,7 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 7662 (Introspection) | `introspection_compliance_test.go` | Covered |
 | RFC 8414 (AS Metadata) | `discovery_compliance_test.go` | Covered |
 | RFC 8693 (Token Exchange) | `token_exchange_compliance_test.go` | Covered |
+| RFC 9396 (Rich Authorization Requests) | `rar_compliance_test.go` | Partial — bc-authorize side only; token-side (§5/§6/§7) ships in the follow-up token-embed PR |
 | RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
 | OpenID CIBA Core 1.0 | `ciba_compliance_test.go` | Covered |
 | SPIFFE ID + JWT-SVID | `spiffe_compliance_test.go` | Covered |
