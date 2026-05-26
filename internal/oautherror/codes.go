@@ -26,6 +26,15 @@
 //     https://www.rfc-editor.org/rfc/rfc9396#section-5.4
 //   - RFC 9449 §5 (DPoP errors):
 //     https://www.rfc-editor.org/rfc/rfc9449#section-5
+//
+// Scope: this package covers ONLY OAuth-spec-defined error codes. Highflame-
+// or product-specific codes that aren't defined by an RFC (e.g.
+// "policy_violation" in extractOAuthError) stay as bare string literals at
+// their emission sites — they have no canonical RFC source for this package
+// to anchor on, and adding them here would dilute the "every constant maps
+// to a clause in a published RFC" invariant. Future RFC-defined codes go
+// here; future Highflame-internal codes either stay literal or move to a
+// separate Highflame-namespaced constants package.
 package oautherror
 
 // ── RFC 6749 §5.2 — token-endpoint error codes ──────────────────────────────
