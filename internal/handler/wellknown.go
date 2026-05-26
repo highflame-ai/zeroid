@@ -161,7 +161,9 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 // §2 field semantics:
 //   - resource (REQUIRED): the canonical URL of the protected resource. ZeroID
 //     is both the resource server and the authorization server in the
-//     single-deployment topology, so resource == baseURL.
+//     single-deployment topology, so resource == issuer (this PR collapses
+//     the old BaseURL knob into Issuer per RFC 8414 §3 — the issuer URL is
+//     the single discovery anchor and endpoint prefix).
 //   - authorization_servers: AS issuers a client SHOULD use; clients fetch
 //     /.well-known/oauth-authorization-server from one of these.
 //   - jwks_uri: the resource's own keyset for verifying signed responses.
@@ -177,10 +179,10 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 // field gets added in the same PR — not before.
 func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*ProtectedResourceMetadataOutput, error) {
 	return &ProtectedResourceMetadataOutput{Body: map[string]any{
-		"resource":                 a.baseURL,
+		"resource":                 a.issuer,
 		"resource_name":            "ZeroID",
 		"authorization_servers":    []string{a.issuer},
-		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
+		"jwks_uri":                 a.issuer + "/.well-known/jwks.json",
 		"bearer_methods_supported": []string{"header"},
 		// RFC 9449 §5.3 — PRM-defined DPoP field. ZeroID will mint
 		// DPoP-bound tokens when a client presents a DPoP proof at
