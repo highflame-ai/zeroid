@@ -620,7 +620,12 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	if req.ApplicationID != "" {
 		resolved, err := s.identitySvc.GetIdentity(ctx, req.ApplicationID, req.AccountID, req.ProjectID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
+			// Previously wrapped via plain fmt.Errorf which extractOAuthError
+			// doesn't match against *OAuthError — the token endpoint emitted
+			// server_error (500) instead of the intended invalid_request (400).
+			// Use oauthBadRequestCause so the OAuth wire shape is correct AND
+			// the wrapped err remains accessible via errors.Unwrap for logs.
+			return nil, oauthBadRequestCause("invalid_request", fmt.Sprintf("application_id %s not found or access denied", req.ApplicationID), err)
 		}
 		if !resolved.Status.IsUsable() {
 			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
