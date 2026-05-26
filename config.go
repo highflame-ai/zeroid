@@ -5,6 +5,7 @@ package zeroid
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -296,11 +297,40 @@ func (c *Config) Validate() error {
 	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
 		return fmt.Errorf("wimse_domain: %w", err)
 	}
-	if c.Token.Issuer == "" {
+	if err := validateIssuer(c.Token.Issuer); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateIssuer enforces RFC 8414 §2's shape constraints on Token.Issuer.
+// The issuer URL is load-bearing — it is the JWT iss claim, the RFC 8414 §3
+// discovery anchor, and the URL prefix for every endpoint advertised in AS
+// metadata, PRM, and RFC 7592 registration_client_uri. A malformed issuer
+// causes silent client failures everywhere, so we reject anything that won't
+// parse as a clean absolute URL up front.
+func validateIssuer(s string) error {
+	if s == "" {
 		return fmt.Errorf("token.issuer is required: it is the JWT iss claim, the RFC 8414 §3 discovery anchor, and the URL prefix for every endpoint the server advertises; see TokenConfig.Issuer")
 	}
-	if strings.HasSuffix(c.Token.Issuer, "/") {
-		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", c.Token.Issuer)
+	if strings.HasSuffix(s, "/") {
+		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", s)
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("token.issuer must be a valid URL (got %q): %w", s, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("token.issuer must use http or https scheme (got %q in %q)", u.Scheme, s)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("token.issuer must have a host (got %q)", s)
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("token.issuer must not contain query parameters (got %q): RFC 8414 §2 requires the issuer URL to have no query component", s)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("token.issuer must not contain a fragment (got %q): RFC 8414 §2 requires the issuer URL to have no fragment component", s)
 	}
 	return nil
 }

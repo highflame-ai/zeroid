@@ -117,8 +117,10 @@ beforeAll(async () => {
       ZEROID_PUBLIC_KEY_PATH: join(keysDir, "public.pem"),
       ZEROID_RSA_PRIVATE_KEY_PATH: join(keysDir, "rsa_private.pem"),
       ZEROID_RSA_PUBLIC_KEY_PATH: join(keysDir, "rsa_public.pem"),
-      ZEROID_ISSUER: "https://zeroid.test",
-      ZEROID_BASE_URL: baseUrl,
+      // ZEROID_ISSUER now serves three roles per RFC 8414 §3: JWT iss claim,
+      // discovery anchor, AND URL prefix for advertised endpoints. Point it
+      // at the test server's actual URL so all three roles work coherently.
+      ZEROID_ISSUER: baseUrl,
       ZEROID_TOKEN_TTL_SECONDS: "3600",
       ZEROID_WIMSE_DOMAIN: "zeroid.test",
       ZEROID_LOG_LEVEL: "warn",
