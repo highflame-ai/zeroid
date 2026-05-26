@@ -421,3 +421,156 @@ func TestCIBA_RAR_FormEncodedMalformed(t *testing.T) {
 	require.Equal(t, "invalid_authorization_details", parsed["error"],
 		"malformed form-encoded RAR must map to RFC 9396 §5.4 error code")
 }
+
+// TestCIBA_RAR_TokenSideEndToEnd exercises the full RFC 9396 token-side flow:
+// bc-authorize with authorization_details → admin approves → client polls
+// the token endpoint → the issued access token carries authorization_details
+// (a) on the token response body (§5.2), (b) as a JWT claim (§6.1), and
+// (c) on the introspection result (§7). All three surfaces MUST agree on
+// the same JSON payload that the bc-authorize call originally supplied.
+//
+// This is the load-bearing end-to-end test for AuthN's downstream consumers:
+// Shield reads authorization_details from the JWT claim; any human-facing UI
+// reads it from introspection. If the three surfaces drift, downstream
+// receipt-chain commitment breaks silently.
+func TestCIBA_RAR_TokenSideEndToEnd(t *testing.T) {
+	clientID := uid("ciba-rar-token-side")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+
+	const (
+		approvedUserID    = "user-bob-001"
+		approvedUserEmail = "bob@example.com"
+	)
+
+	// ── Step 1: bc-authorize with authorization_details ─────────────────────
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id":  clientID,
+		"account_id": testAccountID,
+		"project_id": testProjectID,
+		"login_hint": "bob@example.com",
+		"scope":      "openid",
+		"authorization_details": []map[string]any{
+			{
+				"type":   "highflame_tool_call",
+				"tool":   "transfer_funds",
+				"amount": 50000,
+			},
+		},
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
+	require.NotEmpty(t, authReqID)
+
+	// ── Step 2: admin approves ──────────────────────────────────────────────
+	approveResp := post(t,
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		map[string]any{
+			"subject_id":    approvedUserID,
+			"subject_email": approvedUserEmail,
+		},
+		adminHeaders(),
+	)
+	require.Equal(t, http.StatusOK, approveResp.StatusCode)
+
+	// ── Step 3: poll → access token issued ──────────────────────────────────
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":  "urn:openid:params:grant-type:ciba",
+		"auth_req_id": authReqID,
+		"client_id":   clientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+	tokenBody := decode(t, tokenResp)
+
+	// (a) Token response body carries authorization_details (RFC 9396 §5.2).
+	ad, ok := tokenBody["authorization_details"].([]any)
+	require.True(t, ok, "token response body must carry authorization_details as a JSON array; got %T (%v)", tokenBody["authorization_details"], tokenBody)
+	require.Len(t, ad, 1)
+
+	first, _ := ad[0].(map[string]any)
+	require.NotNil(t, first)
+	require.Equal(t, "highflame_tool_call", first["type"])
+	require.Equal(t, "transfer_funds", first["tool"])
+
+	// (b) Access-token JWT carries authorization_details as a claim (§6.1).
+	accessToken, _ := tokenBody["access_token"].(string)
+	require.NotEmpty(t, accessToken)
+
+	claims := decodeJWTPayload(t, accessToken)
+	jwtAD, ok := claims["authorization_details"].([]any)
+	require.True(t, ok, "access-token JWT must carry authorization_details claim; got %T", claims["authorization_details"])
+	require.Len(t, jwtAD, 1)
+
+	jwtFirst, _ := jwtAD[0].(map[string]any)
+	require.Equal(t, "highflame_tool_call", jwtFirst["type"])
+	require.Equal(t, "transfer_funds", jwtFirst["tool"])
+
+	// (c) Introspection surfaces authorization_details (§7).
+	introspectBody := introspect(t, accessToken)
+	require.Equal(t, true, introspectBody["active"])
+	introAD, ok := introspectBody["authorization_details"].([]any)
+	require.True(t, ok, "introspection must surface authorization_details; got %T", introspectBody["authorization_details"])
+	require.Len(t, introAD, 1)
+
+	introFirst, _ := introAD[0].(map[string]any)
+	require.Equal(t, "highflame_tool_call", introFirst["type"])
+	require.Equal(t, "transfer_funds", introFirst["tool"])
+}
+
+// TestCIBA_RAR_LegacyFlowCarriesEmptyArray pins the legacy-CIBA token-side
+// shape: a client that did not supply authorization_details on bc-authorize
+// still gets the authorization_details field on the token response, in the
+// JWT, and in introspection — populated with the canonical empty array `[]`.
+//
+// Earlier drafts of this PR special-cased the empty array to "omit the
+// field everywhere", but per #168 review (Sharath) that was redundant
+// complexity: an empty array IS the "no RAR grant" signal, and consumers
+// can branch on `len > 0` either way. Dropping the omit-when-empty filter
+// removed a re-parse on every CIBA token issuance and ~30 LOC of
+// special-case code.
+func TestCIBA_RAR_LegacyFlowCarriesEmptyArray(t *testing.T) {
+	clientID := uid("ciba-rar-legacy-token")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+
+	const approvedUserID = "user-legacy-001"
+
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id":  clientID,
+		"account_id": testAccountID,
+		"project_id": testProjectID,
+		"login_hint": "legacy@example.com",
+		"scope":      "openid",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
+
+	approveResp := post(t,
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		map[string]any{"subject_id": approvedUserID},
+		adminHeaders(),
+	)
+	require.Equal(t, http.StatusOK, approveResp.StatusCode)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":  "urn:openid:params:grant-type:ciba",
+		"auth_req_id": authReqID,
+		"client_id":   clientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+	tokenBody := decode(t, tokenResp)
+
+	bodyAD, ok := tokenBody["authorization_details"].([]any)
+	require.True(t, ok,
+		"legacy CIBA token response carries authorization_details as a JSON array (empty); got %T", tokenBody["authorization_details"])
+	require.Empty(t, bodyAD, "legacy flow MUST surface the empty array, not synthesised entries")
+
+	accessToken, _ := tokenBody["access_token"].(string)
+	claims := decodeJWTPayload(t, accessToken)
+	jwtAD, ok := claims["authorization_details"].([]any)
+	require.True(t, ok, "legacy CIBA JWT carries authorization_details claim as empty array; got %T", claims["authorization_details"])
+	require.Empty(t, jwtAD)
+
+	introspectBody := introspect(t, accessToken)
+	introAD, ok := introspectBody["authorization_details"].([]any)
+	require.True(t, ok, "introspection surfaces authorization_details as empty array; got %T", introspectBody["authorization_details"])
+	require.Empty(t, introAD)
+}

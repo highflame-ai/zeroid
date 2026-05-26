@@ -4,16 +4,10 @@
 //
 // Happy-path coverage of authorization_details (multi-element parsing,
 // notifier delivery of the typed slice, opt-in per-type validator, form
-// vs JSON content types, validator panic safety) lives in
-// `ciba_rar_test.go`. This file pins the RFC 9396 normative clauses
-// explicitly so a future spec-revision sweep can grep `RFC9396` and
-// touch every assertion. Each test enforces exactly one MUST.
-//
-// Scope of this PR is bc-authorize-side only. Token-side clauses
-// (`authorization_details` in the token response per RFC 9396 §5,
-// embedded in the access-token JWT per §6.1, surfaced in introspection
-// per §7) are NOT exercised here — they ship in the follow-up token-side
-// PR and will extend this file in lockstep.
+// vs JSON content types, validator panic safety, token-side end-to-end)
+// lives in `ciba_rar_test.go`. This file pins the RFC 9396 normative
+// clauses explicitly so a future spec-revision sweep can grep `RFC9396`
+// and touch every assertion. Each test enforces exactly one MUST.
 
 package integration_test
 
@@ -336,4 +330,148 @@ func TestRFC9396_S5_ValidatorErrorMapsToInvalidAuthorizationDetails(t *testing.T
 	body := decode(t, resp)
 	require.Equal(t, "invalid_authorization_details", body["error"],
 		"validator rejection MUST surface as invalid_authorization_details, not invalid_request")
+}
+
+// ── RFC 9396 §5.2 — Token Response ─────────────────────────────────────────
+//
+// The §5/§6/§7 token-side tests share the bc-authorize → approve → poll
+// scaffolding. issueRARToken returns the parsed token-response body and the
+// approved access-token string so each compliance test can pick the surface
+// it cares about (response field, JWT claim, introspection) without
+// duplicating the lifecycle.
+func issueRARToken(t *testing.T, rar []map[string]any) (tokenBody map[string]any, accessToken string) {
+	t.Helper()
+
+	clientID := setupRARClient(t)
+
+	resp := postBcAuthorize(t, clientID, rar)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
+	require.NotEmpty(t, authReqID)
+
+	approveResp := post(t,
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		map[string]any{"subject_id": "compliance-subject"},
+		adminHeaders(),
+	)
+	require.Equal(t, http.StatusOK, approveResp.StatusCode)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":  "urn:openid:params:grant-type:ciba",
+		"auth_req_id": authReqID,
+		"client_id":   clientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+
+	tokenBody = decode(t, tokenResp)
+	accessToken, _ = tokenBody["access_token"].(string)
+	require.NotEmpty(t, accessToken)
+
+	return tokenBody, accessToken
+}
+
+func TestRFC9396_S5_2_TokenResponseIncludesAuthorizationDetails(t *testing.T) {
+	// RFC 9396 §5.2: "If the authorization_details parameter of the request
+	//   was [...] not modified by the authorization server, [...] the AS
+	//   MUST include the granted authorization_details ... in the token
+	//   response." ZeroID grants verbatim (no modification), so the token
+	//   response MUST carry the exact array the client supplied.
+	tokenBody, _ := issueRARToken(t, []map[string]any{
+		{"type": "highflame_tool_call", "tool": "transfer_funds"},
+	})
+
+	ad, ok := tokenBody["authorization_details"].([]any)
+	require.True(t, ok,
+		"token response MUST include authorization_details as a JSON array; got %T", tokenBody["authorization_details"])
+	require.Len(t, ad, 1, "every granted element MUST be present on the response")
+
+	first, _ := ad[0].(map[string]any)
+	require.Equal(t, "highflame_tool_call", first["type"])
+	require.Equal(t, "transfer_funds", first["tool"])
+}
+
+func TestRFC9396_S5_2_TokenResponseCarriesEmptyArrayForLegacyFlow(t *testing.T) {
+	// RFC 9396 §5.2: the AS MUST include the granted authorization_details on
+	//   the token response. For legacy CIBA (no RAR supplied on bc-authorize),
+	//   the grant is the empty array. ZeroID surfaces that empty array on the
+	//   response — consumers branch on `len > 0` to detect "actual typed grant
+	//   in effect" rather than on field presence. (Earlier drafts of this PR
+	//   omitted the field when empty; dropped per #168 review feedback.)
+	clientID := setupRARClient(t)
+
+	resp := postBcAuthorize(t, clientID, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
+
+	approveResp := post(t,
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		map[string]any{"subject_id": "compliance-subject-legacy"},
+		adminHeaders(),
+	)
+	require.Equal(t, http.StatusOK, approveResp.StatusCode)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":  "urn:openid:params:grant-type:ciba",
+		"auth_req_id": authReqID,
+		"client_id":   clientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+
+	tokenBody := decode(t, tokenResp)
+
+	ad, ok := tokenBody["authorization_details"].([]any)
+	require.True(t, ok,
+		"legacy CIBA token response carries authorization_details as a JSON array (empty); got %T", tokenBody["authorization_details"])
+	require.Empty(t, ad, "legacy flow MUST surface the empty array, not synthesised entries")
+}
+
+// ── RFC 9396 §6.1 — Enrich the Access Token ─────────────────────────────────
+
+func TestRFC9396_S6_1_AccessTokenJWTEmbedsAuthorizationDetails(t *testing.T) {
+	// RFC 9396 §6.1: "The AS MAY enrich the access token with the granted
+	//   authorization_details" — when the AS does enrich, the claim's
+	//   value MUST be the same JSON shape the client supplied. ZeroID
+	//   embeds the claim by default so resource servers can read the
+	//   typed grant without an introspection round-trip; this test pins
+	//   that contract.
+	_, accessToken := issueRARToken(t, []map[string]any{
+		{"type": "highflame_tool_call", "tool": "transfer_funds", "amount": 50000},
+	})
+
+	claims := decodeJWTPayload(t, accessToken)
+	ad, ok := claims["authorization_details"].([]any)
+	require.True(t, ok,
+		"access-token JWT MUST carry authorization_details claim; got %T", claims["authorization_details"])
+	require.Len(t, ad, 1)
+
+	first, _ := ad[0].(map[string]any)
+	require.Equal(t, "highflame_tool_call", first["type"])
+	require.Equal(t, "transfer_funds", first["tool"])
+}
+
+// ── RFC 9396 §7 — Token Introspection ───────────────────────────────────────
+
+func TestRFC9396_S7_IntrospectionExposesAuthorizationDetails(t *testing.T) {
+	// RFC 9396 §7: "The authorization_details element ... MAY be included
+	//   in the response of the introspection endpoint [RFC7662]." When
+	//   included, it MUST be the same JSON shape granted on issuance so
+	//   resource servers and audit pipelines see a consistent view across
+	//   the token + introspection surfaces.
+	_, accessToken := issueRARToken(t, []map[string]any{
+		{"type": "highflame_tool_call", "tool": "transfer_funds"},
+	})
+
+	introspectBody := introspect(t, accessToken)
+	require.Equal(t, true, introspectBody["active"])
+
+	ad, ok := introspectBody["authorization_details"].([]any)
+	require.True(t, ok,
+		"introspection MUST surface authorization_details when the token carries it; got %T", introspectBody["authorization_details"])
+	require.Len(t, ad, 1)
+
+	first, _ := ad[0].(map[string]any)
+	require.Equal(t, "highflame_tool_call", first["type"])
+	require.Equal(t, "transfer_funds", first["tool"])
 }

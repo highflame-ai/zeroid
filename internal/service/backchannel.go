@@ -289,8 +289,9 @@ type CreateAuthRequestInput struct {
 	// validation. Empty when the client omits the parameter (legacy CIBA
 	// behavior unchanged). The service validates outer shape, runs any
 	// registered per-type validators, and persists the bytes verbatim so
-	// downstream consumers (the BackchannelNotifier, the future token-embed
-	// path) see the exact JSON the client supplied.
+	// downstream consumers — the BackchannelNotifier hook and the
+	// token-side embed at issuance — see the exact JSON the client
+	// supplied.
 	AuthorizationDetailsRaw []byte
 }
 
@@ -698,6 +699,23 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		customClaims["binding_message"] = row.BindingMessage
 	}
 
+	// RFC 9396 Rich Authorization Requests — token-side.
+	//
+	// §6.1: include the granted authorization_details as a top-level JWT
+	// claim so resource servers can read the typed authorization without
+	// an introspection round-trip.
+	// §5.2: also include it on the token response body so polling / push
+	// clients see what was granted.
+	//
+	// The raw bytes are passed through verbatim (as json.RawMessage) so
+	// jwx serialises the array structure rather than the {Type, Raw}
+	// surface of the domain type. The bc-authorize-side validator
+	// guarantees the persisted bytes are a valid RFC 9396 array (a
+	// legacy CIBA row stores the canonical empty `[]`); no re-parse or
+	// special-case filtering on issuance.
+	rarBytes := json.RawMessage(row.AuthorizationDetailsRaw)
+	customClaims["authorization_details"] = rarBytes
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		Scopes:            parseScopeString(row.Scope),
@@ -716,6 +734,8 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 
 	accessToken.AccountID = row.AccountID
 	accessToken.ProjectID = row.ProjectID
+	accessToken.AuthorizationDetails = rarBytes
+
 	return accessToken, nil
 }
 
@@ -940,6 +960,11 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	}
 	if accessToken.RefreshToken != "" {
 		payload["refresh_token"] = accessToken.RefreshToken
+	}
+	// RFC 9396 §5.2: include granted authorization_details on the token
+	// response so push clients see the typed grant without parsing the JWT.
+	if len(accessToken.AuthorizationDetails) > 0 {
+		payload["authorization_details"] = accessToken.AuthorizationDetails
 	}
 
 	s.postCallback(ctx, row, payload)

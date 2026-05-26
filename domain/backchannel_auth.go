@@ -69,12 +69,29 @@ const GrantTypeCIBA GrantType = "urn:openid:params:grant-type:ciba"
 // only the outer shape so any application-specific `type` namespace ships
 // without a library-level schema commitment.
 
-// MaxAuthorizationDetailsBytes caps the total RAR payload at request time
-// to prevent unbounded JSON blobs in a persisted Postgres row. RFC 9396 §2
-// is silent on a cap; 64 KB is generous for realistic transactional
-// approvals (a typical entry is a few hundred bytes) and small enough that
-// a malicious oversized payload is rejected before persistence.
-const MaxAuthorizationDetailsBytes = 64 * 1024
+// MaxAuthorizationDetailsBytes caps the total RAR payload at request time.
+// RFC 9396 §2 is silent on a cap; zeroid's choice is driven by two
+// downstream consumers:
+//
+//  1. Postgres persistence — the JSONB column has no schema-side cap; the
+//     library-side limit prevents a malicious caller writing an unbounded
+//     blob to the row.
+//  2. JWT embed (RFC 9396 §6.1, wired by the CIBA token-side path) — the
+//     payload is base64-embedded into the access-token JWT and carried in
+//     `Authorization: Bearer <jwt>` headers. With base64 expansion (~33 %)
+//     plus the rest of the JWT (header + signature + ZeroID's standard
+//     claims ~500 bytes), a 64 KB RAR pushes total header size well past
+//     common reverse-proxy limits (nginx defaults ~8 KB; ALB ~16 KB).
+//     4 KB caps the JWT header at roughly 6.5 KB end-to-end, safe for
+//     every proxy in the path.
+//
+// Realistic per-action authorization_details entries (type + tool + amount
+// + currency + destination ≈ 100–200 bytes) easily fit 10+ entries under
+// the 4 KB ceiling. Deployers needing larger payloads should rely on the
+// /oauth2/token/introspect surface (which can carry any size of granted
+// authorization_details) or reference an out-of-band record by ID in the
+// `authorization_details` payload.
+const MaxAuthorizationDetailsBytes = 4 * 1024
 
 // ErrAuthorizationDetailsOversized is returned when the raw JSON exceeds
 // MaxAuthorizationDetailsBytes.
@@ -206,9 +223,10 @@ type BackchannelAuthRequest struct {
 	// JSONB column (per-row size capped at MaxAuthorizationDetailsBytes by
 	// the service layer at insert time). Decoded into the typed
 	// AuthorizationDetails slice by ParseAuthorizationDetails for use by
-	// validators, the BackchannelNotifier hook, and the future token-embed
-	// path (PR 2). Defaults to '[]'::jsonb in Postgres so pre-RAR rows
-	// read as an empty array; consumers can branch on len(parsed) == 0.
+	// validators, the BackchannelNotifier hook, and the token-side embed
+	// at issuance (RFC 9396 §5.2 / §6.1 / §7). Defaults to '[]'::jsonb
+	// in Postgres so pre-RAR rows read as an empty array; consumers can
+	// branch on len(parsed) == 0.
 	AuthorizationDetailsRaw    json.RawMessage             `bun:"authorization_details,type:jsonb"             json:"authorization_details,omitempty"`
 	NotificationMode           BackchannelNotificationMode `bun:"notification_mode,type:varchar(16)"           json:"notification_mode"`
 	ClientNotificationEndpoint string                      `bun:"client_notification_endpoint,type:text"       json:"client_notification_endpoint,omitempty"`
