@@ -39,7 +39,7 @@ func TestRFC8414_S2_IssuerRequired(t *testing.T) {
 	assert.NotContains(t, iss, "?", "issuer URL MUST NOT have a query component")
 	assert.NotContains(t, iss, "#", "issuer URL MUST NOT have a fragment component")
 	assert.True(t, strings.HasPrefix(iss, "https://"),
-		"issuer URL MUST use the https scheme (RFC 8414 §2) — caught a mis-configured BaseURL")
+		"issuer URL MUST use the https scheme (RFC 8414 §2) — caught a mis-configured Issuer")
 }
 
 func TestRFC8414_S2_TokenEndpointRequired(t *testing.T) {

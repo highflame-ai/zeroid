@@ -69,7 +69,7 @@ Implemented in [`internal/service/dpop.go`](../internal/service/dpop.go). Twelve
 5. Verify the JWS signature using the embedded public JWK.
 6. Parse the payload (only after signature is verified).
 7. `htm` matches the request method **exactly** (case-sensitive per RFC 9110 §9.1).
-8. `htu` matches the request URL **after stripping query and fragment**. The URL we compare against is the **request's effective URL** — captured by `internal/middleware/RequestURLMiddleware` — not the configured `cfg.Token.BaseURL`. This makes reverse-proxied deployments work transparently when `ServerConfig.TrustForwardedHeaders = true`.
+8. `htu` matches the request URL **after stripping query and fragment**. The URL we compare against is the **request's effective URL** — captured by `internal/middleware/RequestURLMiddleware` — not the configured `cfg.Token.Issuer`. This makes reverse-proxied deployments work transparently when `ServerConfig.TrustForwardedHeaders = true`.
 9. `iat` must fall inside the freshness window (60 s in the past + 5 s of clock-skew tolerance).
 10. `jti` is consumed atomically by INSERTing into `dpop_jti` with `jti` as the primary key. A `23505` duplicate-key error → replay. **Wall-clock expiry** (`now + freshness + skew`), not iat-relative — a malicious client cannot backdate `iat` to shrink the row's replay-coverage window.
 11. If an access token is being validated at a resource server (`ValidateProofForToken`), `ath` is required and must equal `base64url(SHA-256(access_token))`.
