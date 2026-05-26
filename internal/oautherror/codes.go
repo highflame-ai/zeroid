@@ -35,6 +35,13 @@
 // to a clause in a published RFC" invariant. Future RFC-defined codes go
 // here; future Highflame-internal codes either stay literal or move to a
 // separate Highflame-namespaced constants package.
+//
+// Convention: the rule covers *emission sites* only — anywhere a wire-bound
+// error code is produced (a call to oauthBadRequest, a header value, a JSON
+// field). Comments and doc strings that quote a code by its literal value
+// for documentation purposes (e.g. "// returns invalid_grant on …") may use
+// the bare string. Grepping for "invalid_grant" should hit either the
+// constant declaration in this file OR a comment, not an emission site.
 package oautherror
 
 // ── RFC 6749 §5.2 — token-endpoint error codes ──────────────────────────────
