@@ -150,6 +150,7 @@ func TestRFC9728_S3_WellKnownPathIsExact(t *testing.T) {
 	// RFC 9728 §3: "The path component of the metadata URL is
 	//   /.well-known/oauth-protected-resource." Served as application/json.
 	resp := get(t, "/.well-known/oauth-protected-resource", nil)
+	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"GET /.well-known/oauth-protected-resource MUST return 200")
 	contentType := resp.Header.Get("Content-Type")
@@ -260,7 +261,9 @@ func TestRFC9728_AuthorizationServersPointsAtASMetadata(t *testing.T) {
 
 	found := false
 	for _, s := range advertised {
-		if s.(string) == asIssuer {
+		issuer, ok := s.(string)
+		require.True(t, ok, "every authorization_servers entry MUST be a string")
+		if issuer == asIssuer {
 			found = true
 			break
 		}
