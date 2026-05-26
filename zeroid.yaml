@@ -28,8 +28,13 @@ token:
   # Issuer is the canonical URL of this AS — the JWT iss claim, the
   # RFC 8414 §3 discovery anchor, AND the URL prefix for every endpoint
   # advertised in AS metadata / PRM / RFC 7592 registration_client_uri.
-  # For local dev: http://localhost:8899. For prod: e.g. https://auth.highflame.ai.
-  issuer: "http://localhost:8899"
+  #
+  # Defaults to Highflame's hosted ZeroID URL. Self-hosted deployments
+  # override via the ZEROID_ISSUER env var (or by editing this file).
+  # Local dev running ZeroID on localhost:8899 should set
+  # `ZEROID_ISSUER=http://localhost:8899` so tokens claim the URL they
+  # were actually issued from.
+  issuer: "https://auth.highflame.ai"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
 
