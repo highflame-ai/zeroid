@@ -32,9 +32,15 @@
 // "policy_violation" in extractOAuthError) stay as bare string literals at
 // their emission sites — they have no canonical RFC source for this package
 // to anchor on, and adding them here would dilute the "every constant maps
-// to a clause in a published RFC" invariant. Future RFC-defined codes go
-// here; future Highflame-internal codes either stay literal or move to a
-// separate Highflame-namespaced constants package.
+// to a clause in a published RFC" invariant.
+//
+// Future RFC-defined codes go here. Highflame-internal codes stay as
+// literals; if a future need ever justifies formalizing them as constants,
+// that belongs in a separate Highflame-namespaced package (e.g.
+// internal/highflameerror), NOT here — keeping the "RFC-only" invariant
+// stable is what makes this package's contents trustworthy for
+// spec-conformance work. No such package exists or is planned today;
+// noted for if/when the question comes up.
 //
 // Convention: the rule covers *emission sites* only — anywhere a wire-bound
 // error code is produced (a call to oauthBadRequest, a header value, a JSON
