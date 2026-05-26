@@ -40,7 +40,6 @@ type API struct {
 	signingCredSvc       *service.SigningCredentialService
 	db                   *bun.DB
 	issuer               string
-	baseURL              string
 	startTime            time.Time
 }
 
@@ -64,7 +63,7 @@ func NewAPI(
 	jwksSvc *signing.JWKSService,
 	signingCredSvc *service.SigningCredentialService,
 	db *bun.DB,
-	issuer, baseURL string,
+	issuer string,
 ) *API {
 	return &API{
 		identitySvc:          identitySvc,
@@ -86,7 +85,6 @@ func NewAPI(
 		signingCredSvc:       signingCredSvc,
 		db:                   db,
 		issuer:               issuer,
-		baseURL:              baseURL,
 		startTime:            time.Now(),
 	}
 }

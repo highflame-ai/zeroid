@@ -416,6 +416,6 @@ func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
 		"grant_types":                cl.GrantTypes,
 		"scope":                      strings.Join(cl.Scopes, " "),
 		"token_endpoint_auth_method": cl.TokenEndpointAuthMethod,
-		"registration_client_uri":    a.baseURL + "/oauth2/register/" + cl.ClientID,
+		"registration_client_uri":    a.issuer + "/oauth2/register/" + cl.ClientID,
 	}
 }

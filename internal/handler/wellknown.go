@@ -99,7 +99,7 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
 	return &OAuthMetadataOutput{Body: map[string]any{
 		"issuer":                                a.issuer,
-		"token_endpoint":                        a.baseURL + "/oauth2/token",
+		"token_endpoint":                        a.issuer + "/oauth2/token",
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
 		"grant_types_supported": []string{
 			"client_credentials",
@@ -108,14 +108,14 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 			"api_key",
 			"urn:openid:params:grant-type:ciba",
 		},
-		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
-		"introspection_endpoint":   a.baseURL + "/oauth2/token/introspect",
-		"revocation_endpoint":      a.baseURL + "/oauth2/token/revoke",
+		"jwks_uri":                 a.issuer + "/.well-known/jwks.json",
+		"introspection_endpoint":   a.issuer + "/oauth2/token/introspect",
+		"revocation_endpoint":      a.issuer + "/oauth2/token/revoke",
 		"response_types_supported": []string{"token"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
-		"registration_endpoint": a.baseURL + "/oauth2/register",
+		"registration_endpoint": a.issuer + "/oauth2/register",
 
 		// RFC 9449 — Demonstrating Proof of Possession (DPoP). Algorithms the
 		// token endpoint will accept on the DPoP header. Symmetric algs are
@@ -125,7 +125,7 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
 		// let CIBA-aware clients auto-discover that this AS supports
 		// backchannel authentication and which delivery modes are wired.
-		"backchannel_authentication_endpoint":        a.baseURL + "/oauth2/bc-authorize",
+		"backchannel_authentication_endpoint":        a.issuer + "/oauth2/bc-authorize",
 		"backchannel_token_delivery_modes_supported": []string{"poll", "ping", "push"},
 		"backchannel_user_code_parameter_supported":  false,
 		// We don't accept signed bc-authorize requests in v1 — clients

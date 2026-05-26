@@ -25,8 +25,11 @@ keys:
   rsa_key_id: "v1"
 
 token:
-  issuer: "https://highflame.ai"
-  base_url: "http://localhost:8899"
+  # Issuer is the canonical URL of this AS — the JWT iss claim, the
+  # RFC 8414 §3 discovery anchor, AND the URL prefix for every endpoint
+  # advertised in AS metadata / PRM / RFC 7592 registration_client_uri.
+  # For local dev: http://localhost:8899. For prod: e.g. https://auth.highflame.ai.
+  issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
 

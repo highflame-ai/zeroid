@@ -238,7 +238,7 @@ func NewServer(cfg Config) (*Server, error) {
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
 		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, delegationSvc, jwksSvc,
 		signingCredSvc, db,
-		cfg.Token.Issuer, cfg.Token.BaseURL,
+		cfg.Token.Issuer,
 	)
 
 	// Shared middleware state — closures reference these holders; the actual functions

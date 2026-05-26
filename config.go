@@ -183,28 +183,28 @@ type KeysConfig struct {
 
 // TokenConfig holds JWT issuance settings.
 type TokenConfig struct {
-	Issuer string `koanf:"issuer"`
-	// BaseURL is the publicly-visible URL clients use to reach this server.
-	// It seeds every URI returned in responses (`registration_endpoint` and
-	// `registration_client_uri` in DCR responses, the JWT `iss` claim's
-	// authority for verification, and the well-known discovery doc).
+	// Issuer is the canonical URL of this ZeroID instance. It serves three
+	// roles, all REQUIRED to be the same URL by RFC 8414 §3:
 	//
-	// MUST be the URL clients actually hit — including any reverse-proxy
-	// rewrites or path prefixes the deployment adds. If a proxy fronts
-	// zeroid at https://auth.example.com/v1 and forwards to a backend on
-	// http://10.0.0.5:8080, set BaseURL = "https://auth.example.com/v1"
-	// (the public form), NOT the backend URL. A wrong value here doesn't
-	// break token signing — JWTs continue to verify against jwks_uri — but
-	// every URI the server PUBLISHES (DCR responses, discovery) becomes
-	// unreachable from outside. Validate() will reject empty values; format
-	// validity is the deployer's responsibility.
+	//  1. The JWT `iss` claim on every issued token.
+	//  2. The discovery anchor — RFC 8414 §3 says clients construct
+	//     `{Issuer}/.well-known/oauth-authorization-server` (with the
+	//     well-known segment inserted between host and path) to find AS
+	//     metadata. Issuer MUST be reachable at that URL.
+	//  3. The URL prefix for every endpoint advertised in the AS metadata,
+	//     PRM document, and RFC 7592 `registration_client_uri` — i.e. the
+	//     URL clients actually hit.
 	//
-	// Note: DPoP `htu` validation does NOT depend on BaseURL — it compares
-	// against the request's effective URL (via RequestURLMiddleware) so
-	// reverse-proxied deployments don't need to keep BaseURL and the proxy
-	// in lock-step for token issuance to work. BaseURL is purely about the
-	// shape of URIs the server hands BACK to clients.
-	BaseURL    string `koanf:"base_url"`
+	// MUST be the publicly-routable URL of this AS, scheme://host[:port][/path],
+	// no fragment. Reverse-proxied deployments: use the public form, not the
+	// backend's listener URL. Path-mounted deployments (rare; antipattern for
+	// new deployments): include the path in Issuer so RFC 8414's insertion
+	// rule lands on a route the AS actually serves.
+	//
+	// DPoP `htu` validation does NOT depend on Issuer — it compares against
+	// the request's effective URL (via RequestURLMiddleware), so reverse-proxy
+	// header trust governs DPoP independently.
+	Issuer     string `koanf:"issuer"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
@@ -245,6 +245,13 @@ func LoadConfig(configPath string) (Config, error) {
 
 	if err := loadEnvVars(k); err != nil {
 		return Config{}, fmt.Errorf("loading env vars: %w", err)
+	}
+
+	// Detect removed/renamed config keys so deployers see a loud failure on
+	// upgrade instead of silently losing settings. Koanf's Unmarshal would
+	// otherwise drop keys that no longer map to struct fields.
+	if err := rejectRemovedKeys(k); err != nil {
+		return Config{}, err
 	}
 
 	var cfg Config
@@ -289,8 +296,32 @@ func (c *Config) Validate() error {
 	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
 		return fmt.Errorf("wimse_domain: %w", err)
 	}
-	if c.Token.BaseURL == "" {
-		return fmt.Errorf("token.base_url is required: every URI the server hands back (DCR registration_client_uri, well-known discovery) derives from it; see TokenConfig.BaseURL")
+	if c.Token.Issuer == "" {
+		return fmt.Errorf("token.issuer is required: it is the JWT iss claim, the RFC 8414 §3 discovery anchor, and the URL prefix for every endpoint the server advertises; see TokenConfig.Issuer")
+	}
+	if strings.HasSuffix(c.Token.Issuer, "/") {
+		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", c.Token.Issuer)
+	}
+	return nil
+}
+
+// rejectRemovedKeys fails fast if a deployer's config (YAML or env) still sets
+// keys that this version of ZeroID has removed. Silent drop on upgrade is
+// indistinguishable from "the setting works but does nothing"; loud rejection
+// forces migration.
+//
+// Add an entry here whenever a config key is removed. Keep entries until you
+// believe no live deployment carries the old key.
+func rejectRemovedKeys(k *koanf.Koanf) error {
+	// Removed in the Token.BaseURL elimination (see CHANGELOG). Issuer now
+	// serves the role BaseURL used to. Migration: set token.issuer (or
+	// ZEROID_ISSUER) to whatever you previously had in token.base_url
+	// (or ZEROID_BASE_URL).
+	if k.Exists("token.base_url") {
+		return fmt.Errorf("token.base_url has been removed: set token.issuer to the full URL ZeroID is reached at (RFC 8414 §3 anchors discovery on the issuer URL). See CHANGELOG for migration notes")
+	}
+	if os.Getenv("ZEROID_BASE_URL") != "" {
+		return fmt.Errorf("ZEROID_BASE_URL has been removed: set ZEROID_ISSUER to the full URL ZeroID is reached at (RFC 8414 §3 anchors discovery on the issuer URL). See CHANGELOG for migration notes")
 	}
 	return nil
 }
@@ -361,7 +392,6 @@ func loadDefaults(k *koanf.Koanf) error {
 
 		// Token
 		"token.issuer":      "https://highflame.ai",
-		"token.base_url":    "https://highflame.ai",
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 
@@ -437,7 +467,6 @@ func loadEnvVars(k *koanf.Koanf) error {
 
 		// Token
 		"ZEROID_ISSUER":                "token.issuer",
-		"ZEROID_BASE_URL":              "token.base_url",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
 

@@ -160,7 +160,6 @@ func runTests(m *testing.M) int {
 		},
 		Token: zeroid.TokenConfig{
 			Issuer:         testIssuer,
-			BaseURL:        testIssuer,
 			DefaultTTL:     3600,
 			MaxTTL:         90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
 			HMACSecret:     testHMACSecret,
