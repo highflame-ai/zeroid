@@ -326,6 +326,15 @@ func validateIssuer(s string) error {
 	if u.Host == "" {
 		return fmt.Errorf("token.issuer must have a host (got %q)", s)
 	}
+	if u.User != nil {
+		// Issuer URLs with embedded user-info (https://user:pass@host) are
+		// not a real OAuth deployment shape — they would leak credentials
+		// into JWT `iss` claims, metadata documents, and every URI the
+		// server publishes. RFC 8414 §2's "URL using the https scheme"
+		// language excludes user-info by reference to RFC 3986's URI
+		// composition rules for OAuth identifiers.
+		return fmt.Errorf("token.issuer must not contain user-info (got %q): an issuer URL with embedded credentials would leak them into the JWT iss claim and every published URI", s)
+	}
 	if u.RawQuery != "" {
 		return fmt.Errorf("token.issuer must not contain query parameters (got %q): RFC 8414 §2 requires the issuer URL to have no query component", s)
 	}

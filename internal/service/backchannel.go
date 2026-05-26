@@ -475,10 +475,10 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 		return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 	}
 	if row.Status != domain.BackchannelStatusPending {
-		return oauthBadRequest("access_denied", fmt.Sprintf("request is in status %q and cannot be approved", row.Status))
+		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be approved", row.Status))
 	}
 	if time.Now().After(row.ExpiresAt) {
-		return oauthBadRequest("access_denied", "request has expired")
+		return oauthBadRequest(oautherror.AccessDenied, "request has expired")
 	}
 
 	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, in.SubjectID, in.SubjectEmail, in.SubjectName)
@@ -487,7 +487,7 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 	}
 	if affected == 0 {
 		// Lost a race against expiry sweep or a concurrent deny.
-		return oauthBadRequest("access_denied", "request could not be approved (concurrent modification or expiry)")
+		return oauthBadRequest(oautherror.AccessDenied, "request could not be approved (concurrent modification or expiry)")
 	}
 	// Re-load so callbacks see the persisted approved_subject_* fields and
 	// the updated status. Ping/push dispatchers consume these.
@@ -523,14 +523,14 @@ func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 		return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 	}
 	if row.Status != domain.BackchannelStatusPending {
-		return oauthBadRequest("access_denied", fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
+		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
 	}
 	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request denied", err)
 	}
 	if affected == 0 {
-		return oauthBadRequest("access_denied", "request could not be denied (concurrent modification or expiry)")
+		return oauthBadRequest(oautherror.AccessDenied, "request could not be denied (concurrent modification or expiry)")
 	}
 	persisted, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err == nil {
@@ -611,13 +611,13 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	// callback exactly once. Allowing both would double-deliver and break
 	// single-use semantics.
 	if row.NotificationMode == domain.BackchannelNotificationPush {
-		return nil, oauthBadRequest("access_denied", "auth_req_id is delivered via push callback; polling is not permitted")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id is delivered via push callback; polling is not permitted")
 	}
 
 	now := time.Now()
 	if now.After(row.ExpiresAt) && row.Status == domain.BackchannelStatusPending {
 		// Race against the sweep: surface expired_token immediately.
-		return nil, oauthBadRequest("expired_token", "the backchannel authentication request has expired")
+		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
 	}
 
 	switch row.Status {
@@ -625,23 +625,23 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		// Enforce the slow_down floor — clients that poll faster than
 		// MinPollInterval get a 400 even if their previous response said they could.
 		if row.LastPolledAt != nil && now.Sub(*row.LastPolledAt) < s.cfg.MinPollInterval {
-			return nil, oauthBadRequest("slow_down", "polling interval must be at least the value returned by the bc-authorize response")
+			return nil, oauthBadRequest(oautherror.SlowDown, "polling interval must be at least the value returned by the bc-authorize response")
 		}
 		if err := s.repo.TouchPoll(ctx, in.AuthReqID, now); err != nil {
 			log.Warn().Err(err).Str("auth_req_id", in.AuthReqID).Msg("failed to record poll timestamp")
 		}
-		return nil, oauthBadRequest("authorization_pending", "the user has not yet acted on the authentication request")
+		return nil, oauthBadRequest(oautherror.AuthorizationPending, "the user has not yet acted on the authentication request")
 
 	case domain.BackchannelStatusDenied:
-		return nil, oauthBadRequest("access_denied", "the user denied the authentication request")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "the user denied the authentication request")
 
 	case domain.BackchannelStatusExpired:
-		return nil, oauthBadRequest("expired_token", "the backchannel authentication request has expired")
+		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
 
 	case domain.BackchannelStatusIssued:
 		// A successful token was already minted for this auth_req_id. Refuse
 		// re-redemption — auth codes / auth_req_ids are single-use.
-		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 
 	case domain.BackchannelStatusApproved:
 		return s.issueTokenForApprovedRow(ctx, row, in.DPoPKeyThumbprint)
@@ -678,7 +678,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		return nil, oauthServerError("failed to commit issuance state", mErr)
 	}
 	if affected == 0 {
-		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 	}
 
 	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
@@ -957,7 +957,7 @@ func (s *BackchannelService) dispatchPushDenial(ctx context.Context, row *domain
 		return
 	}
 	payload := map[string]any{
-		"error":             "access_denied",
+		"error":             oautherror.AccessDenied,
 		"error_description": "the user denied the authentication request",
 		"auth_req_id":       row.AuthReqID,
 	}

@@ -120,3 +120,29 @@ const (
 	// RFC 9449 §4.3.
 	InvalidDPoPProof = "invalid_dpop_proof"
 )
+
+// ── OpenID CIBA Core 1.0 §11 — Backchannel Authentication error codes ───────
+// https://openid.net/specs/openid-client-initiated-backchannel-authentication-core-1_0.html#rfc.section.11
+const (
+	// AuthorizationPending indicates the authorization request is still
+	// pending — the end-user has not yet completed the user interaction.
+	// Clients SHOULD continue polling after the interval returned in the
+	// bc-authorize response.
+	AuthorizationPending = "authorization_pending"
+
+	// SlowDown indicates the client is polling /oauth2/token too frequently.
+	// The poll interval is implicitly increased; clients MUST wait at least
+	// the new interval before polling again.
+	SlowDown = "slow_down"
+
+	// ExpiredToken indicates the auth_req_id has expired and the request is
+	// no longer redeemable. The client MUST start a new authentication
+	// request via /oauth2/bc-authorize.
+	ExpiredToken = "expired_token"
+
+	// AccessDenied indicates the end-user or the authorization server denied
+	// the request. Also used for state-machine violations (e.g. polling a
+	// push-delivery auth_req_id, redeeming an already-redeemed code) where
+	// no other code applies.
+	AccessDenied = "access_denied"
+)

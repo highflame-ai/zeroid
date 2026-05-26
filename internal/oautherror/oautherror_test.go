@@ -31,6 +31,11 @@ func TestConstantsAreNonEmpty(t *testing.T) {
 		"InvalidAuthorizationDetails": InvalidAuthorizationDetails,
 		// RFC 9449 §5
 		"InvalidDPoPProof": InvalidDPoPProof,
+		// OpenID CIBA Core §11
+		"AuthorizationPending": AuthorizationPending,
+		"SlowDown":             SlowDown,
+		"ExpiredToken":         ExpiredToken,
+		"AccessDenied":         AccessDenied,
 	}
 	for name, val := range cases {
 		if val == "" {
