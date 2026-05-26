@@ -50,11 +50,21 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				// RFC 6750 §3: "If the request lacks any authentication
+				// information, the resource server SHOULD NOT include an
+				// error code or other error information." Emit a bare
+				// Bearer challenge — the RFC 9728 §5.1 resource_metadata
+				// breadcrumb still gets attached (the SHOULD-NOT clause
+				// scopes to error info, not discovery hints), so a
+				// cold-start client can still find PRM.
+				writeAgentAuthError(w, "", "", cfg.ResourceMetadataURL)
+				return
+			}
 			if !strings.HasPrefix(authHeader, "Bearer ") {
-				// RFC 6750 §3.1: "invalid_request" — request lacks the
-				// Authorization header or it is malformed. RFC 9728 §5.1
-				// breadcrumb points the cold-start client at PRM.
-				writeAgentAuthError(w, "invalid_request", "missing or invalid Authorization header", cfg.ResourceMetadataURL)
+				// Credentials WERE sent, just not in a recognized scheme —
+				// RFC 6750 §3.1 error_code applies here.
+				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer scheme", cfg.ResourceMetadataURL)
 				return
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
