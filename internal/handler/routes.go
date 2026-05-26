@@ -107,6 +107,14 @@ func NewHumaAPI(router chi.Router) huma.API {
 	return humachi.New(router, config)
 }
 
+// prmURL returns the absolute URL of this server's RFC 9728 Protected
+// Resource Metadata document. Centralized so the value emitted in
+// WWW-Authenticate breadcrumbs (RFC 9728 §5.1) stays in lockstep with the
+// PRM endpoint's registered path.
+func (a *API) prmURL() string {
+	return a.issuer + "/.well-known/oauth-protected-resource"
+}
+
 // RegisterPublic registers endpoints that require no authentication:
 // health, well-known, OAuth2 endpoints (token, revoke), and forward-auth verify.
 // The /oauth2/register endpoints (RFC 7591/7592) live here too — they enforce
