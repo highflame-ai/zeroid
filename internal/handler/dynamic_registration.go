@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
@@ -159,10 +160,10 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 	})
 	if regErr != nil {
 		if errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
-			return dcrErr(&dcrError{status: http.StatusConflict, code: "invalid_client_metadata", desc: "client already exists"}), nil
+			return dcrErr(&dcrError{status: http.StatusConflict, code: oautherror.InvalidClientMetadata, desc: "client already exists"}), nil
 		}
 		log.Error().Err(regErr).Msg("dynamic client registration failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to register client"}), nil
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to register client"}), nil
 	}
 
 	// Audit log: who minted what. registered_by_* claims are derived from the
@@ -216,10 +217,10 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		// have been deleted in between. Map ErrOAuthClientNotFound to the
 		// same 401 the auth path uses; other errors are infra failures.
 		if errors.Is(updateErr, service.ErrOAuthClientNotFound) {
-			return dcrErr(&dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "client no longer exists"}), nil
+			return dcrErr(&dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "client no longer exists"}), nil
 		}
 		log.Error().Err(updateErr).Str("client_id", input.ClientID).Msg("dynamic client update failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to update client registration"}), nil
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to update client registration"}), nil
 	}
 	return &DCROutput{Status: http.StatusOK, Body: a.dcrClientResponse(updated)}, nil
 }
@@ -230,7 +231,7 @@ func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutpu
 	}
 	if err := a.oauthClientSvc.DeleteDynamicClient(ctx, input.ClientID); err != nil {
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client delete failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to delete client registration"}), nil
+		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to delete client registration"}), nil
 	}
 	return &DCROutput{Status: http.StatusNoContent, Body: nil}, nil
 }
@@ -251,7 +252,7 @@ type dcrValidatedFields struct {
 // in. Returns the normalised fields or a *dcrError ready for dcrErr().
 func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantTypesIn []string) (*dcrValidatedFields, *dcrError) {
 	if clientName == "" {
-		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "client_name is required"}
+		return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "client_name is required"}
 	}
 	grantTypes := grantTypesIn
 	if len(grantTypes) == 0 {
@@ -259,7 +260,7 @@ func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantT
 	}
 	for _, gt := range grantTypes {
 		if !allowedDCRGrantTypes[gt] {
-			return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported grant_type: " + gt}
+			return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "unsupported grant_type: " + gt}
 		}
 	}
 	authMethod := authMethodIn
@@ -273,9 +274,9 @@ func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantT
 	case "client_secret_post", "client_secret_basic":
 		// accepted
 	case "none":
-		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication"}
+		return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication"}
 	default:
-		return nil, &dcrError{status: http.StatusBadRequest, code: "invalid_client_metadata", desc: "unsupported token_endpoint_auth_method: " + authMethod}
+		return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "unsupported token_endpoint_auth_method: " + authMethod}
 	}
 	var scopes []string
 	if scopeStr != "" {
@@ -323,7 +324,7 @@ type initialAccessTokenClaims struct {
 // Returns the extracted tenant claims on success or a *dcrError on failure.
 func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessTokenClaims, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer initial access token is required"}
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer initial access token is required"}
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
@@ -335,7 +336,7 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 	)
 	if err != nil {
 		log.Info().Err(err).Msg("DCR: initial access token rejected")
-		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "initial access token is invalid or expired"}
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "initial access token is invalid or expired"}
 	}
 
 	// The scopes claim may decode as []string (when jwx preserves the issuance
@@ -361,7 +362,7 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 	}
 	if !hasRegisterScope {
 		log.Info().Msg("DCR: initial access token rejected — insufficient scope")
-		return nil, &dcrError{status: http.StatusForbidden, code: "insufficient_scope", desc: "initial access token must have '" + dcrClientRegisterScope + "' scope"}
+		return nil, &dcrError{status: http.StatusForbidden, code: oautherror.InsufficientScope, desc: "initial access token must have '" + dcrClientRegisterScope + "' scope"}
 	}
 
 	claims := &initialAccessTokenClaims{}
@@ -378,7 +379,7 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 		log.Info().
 			Str("registered_by_sub", claims.Subject).
 			Msg("DCR: initial access token rejected — missing tenant claims")
-		return nil, &dcrError{status: http.StatusForbidden, code: "invalid_token", desc: "initial access token must carry account_id and project_id claims"}
+		return nil, &dcrError{status: http.StatusForbidden, code: oautherror.InvalidToken, desc: "initial access token must carry account_id and project_id claims"}
 	}
 	return claims, nil
 }
@@ -387,7 +388,7 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 // Authorization header against the stored bcrypt hash for the path's client_id.
 func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID string) (*domain.OAuthClient, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "Authorization header with Bearer registration_access_token is required"}
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer registration_access_token is required"}
 	}
 	regToken := strings.TrimPrefix(authHeader, "Bearer ")
 
@@ -396,10 +397,10 @@ func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID s
 		// 401 for genuine not-found / bad token; 500 for DB / infra failures so an
 		// outage isn't masked as an auth rejection.
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
-			return nil, &dcrError{status: http.StatusUnauthorized, code: "invalid_token", desc: "invalid or unknown registration_access_token"}
+			return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "invalid or unknown registration_access_token"}
 		}
 		log.Error().Err(err).Str("client_id", clientID).Msg("DCR: registration-token verification failed")
-		return nil, &dcrError{status: http.StatusInternalServerError, code: "server_error", desc: "failed to verify registration token"}
+		return nil, &dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to verify registration token"}
 	}
 	return client, nil
 }
