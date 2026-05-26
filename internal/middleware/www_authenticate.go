@@ -26,13 +26,19 @@ import (
 // challenges (invalid credentials).
 //
 // All parameter values are double-quoted per RFC 7235 §2.1 quoted-string
-// rules — only " and \ are escaped. We do NOT use fmt's %q verb here because
-// %q applies Go-specific escaping (e.g. \uXXXX for non-ASCII, \n for
-// newlines) which produces strings that are not valid HTTP quoted-string per
-// RFC 7230 §3.2.6. For ASCII-only inputs the two are identical, but the
-// custom quote() helper stays correct if a future caller passes a
-// URL containing non-ASCII (punycode, IDN, etc.) or a description with a
-// literal newline that the caller forgot to strip.
+// rules — only " and \ are escaped, with HTAB, CR, and LF stripped. We do
+// NOT use fmt's %q verb here because %q applies Go-specific escaping (e.g.
+// \uXXXX for non-ASCII) which produces strings that are not valid HTTP
+// quoted-string per RFC 7230 §3.2.6. For ASCII-only inputs the two are
+// nearly identical, but the custom helper stays correct if a future caller
+// passes a URL containing non-ASCII (punycode, IDN, etc.).
+//
+// httpQuotedString defensively strips CTL characters (0x00-0x1F, 0x7F)
+// other than HTAB before quoting. CTLs in a header value would be rejected
+// by Go's net/http at write time, and CR/LF specifically would enable
+// response-splitting attacks if any caller fed user-controlled input
+// without sanitizing first. Callers SHOULD still pre-validate; the strip
+// is defense-in-depth.
 func WWWAuthenticate(errorCode, errorDesc, resourceMetadataURL string) string {
 	var params []string
 	if errorCode != "" {
@@ -52,11 +58,33 @@ func WWWAuthenticate(errorCode, errorDesc, resourceMetadataURL string) string {
 
 // httpQuotedString wraps s in double quotes and escapes only the two
 // characters that RFC 7230 §3.2.6 quoted-string requires escaping (backslash
-// and double-quote). All other octets — including UTF-8 — pass through
-// unchanged, matching the RFC's allowed character set (obs-text covers any
-// %x80-FF byte).
+// and double-quote). CTL characters (0x00-0x1F and 0x7F) other than HTAB are
+// stripped — they're disallowed in HTTP header field values, Go's net/http
+// rejects them at write time, and CR/LF specifically would enable response-
+// splitting attacks if user-controlled input ever reached this helper. All
+// other octets — including UTF-8 — pass through unchanged, matching the RFC's
+// allowed character set (obs-text covers any %x80-FF byte).
 func httpQuotedString(s string) string {
+	s = stripCTL(s)
 	s = strings.ReplaceAll(s, `\`, `\\`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return `"` + s + `"`
+}
+
+// stripCTL removes CTL characters per RFC 7230 §3.2.6's exclusion: control
+// characters (%x00-1F / %x7F) are forbidden in quoted-string values, except
+// for HTAB (%x09) which is explicitly permitted in obs-text. The strip is
+// intentionally lossy — a header value with a stray newline is broken
+// whether we strip it or emit it; stripping is the safer of the two
+// failure modes.
+func stripCTL(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\t' || (c >= 0x20 && c != 0x7F) {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
