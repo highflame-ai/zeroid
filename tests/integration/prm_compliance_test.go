@@ -96,23 +96,19 @@ func TestRFC9728_S2_JwksUriPointsAtASKeyset(t *testing.T) {
 	assert.Contains(t, jwks, "/.well-known/jwks.json")
 }
 
-func TestRFC9728_S2_ResourceSigningAlgValuesSupportedListed(t *testing.T) {
+func TestRFC9728_S2_ResourceSigningAlgValuesNotAdvertisedUntilRFC9701(t *testing.T) {
 	// RFC 9728 §2: "resource_signing_alg_values_supported OPTIONAL. JSON
 	//   array containing a list of the JWS [JWS] signing algorithms (alg
 	//   values) [JWA] supported by the protected resource for signed
-	//   responses." ZeroID signs introspection responses and signed
-	//   resource responses with the AS keyset, so the advertised algs
-	//   MUST match the AS's signing algs.
+	//   responses." This field is about the *resource* signing things it
+	//   returns — RFC 9701 signed introspection is the obvious case.
+	//   ZeroID's /oauth2/token/introspect currently returns plain JSON
+	//   (RFC 7662), so advertising signing algs would overclaim. When
+	//   RFC 9701 lands the field gets added in that PR.
 	body := fetchPRMetadata(t)
-	raw, _ := body["resource_signing_alg_values_supported"].([]any)
-	require.NotEmpty(t, raw, "resource_signing_alg_values_supported expected when the resource signs responses")
-	algs := make(map[string]bool, len(raw))
-	for _, a := range raw {
-		s, ok := a.(string)
-		require.True(t, ok, "every resource_signing_alg_values_supported entry MUST be a string")
-		algs[s] = true
-	}
-	assert.True(t, algs["ES256"], "ES256 MUST be advertised — ZeroID's default signing alg")
+	_, leaked := body["resource_signing_alg_values_supported"]
+	assert.False(t, leaked,
+		"resource_signing_alg_values_supported MUST NOT appear until RFC 9701 signed introspection ships")
 }
 
 // ── RFC 9449 §5.3 — DPoP fields in PRM ──────────────────────────────────────
@@ -159,6 +155,91 @@ func TestRFC9728_S3_WellKnownPathIsExact(t *testing.T) {
 	contentType := resp.Header.Get("Content-Type")
 	assert.True(t, strings.HasPrefix(contentType, "application/json"),
 		"PRM document MUST be served as application/json; got %q", contentType)
+}
+
+func TestRFC9728_S3_GetMethodOnly(t *testing.T) {
+	// RFC 9728 §3.2: "A protected resource metadata document MUST be
+	//   queried using an HTTP GET request." POST/PUT/DELETE to the
+	//   well-known URL MUST NOT succeed; the metadata document is a
+	//   read-only resource.
+	resp := post(t, "/.well-known/oauth-protected-resource", nil, nil)
+	defer resp.Body.Close()
+	assert.NotEqual(t, http.StatusOK, resp.StatusCode,
+		"POST to /.well-known/oauth-protected-resource MUST NOT succeed (RFC 9728 §3.2 — GET only)")
+}
+
+func TestRFC9728_S3_3_ResourceMatchesRequestedURL(t *testing.T) {
+	// RFC 9728 §3.3 (Protected Resource Metadata Validation): "The
+	//   `resource` value returned MUST be identical to the protected
+	//   resource's resource identifier value into which the well-known URI
+	//   path suffix was inserted to create the URL used to retrieve the
+	//   metadata."
+	//
+	// Practically: the `resource` claim in the document must equal the
+	// base URL the client used to fetch it. If they diverge, every client
+	// MUST reject the document — so a misconfigured BaseURL ships a
+	// document no conformant client will trust. Pin it.
+	//
+	// Note on the test harness: helpers_test.go sets BaseURL == Issuer,
+	// so the expected value is testIssuer. In a production deployment
+	// where BaseURL and Issuer diverge, the response carries BaseURL —
+	// that's the existing pre-PR pattern this PR doesn't change.
+	body := fetchPRMetadata(t)
+	res, ok := body["resource"].(string)
+	require.True(t, ok, "resource REQUIRED")
+	assert.Equal(t, testIssuer, res,
+		"PRM resource MUST equal the URL used to fetch it (RFC 9728 §3.3) — caught BaseURL drift")
+}
+
+func TestRFC9728_S3_2_NoEmptyArrayValues(t *testing.T) {
+	// RFC 9728 §3.2 (Protected Resource Metadata Response): "Parameters
+	//   with multiple values are represented as JSON arrays. Parameters
+	//   with zero values MUST be omitted from the response."
+	//
+	// Implementations that emit empty arrays for unsupported features
+	// ship a document conformant clients may interpret ambiguously. Walk
+	// every top-level field and assert no empty array.
+	body := fetchPRMetadata(t)
+	for key, val := range body {
+		if arr, ok := val.([]any); ok {
+			assert.NotEmpty(t, arr,
+				"RFC 9728 §3.2: field %q is an empty array — MUST be omitted instead", key)
+		}
+	}
+}
+
+// ── RFC 9728 §5.1 — WWW-Authenticate Response ───────────────────────────────
+
+func TestRFC9728_S5_1_WWWAuthenticateResourceMetadataNotYetEmitted(t *testing.T) {
+	// RFC 9728 §5.1 (WWW-Authenticate Response) defines the
+	//   `resource_metadata` parameter as "The URL of the protected
+	//   resource metadata," carried in the WWW-Authenticate header that a
+	//   resource server returns on 401.
+	//
+	// This is the breadcrumb that lets a cold agent discover PRM from a
+	// 401 without prior knowledge. ZeroID's bearer-auth middleware does
+	// not currently emit this parameter — that change has wider blast
+	// radius (touches every 401 emission site) and lands as a follow-up.
+	//
+	// Pinning the current state explicitly:
+	//   - If a future change wires the parameter, this test fails and the
+	//     implementer must flip the assertion to verify the breadcrumb
+	//     matches the well-known URL.
+	//   - If the parameter is added inconsistently (some 401s emit it,
+	//     others don't), the failing test localizes the gap.
+	//
+	// Probe with an obviously-invalid bearer on a protected endpoint; we
+	// just need *a* 401 from the bearer-auth middleware path.
+	resp := get(t, adminPath("/identities"), map[string]string{
+		"Authorization": "Bearer not-a-real-token",
+	})
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"protected endpoint with bogus token MUST 401")
+
+	wwwAuth := resp.Header.Get("WWW-Authenticate")
+	assert.NotContains(t, wwwAuth, "resource_metadata=",
+		"RFC 9728 §5.1 breadcrumb not yet emitted — flip this assertion when the middleware change lands")
 }
 
 // ── Cross-document consistency ──────────────────────────────────────────────

@@ -169,16 +169,19 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 //     JWKS — verifiers don't need a separate resource keyset.
 //   - bearer_methods_supported: how to present the access token. ZeroID
 //     accepts the Authorization: Bearer header.
-//   - resource_signing_alg_values_supported: signing algs for any
-//     resource-signed response. Matches the AS signing algs.
+//
+// resource_signing_alg_values_supported is intentionally NOT advertised:
+// RFC 9728 §2 defines it as algs the resource uses *for signed responses*.
+// ZeroID's /oauth2/token/introspect returns plain JSON (RFC 7662), not
+// the JWT envelope from RFC 9701. When signed introspection lands, this
+// field gets added in the same PR — not before.
 func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*ProtectedResourceMetadataOutput, error) {
 	return &ProtectedResourceMetadataOutput{Body: map[string]any{
-		"resource":                              a.baseURL,
-		"resource_name":                         "ZeroID",
-		"authorization_servers":                 []string{a.issuer},
-		"jwks_uri":                              a.baseURL + "/.well-known/jwks.json",
-		"bearer_methods_supported":              []string{"header"},
-		"resource_signing_alg_values_supported": []string{"ES256", "RS256"},
+		"resource":                 a.baseURL,
+		"resource_name":            "ZeroID",
+		"authorization_servers":    []string{a.issuer},
+		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
+		"bearer_methods_supported": []string{"header"},
 		// RFC 9449 §5.3 — PRM-defined DPoP field. ZeroID will mint
 		// DPoP-bound tokens when a client presents a DPoP proof at
 		// /oauth2/token, but does not currently *require* DPoP for
