@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -621,7 +622,30 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	if req.ApplicationID != "" {
 		resolved, err := s.identitySvc.GetIdentity(ctx, req.ApplicationID, req.AccountID, req.ProjectID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
+			// Distinguish "row not found / wrong tenant" (client error,
+			// 400 invalid_request) from transient infrastructure failures
+			// (server error, 500 — retriable by the client). The bun
+			// repository wraps sql.ErrNoRows for "no row matches id +
+			// account_id + project_id" — that covers both genuine-missing
+			// and IDOR-protected cross-tenant lookups. Anything else is
+			// an infra problem (DB unreachable, query timeout, etc.) the
+			// client can't act on; 500 with the cause preserved for logs
+			// lets the client retry instead of getting a misleading 400.
+			//
+			// Previously this branch used plain fmt.Errorf, which
+			// extractOAuthError didn't match as *OAuthError — every
+			// failure ended up as a 500 server_error regardless of cause.
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, oauthBadRequestCause(
+					oautherror.InvalidRequest,
+					fmt.Sprintf("application_id %s not found or access denied", req.ApplicationID),
+					err,
+				)
+			}
+			return nil, oauthServerError(
+				fmt.Sprintf("failed to look up application_id %s", req.ApplicationID),
+				err,
+			)
 		}
 		if !resolved.Status.IsUsable() {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
