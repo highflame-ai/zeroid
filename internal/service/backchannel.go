@@ -43,6 +43,15 @@ type BackchannelService struct {
 	notifier            BackchannelNotifierFunc
 	notifyDispatchAsync bool // overridable for tests
 
+	// rarValidators is the deployer-supplied per-type validator registry
+	// for RFC 9396 authorization_details. Guarded by mu (the same lock
+	// that protects notifier) so a concurrent Register/Unregister cannot
+	// race with a bc-authorize handler reading the map. Map writes are
+	// rare (deployer-side at server-init); reads are per-request — but
+	// the map is small (single-digit entries in practice) so RLock + map
+	// lookup is well under microsecond cost.
+	rarValidators map[string]AuthorizationDetailValidator
+
 	// svcCtx is the long-lived context used by detached notifier goroutines.
 	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
 	// can wind down on graceful shutdown instead of leaking past the server's
@@ -65,18 +74,25 @@ type BackchannelService struct {
 // that internal callers don't need to import the top-level package.
 type BackchannelNotifierFunc func(ctx context.Context, n BackchannelNotification) error
 
+// AuthorizationDetailValidator is the internal alias for the public
+// zeroid.AuthorizationDetailValidator. See the top-level package's doc
+// for semantics; the wrapper in server.go bridges the two type names so
+// internal callers don't reach across packages.
+type AuthorizationDetailValidator func(raw json.RawMessage) error
+
 // BackchannelNotification is the payload delivered to the notifier.
 // Mirrors the public zeroid.BackchannelNotification shape — the top-level
 // Server.SetBackchannelNotifier hook wraps the public type into this one.
 type BackchannelNotification struct {
-	AuthReqID      string
-	AccountID      string
-	ProjectID      string
-	ClientID       string
-	LoginHint      string
-	Scope          string
-	BindingMessage string
-	ExpiresAt      time.Time
+	AuthReqID            string
+	AccountID            string
+	ProjectID            string
+	ClientID             string
+	LoginHint            string
+	Scope                string
+	BindingMessage       string
+	ExpiresAt            time.Time
+	AuthorizationDetails domain.AuthorizationDetails
 }
 
 // BackchannelServiceConfig bounds the request lifecycle.
@@ -200,6 +216,42 @@ func (s *BackchannelService) SetNotifyDispatchSync(sync bool) {
 	s.notifyDispatchAsync = !sync
 }
 
+// RegisterAuthorizationDetailValidator wires a deployer-supplied validator
+// for the named RAR `type` discriminator. Replaces any prior validator for
+// the same type. Safe to call concurrently with bc-authorize handling —
+// the registry is read under RLock per request.
+func (s *BackchannelService) RegisterAuthorizationDetailValidator(typ string, fn AuthorizationDetailValidator) {
+	if typ == "" || fn == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.rarValidators == nil {
+		s.rarValidators = make(map[string]AuthorizationDetailValidator)
+	}
+
+	s.rarValidators[typ] = fn
+}
+
+// UnregisterAuthorizationDetailValidator removes the validator for typ if
+// one was registered. No-op when no validator is registered.
+func (s *BackchannelService) UnregisterAuthorizationDetailValidator(typ string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rarValidators, typ)
+}
+
+// rarValidatorFor returns the registered validator for typ, or nil if none.
+// Reads under RLock so concurrent bc-authorize handlers don't serialise.
+func (s *BackchannelService) rarValidatorFor(typ string) AuthorizationDetailValidator {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.rarValidators[typ]
+}
+
 // SetPingTransport overrides the outbound HTTP transport used for CIBA ping
 // dispatch. Tests inject a capturing RoundTripper here so they don't have to
 // stand up a real httptest listener. Pass nil to restore the default
@@ -231,6 +283,14 @@ type CreateAuthRequestInput struct {
 	// credential in the ping callback's Authorization header. The client
 	// uses it to authenticate the inbound notification.
 	ClientNotificationToken string
+	// AuthorizationDetailsRaw is the RFC 9396 `authorization_details` JSON
+	// array as supplied on the bc-authorize form, before parsing or
+	// validation. Empty when the client omits the parameter (legacy CIBA
+	// behavior unchanged). The service validates outer shape, runs any
+	// registered per-type validators, and persists the bytes verbatim so
+	// downstream consumers (the BackchannelNotifier, the future token-embed
+	// path) see the exact JSON the client supplied.
+	AuthorizationDetailsRaw []byte
 }
 
 // CreateAuthRequestOutput is returned to the client on success.
@@ -321,6 +381,22 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		)
 	}
 
+	// RFC 9396 Rich Authorization Requests (RAR).
+	//
+	// Three steps in order:
+	//   1. Size-cap the raw bytes before parsing so a multi-MB payload is
+	//      rejected before allocating the typed slice.
+	//   2. Parse with domain.ParseAuthorizationDetails — enforces outer
+	//      shape (array of objects, each with a non-empty string `type`).
+	//   3. Run any deployer-registered per-type validator. RFC 9396 §5.4
+	//      specifies `invalid_authorization_details` as the OAuth error
+	//      code for any RAR-specific rejection; map both the outer-shape
+	//      failure and any per-type rejection to that code.
+	rarDetails, rarRaw, err := s.parseAndValidateAuthorizationDetails(in.AuthorizationDetailsRaw)
+	if err != nil {
+		return nil, err
+	}
+
 	expiry := time.Duration(in.RequestedExpiry) * time.Second
 	if expiry <= 0 {
 		expiry = s.cfg.DefaultExpiry
@@ -343,6 +419,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		LoginHint:                  in.LoginHint,
 		Scope:                      in.Scope,
 		BindingMessage:             bindingMsg,
+		AuthorizationDetailsRaw:    rarRaw,
 		NotificationMode:           notificationMode,
 		ClientNotificationEndpoint: notificationEndpoint,
 		ClientNotificationToken:    in.ClientNotificationToken,
@@ -355,7 +432,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		return nil, oauthServerError("failed to persist backchannel auth request", err)
 	}
 
-	s.dispatchNotifier(ctx, row)
+	s.dispatchNotifierWithRAR(ctx, row, rarDetails)
 
 	return &CreateAuthRequestOutput{
 		AuthReqID: authReqID,
@@ -651,45 +728,141 @@ func (s *BackchannelService) DeleteExpired(ctx context.Context, now time.Time) (
 	return s.repo.DeleteExpired(ctx, now)
 }
 
-// dispatchNotifier fires the notifier hook on a goroutine so notifier latency
-// (third-party push providers, SMS APIs) does not block the bc-authorize
-// response. Failures are recorded on the row's last_notify_error for
-// operator debugging — the request remains valid because the user may
-// approve through another channel.
+// parseAndValidateAuthorizationDetails enforces RFC 9396 §2 outer shape on
+// the raw `authorization_details` JSON, then runs any registered per-type
+// validators. Returns:
+//   - the typed slice (nil-or-empty for callers that omit the parameter,
+//     keeping the legacy CIBA path branch-free),
+//   - the canonical raw bytes to persist on the row (nil if the client
+//     supplied nothing, to preserve the empty-array DEFAULT semantics in
+//     the Postgres column),
+//   - an OAuth-shaped error mapped to invalid_authorization_details for
+//     any rejection (RFC 9396 §5.4).
+func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (domain.AuthorizationDetails, []byte, error) {
+	// emptyRAR is the canonical persisted value for "client supplied no
+	// authorization_details" — the same JSON shape as the column's DB
+	// default. We persist this explicitly (instead of letting bun emit
+	// NULL via a `nullzero` tag and relying on Postgres to swap NULL for
+	// DEFAULT — which Postgres does not do) so the insert path is
+	// independent of bun's zero-value handling. Belt-and-suspenders with
+	// the migration's NOT NULL DEFAULT '[]'::jsonb.
+	emptyRAR := []byte("[]")
+
+	if len(raw) == 0 {
+		return nil, emptyRAR, nil
+	}
+
+	if len(raw) > domain.MaxAuthorizationDetailsBytes {
+		return nil, nil, oauthBadRequestCause(
+			"invalid_authorization_details",
+			fmt.Sprintf("authorization_details exceeds %d bytes", domain.MaxAuthorizationDetailsBytes),
+			fmt.Errorf("%w: length %d > cap %d",
+				domain.ErrAuthorizationDetailsOversized,
+				len(raw), domain.MaxAuthorizationDetailsBytes),
+		)
+	}
+
+	parsed, err := domain.ParseAuthorizationDetails(raw)
+	if err != nil {
+		return nil, nil, oauthBadRequestCause(
+			"invalid_authorization_details",
+			"authorization_details is not a valid RFC 9396 array of typed objects",
+			err,
+		)
+	}
+
+	if len(parsed) == 0 {
+		// Empty array or `null` — treat as if the client omitted the
+		// parameter. Persist the canonical empty array so the row's
+		// authorization_details column always carries a valid JSONB
+		// value, never NULL.
+		return nil, emptyRAR, nil
+	}
+
+	// Run any deployer-registered per-type validator. Types without a
+	// registration pass through (outer-shape-only validation is the
+	// permissive default). Strict allow-listing (reject unknown types
+	// during bc-authorize) is not expressible via this registry — see
+	// the public docs on Server.RegisterAuthorizationDetailValidator.
+	for i, d := range parsed {
+		fn := s.rarValidatorFor(d.Type)
+		if fn == nil {
+			continue
+		}
+
+		// runRARValidator wraps fn in a defer-recover so a buggy
+		// deployer-registered validator (nil-deref, library panic) maps
+		// to invalid_authorization_details rather than escaping as
+		// HTTP 500 via chi's Recoverer. RFC 9396 §5.4 is the only error
+		// code clients should see for any RAR-side rejection.
+		if vErr := runRARValidator(fn, d.Raw); vErr != nil {
+			return nil, nil, oauthBadRequestCause(
+				"invalid_authorization_details",
+				fmt.Sprintf("authorization_details[%d] (type=%q): %s", i, d.Type, vErr.Error()),
+				vErr,
+			)
+		}
+	}
+
+	return parsed, raw, nil
+}
+
+// runRARValidator invokes a deployer-registered validator and converts any
+// panic into an error so the caller can map it to the RFC 9396 §5.4 OAuth
+// error code uniformly with explicit-error returns.
+func runRARValidator(fn AuthorizationDetailValidator, raw json.RawMessage) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("validator panicked: %v", r)
+		}
+	}()
+
+	return fn(raw)
+}
+
+// dispatchNotifierWithRAR fires the BackchannelNotifier hook with the parsed
+// authorization_details threaded through to the notification payload.
 //
-// Tests can flip dispatch to synchronous via SetNotifyDispatchSync(true).
-func (s *BackchannelService) dispatchNotifier(ctx context.Context, row *domain.BackchannelAuthRequest) {
+// Runs on a goroutine by default so notifier latency (third-party push
+// providers, SMS APIs) does not block the bc-authorize response. Failures
+// are recorded on the row's last_notify_error for operator debugging —
+// the request remains valid because the user may approve through another
+// channel. Tests can flip dispatch to synchronous via
+// SetNotifyDispatchSync(true).
+//
+// The inbound request's ctx is intentionally NOT carried into the dispatch:
+// the deliver goroutine parents on the service's long-lived svcCtx so a
+// client disconnect can't cancel an already-fired approval prompt. Graceful
+// shutdown still cancels deliveries via Server.Shutdown → Stop().
+func (s *BackchannelService) dispatchNotifierWithRAR(
+	_ context.Context,
+	row *domain.BackchannelAuthRequest,
+	details domain.AuthorizationDetails,
+) {
+	// Single RLock snapshot of all the shared state the dispatch path
+	// needs. Holding RLock across the snapshot prevents a Stop() racing
+	// in between two separate acquisitions and leaving us with a
+	// half-stale view (e.g., notifier installed, svcCtx already nil).
 	s.mu.RLock()
 	fn := s.notifier
 	async := s.notifyDispatchAsync
+	parent := s.svcCtx
 	s.mu.RUnlock()
-	if fn == nil {
+
+	if fn == nil || parent == nil {
 		return
 	}
 
 	payload := BackchannelNotification{
-		AuthReqID:      row.AuthReqID,
-		AccountID:      row.AccountID,
-		ProjectID:      row.ProjectID,
-		ClientID:       row.ClientID,
-		LoginHint:      row.LoginHint,
-		Scope:          row.Scope,
-		BindingMessage: row.BindingMessage,
-		ExpiresAt:      row.ExpiresAt,
-	}
-
-	// Parent the detached context on svcCtx (cancelled by Server.Shutdown via
-	// BackchannelService.Stop) instead of context.Background — that way a
-	// graceful shutdown cancels in-flight notifier deliveries instead of
-	// letting them outlive the server. We still detach from the inbound
-	// request's ctx so a client disconnect doesn't kill the notification.
-	s.mu.RLock()
-	parent := s.svcCtx
-	s.mu.RUnlock()
-	if parent == nil {
-		// Stop() has been called; service is shutting down — drop the
-		// notification rather than firing into the void.
-		return
+		AuthReqID:            row.AuthReqID,
+		AccountID:            row.AccountID,
+		ProjectID:            row.ProjectID,
+		ClientID:             row.ClientID,
+		LoginHint:            row.LoginHint,
+		Scope:                row.Scope,
+		BindingMessage:       row.BindingMessage,
+		ExpiresAt:            row.ExpiresAt,
+		AuthorizationDetails: details,
 	}
 
 	deliver := func() {

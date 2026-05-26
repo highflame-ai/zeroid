@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -337,6 +338,15 @@ type BcAuthorizeInput struct {
 		BindingMessage          string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
 		RequestedExpiry         int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
 		ClientNotificationToken string `json:"client_notification_token,omitempty" doc:"Bearer the server echoes in the ping callback (required for ping mode)"`
+		// AuthorizationDetails is the RFC 9396 Rich Authorization Requests
+		// payload — a JSON array of typed objects describing what is being
+		// authorized at a finer granularity than scope. ZeroID validates
+		// the outer shape (array of objects, each with a non-empty string
+		// `type` field) and runs any registered per-type validators; the
+		// raw bytes are persisted on the auth request row and delivered
+		// to the BackchannelNotifier hook for typed approval-prompt
+		// rendering. Empty / omitted keeps the legacy CIBA flow unchanged.
+		AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty" doc:"RFC 9396 Rich Authorization Requests payload (JSON array of typed objects)"`
 	}
 }
 
@@ -365,6 +375,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		BindingMessage:          input.Body.BindingMessage,
 		RequestedExpiry:         input.Body.RequestedExpiry,
 		ClientNotificationToken: input.Body.ClientNotificationToken,
+		AuthorizationDetailsRaw: []byte(input.Body.AuthorizationDetails),
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")

@@ -94,6 +94,15 @@ type BackchannelNotification struct {
 	Scope          string
 	BindingMessage string
 	ExpiresAt      time.Time
+	// AuthorizationDetails carries the RFC 9396 RAR payload parsed at
+	// bc-authorize time. Empty when the client did not supply
+	// authorization_details (legacy CIBA flow), or when the payload was
+	// rejected by a registered per-type validator (in which case the
+	// request was never created and this notifier is not invoked).
+	// Notifiers should render typed approval prompts from this field when
+	// non-empty; scope and binding_message remain the fallback for clients
+	// that have not adopted RAR.
+	AuthorizationDetails domain.AuthorizationDetails
 }
 
 // BackchannelNotifier delivers a CIBA approval prompt to the end user via an
@@ -104,3 +113,29 @@ type BackchannelNotification struct {
 // debuggability but does not block request creation — the user may approve
 // through another channel.
 type BackchannelNotifier func(ctx context.Context, n BackchannelNotification) error
+
+// AuthorizationDetailValidator is the deployer-supplied per-type validator
+// for RFC 9396 RAR `authorization_details` entries. Registered against a
+// specific `type` discriminator via Server.RegisterAuthorizationDetailValidator;
+// invoked at bc-authorize time for every element whose `type` field matches.
+//
+// The validator receives the original JSON bytes of the element (preserving
+// key order and any deployer-specific fields beyond `type`). It MUST return
+// nil to accept or a descriptive error to reject — a rejection fails the
+// entire bc-authorize request with OAuth error `invalid_authorization_details`
+// (RFC 9396 §5.4).
+//
+// The registry is strictly per-`type`: unregistered `type` values pass
+// outer-shape validation and are forwarded to the BackchannelNotifier
+// with no extra checks. A type-allowlist that REJECTS unknown types is
+// not expressible via this hook in the current release — there is no
+// catch-all / fallback registration, and the BackchannelNotifier fires
+// after the bc-authorize response is sent (an error there records
+// `last_notify_error` on the row but does not surface as a 400 to the
+// client). Deployers that need strict allow-listing today must front
+// zeroid with a thin shim that screens `authorization_details` before
+// forwarding. A future release may add a fallback validator hook.
+//
+// Validators run synchronously on the bc-authorize request path; keep them
+// fast (no network I/O, no DB queries beyond in-process caches).
+type AuthorizationDetailValidator func(raw json.RawMessage) error

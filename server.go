@@ -538,16 +538,49 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 	}
 	s.backchannelSvc.SetNotifier(func(ctx context.Context, n service.BackchannelNotification) error {
 		return fn(ctx, BackchannelNotification{
-			AuthReqID:      n.AuthReqID,
-			AccountID:      n.AccountID,
-			ProjectID:      n.ProjectID,
-			ClientID:       n.ClientID,
-			LoginHint:      n.LoginHint,
-			Scope:          n.Scope,
-			BindingMessage: n.BindingMessage,
-			ExpiresAt:      n.ExpiresAt,
+			AuthReqID:            n.AuthReqID,
+			AccountID:            n.AccountID,
+			ProjectID:            n.ProjectID,
+			ClientID:             n.ClientID,
+			LoginHint:            n.LoginHint,
+			Scope:                n.Scope,
+			BindingMessage:       n.BindingMessage,
+			ExpiresAt:            n.ExpiresAt,
+			AuthorizationDetails: n.AuthorizationDetails,
 		})
 	})
+}
+
+// RegisterAuthorizationDetailValidator wires a deployer-supplied per-type
+// validator for RFC 9396 RAR `authorization_details` entries. Invoked at
+// bc-authorize time for every element whose `type` discriminator matches.
+//
+// The registry is strictly per-`type`. Unregistered `type` values pass
+// outer-shape validation and are forwarded to the BackchannelNotifier
+// with no extra checks — there is no catch-all / fallback registration.
+// A strict allowlist that rejects unknown `type` values during the
+// bc-authorize call is not expressible via this hook today; the
+// BackchannelNotifier fires after the response is sent, so a
+// notifier-side rejection records `last_notify_error` but does not
+// surface to the client as a 400. Deployers needing that policy must
+// front zeroid with a thin shim that screens `authorization_details`
+// before forwarding.
+//
+// Registering twice with the same type replaces the previous validator;
+// passing nil unregisters. Safe to call any time after NewServer.
+func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn AuthorizationDetailValidator) {
+	if s.backchannelSvc == nil {
+		return
+	}
+
+	if fn == nil {
+		s.backchannelSvc.UnregisterAuthorizationDetailValidator(typ)
+		return
+	}
+
+	// Wrap the public-typed validator into the service-internal alias so the
+	// service layer stays decoupled from the top-level package's type names.
+	s.backchannelSvc.RegisterAuthorizationDetailValidator(typ, service.AuthorizationDetailValidator(fn))
 }
 
 // SetBackchannelNotifyDispatchSync forces synchronous notifier dispatch.
@@ -820,6 +853,18 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/bc-authorize":     {},
 }
 
+// jsonShapedFormFields are OAuth form parameters whose value is itself JSON
+// (a typed array or object), not a scalar string. The form-compat middleware
+// special-cases these so the downstream JSON binder sees the original shape
+// instead of the default string-flatten (which would quote the JSON and
+// break array/object binding silently).
+//
+// Today only RFC 9396 `authorization_details` qualifies; extend this set as
+// new JSON-shaped OAuth parameters land.
+var jsonShapedFormFields = map[string]struct{}{
+	"authorization_details": {},
+}
+
 // mediaTypeEquals parses a Content-Type header and reports whether the media
 // type portion matches want (case-insensitive per RFC 7231 §3.1.1.1).
 // Parameters like charset are ignored for the comparison.
@@ -871,7 +916,7 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		flat := make(map[string]string, len(r.PostForm))
+		flat := make(map[string]any, len(r.PostForm))
 		for k, vs := range r.PostForm {
 			// RFC 6749 §3.1: request parameters MUST NOT be included more
 			// than once. Duplicate keys are rejected rather than silently
@@ -887,6 +932,19 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 			// as if they were omitted. Drop so downstream handlers see a
 			// missing field, not a bound empty string.
 			if vs[0] == "" {
+				continue
+			}
+
+			// JSON-shaped fields (e.g. RFC 9396 authorization_details): pass
+			// the form value through as raw JSON when it parses, so the
+			// downstream JSON binder sees the original array/object shape.
+			// When the value is not valid JSON, fall back to the default
+			// string-flatten — the downstream parser will then reject it
+			// with the correct OAuth error code (e.g.
+			// invalid_authorization_details per RFC 9396 §5.4) rather than
+			// a generic 400 from this middleware.
+			if _, jsonShaped := jsonShapedFormFields[k]; jsonShaped && gojson.Valid([]byte(vs[0])) {
+				flat[k] = gojson.RawMessage(vs[0])
 				continue
 			}
 			flat[k] = vs[0]
