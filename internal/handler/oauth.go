@@ -467,6 +467,15 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 // admin error. The admin endpoints are not OAuth token endpoints, so the
 // RFC 6749 §5.2 error_code/error_description envelope would be misleading
 // here; we use plain HTTP semantics instead.
+//
+// TODO(RFC 9728 §5.1): the 401 branch below should emit the
+// resource_metadata breadcrumb on its WWW-Authenticate header, matching
+// the bearer-auth, DCR, and forward-auth paths PR #166 covered.
+// huma.Error401Unauthorized doesn't accept response headers, so this
+// needs a deeper huma error-injection pattern (e.g. a custom error type
+// implementing huma.StatusError + a Headers() method, or a response
+// hook). Deferred until that pattern is established — tracked in #165
+// follow-up.
 func mapBackchannelAdminError(err error) error {
 	var oauthErr *service.OAuthError
 	if errors.As(err, &oauthErr) {

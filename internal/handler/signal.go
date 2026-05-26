@@ -144,6 +144,13 @@ func (a *API) listSignalsOp(ctx context.Context, input *SignalListInput) (*Signa
 func (a *API) streamSignalsHandler(w http.ResponseWriter, r *http.Request) {
 	tenant, err := internalMiddleware.GetTenant(r.Context())
 	if err != nil {
+		// TODO(RFC 9728 §5.1): emit the resource_metadata breadcrumb in the
+		// WWW-Authenticate header on this 401, alongside the rest of the
+		// Bearer-protected paths covered by PR #166. Deferred because this
+		// endpoint's 401 path is "missing admin tenant context" (different
+		// failure class from a Bearer-auth failure), not the cold-start
+		// discovery case the breadcrumb is most valuable for. See #165
+		// follow-up.
 		respondWithError(w, http.StatusUnauthorized, domain.ErrCodeUnauthorized, "missing tenant context")
 		return
 	}
