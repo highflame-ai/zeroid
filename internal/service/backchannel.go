@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -308,15 +309,15 @@ type CreateAuthRequestOutput struct {
 // error responses without re-classification.
 func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAuthRequestInput) (*CreateAuthRequestOutput, error) {
 	if in.ClientID == "" {
-		return nil, oauthBadRequest("invalid_request", "client_id is required for bc-authorize")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "client_id is required for bc-authorize")
 	}
 	if in.AccountID == "" || in.ProjectID == "" {
-		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for bc-authorize")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for bc-authorize")
 	}
 	if in.LoginHint == "" {
 		// CIBA Core §7.1: at least one of login_hint / login_hint_token / id_token_hint
 		// MUST be supplied. PR 1 supports login_hint only.
-		return nil, oauthBadRequest("invalid_request", "login_hint is required")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "login_hint is required")
 	}
 
 	// Validate client exists in the tenant scope. We don't enforce a
@@ -325,7 +326,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	// user's approval, not the client credential.
 	client, err := s.oauthClientSvc.GetClientByClientID(ctx, in.ClientID)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_client", fmt.Sprintf("unknown client %s", in.ClientID), err)
+		return nil, oauthBadRequestCause(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID), err)
 	}
 
 	// Determine notification mode. CIBA Core §10 makes the delivery mode a
@@ -342,11 +343,11 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	switch declared {
 	case domain.BackchannelNotificationPing, domain.BackchannelNotificationPush:
 		if in.ClientNotificationToken == "" {
-			return nil, oauthBadRequest("invalid_request",
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
 				fmt.Sprintf("backchannel_token_delivery_mode=%s requires client_notification_token on bc-authorize", declared))
 		}
 		if client.ClientNotificationEndpoint == "" {
-			return nil, oauthBadRequest("invalid_request",
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
 				"client_notification_token requires the client to have a registered client_notification_endpoint")
 		}
 		// Defence-in-depth: re-validate the registered endpoint at request time.
@@ -357,7 +358,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		//      hostname might have been DNS-rebound to point at a private IP
 		//      since registration — this catches that (GHSA-599q-j34m-33vc).
 		if err := validateNotificationEndpoint(ctx, client.ClientNotificationEndpoint, s.cfg.AllowPrivateNotificationEndpoints); err != nil {
-			return nil, oauthBadRequestCause("invalid_request", "client_notification_endpoint is invalid", err)
+			return nil, oauthBadRequestCause(oautherror.InvalidRequest, "client_notification_endpoint is invalid", err)
 		}
 		notificationMode = declared
 		notificationEndpoint = client.ClientNotificationEndpoint
@@ -375,7 +376,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	bindingMsg := in.BindingMessage
 	if s.cfg.MaxBindingMessageBytes > 0 && len(bindingMsg) > s.cfg.MaxBindingMessageBytes {
 		return nil, oauthBadRequestCause(
-			"invalid_request",
+			oautherror.InvalidRequest,
 			fmt.Sprintf("binding_message exceeds maximum length of %d bytes", s.cfg.MaxBindingMessageBytes),
 			fmt.Errorf("%w: length %d > max %d", ErrInvalidBindingMessage, len(bindingMsg), s.cfg.MaxBindingMessageBytes),
 		)
@@ -460,24 +461,24 @@ type ApproveInput struct {
 //   - access_denied: row already in a terminal state, expired, or wrong tenant
 func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error {
 	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" || in.SubjectID == "" {
-		return oauthBadRequest("invalid_request", "auth_req_id, account_id, project_id, subject_id are required to approve")
+		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id, subject_id are required to approve")
 	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err != nil {
 		if errors.Is(err, postgres.ErrBackchannelRequestNotFound) {
-			return oauthBadRequest("invalid_request", "unknown auth_req_id")
+			return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 		}
 		return oauthServerError("failed to load backchannel auth request", err)
 	}
 	if row.AccountID != in.AccountID || row.ProjectID != in.ProjectID {
 		// Don't leak existence across tenants — same opaque error as "unknown".
-		return oauthBadRequest("invalid_request", "unknown auth_req_id")
+		return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 	}
 	if row.Status != domain.BackchannelStatusPending {
-		return oauthBadRequest("access_denied", fmt.Sprintf("request is in status %q and cannot be approved", row.Status))
+		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be approved", row.Status))
 	}
 	if time.Now().After(row.ExpiresAt) {
-		return oauthBadRequest("access_denied", "request has expired")
+		return oauthBadRequest(oautherror.AccessDenied, "request has expired")
 	}
 
 	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, in.SubjectID, in.SubjectEmail, in.SubjectName)
@@ -486,7 +487,7 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 	}
 	if affected == 0 {
 		// Lost a race against expiry sweep or a concurrent deny.
-		return oauthBadRequest("access_denied", "request could not be approved (concurrent modification or expiry)")
+		return oauthBadRequest(oautherror.AccessDenied, "request could not be approved (concurrent modification or expiry)")
 	}
 	// Re-load so callbacks see the persisted approved_subject_* fields and
 	// the updated status. Ping/push dispatchers consume these.
@@ -509,27 +510,27 @@ type DenyInput struct {
 // Deny transitions the request to denied. Same tenant-isolation guarantees as Approve.
 func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" {
-		return oauthBadRequest("invalid_request", "auth_req_id, account_id, project_id are required to deny")
+		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id are required to deny")
 	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err != nil {
 		if errors.Is(err, postgres.ErrBackchannelRequestNotFound) {
-			return oauthBadRequest("invalid_request", "unknown auth_req_id")
+			return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 		}
 		return oauthServerError("failed to load backchannel auth request", err)
 	}
 	if row.AccountID != in.AccountID || row.ProjectID != in.ProjectID {
-		return oauthBadRequest("invalid_request", "unknown auth_req_id")
+		return oauthBadRequest(oautherror.InvalidRequest, "unknown auth_req_id")
 	}
 	if row.Status != domain.BackchannelStatusPending {
-		return oauthBadRequest("access_denied", fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
+		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
 	}
 	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request denied", err)
 	}
 	if affected == 0 {
-		return oauthBadRequest("access_denied", "request could not be denied (concurrent modification or expiry)")
+		return oauthBadRequest(oautherror.AccessDenied, "request could not be denied (concurrent modification or expiry)")
 	}
 	persisted, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err == nil {
@@ -592,31 +593,31 @@ type RedeemInput struct {
 // authorization_pending, slow_down, access_denied, expired_token, invalid_grant.
 func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domain.AccessToken, error) {
 	if in.AuthReqID == "" {
-		return nil, oauthBadRequest("invalid_grant", "auth_req_id is required for grant_type=urn:openid:params:grant-type:ciba")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id is required for grant_type=urn:openid:params:grant-type:ciba")
 	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err != nil {
 		if errors.Is(err, postgres.ErrBackchannelRequestNotFound) {
-			return nil, oauthBadRequest("invalid_grant", "unknown auth_req_id")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "unknown auth_req_id")
 		}
 		return nil, oauthServerError("failed to load backchannel auth request", err)
 	}
 	if in.ClientID != "" && row.ClientID != in.ClientID {
 		// Mismatch means a different client is polling — refuse without leaking detail.
-		return nil, oauthBadRequest("invalid_grant", "auth_req_id was not issued to this client")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id was not issued to this client")
 	}
 
 	// Push mode never permits polling — the token is delivered via the
 	// callback exactly once. Allowing both would double-deliver and break
 	// single-use semantics.
 	if row.NotificationMode == domain.BackchannelNotificationPush {
-		return nil, oauthBadRequest("access_denied", "auth_req_id is delivered via push callback; polling is not permitted")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id is delivered via push callback; polling is not permitted")
 	}
 
 	now := time.Now()
 	if now.After(row.ExpiresAt) && row.Status == domain.BackchannelStatusPending {
 		// Race against the sweep: surface expired_token immediately.
-		return nil, oauthBadRequest("expired_token", "the backchannel authentication request has expired")
+		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
 	}
 
 	switch row.Status {
@@ -624,29 +625,29 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		// Enforce the slow_down floor — clients that poll faster than
 		// MinPollInterval get a 400 even if their previous response said they could.
 		if row.LastPolledAt != nil && now.Sub(*row.LastPolledAt) < s.cfg.MinPollInterval {
-			return nil, oauthBadRequest("slow_down", "polling interval must be at least the value returned by the bc-authorize response")
+			return nil, oauthBadRequest(oautherror.SlowDown, "polling interval must be at least the value returned by the bc-authorize response")
 		}
 		if err := s.repo.TouchPoll(ctx, in.AuthReqID, now); err != nil {
 			log.Warn().Err(err).Str("auth_req_id", in.AuthReqID).Msg("failed to record poll timestamp")
 		}
-		return nil, oauthBadRequest("authorization_pending", "the user has not yet acted on the authentication request")
+		return nil, oauthBadRequest(oautherror.AuthorizationPending, "the user has not yet acted on the authentication request")
 
 	case domain.BackchannelStatusDenied:
-		return nil, oauthBadRequest("access_denied", "the user denied the authentication request")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "the user denied the authentication request")
 
 	case domain.BackchannelStatusExpired:
-		return nil, oauthBadRequest("expired_token", "the backchannel authentication request has expired")
+		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
 
 	case domain.BackchannelStatusIssued:
 		// A successful token was already minted for this auth_req_id. Refuse
 		// re-redemption — auth codes / auth_req_ids are single-use.
-		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 
 	case domain.BackchannelStatusApproved:
 		return s.issueTokenForApprovedRow(ctx, row, in.DPoPKeyThumbprint)
 
 	default:
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("unexpected request status %q", row.Status))
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("unexpected request status %q", row.Status))
 	}
 }
 
@@ -677,7 +678,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		return nil, oauthServerError("failed to commit issuance state", mErr)
 	}
 	if affected == 0 {
-		return nil, oauthBadRequest("access_denied", "auth_req_id has already been redeemed")
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 	}
 
 	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
@@ -754,7 +755,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 
 	if len(raw) > domain.MaxAuthorizationDetailsBytes {
 		return nil, nil, oauthBadRequestCause(
-			"invalid_authorization_details",
+			oautherror.InvalidAuthorizationDetails,
 			fmt.Sprintf("authorization_details exceeds %d bytes", domain.MaxAuthorizationDetailsBytes),
 			fmt.Errorf("%w: length %d > cap %d",
 				domain.ErrAuthorizationDetailsOversized,
@@ -765,7 +766,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 	parsed, err := domain.ParseAuthorizationDetails(raw)
 	if err != nil {
 		return nil, nil, oauthBadRequestCause(
-			"invalid_authorization_details",
+			oautherror.InvalidAuthorizationDetails,
 			"authorization_details is not a valid RFC 9396 array of typed objects",
 			err,
 		)
@@ -797,7 +798,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 		// code clients should see for any RAR-side rejection.
 		if vErr := runRARValidator(fn, d.Raw); vErr != nil {
 			return nil, nil, oauthBadRequestCause(
-				"invalid_authorization_details",
+				oautherror.InvalidAuthorizationDetails,
 				fmt.Sprintf("authorization_details[%d] (type=%q): %s", i, d.Type, vErr.Error()),
 				vErr,
 			)
@@ -956,7 +957,7 @@ func (s *BackchannelService) dispatchPushDenial(ctx context.Context, row *domain
 		return
 	}
 	payload := map[string]any{
-		"error":             "access_denied",
+		"error":             oautherror.AccessDenied,
 		"error_description": "the user denied the authentication request",
 		"auth_req_id":       row.AuthReqID,
 	}
