@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
+
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
 func (a *API) registerAuthVerifyRoute(router chi.Router) {
@@ -49,7 +52,7 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	token, ok := strings.CutPrefix(authHeader, "Bearer ")
 	token = strings.TrimSpace(token)
 	if !ok || token == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_request"`)
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error=%q`, oautherror.InvalidRequest))
 		http.Error(w, `{"error":"invalid_authorization_header"}`, http.StatusUnauthorized)
 		return
 	}
@@ -57,14 +60,14 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	claims, err := a.oauthSvc.Introspect(r.Context(), token)
 	if err != nil {
 		log.Error().Err(err).Msg("auth/verify: introspect error")
-		http.Error(w, `{"error":"server_error"}`, http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, oautherror.ServerError), http.StatusInternalServerError)
 		return
 	}
 
 	active, _ := claims["active"].(bool)
 	if !active {
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
-		http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error=%q`, oautherror.InvalidToken))
+		http.Error(w, fmt.Sprintf(`{"error":%q}`, oautherror.InvalidToken), http.StatusUnauthorized)
 		return
 	}
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
@@ -77,7 +78,7 @@ func extractOAuthError(err error) (code, description string, status int) {
 		return "policy_violation", err.Error(), http.StatusBadRequest
 	}
 	if errors.Is(err, service.ErrScopesNotAllowed) {
-		return "insufficient_scope", err.Error(), http.StatusBadRequest
+		return oautherror.InsufficientScope, err.Error(), http.StatusBadRequest
 	}
 	// Identity gates can fire at the chokepoint after the per-grant
 	// check passed (TOCTOU window). Map to stable error_description
@@ -87,15 +88,15 @@ func extractOAuthError(err error) (code, description string, status int) {
 	// the literal expires_at timestamp) and produce a different string
 	// shape than the per-grant path.
 	if errors.Is(err, domain.ErrIdentityExpired) {
-		return "invalid_grant", "identity_expired", http.StatusBadRequest
+		return oautherror.InvalidGrant, "identity_expired", http.StatusBadRequest
 	}
 	if errors.Is(err, domain.ErrIdentityNotUsable) {
-		return "invalid_grant", "identity is suspended or deactivated", http.StatusBadRequest
+		return oautherror.InvalidGrant, "identity is suspended or deactivated", http.StatusBadRequest
 	}
 	if errors.Is(err, domain.ErrCredentialExpired) {
-		return "invalid_grant", "credential_expired", http.StatusBadRequest
+		return oautherror.InvalidGrant, "credential_expired", http.StatusBadRequest
 	}
-	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
+	return oautherror.ServerError, "an unexpected error occurred", http.StatusInternalServerError
 }
 
 type IntrospectInput struct {
@@ -241,7 +242,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		if a.dpopSvc == nil {
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
-				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: "DPoP is not enabled on this deployment"},
+				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: "DPoP is not enabled on this deployment"},
 			}, nil
 		}
 		// htu must match what the client signed. Prefer the request's effective URL
@@ -258,12 +259,12 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")
 				return &TokenOutput{
 					Status: http.StatusInternalServerError,
-					Body:   oauthErrorBody{Error: "server_error", ErrorDescription: "failed to validate DPoP proof"},
+					Body:   oauthErrorBody{Error: oautherror.ServerError, ErrorDescription: "failed to validate DPoP proof"},
 				}, nil
 			}
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
-				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: dpopErr.Error()},
+				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: dpopErr.Error()},
 			}, nil
 		}
 		dpopThumbprint = tp
@@ -363,7 +364,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		// gate trips.
 		return &BcAuthorizeOutput{
 			Status: http.StatusBadRequest,
-			Body:   oauthErrorBody{Error: "unsupported_grant_type", ErrorDescription: "CIBA is not enabled on this deployment"},
+			Body:   oauthErrorBody{Error: oautherror.UnsupportedGrantType, ErrorDescription: "CIBA is not enabled on this deployment"},
 		}, nil
 	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
