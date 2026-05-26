@@ -755,7 +755,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 
 	if len(raw) > domain.MaxAuthorizationDetailsBytes {
 		return nil, nil, oauthBadRequestCause(
-			"invalid_authorization_details",
+			oautherror.InvalidAuthorizationDetails,
 			fmt.Sprintf("authorization_details exceeds %d bytes", domain.MaxAuthorizationDetailsBytes),
 			fmt.Errorf("%w: length %d > cap %d",
 				domain.ErrAuthorizationDetailsOversized,
@@ -766,7 +766,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 	parsed, err := domain.ParseAuthorizationDetails(raw)
 	if err != nil {
 		return nil, nil, oauthBadRequestCause(
-			"invalid_authorization_details",
+			oautherror.InvalidAuthorizationDetails,
 			"authorization_details is not a valid RFC 9396 array of typed objects",
 			err,
 		)
@@ -798,7 +798,7 @@ func (s *BackchannelService) parseAndValidateAuthorizationDetails(raw []byte) (d
 		// code clients should see for any RAR-side rejection.
 		if vErr := runRARValidator(fn, d.Raw); vErr != nil {
 			return nil, nil, oauthBadRequestCause(
-				"invalid_authorization_details",
+				oautherror.InvalidAuthorizationDetails,
 				fmt.Sprintf("authorization_details[%d] (type=%q): %s", i, d.Type, vErr.Error()),
 				vErr,
 			)
