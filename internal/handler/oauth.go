@@ -411,7 +411,12 @@ func (a *API) bcApproveOp(ctx context.Context, input *BcApproveInput) (*BcApprov
 	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
+		// Missing X-Account-ID / X-Project-ID is a request-formedness
+		// failure (admin endpoints have no built-in auth — the deployer's
+		// edge service is responsible for setting routing headers after
+		// its own auth check). 400, not 401: there are no credentials in
+		// play at this layer.
+		return nil, huma.Error400BadRequest("missing X-Account-ID or X-Project-ID header")
 	}
 	if err := a.backchannelSvc.Approve(ctx, service.ApproveInput{
 		AuthReqID:    input.AuthReqID,
@@ -448,7 +453,8 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
+		// See bcApproveOp comment — same 400-not-401 rationale.
+		return nil, huma.Error400BadRequest("missing X-Account-ID or X-Project-ID header")
 	}
 	if err := a.backchannelSvc.Deny(ctx, service.DenyInput{
 		AuthReqID: input.AuthReqID,
@@ -468,22 +474,20 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 // RFC 6749 §5.2 error_code/error_description envelope would be misleading
 // here; we use plain HTTP semantics instead.
 //
-// TODO(RFC 9728 §5.1): the 401 branch below should emit the
-// resource_metadata breadcrumb on its WWW-Authenticate header, matching
-// the bearer-auth, DCR, and forward-auth paths PR #166 covered.
-// huma.Error401Unauthorized doesn't accept response headers, so this
-// needs a deeper huma error-injection pattern (e.g. a custom error type
-// implementing huma.StatusError + a Headers() method, or a response
-// hook). Deferred until that pattern is established — tracked in #165
-// follow-up.
+// The backchannel service produces only 400 and 500 OAuthErrors — there's
+// no auth surface inside the service (admin auth happens at the handler /
+// edge layer, see bcApproveOp / bcDenyOp). 401 would be returned only if
+// the service started producing invalid_client errors directly, which it
+// doesn't today; if that ever changes, add a case here AND consider
+// whether the failure is really an OAuth client-auth failure (RFC 9728
+// §5.1 breadcrumb applies) or just a misuse of OAuthError shape (it
+// doesn't apply).
 func mapBackchannelAdminError(err error) error {
 	var oauthErr *service.OAuthError
 	if errors.As(err, &oauthErr) {
 		switch oauthErr.HTTPStatus {
 		case http.StatusBadRequest:
 			return huma.Error400BadRequest(oauthErr.Description)
-		case http.StatusUnauthorized:
-			return huma.Error401Unauthorized(oauthErr.Description)
 		case http.StatusInternalServerError:
 			return huma.Error500InternalServerError(oauthErr.Description)
 		}
