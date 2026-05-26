@@ -868,7 +868,9 @@ graph TD
 | GET | `/health` | Health check |
 | GET | `/ready` | Readiness check |
 | GET | `/.well-known/jwks.json` | JWKS public keys |
-| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata |
+| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata (RFC 8414) |
+| GET | `/.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) — discovery entry point clients hit before AS metadata |
+| GET | `/.well-known/spiffe-trust-bundle.json` | SPIFFE JWT-SVID trust bundle |
 | POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
 | POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
@@ -934,6 +936,8 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 | PKCE | RFC 7636 | Authorization code flow |
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
+| OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |

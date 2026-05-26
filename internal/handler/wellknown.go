@@ -34,6 +34,15 @@ type OAuthMetadataOutput struct {
 	Body map[string]any
 }
 
+// ProtectedResourceMetadataOutput is the RFC 9728 OAuth 2.0 Protected Resource
+// Metadata document published at /.well-known/oauth-protected-resource. Agents
+// that hit a 401 with a WWW-Authenticate: Bearer resource_metadata="…" header
+// follow that breadcrumb to this document, then to the authorization server
+// metadata it advertises.
+type ProtectedResourceMetadataOutput struct {
+	Body map[string]any
+}
+
 // ── Well-known routes ────────────────────────────────────────────────────────
 
 func (a *API) registerWellKnownRoutes(api huma.API) {
@@ -60,6 +69,14 @@ func (a *API) registerWellKnownRoutes(api huma.API) {
 		Summary:     "OAuth 2.0 Authorization Server Metadata",
 		Tags:        []string{"Discovery"},
 	}, a.oauthMetadataOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-protected-resource",
+		Method:      http.MethodGet,
+		Path:        "/.well-known/oauth-protected-resource",
+		Summary:     "OAuth 2.0 Protected Resource Metadata (RFC 9728)",
+		Tags:        []string{"Discovery"},
+	}, a.protectedResourceMetadataOp)
 }
 
 func (a *API) jwksOp(_ context.Context, _ *struct{}) (*JWKSOutput, error) {
@@ -133,5 +150,47 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// backchannel endpoint. An empty array signals "no signing algs
 		// supported" per the spec's MAY clause.
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
+	}}, nil
+}
+
+// protectedResourceMetadataOp serves RFC 9728 OAuth 2.0 Protected Resource
+// Metadata at /.well-known/oauth-protected-resource. The document points
+// clients at this AS's metadata, which they fetch next to discover the token
+// endpoint, JWKS, and supported grants.
+//
+// §2 field semantics:
+//   - resource (REQUIRED): the canonical URL of the protected resource. ZeroID
+//     is both the resource server and the authorization server in the
+//     single-deployment topology, so resource == baseURL.
+//   - authorization_servers: AS issuers a client SHOULD use; clients fetch
+//     /.well-known/oauth-authorization-server from one of these.
+//   - jwks_uri: the resource's own keyset for verifying signed responses.
+//     ZeroID signs all tokens via the AS keyset, so we advertise the same
+//     JWKS — verifiers don't need a separate resource keyset.
+//   - bearer_methods_supported: how to present the access token. ZeroID
+//     accepts the Authorization: Bearer header.
+//
+// resource_signing_alg_values_supported is intentionally NOT advertised:
+// RFC 9728 §2 defines it as algs the resource uses *for signed responses*.
+// ZeroID's /oauth2/token/introspect returns plain JSON (RFC 7662), not
+// the JWT envelope from RFC 9701. When signed introspection lands, this
+// field gets added in the same PR — not before.
+func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*ProtectedResourceMetadataOutput, error) {
+	return &ProtectedResourceMetadataOutput{Body: map[string]any{
+		"resource":                 a.baseURL,
+		"resource_name":            "ZeroID",
+		"authorization_servers":    []string{a.issuer},
+		"jwks_uri":                 a.baseURL + "/.well-known/jwks.json",
+		"bearer_methods_supported": []string{"header"},
+		// RFC 9449 §5.3 — PRM-defined DPoP field. ZeroID will mint
+		// DPoP-bound tokens when a client presents a DPoP proof at
+		// /oauth2/token, but does not currently *require* DPoP for
+		// resource access; bearer tokens are also accepted. The
+		// per-resource policy that flips this to true lives in a later
+		// PR alongside the per-resource enforcement check.
+		//
+		// Note: `dpop_signing_alg_values_supported` is RFC 9449 §5.1 AS
+		// metadata, not PRM — it's already advertised in oauthMetadataOp.
+		"dpop_bound_access_tokens_required": false,
 	}}, nil
 }

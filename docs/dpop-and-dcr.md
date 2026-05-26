@@ -349,10 +349,14 @@ Existing rows back-fill to `'internal'`; no manual migration step. The `registra
 
 ### Discovery
 
-`/.well-known/oauth-authorization-server` advertises:
+A standards-conformant client walks two documents to find the registration endpoint:
 
-- `registration_endpoint` — set to `{baseURL}/oauth2/register` when DCR is wired (it always is in this build; the endpoint exists but every request 401s if the deployer doesn't mint `client:register`-scoped tokens).
-- `dpop_signing_alg_values_supported: ["ES256", "RS256"]`.
+1. `/.well-known/oauth-protected-resource` (RFC 9728) — the *resource server's* metadata. Advertises `resource`, `authorization_servers` (pointers to the AS), `bearer_methods_supported: ["header"]`, `dpop_bound_access_tokens_required: false`. This is the document a 401 with `WWW-Authenticate: Bearer resource_metadata="…"` points the client at.
+2. `/.well-known/oauth-authorization-server` (RFC 8414) — the *authorization server's* metadata, fetched after PRM points the client here. Advertises the actual endpoints:
+   - `registration_endpoint` — set to `{baseURL}/oauth2/register` when DCR is wired (it always is in this build; the endpoint exists but every request 401s if the deployer doesn't mint `client:register`-scoped tokens).
+   - `dpop_signing_alg_values_supported: ["ES256", "RS256"]`.
+
+The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. Publishing both documents lets stock OAuth clients work without ZeroID-specific shimming.
 
 ### Limitations / future work
 
