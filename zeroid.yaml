@@ -29,12 +29,14 @@ token:
   # RFC 8414 §3 discovery anchor, AND the URL prefix for every endpoint
   # advertised in AS metadata / PRM / RFC 7592 registration_client_uri.
   #
-  # Defaults to Highflame's hosted ZeroID URL. Self-hosted deployments
-  # override via the ZEROID_ISSUER env var (or by editing this file).
-  # Local dev running ZeroID on localhost:8899 should set
-  # `ZEROID_ISSUER=http://localhost:8899` so tokens claim the URL they
-  # were actually issued from.
-  issuer: "https://auth.highflame.ai"
+  # This file is the local-dev sample; localhost:8899 matches where
+  # `make run` actually serves. Production deployments override via
+  # ZEROID_ISSUER (Helm/Terraform) to their public URL — e.g.
+  # https://auth.highflame.ai for the hosted Highflame instance.
+  #
+  # The code default in loadDefaults() is https://auth.highflame.ai;
+  # YAML overrides it for `make run`, env vars override both.
+  issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
 
