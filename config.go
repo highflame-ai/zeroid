@@ -391,7 +391,11 @@ func loadDefaults(k *koanf.Koanf) error {
 		"keys.rsa_key_id":           "v1",
 
 		// Token
-		"token.issuer":      "https://highflame.ai",
+		// Default points at Highflame's hosted ZeroID URL (the actual
+		// service, not the marketing site). Self-hosted deployments
+		// override via ZEROID_ISSUER or token.issuer in YAML. Local dev
+		// uses the bundled zeroid.yaml which sets http://localhost:8899.
+		"token.issuer":      "https://auth.highflame.ai",
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 
