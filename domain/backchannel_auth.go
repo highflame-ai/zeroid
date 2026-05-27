@@ -1,6 +1,10 @@
 package domain
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -53,6 +57,148 @@ func IsValidBackchannelDeliveryMode(mode string) bool {
 // Clients submit this at /oauth2/token along with auth_req_id to poll for a token.
 const GrantTypeCIBA GrantType = "urn:openid:params:grant-type:ciba"
 
+// ─── RFC 9396 OAuth 2.0 Rich Authorization Requests (RAR) ───────────────────
+//
+// RAR extends a CIBA bc-authorize request with an `authorization_details`
+// parameter — a JSON array of objects, each with a `type` discriminator,
+// describing exactly what is being authorized (vs the coarse `scope`
+// string). ZeroID stores the array verbatim and exposes it through the
+// BackchannelNotifier hook so the deployer's approver UX can render a
+// typed approval prompt. Per-type schema validation is opt-in via
+// Server.RegisterAuthorizationDetailValidator — zeroid itself validates
+// only the outer shape so any application-specific `type` namespace ships
+// without a library-level schema commitment.
+
+// MaxAuthorizationDetailsBytes caps the total RAR payload at request time.
+// RFC 9396 §2 is silent on a cap; zeroid's choice is driven by two
+// downstream consumers:
+//
+//  1. Postgres persistence — the JSONB column has no schema-side cap; the
+//     library-side limit prevents a malicious caller writing an unbounded
+//     blob to the row.
+//  2. JWT embed (RFC 9396 §6.1, wired by the CIBA token-side path) — the
+//     payload is base64-embedded into the access-token JWT and carried in
+//     `Authorization: Bearer <jwt>` headers. With base64 expansion (~33 %)
+//     plus the rest of the JWT (header + signature + ZeroID's standard
+//     claims ~500 bytes), a 64 KB RAR pushes total header size well past
+//     common reverse-proxy limits (nginx defaults ~8 KB; ALB ~16 KB).
+//     4 KB caps the JWT header at roughly 6.5 KB end-to-end, safe for
+//     every proxy in the path.
+//
+// Realistic per-action authorization_details entries (type + tool + amount
+// + currency + destination ≈ 100–200 bytes) easily fit 10+ entries under
+// the 4 KB ceiling. Deployers needing larger payloads should rely on the
+// /oauth2/token/introspect surface (which can carry any size of granted
+// authorization_details) or reference an out-of-band record by ID in the
+// `authorization_details` payload.
+const MaxAuthorizationDetailsBytes = 4 * 1024
+
+// ErrAuthorizationDetailsOversized is returned when the raw JSON exceeds
+// MaxAuthorizationDetailsBytes.
+var ErrAuthorizationDetailsOversized = errors.New(
+	"authorization_details exceeds the per-request size cap",
+)
+
+// ErrAuthorizationDetailsMalformed is returned when the raw JSON is not a
+// valid array of objects each carrying a non-empty string `type`.
+var ErrAuthorizationDetailsMalformed = errors.New(
+	"authorization_details is not a valid RFC 9396 array of typed objects",
+)
+
+// AuthorizationDetail is one entry in the RAR `authorization_details` array.
+//
+// Type is the RFC 9396 type discriminator (required, non-empty string) — the
+// only field zeroid validates. Raw is the full original JSON object preserved
+// verbatim so consumers (per-type validators, the BackchannelNotifier, the
+// future token-side JWT-embed) can decode their own typed shapes without
+// re-stringifying or normalising the bytes.
+type AuthorizationDetail struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"`
+}
+
+// AuthorizationDetails is the parsed slice form, used by service code and
+// the BackchannelNotifier hook. On the bun model the column is stored as a
+// json.RawMessage (the array as a whole); ParseAuthorizationDetails decodes
+// it into this typed slice. Round-trip preserves bytes: marshalling the
+// slice back produces equivalent JSON (key order may differ; element order
+// is preserved).
+type AuthorizationDetails []AuthorizationDetail
+
+// ParseAuthorizationDetails decodes raw JSON into a typed slice, enforcing
+// the outer-shape contract: top-level is a JSON array, each element is a
+// JSON object, each object has a non-empty string `type` field. An empty
+// or null input returns (nil, nil) — backward-compatible with pre-RAR
+// rows / clients that omit the parameter.
+//
+// Returns ErrAuthorizationDetailsMalformed on any structural failure
+// (wrapped with a descriptive index/reason for operator-facing logs).
+// Does NOT invoke per-type validators — that is the service layer's
+// responsibility after this parse succeeds.
+func ParseAuthorizationDetails(raw []byte) (AuthorizationDetails, error) {
+	// Treat empty, whitespace-only, and the literal JSON null as "no RAR
+	// supplied" — backward compatible with clients that omit the parameter.
+	// Trim first so the contract matches what the doc comment promises; the
+	// whitespace case is unreachable from the HTTP path today (Huma's JSON
+	// decode would never hand us bare whitespace bytes) but the explicit
+	// trim removes a code/doc mismatch for any future direct caller of
+	// this function.
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+
+	// Outer must be an array.
+	var elements []json.RawMessage
+	if err := json.Unmarshal(trimmed, &elements); err != nil {
+		return nil, fmt.Errorf("%w: outer must be a JSON array: %w",
+			ErrAuthorizationDetailsMalformed, err)
+	}
+
+	if len(elements) == 0 {
+		return nil, nil
+	}
+
+	out := make(AuthorizationDetails, 0, len(elements))
+
+	for i, el := range elements {
+		// Each element must be a JSON object (not array/string/number/null).
+		// Decode the `type` discriminator to enforce the contract; preserve
+		// the full raw bytes for downstream consumers.
+		var probe struct {
+			Type *string `json:"type"`
+		}
+
+		if err := json.Unmarshal(el, &probe); err != nil {
+			return nil, fmt.Errorf(
+				"%w: element[%d] must be a JSON object with a string `type` field: %w",
+				ErrAuthorizationDetailsMalformed, i, err,
+			)
+		}
+
+		if probe.Type == nil {
+			return nil, fmt.Errorf(
+				"%w: element[%d] is missing the required `type` field",
+				ErrAuthorizationDetailsMalformed, i,
+			)
+		}
+
+		if *probe.Type == "" {
+			return nil, fmt.Errorf(
+				"%w: element[%d] has an empty `type` (must be a non-empty string)",
+				ErrAuthorizationDetailsMalformed, i,
+			)
+		}
+
+		out = append(out, AuthorizationDetail{
+			Type: *probe.Type,
+			Raw:  el,
+		})
+	}
+
+	return out, nil
+}
+
 // BackchannelAuthRequest is a persisted CIBA authentication request.
 //
 // The row is created on POST /oauth2/bc-authorize. The auth_req_id is the
@@ -65,13 +211,23 @@ const GrantTypeCIBA GrantType = "urn:openid:params:grant-type:ciba"
 type BackchannelAuthRequest struct {
 	bun.BaseModel `bun:"table:backchannel_auth_requests,alias:bcr"`
 
-	AuthReqID                  string                      `bun:"auth_req_id,pk,type:varchar(255)"             json:"auth_req_id"`
-	AccountID                  string                      `bun:"account_id,type:varchar(255)"                 json:"account_id"`
-	ProjectID                  string                      `bun:"project_id,type:varchar(255)"                 json:"project_id"`
-	ClientID                   string                      `bun:"client_id,type:varchar(255)"                  json:"client_id"`
-	LoginHint                  string                      `bun:"login_hint,type:text"                         json:"login_hint,omitempty"`
-	Scope                      string                      `bun:"scope,type:text"                              json:"scope,omitempty"`
-	BindingMessage             string                      `bun:"binding_message,type:text"                    json:"binding_message,omitempty"`
+	AuthReqID      string `bun:"auth_req_id,pk,type:varchar(255)"             json:"auth_req_id"`
+	AccountID      string `bun:"account_id,type:varchar(255)"                 json:"account_id"`
+	ProjectID      string `bun:"project_id,type:varchar(255)"                 json:"project_id"`
+	ClientID       string `bun:"client_id,type:varchar(255)"                  json:"client_id"`
+	LoginHint      string `bun:"login_hint,type:text"                         json:"login_hint,omitempty"`
+	Scope          string `bun:"scope,type:text"                              json:"scope,omitempty"`
+	BindingMessage string `bun:"binding_message,type:text"                    json:"binding_message,omitempty"`
+	// AuthorizationDetailsRaw is the RFC 9396 `authorization_details` JSON
+	// array as supplied on bc-authorize, preserved verbatim. Stored as a
+	// JSONB column (per-row size capped at MaxAuthorizationDetailsBytes by
+	// the service layer at insert time). Decoded into the typed
+	// AuthorizationDetails slice by ParseAuthorizationDetails for use by
+	// validators, the BackchannelNotifier hook, and the token-side embed
+	// at issuance (RFC 9396 §5.2 / §6.1 / §7). Defaults to '[]'::jsonb
+	// in Postgres so pre-RAR rows read as an empty array; consumers can
+	// branch on len(parsed) == 0.
+	AuthorizationDetailsRaw    json.RawMessage             `bun:"authorization_details,type:jsonb"             json:"authorization_details,omitempty"`
 	NotificationMode           BackchannelNotificationMode `bun:"notification_mode,type:varchar(16)"           json:"notification_mode"`
 	ClientNotificationEndpoint string                      `bun:"client_notification_endpoint,type:text"       json:"client_notification_endpoint,omitempty"`
 	ClientNotificationToken    string                      `bun:"client_notification_token,type:varchar(1024)" json:"-"`

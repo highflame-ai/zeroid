@@ -1,6 +1,10 @@
 package service
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/highflame-ai/zeroid/internal/oautherror"
+)
 
 // OAuthError is the structured error type returned by OAuthService methods.
 //
@@ -48,10 +52,10 @@ func oauthBadRequestCause(code, description string, cause error) *OAuthError {
 
 // oauthUnauthorized returns an *OAuthError for invalid_client with HTTP 401.
 func oauthUnauthorized(description string, cause error) *OAuthError {
-	return &OAuthError{Code: "invalid_client", Description: description, HTTPStatus: http.StatusUnauthorized, err: cause}
+	return &OAuthError{Code: oautherror.InvalidClient, Description: description, HTTPStatus: http.StatusUnauthorized, err: cause}
 }
 
 // oauthServerError returns an *OAuthError for server_error with HTTP 500.
 func oauthServerError(description string, cause error) *OAuthError {
-	return &OAuthError{Code: "server_error", Description: description, HTTPStatus: http.StatusInternalServerError, err: cause}
+	return &OAuthError{Code: oautherror.ServerError, Description: description, HTTPStatus: http.StatusInternalServerError, err: cause}
 }

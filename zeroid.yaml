@@ -25,8 +25,18 @@ keys:
   rsa_key_id: "v1"
 
 token:
-  issuer: "https://highflame.ai"
-  base_url: "http://localhost:8899"
+  # Issuer is the canonical URL of this AS — the JWT iss claim, the
+  # RFC 8414 §3 discovery anchor, AND the URL prefix for every endpoint
+  # advertised in AS metadata / PRM / RFC 7592 registration_client_uri.
+  #
+  # This file is the local-dev sample; localhost:8899 matches where
+  # `make run` actually serves. Production deployments override via
+  # ZEROID_ISSUER (Helm/Terraform) to their public URL — e.g.
+  # https://auth.highflame.ai for the hosted Highflame instance.
+  #
+  # The code default in loadDefaults() is https://auth.highflame.ai;
+  # YAML overrides it for `make run`, env vars override both.
+  issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
 

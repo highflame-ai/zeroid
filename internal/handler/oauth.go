@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -10,6 +11,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
@@ -76,7 +78,7 @@ func extractOAuthError(err error) (code, description string, status int) {
 		return "policy_violation", err.Error(), http.StatusBadRequest
 	}
 	if errors.Is(err, service.ErrScopesNotAllowed) {
-		return "insufficient_scope", err.Error(), http.StatusBadRequest
+		return oautherror.InsufficientScope, err.Error(), http.StatusBadRequest
 	}
 	// Identity gates can fire at the chokepoint after the per-grant
 	// check passed (TOCTOU window). Map to stable error_description
@@ -86,15 +88,15 @@ func extractOAuthError(err error) (code, description string, status int) {
 	// the literal expires_at timestamp) and produce a different string
 	// shape than the per-grant path.
 	if errors.Is(err, domain.ErrIdentityExpired) {
-		return "invalid_grant", "identity_expired", http.StatusBadRequest
+		return oautherror.InvalidGrant, "identity_expired", http.StatusBadRequest
 	}
 	if errors.Is(err, domain.ErrIdentityNotUsable) {
-		return "invalid_grant", "identity is suspended or deactivated", http.StatusBadRequest
+		return oautherror.InvalidGrant, "identity is suspended or deactivated", http.StatusBadRequest
 	}
 	if errors.Is(err, domain.ErrCredentialExpired) {
-		return "invalid_grant", "credential_expired", http.StatusBadRequest
+		return oautherror.InvalidGrant, "credential_expired", http.StatusBadRequest
 	}
-	return "server_error", "an unexpected error occurred", http.StatusInternalServerError
+	return oautherror.ServerError, "an unexpected error occurred", http.StatusInternalServerError
 }
 
 type IntrospectInput struct {
@@ -240,16 +242,16 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		if a.dpopSvc == nil {
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
-				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: "DPoP is not enabled on this deployment"},
+				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: "DPoP is not enabled on this deployment"},
 			}, nil
 		}
 		// htu must match what the client signed. Prefer the request's effective URL
 		// (recorded by RequestURLMiddleware) so reverse-proxied deployments work
-		// transparently; fall back to the configured baseURL only when the
+		// transparently; fall back to the configured issuer URL only when the
 		// middleware was not installed (defensive, should not happen in production).
 		htu := internalMiddleware.EffectiveRequestURL(ctx)
 		if htu == "" {
-			htu = a.baseURL + "/oauth2/token"
+			htu = a.issuer + "/oauth2/token"
 		}
 		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, htu, input.DPoPProof)
 		if dpopErr != nil {
@@ -257,12 +259,12 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")
 				return &TokenOutput{
 					Status: http.StatusInternalServerError,
-					Body:   oauthErrorBody{Error: "server_error", ErrorDescription: "failed to validate DPoP proof"},
+					Body:   oauthErrorBody{Error: oautherror.ServerError, ErrorDescription: "failed to validate DPoP proof"},
 				}, nil
 			}
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
-				Body:   oauthErrorBody{Error: "invalid_dpop_proof", ErrorDescription: dpopErr.Error()},
+				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: dpopErr.Error()},
 			}, nil
 		}
 		dpopThumbprint = tp
@@ -337,6 +339,15 @@ type BcAuthorizeInput struct {
 		BindingMessage          string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
 		RequestedExpiry         int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
 		ClientNotificationToken string `json:"client_notification_token,omitempty" doc:"Bearer the server echoes in the ping callback (required for ping mode)"`
+		// AuthorizationDetails is the RFC 9396 Rich Authorization Requests
+		// payload — a JSON array of typed objects describing what is being
+		// authorized at a finer granularity than scope. ZeroID validates
+		// the outer shape (array of objects, each with a non-empty string
+		// `type` field) and runs any registered per-type validators; the
+		// raw bytes are persisted on the auth request row and delivered
+		// to the BackchannelNotifier hook for typed approval-prompt
+		// rendering. Empty / omitted keeps the legacy CIBA flow unchanged.
+		AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty" doc:"RFC 9396 Rich Authorization Requests payload (JSON array of typed objects)"`
 	}
 }
 
@@ -353,7 +364,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		// gate trips.
 		return &BcAuthorizeOutput{
 			Status: http.StatusBadRequest,
-			Body:   oauthErrorBody{Error: "unsupported_grant_type", ErrorDescription: "CIBA is not enabled on this deployment"},
+			Body:   oauthErrorBody{Error: oautherror.UnsupportedGrantType, ErrorDescription: "CIBA is not enabled on this deployment"},
 		}, nil
 	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
@@ -365,6 +376,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		BindingMessage:          input.Body.BindingMessage,
 		RequestedExpiry:         input.Body.RequestedExpiry,
 		ClientNotificationToken: input.Body.ClientNotificationToken,
+		AuthorizationDetailsRaw: []byte(input.Body.AuthorizationDetails),
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")

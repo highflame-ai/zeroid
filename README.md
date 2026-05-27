@@ -91,6 +91,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **DPoP Sender-Constrained Tokens** — RFC 9449. Clients may attach a `DPoP` proof JWT to any `/oauth2/token` call; the issued token then carries `cnf.jkt` and `token_type: "DPoP"`. Proof replay is blocked by an atomic `dpop_jti` upsert (DB primary key — no pre-check race). Resource servers retrieve `cnf` via introspection and validate the per-request proof themselves. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
 - **Dynamic Client Registration** — RFC 7591 (`POST /oauth2/register`) gated by an initial access token with the `client:register` scope, plus RFC 7592 management (`GET`/`PUT`/`DELETE /oauth2/register/{client_id}`) authenticated by a one-shot `registration_access_token` (bcrypt-hashed at rest, constant-time lookup). Internal admin-registered clients remain isolated from DCR — the delete path refuses to touch `registration_source = 'internal'`. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
 - **CIBA Backchannel Approval** — OpenID Client-Initiated Backchannel Authentication (CIBA Core 1.0). Agent posts to `/oauth2/bc-authorize` with a `binding_message`; the deployer's `BackchannelNotifier` prompts the end user out-of-band (email, Slack, mobile push); user approves or denies; agent receives the resulting token via poll, ping callback, or push delivery. SSRF-guarded outbound callbacks, per-tenant audit, single-use `auth_req_id`s.
+- **Rich Authorization Requests (RAR)** — RFC 9396. Agents can attach a typed `authorization_details` JSON array to a CIBA `/oauth2/bc-authorize` call describing exactly what is being authorized at finer granularity than `scope` — e.g. `{"type": "tool_call", "tool": "transfer_funds", "amount": 50000}`. The `BackchannelNotifier` receives the parsed typed slice so the approver UX can render a per-action prompt instead of "approve this scope." Per-type schema validation is opt-in via `Server.RegisterAuthorizationDetailValidator(typ, fn)`. JSON and form-encoded bodies both supported. Rejections map to the RFC 9396 `invalid_authorization_details` OAuth error code. Full reference: [`docs/rar.md`](docs/rar.md).
 - **On-Behalf-Of (OBO) Delegation** — RFC 8693 token exchange with automatic scope attenuation at each hop, delegation depth tracking, and cascade revocation when any upstream credential is revoked. The `act` claim carries the full chain per RFC 8693, closing the auditability gap that plagues shared service accounts.
 - **WIMSE/SPIFFE URIs** — Stable, globally unique identity URIs: `spiffe://{domain}/{account}/{project}/{type}/{id}` for every agent. Tokens carry the WIMSE URI as `sub`, so every downstream system receives a meaningful, verifiable identity—not just a client ID.
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
@@ -867,7 +868,9 @@ graph TD
 | GET | `/health` | Health check |
 | GET | `/ready` | Readiness check |
 | GET | `/.well-known/jwks.json` | JWKS public keys |
-| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata |
+| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata (RFC 8414) |
+| GET | `/.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) — discovery entry point clients hit before AS metadata |
+| GET | `/.well-known/spiffe-trust-bundle.json` | SPIFFE JWT-SVID trust bundle |
 | POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
 | POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
@@ -908,6 +911,9 @@ Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
 | POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
+| GET | `/api/v1/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
+| GET | `/api/v1/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
+| GET | `/api/v1/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
@@ -930,10 +936,13 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 | PKCE | RFC 7636 | Authorization code flow |
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
+| OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |
 | CIBA | OpenID CIBA Core 1.0 | Out-of-band user approval for agent-initiated actions (poll / ping / push) |
+| Rich Authorization Requests | RFC 9396 | Typed `authorization_details` on CIBA bc-authorize for per-action approval prompts (vs scope-string) |
 | DPoP | RFC 9449 | Sender-constrained access tokens — proof-of-possession at `/oauth2/token` and at the resource server |
 | JWK Thumbprint | RFC 7638 | DPoP `cnf.jkt` key binding |
 | Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating |
@@ -951,6 +960,8 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
 - Ecosystem integrations (LangGraph, CrewAI, Strands)
 - **CIBA (Client-Initiated Backchannel Authentication)** — full OpenID CIBA Core 1.0 server-side flow with poll, ping, and push delivery modes; deployer-pluggable `BackchannelNotifier` for out-of-band user prompts (email, Slack, push); SSRF-guarded outbound callbacks
+- **Rich Authorization Requests (RFC 9396)** — typed `authorization_details` JSON array on CIBA `/oauth2/bc-authorize`; outer-shape + per-type validator hooks; raw payload threaded verbatim through to the `BackchannelNotifier` for typed approver UX; both JSON and form-encoded bodies; RFC 9396 §5 error-code mapping (`invalid_authorization_details`). On approval the granted payload is embedded in the access-token JWT (§6.1), surfaced on the token response body (§5.2), and exposed in introspection (§7) — resource servers can read the typed grant from either the JWT or `/oauth2/token/introspect`.
+- **Delegation Explorer** — three read-only endpoints that expose the delegation graph stored in `issued_credentials`: `/delegations/graph` (depth-bounded subgraph centered on any identity, with per-edge scope attenuation), `/delegations/by-jti/{jti}` (forensic lineage walk root → leaf), and `/delegations/chains` (mission summary list with time-window filtering). All three are tenant-scoped and driven by `parent_jti` recursive CTEs — no dependency on `mission_id` for correctness.
 
 **Planned**
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)
