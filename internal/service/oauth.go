@@ -1222,7 +1222,9 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	// string and structured shapes (e.g. act and cnf are nested objects).
 	// cnf is surfaced so resource servers see the RFC 9449 jkt binding and
 	// can validate the caller's DPoP proof against the expected thumbprint.
-	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf"} {
+	// authorization_details is surfaced per RFC 9396 §7 so resource servers
+	// can read the typed RAR grant via introspection without parsing the JWT.
+	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details"} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v
 		}

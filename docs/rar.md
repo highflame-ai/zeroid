@@ -192,7 +192,7 @@ ALTER TABLE backchannel_auth_requests
 
 - Pre-RAR rows read as `[]`, not `NULL` — consumer code stays branch-free.
 - Bytes are preserved verbatim (no normalization, no re-marshalling) so per-type validators and approver UX see exactly what the client supplied.
-- The per-request payload is capped at 64 KiB (`domain.MaxAuthorizationDetailsBytes`); oversized payloads are rejected with `invalid_authorization_details` before persistence.
+- The per-request payload is capped at 4 KiB (`domain.MaxAuthorizationDetailsBytes`); oversized payloads are rejected with `invalid_authorization_details` before persistence. The cap is sized so the granted payload fits inside the access-token JWT without pushing `Authorization: Bearer …` headers past common reverse-proxy limits — see the const's docstring for the math.
 - No GIN index ships in v1 — nothing today queries by `authorization_details` content. Add one if usage emerges.
 
 ---
@@ -211,17 +211,48 @@ ALTER TABLE backchannel_auth_requests
 
 ---
 
-## What's NOT in this PR (follow-up)
+## Token-side wiring
 
-The bc-authorize side is everything a deployer needs to start using RAR for approval prompts. The token-side wiring — RFC 9396 §5 token response, §6.1 access-token JWT claim, §7 introspection response — is intentionally deferred to a follow-up so resource servers can read approved `authorization_details` for receipt-chain commitment.
+When a CIBA request that carried `authorization_details` is approved and the client polls (or receives via push) the access token, the granted payload is surfaced through three coordinated surfaces:
 
-In the meantime, an approved request stores the original `authorization_details` JSON on the `backchannel_auth_requests` row; downstream code that has the `auth_req_id` can read it directly from Postgres if it needs the typed payload before the token-side ships.
+| Surface                         | Where                                                                 | RFC clause |
+| ------------------------------- | --------------------------------------------------------------------- | ---------- |
+| **Token response body**         | `authorization_details` field on the `/oauth2/token` response         | §5.2       |
+| **Access-token JWT claim**      | `authorization_details` top-level claim on the issued JWT             | §6.1       |
+| **Introspection response**      | `authorization_details` field on `/oauth2/token/introspect` response  | §7         |
+
+All three surfaces carry the same JSON array — the verbatim bytes the client supplied on bc-authorize (zeroid does not modify granted RAR in this release). Resource servers can read the typed grant from either the JWT (cheapest; no network round-trip) or `/oauth2/token/introspect` (works without sharing JWKS).
+
+**Legacy CIBA tokens carry an empty array.** A CIBA request with no `authorization_details` parameter still gets the field on all three surfaces — populated with `[]`. Clients branch on `len(authorization_details) > 0` (not on field presence) to detect "an actual typed grant is in effect." This is cheaper than filtering the empty case on issuance, and the wire shape stays uniform between legacy and RAR flows.
+
+### Example: introspection response with RAR
+
+```json
+{
+  "active": true,
+  "sub": "user-alice-001",
+  "iss": "https://auth.example.com",
+  "jti": "...",
+  "scope": "payments:write",
+  "account_id": "acct_X",
+  "project_id": "proj_Y",
+  "authorization_details": [
+    {
+      "type": "tool_call",
+      "tool": "transfer_funds",
+      "amount": 50000,
+      "currency": "USD",
+      "destination": "acct_Vendor_Z"
+    }
+  ]
+}
+```
 
 ---
 
 ## Compliance suite
 
-RFC 9396 normative MUSTs are pinned by [`tests/integration/rar_compliance_test.go`](../tests/integration/rar_compliance_test.go) following the conventions in [`tests/integration/COMPLIANCE.md`](../tests/integration/COMPLIANCE.md) — one MUST per test, `TestRFC9396_S<section>_<descriptor>` naming, the test's first body line cites the spec clause. Token-side clauses will extend that file in lockstep with the token-embed PR.
+RFC 9396 normative MUSTs are pinned by [`tests/integration/rar_compliance_test.go`](../tests/integration/rar_compliance_test.go) following the conventions in [`tests/integration/COMPLIANCE.md`](../tests/integration/COMPLIANCE.md) — one MUST per test, `TestRFC9396_S<section>_<descriptor>` naming, the test's first body line cites the spec clause. Suite covers §2 / §2.1 (request shape), §3 (form-encoded body), §5 / §5.2 (error code + token response field), §6.1 (JWT claim), §7 (introspection).
 
 ---
 
