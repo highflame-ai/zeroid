@@ -334,7 +334,8 @@ type BcAuthorizeInput struct {
 		ClientID                string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
 		AccountID               string `json:"account_id" required:"true" doc:"Tenant account ID"`
 		ProjectID               string `json:"project_id" required:"true" doc:"Tenant project ID"`
-		LoginHint               string `json:"login_hint" required:"true" doc:"User identifier (email, phone, user_id)"`
+		LoginHint               string `json:"login_hint,omitempty" doc:"User identifier (email, phone, user_id). Required IF group_hint is not supplied."`
+		GroupHint               string `json:"group_hint,omitempty" doc:"CIBA extension — opaque deployer-namespaced identifier for role/group-targeted approval (e.g. 'highflame:role:finance_lead'). Required IF login_hint is not supplied. Max 255 codepoints (multi-byte UTF-8 accepted)."`
 		Scope                   string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
 		BindingMessage          string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
 		RequestedExpiry         int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
@@ -372,6 +373,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		AccountID:               input.Body.AccountID,
 		ProjectID:               input.Body.ProjectID,
 		LoginHint:               input.Body.LoginHint,
+		GroupHint:               input.Body.GroupHint,
 		Scope:                   input.Body.Scope,
 		BindingMessage:          input.Body.BindingMessage,
 		RequestedExpiry:         input.Body.RequestedExpiry,
