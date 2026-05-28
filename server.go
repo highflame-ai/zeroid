@@ -543,6 +543,7 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			ProjectID:            n.ProjectID,
 			ClientID:             n.ClientID,
 			LoginHint:            n.LoginHint,
+			GroupHint:            n.GroupHint,
 			Scope:                n.Scope,
 			BindingMessage:       n.BindingMessage,
 			ExpiresAt:            n.ExpiresAt,

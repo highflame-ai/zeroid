@@ -86,11 +86,19 @@ type TrustedServiceValidator func(ctx context.Context) (serviceName string, err 
 // Fields mirror the OpenID CIBA spec's request shape so deployers can pass
 // the payload directly to their notification provider without re-mapping.
 type BackchannelNotification struct {
-	AuthReqID      string
-	AccountID      string
-	ProjectID      string
-	ClientID       string
-	LoginHint      string
+	AuthReqID string
+	AccountID string
+	ProjectID string
+	ClientID  string
+	LoginHint string
+	// GroupHint is the CIBA extension parameter for role/group-targeted
+	// approval. zeroid treats the value as opaque; deployers choose
+	// their own namespace convention (e.g. "highflame:role:finance_lead",
+	// "pd:schedule:P12345"). At least one of {LoginHint, GroupHint} is
+	// guaranteed non-empty when this notifier fires — the server-side
+	// validator enforces it at bc-authorize time. Empty when the client
+	// supplied LoginHint only (the canonical CIBA per-user case).
+	GroupHint      string
 	Scope          string
 	BindingMessage string
 	ExpiresAt      time.Time
