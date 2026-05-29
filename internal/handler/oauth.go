@@ -334,7 +334,8 @@ type BcAuthorizeInput struct {
 		ClientID                string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
 		AccountID               string `json:"account_id" required:"true" doc:"Tenant account ID"`
 		ProjectID               string `json:"project_id" required:"true" doc:"Tenant project ID"`
-		LoginHint               string `json:"login_hint" required:"true" doc:"User identifier (email, phone, user_id)"`
+		LoginHint               string `json:"login_hint,omitempty" doc:"User identifier (email, phone, user_id). Required IF group_hint is not supplied."`
+		GroupHint               string `json:"group_hint,omitempty" doc:"CIBA extension — opaque deployer-namespaced identifier for role/group-targeted approval (e.g. 'highflame:role:finance_lead'). Required IF login_hint is not supplied. Max 255 codepoints (multi-byte UTF-8 accepted)."`
 		Scope                   string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
 		BindingMessage          string `json:"binding_message,omitempty" doc:"Human-readable context shown to the user during approval"`
 		RequestedExpiry         int    `json:"requested_expiry,omitempty" doc:"Auth-request TTL in seconds; bounded by server default"`
@@ -372,6 +373,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		AccountID:               input.Body.AccountID,
 		ProjectID:               input.Body.ProjectID,
 		LoginHint:               input.Body.LoginHint,
+		GroupHint:               input.Body.GroupHint,
 		Scope:                   input.Body.Scope,
 		BindingMessage:          input.Body.BindingMessage,
 		RequestedExpiry:         input.Body.RequestedExpiry,
@@ -411,7 +413,12 @@ func (a *API) bcApproveOp(ctx context.Context, input *BcApproveInput) (*BcApprov
 	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
+		// Missing X-Account-ID / X-Project-ID is a request-formedness
+		// failure (admin endpoints have no built-in auth — the deployer's
+		// edge service is responsible for setting routing headers after
+		// its own auth check). 400, not 401: there are no credentials in
+		// play at this layer.
+		return nil, huma.Error400BadRequest("missing X-Account-ID or X-Project-ID header")
 	}
 	if err := a.backchannelSvc.Approve(ctx, service.ApproveInput{
 		AuthReqID:    input.AuthReqID,
@@ -448,7 +455,8 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
-		return nil, huma.Error401Unauthorized("missing tenant context")
+		// See bcApproveOp comment — same 400-not-401 rationale.
+		return nil, huma.Error400BadRequest("missing X-Account-ID or X-Project-ID header")
 	}
 	if err := a.backchannelSvc.Deny(ctx, service.DenyInput{
 		AuthReqID: input.AuthReqID,
@@ -467,14 +475,21 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 // admin error. The admin endpoints are not OAuth token endpoints, so the
 // RFC 6749 §5.2 error_code/error_description envelope would be misleading
 // here; we use plain HTTP semantics instead.
+//
+// The backchannel service produces only 400 and 500 OAuthErrors — there's
+// no auth surface inside the service (admin auth happens at the handler /
+// edge layer, see bcApproveOp / bcDenyOp). 401 would be returned only if
+// the service started producing invalid_client errors directly, which it
+// doesn't today; if that ever changes, add a case here AND consider
+// whether the failure is really an OAuth client-auth failure (RFC 9728
+// §5.1 breadcrumb applies) or just a misuse of OAuthError shape (it
+// doesn't apply).
 func mapBackchannelAdminError(err error) error {
 	var oauthErr *service.OAuthError
 	if errors.As(err, &oauthErr) {
 		switch oauthErr.HTTPStatus {
 		case http.StatusBadRequest:
 			return huma.Error400BadRequest(oauthErr.Description)
-		case http.StatusUnauthorized:
-			return huma.Error401Unauthorized(oauthErr.Description)
 		case http.StatusInternalServerError:
 			return huma.Error500InternalServerError(oauthErr.Description)
 		}

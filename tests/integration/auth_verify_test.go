@@ -24,15 +24,26 @@ func issueAPIKeyToken(t *testing.T, externalID string) string {
 	return decode(t, resp)["access_token"].(string)
 }
 
+// expectedWWWAuth builds the WWW-Authenticate value the forward-auth endpoint
+// is expected to emit for a given Bearer error code string. Note this is not
+// always an RFC 6750-defined code: the forward-auth path intentionally ships
+// the non-standard "missing_token" string for client compatibility (see
+// auth_verify.go). Every 401 from a Bearer-protected path also adds the
+// RFC 9728 §5.1 resource_metadata parameter pointing at this server's PRM
+// document.
+func expectedWWWAuth(errorCode string) string {
+	return `Bearer error="` + errorCode + `", resource_metadata="` + prmURL() + `"`
+}
+
 // TestAuthVerify_MissingAuthorizationHeader checks that a request with no
 // Authorization header is rejected with 401 and the correct WWW-Authenticate
-// challenge.
+// challenge (RFC 6750 §3 error + RFC 9728 §5.1 resource_metadata breadcrumb).
 func TestAuthVerify_MissingAuthorizationHeader(t *testing.T) {
 	resp := get(t, "/oauth2/token/verify", nil)
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, `Bearer error="missing_token"`, resp.Header.Get("WWW-Authenticate"))
+	assert.Equal(t, expectedWWWAuth("missing_token"), resp.Header.Get("WWW-Authenticate"))
 }
 
 // TestAuthVerify_WrongScheme checks that a non-Bearer Authorization scheme
@@ -44,7 +55,7 @@ func TestAuthVerify_WrongScheme(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, `Bearer error="invalid_request"`, resp.Header.Get("WWW-Authenticate"))
+	assert.Equal(t, expectedWWWAuth("invalid_request"), resp.Header.Get("WWW-Authenticate"))
 }
 
 // TestAuthVerify_EmptyBearerToken checks that "Bearer " followed by only
@@ -56,7 +67,7 @@ func TestAuthVerify_EmptyBearerToken(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, `Bearer error="invalid_request"`, resp.Header.Get("WWW-Authenticate"))
+	assert.Equal(t, expectedWWWAuth("invalid_request"), resp.Header.Get("WWW-Authenticate"))
 }
 
 // TestAuthVerify_InvalidToken checks that a well-formed but unrecognised token
@@ -68,7 +79,7 @@ func TestAuthVerify_InvalidToken(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, `Bearer error="invalid_token"`, resp.Header.Get("WWW-Authenticate"))
+	assert.Equal(t, expectedWWWAuth("invalid_token"), resp.Header.Get("WWW-Authenticate"))
 }
 
 // TestAuthVerify_ValidToken checks that a valid JWT issued by ZeroID is
@@ -110,7 +121,7 @@ func TestAuthVerify_RevokedToken(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, `Bearer error="invalid_token"`, resp.Header.Get("WWW-Authenticate"))
+	assert.Equal(t, expectedWWWAuth("invalid_token"), resp.Header.Get("WWW-Authenticate"))
 }
 
 // TestAuthVerify_ResponseBodyOnSuccess checks that the 200 response body is

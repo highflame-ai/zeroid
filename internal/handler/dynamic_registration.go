@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
@@ -57,9 +58,15 @@ type DCRRegisterInput struct {
 
 // DCROutput is the polymorphic response body. RFC 7591/7592 success bodies are
 // dynamic-shape; error bodies are oauthErrorBody.
+//
+// WWWAuthenticate, when set, is emitted as the WWW-Authenticate response
+// header. Populated by `dcrErr` for 401 responses so the RFC 9728 §5.1
+// resource_metadata breadcrumb reaches clients that hit a DCR auth failure
+// the same way it reaches clients that hit a generic bearer-auth failure.
 type DCROutput struct {
-	Status int
-	Body   any
+	Status          int
+	WWWAuthenticate string `header:"WWW-Authenticate"`
+	Body            any
 }
 
 // DCRGetInput / DCRUpdateInput / DCRDeleteInput share the same auth shape:
@@ -140,12 +147,12 @@ func (a *API) registerDynamicRegistrationRoutes(api huma.API) {
 func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCROutput, error) {
 	iatClaims, err := a.validateInitialAccessToken(input.Authorization)
 	if err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 
 	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
 	if err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 
 	client, plainSecret, plainRegToken, regErr := a.oauthClientSvc.DynamicRegisterClient(ctx, service.DynamicRegisterClientRequest{
@@ -160,10 +167,10 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 	})
 	if regErr != nil {
 		if errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
-			return dcrErr(&dcrError{status: http.StatusConflict, code: oautherror.InvalidClientMetadata, desc: "client already exists"}), nil
+			return a.dcrErr(&dcrError{status: http.StatusConflict, code: oautherror.InvalidClientMetadata, desc: "client already exists"}), nil
 		}
 		log.Error().Err(regErr).Msg("dynamic client registration failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to register client"}), nil
+		return a.dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to register client"}), nil
 	}
 
 	// Audit log: who minted what. registered_by_* claims are derived from the
@@ -187,19 +194,19 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 func (a *API) dcrGetOp(ctx context.Context, input *DCRGetInput) (*DCROutput, error) {
 	cl, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID)
 	if err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 	return &DCROutput{Status: http.StatusOK, Body: a.dcrClientResponse(cl)}, nil
 }
 
 func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutput, error) {
 	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 
 	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
 	if err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 
 	updated, updateErr := a.oauthClientSvc.UpdateDynamicClient(ctx, input.ClientID, service.DynamicRegisterClientRequest{
@@ -217,21 +224,21 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		// have been deleted in between. Map ErrOAuthClientNotFound to the
 		// same 401 the auth path uses; other errors are infra failures.
 		if errors.Is(updateErr, service.ErrOAuthClientNotFound) {
-			return dcrErr(&dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "client no longer exists"}), nil
+			return a.dcrErr(&dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "client no longer exists"}), nil
 		}
 		log.Error().Err(updateErr).Str("client_id", input.ClientID).Msg("dynamic client update failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to update client registration"}), nil
+		return a.dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to update client registration"}), nil
 	}
 	return &DCROutput{Status: http.StatusOK, Body: a.dcrClientResponse(updated)}, nil
 }
 
 func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutput, error) {
 	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
-		return dcrErr(err), nil
+		return a.dcrErr(err), nil
 	}
 	if err := a.oauthClientSvc.DeleteDynamicClient(ctx, input.ClientID); err != nil {
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client delete failed")
-		return dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to delete client registration"}), nil
+		return a.dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to delete client registration"}), nil
 	}
 	return &DCROutput{Status: http.StatusNoContent, Body: nil}, nil
 }
@@ -300,8 +307,17 @@ type dcrError struct {
 
 func (e *dcrError) Error() string { return e.code + ": " + e.desc }
 
-func dcrErr(de *dcrError) *DCROutput {
-	return &DCROutput{Status: de.status, Body: oauthErrorBody{Error: de.code, ErrorDescription: de.desc}}
+func (a *API) dcrErr(de *dcrError) *DCROutput {
+	out := &DCROutput{Status: de.status, Body: oauthErrorBody{Error: de.code, ErrorDescription: de.desc}}
+	// RFC 9728 §5.1 — on 401 from any Bearer-protected path, the
+	// resource_metadata breadcrumb points cold-start clients at the PRM
+	// document so they can discover the AS without prior knowledge. The
+	// error code and description echo what the body already carries so a
+	// client that only inspects headers gets the same signal.
+	if de.status == http.StatusUnauthorized {
+		out.WWWAuthenticate = middleware.WWWAuthenticate(de.code, de.desc, a.prmURL())
+	}
+	return out
 }
 
 // initialAccessTokenClaims captures the tenant-relevant claims of a successfully
@@ -324,7 +340,12 @@ type initialAccessTokenClaims struct {
 // Returns the extracted tenant claims on success or a *dcrError on failure.
 func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessTokenClaims, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer initial access token is required"}
+		// RFC 6750 §3.1 — a missing/non-Bearer scheme is a malformed request,
+		// not a bad token, so the WWW-Authenticate challenge `error` (which
+		// dcrErr mirrors from this code) must be invalid_request. invalid_token
+		// is reserved for a syntactically valid Bearer credential that fails
+		// validation (see the jwt.Parse failure path below).
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidRequest, desc: "Authorization header with Bearer initial access token is required"}
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
@@ -388,7 +409,10 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 // Authorization header against the stored bcrypt hash for the path's client_id.
 func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID string) (*domain.OAuthClient, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer registration_access_token is required"}
+		// RFC 6750 §3.1 — missing/non-Bearer scheme is a malformed request
+		// (invalid_request), not a rejected credential (invalid_token). The
+		// real-token-but-wrong/unknown case below correctly stays invalid_token.
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidRequest, desc: "Authorization header with Bearer registration_access_token is required"}
 	}
 	regToken := strings.TrimPrefix(authHeader, "Bearer ")
 

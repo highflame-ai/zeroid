@@ -209,39 +209,14 @@ func TestRFC9728_S3_2_NoEmptyArrayValues(t *testing.T) {
 	}
 }
 
-// ── RFC 9728 §5.1 — WWW-Authenticate Response ───────────────────────────────
-
-func TestRFC9728_S5_1_WWWAuthenticateResourceMetadataNotYetEmitted(t *testing.T) {
-	// RFC 9728 §5.1 (WWW-Authenticate Response) defines the
-	//   `resource_metadata` parameter as "The URL of the protected
-	//   resource metadata," carried in the WWW-Authenticate header that a
-	//   resource server returns on 401.
-	//
-	// This is the breadcrumb that lets a cold agent discover PRM from a
-	// 401 without prior knowledge. ZeroID's bearer-auth middleware does
-	// not currently emit this parameter — that change has wider blast
-	// radius (touches every 401 emission site) and lands as a follow-up.
-	//
-	// Pinning the current state explicitly:
-	//   - If a future change wires the parameter, this test fails and the
-	//     implementer must flip the assertion to verify the breadcrumb
-	//     matches the well-known URL.
-	//   - If the parameter is added inconsistently (some 401s emit it,
-	//     others don't), the failing test localizes the gap.
-	//
-	// Probe with an obviously-invalid bearer on a protected endpoint; we
-	// just need *a* 401 from the bearer-auth middleware path.
-	resp := get(t, adminPath("/identities"), map[string]string{
-		"Authorization": "Bearer not-a-real-token",
-	})
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
-		"protected endpoint with bogus token MUST 401")
-
-	wwwAuth := resp.Header.Get("WWW-Authenticate")
-	assert.NotContains(t, wwwAuth, "resource_metadata=",
-		"RFC 9728 §5.1 breadcrumb not yet emitted — flip this assertion when the middleware change lands")
-}
+// RFC 9728 §5.1 (WWW-Authenticate Response) — positive coverage now lives in
+// tests/integration/www_authenticate_compliance_test.go, which probes the
+// AgentAuthMiddleware, DCR, and forward-auth paths that actually emit the
+// breadcrumb. A prior negative-pin test ("…NotYetEmitted") lived here as a
+// placeholder for the then-deferred middleware work; it probed
+// /api/v1/identities, which is admin-only (no bearer-auth middleware) and
+// so couldn't actually exercise the §5.1 emission. It was removed when the
+// real implementation and its dedicated compliance file landed.
 
 // ── Cross-document consistency ──────────────────────────────────────────────
 

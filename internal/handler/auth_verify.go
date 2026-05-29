@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
@@ -42,9 +43,15 @@ func (a *API) registerAuthVerifyRoute(router chi.Router) {
 //	  copy_headers X-Forwarded-User X-Zeroid-Identity-Type X-Zeroid-Trust-Level X-Zeroid-Account-ID X-Zeroid-Project-ID
 //	}
 func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	prm := a.prmURL()
+
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer error="missing_token"`)
+		// RFC 6750 §3.1 — "missing_token" is not in the standard enum,
+		// but pre-PR usage shipped this string; preserved for client
+		// compatibility. The RFC 9728 §5.1 breadcrumb is the additive
+		// improvement.
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate("missing_token", "", prm))
 		http.Error(w, `{"error":"missing_token"}`, http.StatusUnauthorized)
 		return
 	}
@@ -52,7 +59,7 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	token, ok := strings.CutPrefix(authHeader, "Bearer ")
 	token = strings.TrimSpace(token)
 	if !ok || token == "" {
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error=%q`, oautherror.InvalidRequest))
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidRequest, "", prm))
 		http.Error(w, `{"error":"invalid_authorization_header"}`, http.StatusUnauthorized)
 		return
 	}
@@ -66,7 +73,7 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	active, _ := claims["active"].(bool)
 	if !active {
-		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error=%q`, oautherror.InvalidToken))
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidToken, "", prm))
 		http.Error(w, fmt.Sprintf(`{"error":%q}`, oautherror.InvalidToken), http.StatusUnauthorized)
 		return
 	}

@@ -316,6 +316,10 @@ func NewServer(cfg Config) (*Server, error) {
 			agentAuthCfg := internalMiddleware.AgentAuthConfig{
 				PublicKey: jwksSvc.PublicKey(),
 				Issuer:    cfg.Token.Issuer,
+				// RFC 9728 §5.1 breadcrumb on 401s — points cold-start
+				// clients at the PRM document so they can chain
+				// resource → PRM → AS metadata without prior knowledge.
+				ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
 			}
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
@@ -543,6 +547,7 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			ProjectID:            n.ProjectID,
 			ClientID:             n.ClientID,
 			LoginHint:            n.LoginHint,
+			GroupHint:            n.GroupHint,
 			Scope:                n.Scope,
 			BindingMessage:       n.BindingMessage,
 			ExpiresAt:            n.ExpiresAt,

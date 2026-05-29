@@ -99,6 +99,23 @@ var ErrAuthorizationDetailsOversized = errors.New(
 	"authorization_details exceeds the per-request size cap",
 )
 
+// MaxGroupHintChars caps the CIBA group_hint extension parameter. zeroid
+// treats group_hint as opaque (the deployer's namespace convention owns
+// interpretation), so the only library-level concern is bounding write
+// size against the persisted VARCHAR(255) column. 255 chars is generous
+// for any reasonable namespace scheme — "highflame:role:finance_lead"
+// is 27 chars, "pd:schedule:P12345" is 18 — and small enough that abuse
+// (a megabyte-long pseudo-hint) is rejected before persistence.
+const MaxGroupHintChars = 255
+
+// ErrInvalidGroupHint is the sentinel returned when group_hint exceeds
+// MaxGroupHintChars. Wrapped via %w so handlers can use errors.Is to
+// map to 400 Bad Request consistently — see the convention used for
+// ErrInvalidBindingMessage.
+var ErrInvalidGroupHint = errors.New(
+	"group_hint exceeds the per-request size cap",
+)
+
 // ErrAuthorizationDetailsMalformed is returned when the raw JSON is not a
 // valid array of objects each carrying a non-empty string `type`.
 var ErrAuthorizationDetailsMalformed = errors.New(
@@ -211,11 +228,20 @@ func ParseAuthorizationDetails(raw []byte) (AuthorizationDetails, error) {
 type BackchannelAuthRequest struct {
 	bun.BaseModel `bun:"table:backchannel_auth_requests,alias:bcr"`
 
-	AuthReqID      string `bun:"auth_req_id,pk,type:varchar(255)"             json:"auth_req_id"`
-	AccountID      string `bun:"account_id,type:varchar(255)"                 json:"account_id"`
-	ProjectID      string `bun:"project_id,type:varchar(255)"                 json:"project_id"`
-	ClientID       string `bun:"client_id,type:varchar(255)"                  json:"client_id"`
-	LoginHint      string `bun:"login_hint,type:text"                         json:"login_hint,omitempty"`
+	AuthReqID string `bun:"auth_req_id,pk,type:varchar(255)"             json:"auth_req_id"`
+	AccountID string `bun:"account_id,type:varchar(255)"                 json:"account_id"`
+	ProjectID string `bun:"project_id,type:varchar(255)"                 json:"project_id"`
+	ClientID  string `bun:"client_id,type:varchar(255)"                  json:"client_id"`
+	LoginHint string `bun:"login_hint,type:text"                         json:"login_hint,omitempty"`
+	// GroupHint is the CIBA extension parameter for role-targeted /
+	// group-targeted approval (see Server.RegisterAuthorizationDetailValidator
+	// and BackchannelNotification.GroupHint for the deployer surface).
+	// Opaque to zeroid; the deployer's namespace convention determines
+	// what string content means (e.g. "highflame:role:finance_lead",
+	// "pd:schedule:P12345"). Capped at MaxGroupHintChars by the service
+	// layer; defaults to '' in Postgres so pre-extension rows surface
+	// as no-group_hint without a NULL check in consumer code.
+	GroupHint      string `bun:"group_hint,type:varchar(255)"                 json:"group_hint,omitempty"`
 	Scope          string `bun:"scope,type:text"                              json:"scope,omitempty"`
 	BindingMessage string `bun:"binding_message,type:text"                    json:"binding_message,omitempty"`
 	// AuthorizationDetailsRaw is the RFC 9396 `authorization_details` JSON
