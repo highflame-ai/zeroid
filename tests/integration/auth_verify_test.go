@@ -25,9 +25,12 @@ func issueAPIKeyToken(t *testing.T, externalID string) string {
 }
 
 // expectedWWWAuth builds the WWW-Authenticate value the forward-auth endpoint
-// is expected to emit for a given RFC 6750 error code. After PR-E, every 401
-// from a Bearer-protected path adds the RFC 9728 §5.1 resource_metadata
-// parameter pointing at this server's PRM document.
+// is expected to emit for a given Bearer error code string. Note this is not
+// always an RFC 6750-defined code: the forward-auth path intentionally ships
+// the non-standard "missing_token" string for client compatibility (see
+// auth_verify.go). Every 401 from a Bearer-protected path also adds the
+// RFC 9728 §5.1 resource_metadata parameter pointing at this server's PRM
+// document.
 func expectedWWWAuth(errorCode string) string {
 	return `Bearer error="` + errorCode + `", resource_metadata="` + prmURL() + `"`
 }

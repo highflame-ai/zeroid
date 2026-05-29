@@ -340,7 +340,12 @@ type initialAccessTokenClaims struct {
 // Returns the extracted tenant claims on success or a *dcrError on failure.
 func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessTokenClaims, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer initial access token is required"}
+		// RFC 6750 §3.1 — a missing/non-Bearer scheme is a malformed request,
+		// not a bad token, so the WWW-Authenticate challenge `error` (which
+		// dcrErr mirrors from this code) must be invalid_request. invalid_token
+		// is reserved for a syntactically valid Bearer credential that fails
+		// validation (see the jwt.Parse failure path below).
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidRequest, desc: "Authorization header with Bearer initial access token is required"}
 	}
 	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
@@ -404,7 +409,10 @@ func (a *API) validateInitialAccessToken(authHeader string) (*initialAccessToken
 // Authorization header against the stored bcrypt hash for the path's client_id.
 func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID string) (*domain.OAuthClient, *dcrError) {
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidToken, desc: "Authorization header with Bearer registration_access_token is required"}
+		// RFC 6750 §3.1 — missing/non-Bearer scheme is a malformed request
+		// (invalid_request), not a rejected credential (invalid_token). The
+		// real-token-but-wrong/unknown case below correctly stays invalid_token.
+		return nil, &dcrError{status: http.StatusUnauthorized, code: oautherror.InvalidRequest, desc: "Authorization header with Bearer registration_access_token is required"}
 	}
 	regToken := strings.TrimPrefix(authHeader, "Bearer ")
 

@@ -26,7 +26,8 @@ import (
 // challenges (invalid credentials).
 //
 // All parameter values are double-quoted per RFC 7235 §2.1 quoted-string
-// rules — only " and \ are escaped, with HTAB, CR, and LF stripped. We do
+// rules — only " and \ are escaped, and all CTL characters except HTAB are
+// stripped (HTAB is preserved as RFC 7230 §3.2.6 obs-text permits it). We do
 // NOT use fmt's %q verb here because %q applies Go-specific escaping (e.g.
 // \uXXXX for non-ASCII) which produces strings that are not valid HTTP
 // quoted-string per RFC 7230 §3.2.6. For ASCII-only inputs the two are

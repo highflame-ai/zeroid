@@ -209,14 +209,14 @@ func TestRFC9728_S3_2_NoEmptyArrayValues(t *testing.T) {
 	}
 }
 
-// RFC 9728 §5.1 (WWW-Authenticate Response) — positive coverage lives in
+// RFC 9728 §5.1 (WWW-Authenticate Response) — positive coverage now lives in
 // tests/integration/www_authenticate_compliance_test.go, which probes the
 // AgentAuthMiddleware, DCR, and forward-auth paths that actually emit the
 // breadcrumb. A prior negative-pin test ("…NotYetEmitted") lived here as a
-// placeholder for the deferred middleware work; it probed
+// placeholder for the then-deferred middleware work; it probed
 // /api/v1/identities, which is admin-only (no bearer-auth middleware) and
-// so couldn't actually exercise the §5.1 emission. Removed once PR-166
-// shipped the real implementation and its compliance file.
+// so couldn't actually exercise the §5.1 emission. It was removed when the
+// real implementation and its dedicated compliance file landed.
 
 // ── Cross-document consistency ──────────────────────────────────────────────
 
