@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog/log"
 
@@ -90,6 +91,7 @@ type BackchannelNotification struct {
 	ProjectID            string
 	ClientID             string
 	LoginHint            string
+	GroupHint            string
 	Scope                string
 	BindingMessage       string
 	ExpiresAt            time.Time
@@ -272,10 +274,18 @@ func (s *BackchannelService) SetPingDispatchSync(sync bool) {
 
 // CreateAuthRequest input for POST /oauth2/bc-authorize.
 type CreateAuthRequestInput struct {
-	ClientID        string
-	AccountID       string
-	ProjectID       string
-	LoginHint       string
+	ClientID  string
+	AccountID string
+	ProjectID string
+	LoginHint string
+	// GroupHint is the CIBA extension parameter for role/group-targeted
+	// approval. Opaque to zeroid; the deployer's BackchannelNotifier
+	// owns interpretation (e.g. AuthN treats "highflame:role:finance_lead"
+	// as a role identifier and fans the SSE event out to every user
+	// in that role). At least one of {LoginHint, GroupHint} must be
+	// present — the service-layer validator enforces this. Capped at
+	// domain.MaxGroupHintChars (255 chars) to bound persisted-row size.
+	GroupHint       string
 	Scope           string
 	BindingMessage  string
 	RequestedExpiry int // seconds; 0 → DefaultExpiry
@@ -289,8 +299,9 @@ type CreateAuthRequestInput struct {
 	// validation. Empty when the client omits the parameter (legacy CIBA
 	// behavior unchanged). The service validates outer shape, runs any
 	// registered per-type validators, and persists the bytes verbatim so
-	// downstream consumers (the BackchannelNotifier, the future token-embed
-	// path) see the exact JSON the client supplied.
+	// downstream consumers — the BackchannelNotifier hook and the
+	// token-side embed at issuance — see the exact JSON the client
+	// supplied.
 	AuthorizationDetailsRaw []byte
 }
 
@@ -314,10 +325,32 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	if in.AccountID == "" || in.ProjectID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for bc-authorize")
 	}
-	if in.LoginHint == "" {
-		// CIBA Core §7.1: at least one of login_hint / login_hint_token / id_token_hint
-		// MUST be supplied. PR 1 supports login_hint only.
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "login_hint is required")
+	if in.LoginHint == "" && in.GroupHint == "" {
+		// CIBA Core §7.1 requires at least one of
+		// {login_hint, login_hint_token, id_token_hint} to identify the
+		// target user. zeroid adds group_hint as an extension parameter
+		// for role-targeted approval (see CreateAuthRequestInput.GroupHint
+		// docs) — at least one of {login_hint, group_hint} must therefore
+		// be present. login_hint_token / id_token_hint are not yet
+		// supported by zeroid; they remain a future extension.
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"at least one of login_hint or group_hint is required")
+	}
+
+	if hintRunes := utf8.RuneCountInString(in.GroupHint); hintRunes > domain.MaxGroupHintChars {
+		// Bound the persisted column. group_hint is opaque to zeroid but
+		// stored verbatim in a VARCHAR(255) column — Postgres VARCHAR(N)
+		// counts CODEPOINTS, not bytes, so the validator counts runes to
+		// match. A multi-byte UTF-8 string (e.g. "highflame:角色:finance_lead")
+		// can be under 255 chars while exceeding 255 bytes; a byte-length
+		// check would over-reject. errors.Is mapping to invalid_request
+		// via the wrapped sentinel.
+		return nil, oauthBadRequestCause(
+			oautherror.InvalidRequest,
+			fmt.Sprintf("group_hint exceeds maximum length of %d characters", domain.MaxGroupHintChars),
+			fmt.Errorf("%w: %d runes > max %d",
+				domain.ErrInvalidGroupHint, hintRunes, domain.MaxGroupHintChars),
+		)
 	}
 
 	// Validate client exists in the tenant scope. We don't enforce a
@@ -418,6 +451,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		ProjectID:                  in.ProjectID,
 		ClientID:                   in.ClientID,
 		LoginHint:                  in.LoginHint,
+		GroupHint:                  in.GroupHint,
 		Scope:                      in.Scope,
 		BindingMessage:             bindingMsg,
 		AuthorizationDetailsRaw:    rarRaw,
@@ -698,6 +732,23 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		customClaims["binding_message"] = row.BindingMessage
 	}
 
+	// RFC 9396 Rich Authorization Requests — token-side.
+	//
+	// §6.1: include the granted authorization_details as a top-level JWT
+	// claim so resource servers can read the typed authorization without
+	// an introspection round-trip.
+	// §5.2: also include it on the token response body so polling / push
+	// clients see what was granted.
+	//
+	// The raw bytes are passed through verbatim (as json.RawMessage) so
+	// jwx serialises the array structure rather than the {Type, Raw}
+	// surface of the domain type. The bc-authorize-side validator
+	// guarantees the persisted bytes are a valid RFC 9396 array (a
+	// legacy CIBA row stores the canonical empty `[]`); no re-parse or
+	// special-case filtering on issuance.
+	rarBytes := row.AuthorizationDetailsRaw
+	customClaims["authorization_details"] = rarBytes
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		Scopes:            parseScopeString(row.Scope),
@@ -716,6 +767,8 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 
 	accessToken.AccountID = row.AccountID
 	accessToken.ProjectID = row.ProjectID
+	accessToken.AuthorizationDetails = rarBytes
+
 	return accessToken, nil
 }
 
@@ -860,6 +913,7 @@ func (s *BackchannelService) dispatchNotifierWithRAR(
 		ProjectID:            row.ProjectID,
 		ClientID:             row.ClientID,
 		LoginHint:            row.LoginHint,
+		GroupHint:            row.GroupHint,
 		Scope:                row.Scope,
 		BindingMessage:       row.BindingMessage,
 		ExpiresAt:            row.ExpiresAt,
@@ -940,6 +994,11 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	}
 	if accessToken.RefreshToken != "" {
 		payload["refresh_token"] = accessToken.RefreshToken
+	}
+	// RFC 9396 §5.2: include granted authorization_details on the token
+	// response so push clients see the typed grant without parsing the JWT.
+	if len(accessToken.AuthorizationDetails) > 0 {
+		payload["authorization_details"] = accessToken.AuthorizationDetails
 	}
 
 	s.postCallback(ctx, row, payload)

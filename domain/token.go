@@ -61,6 +61,14 @@ type AccessToken struct {
 	ExternalID   string `json:"external_id,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	// AuthorizationDetails is the granted RFC 9396 authorization_details
+	// JSON array, included on the token response per §5.2 when the request
+	// carried (and the AS granted) RAR. Empty / unset for non-CIBA flows
+	// and for CIBA requests that did not supply authorization_details.
+	// The raw bytes are the same array embedded in the access-token JWT
+	// claim (§6.1) — kept verbatim so resource servers see the exact
+	// payload the approver authorized.
+	AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty"`
 }
 
 // OAuthClient represents a registered OAuth2 client (RFC 7591).
