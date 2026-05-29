@@ -5,8 +5,8 @@ On each `docker compose up`:
   • If /shared/manifest.json already exists, skip provisioning and print the
     revocation command (fast path for restarts without `docker compose down -v`).
   • Otherwise register all 32 agents (idempotent: existing identities get their
-    public key updated and a fresh API key issued), build the delegation chain,
-    and write the manifest.
+    public key updated and a fresh API key issued), build the mission tree, and
+    write the manifest.
 """
 
 import json
@@ -207,10 +207,10 @@ def register_agents(agents: list, all_scopes: list) -> dict:
     return registry
 
 
-# ── Phase 2: Delegation chains ────────────────────────────────────────────────
+# ── Phase 2: Mission tree ─────────────────────────────────────────────────────
 
 def build_delegation_chains(registry: dict, issuer: str) -> dict:
-    print("\n=== Building delegation chains ===")
+    print("\n=== Building mission tree ===")
     tokens = {}
 
     for name, entry in registry.items():

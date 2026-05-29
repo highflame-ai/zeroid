@@ -13,11 +13,13 @@ Without a system that tracks delegation provenance, your options are:
 - Nuke all tokens for the tenant (taking down every unaffected agent too)
 - Manually walk the topology and revoke hop-by-hop (which requires knowing it)
 
-ZeroID solves this with a `parent_jti` graph. Every token issued by RFC 8693 token
-exchange records the JTI of the token it was derived from. When a CAE signal fires
-against any node, ZeroID walks the full downstream graph and invalidates every
-derived credential atomically — in a single operation, with no knowledge of the
-topology required from the caller. Unaffected branches are untouched.
+ZeroID solves this with a mission tree. Every token issued by RFC 8693 token
+exchange inherits a `mission_id` — a stable, opaque identifier shared across every
+credential in the delegation tree. When a CAE signal fires against any node, ZeroID
+performs one indexed UPDATE on the mission tree and atomically invalidates every
+credential bearing that `mission_id` — no graph traversal required, no knowledge of
+the topology required from the caller. Unaffected branches have different
+`mission_id` values and are untouched.
 
 This demo makes that concrete at 32 agents.
 
@@ -33,10 +35,10 @@ chains.
 
 `spec-legal` (the Legal specialist under the Business orchestrator) is flagged as
 anomalous. One `zid signal` command fires a CAE signal against it. Within two
-seconds, ZeroID has walked the `parent_jti` tree and revoked `spec-legal` plus its
-three tool agents. The other 28 agents — including those in other branches under
-the same orchestrator — stay green and keep running. Grafana shows the exact
-moment each token goes inactive.
+seconds, ZeroID has atomically revoked the entire mission tree rooted at
+`spec-legal` — itself plus its three tool agents. The other 28 agents — including
+those in other branches under the same orchestrator — have different `mission_id`
+values and stay green. Grafana shows the exact moment each token goes inactive.
 
 ```
 orch-business  [all scopes]
@@ -84,25 +86,25 @@ orch-platform  [all scopes]
 | Inter-agent HTTP calls with `Authorization: Bearer <token>` | real |
 | Token introspection on every inbound request | real |
 | CAE signal via `zid signal` CLI | real |
-| Cascade revocation via `parent_jti` graph walk | real |
+| Atomic mission tree revocation via `mission_id` | real |
 | Per-agent Prometheus metrics (`zeroid_token_active`) | real |
 | Grafana real-time dashboard | real |
 | LLM inference | stubbed (fixture JSON) |
 
 ---
 
-## How the delegation chain is built
+## How the mission tree is built
 
-At startup the provisioner calls ZeroID once per agent, building the chain
+At startup the provisioner calls ZeroID once per agent, building the mission tree
 depth-first via RFC 8693 token exchange:
 
 ```
-orch-business  [all scopes]        depth=0   api_key grant
-  spec-finance  [finance:*]        depth=1   RFC 8693 token exchange
-    tool-invoice-processor         depth=2   RFC 8693 token exchange
+orch-business  [all scopes]        depth=0   api_key grant        (root — mission_id anchor)
+  spec-finance  [finance:*]        depth=1   RFC 8693 exchange     (inherits mission_id)
+    tool-invoice-processor         depth=2   RFC 8693 exchange     (inherits mission_id)
     tool-budget-tracker            depth=2
     tool-payroll-agent             depth=2
-  spec-legal  [legal:*]           depth=1
+  spec-legal  [legal:*]           depth=1                         (separate mission_id)
     tool-contract-reviewer         depth=2
     tool-compliance-checker        depth=2
     tool-ip-tracker                depth=2
@@ -110,9 +112,10 @@ orch-business  [all scopes]        depth=0   api_key grant
 ```
 
 Scope attenuation is cryptographically enforced at issuance — a tool agent can
-never hold more scope than the specialist that delegated to it. Each token carries
-the `parent_jti` of the token it was derived from, forming the graph ZeroID walks
-on revocation.
+never hold more scope than the specialist that delegated to it. Every token in the
+tree shares the same `mission_id`, so revoking any node atomically invalidates the
+entire sub-tree in one indexed UPDATE — no edge traversal, no topology knowledge
+required.
 
 ---
 
@@ -175,9 +178,9 @@ zid signal \
   --reason 'compromised agent detected'
 ```
 
-ZeroID walks the `parent_jti` graph and atomically invalidates `spec-legal` plus
-its three tool agents. Within ~2 s, those four tiles flip red on Grafana. The
-other 28 agents remain green and keep processing tasks.
+ZeroID performs one indexed UPDATE on the mission tree and atomically invalidates
+`spec-legal` plus its three tool agents. Within ~2 s, those four tiles flip red on
+Grafana. The other 28 agents have different `mission_id` values and remain green.
 
 ```bash
 # Watch the revocation propagate through agent logs

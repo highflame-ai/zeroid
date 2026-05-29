@@ -9,7 +9,7 @@ the shared manifest written by provision.py, then:
   • Posts a stub task to a random child every 5 s (real HTTP, real auth header).
   • Exposes /metrics for Prometheus and /health for compose health checks.
 
-No LLM calls — task payloads are fixture JSON that proves the delegation chain
+No LLM calls — task payloads are fixture JSON that proves the mission tree
 is alive without touching any inference API.
 """
 
