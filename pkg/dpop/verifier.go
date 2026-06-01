@@ -112,7 +112,7 @@ type ValidateResult struct {
 // Validate runs the full RFC 9449 validation pipeline against r:
 //
 //  1. Parse + signature verify (proof.go)
-//  2. htm match (case-insensitive per RFC 9110 §9.1)
+//  2. htm exact-match (RFC 9110 §9.1 — methods are case-sensitive)
 //  3. htu match (after normalization — query, fragment, scheme+host case,
 //     default port stripped)
 //  4. iat within [now - maxAge - clockSkew, now + clockSkew]
@@ -269,10 +269,12 @@ func (v *Verifier) checkBH(proofBH string, body []byte) error {
 	return nil
 }
 
-// methodEqual matches RFC 9449 §4.3: method comparison is case-insensitive,
-// matching the HTTP/1.1 method-token case rules.
+// methodEqual is exact-equality. RFC 9110 §9.1 says HTTP method tokens are
+// case-sensitive — and although a lowercase htm is "obviously not RFC 9449",
+// silently case-folding here lets a buggy client whose method bug was caught
+// nowhere ELSE slip through DPoP validation. Stay strict.
 func methodEqual(a, b string) bool {
-	return strings.EqualFold(a, b)
+	return a == b
 }
 
 // constantTimeStringEq is a length-revealing constant-time string compare.

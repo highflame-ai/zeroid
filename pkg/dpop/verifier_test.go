@@ -89,7 +89,11 @@ func TestValidate_HTU_Normalization(t *testing.T) {
 	}
 }
 
-func TestValidate_HTM_CaseInsensitive(t *testing.T) {
+// TestValidate_HTM_CaseSensitive locks in RFC 9110 §9.1: HTTP method tokens
+// are case-sensitive. A proof asserting `htm=post` against a `POST` request
+// MUST be rejected — silently case-folding would let a buggy client whose
+// method capitalization was wrong slip through.
+func TestValidate_HTM_CaseSensitive(t *testing.T) {
 	key := genTestKey(t, "ES256")
 	v := mustVerifier(t)
 
@@ -105,9 +109,7 @@ func TestValidate_HTM_CaseInsensitive(t *testing.T) {
 		Method:   "POST",
 		URL:      "https://api.example.com/v1/tokens",
 	})
-	if err != nil {
-		t.Fatalf("case-mismatched method should be accepted: %v", err)
-	}
+	assertDPoPCode(t, err, CodeHTMMismatch)
 }
 
 func TestValidate_HTM_Mismatch(t *testing.T) {
