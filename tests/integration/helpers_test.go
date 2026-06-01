@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,6 +79,66 @@ var testServerPrivKey *ecdsa.PrivateKey
 // uses. Exposed so tests can exercise repository-level transactional semantics
 // directly, bypassing the HTTP surface.
 var testDB *bun.DB
+
+// testTrustedServiceHeader gates the test TrustedServiceValidator: requests
+// carrying this header (any non-empty value) are treated as a trusted internal
+// service for external-principal exchange. The value is echoed back as the
+// service name (the `trusted_by` claim).
+const testTrustedServiceHeader = "X-Test-Trusted-Service"
+
+// trustedServiceCtxKey is the context key the test global middleware uses to
+// pass the trusted-service name through to the validator.
+type trustedServiceCtxKey struct{}
+
+// revocationEventCapture is a thread-safe sink for RevocationEvents emitted by
+// the server's RevocationNotifier. Tests filter by JTI / account so the shared
+// server doesn't leak events across tests.
+type revocationEventCapture struct {
+	mu     sync.Mutex
+	events []zeroid.RevocationEvent
+}
+
+func (c *revocationEventCapture) add(e zeroid.RevocationEvent) {
+	c.mu.Lock()
+	c.events = append(c.events, e)
+	c.mu.Unlock()
+}
+
+// forJTI returns every captured event whose JTI matches.
+func (c *revocationEventCapture) forJTI(jti string) []zeroid.RevocationEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []zeroid.RevocationEvent
+	for _, e := range c.events {
+		if e.JTI == jti {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// forReason returns every captured event whose Reason matches.
+func (c *revocationEventCapture) forReason(reason string) []zeroid.RevocationEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []zeroid.RevocationEvent
+	for _, e := range c.events {
+		if e.Reason == reason {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// count returns the total number of captured events.
+func (c *revocationEventCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.events)
+}
+
+// revocationCapture is the shared sink, wired into the server in TestMain.
+var revocationCapture = &revocationEventCapture{}
 
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
@@ -200,6 +261,35 @@ func runTests(m *testing.M) int {
 	}
 
 	testZeroIDServer = srv
+
+	// Install a capturing RevocationNotifier so revocation tests can
+	// assert that exactly one event fires per revoked JTI on every path. Force
+	// synchronous dispatch so assertions are deterministic without sleeps racing
+	// the detached goroutine.
+	srv.SetRevocationNotifier(func(_ context.Context, e zeroid.RevocationEvent) error {
+		revocationCapture.add(e)
+		return nil
+	})
+	srv.SetRevocationNotifyDispatchSync(true)
+
+	// Wire a TrustedServiceValidator gated on a test header so the
+	// external-principal exchange (role / privilege_scope) tests can exercise
+	// both the trusted and untrusted caller paths against the same server.
+	srv.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get(testTrustedServiceHeader) != "" {
+				r = r.WithContext(context.WithValue(r.Context(), trustedServiceCtxKey{}, r.Header.Get(testTrustedServiceHeader)))
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	srv.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
+		if name, ok := ctx.Value(trustedServiceCtxKey{}).(string); ok && name != "" {
+			return name, nil
+		}
+		return "", fmt.Errorf("caller is not a trusted service")
+	})
+
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 

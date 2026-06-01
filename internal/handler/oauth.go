@@ -42,7 +42,17 @@ type TokenInput struct {
 		ApplicationID string `json:"application_id,omitempty" doc:"Application scope (for external principal exchange)"`
 		// AdditionalClaims allows callers to inject arbitrary claims into the issued JWT.
 		// Keys must not collide with standard OAuth/ZeroID claims. Values are set as-is.
+		// The reserved authorization claims `role` and `privilege_scope` are rejected
+		// here (they can only be set via the dedicated fields below, on the trusted
+		// external-principal exchange path).
 		AdditionalClaims map[string]any `json:"additional_claims,omitempty" doc:"Arbitrary claims to include in the issued JWT"`
+		// Role and PrivilegeScope are authorization claims minted ONLY by the
+		// trusted-service external-principal exchange (RFC 8693 token-exchange
+		// with no actor_token), and only after the TrustedServiceValidator gate
+		// authorizes the caller. They are ignored on all other grants,
+		// and can never be injected via additional_claims (both keys are reserved).
+		Role           string   `json:"role,omitempty" doc:"Authorization role claim (trusted external-principal exchange only)"`
+		PrivilegeScope []string `json:"privilege_scope,omitempty" doc:"Authorization privilege scope claim (trusted external-principal exchange only)"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -287,6 +297,8 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		UserName:          input.Body.UserName,
 		ApplicationID:     input.Body.ApplicationID,
 		AdditionalClaims:  input.Body.AdditionalClaims,
+		Role:              input.Body.Role,
+		PrivilegeScope:    input.Body.PrivilegeScope,
 		Code:              input.Body.Code,
 		CodeVerifier:      input.Body.CodeVerifier,
 		RedirectURI:       input.Body.RedirectURI,

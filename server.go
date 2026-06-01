@@ -74,6 +74,10 @@ type Server struct {
 	backchannelSvc      *service.BackchannelService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
+	// revocationDispatcher fans out RevocationEvents
+	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
+	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
+	revocationDispatcher *service.RevocationDispatcher
 
 	// Cleanup
 	cleanupWorker *worker.CleanupWorker
@@ -182,7 +186,7 @@ func NewServer(cfg Config) (*Server, error) {
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
-	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
 		cfg.SigningCreds.MaxTTLSeconds,
@@ -197,6 +201,15 @@ func NewServer(cfg Config) (*Server, error) {
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
+
+	// RevocationNotifier plumbing. One shared
+	// dispatcher is handed to every service that performs revocation so a
+	// single Server.SetRevocationNotifier wires all paths. Default: no
+	// notifier installed ⇒ revocation behaviour is unchanged.
+	revocationDispatcher := service.NewRevocationDispatcher()
+	credentialSvc.SetRevocationDispatcher(revocationDispatcher)
+	refreshTokenSvc.SetRevocationDispatcher(revocationDispatcher)
+
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
@@ -342,25 +355,26 @@ func NewServer(cfg Config) (*Server, error) {
 	idleTimeout := parseDurationOrDefault(cfg.Server.IdleTimeout, 60*time.Second)
 
 	srv := &Server{
-		cfg:                 cfg,
-		db:                  db,
-		router:              r,
-		identitySvc:         identitySvc,
-		credentialSvc:       credentialSvc,
-		credentialPolicySvc: credentialPolicySvc,
-		attestationSvc:      attestationSvc,
-		proofSvc:            proofSvc,
-		oauthSvc:            oauthSvc,
-		oauthClientSvc:      oauthClientSvc,
-		signalSvc:           signalSvc,
-		apiKeySvc:           apiKeySvc,
-		agentSvc:            agentSvc,
-		backchannelSvc:      backchannelSvc,
-		jwksSvc:             jwksSvc,
-		refreshTokenSvc:     refreshTokenSvc,
-		cleanupWorker:       worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
-		adminAuthState:      authState,
-		globalMWState:       globalMW,
+		cfg:                  cfg,
+		db:                   db,
+		router:               r,
+		identitySvc:          identitySvc,
+		credentialSvc:        credentialSvc,
+		credentialPolicySvc:  credentialPolicySvc,
+		attestationSvc:       attestationSvc,
+		proofSvc:             proofSvc,
+		oauthSvc:             oauthSvc,
+		oauthClientSvc:       oauthClientSvc,
+		signalSvc:            signalSvc,
+		apiKeySvc:            apiKeySvc,
+		agentSvc:             agentSvc,
+		backchannelSvc:       backchannelSvc,
+		jwksSvc:              jwksSvc,
+		refreshTokenSvc:      refreshTokenSvc,
+		revocationDispatcher: revocationDispatcher,
+		cleanupWorker:        worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
+		adminAuthState:       authState,
+		globalMWState:        globalMW,
 		http: &http.Server{
 			Addr:         ":" + cfg.Server.Port,
 			Handler:      r,
@@ -438,6 +452,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.backchannelSvc.Stop()
 	}
 
+	// Cancel the revocation dispatcher's lifecycle context so detached
+	// RevocationNotifier goroutines wind down with the server.
+	if s.revocationDispatcher != nil {
+		s.revocationDispatcher.Stop()
+	}
+
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
@@ -469,6 +489,8 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 			ApplicationID:    req.ApplicationID,
 			Scope:            req.Scope,
 			AdditionalClaims: req.AdditionalClaims,
+			Role:             req.Role,
+			PrivilegeScope:   req.PrivilegeScope,
 		})
 	})
 }
@@ -488,6 +510,8 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 		ApplicationID:    req.ApplicationID,
 		Scope:            req.Scope,
 		AdditionalClaims: req.AdditionalClaims,
+		Role:             req.Role,
+		PrivilegeScope:   req.PrivilegeScope,
 		TrustedService:   true,
 	})
 }
@@ -554,6 +578,58 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			AuthorizationDetails: n.AuthorizationDetails,
 		})
 	})
+}
+
+// SetRevocationNotifier wires the RevocationNotifier called after every
+// token/credential revocation commits. ZeroID ships
+// no built-in notifier and owns no fan-out (no Redis, no bus); pass a
+// deployer-supplied function that propagates the revocation to its own
+// infrastructure — typically publishing to a Redis deny-set channel so
+// resource servers can block the revoked JTI before its TTL elapses.
+//
+// The notifier fires exactly once per revoked JTI across every revocation
+// path: the RFC 7009 /oauth2/token/revoke flow, CredentialService.RevokeCredential
+// and RotateCredential, RevokeAllActiveForIdentity (identity deactivation), the
+// CAE high/critical-severity signal cascade, and refresh-token reuse/replay
+// revocation. A cascade revoking N tokens fires N times.
+//
+// Dispatch is asynchronous (detached goroutine parented on the server's
+// lifecycle context) so notifier latency never blocks the request that caused
+// the revocation; notifier errors are logged, not propagated. The revocation
+// itself has already committed before the notifier fires.
+//
+// Can be called any time after NewServer; safe to call concurrently. Passing
+// nil clears the notifier. When unset (the default), revocation behaviour is
+// unchanged — no new required config.
+func (s *Server) SetRevocationNotifier(fn RevocationNotifier) {
+	if s.revocationDispatcher == nil {
+		return
+	}
+	if fn == nil {
+		s.revocationDispatcher.SetNotifier(nil)
+		return
+	}
+	s.revocationDispatcher.SetNotifier(func(ctx context.Context, e service.RevocationEvent) error {
+		return fn(ctx, RevocationEvent{
+			JTI:        e.JTI,
+			IdentityID: e.IdentityID,
+			AccountID:  e.AccountID,
+			ProjectID:  e.ProjectID,
+			ExpiresAt:  e.ExpiresAt,
+			Reason:     e.Reason,
+			RevokedAt:  e.RevokedAt,
+		})
+	})
+}
+
+// SetRevocationNotifyDispatchSync forces synchronous revocation-notifier
+// dispatch. Test-only — production must keep async dispatch (the default) so
+// notifier latency cannot block the request that triggered the revocation.
+func (s *Server) SetRevocationNotifyDispatchSync(sync bool) {
+	if s.revocationDispatcher == nil {
+		return
+	}
+	s.revocationDispatcher.SetDispatchSync(sync)
 }
 
 // RegisterAuthorizationDetailValidator wires a deployer-supplied per-type

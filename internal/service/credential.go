@@ -26,6 +26,12 @@ type CredentialService struct {
 	issuer          string
 	defaultTTL      int
 	maxTTL          int
+	// revocationDispatcher fans out a RevocationEvent per revoked JTI to the
+	// deployer-supplied RevocationNotifier after each revocation commits.
+	// Shared with RefreshTokenService so one Server.SetRevocationNotifier call
+	// wires every revocation path. Nil-safe: when no dispatcher is attached, or
+	// no notifier is set on it, revocation behaviour is unchanged.
+	revocationDispatcher *RevocationDispatcher
 }
 
 // NewCredentialService creates a new CredentialService.
@@ -493,23 +499,80 @@ func (s *CredentialService) ListCredentialsByMission(ctx context.Context, missio
 	return s.repo.ListByMissionID(ctx, missionID, accountID, projectID)
 }
 
-// RevokeCredential revokes a credential by ID.
+// SetRevocationDispatcher attaches the shared revocation-event dispatcher.
+// Wired once at server construction; the same dispatcher is shared with
+// RefreshTokenService so a single Server.SetRevocationNotifier configures every
+// revocation path. Nil-safe — when unset, revocation emits no events.
+func (s *CredentialService) SetRevocationDispatcher(d *RevocationDispatcher) {
+	s.revocationDispatcher = d
+}
+
+// RevokeCredential revokes a credential by ID and cascades to any delegated
+// descendants. Fires one RevocationNotifier event per affected JTI after the
+// revocation commits (on a detached goroutine — never on the request's
+// critical path).
 func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID, projectID, reason string) error {
 	if reason == "" {
 		reason = "manual_revocation"
 	}
-	return s.repo.Revoke(ctx, id, accountID, projectID, reason)
+	revoked, err := s.repo.Revoke(ctx, id, accountID, projectID, reason)
+	if err != nil {
+		return err
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return nil
 }
 
 // RevokeAllActiveForIdentity revokes every active credential issued to the given
 // identity and cascades to any delegated descendants via the parent_jti chain.
 // Returns the total number of credentials revoked. Used during agent deactivation
-// so existing tokens stop working immediately rather than surviving until TTL.
+// (and CAE high/critical signal ingest) so existing tokens stop working
+// immediately rather than surviving until TTL.
+//
+// Fires one RevocationNotifier event per affected JTI after the revocation
+// commits — if the cascade revokes N tokens, N events are emitted, each on the
+// shared dispatcher's detached goroutine so the caller's path is never blocked.
 func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
 	if reason == "" {
 		reason = "identity_deactivated"
 	}
-	return s.repo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+	revoked, err := s.repo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
+// dispatchRevocations maps the repository's affected-row projection into
+// RevocationEvents and hands them to the shared dispatcher. The dispatcher
+// itself owns the async/sync decision, the notifier-installed check, and the
+// detached-goroutine lifecycle (mirroring the backchannel notifier). No-op when
+// no dispatcher is attached or no notifier is installed — the no-listener path
+// stays exactly as cheap as before this hook existed.
+func (s *CredentialService) dispatchRevocations(ctx context.Context, revoked []postgres.RevokedCredential, reason string) {
+	// hasNotifier short-circuit keeps the default no-listener path allocation-free:
+	// skip building the events slice + mapping loop when nobody is subscribed.
+	if s.revocationDispatcher == nil || !s.revocationDispatcher.hasNotifier() || len(revoked) == 0 {
+		return
+	}
+	events := make([]RevocationEvent, 0, len(revoked))
+	for _, rc := range revoked {
+		identityID := ""
+		if rc.IdentityID != nil {
+			identityID = *rc.IdentityID
+		}
+		events = append(events, RevocationEvent{
+			JTI:        rc.JTI,
+			IdentityID: identityID,
+			AccountID:  rc.AccountID,
+			ProjectID:  rc.ProjectID,
+			ExpiresAt:  rc.ExpiresAt,
+			Reason:     reason,
+			RevokedAt:  rc.RevokedAt,
+		})
+	}
+	s.revocationDispatcher.Dispatch(ctx, events)
 }
 
 // RotateCredential revokes an existing credential and immediately issues a new one for the same identity.
@@ -523,10 +586,13 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		return nil, nil, fmt.Errorf("credential is already revoked")
 	}
 
-	// Revoke the old credential.
-	if err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated"); err != nil {
+	// Revoke the old credential (cascades to descendants and fires the
+	// RevocationNotifier per affected JTI, same as any other revoke path).
+	revoked, err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated")
+	if err != nil {
 		return nil, nil, fmt.Errorf("failed to revoke old credential during rotation: %w", err)
 	}
+	s.dispatchRevocations(ctx, revoked, "rotated")
 
 	// Issue a new one with the same parameters.
 	return s.IssueCredential(ctx, IssueRequest{

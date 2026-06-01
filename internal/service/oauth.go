@@ -74,6 +74,17 @@ var reservedClaims = map[string]bool{
 	// let a trusted-service caller mint a token that appears DPoP-bound to
 	// an attacker-chosen key thumbprint.
 	"cnf": true,
+	// Authorization claims. `role` and
+	// `privilege_scope` carry authorization weight downstream, so they must
+	// never be settable via the ungated additional_claims map on ANY grant —
+	// that would be a privilege-escalation vector for any caller that can
+	// reach the token endpoint. They are honoured ONLY on the trusted-service
+	// external-principal exchange path, set from dedicated request fields
+	// after the TrustedServiceValidator has authorised the caller (see
+	// ExternalPrincipalExchange). Reserving them here makes the additional_claims
+	// route fail closed regardless of which grant is in play.
+	"role":            true,
+	"privilege_scope": true,
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
@@ -166,6 +177,17 @@ type TokenRequest struct {
 	UserName         string         // user display name
 	ApplicationID    string         // optional application scope
 	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
+	// Role and PrivilegeScope are authorization claims
+	// that the trusted service (already authenticated via TrustedServiceValidator)
+	// may set on the issued token. They are minted into the `role` (string) and
+	// `privilege_scope` (array of strings) JWT claims ONLY on the trusted-service
+	// external-principal exchange path. They CANNOT be set via AdditionalClaims —
+	// both names are in reservedClaims — so an untrusted caller can never inject
+	// them. On any non-trusted path these fields are ignored (never reach the
+	// token), because only ExternalPrincipalExchange reads them and that function
+	// rejects untrusted callers before issuance.
+	Role           string   // authorization role claim (`role`)
+	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -682,12 +704,28 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		"trusted_by":     serviceName,
 	}
 	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
-	// Blocklist prevents overriding standard JWT/ZeroID claims.
+	// Blocklist prevents overriding standard JWT/ZeroID claims — including the
+	// reserved authorization claims `role` and `privilege_scope`, which can only
+	// be set via the dedicated request fields below, never through additional_claims.
 	for k, v := range req.AdditionalClaims {
 		if reservedClaims[k] {
 			continue
 		}
 		customClaims[k] = v
+	}
+
+	// Authorization claims. We are PAST the
+	// TrustedServiceValidator gate at the top of this function, so the caller
+	// is an authorised trusted service — only here may `role` / `privilege_scope`
+	// be minted. Set them from the dedicated request fields (not additional_claims,
+	// which is reserved-blocked) so an untrusted caller has no path to inject an
+	// authorization role. Empty values are omitted so legacy callers that don't
+	// supply them produce identical tokens to before (backward-compatible).
+	if req.Role != "" {
+		customClaims["role"] = req.Role
+	}
+	if len(req.PrivilegeScope) > 0 {
+		customClaims["privilege_scope"] = req.PrivilegeScope
 	}
 
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
@@ -1046,7 +1084,7 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 	}
 
 	if record.RefreshFamilyID != nil && *record.RefreshFamilyID != "" && s.refreshTokenSvc != nil {
-		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID)
+		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID, "auth_code_replay")
 		if revokeErr != nil {
 			log.Error().Err(revokeErr).Str("family_id", *record.RefreshFamilyID).Msg("Auth code replay: failed to revoke refresh token family")
 		} else if count > 0 {
