@@ -36,18 +36,29 @@ type Proof struct {
 	Thumbprint string
 
 	// JTI is the proof's unique identifier (RFC 9449 §4.2 jti claim).
-	// Required; empty values are rejected during parse.
+	// Required; empty values are rejected during parse. Already gated to
+	// the configured max length so the downstream replay store can store
+	// it without truncation surprises.
 	JTI string
 
 	// HTM is the HTTP method the proof asserts coverage of.
 	HTM string
 
 	// HTU is the HTTP URL the proof asserts coverage of. Already normalized
-	// (query and fragment stripped) by parseAndVerify.
+	// by parseAndVerify (query, fragment, scheme+host case, default port).
 	HTU string
 
 	// IssuedAt is the iat claim parsed as time.Time.
 	IssuedAt time.Time
+
+	// ExpiresAt is the optional exp claim (RFC 7519). Zero when the proof
+	// has no exp claim. RFC 9449 §4.2 permits but does not require exp;
+	// when present the verifier enforces it so an explicitly-expired proof
+	// cannot succeed on the iat freshness check alone.
+	ExpiresAt time.Time
+
+	// NotBefore is the optional nbf claim (RFC 7519). Zero when absent.
+	NotBefore time.Time
 
 	// ATH is the optional access-token-hash claim (base64url(sha256(token))).
 	// Empty when not present on the proof.
@@ -62,12 +73,16 @@ type Proof struct {
 	Nonce string
 }
 
-// proofClaims is the JSON payload of a DPoP proof. Mirrors RFC 9449 §4.2.
+// proofClaims is the JSON payload of a DPoP proof. Mirrors RFC 9449 §4.2
+// plus the optional RFC 7519 exp/nbf claims (enforced when present) and
+// the bh extension claim.
 type proofClaims struct {
 	JTI   string `json:"jti"`
 	HTM   string `json:"htm"`
 	HTU   string `json:"htu"`
 	IAT   int64  `json:"iat"`
+	Exp   int64  `json:"exp,omitempty"`
+	Nbf   int64  `json:"nbf,omitempty"`
 	ATH   string `json:"ath,omitempty"`
 	BH    string `json:"bh,omitempty"`
 	Nonce string `json:"nonce,omitempty"`
@@ -82,7 +97,12 @@ type proofClaims struct {
 // The function deliberately splits header parse → header validate →
 // signature verify → payload parse so that algorithm-confusion attempts
 // die before any cryptographic work is done.
-func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error) {
+//
+// maxJTILen caps the jti claim — oversized values are rejected as malformed
+// proofs (4xx) rather than allowed to surface from the downstream store as
+// truncation errors (which a column-bound store would otherwise mis-map to
+// 5xx). Zero disables the check.
+func parseAndVerify(raw string, normalizeURL func(string) string, maxJTILen int) (*Proof, error) {
 	if raw == "" {
 		return nil, withCause(ErrInvalidProof, errors.New("proof is empty"))
 	}
@@ -119,7 +139,8 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 		return nil, wrap(CodeUnsupportedAlg, fmt.Sprintf("alg %q is not in the allow-list", alg), nil)
 	}
 
-	// 4. jwk must be present, public-only, and match the alg.
+	// 4. jwk must be present, public-only (no private material, no symmetric
+	//    keys), and match the alg.
 	embedded, ok := hdr.JWK()
 	if !ok || embedded == nil {
 		return nil, wrap(CodeInvalidProof, "proof header missing jwk", nil)
@@ -127,6 +148,14 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 	if isPrivateJWK(embedded) {
 		// RFC 9449 §4.2: "the jwk header parameter must contain the public key"
 		return nil, wrap(CodeInvalidProof, "proof jwk must be a public key; private material rejected", nil)
+	}
+	if _, sym := embedded.(jwk.SymmetricKey); sym {
+		// Defense-in-depth: an oct JWK in the jwk header is shared-secret
+		// material. The alg allow-list at step 3 already excludes HS*, but
+		// the explicit symmetric-key check keeps the policy honest if a
+		// future jwx version adds an asymmetric alg paired with a symmetric
+		// key shape.
+		return nil, wrap(CodeInvalidProof, "proof jwk must not be a symmetric key", nil)
 	}
 	if !algMatchesKey(alg, embedded) {
 		return nil, wrap(CodeInvalidProof, fmt.Sprintf("alg %q does not match jwk key type %q", alg, embedded.KeyType()), nil)
@@ -148,6 +177,12 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 	if claims.JTI == "" {
 		return nil, wrap(CodeInvalidProof, "proof missing jti", nil)
 	}
+	if maxJTILen > 0 && len(claims.JTI) > maxJTILen {
+		// Bounded so an oversized JTI surfaces as 4xx (malformed proof), not as
+		// a store-side truncation error that a column-bound ReplayStore would
+		// otherwise mis-map to 5xx.
+		return nil, wrap(CodeInvalidProof, fmt.Sprintf("proof jti exceeds %d bytes", maxJTILen), nil)
+	}
 	if claims.HTM == "" {
 		return nil, wrap(CodeInvalidProof, "proof missing htm", nil)
 	}
@@ -159,6 +194,9 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 	}
 
 	// 7. Compute the thumbprint once, here, while we hold a verified key.
+	//    Done BEFORE the verifier's replay-store insert so a thumbprint
+	//    computation failure (vanishingly unlikely past jws.Verify) does
+	//    not leave the jti consumed.
 	thumb, err := JKT(embedded)
 	if err != nil {
 		return nil, err
@@ -169,7 +207,7 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 		htu = normalizeURL(htu)
 	}
 
-	return &Proof{
+	p := &Proof{
 		Alg:        alg,
 		JWK:        embedded,
 		Thumbprint: thumb,
@@ -180,7 +218,14 @@ func parseAndVerify(raw string, normalizeURL func(string) string) (*Proof, error
 		ATH:        claims.ATH,
 		BH:         claims.BH,
 		Nonce:      claims.Nonce,
-	}, nil
+	}
+	if claims.Exp != 0 {
+		p.ExpiresAt = time.Unix(claims.Exp, 0)
+	}
+	if claims.Nbf != 0 {
+		p.NotBefore = time.Unix(claims.Nbf, 0)
+	}
+	return p, nil
 }
 
 // isPrivateJWK reports whether the JWK carries private-key material. Used to

@@ -521,6 +521,125 @@ func TestValidate_StorageFailure(t *testing.T) {
 	}
 }
 
+func TestValidate_MaxJTILen_Default(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	claims := validClaims("POST", "https://api.example.com/v1/tokens")
+	claims["jti"] = strings.Repeat("x", 513) // one byte over the 512 default
+	proof := key.signProof(t, claims)
+
+	_, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "POST",
+		URL:      "https://api.example.com/v1/tokens",
+	})
+	assertDPoPCode(t, err, CodeInvalidProof)
+}
+
+func TestValidate_MaxJTILen_Disabled(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v, err := NewVerifier(Config{Store: NewMemoryStore()}, WithMaxJTILen(0))
+	if err != nil {
+		t.Fatalf("NewVerifier: %v", err)
+	}
+	claims := validClaims("POST", "https://api.example.com/v1/tokens")
+	claims["jti"] = strings.Repeat("y", 1024)
+	proof := key.signProof(t, claims)
+
+	if _, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "POST",
+		URL:      "https://api.example.com/v1/tokens",
+	}); err != nil {
+		t.Fatalf("disabled check should accept oversized jti: %v", err)
+	}
+}
+
+func TestValidate_Exp_HonoredWhenPresent(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	claims := validClaims("POST", "https://api.example.com/v1/tokens")
+	// Proof's iat is "now" (passes freshness) but exp is well in the past.
+	claims["exp"] = time.Now().Add(-time.Hour).Unix()
+	proof := key.signProof(t, claims)
+
+	_, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "POST",
+		URL:      "https://api.example.com/v1/tokens",
+	})
+	assertDPoPCode(t, err, CodeClockSkew)
+}
+
+func TestValidate_Nbf_HonoredWhenPresent(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	claims := validClaims("POST", "https://api.example.com/v1/tokens")
+	claims["nbf"] = time.Now().Add(time.Hour).Unix() // nbf in the future
+	proof := key.signProof(t, claims)
+
+	_, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "POST",
+		URL:      "https://api.example.com/v1/tokens",
+	})
+	assertDPoPCode(t, err, CodeClockSkew)
+}
+
+func TestValidate_Exp_AbsentSilentlyAccepted(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	// No exp / no nbf — must succeed.
+	proof := key.signProof(t, validClaims("POST", "https://api.example.com/v1/tokens"))
+	if _, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "POST",
+		URL:      "https://api.example.com/v1/tokens",
+	}); err != nil {
+		t.Fatalf("proof without exp/nbf should be accepted: %v", err)
+	}
+}
+
+func TestValidate_DefaultPort_Normalized(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	// Proof signs with default-port form; request arrives with explicit :443.
+	proof := key.signProof(t, validClaims("GET", "https://api.example.com/v1/resource"))
+	if _, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "GET",
+		URL:      "https://api.example.com:443/v1/resource",
+	}); err != nil {
+		t.Fatalf("https:443 must normalize to https:: %v", err)
+	}
+}
+
+func TestValidate_DefaultPort_Http80(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	proof := key.signProof(t, validClaims("GET", "http://api.example.com/v1/resource"))
+	if _, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "GET",
+		URL:      "http://api.example.com:80/v1/resource",
+	}); err != nil {
+		t.Fatalf("http:80 must normalize to http:: %v", err)
+	}
+}
+
+func TestValidate_NonDefaultPort_Preserved(t *testing.T) {
+	key := genTestKey(t, "ES256")
+	v := mustVerifier(t)
+	// Non-default port must be preserved — proof for :8443 should NOT match request for :443.
+	proof := key.signProof(t, validClaims("GET", "https://api.example.com:8443/v1/resource"))
+	_, err := v.Validate(context.Background(), ValidateRequest{
+		ProofJWT: proof,
+		Method:   "GET",
+		URL:      "https://api.example.com:443/v1/resource",
+	})
+	assertDPoPCode(t, err, CodeHTUMismatch)
+}
+
 // failingStore is a ReplayStore that always errors with a non-dpop error.
 type failingStore struct{}
 

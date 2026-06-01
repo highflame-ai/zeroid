@@ -18,6 +18,11 @@ import (
 const (
 	defaultMaxAge    = 60 * time.Second
 	defaultClockSkew = 5 * time.Second
+	// defaultMaxJTILen caps the jti claim at a value comfortably under the
+	// VARCHAR(512) column width used by zeroid's bun-backed ReplayStore. An
+	// oversized jti from a client is a 4xx (malformed proof), not the 5xx a
+	// store-side truncation error would otherwise produce.
+	defaultMaxJTILen = 512
 )
 
 // Config configures a Verifier. The zero value is NOT valid — Store is
@@ -35,6 +40,7 @@ type Verifier struct {
 	store           ReplayStore
 	clockSkew       time.Duration
 	maxAge          time.Duration
+	maxJTILen       int
 	requireBodyHash bool
 	nowFn           func() time.Time
 	urlNormalize    func(string) string
@@ -53,6 +59,7 @@ func NewVerifier(cfg Config, opts ...Option) (*Verifier, error) {
 		store:        cfg.Store,
 		clockSkew:    defaultClockSkew,
 		maxAge:       defaultMaxAge,
+		maxJTILen:    defaultMaxJTILen,
 		nowFn:        time.Now,
 		urlNormalize: normalizeHTU,
 		logger:       zerolog.Nop(),
@@ -105,18 +112,27 @@ type ValidateResult struct {
 // Validate runs the full RFC 9449 validation pipeline against r:
 //
 //  1. Parse + signature verify (proof.go)
-//  2. htm match
-//  3. htu match (after normalization)
-//  4. iat within [now - maxAge, now + clockSkew]
-//  5. ath match (when AccessToken non-empty)
-//  6. bh match (when Body non-nil + bh present; required if RequireBodyHash)
-//  7. jti insert into ReplayStore (atomic; last because it commits state)
+//  2. htm match (case-insensitive per RFC 9110 §9.1)
+//  3. htu match (after normalization — query, fragment, scheme+host case,
+//     default port stripped)
+//  4. iat within [now - maxAge - clockSkew, now + clockSkew]
+//  5. exp + nbf if present (RFC 7519 optional but enforced when set)
+//  6. ath match (when AccessToken non-empty) — BEFORE the replay insert so
+//     a mis-attached proof can be re-presented with a corrected ath without
+//     burning the jti
+//  7. bh match (when Body non-nil + bh present; required if RequireBodyHash)
+//  8. jti insert into ReplayStore (atomic; LAST because it commits state)
+//
+// The replay-store row's expires_at is computed against the server's wall
+// clock (now + maxAge + clockSkew), NOT against the client-supplied iat —
+// iat-relative expiry would let a client backdate iat to shorten the row's
+// lifetime in the store and re-use a jti within the freshness window.
 //
 // Returns a *dpop.Error on failure. Use errors.As to inspect the stable
 // Code. Storage failures surface as ErrStorageFailure (CodeStorageFailure)
 // and should map to 503; all other failures map to 401 invalid_dpop_proof.
 func (v *Verifier) Validate(ctx context.Context, r ValidateRequest) (*ValidateResult, error) {
-	proof, err := parseAndVerify(r.ProofJWT, v.urlNormalize)
+	proof, err := parseAndVerify(r.ProofJWT, v.urlNormalize, v.maxJTILen)
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +149,9 @@ func (v *Verifier) Validate(ctx context.Context, r ValidateRequest) (*ValidateRe
 	if err := v.checkIATFreshness(proof.IssuedAt); err != nil {
 		return nil, err
 	}
+	if err := v.checkExpNbf(proof.ExpiresAt, proof.NotBefore); err != nil {
+		return nil, err
+	}
 
 	if r.AccessToken != "" {
 		if err := checkATH(proof.ATH, r.AccessToken); err != nil {
@@ -147,8 +166,10 @@ func (v *Verifier) Validate(ctx context.Context, r ValidateRequest) (*ValidateRe
 	}
 
 	// jti insert is last — it commits state. Earlier failures must NOT
-	// poison the replay store.
-	if err := v.store.Insert(ctx, proof.JTI, proof.IssuedAt.Add(v.maxAge+v.clockSkew)); err != nil {
+	// poison the replay store. Wall-clock expiry decouples replay defence
+	// from anything the client controls.
+	expiresAt := v.nowFn().Add(v.maxAge + v.clockSkew)
+	if err := v.store.Insert(ctx, proof.JTI, expiresAt); err != nil {
 		var de *Error
 		if errors.As(err, &de) {
 			return nil, de
@@ -195,6 +216,23 @@ func (v *Verifier) checkIATFreshness(iat time.Time) error {
 	}
 	if iat.After(upper) {
 		return withCause(ErrClockSkew, fmt.Errorf("iat=%s more than %s in the future (now=%s)", iat, v.clockSkew, now))
+	}
+	return nil
+}
+
+// checkExpNbf enforces RFC 7519 exp / nbf claims when the proof carries them.
+// RFC 9449 §4.2 permits both as optional — when present, ignoring them would
+// let an explicitly-expired proof slip past on the iat freshness check alone.
+// Zero values from time.Unix(0, 0) cannot occur here because parseAndVerify
+// only populates these fields when the corresponding claim is present and
+// non-zero.
+func (v *Verifier) checkExpNbf(exp, nbf time.Time) error {
+	now := v.nowFn()
+	if !exp.IsZero() && now.After(exp.Add(v.clockSkew)) {
+		return withCause(ErrClockSkew, fmt.Errorf("exp=%s has passed (now=%s)", exp, now))
+	}
+	if !nbf.IsZero() && now.Add(v.clockSkew).Before(nbf) {
+		return withCause(ErrClockSkew, fmt.Errorf("nbf=%s is in the future (now=%s)", nbf, now))
 	}
 	return nil
 }
@@ -247,10 +285,15 @@ func constantTimeStringEq(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// normalizeHTU strips the query and fragment from a URL and case-folds the
-// scheme and host, per RFC 9449 §4.3 which mandates RFC 3986 §6.2.2 syntax-
-// based normalization. Path case is preserved (RFC 3986 leaves path case-
-// sensitivity to the scheme).
+// normalizeHTU strips the query and fragment from a URL, case-folds the
+// scheme + host (RFC 9449 §4.3 → RFC 3986 §6.2.2 syntax-based normalization),
+// and strips the scheme's default port (§3.2.3 — `https://example.com:443`
+// and `https://example.com` are URI-equivalent). Path case is preserved
+// (RFC 3986 leaves path case-sensitivity to the scheme).
+//
+// Without these normalizations a client signing one form and a server seeing
+// the other — common when a reverse proxy rewrites case or default port —
+// would fail an otherwise-valid proof.
 func normalizeHTU(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -259,9 +302,29 @@ func normalizeHTU(raw string) string {
 		return raw
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
-	u.Host = strings.ToLower(u.Host)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port != "" && !isDefaultPort(u.Scheme, port) {
+		u.Host = host + ":" + port
+	} else {
+		u.Host = host
+	}
 	u.RawQuery = ""
 	u.Fragment = ""
 	u.RawFragment = ""
 	return u.String()
+}
+
+// isDefaultPort reports whether port is the IANA default for scheme.
+// Used by normalizeHTU to fold `https://a.com:443` into `https://a.com`
+// (and the http/80 equivalent) so a proof signed against the default-port
+// form matches a request that arrived with an explicit port.
+func isDefaultPort(scheme, port string) bool {
+	switch {
+	case scheme == "https" && port == "443":
+		return true
+	case scheme == "http" && port == "80":
+		return true
+	}
+	return false
 }

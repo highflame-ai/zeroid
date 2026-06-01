@@ -47,7 +47,8 @@ func RequireBodyHash() Option {
 }
 
 // WithURLNormalizer overrides the htu normalization function. Default
-// behavior strips query and fragment per RFC 9449 §4.3.
+// behavior strips query and fragment per RFC 9449 §4.3, case-folds scheme
+// and host per RFC 3986 §6.2.2, and strips default ports per §3.2.3.
 //
 // Override only if you have a reverse proxy or path rewriter that produces
 // an htu the client could not reproduce — for example, a gateway that
@@ -55,4 +56,15 @@ func RequireBodyHash() Option {
 // In that case, normalize htu the same way on both sides.
 func WithURLNormalizer(f func(string) string) Option {
 	return func(v *Verifier) { v.urlNormalize = f }
+}
+
+// WithMaxJTILen caps the proof's jti claim length. Oversized jti values are
+// rejected as malformed proofs (CodeInvalidProof, 4xx) rather than allowed
+// through to a column-bound ReplayStore where truncation would surface as
+// a 5xx storage error.
+//
+// Pass 0 to disable the check entirely. Default is 512 — comfortably under
+// the standard VARCHAR(512) column width zeroid's bun-backed store uses.
+func WithMaxJTILen(n int) Option {
+	return func(v *Verifier) { v.maxJTILen = n }
 }
