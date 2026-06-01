@@ -247,10 +247,10 @@ func constantTimeStringEq(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// normalizeHTU strips the query and fragment from a URL, per RFC 9449 §4.3.
-// Lower-casing scheme + host is intentionally NOT done here — RFC 3986 reserves
-// case-sensitivity for path; case-folding scheme/host is a transport concern
-// the caller already controls (the host the request was received on).
+// normalizeHTU strips the query and fragment from a URL and case-folds the
+// scheme and host, per RFC 9449 §4.3 which mandates RFC 3986 §6.2.2 syntax-
+// based normalization. Path case is preserved (RFC 3986 leaves path case-
+// sensitivity to the scheme).
 func normalizeHTU(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -258,6 +258,8 @@ func normalizeHTU(raw string) string {
 		// at the equality check; a malformed URL is the caller's bug, not ours.
 		return raw
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
 	u.RawQuery = ""
 	u.Fragment = ""
 	u.RawFragment = ""

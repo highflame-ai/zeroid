@@ -66,6 +66,11 @@ func TestValidate_HTU_Normalization(t *testing.T) {
 		{"with query", "https://api.example.com/v1/resource?foo=bar"},
 		{"with fragment", "https://api.example.com/v1/resource#section"},
 		{"with both", "https://api.example.com/v1/resource?x=y#z"},
+		// RFC 9449 §4.3 / RFC 3986 §6.2.2.1: scheme and host MUST be
+		// case-folded during normalization; path case is preserved.
+		{"uppercase scheme", "HTTPS://api.example.com/v1/resource"},
+		{"uppercase host", "https://API.EXAMPLE.COM/v1/resource"},
+		{"mixed case scheme + host", "HtTpS://Api.Example.Com/v1/resource"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

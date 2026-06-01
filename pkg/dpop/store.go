@@ -171,10 +171,6 @@ func (m *MemoryStore) StartPruner(interval time.Duration) (stop func()) {
 // it disables RFC 9449's replay defense entirely. Provided for tests that
 // want to focus on non-replay validation, and for benchmarks measuring
 // non-store overhead.
-//
-// Use of NullStore is intentionally noisy: every call logs through the
-// passed logger if available. Callers who need a silent no-op should
-// implement their own ReplayStore.
 type NullStore struct{}
 
 // Insert implements ReplayStore by always returning nil. Does NOT detect
