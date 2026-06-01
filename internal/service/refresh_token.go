@@ -26,6 +26,11 @@ type RefreshTokenService struct {
 	// failed successor insert rolls back the claim, avoiding spurious reuse
 	// detection on a client retry after a transient DB error.
 	db *bun.DB
+	// revocationDispatcher fans out a RevocationEvent per revoked refresh token
+	// when reuse detection (or auth-code replay) nukes a family. Shared with
+	// CredentialService so one Server.SetRevocationNotifier wires every path.
+	// Nil-safe: unset ⇒ no events.
+	revocationDispatcher *RevocationDispatcher
 }
 
 // NewRefreshTokenService creates a new refresh token service.
@@ -212,14 +217,17 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 			return fmt.Errorf("refresh token already rotated")
 		}
 
-		count, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
+		revoked, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
 		log.Warn().
 			Str("family_id", existing.FamilyID).
 			Str("user_id", existing.UserID).
 			Str("client_id", existing.ClientID).
-			Int64("revoked_count", count).
+			Int("revoked_count", len(revoked)).
 			Err(revokeErr).
 			Msg("Refresh token reuse detected — entire family revoked")
+		// Fan out one revocation event per revoked token after the family
+		// revocation commits (detached; never blocks reuse-detection's response).
+		s.dispatchRefreshRevocations(ctx, revoked, "refresh_token_reuse")
 		return fmt.Errorf("refresh token reuse detected — family revoked")
 	}
 
@@ -238,10 +246,59 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 	return fmt.Errorf("refresh token in unexpected state")
 }
 
-// RevokeFamily revokes all active tokens in a refresh token family.
-// Used during auth code replay detection per RFC 6749 §4.1.2.
-func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
-	return s.repo.RevokeFamily(ctx, familyID)
+// SetRevocationDispatcher attaches the shared revocation-event dispatcher.
+// Wired once at server construction; shares the dispatcher with
+// CredentialService. Nil-safe.
+func (s *RefreshTokenService) SetRevocationDispatcher(d *RevocationDispatcher) {
+	s.revocationDispatcher = d
+}
+
+// RevokeFamily revokes all active tokens in a refresh token family and fires a
+// RevocationNotifier event per revoked token. Used during refresh-token reuse
+// detection (RFC 6749 §10.4) and auth-code replay detection (§4.1.2) — the
+// caller passes the reason so each path is labelled correctly on the emitted
+// events (e.g. "refresh_token_reuse" vs "auth_code_replay").
+//
+// Returns the number of tokens revoked. The revocation commits before the
+// events are dispatched (on the shared dispatcher's detached goroutine), so a
+// slow subscriber never blocks reuse-detection's response.
+func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID, reason string) (int64, error) {
+	revoked, err := s.repo.RevokeFamily(ctx, familyID)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRefreshRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
+// dispatchRefreshRevocations maps revoked refresh-token rows into
+// RevocationEvents and hands them to the shared dispatcher. The refresh token's
+// UUID is used as the JTI surrogate (refresh tokens are opaque and carry no JWT
+// id), and ExpiresAt is the token's own expiry so subscribers can size their
+// deny-set TTL. No-op when no dispatcher/notifier is attached.
+func (s *RefreshTokenService) dispatchRefreshRevocations(ctx context.Context, revoked []*domain.RefreshToken, reason string) {
+	// hasNotifier short-circuit keeps the default no-listener path allocation-free:
+	// skip building the events slice + mapping loop when nobody is subscribed.
+	if s.revocationDispatcher == nil || !s.revocationDispatcher.hasNotifier() || len(revoked) == 0 {
+		return
+	}
+	events := make([]RevocationEvent, 0, len(revoked))
+	for _, rt := range revoked {
+		identityID := ""
+		if rt.IdentityID != nil {
+			identityID = *rt.IdentityID
+		}
+		events = append(events, RevocationEvent{
+			JTI:        rt.ID, // refresh tokens have no jti; the row UUID is the stable handle
+			IdentityID: identityID,
+			AccountID:  rt.AccountID,
+			ProjectID:  rt.ProjectID,
+			ExpiresAt:  rt.ExpiresAt,
+			Reason:     reason,
+			RevokedAt:  time.Now(),
+		})
+	}
+	s.revocationDispatcher.Dispatch(ctx, events)
 }
 
 // refreshTokenTTL resolves the effective token lifetime: a positive

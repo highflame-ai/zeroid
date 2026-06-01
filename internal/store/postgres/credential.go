@@ -95,38 +95,66 @@ func (r *CredentialRepository) ListByMissionID(ctx context.Context, missionID, a
 	return creds, nil
 }
 
+// RevokedCredential is the minimal projection of a credential affected by a
+// cascade revocation, returned by the revoke functions so the service layer can
+// emit one RevocationNotifier event per affected JTI without a follow-up query.
+// IdentityID is nullable because delegated descendants may not carry an
+// identity_id, and the synthetic external-principal carrier has none.
+type RevokedCredential struct {
+	JTI        string    `bun:"jti"`
+	IdentityID *string   `bun:"identity_id"`
+	AccountID  string    `bun:"account_id"`
+	ProjectID  string    `bun:"project_id"`
+	ExpiresAt  time.Time `bun:"expires_at"`
+	RevokedAt  time.Time `bun:"-"`
+}
+
 // RevokeAllActiveForIdentity revokes all non-expired, non-revoked credentials for an
 // identity and cascades the revocation to every downstream delegated credential in the
 // parent_jti chain (RFC 8693 token_exchange descendants), regardless of which identity
 // issued those child tokens. Implemented via the revoke_credentials_cascade DB function
-// (migration 007) which executes the full subtree update atomically in one statement.
-// Returns the total number of credentials revoked (root + descendants).
-func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
+// (migration 007, evolved to RETURNS TABLE in migration 029) which executes the full
+// subtree update atomically in one statement and returns the affected rows.
+//
+// Returns the affected credentials (root + descendants), one entry per revoked
+// JTI, each stamped with the cascade's revoked_at timestamp. len(result) is the
+// total number of credentials revoked.
+func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var count int64
+	var rows []RevokedCredential
 	db := dbOrTx(ctx, r.db)
 	if err := db.NewRaw(
-		"SELECT revoke_credentials_cascade(?, ?, ?)",
+		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_cascade(?, ?, ?)",
 		identityID, now, reason,
-	).Scan(ctx, &count); err != nil {
-		return 0, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
+	).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to cascade-revoke credentials for identity %s: %w", identityID, err)
 	}
-	return count, nil
+	for i := range rows {
+		rows[i].RevokedAt = now
+	}
+	return rows, nil
 }
 
 // Revoke marks a credential as revoked and cascades the revocation to every
 // downstream delegated credential in the parent_jti chain (RFC 8693 descendants).
 // account_id and project_id are enforced on the anchor as tenant-safety guards.
-// Implemented via the revoke_credential_cascade DB function (migration 008).
-func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) error {
+// Implemented via the revoke_credential_cascade DB function (migration 007,
+// evolved to RETURNS TABLE in migration 029).
+//
+// Returns the affected credentials (the token itself + descendants), one entry
+// per revoked JTI, each stamped with the cascade's revoked_at timestamp.
+func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
-	var count int64
+	var rows []RevokedCredential
 	db := dbOrTx(ctx, r.db)
 	if err := db.NewRaw(
-		"SELECT revoke_credential_cascade(?, ?, ?, ?, ?)",
+		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credential_cascade(?, ?, ?, ?, ?)",
 		id, accountID, projectID, now, reason,
-	).Scan(ctx, &count); err != nil {
-		return fmt.Errorf("failed to cascade-revoke credential %s: %w", id, err)
+	).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to cascade-revoke credential %s: %w", id, err)
 	}
-	return nil
+	for i := range rows {
+		rows[i].RevokedAt = now
+	}
+	return rows, nil
 }
