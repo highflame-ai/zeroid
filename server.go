@@ -26,6 +26,8 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
+
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
@@ -237,9 +239,18 @@ func NewServer(cfg Config) (*Server, error) {
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
-	// DPoP service — validates RFC 9449 proofs and enforces JTI replay protection
-	// via the dpop_jti table. Stateless beyond the DB it reads/writes.
-	dpopSvc := service.NewDPoPService(db)
+	// DPoP verifier — validates RFC 9449 proofs (and the bh extension claim)
+	// against the embedded jwk, with replay prevention via the dpop_jti table.
+	// Verifier logic lives in pkg/dpop (the public OSS primitive); the
+	// Postgres-backed ReplayStore impl lives in internal/store/postgres so
+	// pkg/dpop stays bun-free for downstream consumers that bring their own
+	// storage (Cerberus, Shield, Firehog).
+	dpopVerifier, err := dpop.NewVerifier(dpop.Config{
+		Store: postgres.NewDPoPReplayStore(db),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dpop verifier init: %w", err)
+	}
 
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -249,7 +260,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, delegationSvc, jwksSvc,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopVerifier, delegationSvc, jwksSvc,
 		signingCredSvc, db,
 		cfg.Token.Issuer,
 	)

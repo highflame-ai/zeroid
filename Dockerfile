@@ -13,6 +13,7 @@ RUN apk add --no-cache git ca-certificates
 WORKDIR /app
 COPY go.mod go.sum ./
 COPY pkg/authjwt/go.mod pkg/authjwt/go.sum ./pkg/authjwt/
+COPY pkg/dpop/go.mod pkg/dpop/go.sum ./pkg/dpop/
 RUN go mod download
 
 COPY . .

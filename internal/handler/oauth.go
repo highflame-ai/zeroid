@@ -13,6 +13,7 @@ import (
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // ── OAuth types ──────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	// proof key via cnf.jkt and token_type is returned as "DPoP" (RFC 9449).
 	var dpopThumbprint string
 	if input.DPoPProof != "" {
-		if a.dpopSvc == nil {
+		if a.dpopVerifier == nil {
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
 				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: "DPoP is not enabled on this deployment"},
@@ -263,9 +264,15 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		if htu == "" {
 			htu = a.issuer + "/oauth2/token"
 		}
-		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, htu, input.DPoPProof)
+		res, dpopErr := a.dpopVerifier.Validate(ctx, dpop.ValidateRequest{
+			ProofJWT: input.DPoPProof,
+			Method:   http.MethodPost,
+			URL:      htu,
+		})
 		if dpopErr != nil {
-			if errors.Is(dpopErr, service.ErrDPoPStorageFailure) {
+			// pkg/dpop.IsClientFault is false only for storage failures —
+			// everything else is a client-side 4xx. Storage failure → 5xx.
+			if !dpop.IsClientFault(dpopErr) {
 				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")
 				return &TokenOutput{
 					Status: http.StatusInternalServerError,
@@ -277,7 +284,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: dpopErr.Error()},
 			}, nil
 		}
-		dpopThumbprint = tp
+		dpopThumbprint = res.Thumbprint
 	}
 
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
