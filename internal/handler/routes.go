@@ -17,6 +17,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.
@@ -34,7 +35,7 @@ type API struct {
 	agentSvc             *service.AgentService
 	auditSvc             *service.AuditService
 	backchannelSvc       *service.BackchannelService
-	dpopSvc              *service.DPoPService
+	dpopVerifier         *dpop.Verifier
 	delegationSvc        *service.DelegationService
 	jwksSvc              *signing.JWKSService
 	signingCredSvc       *service.SigningCredentialService
@@ -58,7 +59,7 @@ func NewAPI(
 	agentSvc *service.AgentService,
 	auditSvc *service.AuditService,
 	backchannelSvc *service.BackchannelService,
-	dpopSvc *service.DPoPService,
+	dpopVerifier *dpop.Verifier,
 	delegationSvc *service.DelegationService,
 	jwksSvc *signing.JWKSService,
 	signingCredSvc *service.SigningCredentialService,
@@ -79,7 +80,7 @@ func NewAPI(
 		agentSvc:             agentSvc,
 		auditSvc:             auditSvc,
 		backchannelSvc:       backchannelSvc,
-		dpopSvc:              dpopSvc,
+		dpopVerifier:         dpopVerifier,
 		delegationSvc:        delegationSvc,
 		jwksSvc:              jwksSvc,
 		signingCredSvc:       signingCredSvc,
