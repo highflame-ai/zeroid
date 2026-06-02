@@ -16,7 +16,8 @@ out-of-band approval, ZeroID layers a small set of extensions on top of the
 baseline IETF and OpenID specifications it implements. This document specifies
 those extensions — and *only* those extensions — at the wire level: the
 additional JWT claims, request parameters, URI scheme, gating rules,
-event types, and non-standard endpoints. It is the normative reference an
+event types, workload identity federation, and non-standard endpoints. It is
+the normative reference an
 independent implementer or a resource server would use to interoperate with
 ZeroID without reading its source.
 
@@ -30,7 +31,7 @@ the deltas only.
 This is an implementation specification, not an IETF/OpenID standards-track
 document. The `urn`/draft naming is a convenience for citation. None of the
 extensions defined here are registered with IANA; the registry in
-[Section 13](#13-claim--parameter-registry-iana-style) is informative and scoped
+[Section 14](#14-claim--parameter-registry-iana-style) is informative and scoped
 to ZeroID deployments.
 
 ---
@@ -46,11 +47,12 @@ to ZeroID deployments.
 7. [DPoP Extensions](#7-dpop-extensions)
 8. [Reserved-Claims Gating](#8-reserved-claims-gating)
 9. [CAE / SSF Signals](#9-cae--ssf-signals)
-10. [Non-Standard Endpoints](#10-non-standard-endpoints)
-11. [Discovery Metadata Extensions](#11-discovery-metadata-extensions)
-12. [Security Considerations](#12-security-considerations)
-13. [Claim / Parameter Registry (IANA-style)](#13-claim--parameter-registry-iana-style)
-14. [References](#14-references)
+10. [Workload Identity Federation](#10-workload-identity-federation)
+11. [Non-Standard Endpoints](#11-non-standard-endpoints)
+12. [Discovery Metadata Extensions](#12-discovery-metadata-extensions)
+13. [Security Considerations](#13-security-considerations)
+14. [Claim / Parameter Registry (IANA-style)](#14-claim--parameter-registry-iana-style)
+15. [References](#15-references)
 
 ---
 
@@ -229,7 +231,7 @@ ZeroID populates the RFC 8693 §4.1 `act` claim as a single-level object
 
 A token carries at most one `act`. ZeroID's `act` is a single object, not the
 nested `act` chain RFC 8693 permits; the full lineage is reconstructable from
-the `parent_jti` edges via the Delegation Explorer (Section 10.1) rather than by
+the `parent_jti` edges via the Delegation Explorer (Section 11.1) rather than by
 nesting.
 
 ### 4.5 Sender-constraint claim (`cnf.jkt`)
@@ -419,7 +421,7 @@ See `docs/rar.md` for worked examples.
 ### 6.3 Delivery-mode and notification client metadata
 
 Two OAuth-client fields govern CIBA delivery (advertised in discovery,
-Section 11.1):
+Section 12.1):
 
 | Client field | Values | Meaning |
 |---|---|---|
@@ -457,7 +459,7 @@ The DPoP proof `alg` **MUST** be asymmetric: one of `ES256` `ES384` `ES512`
 algorithms (`HS*`) and any unknown alg **MUST** be rejected **before** any
 cryptographic work, to foreclose algorithm-confusion attacks. (ZeroID's
 *issued-token* DPoP-alg discovery advertises the subset it accepts on the proof
-header; see Section 11.1.)
+header; see Section 12.1.)
 
 ### 7.3 Validation order
 
@@ -541,7 +543,99 @@ A signal carries `identity_id`, `signal_type`, `severity`, a `source` string,
 and an arbitrary JSON `payload`. Signals are tenant-scoped and may carry
 `mission_id` so subscribers can filter to one delegation tree.
 
-## 10. Non-Standard Endpoints
+## 10. Workload Identity Federation
+
+ZeroID lets a workload running on a platform that issues OIDC tokens — GitHub
+Actions, GCP Workload Identity, Kubernetes projected service-account tokens, AWS
+IAM/EKS, and the like — bootstrap a ZeroID credential **with no long-lived
+secret**, by federating the platform's own OIDC token. This is realised through
+the attestation framework's OIDC verifier rather than a distinct OAuth grant;
+this section specifies the wire contract. See `docs/attestation.md` for the full
+verifier reference and worked examples.
+
+### 10.1 Proof types
+
+An attestation submission carries a `proof_type`:
+
+| `proof_type` | Status | Use |
+|---|---|---|
+| `oidc_token` | Implemented | Federate an upstream platform OIDC token — the WIF path. |
+| `image_hash` | Reserved (not yet implemented) | Container image-digest attestation. |
+| `tpm` | Reserved (not yet implemented) | Hardware / TPM attestation. |
+
+The verifier contract is **fail-closed**: a missing verifier, a missing policy,
+or any verification failure yields no trust promotion and no credential.
+
+### 10.2 Per-tenant issuer policy (`oidc_token`)
+
+A tenant authorises upstream issuers through an `AttestationPolicy` whose
+`proof_type` is `oidc_token` and whose config is an `OIDCPolicyConfig`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `issuers` | array of issuer configs | Allowlist. The submitted token's `iss` **MUST** match one entry's `url` or verification fails; at least one issuer is required. |
+
+Each `issuers[]` entry (`OIDCIssuerConfig`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `url` | string | Issuer URL. Matched against the token `iss` **and** used to discover the JWKS via `{url}/.well-known/openid-configuration`. The discovery fetch is size-bounded and **MUST** use HTTPS (loopback hosts excepted, for local dev/test). |
+| `audiences` | array&lt;string&gt; (OPTIONAL) | If non-empty, the token `aud` **MUST** contain at least one of these. Empty disables the audience check. |
+| `required_claims` | map&lt;string,string&gt; (OPTIONAL) | Exact-string-match requirements that bind the token to a specific workload. Every listed key **MUST** be present on the token and equal the configured value. E.g. for GitHub Actions OIDC: `{"repository":"myorg/myrepo","ref":"refs/heads/main"}`. |
+
+Issuer allowlisting and claim binding are configured per `(account_id,
+project_id)` — there is no global trust.
+
+### 10.3 Verification and trust-elevation flow
+
+WIF is a two-step exchange:
+
+1. `POST /attestation/submit` persists the submitted proof (e.g. the platform
+   `oidc_token`) as an attestation record for an identity.
+2. `POST /attestation/verify` runs the OIDC verifier against that record and, on
+   success, **promotes the identity's trust level and issues a credential** in a
+   single transaction.
+
+The OIDC verifier applies, in order:
+
+1. Parse the submitted token; match its `iss` against the tenant's issuer
+   allowlist (Section 10.2). No match → reject.
+2. Discover the matched issuer's JWKS (`/.well-known/openid-configuration`,
+   HTTPS, size-bounded) and verify the token signature.
+3. If the issuer config sets `audiences`, require the token `aud` to contain one.
+4. Enforce every `required_claims` exact match.
+5. Require and validate `exp`; require `sub` and `iss`.
+6. On success, record the verified `sub` / `iss` / expiry, promote the
+   identity's trust level (mapping the attestation level to `first_party` or
+   `verified_third_party`, per Section 3.2), and issue a credential through the
+   credential service under the identity's policy.
+
+A workload therefore presents only its platform-issued OIDC token; ZeroID never
+holds a secret for it, and rotation is the platform's concern.
+
+### 10.4 Endpoints
+
+Under the admin prefix (Section 11), tenant-scoped:
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/attestation/submit` | Submit an attestation proof (e.g. an `oidc_token`) for an identity. |
+| POST | `/attestation/verify` | Verify a submitted proof, promote trust, and issue a credential. |
+| GET | `/attestation/{id}` | Retrieve an attestation record. |
+| PUT | `/attestation-policies` | Upsert a per-tenant attestation policy (e.g. the `oidc_token` issuer allowlist). |
+| GET | `/attestation-policies` | List attestation policies. |
+| DELETE | `/attestation-policies/{id}` | Delete an attestation policy. |
+
+### 10.5 Relationship to direct IdP federation (roadmap)
+
+The mechanism above federates a platform OIDC token **as an attestation** that
+gates credential issuance. A separate, more direct OIDC-IdP-federation path —
+exchanging an IdP token for a ZeroID token without recording an attestation — is
+in progress (issue #88 / PR #124) and is **not** part of `main` at the time of
+writing. It is out of scope for this revision and will be specified here when it
+lands.
+
+## 11. Non-Standard Endpoints
 
 These endpoints are not defined by any OAuth/OIDC RFC. They live under the admin
 prefix, which defaults to `/api/v1` and is deployer-configurable
@@ -549,7 +643,7 @@ prefix, which defaults to `/api/v1` and is deployer-configurable
 `/v1/auth`). Paths below are shown relative to that prefix. All are
 tenant-scoped.
 
-### 10.1 Delegation Explorer
+### 11.1 Delegation Explorer
 
 Read-only views over the delegation graph stored as `parent_jti` edges in
 `issued_credentials`.
@@ -563,7 +657,7 @@ Read-only views over the delegation graph stored as `parent_jti` edges in
 All three are driven by recursive `parent_jti` CTEs and do not depend on
 `mission_id` for correctness.
 
-### 10.2 CAE signals
+### 11.2 CAE signals
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -571,7 +665,7 @@ All three are driven by recursive `parent_jti` CTEs and do not depend on
 | GET | `/signals` | List recent signals (paginated; OPTIONAL `mission_id` filter). |
 | GET | `/signals/stream` | Server-Sent Events stream of signals (raw stream handler). |
 
-### 10.3 WIMSE Proof Tokens (WPT)
+### 11.3 WIMSE Proof Tokens (WPT)
 
 Single-use, nonce-bound proof tokens for service-to-service proof-of-possession.
 
@@ -586,9 +680,9 @@ response is `{ proof_token, token_type: "WIMSE-Proof", expires_in: 300 }`. The
 `nonce` column carries a DB `UNIQUE` constraint giving atomic single-use replay
 prevention without a pre-check query.
 
-## 11. Discovery Metadata Extensions
+## 12. Discovery Metadata Extensions
 
-### 11.1 Authorization Server Metadata (RFC 8414)
+### 12.1 Authorization Server Metadata (RFC 8414)
 
 `GET /.well-known/oauth-authorization-server` includes, beyond the RFC 8414
 baseline:
@@ -601,7 +695,7 @@ baseline:
 | `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
 | `backchannel_authentication_request_signing_alg_values_supported` | `[]` (signed bc-authorize requests unsupported) | CIBA Core |
 
-### 11.2 Protected Resource Metadata (RFC 9728)
+### 12.2 Protected Resource Metadata (RFC 9728)
 
 `GET /.well-known/oauth-protected-resource`:
 
@@ -613,14 +707,14 @@ baseline:
 | `bearer_methods_supported` | `["header"]` |
 | `dpop_bound_access_tokens_required` | `false` (DPoP optional) |
 
-### 11.3 SPIFFE trust bundle
+### 12.3 SPIFFE trust bundle
 
 `GET /.well-known/spiffe-trust-bundle.json` publishes the JWKS as a SPIFFE
 JWT-SVID trust bundle: each key's `use` is `JWT-SVID`, and the document carries
 `spiffe_sequence` and `spiffe_refresh_hint` per the SPIFFE bundle format. This
 lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
 
-## 12. Security Considerations
+## 13. Security Considerations
 
 - **No authority amplification on delegation.** Scope attenuation (5.1) and
   depth capping (5.2) are enforced server-side; a delegated token is always a
@@ -654,13 +748,13 @@ lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
   delegation/by-jti lineage (10.1) reveal structure; they are tenant-scoped but
   SHOULD be treated as readable by anyone holding a tenant credential.
 
-## 13. Claim / Parameter Registry (IANA-style)
+## 14. Claim / Parameter Registry (IANA-style)
 
 Informative registry of every identifier this document defines, for ZeroID
 deployments. "Std" marks an identifier defined by a baseline spec but
 *populated* with ZeroID semantics.
 
-### 13.1 JWT claims
+### 14.1 JWT claims
 
 | Claim | Kind | Defined in |
 |---|---|---|
@@ -689,9 +783,9 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `backchannel_client_id` | string | §4.7 |
 | `binding_message` | string | §4.7 |
 | `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |
-| `nonce` | string | §10.3 (WPT) |
+| `nonce` | string | §11.3 (WPT) |
 
-### 13.2 Request parameters
+### 14.2 Request parameters
 
 | Parameter | Endpoint | Defined in |
 |---|---|---|
@@ -700,23 +794,29 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `role`, `privilege_scope` | `/oauth2/token` (ext-principal exchange) | §5.5, §8 |
 | `additional_claims` | `/oauth2/token` (ext-principal exchange) | §4.8, §8 |
 
-### 13.3 DPoP proof claim
+### 14.3 DPoP proof claim
 
 | Claim | Defined in |
 |---|---|
 | `bh` | §7.1 (Std-draft: `draft-ietf-oauth-dpop-bh`) |
 
-### 13.4 Signal types & severities
+### 14.4 Signal types & severities
 
 See §9.1 / §9.2.
 
-### 13.5 Discovery fields
+### 14.5 Discovery fields
 
-See §11.1 / §11.2 / §11.3.
+See §12.1 / §12.2 / §12.3.
 
-## 14. References
+### 14.6 Workload Identity Federation
 
-### 14.1 Normative (baseline specs extended)
+Proof types (`oidc_token`, `image_hash`, `tpm`), the `OIDCPolicyConfig` /
+`OIDCIssuerConfig` policy fields (`issuers`, `url`, `audiences`,
+`required_claims`), and the attestation endpoints are defined in §10.
+
+## 15. References
+
+### 15.1 Normative (baseline specs extended)
 
 - [RFC 2119] / [RFC 8174] — Requirement keywords.
 - [RFC 6749] / OAuth 2.1 — OAuth framework.
@@ -733,7 +833,7 @@ See §11.1 / §11.2 / §11.3.
 - OpenID Shared Signals Framework / CAEP — CAE signals.
 - SPIFFE / WIMSE — identity URI scheme and trust bundle.
 
-### 14.2 Informative
+### 15.2 Informative
 
 - `draft-ietf-oauth-dpop-bh` — DPoP body-hash extension claim.
 - OpenID Foundation, *Identity Management for Agentic AI* (Oct 2025).
