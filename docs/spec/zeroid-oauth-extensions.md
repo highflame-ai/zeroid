@@ -545,15 +545,24 @@ and an arbitrary JSON `payload`. Signals are tenant-scoped and may carry
 
 ## 10. Workload Identity Federation
 
-ZeroID lets a workload running on a platform that issues OIDC tokens — GitHub
-Actions, GCP Workload Identity, Kubernetes projected service-account tokens, AWS
-IAM/EKS, and the like — bootstrap a ZeroID credential **with no long-lived
-secret**, by federating the platform's own OIDC token. This is realised through
-the attestation framework's OIDC verifier rather than a distinct OAuth grant;
-this section specifies the wire contract. See `docs/attestation.md` for the full
-verifier reference and worked examples.
+ZeroID participates in workload identity federation (WIF) in **both
+directions**, neither of which uses a long-lived secret:
 
-### 10.1 Proof types
+- **Inbound — ZeroID as relying party (§10.1–10.4).** A workload presents an
+  upstream platform OIDC token (GitHub Actions, GCP Workload Identity,
+  Kubernetes projected service-account tokens, AWS IAM/EKS, …); ZeroID verifies
+  it as an attestation and issues a ZeroID credential. Realised through the
+  attestation framework's OIDC verifier (see `docs/attestation.md`).
+- **Outbound — ZeroID as a federation issuer (§10.5).** A ZeroID-issued token is
+  itself federated by a downstream WIF relying party (e.g. Anthropic, GCP, AWS,
+  Azure); the workload uses its ZeroID credential to obtain access at that
+  provider with no provider-native secret. Realised purely through ZeroID's
+  standard, externally-verifiable token + JWKS surface — no provider-specific
+  code on either side.
+
+This section specifies both wire contracts.
+
+### 10.1 Inbound — proof types
 
 An attestation submission carries a `proof_type`:
 
@@ -566,7 +575,7 @@ An attestation submission carries a `proof_type`:
 The verifier contract is **fail-closed**: a missing verifier, a missing policy,
 or any verification failure yields no trust promotion and no credential.
 
-### 10.2 Per-tenant issuer policy (`oidc_token`)
+### 10.2 Inbound — per-tenant issuer policy (`oidc_token`)
 
 A tenant authorises upstream issuers through an `AttestationPolicy` whose
 `proof_type` is `oidc_token` and whose config is an `OIDCPolicyConfig`:
@@ -586,7 +595,7 @@ Each `issuers[]` entry (`OIDCIssuerConfig`):
 Issuer allowlisting and claim binding are configured per `(account_id,
 project_id)` — there is no global trust.
 
-### 10.3 Verification and trust-elevation flow
+### 10.3 Inbound — verification and trust-elevation flow
 
 WIF is a two-step exchange:
 
@@ -613,7 +622,7 @@ The OIDC verifier applies, in order:
 A workload therefore presents only its platform-issued OIDC token; ZeroID never
 holds a secret for it, and rotation is the platform's concern.
 
-### 10.4 Endpoints
+### 10.4 Inbound — attestation endpoints
 
 Under the admin prefix (Section 11), tenant-scoped:
 
@@ -626,14 +635,55 @@ Under the admin prefix (Section 11), tenant-scoped:
 | GET | `/attestation-policies` | List attestation policies. |
 | DELETE | `/attestation-policies/{id}` | Delete an attestation policy. |
 
-### 10.5 Relationship to direct IdP federation (roadmap)
+### 10.5 Outbound — ZeroID as a federation issuer
 
-The mechanism above federates a platform OIDC token **as an attestation** that
-gates credential issuance. A separate, more direct OIDC-IdP-federation path —
-exchanging an IdP token for a ZeroID token without recording an attestation — is
-in progress (issue #88 / PR #124) and is **not** part of `main` at the time of
-writing. It is out of scope for this revision and will be specified here when it
-lands.
+ZeroID-issued tokens are ordinary, externally-verifiable JWTs, so a downstream
+**WIF relying party** can be configured to trust ZeroID as an external OIDC
+issuer and accept a ZeroID credential in place of its own provider-native
+secret. This requires no ZeroID-specific integration on either side — only
+ZeroID's standard issuer surface:
+
+- **Verifiable tokens.** Every issued token carries `iss` (the ZeroID issuer
+  URL), `sub` (the workload's WIMSE URI, Section 3.1), `aud`, `exp`, and a `kid`
+  header, signed ES256 (NHI flows) or RS256.
+- **JWKS at `/.well-known/jwks.json`.** Keys are published with `use="sig"`
+  (RFC 7517 §4.2) **specifically so external WIF validators accept them** — the
+  Anthropic, Azure, GCP, and AWS WIF validators reject keys whose `use` is
+  anything other than `sig`/`enc`. This is asserted by ZeroID's JWKS
+  compatibility test.
+- **Issuer discovery.** `/.well-known/oauth-authorization-server` (Section 12.1)
+  advertises `issuer` and `jwks_uri`; a relying party is configured with those
+  directly. ZeroID does not publish an `/.well-known/openid-configuration`
+  document — relying parties are pointed at the issuer URL and the JWKS URI.
+- **SPIFFE consumers.** `/.well-known/spiffe-trust-bundle.json` (Section 12.3)
+  serves the same keys with `use="JWT-SVID"` for SPIFFE-strict validators.
+
+A relying party configures (a) the trusted issuer = ZeroID's issuer URL,
+(b) the JWKS URI = `{issuer}/.well-known/jwks.json`, and (c) whatever audience /
+subject / claim constraints it enforces, then maps the verified ZeroID `sub`
+(a WIMSE URI) to a local principal. The workload presents its ZeroID access
+token to the relying party; no provider-native secret is involved.
+
+**Anthropic Workload Identity Federation** is a verified relying party for this
+path: configured to trust the ZeroID issuer and its JWKS, it accepts a
+ZeroID-issued token as a federated workload credential — granting Anthropic API
+access without a static Anthropic API key. GCP Workload Identity Federation,
+AWS, and Azure follow the same configuration shape.
+
+> **Audience note.** The public `/oauth2/token` endpoint does not expose an
+> `audience` / `resource` parameter; issued tokens default `aud` to the ZeroID
+> issuer URL. A relying party that enforces a specific audience **MUST**
+> therefore be configured to accept the ZeroID issuer URL as the expected
+> audience (rather than expecting ZeroID to mint a caller-chosen `aud`).
+
+### 10.6 Relationship to direct IdP federation (roadmap)
+
+The **inbound** mechanism (§10.1–10.4) federates a platform OIDC token **as an
+attestation** that gates credential issuance. A separate, more direct
+OIDC-IdP-federation path — exchanging an IdP token for a ZeroID token without
+recording an attestation — is in progress (issue #88 / PR #124) and is **not**
+part of `main` at the time of writing. It is out of scope for this revision and
+will be specified here when it lands.
 
 ## 11. Non-Standard Endpoints
 
@@ -744,9 +794,17 @@ lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
   fan-out are asynchronous; a resource server requiring hard real-time
   revocation **MUST** introspect rather than rely solely on local JWT
   verification.
-- **Metadata is non-confidential.** All discovery documents (11) and the
-  delegation/by-jti lineage (10.1) reveal structure; they are tenant-scoped but
-  SHOULD be treated as readable by anyone holding a tenant credential.
+- **Metadata is non-confidential.** All discovery documents (Section 12) and the
+  delegation/by-jti lineage (Section 11.1) reveal structure; they are
+  tenant-scoped but SHOULD be treated as readable by anyone holding a tenant
+  credential.
+- **Outbound federation extends the trust boundary.** When a relying party
+  federates ZeroID as an external issuer (Section 10.5), it inherits a
+  dependency on ZeroID's key custody and issuer security, and — if it validates
+  only signature + `exp` — it will **not** observe ZeroID-side revocation or CAE
+  cascade. Relying parties that need real-time revocation MUST introspect or
+  rely on short token TTLs; deployers SHOULD scope the `aud`/`sub`/claim
+  constraints a relying party accepts as tightly as the provider allows.
 
 ## 14. Claim / Parameter Registry (IANA-style)
 
@@ -810,9 +868,11 @@ See §12.1 / §12.2 / §12.3.
 
 ### 14.6 Workload Identity Federation
 
-Proof types (`oidc_token`, `image_hash`, `tpm`), the `OIDCPolicyConfig` /
-`OIDCIssuerConfig` policy fields (`issuers`, `url`, `audiences`,
-`required_claims`), and the attestation endpoints are defined in §10.
+Inbound: proof types (`oidc_token`, `image_hash`, `tpm`), the `OIDCPolicyConfig`
+/ `OIDCIssuerConfig` policy fields (`issuers`, `url`, `audiences`,
+`required_claims`), and the attestation endpoints (§10.1–10.4). Outbound: the
+ZeroID-as-federation-issuer surface — JWKS `use="sig"`, `oauth-authorization-server`
+`issuer`/`jwks_uri`, and the SPIFFE trust bundle (§10.5).
 
 ## 15. References
 
