@@ -625,8 +625,16 @@ holds a secret for it, and rotation is the platform's concern.
 ZeroID-issued tokens are ordinary, externally-verifiable JWTs, so a downstream
 **WIF relying party** can be configured to trust ZeroID as an external OIDC
 issuer and accept a ZeroID credential in place of its own provider-native
-secret. This requires no ZeroID-specific integration on either side — only
-ZeroID's standard issuer surface:
+secret. The federation mechanism is **RFC 7523** (JWT-bearer assertion): the
+workload mints a ZeroID access token, then presents it to the relying party's
+token endpoint as the assertion in a
+`urn:ietf:params:oauth:grant-type:jwt-bearer` exchange; the relying party
+validates the signature against ZeroID's published JWKS and maps it — via a
+federation rule keyed on `iss`, `aud`, the `sub` prefix, and ZeroID claims such
+as `trust_level` — to a short-lived credential bound to one of its own
+service accounts. This is the outward mirror of ZeroID's own inbound RFC 7523 /
+RFC 8693 exchanges (Section 5), and requires no ZeroID-specific integration on
+either side — only ZeroID's standard issuer surface:
 
 - **Verifiable tokens.** Every issued token carries `iss` (the ZeroID issuer
   URL), `sub` (the workload's WIMSE URI, Section 3.1), `aud`, `exp`, and a `kid`
@@ -637,9 +645,9 @@ ZeroID's standard issuer surface:
   anything other than `sig`/`enc`. This is asserted by ZeroID's JWKS
   compatibility test.
 - **Issuer discovery.** `/.well-known/oauth-authorization-server` (Section 11.1)
-  advertises `issuer` and `jwks_uri`; a relying party is configured with those
-  directly. ZeroID does not publish an `/.well-known/openid-configuration`
-  document — relying parties are pointed at the issuer URL and the JWKS URI.
+  advertises `issuer` and `jwks_uri`; a relying party either points its JWKS
+  source at that discovery document or is given the JWKS URL explicitly. ZeroID
+  does not publish an `/.well-known/openid-configuration` document.
 - **SPIFFE consumers.** `/.well-known/spiffe-trust-bundle.json` (Section 11.3)
   serves the same keys with `use="JWT-SVID"` for SPIFFE-strict validators.
 
