@@ -120,9 +120,14 @@ spiffe://{trust_domain}/{account_id}/{project_id}/{identity_type}/{external_id}
 
 Constraints:
 
-- Each path segment **MUST** consist only of the characters `a–z A–Z 0–9 . - _`
-  (SPIFFE §2.3 path-segment safe set). Registration **MUST** reject any segment
-  outside this set.
+- Each path segment **MUST** consist only of the characters `a-z A-Z 0-9 . - _`.
+  Registration **MUST** reject any segment outside this set. Because the set
+  excludes `/ ? # @ :`, a segment cannot introduce an empty segment, a query
+  string, a fragment, user-info, or an embedded port. (ZeroID's implementation
+  intentionally permits uppercase letters `A-Z` in path segments — more
+  permissive than a strict-lowercase SPIFFE profile. The `trust_domain` is
+  server configuration, not request input, and is therefore not re-validated
+  per request.)
 - The assembled URI **MUST NOT** exceed **2048 bytes**. Registration **MUST**
   reject a longer URI rather than persist a non-conformant subject.
 
@@ -309,10 +314,21 @@ claim only when &gt; 0 (Section 4.3).
 
 For NHI → NHI delegation, both `subject_token` (the orchestrator's active
 credential) and `actor_token` (a JWT assertion the sub-agent self-signs with the
-private key matching its registered public key) are **REQUIRED**. ZeroID
-verifies the actor assertion's `iss`/`sub` equal the actor identity's WIMSE URI
-before issuing. The issued token's `act.sub` is set to the orchestrator's WIMSE
-URI (Section 4.4 case 1).
+private key matching its registered public key) are **REQUIRED**. The
+`actor_token`:
+
+- **MUST** use an asymmetric `alg`; `none` and HMAC algorithms are rejected
+  (JWT-SVID §3, same allow-list as Section 7.2);
+- **MUST** carry `iss` equal to the actor identity's WIMSE URI;
+- **MUST** carry `aud` equal to the ZeroID issuer;
+- **MUST** carry `sub` and `exp` — RFC 7523 §3 mandatory assertion claims,
+  inherited by the RFC 8693 token-exchange assertion contract (§1.2). ZeroID
+  enforces their presence explicitly, because the underlying JWT library honors
+  these claims when present but does not require them.
+
+ZeroID validates the assertion signature against the actor identity's registered
+ES256 public key before issuing. The issued token's `act.sub` is set to the
+orchestrator's WIMSE URI (Section 4.4 case 1).
 
 ### 5.4 `mission_id` — delegation-tree identifier
 
