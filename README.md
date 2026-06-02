@@ -926,6 +926,8 @@ Full interactive docs at `GET /docs` when running.
 ZeroID implements the complete stack for production agent identity systems. No proprietary protocols.  
 References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Identity-Management-for-Agentic-AI.pdf)
 
+The extensions ZeroID layers on these baseline specs — the additional JWT claims, the CIBA `group_hint` parameter, the DPoP `bh` claim, RFC 8693 attenuation/depth semantics, the WIMSE URI scheme, reserved-claims gating, CAE signal types, and the non-standard endpoints — are specified normatively in [`docs/spec/zeroid-oauth-extensions.md`](docs/spec/zeroid-oauth-extensions.md).
+
 | Standard | RFC / Spec | Used For |
 |----------|-----------|----------|
 | OAuth 2.1 | RFC 6749 + BCP | Foundational auth framework |
