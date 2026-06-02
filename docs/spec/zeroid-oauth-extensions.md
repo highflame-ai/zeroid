@@ -872,20 +872,22 @@ ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
 
 ### 14.1 Normative (baseline specs extended)
 
-- [RFC 2119] / [RFC 8174] — Requirement keywords.
-- [RFC 6749] / OAuth 2.1 — OAuth framework.
-- [RFC 7519] — JSON Web Token.
-- [RFC 7638] — JWK Thumbprint (`cnf.jkt`).
-- [RFC 7591] / [RFC 7592] — Dynamic Client Registration / Management.
-- [RFC 7662] / [RFC 7009] — Introspection / Revocation.
-- [RFC 8414] — Authorization Server Metadata.
-- [RFC 8693] — OAuth 2.0 Token Exchange (`act`, delegation).
-- [RFC 9396] — Rich Authorization Requests (`authorization_details`).
-- [RFC 9449] — DPoP.
-- [RFC 9728] — Protected Resource Metadata.
-- OpenID CIBA Core 1.0 — Backchannel Authentication.
-- OpenID Shared Signals Framework / CAEP — CAE signals.
-- SPIFFE / WIMSE — identity URI scheme and trust bundle.
+| Specification | Used for |
+|---|---|
+| RFC 2119 / RFC 8174 | Requirement keywords |
+| RFC 6749 / OAuth 2.1 | OAuth framework |
+| RFC 7519 | JSON Web Token |
+| RFC 7638 | JWK Thumbprint (`cnf.jkt`) |
+| RFC 7591 / RFC 7592 | Dynamic Client Registration / Management |
+| RFC 7662 / RFC 7009 | Introspection / Revocation |
+| RFC 8414 | Authorization Server Metadata |
+| RFC 8693 | OAuth 2.0 Token Exchange (`act`, delegation) |
+| RFC 9396 | Rich Authorization Requests (`authorization_details`) |
+| RFC 9449 | DPoP |
+| RFC 9728 | Protected Resource Metadata |
+| OpenID CIBA Core 1.0 | Backchannel Authentication |
+| OpenID Shared Signals Framework / CAEP | CAE signals |
+| SPIFFE / WIMSE | Identity URI scheme and trust bundle |
 
 ### 14.2 Informative
 
