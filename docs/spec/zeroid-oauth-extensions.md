@@ -63,6 +63,22 @@ delegating an attenuated subset of its authority to another, for the resulting
 multi-hop chain to remain cryptographically attributable, or for an agent to
 pause mid-task and obtain a human's out-of-band approval.
 
+ZeroID exists to solve **Agent Identity**. Human identity (the domain of
+OAuth/OIDC IdPs) and general workload / machine identity (the domain of
+SPIFFE/SPIRE, cloud IAM, and secret managers) are separate, mature ecosystems;
+ZeroID builds on their primitives — WIMSE/SPIFFE URIs, OIDC, RFC 8693 — and
+federates with them rather than replacing them. What it adds is the
+agent-shaped layer those baselines do not model.
+
+Because agents do not act in isolation — they call services, applications, and
+MCP servers — ZeroID also represents those non-agent principals so the wire
+claims are uniform. This document calls the whole set **NHIs** (non-human
+identities, Section 3.2) and reserves **agent** for the specialization that
+additionally carries the agent-shaped semantics: delegation depth, the `act`
+chain, an agent role, and agent metadata. NHI is the umbrella; agent is one kind
+of NHI; the two are kept distinct throughout (Section 2). The extensions below
+say which layer each belongs to.
+
 ZeroID closes those gaps with the smallest possible set of extensions. The
 design rule is: **extend the standard, never fork it.** Every extension is
 either (a) an additional claim that standard verifiers ignore, (b) an
@@ -83,10 +99,22 @@ and only when, they appear in all capitals.
 
 This document uses the following terms:
 
-- **Identity** — a persistent ZeroID record for a non-human (or, for the human
-  delegation flows, a synthesised) principal. Carries a stable WIMSE URI
+- **NHI (Non-Human Identity)** — the umbrella category for every non-human
+  principal ZeroID registers: a `service`, an `application`, an `mcp_server`,
+  **or** an `agent` (the four `identity_type`s of Section 3.2). Every NHI,
+  whatever its kind, gets a stable WIMSE URI (Section 3) and the core identity
+  claims — `identity_type`, `trust_level`, `status`, `external_id`.
+- **Agent** — the `identity_type = agent` **specialization** of an NHI. Every
+  agent is an NHI; not every NHI is an agent. An agent additionally carries the
+  *agent-shaped* claims a plain service or application does not: an agent
+  `sub_type` (Section 3.2), the delegation semantics `delegation_depth` and the
+  `act` chain (Sections 4.3, 4.4, 5), and the optional agent metadata and
+  coding-agent task claims (Sections 4.2, 4.8). This document writes **NHI**
+  for statements true of any non-human principal and **agent** only for the
+  agent specialization; the two are not interchangeable.
+- **Identity** — a persistent ZeroID record for an NHI (or, for the
+  human-delegation flows, a synthesised principal). Carries a stable WIMSE URI
   (Section 3), a type, a sub-type, a trust level, and a status.
-- **NHI** — Non-Human Identity; an agent, MCP server, application, or service.
 - **Credential** — an issued, signed JWT (an `issued_credentials` row).
 - **Delegation tree** — the set of credentials reachable from a root credential
   by following `parent_jti` edges. Identified by `mission_id` (Section 5.4).
@@ -148,6 +176,15 @@ claim) is one of:
 | `mcp_server` | A Model Context Protocol server |
 | `service` | A backend service or internal worker |
 
+`identity_type = agent` denotes an **Agent Identity** — the specialization that
+also carries the agent-shaped claims of Sections 4–5 (an agent `sub_type`,
+`delegation_depth`, the `act` chain, and the optional agent metadata / task
+claims). The other three types are **non-agent NHIs**: they carry the core
+identity claims and any descriptive metadata, but the agent-shaped claims are
+absent or not meaningful for them. Everything in this document that is scoped to
+a `sub_type` of `agent` applies to Agent Identities specifically; everything
+keyed only on the WIMSE URI or the core claims applies to every NHI.
+
 `sub_type` (the `sub_type` claim) refines the type. The defined values are:
 
 | `sub_type` | Valid for `identity_type` |
@@ -167,9 +204,13 @@ worker and CAE cascade move identities out of `active` fail-closed.
 
 ## 4. JWT Claim Extensions
 
-ZeroID-issued access tokens are JWS-signed JWTs. NHI/agent flows sign with
-**ES256**; human/SDK flows (`api_key`, `authorization_code`, external-principal
-exchange, CIBA) sign with **RS256**. The `kid` header selects the verifying key
+ZeroID-issued access tokens are JWS-signed JWTs. NHI flows
+(`client_credentials`, `jwt_bearer`, `token_exchange`) sign with **ES256**;
+human / SDK flows (`api_key`, `authorization_code`, external-principal exchange,
+CIBA) sign with **RS256**. The claims below are emitted for the relevant NHI;
+the ones flagged *agent-shaped* characterise an Agent Identity
+(`identity_type = agent`, Section 3.2) and are normally absent on a plain
+service, application, or MCP-server NHI. The `kid` header selects the verifying key
 from the JWKS; `typ` is `JWT`. Beyond the RFC 7519 registered claims, ZeroID
 emits the following.
 
@@ -187,25 +228,34 @@ the issuer URL (JWT-SVID §3 requires `aud`).
 
 ### 4.2 Identity claims
 
-Emitted when an identity backs the credential:
+**Core identity claims** — present on every NHI-backed credential, regardless of
+kind:
 
 | Claim | Type | Presence | Description |
 |---|---|---|---|
 | `external_id` | string | always (may be empty) | Registrant-assigned stable id. |
 | `identity_type` | string | always | Section 3.2. |
-| `sub_type` | string | always (may be empty) | Section 3.2. |
+| `sub_type` | string | always (may be empty) | Section 3.2. For an agent this is an agent role (`orchestrator`, …); for other NHIs it is that type's own sub-type or empty. |
 | `trust_level` | string | always | Section 3.2. |
 | `status` | string | always | Section 3.2. |
 | `owner_user_id` | string | when non-empty | The user who **registered/owns** this identity. Distinct from `sub` (the principal) and from `act.sub` (the principal it acts for). |
 | `name` | string | when non-empty | Human-readable identity name. |
-| `framework` | string | when non-empty | Agent framework (e.g. `langgraph`). |
-| `version` | string | when non-empty | Agent/software version. |
-| `publisher` | string | when non-empty | Publisher of the agent. |
-| `capabilities` | JSON | when non-empty and not `[]` | Embedded capability manifest, verbatim. |
 
-The metadata claims (`name`, `framework`, `version`, `publisher`,
-`capabilities`) are embedded so a resource server can make identity-aware
-decisions without calling back to ZeroID.
+**Agent metadata claims** — *agent-shaped*: descriptive metadata that
+characterises an Agent Identity. Optional and chiefly set on agents
+(`identity_type = agent`); a non-agent NHI normally omits them:
+
+| Claim | Type | Presence | Description |
+|---|---|---|---|
+| `framework` | string | when non-empty | Agent framework (e.g. `langgraph`). |
+| `version` | string | when non-empty | Agent / software version. |
+| `publisher` | string | when non-empty | Publisher of the agent. |
+| `capabilities` | JSON | when non-empty and not `[]` | Agent capability manifest, verbatim. |
+
+The metadata claims are embedded so a resource server can make identity-aware
+decisions without calling back to ZeroID. The remaining agent-shaped claims —
+`delegation_depth`, the delegation `act` chain, and the coding-agent task
+claims — are specified in Sections 4.3, 4.4, and 4.8.
 
 ### 4.3 Authorization-context claims
 
@@ -222,11 +272,12 @@ decisions without calling back to ZeroID.
 ZeroID populates the RFC 8693 §4.1 `act` claim as a single-level object
 `{"sub": "<principal>"}`, used in two mutually-exclusive ways on a given token:
 
-1. **NHI delegation** — `act.sub` is the **orchestrator's WIMSE URI** (the agent
-   that delegated). Set on `token_exchange`-issued tokens.
-2. **User context** — `act.sub` is the **end-user id** the NHI is acting for.
-   Set when an agent acts on behalf of a human (e.g. `jwt_bearer`,
-   `authorization_code`-delegated flows).
+1. **Agent delegation** (*agent-shaped*) — `act.sub` is the **orchestrator
+   agent's WIMSE URI** (the agent that delegated). Set on `token_exchange`-issued
+   tokens; this is the orchestrator → sub-agent chain of Section 5.
+2. **User context** (any NHI) — `act.sub` is the **end-user id** the NHI is
+   acting for. Set when an NHI acts on behalf of a human (e.g. `jwt_bearer`,
+   `authorization_code`-delegated flows). This case is not agent-specific.
 
 A token carries at most one `act`. ZeroID's `act` is a single object, not the
 nested `act` chain RFC 8693 permits; the full lineage is reconstructable from
@@ -288,7 +339,12 @@ relying on them MUST treat them as deployment convention, not protocol.
 ## 5. RFC 8693 Delegation Extensions
 
 ZeroID's `token_exchange` (`urn:ietf:params:oauth:grant-type:token-exchange`)
-implements RFC 8693 and adds the following normative behaviour.
+implements RFC 8693 and adds the following normative behaviour. The exchange
+mechanism itself is NHI-general — any NHI may be a subject or actor — but the
+`act` chain and `delegation_depth` it produces are the *agent-shaped* semantics
+that make agent orchestration attributable. The terms **orchestrator** and
+**sub-agent** below are agent roles (Section 3.2); a delegation between
+non-agent NHIs uses the same mechanism without those role labels.
 
 ### 5.1 Scope attenuation (three-way intersection)
 
