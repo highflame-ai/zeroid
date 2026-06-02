@@ -489,10 +489,13 @@ atomic `jti` replay store, resource-server-side validation). The portable
 verifier lives in the standalone module `pkg/dpop`. ZeroID adds one extension
 claim.
 
-### 7.1 Body-hash claim (`bh`)
+### 7.1 Body-hash claim (`bh`) — ZeroID extension
 
-Per `draft-ietf-oauth-dpop-bh`, ZeroID's DPoP verifier supports a `bh` claim on
-the proof that binds it to a specific request payload:
+`bh` is a **ZeroID-defined extension** to the DPoP proof. It is **not** part of
+RFC 9449 (which protects only the HTTP method and URI, via `htm`/`htu`, and does
+not cover the request body) and is **not** an adopted IETF draft as of this
+writing. ZeroID's DPoP verifier supports it to bind a proof to a specific
+request payload:
 
 ```
 bh = base64url( SHA-256( request-body ) )   // no padding
@@ -849,7 +852,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 
 | Claim | Defined in |
 |---|---|
-| `bh` | §7.1 (Std-draft: `draft-ietf-oauth-dpop-bh`) |
+| `bh` | §7.1 (ZeroID extension — not in RFC 9449, no adopted IETF draft) |
 
 ### 13.4 Signal types & severities
 
@@ -891,7 +894,8 @@ ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
 
 ### 14.2 Informative
 
-- `draft-ietf-oauth-dpop-bh` — DPoP body-hash extension claim.
+- The `bh` body-hash proof claim (Section 7.1) is a ZeroID extension, not an
+  external specification; it has no IETF draft or RFC to cite.
 - OpenID Foundation, *Identity Management for Agentic AI* (Oct 2025).
 - Companion guides in this repository: `docs/dpop-and-dcr.md`, `docs/rar.md`,
   `docs/attestation.md`, `docs/vs_entra_agentidentity.md`.
