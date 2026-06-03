@@ -776,8 +776,11 @@ type APIKeyResolution struct {
 	// the developer whose CLI is being used right now. Empty for keys
 	// minted programmatically without a creator.
 	UserID string
-	// Scopes is the api key's intrinsic scope set. Empty means "no
-	// per-key restriction"; downstream policy may still narrow.
+	// Scopes is the api key's intrinsic scope set. Always non-nil
+	// (possibly len 0). Empty means "no per-key restriction";
+	// downstream policy may still narrow. Non-nil contract is to
+	// keep consumer code (range/len) safe without nil-checking and
+	// to JSON-marshal as `[]` rather than `null`.
 	Scopes []string
 	// KeyID is the API key's row UUID. Useful for audit/log
 	// attribution — never returned to end users.
@@ -885,8 +888,13 @@ func (s *OAuthService) resolveAPIKeyContext(ctx context.Context, apiKey string) 
 			AccountID: sk.AccountID,
 			ProjectID: sk.ProjectID,
 			UserID:    sk.CreatedBy,
-			Scopes:    append([]string(nil), sk.Scopes...),
-			KeyID:     sk.ID,
+			// Always non-nil (possibly len 0) so consumers can range /
+			// len safely without nil-checking. JSON-marshals to `[]`
+			// instead of `null` — better API hygiene for downstream
+			// serializers. Defensive copy so caller mutation can't
+			// leak back into the api_key row's slice.
+			Scopes: append(make([]string, 0, len(sk.Scopes)), sk.Scopes...),
+			KeyID:  sk.ID,
 		},
 		APIKey:   sk,
 		Identity: identity,
