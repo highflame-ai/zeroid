@@ -71,6 +71,17 @@ type PrincipalResolver = service.PrincipalResolver
 // this sentinel, the request fails with 401 invalid_client.
 var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 
+// ErrNoResolversRegistered is the sentinel surfaced by zeroid when
+// /oauth2/authorize is reached but no PrincipalResolver has been
+// registered via Server.RegisterPrincipalResolver. The handler maps
+// this to 503 Service Unavailable so the deployer sees a clear
+// "you forgot to wire this up" signal rather than an ambiguous 401.
+//
+// Deployers don't typically observe this sentinel directly — it's
+// emitted by zeroid's chain walker and consumed by the handler. The
+// re-export exists so deployer tests can match on it via errors.Is.
+var ErrNoResolversRegistered = service.ErrNoResolversRegistered
+
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before
 // reaching any handler. Use this to add authentication (Bearer JWT, mTLS, API key,

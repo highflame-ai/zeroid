@@ -18,6 +18,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -133,18 +134,22 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── Step 4: principal resolution ─────────────────────────────────
-	// resolvePrincipal is nil only when the deployer never registered
-	// any resolver — surface a clear 503 so they see the
-	// "you forgot to wire this up" signal instead of an ambiguous 401.
-	if a.resolvePrincipal == nil {
-		log.Warn().Str("client_id", req.ClientID).Msg("/oauth2/authorize called but no PrincipalResolver is registered")
-		writeAuthorizeError(w, http.StatusServiceUnavailable, oautherror.ServerError,
-			"/oauth2/authorize is not configured on this deployment: no PrincipalResolver registered")
-		return
-	}
-
+	// The resolvePrincipal callback is wired unconditionally by
+	// Server.NewServer (it's a method bound to the server's resolver
+	// registry — never nil). The registry itself may be empty, which
+	// is the "deployer forgot to wire it up" case — surfaced via the
+	// ErrNoResolversRegistered sentinel below as a 503.
 	principal, resolverName, err := a.resolvePrincipal(r.Context(), req)
 	if err != nil {
+		if errors.Is(err, service.ErrNoResolversRegistered) {
+			// Configuration error, not a runtime credential error —
+			// 503 so embedders see a clear setup signal. Distinct
+			// from 401 ("you wired it up but no credential matched").
+			log.Warn().Str("client_id", req.ClientID).Msg("/oauth2/authorize called but no PrincipalResolver is registered")
+			writeAuthorizeError(w, http.StatusServiceUnavailable, oautherror.ServerError,
+				"/oauth2/authorize is not configured on this deployment: no PrincipalResolver registered")
+			return
+		}
 		// A specific resolver found its credential in the request but
 		// rejected it (wrong api_key, expired cookie, etc.). Log the
 		// resolver name + error for operators; return a generic

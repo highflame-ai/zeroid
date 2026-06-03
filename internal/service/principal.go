@@ -123,3 +123,17 @@ type PrincipalResolver func(ctx context.Context, req *AuthorizeRequest) (*Princi
 // the resolver doesn't see itself in this request — not "this request
 // is invalid."
 var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not applicable")
+
+// ErrNoResolversRegistered is the sentinel Server.resolvePrincipal
+// returns when the /oauth2/authorize endpoint is reached but the
+// deployer never registered any PrincipalResolver. The handler maps
+// this to 503 Service Unavailable so embedders see a clear
+// "you forgot to wire this up" signal — distinct from 401, which
+// signals "you wired it up but no credential matched."
+//
+// This is a configuration error, not a runtime credential error;
+// hence 503 (server is missing required configuration) rather than
+// 500 (something went wrong). Surfacing it as its own sentinel lets
+// the handler distinguish from the "all resolvers returned
+// ErrPrincipalNotApplicable" case, which is a legitimate 401.
+var ErrNoResolversRegistered = errors.New("zeroid: no principal resolvers registered")

@@ -593,20 +593,24 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 // used by the /oauth2/authorize handler for log attribution.
 //
 // Errors:
-//   - All resolvers returning ErrPrincipalNotApplicable → returns
-//     (nil, "", nil). Caller (the authorize handler) maps this to a
-//     401 invalid_client.
+//   - No resolvers registered → returns
+//     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
+//     so the deployer sees a clear "you forgot to wire this up"
+//     signal, distinct from the 401 "credential didn't match" case.
+//   - All registered resolvers returning ErrPrincipalNotApplicable →
+//     returns (nil, "", nil). Handler maps to 401 invalid_client.
 //   - Any resolver returning a non-sentinel error → returns
 //     (nil, resolverName, err). The chain stops at the first such
-//     error; caller surfaces it as 401 invalid_client with the
-//     resolver's description.
-//   - No resolvers registered → returns (nil, "", nil). Handler maps
-//     to 503 — the deployer never wired this up.
+//     error; handler surfaces it as 401 invalid_client.
 func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
 	s.mu.RLock()
 	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
 	copy(resolvers, s.principalResolvers)
 	s.mu.RUnlock()
+
+	if len(resolvers) == 0 {
+		return nil, "", ErrNoResolversRegistered
+	}
 
 	for _, r := range resolvers {
 		p, err := r.fn(ctx, req)
@@ -625,16 +629,6 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	}
 
 	return nil, "", nil
-}
-
-// hasPrincipalResolvers reports whether any PrincipalResolver has been
-// registered. Used by the /oauth2/authorize handler to distinguish a
-// "deployer never wired the endpoint" 503 from a "credential rejected"
-// 401, so embedders get a clear setup-error message in the former case.
-func (s *Server) hasPrincipalResolvers() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.principalResolvers) > 0
 }
 
 // AdminAuth sets an optional authentication middleware for admin routes.
@@ -1167,22 +1161,44 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// nonJSONContentTypeExemptPaths lists endpoints that accept
+// non-application/json POST bodies. The body-size cap still applies to
+// these paths (preserved as a generic DoS guard); the Content-Type
+// enforcement is what's exempted.
+//
+// /oauth2/authorize is here because its chi handler reads raw
+// application/x-www-form-urlencoded bodies directly — see
+// internal/handler/authorize.go for why it's chi-not-Huma. Other
+// /oauth2/* endpoints (token, introspect, revoke, bc-authorize) get
+// their form-encoded bodies REWRITTEN to JSON by
+// oauthFormCompatMiddleware before requestValidationMiddleware runs,
+// so by the time the Content-Type check fires they look like JSON.
+// /oauth2/authorize is not in OAuthFormEndpoints (no rewrite), so it
+// arrives here still form-encoded and must be exempted explicitly.
+var nonJSONContentTypeExemptPaths = map[string]struct{}{
+	"/oauth2/authorize": {},
+}
+
 // requestValidationMiddleware limits request body size to 10 MiB and enforces
-// application/json Content-Type on mutating requests (POST, PUT, PATCH).
+// application/json Content-Type on mutating requests (POST, PUT, PATCH),
+// except for paths in nonJSONContentTypeExemptPaths which handle their
+// own content negotiation.
 func requestValidationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const maxBodySize = 10 * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-			ct := r.Header.Get("Content-Type")
-			if ct == "" {
-				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
-				return
-			}
-			if !mediaTypeEquals(ct, "application/json") {
-				writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
-				return
+			if _, exempt := nonJSONContentTypeExemptPaths[r.URL.Path]; !exempt {
+				ct := r.Header.Get("Content-Type")
+				if ct == "" {
+					writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
+					return
+				}
+				if !mediaTypeEquals(ct, "application/json") {
+					writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
+					return
+				}
 			}
 		}
 
