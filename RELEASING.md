@@ -8,11 +8,43 @@ ZeroID is published as **three Go modules** from this one repository:
 | `github.com/highflame-ai/zeroid/pkg/authjwt` | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` |
 | `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` |
 
-Every release tags all three modules at the **same `vX.Y.Z`**. This document explains why, how, and what to do when things go sideways.
+Every release tags all three modules at the **same `vX.Y.Z`**. The release flow is a **two-step PR-based pattern** that mirrors what opentelemetry-go and etcd use. This document explains why, how, and what to do when things go sideways.
 
 ---
 
 ## TL;DR — how to cut a release
+
+```bash
+# 1. Open the release-prep PR
+make prepare-release VERSION=v1.7.0
+
+# 2. Review the PR in GitHub (it's auto-generated; should be go.mod + go.sum only).
+#    Approve + merge it. Use a merge commit or squash — either works.
+
+# 3. Create the root tag + GitHub release
+make tag-release VERSION=v1.7.0
+```
+
+That's it. Three commands (one is "merge the PR"). Total wall-clock: 5-10 minutes including CI.
+
+Both `make` targets wrap `gh workflow run` against the respective workflows; the raw form is shown under each step below for environments without `make`.
+
+---
+
+## What each step does
+
+### Step 1: `make prepare-release VERSION=v1.7.0`
+
+Triggers [`prepare-release.yml`](.github/workflows/prepare-release.yml). The workflow:
+
+1. **Validates** the version format (`vMAJOR.MINOR.PATCH`).
+2. **Tags subpackages first**: pushes `pkg/authjwt/v1.7.0` and `pkg/dpop/v1.7.0` pointing at current `main` HEAD. Idempotent (skip-if-exists). Load-bearing — step 4's `go mod tidy` needs these tags to exist so the proxy can resolve them.
+3. **Branches** off `main` as `release-prep/v1.7.0`. Idempotent (reuses existing branch if a prior run created one).
+4. **Bumps** `zeroid/go.mod`: `go mod edit -require=...@v1.7.0` for both subpackages, then `go mod tidy` to reconcile `go.sum`.
+5. **Commits** as `devops: prepare release v1.7.0` and pushes the branch.
+6. **Opens a PR** (`devops: prepare release v1.7.0`) with a checklist + recovery instructions in the body.
+
+Raw command equivalent:
 
 ```bash
 gh workflow run prepare-release.yml \
@@ -20,18 +52,50 @@ gh workflow run prepare-release.yml \
   --field version=v1.7.0
 ```
 
-Then watch:
+### Step 2: Review + merge the PR
 
-- `prepare-release.yml` (in-progress, ~30s) — bumps `zeroid/go.mod` cross-module refs, commits as `devops: prepare release v1.7.0`, pushes to main, creates the GitHub release.
-- `release.yml` (fires on release-published, ~3-5m) — validates, runs tests, builds the goreleaser binaries, builds + pushes the Docker image.
+The PR should contain `go.mod` + `go.sum` changes ONLY. The diff is mechanical (version bumps), but human review catches:
 
-**Do not use the GitHub UI's "Draft a new release" button directly.** It still works mechanically, but it skips the cross-module version bump that downstream consumers need — `release.yml`'s validate-gate will reject the release if `zeroid/go.mod` is out of sync. See [Recovery](#recovery--what-if-i-publish-directly-via-the-ui) below.
+- Wrong version specified
+- Unexpected indirect deps shuffled by `go mod tidy`
+- The subpackage tags actually exist on the remote (mentioned in PR body)
+
+Merge via the UI or `gh pr merge --squash` (commit subject stays compliant either way; `devops:` prefix matches `highflame-commit-check`).
+
+### Step 3: `make tag-release VERSION=v1.7.0`
+
+Triggers [`tag-release.yml`](.github/workflows/tag-release.yml). The workflow:
+
+1. **Validates** the version format.
+2. **Guards**: refuses to proceed unless
+   - main HEAD's `go.mod` references `pkg/{authjwt,dpop}` at the target version (i.e. the release-prep PR was actually merged), AND
+   - `pkg/authjwt/v1.7.0` + `pkg/dpop/v1.7.0` already exist on the remote (created by step 1), AND
+   - The release `v1.7.0` does not already exist.
+3. **Creates** the GitHub release `v1.7.0` pointing at `main` HEAD with `--generate-notes`.
+
+Raw command equivalent:
+
+```bash
+gh workflow run tag-release.yml \
+  --repo highflame-ai/zeroid \
+  --field version=v1.7.0
+```
+
+### What happens after step 3
+
+The existing [`release.yml`](.github/workflows/release.yml) fires on `release: published`. In order:
+
+1. **`highflame-validate`** → tag format + svu semver check + cross-module ref consistency check.
+2. **`tag-submodules`** → tries to create `pkg/{authjwt,dpop}/v1.7.0`; they already exist from step 1, so skip-if-exists fires and the job is a no-op.
+3. **`highflame-sast`** → runs the integration test suite.
+4. **`highflame-goreleaser`** → builds binaries + attaches to the release.
+5. **`highflame-docker`** → builds + pushes the Docker image to GHCR.
 
 ---
 
-## Why prepare-release exists — the quirk
+## Why the PR-based flow?
 
-ZeroID's root module **imports `pkg/dpop`** in its non-test source code (the DPoP verifier wires into `/oauth2/token` for RFC 9449 DPoP-bound tokens). Concretely:
+zeroid's root module **imports `pkg/dpop`** in its non-test source code (DPoP RFC 9449 verifier wires into `/oauth2/token` for DPoP-bound tokens). Concretely:
 
 ```
 server.go                              → import ".../pkg/dpop"
@@ -40,51 +104,29 @@ internal/handler/oauth.go              → import ".../pkg/dpop"
 internal/store/postgres/dpop_replay.go → import ".../pkg/dpop"
 ```
 
-`pkg/authjwt` is imported only from `tests/integration/`, which means it's NOT a transitive dependency of downstream consumers (Go's module resolution only follows non-test imports across module boundaries). But `pkg/dpop` IS a real load-bearing transitive dep — whenever anyone runs `go get github.com/highflame-ai/zeroid@vX.Y.Z`, Go has to resolve `pkg/dpop@vX.Y.Z` from the proxy.
+`pkg/authjwt` is imported only from `tests/integration/`, which means Go's module resolution doesn't pull it transitively for downstream consumers. But `pkg/dpop` IS a real load-bearing transitive dep — every `go get github.com/highflame-ai/zeroid@vX.Y.Z` from an external consumer (authn, shield, anyone) requires Go to resolve `pkg/dpop@vX.Y.Z` from the proxy.
 
-**The trap:** Go's `replace` directives only apply to the *main* module being built — they do NOT propagate to downstream consumers. So writing `replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop` in `zeroid/go.mod` makes in-repo dev work, but every `go get zeroid@vX.Y.Z` from outside the repo fails because `zeroid/go.mod`'s require directive still says `pkg/dpop v0.0.0` and `v0.0.0` doesn't exist as a published tag. This is why `prepare-release.yml` exists: to keep `zeroid/go.mod`'s cross-module version refs in lockstep with the actual released tags.
+**The trap:** Go's `replace` directives only apply to the *main* module being built — they do NOT propagate to downstream consumers. So `replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop` in `zeroid/go.mod` works for in-repo dev but every external `go get zeroid@vX.Y.Z` fails because `go.mod`'s require directive still says `pkg/dpop v0.0.0` and `v0.0.0` doesn't exist as a published tag.
 
-**In-repo dev experience is preserved** by `go.work` at the repo root. Go automatically reads it when you `go build` from anywhere inside the tree and overrides the published version refs with the local source. No manual `replace` directives needed.
+**The fix is to keep `zeroid/go.mod`'s cross-module version refs in lockstep with the actual released subpackage tags.** That's the entire purpose of `prepare-release.yml`. PR-based review of the bump (rather than direct push to main) is the industry-standard shape — see opentelemetry-go's `make prerelease`, etcd's release tooling, kubernetes's staging publishing-bot.
 
-This pattern (workspace for dev + real version refs in go.mod + automated release-prep) is the standard Go-monorepo idiom — see kubernetes/staging, etcd, opentelemetry-go for the same shape.
-
----
-
-## What prepare-release.yml does, step by step
-
-For `version=v1.7.0`:
-
-1. **Validates** the version format matches `vMAJOR.MINOR.PATCH`.
-2. **Checks out** `main` at current HEAD.
-3. **Tags subpackages first** at current HEAD: pushes `pkg/authjwt/v1.7.0` and `pkg/dpop/v1.7.0`.
-   - Why first? Step 5's `go mod tidy` needs to resolve these new versions, which requires the tags to exist (`go list -m` would otherwise error with `unknown revision`).
-   - Idempotent: skips tags that already exist (handles re-runs after a failed attempt).
-4. **Bumps `zeroid/go.mod`** cross-module refs to `v1.7.0` via `go mod edit -require=...@v1.7.0`.
-5. **Runs `go mod tidy`** to reconcile `go.sum` against the new version.
-6. **Commits** the bump as `devops: prepare release v1.7.0` and pushes to `main`.
-7. **Creates the GitHub release** pointing at that commit with auto-generated notes.
-
-The downstream `release.yml` workflow (which fires on `release: published`) then:
-
-1. Validates the tag format + svu semver match.
-2. Validates cross-module refs match the release tag (this is the gate that catches missing bumps).
-3. Sub-tags subpackages at the release commit (idempotent; skips since prepare-release already created them).
-4. Runs the integration test suite.
-5. Runs goreleaser + Docker build.
+In-repo dev experience is preserved by `go.work` at the repo root. Go reads it automatically when you `go build` from anywhere inside the tree and overrides published version refs with local source. No manual `replace` directives needed.
 
 ---
 
 ## Subtle consistency note
 
-Because `prepare-release.yml` tags subpackages BEFORE the bump commit, the sub-tag `pkg/dpop/vX.Y.Z` points at the **pre-bump main HEAD**, while the root tag `vX.Y.Z` points at the **bump commit** (one commit later). The two commits differ only in `zeroid/go.mod` and `zeroid/go.sum` — `pkg/dpop/` source is byte-identical at both commits — so the semantic content under both tags matches. A downstream `go get github.com/highflame-ai/zeroid/pkg/dpop@vX.Y.Z` and a downstream `go get github.com/highflame-ai/zeroid@vX.Y.Z` both get a consistent view.
+Because `prepare-release.yml` tags subpackages BEFORE creating the bump commit, the sub-tags `pkg/{authjwt,dpop}/vX.Y.Z` point at the **pre-bump main HEAD** while the root tag `vX.Y.Z` points at the **merge commit** (one commit later). The two commits differ only in `zeroid/go.mod` and `zeroid/go.sum` — `pkg/dpop/` and `pkg/authjwt/` source is byte-identical at both commits — so the semantic content under both tags matches. A downstream `go get github.com/highflame-ai/zeroid/pkg/dpop@vX.Y.Z` and a downstream `go get github.com/highflame-ai/zeroid@vX.Y.Z` both get a consistent view.
 
-This is the same approach kubernetes/staging uses for its prerelease pattern. The alternative — tagging subpackages at the bump commit — would require running `go mod tidy` BEFORE the subpackage tags exist, which is what creates the chicken-and-egg.
+This is the same approach kubernetes/staging uses for its pre-release pattern. The alternative — tagging subpackages at the merge commit — would require running `go mod tidy` BEFORE the subpackage tags exist, which is what creates the chicken-and-egg.
 
 ---
 
-## Recovery — what if I publish directly via the UI?
+## What happens if I bypass the flow?
 
-GitHub's "Draft a new release" button works mechanically (the tag gets created), but `release.yml`'s **validate-gate will fail** with a clear error:
+### GitHub UI: "Draft a new release"
+
+If you draft a release in the UI and click Publish directly (bypassing `prepare-release.yml`), the existing `release.yml`'s cross-module validate-gate **will fail** with a clear error:
 
 ```
 ::error::go.mod references github.com/highflame-ai/zeroid/pkg/dpop v1.6.0 but release is v1.7.0.
@@ -94,19 +136,26 @@ GitHub's "Draft a new release" button works mechanically (the tag gets created),
 ::error::Then re-publish the release pointing at the new commit.
 ```
 
-**Cleanest recovery:**
+The release page exists, but no sub-tags, no goreleaser binaries, no Docker image. **Cleanest recovery**: delete the release + tag, then `make prepare-release VERSION=v1.7.0` and proceed normally.
 
-1. Delete the GitHub release.
-2. Delete the root tag: `git push --delete origin v1.7.0`.
-3. Delete any sub-tags that got created (none, if validate failed before tag-submodules ran).
-4. Re-run `prepare-release.yml`.
+### `make tag-release` without the PR merged
 
-**Manual recovery** (if you want to keep the release):
+`tag-release.yml`'s first guard checks that main HEAD's `go.mod` references the target version. If you ran `make tag-release VERSION=v1.7.0` without first merging the release-prep PR, that guard fails:
 
-1. Locally on main: `go mod edit -require=github.com/highflame-ai/zeroid/pkg/authjwt@v1.7.0 -require=github.com/highflame-ai/zeroid/pkg/dpop@v1.7.0 && go mod tidy`.
-2. `git commit -am 'devops: prepare release v1.7.0' && git push origin main`.
-3. Move the v1.7.0 tag to the new commit: `git tag -f v1.7.0 && git push --force origin v1.7.0`. (Force-pushing a tag is generally bad practice, but acceptable here if the release was published seconds ago and no one has pulled it yet.)
-4. Re-trigger `release.yml` via `gh workflow run release.yml` or by republishing the release.
+```
+::error::go.mod references github.com/highflame-ai/zeroid/pkg/dpop v1.6.0 but target is v1.7.0.
+::error::Did you merge the release-prep PR for v1.7.0?
+```
+
+No release is created. Re-run `make prepare-release`, merge the PR, then re-run `make tag-release`.
+
+### Abandoning a release-prep PR
+
+If you close a release-prep PR without merging, the sub-tags pushed by `prepare-release.yml` become **orphans** — they point at a real commit with valid source, but no root tag references them. They're not catastrophic, but worth cleaning up:
+
+```bash
+git push --delete origin pkg/authjwt/v1.7.0 pkg/dpop/v1.7.0
+```
 
 ---
 
@@ -119,18 +168,33 @@ GitHub's "Draft a new release" button works mechanically (the tag gets created),
 - `feat!:` or `BREAKING CHANGE:` → MAJOR bump (e.g. v1.x.x → v2.0.0)
 - `devops:`, `build(deps)`, `[Snyk]`, `Bump`, `Merge`, `Revert` — no bump (housekeeping)
 
-The gate **fails if your release tag is below svu's recommendation** (e.g. you published `v1.6.1` but svu says `v1.7.0` because there's been a `feat:` commit since the last tag — that would silently ship a feature as a patch). The gate **allows tags at or above the recommendation**, so a maintainer can manually force a higher bump when intentional.
+The gate **fails if your release tag is below svu's recommendation** (e.g. you pick `v1.6.1` but svu says `v1.7.0` because there's been a `feat:` commit since the last tag — that would silently ship a feature as a patch). The gate **allows tags at or above the recommendation**, so a maintainer can force a higher bump when intentional.
 
 The `devops: prepare release vX.Y.Z` commit created by `prepare-release.yml` is correctly classified by svu as housekeeping (no version movement), so the bump commit itself doesn't perturb svu's recommendation for the release.
+
+Run `make next-version` at any time to see what svu would recommend.
 
 ---
 
 ## Adding a new nested module
 
-If you introduce a new module (e.g. `pkg/dcr/`), three things must change:
+If you introduce a new module (e.g. `pkg/dcr/`), update **four places**:
 
 1. **`go.work`** — add `./pkg/dcr` to the `use (...)` list.
 2. **`.github/workflows/release.yml`** — append `pkg/dcr` to the `SUBMODULES=(...)` array in both `tag-submodules` AND the cross-module validate-gate.
-3. **`.github/workflows/prepare-release.yml`** — append `pkg/dcr` to the `SUBMODULES=(...)` array in `Tag sub-modules at current HEAD`, and add `-require=github.com/highflame-ai/zeroid/pkg/dcr@${VERSION}` to the `go mod edit` step.
+3. **`.github/workflows/prepare-release.yml`** — append `pkg/dcr` to the `SUBMODULES=(...)` array in the tag-sub-modules step, and add `-require=github.com/highflame-ai/zeroid/pkg/dcr@${VERSION}` to the `go mod edit` step.
+4. **`.github/workflows/tag-release.yml`** — append `pkg/dcr` to the `SUBMODULES=(...)` array in the verify-go.mod-refs step AND the verify-sub-module-tags step.
 
 After the next release, downstream consumers can `go get github.com/highflame-ai/zeroid/pkg/dcr@vX.Y.Z`.
+
+---
+
+## Industry context
+
+This pattern (workspace for dev + real version refs in go.mod + PR-based release prep + CLI-triggered tagging) is the standard Go-monorepo idiom. References:
+
+- **opentelemetry-go** — `make prerelease` opens release-prep PR, `make tag` creates tags atomically. [RELEASING.md](https://github.com/open-telemetry/opentelemetry-go/blob/main/RELEASING.md)
+- **etcd** — `./scripts/release` opens release-prep PR, separate script tags. [github.com/etcd-io/etcd/release](https://github.com/etcd-io/etcd/tree/main/release)
+- **kubernetes/staging** — uses publishing-bot to mirror each module to a separate read-only repo. Different approach for much larger scale; overkill for zeroid.
+
+None of these use the GitHub release UI as the primary release entry point — the UI is treated as a downstream side effect of CLI/automation, never as the source of truth.

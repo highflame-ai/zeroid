@@ -1,42 +1,32 @@
-name: Prepare Release - Zeroid
+name: Prepare Release - Zeroid (open PR)
 
-# Authors a release-prep commit ("devops: prepare release vX.Y.Z") that
-# bumps zeroid/go.mod's cross-module version refs to the target version,
-# then creates the GitHub release pointing at that commit. The
-# downstream on-release-published `release.yml` workflow takes over
-# from there (validates, tags subpackages [idempotent — already done
-# here], runs goreleaser, builds Docker image).
+# Opens a release-prep PR that bumps zeroid/go.mod's cross-module
+# version refs to the target version. Maintainer reviews + merges the
+# PR. After merge, the maintainer runs tag-release.yml to create the
+# root tag + GitHub release at the merge commit. The downstream
+# release.yml workflow takes over from there (validate, sub-module
+# tagging idempotent, goreleaser, docker).
 #
-# Why this workflow exists: zeroid is a Go module that contains two
-# nested published modules (pkg/authjwt, pkg/dpop). zeroid's own
-# non-test code imports pkg/dpop, so downstream consumers pull
-# pkg/dpop transitively. Go's module system requires zeroid/go.mod
-# to reference these subpackages at REAL released versions for
-# downstream `go get github.com/highflame-ai/zeroid@vX.Y.Z` resolution
-# to work. The `replace ./pkg/...` directive that used to live in
-# zeroid/go.mod worked for in-repo dev but did NOT propagate to
-# downstream consumers (Go deliberately doesn't honor a transitive
-# module's replaces). See RELEASING.md for the full architectural
-# context.
+# This is the PR-based release flow used by opentelemetry-go (and
+# similar to etcd's release tooling) — cross-module bumps land via
+# a reviewable PR, not a direct push to main. The GitHub UI's "Draft
+# a new release" button is intentionally not the entry point; see
+# RELEASING.md for the full architectural rationale.
 #
-# Atomicity guarantees:
+# Why bump go.mod via a PR rather than directly on main:
+#   - Cross-module ref changes show up in a reviewable diff
+#   - Existing branch protection on main stays intact (no bypass needed)
+#   - PR-level CI runs against the bumped state before it lands
 #
-#   - Sub-tags pkg/authjwt/vX.Y.Z and pkg/dpop/vX.Y.Z are pushed
-#     BEFORE go.mod is bumped, so `go mod tidy` can resolve the new
-#     versions. They point at the current main HEAD (pre-bump).
-#   - The bump commit is then created on main referencing those
-#     just-published sub-tags.
-#   - The GitHub release tag vX.Y.Z is created at the bump commit.
-#   - pkg/{authjwt,dpop} source code is identical at the pre-bump and
-#     bump commits (only zeroid/go.mod + go.sum change in between),
-#     so the semantic content under the sub-tags matches what the
-#     root tag's go.mod references.
-#
-# Recovery if this workflow fails partway through: tag-submodules in
-# release.yml is idempotent (skip-if-exists), so re-running this
-# workflow with the same version is safe. If only the sub-tags got
-# created and you want to abandon the release entirely, manually
-# delete them: `git push --delete origin pkg/authjwt/vX.Y.Z pkg/dpop/vX.Y.Z`.
+# Why tag sub-modules BEFORE opening the PR:
+#   - `go mod tidy` in the bump step needs to resolve the new
+#     subpackage versions. Tagging first means the proxy can serve
+#     the new versions when tidy runs.
+#   - Idempotent (skip-if-exists) so re-runs are safe.
+#   - If the PR is abandoned (never merged), the sub-tags become
+#     orphans pointing at a real commit with valid source — not
+#     catastrophic but worth cleaning up via:
+#     `git push --delete origin pkg/{authjwt,dpop}/vX.Y.Z`
 
 on:
   workflow_dispatch:
@@ -53,6 +43,7 @@ env:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   prepare:
@@ -66,11 +57,8 @@ jobs:
             exit 1
           fi
 
-      # Same App token shape the existing goreleaser job uses. The App
-      # must have `contents: write` on this repo AND be allowed to
-      # push to main (bypass branch protection or be added to an
-      # allow-list rule). Without that, the `git push origin main`
-      # step below will fail at the protection check.
+      # Same App token shape the goreleaser job uses. The App must have
+      # `contents: write` and `pull-requests: write` on this repo.
       - name: Create App token
         uses: actions/create-github-app-token@v3
         id: token
@@ -98,20 +86,16 @@ jobs:
           git config user.name "highflame-release-bot[bot]"
           git config user.email "${{ steps.token.outputs.app-slug }}[bot]@users.noreply.github.com"
 
-      # Tag sub-modules FIRST at current main HEAD, before go.mod is
-      # bumped. This is the load-bearing ordering — go mod tidy in
-      # the next step needs to resolve the new version, which means
-      # the sub-tag must already exist (or the proxy returns "unknown
-      # revision"). Idempotent: skip-if-exists handles re-runs.
-      - name: Tag sub-modules at current HEAD
+      # Step 1: tag sub-modules at current main HEAD. Load-bearing —
+      # the next step's `go mod tidy` needs these tags to be resolvable.
+      - name: Tag sub-modules at current main HEAD
         shell: bash
         run: |-
           VERSION="${{ inputs.version }}"
-          SUBMODULES=(pkg/authjwt pkg/dpop)
-          for SUBMODULE in "${SUBMODULES[@]}"; do
+          for SUBMODULE in pkg/authjwt pkg/dpop; do
             SUBTAG="${SUBMODULE}/${VERSION}"
             if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
-              echo "Tag ${SUBTAG} already exists locally, skipping"
+              echo "Tag ${SUBTAG} already exists, skipping"
             else
               git tag "${SUBTAG}"
               git push origin "${SUBTAG}"
@@ -119,11 +103,23 @@ jobs:
             fi
           done
 
-      # Bump zeroid/go.mod's cross-module refs to the new version.
-      # go mod tidy reconciles go.sum + indirect refs; needs the
-      # sub-tags from the previous step to be resolvable, which they
-      # are (just pushed). GOFLAGS=-mod=mod forces tidy to write
-      # rather than verify-only.
+      # Step 2: branch off main for the release-prep work.
+      - name: Create release-prep branch
+        shell: bash
+        run: |-
+          BRANCH="release-prep/${{ inputs.version }}"
+          # Idempotent: if a prior prepare-release run created the
+          # branch already, reuse it so the bump is appended to the
+          # existing PR rather than spawning a duplicate.
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            git pull --ff-only origin "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+          fi
+
+      # Step 3: bump cross-module refs and reconcile go.sum.
       - name: Bump cross-module version refs in go.mod
         shell: bash
         run: |-
@@ -131,40 +127,90 @@ jobs:
           go mod edit \
             -require=github.com/highflame-ai/zeroid/pkg/authjwt@${VERSION} \
             -require=github.com/highflame-ai/zeroid/pkg/dpop@${VERSION}
+          # GOFLAGS=-mod=mod forces tidy to write rather than verify-only.
+          # Sub-tags from step 1 exist, so the proxy resolves them.
           GOFLAGS="-mod=mod" go mod tidy
           echo "--- go.mod diff ---"
           git diff go.mod
           echo "--- go.sum diff (truncated) ---"
           git diff go.sum | head -40
 
-      - name: Commit + push release-prep
+      # Step 4: commit the bump on the release-prep branch.
+      - name: Commit + push release-prep branch
         shell: bash
         run: |-
           VERSION="${{ inputs.version }}"
+          BRANCH="release-prep/${VERSION}"
           if git diff --quiet go.mod go.sum; then
-            echo "::notice::go.mod + go.sum already match ${VERSION} — no release-prep commit needed."
+            echo "::notice::go.mod + go.sum already match ${VERSION} — no bump commit needed."
           else
             git add go.mod go.sum
+            # `devops:` prefix matches highflame-commit-check and is
+            # ignored by svu's version-bump computation.
             git commit -m "devops: prepare release ${VERSION}"
-            git push origin main
+            git push origin "${BRANCH}"
           fi
 
-      # Create the GitHub release pointing at the (just-pushed) bump
-      # commit, OR at the current main HEAD if no bump was needed.
-      # `--generate-notes` lets GH auto-author release notes from
-      # commits since the last tag.
-      - name: Create GitHub release
+      # Step 5: open (or update) the release-prep PR. PR body is built
+      # via a heredoc to a temp file so multi-line markdown survives
+      # YAML block-scalar indentation without each body line needing
+      # an indent prefix.
+      - name: Open release-prep PR
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
         run: |-
-          VERSION="${{ inputs.version }}"
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Release ${VERSION} already exists. Refusing to overwrite."
-            exit 1
+          BRANCH="release-prep/${VERSION}"
+          EXISTING_PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // ""')
+          if [[ -n "${EXISTING_PR}" ]]; then
+            echo "::notice::PR already open for ${BRANCH}: #${EXISTING_PR}. Bump appended."
+            echo "::notice::Review: $(gh pr view "${EXISTING_PR}" --json url --jq .url)"
+            exit 0
           fi
-          gh release create "${VERSION}" \
-            --target main \
-            --title "${VERSION}" \
-            --generate-notes
-          echo "::notice::Release ${VERSION} created. The on-release-published release.yml workflow now takes over."
+          BODY_FILE=$(mktemp)
+          cat >"${BODY_FILE}" <<EOF
+          Auto-generated by prepare-release.yml. Bumps cross-module version references in \`zeroid/go.mod\` to **${VERSION}**.
+
+          ## Review checklist
+
+          - [ ] \`go.mod\`: \`pkg/authjwt\` and \`pkg/dpop\` both updated to ${VERSION}
+          - [ ] \`go.sum\`: corresponding hashes updated (auto-generated by \`go mod tidy\`)
+          - [ ] No other files changed (this PR should be go.mod + go.sum only)
+
+          ## Sub-module tags (already pushed)
+
+          - \`pkg/authjwt/${VERSION}\` → pre-bump main HEAD
+          - \`pkg/dpop/${VERSION}\` → pre-bump main HEAD
+
+          These point at the current pre-merge main HEAD. After this PR merges, the root tag will be created at the merge commit (one commit later). The two commits differ only in go.mod + go.sum; \`pkg/{authjwt,dpop}/\` source is byte-identical at both. See RELEASING.md "Subtle consistency note" for the full explanation.
+
+          ## Next step after merge
+
+          \`\`\`bash
+          make tag-release VERSION=${VERSION}
+          # or equivalently:
+          gh workflow run tag-release.yml --repo ${REPO} --field version=${VERSION}
+          \`\`\`
+
+          This creates the root \`${VERSION}\` tag at the merge commit and publishes the GitHub release. The downstream \`release.yml\` workflow then validates, runs the integration test suite, builds goreleaser artifacts, and pushes the Docker image.
+
+          ## Abandoning this release
+
+          If this PR is closed without merging, the orphan sub-tags can be deleted:
+
+          \`\`\`bash
+          git push --delete origin pkg/authjwt/${VERSION} pkg/dpop/${VERSION}
+          \`\`\`
+          EOF
+          # Strip the leading 10 spaces YAML demanded on every line so
+          # the rendered PR body is column-zero markdown.
+          sed -i 's/^          //' "${BODY_FILE}"
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "${BRANCH}" \
+            --title "devops: prepare release ${VERSION}" \
+            --body-file "${BODY_FILE}")
+          rm -f "${BODY_FILE}"
+          echo "::notice::Opened release-prep PR: ${PR_URL}"

@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version
+.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version prepare-release tag-release
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -63,8 +63,64 @@ next-version: ## Print svu-computed next semver from commits since last v* tag
 	@echo "current : $$(svu current)"
 	@echo "next    : $$(svu next)"
 	@echo
-	@echo "Use 'gh release create \$$(svu next) --generate-notes' to cut the release."
-	@echo "(Workflow guardrail in release.yml will fail any tag below this value.)"
+	@echo "Cut a release with:"
+	@echo "  make prepare-release VERSION=\$$(svu next)"
+	@echo "  # ...review + merge the release-prep PR, then:"
+	@echo "  make tag-release VERSION=\$$(svu next)"
+
+# ── Release flow ─────────────────────────────────────────────────────
+# Two-step PR-based release flow (see RELEASING.md):
+#
+#   1. `make prepare-release VERSION=v1.7.0`
+#      → triggers prepare-release.yml which opens a release-prep PR
+#      → maintainer reviews + merges
+#   2. `make tag-release VERSION=v1.7.0`
+#      → triggers tag-release.yml which creates the root tag + GH
+#         release (the downstream release.yml then runs validate,
+#         tests, goreleaser, docker)
+#
+# Both targets require `gh` CLI installed + authenticated against
+# highflame-ai/zeroid. Both pin VERSION on the command line; no
+# global config to drift.
+
+prepare-release: ## Open release-prep PR via prepare-release.yml (requires VERSION=vX.Y.Z)
+	@command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI is required (https://cli.github.com/)"; exit 1; }
+	@if [ -z "$(VERSION)" ]; then \
+		echo "::error::VERSION is required, e.g. make prepare-release VERSION=v1.7.0"; \
+		exit 1; \
+	fi
+	@if ! printf '%s' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
+		exit 1; \
+	fi
+	@echo "Triggering prepare-release.yml with version=$(VERSION)..."
+	gh workflow run prepare-release.yml \
+		--repo highflame-ai/zeroid \
+		--field version=$(VERSION)
+	@echo
+	@echo "Watch progress:"
+	@echo "  gh run watch --repo highflame-ai/zeroid"
+	@echo "Find the opened PR:"
+	@echo "  gh pr list --repo highflame-ai/zeroid --head release-prep/$(VERSION)"
+
+tag-release: ## Create root tag + GH release via tag-release.yml after release-prep PR merges (requires VERSION=vX.Y.Z)
+	@command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI is required (https://cli.github.com/)"; exit 1; }
+	@if [ -z "$(VERSION)" ]; then \
+		echo "::error::VERSION is required, e.g. make tag-release VERSION=v1.7.0"; \
+		exit 1; \
+	fi
+	@if ! printf '%s' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
+		exit 1; \
+	fi
+	@echo "Triggering tag-release.yml with version=$(VERSION)..."
+	gh workflow run tag-release.yml \
+		--repo highflame-ai/zeroid \
+		--field version=$(VERSION)
+	@echo
+	@echo "Watch progress:"
+	@echo "  gh run watch --repo highflame-ai/zeroid"
+	@echo "After completion, release.yml fires on release:published (validate, tests, goreleaser, docker)."
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)
