@@ -522,6 +522,49 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 	})
 }
 
+// ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
+// tenant + user context. Public wrapper over the internal
+// OAuthService.ResolveAPIKey — exposed at Server level so deployer-
+// supplied PrincipalResolvers (and any other consumer that needs to
+// authenticate an API key out-of-band from the /oauth2/token endpoint)
+// can call into zeroid's canonical resolution path without
+// reimplementing the hash + lookup + identity-status checks themselves.
+//
+// Returns:
+//   - (*APIKeyResolution, nil) on a valid, active, non-expired key
+//     whose linked identity (if any) is also usable.
+//   - (nil, error) when the key is unknown, deactivated, or linked to
+//     a suspended/expired identity. The error is shaped for direct
+//     surfacing from an OAuth-style handler (RFC 6749 §5.2 envelope
+//     via extractOAuthError).
+//
+// Same gates as apiKeyGrant runs at /oauth2/token time — a key whose
+// identity is suspended must not even authenticate at /oauth2/authorize,
+// let alone mint a token. The shared core (resolveAPIKeyContext) is
+// the single source of truth.
+//
+// Typical usage from a PrincipalResolver:
+//
+//	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+//	    key := req.Form("api_key")
+//	    if key == "" {
+//	        return nil, zeroid.ErrPrincipalNotApplicable
+//	    }
+//	    res, err := srv.ResolveAPIKey(ctx, key)
+//	    if err != nil {
+//	        return nil, err
+//	    }
+//	    return &zeroid.Principal{
+//	        AccountID: res.AccountID,
+//	        ProjectID: res.ProjectID,
+//	        UserID:    res.UserID,
+//	        Scopes:    res.Scopes,
+//	    }, nil
+//	})
+func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResolution, error) {
+	return s.oauthSvc.ResolveAPIKey(ctx, apiKey)
+}
+
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated user.
 // The caller (a trusted internal service) has already verified the user's identity and
 // resolved tenant context. ZeroID trusts the caller and issues a token with the provided claims.

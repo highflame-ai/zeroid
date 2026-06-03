@@ -373,3 +373,40 @@ func TestAuthorize_PKCERoundTrip(t *testing.T) {
 	defer func() { _ = exchangeResp.Body.Close() }()
 	require.Equal(t, http.StatusOK, exchangeResp.StatusCode)
 }
+
+// TestServerResolveAPIKey pins the public Server.ResolveAPIKey wrapper
+// — the surface deployer-supplied PrincipalResolvers (and any other
+// out-of-band consumer) use to authenticate an API key without going
+// through /oauth2/token. Verifies the narrow APIKeyResolution
+// projection carries the tenant + user context that an authorize-time
+// resolver needs to build a *zeroid.Principal.
+func TestServerResolveAPIKey(t *testing.T) {
+	agent := registerAgent(t, uid("resolve-apikey-test-agent"))
+
+	res, err := testZeroIDServer.ResolveAPIKey(context.Background(), agent.APIKey)
+	require.NoError(t, err, "ResolveAPIKey must succeed for a freshly-minted api_key")
+	require.NotNil(t, res)
+
+	assert.Equal(t, testAccountID, res.AccountID,
+		"AccountID must match the tenant the api_key was minted under")
+	assert.Equal(t, testProjectID, res.ProjectID,
+		"ProjectID must match the tenant the api_key was minted under")
+	assert.NotEmpty(t, res.KeyID,
+		"KeyID must be populated for audit/log attribution")
+	// Scopes / UserID can be empty for a programmatically-registered
+	// agent (registerAgent doesn't set them), but the fields must be
+	// present and accessible — pin that contract.
+	assert.NotNil(t, res.Scopes, "Scopes must be addressable (empty slice or populated, never nil-vs-missing)")
+}
+
+// TestServerResolveAPIKey_UnknownKey pins the rejection contract:
+// looking up a non-existent api_key returns an error (which zeroid's
+// /oauth2/authorize handler maps to 401 invalid_client). The exact
+// error shape is a service.OAuthError — already covered by the
+// /oauth2/authorize integration tests above; this test just pins the
+// public Server.ResolveAPIKey wrapper does NOT swallow the rejection.
+func TestServerResolveAPIKey_UnknownKey(t *testing.T) {
+	res, err := testZeroIDServer.ResolveAPIKey(context.Background(), "zid_sk_does_not_exist_anywhere_in_db")
+	require.Error(t, err, "unknown api_key must return an error")
+	require.Nil(t, res, "no resolution on error path")
+}

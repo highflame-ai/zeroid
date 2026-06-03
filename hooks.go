@@ -82,6 +82,16 @@ var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 // re-export exists so deployer tests can match on it via errors.Is.
 var ErrNoResolversRegistered = service.ErrNoResolversRegistered
 
+// APIKeyResolution is the public projection returned by
+// Server.ResolveAPIKey. Narrow + stable — does not leak zeroid
+// internals (*domain.Identity, *domain.APIKey row, credential-policy
+// records). Consumers map this onto whatever shape their layer needs
+// (typically zeroid.Principal in a PrincipalResolver implementation).
+//
+// See internal/service/oauth.go (APIKeyResolution definition) for the
+// canonical doc comment + field-level semantics.
+type APIKeyResolution = service.APIKeyResolution
+
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before
 // reaching any handler. Use this to add authentication (Bearer JWT, mTLS, API key,
