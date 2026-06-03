@@ -491,20 +491,13 @@ claim.
 
 ### 7.1 Body-hash claim (`bh`) — ZeroID extension
 
-`bh` is a **ZeroID extension** to the DPoP proof, not a standardized claim.
-RFC 9449 covers only the HTTP method and URI (`htm`/`htu`) and the access-token
-hash (`ath`); it leaves request-body integrity out of scope but notes that
-additional signed information may be added to a proof — `bh` is such an
-addition. There is no adopted IETF draft for a DPoP body-hash claim, and the
-standards momentum is elsewhere: the standards-track way to obtain full
-request-body integrity is **HTTP Message Signatures (RFC 9421)** over a signed
-**`Content-Digest` (RFC 9530)**. In the IETF WIMSE track that role is filled by
-the workload-to-workload HTTP-Message-Signatures profile
-(`draft-schwenkschuster-s2s-http-sig`), while the WIMSE Workload Proof Token
-(`draft-ietf-wimse-wpt`) deliberately does **not** cover the body. ZeroID's `bh`
-is a lighter-weight, DPoP-inline alternative used by the agent hook flow;
-deployments that need full message-signature semantics should layer RFC 9421
-instead. The verifier binds a proof to a specific request payload as:
+`bh` is a **ZeroID extension** to the DPoP proof. RFC 9449 covers only the HTTP method 
+and URI (`htm`/`htu`) and the access-token hash (`ath`); it leaves request-body 
+integrity out of scope but notes that additional signed information may be added 
+to a proof — `bh` is such an addition. ZeroID's `bh`is a light-weight, DPoP-inline 
+alternative used by the agent hook flow; deployments that need full message-signature 
+semantics should layer RFC 9421 instead. The verifier binds a proof to a specific request 
+payload as:
 
 ```
 bh = base64url( SHA-256( request-body ) )   // no padding
@@ -906,19 +899,14 @@ ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
 - The `bh` body-hash proof claim (Section 7.1) is a ZeroID extension with no RFC
   or IETF draft of its own. For the standards-track approach to request-body
   integrity, see the related work below.
-- RFC 9421 — HTTP Message Signatures (application-layer request integrity,
+  - RFC 9421 — HTTP Message Signatures (application-layer request integrity,
   including the body when a `Content-Digest` is signed).
-- RFC 9530 — Digest Fields (`Content-Digest`).
-- `draft-ietf-wimse-wpt` — WIMSE Workload Proof Token (key-bound request PoP;
-  binds target URI and token hashes, not the body).
-- `draft-schwenkschuster-s2s-http-sig` — WIMSE workload-to-workload via HTTP
-  Message Signatures (the WIMSE body-integrity path; ZeroID's `bh` is a lighter
-  inline alternative).
+  - RFC 9530 — Digest Fields (`Content-Digest`).
 - OpenID Foundation, *Identity Management for Agentic AI* (Oct 2025).
 - Companion guides in this repository: `docs/dpop-and-dcr.md`, `docs/rar.md`,
   `docs/attestation.md`, `docs/vs_entra_agentidentity.md`.
 
 ---
 
-*This specification documents the ZeroID reference implementation maintained by
-[Highflame](https://highflame.ai). Apache-2.0.*
+*This specification documents the ZeroID's Agent Identity implementation maintained by
+[Highflame](https://highflame.ai) at https://github.com/highflame-ai/zeroid*
