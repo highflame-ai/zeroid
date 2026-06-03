@@ -84,6 +84,49 @@ jobs:
             echo "Release tag matches svu recommendation."
           fi
 
+      # Cross-module version-consistency gate. zeroid is a Go module that
+      # contains two nested published modules at pkg/authjwt and pkg/dpop.
+      # zeroid's own non-test code imports pkg/dpop, so downstream
+      # consumers pull pkg/dpop transitively — which means zeroid/go.mod
+      # must reference pkg/dpop at a REAL released version (not the v0.0.0
+      # placeholder + local replace, which Go does NOT honor across module
+      # boundaries). When the prepare-release workflow runs, it auto-bumps
+      # these refs to match the release tag; this gate enforces the
+      # invariant in case someone publishes a release bypassing
+      # prepare-release. See RELEASING.md for the full story.
+      - name: Validate cross-module version refs match release tag
+        shell: bash
+        run: |-
+          VERSION="${{ env.RELEASE_NAME }}"
+          SUBMODULES=(pkg/authjwt pkg/dpop)
+          FAIL=0
+          for SUBMODULE in "${SUBMODULES[@]}"; do
+            MODPATH="github.com/highflame-ai/zeroid/${SUBMODULE}"
+            # Match the require line for this nested module. The version
+            # is the last whitespace-separated token; this handles both
+            # the direct (`MODPATH vX.Y.Z`) and `// indirect` shapes.
+            REF=$(awk -v mp="${MODPATH}" '
+              $1 == mp { print $2; exit }
+            ' go.mod)
+            if [[ -z "$REF" ]]; then
+              echo "::error::go.mod has no require directive for ${MODPATH}"
+              FAIL=1
+              continue
+            fi
+            if [[ "$REF" != "$VERSION" ]]; then
+              echo "::error::go.mod references ${MODPATH} ${REF} but release is ${VERSION}."
+              echo "::error::Run prepare-release.yml with version=${VERSION}, OR manually:"
+              echo "::error::  go mod edit -require=${MODPATH}@${VERSION} && go mod tidy"
+              echo "::error::  git commit -am 'devops: prepare release ${VERSION}' && git push"
+              echo "::error::Then re-publish the release pointing at the new commit."
+              FAIL=1
+            fi
+          done
+          if [[ $FAIL -eq 1 ]]; then
+            exit 1
+          fi
+          echo "Cross-module version refs match release tag ${VERSION}."
+
   tag-submodules:
     needs:
       - highflame-validate

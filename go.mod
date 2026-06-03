@@ -8,8 +8,8 @@ require (
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
-	github.com/highflame-ai/zeroid/pkg/authjwt v0.0.0
-	github.com/highflame-ai/zeroid/pkg/dpop v0.0.0
+	github.com/highflame-ai/zeroid/pkg/authjwt v1.6.0
+	github.com/highflame-ai/zeroid/pkg/dpop v1.6.0
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
@@ -106,6 +106,3 @@ require (
 	mellium.im/sasl v0.3.2 // indirect
 )
 
-replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
-
-replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop

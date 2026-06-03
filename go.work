@@ -1,0 +1,30 @@
+// Go workspace for in-repo development across zeroid's three published
+// modules. When you run `go build` or `go test` from anywhere inside the
+// repo, Go reads this file and treats the three modules as one workspace
+// — local code in ./pkg/authjwt and ./pkg/dpop is used directly,
+// regardless of what versions zeroid/go.mod's require directives
+// declare. Each module's go.mod can therefore reference real published
+// versions (which downstream consumers need for `go get` resolution),
+// without breaking the dev experience.
+//
+// This replaces the older pattern of `replace github.com/highflame-ai/
+// zeroid/pkg/foo => ./pkg/foo` directives in zeroid/go.mod. Those
+// directives worked for in-repo dev but were invisible to downstream
+// consumers (Go does not honor a transitive module's replace
+// directives), so external `go get github.com/highflame-ai/zeroid@vX.Y.Z`
+// always failed against the `v0.0.0` placeholder version. The workspace
+// + real-version pattern is the modern Go-monorepo idiom — see
+// kubernetes, etcd, opentelemetry-go for the same shape.
+//
+// Releases: see RELEASING.md for how the prepare-release workflow
+// keeps the cross-module version refs in zeroid/go.mod in lockstep with
+// the published release tag, so consumers see consistent versions
+// across the root module + sub-modules.
+
+go 1.26.0
+
+use (
+	.
+	./pkg/authjwt
+	./pkg/dpop
+)
