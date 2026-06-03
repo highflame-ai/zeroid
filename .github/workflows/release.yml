@@ -97,18 +97,35 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Tag pkg/authjwt sub-module
+      # Each entry below is a nested Go module (its own go.mod under
+      # the repo root) and must be tagged independently of the root —
+      # Go's module proxy resolves `go get github.com/highflame-ai/
+      # zeroid/<subpath>@vX.Y.Z` against a `<subpath>/vX.Y.Z` tag, not
+      # the root `vX.Y.Z` tag. Without these tags, downstream consumers
+      # cannot pin a specific version of the sub-module.
+      #
+      # Idempotent — skips tags that already exist (handles re-runs
+      # of a published release, and out-of-band manual tags). To add
+      # another sub-module, append it to the loop and confirm it has a
+      # go.mod at that path.
+      - name: Tag sub-modules
         shell: bash
         run: |
           VERSION="${{ env.RELEASE_NAME }}"
-          SUBTAG="pkg/authjwt/${VERSION}"
-          if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
-            echo "Tag ${SUBTAG} already exists, skipping"
-          else
-            git tag "${SUBTAG}"
-            git push origin "${SUBTAG}"
-            echo "Created and pushed tag ${SUBTAG}"
-          fi
+          SUBMODULES=(
+            pkg/authjwt
+            pkg/dpop
+          )
+          for SUBMODULE in "${SUBMODULES[@]}"; do
+            SUBTAG="${SUBMODULE}/${VERSION}"
+            if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
+              echo "Tag ${SUBTAG} already exists, skipping"
+            else
+              git tag "${SUBTAG}"
+              git push origin "${SUBTAG}"
+              echo "Created and pushed tag ${SUBTAG}"
+            fi
+          done
 
   highflame-sast:
     needs:
