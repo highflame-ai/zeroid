@@ -15,163 +15,11 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # bump-go-mod runs FIRST on every release. It:
-  #
-  #   1. Tags the nested modules (pkg/authjwt, pkg/dpop) at the
-  #      release's source commit so `go mod tidy` can resolve the
-  #      new versions in the next step. Idempotent (skip-if-exists).
-  #   2. Bumps zeroid/go.mod's cross-module refs to the release
-  #      version. Required because zeroid imports pkg/dpop in its
-  #      non-test source — downstream consumers cannot resolve
-  #      `go get zeroid@vX.Y.Z` unless go.mod references real
-  #      released subpackage versions. See RELEASING.md for the
-  #      architectural rationale.
-  #   3. Commits + pushes the bump to main as a `devops: prepare
-  #      release vX.Y.Z` commit.
-  #   4. Force-moves the release tag from the original commit to
-  #      the bump commit, AND retargets the GH release. The window
-  #      between the release publish and this force-move is ~30s;
-  #      no downstream consumer has had time to pull v1.6.0.0 etc.,
-  #      so this is safe.
-  #
-  # If go.mod is already at the target version (the rare case where
-  # someone manually pre-bumped before publishing), steps 3-4 are
-  # no-ops and the original tag stays put.
-  #
-  # All subsequent jobs (validate, tag-submodules, sast, goreleaser,
-  # docker) depend on bump-go-mod and run against the bump commit.
-  bump-go-mod:
-    permissions:
-      contents: write
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Validate release tag format
-        shell: bash
-        run: |-
-          if [[ ! "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]]; then
-            echo "::error::Invalid version format: ${{ env.RELEASE_NAME }}"
-            exit 1
-          fi
-
-      - name: Refuse releases from non-main branches
-        shell: bash
-        run: |-
-          TARGET="${{ github.event.release.target_commitish }}"
-          if [[ "${TARGET}" != "main" ]]; then
-            echo "::error::This release was cut from '${TARGET}'. release.yml only supports releases from main."
-            echo "::error::Either re-create the release with target=main, or extend bump-go-mod to handle non-main release branches."
-            exit 1
-          fi
-
-      - name: Create App token
-        uses: actions/create-github-app-token@v3
-        id: token
-        with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
-          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      # Checkout main (NOT the release tag) so we're on the latest
-      # default-branch tip when pushing the bump commit. The release
-      # was just created at main HEAD, so main and the tag point to
-      # the same commit at this moment.
-      - name: Checkout main
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-          token: ${{ steps.token.outputs.token }}
-
-      - name: Setup Golang Version
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Configure git
-        shell: bash
-        run: |-
-          git config user.name "highflame-release-bot[bot]"
-          git config user.email "${{ steps.token.outputs.app-slug }}[bot]@users.noreply.github.com"
-
-      # Tag sub-modules at current main HEAD. Load-bearing — the next
-      # step's `go mod tidy` needs these tags to be resolvable.
-      # Idempotent: skip-if-exists. After this step both sub-tags
-      # point at the pre-bump commit.
-      - name: Tag sub-modules at current main HEAD
-        shell: bash
-        run: |-
-          VERSION="${{ env.RELEASE_NAME }}"
-          for SUBMODULE in pkg/authjwt pkg/dpop; do
-            SUBTAG="${SUBMODULE}/${VERSION}"
-            if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
-              echo "Tag ${SUBTAG} already exists, skipping"
-            else
-              git tag "${SUBTAG}"
-              git push origin "${SUBTAG}"
-              echo "Created and pushed tag ${SUBTAG}"
-            fi
-          done
-
-      # Bump zeroid/go.mod cross-module refs to the release version.
-      # GOFLAGS=-mod=mod forces tidy to write rather than verify-only.
-      # Sub-tags from the previous step are now resolvable.
-      - name: Bump cross-module version refs in go.mod
-        shell: bash
-        run: |-
-          VERSION="${{ env.RELEASE_NAME }}"
-          go mod edit \
-            -require=github.com/highflame-ai/zeroid/pkg/authjwt@${VERSION} \
-            -require=github.com/highflame-ai/zeroid/pkg/dpop@${VERSION}
-          GOFLAGS="-mod=mod" go mod tidy
-          echo "--- go.mod diff ---"
-          git diff go.mod
-          echo "--- go.sum diff (truncated) ---"
-          git diff go.sum | head -40
-
-      # Commit the bump, push to main, force-move the release tag,
-      # and retarget the GH release.
-      #
-      # If there are no go.mod/go.sum changes (someone manually
-      # pre-bumped before publishing), all of this is skipped and
-      # the original tag stays put.
-      - name: Commit + push + force-move release tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ steps.token.outputs.token }}
-        run: |-
-          VERSION="${{ env.RELEASE_NAME }}"
-          if git diff --quiet go.mod go.sum; then
-            echo "::notice::go.mod + go.sum already match ${VERSION}; release tag stays at original commit."
-            exit 0
-          fi
-          git add go.mod go.sum
-          git commit -m "devops: prepare release ${VERSION}"
-          git push origin main
-          NEW_SHA=$(git rev-parse HEAD)
-          echo "::notice::Bump commit pushed: ${NEW_SHA}"
-
-          # Force-move the release tag from the original commit to
-          # the bump commit. Window is ~30s; no consumer has pulled.
-          git tag -f "${VERSION}" "${NEW_SHA}"
-          git push --force origin "${VERSION}"
-          echo "::notice::Release tag ${VERSION} force-moved to ${NEW_SHA}"
-
-          # Update the GH release's target_commitish so the release
-          # page UI shows the correct commit.
-          gh release edit "${VERSION}" --target "${NEW_SHA}"
-          echo "::notice::GH release ${VERSION} retargeted to ${NEW_SHA}"
-
   highflame-validate:
-    needs:
-      - bump-go-mod
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
     steps:
-      # Checkout the release tag (which now points at the bump commit
-      # after bump-go-mod completed). All validation runs against the
-      # post-bump state.
       - name: Checkout code
         uses: actions/checkout@v6
         with:
@@ -236,48 +84,56 @@ jobs:
             echo "Release tag matches svu recommendation."
           fi
 
-      # Cross-module version-consistency gate. zeroid is a Go module that
-      # contains two nested published modules at pkg/authjwt and pkg/dpop.
-      # zeroid's own non-test code imports pkg/dpop, so downstream
-      # consumers pull pkg/dpop transitively — which means zeroid/go.mod
-      # must reference pkg/dpop at a REAL released version (not the v0.0.0
-      # placeholder + local replace, which Go does NOT honor across module
-      # boundaries). When the prepare-release workflow runs, it auto-bumps
-      # these refs to match the release tag; this gate enforces the
-      # invariant in case someone publishes a release bypassing
-      # prepare-release. See RELEASING.md for the full story.
-      - name: Validate cross-module version refs match release tag
+      # pkg/dpop drift guard. zeroid is a Go module that contains a
+      # nested published module at pkg/dpop, and zeroid's non-test
+      # code imports it — downstream consumers pull pkg/dpop
+      # transitively. The release cadences are intentionally
+      # DECOUPLED: zeroid/go.mod pins pkg/dpop to a specific released
+      # version (not the zeroid release tag). When pkg/dpop/ source
+      # changes, the maintainer runs release-dpop.yml to cut a new
+      # pkg/dpop release and open a PR bumping zeroid's reference.
+      # See RELEASING.md.
+      #
+      # This guard catches the foot-gun: if pkg/dpop/ source on main
+      # has diverged from the version zeroid/go.mod references, that
+      # means pkg/dpop changed but the release-dpop dance was never
+      # run. Releasing zeroid in that state ships a binary that
+      # references the OLD pkg/dpop (whatever the proxy serves for
+      # the pinned tag) while in-repo tests passed against the NEW
+      # local source — a silent regression. Fail loudly instead.
+      #
+      # pkg/authjwt is NOT checked because it's imported only from
+      # tests/integration. Go does not follow test imports across
+      # module boundaries, so its version reference (currently
+      # v0.0.0 placeholder) is invisible to downstream consumers
+      # and cannot break anything. The pkg/authjwt tag is still
+      # created by tag-submodules at every zeroid release for
+      # convenience.
+      - name: Verify pkg/dpop/ source matches the version in go.mod
         shell: bash
         run: |-
-          VERSION="${{ env.RELEASE_NAME }}"
-          SUBMODULES=(pkg/authjwt pkg/dpop)
-          FAIL=0
-          for SUBMODULE in "${SUBMODULES[@]}"; do
-            MODPATH="github.com/highflame-ai/zeroid/${SUBMODULE}"
-            # Match the require line for this nested module. The version
-            # is the last whitespace-separated token; this handles both
-            # the direct (`MODPATH vX.Y.Z`) and `// indirect` shapes.
-            REF=$(awk -v mp="${MODPATH}" '
-              $1 == mp { print $2; exit }
-            ' go.mod)
-            if [[ -z "$REF" ]]; then
-              echo "::error::go.mod has no require directive for ${MODPATH}"
-              FAIL=1
-              continue
-            fi
-            if [[ "$REF" != "$VERSION" ]]; then
-              echo "::error::go.mod references ${MODPATH} ${REF} but release is ${VERSION}."
-              echo "::error::Run prepare-release.yml with version=${VERSION}, OR manually:"
-              echo "::error::  go mod edit -require=${MODPATH}@${VERSION} && go mod tidy"
-              echo "::error::  git commit -am 'devops: prepare release ${VERSION}' && git push"
-              echo "::error::Then re-publish the release pointing at the new commit."
-              FAIL=1
-            fi
-          done
-          if [[ $FAIL -eq 1 ]]; then
+          MODPATH="github.com/highflame-ai/zeroid/pkg/dpop"
+          REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
+          if [[ -z "${REF}" ]]; then
+            echo "::error::go.mod has no require directive for ${MODPATH}"
             exit 1
           fi
-          echo "Cross-module version refs match release tag ${VERSION}."
+          TAG="pkg/dpop/${REF}"
+          if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "::error::go.mod references ${MODPATH} ${REF} but tag ${TAG} does not exist."
+            echo "::error::This usually means the pkg/dpop release-dpop dance was started but not completed."
+            echo "::error::Either fix go.mod to reference an existing pkg/dpop tag, or run release-dpop.yml."
+            exit 1
+          fi
+          if ! git diff --quiet "${TAG}" -- pkg/dpop/; then
+            echo "::error::pkg/dpop/ source has drifted from ${TAG} but go.mod still references it."
+            echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
+            echo "::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update zeroid/go.mod's reference:"
+            echo "::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>"
+            echo "::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release."
+            exit 1
+          fi
+          echo "✓ pkg/dpop/ source matches ${TAG} — safe to release"
 
   tag-submodules:
     needs:
@@ -292,35 +148,34 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # Each entry below is a nested Go module (its own go.mod under
-      # the repo root) and must be tagged independently of the root —
-      # Go's module proxy resolves `go get github.com/highflame-ai/
-      # zeroid/<subpath>@vX.Y.Z` against a `<subpath>/vX.Y.Z` tag, not
-      # the root `vX.Y.Z` tag. Without these tags, downstream consumers
-      # cannot pin a specific version of the sub-module.
+      # Tag pkg/authjwt at the release commit. pkg/authjwt is
+      # CLUBBED with zeroid releases — its version moves in lockstep
+      # with zeroid's because it's imported only from tests/integration
+      # (not transitively visible to downstream consumers) and so its
+      # version reference in zeroid/go.mod cannot break anything. Any
+      # external consumer who imports pkg/authjwt directly gets the
+      # tag at the zeroid release commit, which is the most recent
+      # source.
       #
-      # Idempotent — skips tags that already exist (handles re-runs
-      # of a published release, and out-of-band manual tags). To add
-      # another sub-module, append it to the loop and confirm it has a
-      # go.mod at that path.
-      - name: Tag sub-modules
+      # pkg/dpop is NOT tagged here. It has DECOUPLED release cadence
+      # because it IS transitively visible to downstream consumers,
+      # and zeroid/go.mod references a specific pinned pkg/dpop
+      # version. Tagging pkg/dpop only happens via release-dpop.yml
+      # when its source actually changes. The highflame-validate
+      # job above guards against pkg/dpop source drifting from the
+      # pinned version.
+      - name: Tag pkg/authjwt at release commit
         shell: bash
         run: |
           VERSION="${{ env.RELEASE_NAME }}"
-          SUBMODULES=(
-            pkg/authjwt
-            pkg/dpop
-          )
-          for SUBMODULE in "${SUBMODULES[@]}"; do
-            SUBTAG="${SUBMODULE}/${VERSION}"
-            if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
-              echo "Tag ${SUBTAG} already exists, skipping"
-            else
-              git tag "${SUBTAG}"
-              git push origin "${SUBTAG}"
-              echo "Created and pushed tag ${SUBTAG}"
-            fi
-          done
+          SUBTAG="pkg/authjwt/${VERSION}"
+          if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
+            echo "Tag ${SUBTAG} already exists, skipping"
+          else
+            git tag "${SUBTAG}"
+            git push origin "${SUBTAG}"
+            echo "Created and pushed tag ${SUBTAG}"
+          fi
 
   highflame-sast:
     needs:

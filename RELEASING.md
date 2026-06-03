@@ -2,29 +2,34 @@
 
 ZeroID is published as **three Go modules** from this one repository:
 
-| Module path | Source tree | Tag prefix |
-|----|----|----|
-| `github.com/highflame-ai/zeroid` (the root OAuth/OIDC server library) | `./` | `vX.Y.Z` |
-| `github.com/highflame-ai/zeroid/pkg/authjwt` | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` |
-| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` |
+| Module path | Source tree | Tag prefix | Release cadence |
+|----|----|----|----|
+| `github.com/highflame-ai/zeroid` (the root OAuth/OIDC server library) | `./` | `vX.Y.Z` | Whenever zeroid features/fixes ship |
+| `github.com/highflame-ai/zeroid/pkg/authjwt` | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` | **Clubbed with zeroid** — same vX.Y.Z |
+| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Decoupled** — released independently when its source changes |
 
-Every release tags all three modules at the **same `vX.Y.Z`**. The release flow is **driven entirely from the GitHub UI**; the workflow handles cross-module bumping invisibly.
+The asymmetry between pkg/authjwt and pkg/dpop is deliberate:
+
+- **pkg/dpop** is imported in zeroid's non-test code (the DPoP RFC 9449 verifier in `/oauth2/token`). That makes it a transitive dep for everyone who consumes zeroid — `go get zeroid@vX.Y.Z` causes Go to also fetch pkg/dpop's source. So zeroid/go.mod must reference a real published pkg/dpop tag, and it gets a decoupled release cadence so we only bump it when pkg/dpop actually changes.
+- **pkg/authjwt** is imported only from `tests/integration/`. Go doesn't follow test imports across module boundaries, so its version reference in zeroid/go.mod is invisible to downstream consumers and never needs to be a real version. The pkg/authjwt tag is created at every zeroid release (clubbed) for convenience of direct consumers.
 
 ---
 
-## How to cut a release
+## How to cut a normal zeroid release (the common case)
+
+If you haven't touched `pkg/dpop/` source since the last release, this is your whole flow:
 
 ```
 1. github.com/highflame-ai/zeroid → Releases → "Draft a new release"
 2. Choose a tag → "Create new tag: vX.Y.Z on publish"
-3. (Optional) Generate release notes
+3. Generate release notes
 4. Click "Publish release"
-5. Wait ~3–5 minutes
+5. Wait ~3-5 minutes
 ```
 
-That's it. No CLI commands, no PRs to review, no manual go.mod edits. Whatever version you pick (subject to the svu gate — see below), the `release.yml` workflow takes over and handles everything.
+The `release.yml` workflow validates the tag format, runs svu against commit history, checks pkg/dpop source matches what go.mod references (the drift guard), tags `pkg/authjwt/vX.Y.Z` at the release commit, runs integration tests, builds goreleaser binaries, and pushes the Docker image.
 
-To preview what version svu would recommend (based on commit prefixes since the last tag):
+To preview what svu would recommend:
 
 ```bash
 make next-version
@@ -32,96 +37,84 @@ make next-version
 
 ---
 
-## What happens after you click Publish
+## When you change pkg/dpop/
 
-`release.yml` fires on the `release: published` event and runs these jobs in order:
+If you've modified anything under `pkg/dpop/`, **cut a new pkg/dpop release first**, BEFORE the next zeroid release:
 
-```
-1. bump-go-mod
-   ├─ Validate tag format (vMAJOR.MINOR.PATCH)
-   ├─ Verify release was cut from main (not a feature branch)
-   ├─ Tag pkg/authjwt/vX.Y.Z + pkg/dpop/vX.Y.Z at current main HEAD
-   ├─ go mod edit -require=...@vX.Y.Z for each subpackage
-   ├─ go mod tidy (works because sub-tags now exist)
-   ├─ git commit -m "devops: prepare release vX.Y.Z"
-   ├─ git push origin main          ← new commit on main
-   ├─ git tag -f vX.Y.Z + git push --force origin vX.Y.Z   ← release tag now points at bump commit
-   └─ gh release edit vX.Y.Z --target <bump-sha>           ← release page UI updates
+```bash
+# 1. Cut a new pkg/dpop release (tags pkg/dpop/vX.Y.Z + opens a PR
+#    bumping zeroid/go.mod's pkg/dpop reference)
+make release-dpop VERSION=v1.6.1
 
-2. highflame-validate
-   ├─ svu gate: verifies vX.Y.Z is at or above what commit-history implies
-   └─ cross-module gate: defensive — verifies go.mod refs match vX.Y.Z (bump-go-mod should have ensured this)
+# 2. Review + merge the auto-opened PR titled
+#    "devops: bump pkg/dpop to v1.6.1"
 
-3. tag-submodules
-   └─ Idempotent skip — sub-tags already created in step 1
-
-4. highflame-sast → integration tests
-5. highflame-goreleaser → binaries attached to the release
-6. highflame-docker → image pushed to GHCR
+# 3. (Later) Cut your zeroid release normally via GitHub UI.
+#    It will ship with pkg/dpop v1.6.1.
 ```
 
-Total wall-clock: ~3–5 minutes from clicking Publish to the release being fully complete.
+If you skip step 1-2 and try to cut a zeroid release directly, `release.yml`'s drift guard fails with a clear error:
+
+```
+::error::pkg/dpop/ source has drifted from pkg/dpop/v1.6.0 but go.mod still references it.
+::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop v1.6.0, while
+::error::in-repo tests passed against the NEW local source. Silent regression risk.
+::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update
+::error::zeroid/go.mod's reference:
+::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>
+::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release.
+```
+
+This is the safety net — you can't silently ship a zeroid binary built against a different pkg/dpop than what consumers will resolve from the proxy.
 
 ---
 
-## Why the auto-bump exists
+## How pkg/dpop versioning works
 
-zeroid's root module **imports `pkg/dpop`** in its non-test source code (the DPoP RFC 9449 verifier wires into `/oauth2/token` for DPoP-bound tokens). Concretely:
+`zeroid/go.mod` references a specific pinned version of pkg/dpop:
 
 ```
-server.go                              → import ".../pkg/dpop"
-internal/handler/routes.go             → import ".../pkg/dpop"
-internal/handler/oauth.go              → import ".../pkg/dpop"
-internal/store/postgres/dpop_replay.go → import ".../pkg/dpop"
+require github.com/highflame-ai/zeroid/pkg/dpop v1.6.0
 ```
 
-`pkg/authjwt` is imported only from `tests/integration/` — Go's module resolution doesn't follow test imports across module boundaries, so it's not a transitive dep for downstream consumers. But `pkg/dpop` IS a real load-bearing transitive dep. Every external `go get github.com/highflame-ai/zeroid@vX.Y.Z` requires Go to resolve `pkg/dpop@vX.Y.Z` from the proxy.
+This reference is **static across most zeroid releases**. When zeroid v1.7.0 ships, its go.mod still says `pkg/dpop v1.6.0` if pkg/dpop hasn't changed. Consumers `go get zeroid@v1.7.0` and transitively resolve `pkg/dpop v1.6.0` from the proxy — fine, because that tag exists.
 
-**Go's `replace` directives don't propagate across module boundaries.** A `replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop` in zeroid's go.mod works for in-repo dev but every external consumer sees the `require pkg/dpop v0.0.0` directive instead, fails to resolve it, and breaks. Hence the need to keep `zeroid/go.mod` referencing real released subpackage versions in lockstep with the release tag.
+The reference only changes when:
 
-In-repo dev is unaffected — the `go.work` file at the repo root makes Go use the local subdirectories regardless of what versions go.mod declares.
+1. You modify pkg/dpop/ source.
+2. You run `make release-dpop VERSION=v1.6.1`.
+3. The workflow tags `pkg/dpop/v1.6.1` and opens a PR updating zeroid/go.mod's require directive.
+4. You merge the PR.
 
----
+Now main's go.mod says `pkg/dpop v1.6.1`, and the next zeroid release ships that reference.
 
-## The force-moved tag
+### In-repo dev
 
-`bump-go-mod` does the bump AFTER the release tag is created (when you click Publish), then force-moves the tag to point at the bump commit. This sounds scary but is fine in practice:
+The `go.work` file at the repo root makes Go use local pkg/dpop source for in-repo builds, regardless of what versions go.mod references. So you can iterate on pkg/dpop/ freely without bumping anything until you're ready to cut a new pkg/dpop release.
 
-- The force-move happens within ~30 seconds of the original tag creation.
-- No downstream consumer has had time to pull v1.7.0 in that window.
-- The GitHub release page is updated via `gh release edit --target` so users see the correct commit.
-- The Go module proxy fetches on-demand; subsequent fetches return the post-bump commit's source.
+### Why this works
 
-The "no force-pushing tags" rule from git lore is about long-lived tag history, not about adjustments within seconds of creation before anyone has noticed. goreleaser-pro and several other Go release tools do the same thing internally.
-
----
-
-## Subtle consistency note
-
-`bump-go-mod` creates the sub-module tags BEFORE the bump commit exists. So:
-
-- `pkg/authjwt/vX.Y.Z` → pre-bump commit (the commit you clicked Publish on)
-- `pkg/dpop/vX.Y.Z` → pre-bump commit (same)
-- `vX.Y.Z` (root) → post-bump commit (the `devops: prepare release vX.Y.Z` commit)
-
-The two commits differ only in `zeroid/go.mod` and `zeroid/go.sum`. `pkg/dpop/` and `pkg/authjwt/` source trees are byte-identical at both commits. A downstream `go get github.com/highflame-ai/zeroid/pkg/dpop@vX.Y.Z` and a downstream `go get github.com/highflame-ai/zeroid@vX.Y.Z` produce a consistent view of the source tree.
-
-This is the same approach kubernetes-staging and opentelemetry-go use for their multi-module release patterns. The alternative — tagging subpackages at the bump commit — would require running `go mod tidy` BEFORE the subpackage tags exist, which creates a chicken-and-egg the proxy can't resolve.
+| Concern | How it's handled |
+|---------|------------------|
+| Chicken-and-egg (bump go.mod to vX.Y.Z before vX.Y.Z exists on proxy) | Eliminated. zeroid releases don't bump pkg/dpop refs. The release-dpop flow tags pkg/dpop FIRST, then opens the PR — the PR's CI can resolve the new version. |
+| Force-pushing tags | Never needed. The release tag is created at the correct commit on the first try. |
+| Source drift (changing pkg/dpop/ without releasing it) | Caught by the drift guard in `release.yml`. Fails the release with a clear pointer at `release-dpop.yml`. |
+| Orphan tags (abandoning a release-dpop PR) | The orphan `pkg/dpop/vX.Y.Z` tag points at a real commit with valid source. Easy cleanup: `git push --delete origin pkg/dpop/vX.Y.Z`. |
 
 ---
 
 ## The svu gate, briefly
 
-`release.yml`'s second job (`highflame-validate`) runs [svu](https://github.com/caarlos0/svu) to compute the expected next version from commit-prefix history. It maps:
+`release.yml`'s validation runs [svu](https://github.com/caarlos0/svu) against commit history. It maps:
 
-- `feat:` → MINOR bump (e.g. v1.6.0 → v1.7.0)
-- `fix:` → PATCH bump (e.g. v1.6.0 → v1.6.1)
-- `feat!:` or `BREAKING CHANGE:` → MAJOR bump (e.g. v1.x.x → v2.0.0)
-- `devops:`, `build(deps)`, `[Snyk]`, `Bump`, `Merge`, `Revert` — no bump (housekeeping)
+- `feat:` → MINOR bump
+- `fix:` → PATCH bump
+- `feat!:` or `BREAKING CHANGE:` → MAJOR bump
+- `devops:`, `build(deps)`, `[Snyk]`, `Bump`, `Merge`, `Revert` — no bump
 
-The gate **fails if your release tag is below svu's recommendation** (you'd silently ship a `feat:` as a patch). The gate **allows tags at or above the recommendation**, so a maintainer can force a higher bump when intentional. Run `make next-version` to preview.
+The gate fails if your release tag is below svu's recommendation (you'd silently ship a `feat:` as a patch). It allows tags at or above the recommendation, so you can manually force a higher bump.
 
-The `devops: prepare release vX.Y.Z` commit created by `bump-go-mod` is correctly classified by svu as housekeeping (no version movement) — the bump commit itself doesn't perturb the next release's recommendation.
+Run `make next-version` to preview.
 
 ---
 
@@ -129,36 +122,42 @@ The `devops: prepare release vX.Y.Z` commit created by `bump-go-mod` is correctl
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Refuse releases from non-main branches` | You picked a `target_commitish` that isn't main | Re-create the release with target = main |
 | `Invalid version format` | Tag doesn't match `vMAJOR.MINOR.PATCH` | Use a semver tag |
-| `Release tag X is below svu's computed next version Y` | A `feat:` commit since the last tag implies a minor bump | Re-create the release at version Y (or higher), or audit the commit prefixes |
-| `App token failed to push to main` | The release-bot App lacks branch-protection bypass | Add the bot to the bypass list in repo settings → branches → main |
-| `tag-submodules` already exist | Re-running a release that previously partially succeeded | Idempotent skip; no action needed |
-| go.mod references a different version after bump | bump-go-mod failed mid-way and you have a partial state | Manually verify go.mod on main is consistent with the latest release tag; re-run any failed workflows |
-
-The most common failure mode is **App token can't push to main due to branch protection.** The fix is to add `highflame-release-bot[bot]` to the bypass list for `main`. Without this, `bump-go-mod` will fail at the commit-and-push step and the rest of the release workflow won't run.
+| `Release tag X is below svu's computed next version Y` | A `feat:` commit since the last tag implies a minor bump | Re-create the release at Y or higher |
+| `pkg/dpop/ source has drifted from pkg/dpop/X` | You changed pkg/dpop/ since the last pkg/dpop release | `make release-dpop VERSION=<next>`, merge the PR, then re-publish your zeroid release |
+| `Tag pkg/dpop/X does not exist` | go.mod references a pkg/dpop tag that was never created | Either fix go.mod to reference an existing tag, or run `make release-dpop` |
+| Auto-opened release-dpop PR fails CI | go.sum got out of sync or there's a real test regression in pkg/dpop | Check the PR's CI logs; fix on the branch or close the PR |
 
 ---
 
 ## Adding a new nested module
 
-If you introduce a new module (e.g. `pkg/dcr/`), update **two places**:
+Going forward, nested modules should follow the same pattern as pkg/dpop — decoupled release cadence — IF they get imported in zeroid's non-test code. If they're test-only (like pkg/authjwt currently), they can stay clubbed.
+
+To add a new decoupled nested module (e.g. `pkg/dcr/`):
 
 1. **`go.work`** — add `./pkg/dcr` to the `use (...)` list.
-2. **`.github/workflows/release.yml`** — append `pkg/dcr` to the `SUBMODULES` arrays in BOTH `bump-go-mod` AND `tag-submodules`, and add the corresponding `-require=github.com/highflame-ai/zeroid/pkg/dcr@${VERSION}` to the `go mod edit` step in `bump-go-mod`.
+2. **`zeroid/go.mod`** — add `require github.com/highflame-ai/zeroid/pkg/dcr vX.Y.Z` with a real published version.
+3. **`.github/workflows/release.yml`** — extend the drift guard step to also check pkg/dcr.
+4. **Add `.github/workflows/release-dcr.yml`** — copy `release-dpop.yml` and adjust paths.
+5. **`Makefile`** — add `make release-dcr` target.
 
-After the next release, downstream consumers can `go get github.com/highflame-ai/zeroid/pkg/dcr@vX.Y.Z`.
+To add a test-only nested module that stays clubbed (like pkg/authjwt):
+
+1. **`go.work`** — add it to the `use (...)` list.
+2. **`zeroid/go.mod`** — leave at `v0.0.0`.
+3. **`.github/workflows/release.yml`** — extend the tag-submodules step to also tag pkg/<new>/vX.Y.Z at release commit.
 
 ---
 
 ## Industry context
 
-For curiosity: bigger Go monorepos (opentelemetry-go, etcd, kubernetes) typically use a **PR-based release-prep flow** where a CLI command opens a `release: prepare vX.Y.Z` PR for human review, then a separate command creates the tags. They do this because:
+This pattern (decoupled release cadence for genuinely-shared subpackages, clubbed for test-only ones, with a drift guard catching the foot-gun) maps closely to how `golang.org/x/*` modules relate to Go itself — they're versioned independently and consumers pin them explicitly. It's also similar to how kubernetes-staging modules work (those are even more decoupled, with a separate publishing bot).
 
-- Many maintainers with cut-release permission → diff review acts as a "did the right person review this" gate
-- Larger module sets with cross-module changes that aren't purely mechanical
-- Compliance environments that forbid direct-push to main from any source
+For zeroid's scale (one maintainer, low release frequency, slow pkg/dpop churn), this trade-off lands cleanly:
 
-For zeroid's scale (small maintainer team, mechanical version bumps), the auto-bump-on-publish pattern is cleaner — no CLI ritual, no PR overhead. The trade-off cost (force-moving a tag within 30 seconds of creation, no human review of a literal version-number change) is negligible.
+- Common case: zero CLI commands. Click Publish in UI.
+- pkg/dpop changes case: one extra CLI command (`make release-dpop`) plus a PR review. Infrequent.
+- Foot-gun: caught by the drift guard before it ships.
 
-If zeroid outgrows this — multiple maintainers, more nested modules, contributor-driven releases — the PR-based pattern can be added back. Today, this design is right-sized.
+If pkg/dpop ever ends up changing on every zeroid release (defeating the decoupled benefit), it's a signal to revisit — maybe clubbing makes more sense, or maybe the design got refactored. Today, the cadences are genuinely different and the decoupled pattern is right.
