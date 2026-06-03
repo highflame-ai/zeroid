@@ -60,8 +60,9 @@ cli-test: cli-install ## Run CLI tests
 
 next-version: ## Print svu-computed next semver from commits since last v* tag
 	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
-	@echo "current : $$(svu current)"
-	@echo "next    : $$(svu next)"
+	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
+		echo "current : $$($${SVU} current)"; \
+		echo "next    : $$($${SVU} next)"
 	@echo
 	@echo "Cut a zeroid release: draft a new release in the GitHub UI with tag = svu's recommendation"
 	@echo "(or higher). See RELEASING.md."
