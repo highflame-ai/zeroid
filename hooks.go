@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ClaimsEnricher is called during JWT issuance to add custom claims.
@@ -38,6 +39,37 @@ type GrantRequest struct {
 	Role           string
 	PrivilegeScope []string
 }
+
+// Principal is the resolved caller at /oauth2/authorize — the tenant +
+// user binding that gets baked into the issued authorization code JWT.
+// Re-exported from internal/service so deployer code stays at the
+// top-level zeroid public surface; both names refer to the same type.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type Principal = service.Principal
+
+// AuthorizeRequest is the typed, read-only snapshot of the parsed
+// /oauth2/authorize request handed to every PrincipalResolver. Resolvers
+// see this — never net/http types — so the extensibility hook stays
+// consistent with zeroid's other typed-struct boundaries.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type AuthorizeRequest = service.AuthorizeRequest
+
+// PrincipalResolver authenticates the caller at /oauth2/authorize.
+// Registered via Server.RegisterPrincipalResolver and tried in
+// registration order; the first resolver to return a non-nil Principal
+// wins. Return ErrPrincipalNotApplicable to defer to the next resolver;
+// any other error fails the request with 401 invalid_client.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type PrincipalResolver = service.PrincipalResolver
+
+// ErrPrincipalNotApplicable is the sentinel returned by a
+// PrincipalResolver that does not apply to the current request. zeroid
+// moves to the next registered resolver; when every resolver returns
+// this sentinel, the request fails with 401 invalid_client.
+var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before

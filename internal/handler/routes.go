@@ -5,6 +5,7 @@
 package handler
 
 import (
+	"context"
 	"io"
 	"time"
 
@@ -42,7 +43,25 @@ type API struct {
 	db                   *bun.DB
 	issuer               string
 	startTime            time.Time
+
+	// resolvePrincipal walks the PrincipalResolver chain registered on
+	// the top-level Server. Wired by Server.NewServer via
+	// SetPrincipalResolverFunc; nil when no resolvers are registered
+	// (the /oauth2/authorize handler then returns 503 so deployers
+	// see a clear "not configured" signal).
+	resolvePrincipal PrincipalResolverFunc
 }
+
+// PrincipalResolverFunc is the chain-walker function the /oauth2/authorize
+// handler calls to resolve the caller's tenant + user context. Returns
+// the resolved principal, the name of the resolver that produced it
+// (for log attribution), and any error.
+//
+// The function lives here (handler package) rather than in service or
+// the top-level zeroid package so handler can hold it as a field without
+// pulling in the resolver-registry mutex. Server constructs an instance
+// bound to its own registry and hands it to API at construction time.
+type PrincipalResolverFunc func(ctx context.Context, req *service.AuthorizeRequest) (*service.Principal, string, error)
 
 // NewAPI creates a new API with all service dependencies.
 func NewAPI(
@@ -128,6 +147,16 @@ func (a *API) RegisterPublic(api huma.API, router chi.Router) {
 	a.registerOAuthRoutes(api)
 	a.registerDynamicRegistrationRoutes(api)
 	a.registerAuthVerifyRoute(router)
+	a.registerAuthorizeRoute(router)
+}
+
+// SetPrincipalResolverFunc wires the PrincipalResolver chain walker
+// from the top-level Server into this API. Called by Server.NewServer
+// once after API construction; not part of the public deployer API
+// (deployers call Server.RegisterPrincipalResolver instead, which
+// updates the registry that this function reads from).
+func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
+	a.resolvePrincipal = fn
 }
 
 // RegisterAdmin registers admin/management endpoints:

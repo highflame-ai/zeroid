@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -86,10 +87,19 @@ type Server struct {
 	workerCancel  context.CancelFunc
 
 	// Extensibility
-	mu              sync.RWMutex
-	claimsEnrichers []ClaimsEnricher
-	adminAuthState  *middlewareHolder
-	globalMWState   *middlewareHolder
+	mu                 sync.RWMutex
+	claimsEnrichers    []ClaimsEnricher
+	principalResolvers []namedPrincipalResolver
+	adminAuthState     *middlewareHolder
+	globalMWState      *middlewareHolder
+}
+
+// namedPrincipalResolver pairs a registered PrincipalResolver with the
+// deployer-supplied name used in /oauth2/authorize logs and metrics.
+// Stored in registration order so the chain walk is deterministic.
+type namedPrincipalResolver struct {
+	name string
+	fn   PrincipalResolver
 }
 
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
@@ -401,6 +411,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
 
+	// Hand the principal-resolver chain walker to the API handler. The
+	// handler invokes this on every /oauth2/authorize request to walk
+	// the resolvers registered via Server.RegisterPrincipalResolver.
+	// Wired here (not in NewAPI) so srv exists for the method binding.
+	apiHandler.SetPrincipalResolverFunc(srv.resolvePrincipal)
+
 	return srv, nil
 }
 
@@ -532,6 +548,93 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
+}
+
+// RegisterPrincipalResolver registers a PrincipalResolver against the
+// /oauth2/authorize endpoint. Resolvers are tried in registration order;
+// the first to return a non-nil Principal wins. name is used for
+// log/metric attribution and must be non-empty.
+//
+// Typical usage from a deployer that owns api_key resolution:
+//
+//	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+//	    key := req.Form("api_key")
+//	    if key == "" {
+//	        return nil, zeroid.ErrPrincipalNotApplicable
+//	    }
+//	    res, err := srv.ResolveAPIKey(ctx, key)
+//	    if err != nil {
+//	        return nil, err
+//	    }
+//	    return &zeroid.Principal{
+//	        AccountID: res.AccountID,
+//	        ProjectID: res.ProjectID,
+//	        UserID:    res.UserID,
+//	        Scopes:    res.Scopes,
+//	    }, nil
+//	})
+//
+// Safe to call after NewServer and before Start. Multiple resolvers are
+// supported — register the most-specific first (e.g. session cookie
+// before api_key fallback) because order determines precedence on
+// overlapping requests.
+func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
+	if name == "" || r == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.principalResolvers = append(s.principalResolvers, namedPrincipalResolver{name: name, fn: r})
+}
+
+// resolvePrincipal walks the registered PrincipalResolver chain in
+// registration order, returning the first non-nil Principal. The
+// matchedName return is the resolver name that produced the Principal —
+// used by the /oauth2/authorize handler for log attribution.
+//
+// Errors:
+//   - All resolvers returning ErrPrincipalNotApplicable → returns
+//     (nil, "", nil). Caller (the authorize handler) maps this to a
+//     401 invalid_client.
+//   - Any resolver returning a non-sentinel error → returns
+//     (nil, resolverName, err). The chain stops at the first such
+//     error; caller surfaces it as 401 invalid_client with the
+//     resolver's description.
+//   - No resolvers registered → returns (nil, "", nil). Handler maps
+//     to 503 — the deployer never wired this up.
+func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
+	s.mu.RLock()
+	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
+	copy(resolvers, s.principalResolvers)
+	s.mu.RUnlock()
+
+	for _, r := range resolvers {
+		p, err := r.fn(ctx, req)
+		if err != nil {
+			if errors.Is(err, ErrPrincipalNotApplicable) {
+				continue
+			}
+			return nil, r.name, err
+		}
+		if p != nil {
+			return p, r.name, nil
+		}
+		// nil principal + nil error: defensive — treat as "not applicable"
+		// rather than returning a nil Principal that downstream would
+		// have to nil-check anyway.
+	}
+
+	return nil, "", nil
+}
+
+// hasPrincipalResolvers reports whether any PrincipalResolver has been
+// registered. Used by the /oauth2/authorize handler to distinguish a
+// "deployer never wired the endpoint" 503 from a "credential rejected"
+// 401, so embedders get a clear setup-error message in the former case.
+func (s *Server) hasPrincipalResolvers() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.principalResolvers) > 0
 }
 
 // AdminAuth sets an optional authentication middleware for admin routes.
@@ -943,6 +1046,15 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/token/introspect": {},
 	"/oauth2/token/revoke":     {},
 	"/oauth2/bc-authorize":     {},
+	// /oauth2/authorize is intentionally NOT here. Its handler is a
+	// plain chi route (not Huma) — see internal/handler/authorize.go —
+	// because the endpoint's principal-credential field set is
+	// resolver-dependent (api_key today, session cookie / mTLS
+	// tomorrow) and doesn't fit a static OpenAPI input schema. The
+	// chi handler parses the raw application/x-www-form-urlencoded
+	// body directly; routing it through this middleware would rewrite
+	// the form to JSON before the handler sees it, breaking form
+	// access.
 }
 
 // jsonShapedFormFields are OAuth form parameters whose value is itself JSON
