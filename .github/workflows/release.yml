@@ -10,7 +10,13 @@ env:
   # jwx v4 needs the encoding/json/v2 experiment (Go 1.26+).
   GOEXPERIMENT: "jsonv2"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  RELEASE_NAME: ${{ github.event.release.name }}
+  # release.tag_name is the git tag (e.g. v1.7.0) — what consumers
+  # `go get`. Not release.name, which is the human-readable display
+  # title and can be customised in the UI to something like
+  # "v1.7.0 — PKCE PrincipalResolver" that would fail the tag-format
+  # regex. tag_name is the load-bearing identifier for every gate in
+  # this workflow.
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -35,10 +41,10 @@ jobs:
         id: validate_tag
         shell: bash
         run: |-
-          if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
-            echo "Valid version format: ${{ env.RELEASE_NAME }}"
+          if [[ "${{ env.RELEASE_TAG }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_TAG }}"
           else
-            echo "Invalid version format: ${{ env.RELEASE_NAME }}"
+            echo "Invalid version format: ${{ env.RELEASE_TAG }}"
             exit 1
           fi
 
@@ -66,7 +72,7 @@ jobs:
         run: |-
           go install github.com/caarlos0/svu/v3@latest
           EXPECTED="$(svu next)"
-          ACTUAL="${{ env.RELEASE_NAME }}"
+          ACTUAL="${{ env.RELEASE_TAG }}"
           echo "Published tag : ${ACTUAL}"
           echo "svu next      : ${EXPECTED}"
           # sort -V picks the highest of the two; if EXPECTED is
@@ -167,7 +173,7 @@ jobs:
       - name: Tag pkg/authjwt at release commit
         shell: bash
         run: |
-          VERSION="${{ env.RELEASE_NAME }}"
+          VERSION="${{ env.RELEASE_TAG }}"
           SUBTAG="pkg/authjwt/${VERSION}"
           if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
             echo "Tag ${SUBTAG} already exists, skipping"

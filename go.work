@@ -3,23 +3,21 @@
 // repo, Go reads this file and treats the three modules as one workspace
 // — local code in ./pkg/authjwt and ./pkg/dpop is used directly,
 // regardless of what versions zeroid/go.mod's require directives
-// declare. Each module's go.mod can therefore reference real published
-// versions (which downstream consumers need for `go get` resolution),
-// without breaking the dev experience.
+// declare. This lets zeroid/go.mod reference real published subpackage
+// versions (required for downstream `go get` resolution) without
+// breaking the in-repo dev loop.
 //
-// This replaces the older pattern of `replace github.com/highflame-ai/
-// zeroid/pkg/foo => ./pkg/foo` directives in zeroid/go.mod. Those
-// directives worked for in-repo dev but were invisible to downstream
-// consumers (Go does not honor a transitive module's replace
-// directives), so external `go get github.com/highflame-ai/zeroid@vX.Y.Z`
-// always failed against the `v0.0.0` placeholder version. The workspace
-// + real-version pattern is the modern Go-monorepo idiom — see
-// kubernetes, etcd, opentelemetry-go for the same shape.
+// pkg/authjwt is also covered by a `replace ./pkg/authjwt` directive in
+// zeroid/go.mod. That replace is redundant with this workspace for the
+// common dev path, but keeps `GOWORK=off` builds working (some CI
+// matrix variants disable workspace mode). pkg/dpop has no such
+// replace — its version reference in zeroid/go.mod is a real
+// published version (decoupled release cadence via release-dpop.yml).
 //
-// Releases: see RELEASING.md for how the prepare-release workflow
-// keeps the cross-module version refs in zeroid/go.mod in lockstep with
-// the published release tag, so consumers see consistent versions
-// across the root module + sub-modules.
+// Releases: see RELEASING.md. Normal zeroid release is just "click
+// Publish in UI" — no version-bumping ceremony required because
+// zeroid/go.mod pins pkg/dpop to a specific released version that
+// stays static across most zeroid releases.
 
 go 1.26.0
 
