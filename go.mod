@@ -8,7 +8,7 @@ require (
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
-	github.com/highflame-ai/zeroid/pkg/authjwt v1.6.0
+	github.com/highflame-ai/zeroid/pkg/authjwt v0.0.0
 	github.com/highflame-ai/zeroid/pkg/dpop v1.6.0
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
@@ -105,4 +105,17 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
+
+// pkg/authjwt is import-only-from-tests. Go does not follow test
+// imports across module boundaries, so the v0.0.0 placeholder in the
+// require directive above is invisible to downstream consumers — they
+// never try to resolve it. The local replace keeps `GOWORK=off` builds
+// inside this repo working (e.g. some CI matrix variants); the
+// go.work file at the repo root provides the same override for
+// default workspace-mode builds.
+//
+// pkg/dpop intentionally does NOT have a local replace — it's
+// referenced at a real published version in the require block above
+// (decoupled release cadence via release-dpop.yml). See RELEASING.md.
+replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 
