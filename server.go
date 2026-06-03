@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -86,10 +87,19 @@ type Server struct {
 	workerCancel  context.CancelFunc
 
 	// Extensibility
-	mu              sync.RWMutex
-	claimsEnrichers []ClaimsEnricher
-	adminAuthState  *middlewareHolder
-	globalMWState   *middlewareHolder
+	mu                 sync.RWMutex
+	claimsEnrichers    []ClaimsEnricher
+	principalResolvers []namedPrincipalResolver
+	adminAuthState     *middlewareHolder
+	globalMWState      *middlewareHolder
+}
+
+// namedPrincipalResolver pairs a registered PrincipalResolver with the
+// deployer-supplied name used in /oauth2/authorize logs and metrics.
+// Stored in registration order so the chain walk is deterministic.
+type namedPrincipalResolver struct {
+	name string
+	fn   PrincipalResolver
 }
 
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
@@ -401,6 +411,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
 
+	// Hand the principal-resolver chain walker to the API handler. The
+	// handler invokes this on every /oauth2/authorize request to walk
+	// the resolvers registered via Server.RegisterPrincipalResolver.
+	// Wired here (not in NewAPI) so srv exists for the method binding.
+	apiHandler.SetPrincipalResolverFunc(srv.resolvePrincipal)
+
 	return srv, nil
 }
 
@@ -532,6 +548,87 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
+}
+
+// RegisterPrincipalResolver registers a PrincipalResolver against the
+// /oauth2/authorize endpoint. Resolvers are tried in registration order;
+// the first to return a non-nil Principal wins. name is used for
+// log/metric attribution and must be non-empty.
+//
+// Typical usage from a deployer that owns api_key resolution:
+//
+//	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+//	    key := req.Form("api_key")
+//	    if key == "" {
+//	        return nil, zeroid.ErrPrincipalNotApplicable
+//	    }
+//	    res, err := srv.ResolveAPIKey(ctx, key)
+//	    if err != nil {
+//	        return nil, err
+//	    }
+//	    return &zeroid.Principal{
+//	        AccountID: res.AccountID,
+//	        ProjectID: res.ProjectID,
+//	        UserID:    res.UserID,
+//	        Scopes:    res.Scopes,
+//	    }, nil
+//	})
+//
+// Safe to call after NewServer and before Start. Multiple resolvers are
+// supported — register the most-specific first (e.g. session cookie
+// before api_key fallback) because order determines precedence on
+// overlapping requests.
+func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
+	if name == "" || r == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.principalResolvers = append(s.principalResolvers, namedPrincipalResolver{name: name, fn: r})
+}
+
+// resolvePrincipal walks the registered PrincipalResolver chain in
+// registration order, returning the first non-nil Principal. The
+// matchedName return is the resolver name that produced the Principal —
+// used by the /oauth2/authorize handler for log attribution.
+//
+// Errors:
+//   - No resolvers registered → returns
+//     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
+//     so the deployer sees a clear "you forgot to wire this up"
+//     signal, distinct from the 401 "credential didn't match" case.
+//   - All registered resolvers returning ErrPrincipalNotApplicable →
+//     returns (nil, "", nil). Handler maps to 401 invalid_client.
+//   - Any resolver returning a non-sentinel error → returns
+//     (nil, resolverName, err). The chain stops at the first such
+//     error; handler surfaces it as 401 invalid_client.
+func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
+	s.mu.RLock()
+	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
+	copy(resolvers, s.principalResolvers)
+	s.mu.RUnlock()
+
+	if len(resolvers) == 0 {
+		return nil, "", ErrNoResolversRegistered
+	}
+
+	for _, r := range resolvers {
+		p, err := r.fn(ctx, req)
+		if err != nil {
+			if errors.Is(err, ErrPrincipalNotApplicable) {
+				continue
+			}
+			return nil, r.name, err
+		}
+		if p != nil {
+			return p, r.name, nil
+		}
+		// nil principal + nil error: defensive — treat as "not applicable"
+		// rather than returning a nil Principal that downstream would
+		// have to nil-check anyway.
+	}
+
+	return nil, "", nil
 }
 
 // AdminAuth sets an optional authentication middleware for admin routes.
@@ -943,6 +1040,15 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/token/introspect": {},
 	"/oauth2/token/revoke":     {},
 	"/oauth2/bc-authorize":     {},
+	// /oauth2/authorize is intentionally NOT here. Its handler is a
+	// plain chi route (not Huma) — see internal/handler/authorize.go —
+	// because the endpoint's principal-credential field set is
+	// resolver-dependent (api_key today, session cookie / mTLS
+	// tomorrow) and doesn't fit a static OpenAPI input schema. The
+	// chi handler parses the raw application/x-www-form-urlencoded
+	// body directly; routing it through this middleware would rewrite
+	// the form to JSON before the handler sees it, breaking form
+	// access.
 }
 
 // jsonShapedFormFields are OAuth form parameters whose value is itself JSON
@@ -1055,22 +1161,44 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// nonJSONContentTypeExemptPaths lists endpoints that accept
+// non-application/json POST bodies. The body-size cap still applies to
+// these paths (preserved as a generic DoS guard); the Content-Type
+// enforcement is what's exempted.
+//
+// /oauth2/authorize is here because its chi handler reads raw
+// application/x-www-form-urlencoded bodies directly — see
+// internal/handler/authorize.go for why it's chi-not-Huma. Other
+// /oauth2/* endpoints (token, introspect, revoke, bc-authorize) get
+// their form-encoded bodies REWRITTEN to JSON by
+// oauthFormCompatMiddleware before requestValidationMiddleware runs,
+// so by the time the Content-Type check fires they look like JSON.
+// /oauth2/authorize is not in OAuthFormEndpoints (no rewrite), so it
+// arrives here still form-encoded and must be exempted explicitly.
+var nonJSONContentTypeExemptPaths = map[string]struct{}{
+	"/oauth2/authorize": {},
+}
+
 // requestValidationMiddleware limits request body size to 10 MiB and enforces
-// application/json Content-Type on mutating requests (POST, PUT, PATCH).
+// application/json Content-Type on mutating requests (POST, PUT, PATCH),
+// except for paths in nonJSONContentTypeExemptPaths which handle their
+// own content negotiation.
 func requestValidationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const maxBodySize = 10 * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-			ct := r.Header.Get("Content-Type")
-			if ct == "" {
-				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
-				return
-			}
-			if !mediaTypeEquals(ct, "application/json") {
-				writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
-				return
+			if _, exempt := nonJSONContentTypeExemptPaths[r.URL.Path]; !exempt {
+				ct := r.Header.Get("Content-Type")
+				if ct == "" {
+					writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
+					return
+				}
+				if !mediaTypeEquals(ct, "application/json") {
+					writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
+					return
+				}
 			}
 		}
 

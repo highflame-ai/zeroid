@@ -290,6 +290,32 @@ func runTests(m *testing.M) int {
 		return "", fmt.Errorf("caller is not a trusted service")
 	})
 
+	// Stub PrincipalResolver for /oauth2/authorize tests. Reads its
+	// behaviour from magic form fields so a single resolver covers
+	// every test shape (happy path, not-applicable, rejected). Tests
+	// that don't hit /oauth2/authorize never trigger it.
+	//
+	// Form-field protocol:
+	//   test_principal_account → AccountID (required to "apply")
+	//   test_principal_project → ProjectID
+	//   test_principal_user    → UserID
+	//   test_principal_reject  → "true" returns a non-sentinel error
+	//   (anything else)        → ErrPrincipalNotApplicable
+	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		if req.Form("test_principal_reject") == "true" {
+			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")
+		}
+		acct := req.Form("test_principal_account")
+		if acct == "" {
+			return nil, zeroid.ErrPrincipalNotApplicable
+		}
+		return &zeroid.Principal{
+			AccountID: acct,
+			ProjectID: req.Form("test_principal_project"),
+			UserID:    req.Form("test_principal_user"),
+		}, nil
+	})
+
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 
