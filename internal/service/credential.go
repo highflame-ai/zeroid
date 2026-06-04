@@ -511,6 +511,15 @@ func (s *CredentialService) SetRevocationDispatcher(d *RevocationDispatcher) {
 // descendants. Fires one RevocationNotifier event per affected JTI after the
 // revocation commits (on a detached goroutine — never on the request's
 // critical path).
+//
+// Returns ErrCredentialNotFound when the underlying cascade matches zero
+// rows. The SQL function filters on id + account_id + project_id, and skips
+// rows that are already revoked or past expires_at — so a zero-row outcome
+// means one of: wrong id, tenant-scope mismatch, already revoked, or
+// already expired. Mapping all four to a typed error turns what used to be
+// a silent 200-OK no-op (the handler always set revoked:true) into an
+// explicit failure the caller can react to. Real DB errors still surface
+// as the underlying error.
 func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID, projectID, reason string) error {
 	if reason == "" {
 		reason = "manual_revocation"
@@ -518,6 +527,9 @@ func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID,
 	revoked, err := s.repo.Revoke(ctx, id, accountID, projectID, reason)
 	if err != nil {
 		return err
+	}
+	if len(revoked) == 0 {
+		return ErrCredentialNotFound
 	}
 	s.dispatchRevocations(ctx, revoked, reason)
 	return nil

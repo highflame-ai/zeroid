@@ -46,20 +46,28 @@ type GraphNode struct {
 // identities. ScopesIn/ScopesOut/Attenuated are the scope-attenuation
 // triple; for root credentials (no parent) ScopesIn equals ScopesOut and
 // Attenuated is empty.
+//
+// RevokedAt and RevokeReason surface the durable audit fields from the
+// underlying credential row — populated only when IsRevoked is true so
+// downstream UIs can render "revoked at T by reason R" without a second
+// round-trip to the credential repository. Both are omitempty so the wire
+// shape stays unchanged for unrevoked edges.
 type GraphEdge struct {
-	From            string    `json:"from,omitempty"`
-	To              string    `json:"to,omitempty"`
-	JTI             string    `json:"jti"`
-	ParentJTI       string    `json:"parent_jti,omitempty"`
-	MissionID       string    `json:"mission_id,omitempty"`
-	IssuedAt        time.Time `json:"issued_at"`
-	ExpiresAt       time.Time `json:"expires_at"`
-	GrantType       string    `json:"grant_type"`
-	DelegationDepth int       `json:"delegation_depth"`
-	ScopesIn        []string  `json:"scopes_in"`
-	ScopesOut       []string  `json:"scopes_out"`
-	Attenuated      []string  `json:"attenuated"`
-	IsRevoked       bool      `json:"is_revoked"`
+	From            string     `json:"from,omitempty"`
+	To              string     `json:"to,omitempty"`
+	JTI             string     `json:"jti"`
+	ParentJTI       string     `json:"parent_jti,omitempty"`
+	MissionID       string     `json:"mission_id,omitempty"`
+	IssuedAt        time.Time  `json:"issued_at"`
+	ExpiresAt       time.Time  `json:"expires_at"`
+	GrantType       string     `json:"grant_type"`
+	DelegationDepth int        `json:"delegation_depth"`
+	ScopesIn        []string   `json:"scopes_in"`
+	ScopesOut       []string   `json:"scopes_out"`
+	Attenuated      []string   `json:"attenuated"`
+	IsRevoked       bool       `json:"is_revoked"`
+	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason    string     `json:"revoke_reason,omitempty"`
 }
 
 // Graph is the response shape for /delegations/graph — a depth-bounded
@@ -318,10 +326,12 @@ func credentialToEdge(c *domain.IssuedCredential) *GraphEdge {
 		// ScopesIn defaults to ScopesOut for root credentials so the
 		// triple is always populated; the parent-lookup branch
 		// overwrites this for non-root edges.
-		ScopesIn:   scopesOut,
-		ScopesOut:  scopesOut,
-		Attenuated: []string{},
-		IsRevoked:  c.IsRevoked,
+		ScopesIn:     scopesOut,
+		ScopesOut:    scopesOut,
+		Attenuated:   []string{},
+		IsRevoked:    c.IsRevoked,
+		RevokedAt:    c.RevokedAt,
+		RevokeReason: c.RevokeReason,
 	}
 }
 
