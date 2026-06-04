@@ -567,14 +567,24 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 	return count, nil
 }
 
-// DeleteIdentity permanently removes an identity and cascades to related records.
+// PurgeIdentity permanently removes an identity row (hard delete) and cascades
+// to related records. It is reserved for the compensating rollback of a
+// half-created identity (see AgentService.RegisterAgent).
+//
+// User-facing deletes must NOT call this: DELETE /identities/{id} and
+// DELETE /agents/registry/{id} are SOFT deletes (DeactivateIdentity /
+// DeactivateAgent) per the platform "never hard DELETE" convention, which also
+// preserves the audit trail. A hard delete additionally trips the
+// non-cascading service_keys FK on existing deployments (authn#109); that is
+// safe in the rollback path only because it runs before any service key is
+// persisted (CreateKey writes its row last).
 //
 // Cleanup runs before the DB delete: API keys are revoked, active credentials
 // are cascade-revoked, and a retirement CAE signal is emitted. This ensures
 // tokens issued to the identity stop working at the same moment the identity
 // is removed, not just whenever they happen to TTL-expire (which can be up to
 // 90 days for api_key tokens).
-func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID string) error {
+func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, projectID string) error {
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		// Fall through to Delete so callers get the same not-found semantics.
@@ -582,6 +592,36 @@ func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, pro
 	}
 	s.runDeactivationCleanup(ctx, identity, "identity_deleted")
 	return s.repo.Delete(ctx, id, accountID, projectID)
+}
+
+// DeactivateIdentity is the soft delete: it flips the identity to the
+// deactivated status via the shared UpdateIdentity path, which sweeps linked
+// API keys, cascade-revokes active credentials, and emits the retirement CAE
+// signal on a fresh transition. This is what DELETE /identities/{id} and
+// DELETE /agents/registry/{id} resolve to — the identity row is RETAINED
+// (preserving the audit trail) and no hard DELETE is issued, so the
+// non-cascading service_keys FK (authn#109) is never touched.
+//
+// Idempotent: an already-deactivated identity is a no-op success. Without this
+// short-circuit a repeated DELETE would hit UpdateIdentity's status-transition
+// guard (deactivated → deactivated is rejected) and surface a spurious 400,
+// breaking the idempotency callers expect of DELETE. A missing identity
+// returns the repo's not-found error so the handler can map it to 404.
+func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID, projectID string) error {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return err
+	}
+
+	if identity.Status == domain.IdentityStatusDeactivated {
+		return nil
+	}
+
+	status := domain.IdentityStatusDeactivated
+
+	_, err = s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+
+	return err
 }
 
 // runDeactivationCleanup sweeps everything a deactivated or deleted identity

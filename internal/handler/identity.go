@@ -415,9 +415,14 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*st
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	if err := a.identitySvc.DeleteIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
-		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to delete identity")
-		return nil, huma.Error500InternalServerError("failed to delete identity")
+	// Soft delete: deactivate rather than hard-delete. Matches the route's
+	// "Deactivate an identity (soft delete)" summary and the platform "never
+	// hard DELETE" convention, and avoids the non-cascading service_keys FK
+	// that 500s a hard delete on existing deployments (authn#109). mapErr
+	// surfaces a missing identity as 404 rather than a blanket 500.
+	if err := a.identitySvc.DeactivateIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to deactivate identity")
+		return nil, mapErr(err)
 	}
 
 	return nil, nil

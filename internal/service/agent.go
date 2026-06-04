@@ -212,8 +212,12 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
-		// Compensating action — deactivate the identity if key creation fails.
-		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
+		// Compensating action — hard-purge the half-created identity if key
+		// creation fails. Purge (not deactivate) is correct here: registration
+		// did not complete, so no deactivated ghost should linger holding the
+		// external_id. Safe against the service_keys FK because CreateKey
+		// persists its row last — a failure never leaves a service key behind.
+		_ = s.identitySvc.PurgeIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
 		return nil, fmt.Errorf("failed to create API key: %w", err)
 	}
 
@@ -392,19 +396,33 @@ func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, 
 	return &resp, nil
 }
 
-// DeleteAgent deactivates an agent and revokes its keys.
+// DeleteAgent soft-deletes an agent. DELETE on the registry deactivates the
+// identity rather than issuing a hard DELETE — matching the endpoint's "soft
+// delete" contract and the platform "never hard DELETE" convention.
+// Deactivation sweeps the agent's API keys, cascade-revokes active
+// credentials, and emits the retirement CAE signal (see DeactivateAgent /
+// IdentityService.runDeactivationCleanup), so it is behaviourally the same as
+// POST /agents/registry/{id}/deactivate.
+//
+// A hard delete here previously returned 500 for any agent that had a service
+// key, because service_keys carries a non-cascading FK to identities on
+// existing deployments (authn#109). Deactivation sidesteps that entirely and
+// keeps the audit trail. Idempotent: deleting an already-deactivated agent is
+// a no-op success (DeactivateIdentity short-circuits the status-transition
+// guard).
 func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
+	if err := s.identitySvc.DeactivateIdentity(ctx, id, accountID, projectID); err != nil {
+		return nil, err
+	}
+
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Hard delete — cascades to api_keys, credentials, etc. via FK ON DELETE CASCADE.
-	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID); err != nil {
-		return nil, err
-	}
+	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
+	resp := identityToAgentResponse(identity, keyPrefix)
 
-	resp := identityToAgentResponse(identity, "")
 	return &resp, nil
 }
 
