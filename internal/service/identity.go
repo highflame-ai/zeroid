@@ -235,6 +235,14 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 
 	if err := s.repo.Create(ctx, identity); err != nil {
 		if isDuplicateKeyError(err) {
+			// Distinguish a collision with a DEACTIVATED (soft-deleted) identity
+			// — which is actionable via reactivation — from a live duplicate.
+			// Best-effort: if the lookup fails, fall back to the generic error.
+			if existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); gerr == nil &&
+				existing != nil && existing.Status == domain.IdentityStatusDeactivated {
+				return nil, &IdentityDeactivatedConflictError{ExternalID: req.ExternalID, ExistingID: existing.ID}
+			}
+
 			return nil, ErrIdentityAlreadyExists
 		}
 		return nil, fmt.Errorf("failed to register identity: %w", err)

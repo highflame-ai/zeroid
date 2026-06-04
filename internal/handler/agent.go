@@ -302,6 +302,17 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
+		// A collision with a soft-deleted identity is actionable — surface the
+		// existing id so the caller can reactivate it instead of being stuck
+		// behind an opaque 409 for a row hidden from the active registry view.
+		var deactErr *service.IdentityDeactivatedConflictError
+		if errors.As(err, &deactErr) {
+			return nil, huma.Error409Conflict(deactErr.Error(), &huma.ErrorDetail{
+				Message:  "reactivate the deactivated identity (POST /agents/registry/{id}/activate) or register with a different external_id",
+				Location: "body.external_id",
+				Value:    deactErr.ExistingID,
+			})
+		}
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
 		}
