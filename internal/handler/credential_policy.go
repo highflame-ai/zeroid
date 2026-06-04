@@ -213,6 +213,15 @@ func (a *API) deletePolicyOp(ctx context.Context, input *PolicyIDInput) (*struct
 	}
 
 	if err := a.credentialPolicySvc.DeletePolicy(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+		if errors.Is(err, service.ErrPolicyInUse) {
+			// Safe to surface: the delete dialog already tells the operator
+			// the policy is still attached to keys. Tenant-scoped query means
+			// no cross-tenant information leaks.
+			return nil, huma.Error409Conflict("credential policy is still in use by one or more service keys")
+		}
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error404NotFound("credential policy not found")
+		}
 		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to delete credential policy")
 		return nil, huma.Error500InternalServerError("failed to delete credential policy")
 	}
