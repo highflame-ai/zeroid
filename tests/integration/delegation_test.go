@@ -268,7 +268,7 @@ func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
 		"A's parent (orch) is beyond the depth cap; edge.from must be empty")
 }
 
-// TestDelegationGraph_MostRecentCredentialIsFocal pins the Option-B
+// TestDelegationGraph_AllCredentialsVisible pins the Option-B
 // design choice: when an identity participates in multiple unrelated
 // chains, GetGraph now walks ALL credentials so every mission tree is
 // visible — not just the most recent one.

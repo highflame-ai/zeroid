@@ -150,6 +150,7 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 	// This loop fixes that but issues N×(WalkUp+WalkDown) queries — for
 	// identities with many credentials this may need rethinking (e.g. a
 	// single multi-root CTE, or pagination/lazy-load per mission).
+	seen := make(map[string]struct{})
 	var all []*domain.IssuedCredential
 	for _, c := range creds {
 		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
@@ -160,7 +161,18 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		if err != nil {
 			return nil, err
 		}
-		all = mergeByJTI(all, mergeByJTI(up, down))
+		for _, item := range up {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
+		for _, item := range down {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
 	}
 
 	graph := s.buildGraph(ctx, all, accountID, projectID, identityID)
