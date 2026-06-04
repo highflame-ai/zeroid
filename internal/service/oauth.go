@@ -1317,7 +1317,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
@@ -1349,6 +1349,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			Scopes:            strings.Join(authCode.Scopes, " "),
 			TTL:               oauthClient.RefreshTokenTTL,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			// Seed the family with the access token's mission so every later
+			// rotation (and the access token each one mints) stays inside the
+			// same delegation tree (issue #81).
+			MissionID: cred.MissionID,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -1485,6 +1489,12 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// Inherit the mission from the refresh family rather than re-rooting
+		// it (issue #81). A refresh is continuity of an existing grant, not a
+		// new delegation tree. Empty when the family predates this column —
+		// IssueCredential then falls back to defaulting mission_id to the new
+		// credential's own JTI (the pre-fix behavior).
+		MissionID: oldToken.MissionID,
 	})
 	if err != nil {
 		return nil, err
