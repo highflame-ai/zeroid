@@ -84,6 +84,11 @@ func verifyActorKeyProof(
 	if !ok {
 		return errors.New("proof missing iat claim")
 	}
+	// Guard the subtraction: if exp precedes iat (malicious or skewed claims),
+	// exp.Sub(iat) is negative and would slip under the lifetime cap.
+	if exp.Before(iat) {
+		return errors.New("proof exp claim is before its iat claim")
+	}
 	if exp.Sub(iat) > maxKeyProofLifetime {
 		return fmt.Errorf("proof lifetime exceeds %s", maxKeyProofLifetime)
 	}

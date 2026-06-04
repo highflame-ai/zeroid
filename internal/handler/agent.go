@@ -258,11 +258,11 @@ func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput
 			return nil, huma.Error403Forbidden(err.Error())
 		case errors.Is(err, service.ErrInvalidIdentityField):
 			return nil, huma.Error400BadRequest(err.Error())
-		case errors.Is(err, service.ErrIdentityNotFound):
-			return nil, huma.Error404NotFound("identity not found")
 		default:
-			log.Error().Err(err).Str("identity_id", claims.IdentityID).Msg("failed to set actor public key")
-			return nil, huma.Error500InternalServerError("failed to set public key")
+			// mapErr maps not-found to 404, domain.ErrIdentityExpired /
+			// ErrIdentityNotUsable to 400, and logs + 500s anything unexpected —
+			// keeping status codes consistent with the other agent handlers.
+			return nil, mapErr(err)
 		}
 	}
 	return &SetOwnPublicKeyOutput{Body: resp}, nil

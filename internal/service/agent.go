@@ -298,20 +298,16 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 		Labels:       req.Labels,
 		Metadata:     req.Metadata,
 		Status:       status,
+		// Admin force-set of the actor key (admin recovery path) — validated and
+		// applied in the same update (UpdateIdentity validates PublicKeyPEM when
+		// non-empty). derefStr(nil) is "", which UpdateIdentity treats as "leave
+		// unchanged". Only the secret-gated management route reaches UpdateAgent,
+		// so this is authorized by admin authority with no proof-of-possession;
+		// self-service rotation (with proofs) goes through SetPublicKey instead.
+		PublicKeyPEM: derefStr(req.PublicKeyPEM),
 	})
 	if err != nil {
 		return nil, err
-	}
-
-	// Admin force-set of the actor key (admin recovery path). Only the
-	// secret-gated management route can reach UpdateAgent, so this is authorized
-	// by admin authority — no proof-of-possession. Self-service rotation goes
-	// through SetPublicKey with proofs instead.
-	if req.PublicKeyPEM != nil {
-		identity, err = s.identitySvc.SetPublicKey(ctx, id, accountID, projectID, *req.PublicKeyPEM)
-		if err != nil {
-			return nil, err
-		}
 	}
 
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
@@ -354,10 +350,10 @@ func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, 
 		return nil, err
 	}
 	if !identity.Status.IsUsable() {
-		return nil, fmt.Errorf("%w: identity is suspended or deactivated", ErrInvalidIdentityField)
+		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
 	}
 	if identity.IsExpired() {
-		return nil, fmt.Errorf("%w: identity is expired", ErrInvalidIdentityField)
+		return nil, fmt.Errorf("%w: identity %s", domain.ErrIdentityExpired, identity.ID)
 	}
 
 	aud := s.keyProofAudience()

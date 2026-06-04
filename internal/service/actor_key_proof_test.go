@@ -120,6 +120,17 @@ func TestVerifyActorKeyProof_LifetimeTooLong(t *testing.T) {
 	require.ErrorContains(t, err, "lifetime")
 }
 
+func TestVerifyActorKeyProof_ExpBeforeIat(t *testing.T) {
+	key := newECKey(t)
+	now := time.Now()
+	// iat AFTER exp → negative lifetime. exp is still in the future so it passes
+	// JWT expiry validation; only the explicit exp.Before(iat) guard rejects it,
+	// closing the "negative duration slips under the lifetime cap" bypass.
+	proof := mintProof(t, key, testProofAud, testProofSub, "jti-skew", now.Add(10*time.Minute), now.Add(5*time.Minute), "")
+	err := verifyActorKeyProof(context.Background(), proof, &key.PublicKey, testProofAud, testProofSub, "", newFakeReplay())
+	require.Error(t, err)
+}
+
 func TestVerifyActorKeyProof_MissingJTI(t *testing.T) {
 	key := newECKey(t)
 	now := time.Now()
