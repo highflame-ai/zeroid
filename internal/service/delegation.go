@@ -150,21 +150,40 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		}, nil
 	}
 
-	// creds is ordered issued_at DESC by ListByIdentity, so creds[0] is
-	// the most recent. Anchor the walk on its jti.
-	focal := creds[0]
-
-	up, err := s.delegRepo.WalkUp(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
+	// Walk every credential's delegation tree so the graph covers all
+	// mission chains, not just the most recent one.
+	//
+	// FIX: Previously only creds[0] (most recent) was walked, so identities
+	// with multiple credentials/missions only showed one tree in the graph.
+	// This loop fixes that but issues N×(WalkUp+WalkDown) queries — for
+	// identities with many credentials this may need rethinking (e.g. a
+	// single multi-root CTE, or pagination/lazy-load per mission).
+	seen := make(map[string]struct{})
+	var all []*domain.IssuedCredential
+	for _, c := range creds {
+		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		down, err := s.delegRepo.WalkDown(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range up {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
+		for _, item := range down {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
 	}
-	down, err := s.delegRepo.WalkDown(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
-	}
 
-	merged := mergeByJTI(up, down)
-	graph := s.buildGraph(ctx, merged, accountID, projectID, identityID)
+	graph := s.buildGraph(ctx, all, accountID, projectID, identityID)
 	return graph, nil
 }
 
