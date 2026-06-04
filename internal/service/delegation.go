@@ -142,21 +142,22 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		}, nil
 	}
 
-	// creds is ordered issued_at DESC by ListByIdentity, so creds[0] is
-	// the most recent. Anchor the walk on its jti.
-	focal := creds[0]
-
-	up, err := s.delegRepo.WalkUp(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
+	// Walk every credential's delegation tree so the graph covers all
+	// mission chains, not just the most recent one.
+	var all []*domain.IssuedCredential
+	for _, c := range creds {
+		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		down, err := s.delegRepo.WalkDown(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		all = mergeByJTI(all, mergeByJTI(up, down))
 	}
-	down, err := s.delegRepo.WalkDown(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
-	}
 
-	merged := mergeByJTI(up, down)
-	graph := s.buildGraph(ctx, merged, accountID, projectID, identityID)
+	graph := s.buildGraph(ctx, all, accountID, projectID, identityID)
 	return graph, nil
 }
 

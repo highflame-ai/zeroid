@@ -270,12 +270,9 @@ func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
 
 // TestDelegationGraph_MostRecentCredentialIsFocal pins the Option-B
 // design choice: when an identity participates in multiple unrelated
-// chains, GetGraph centers on the most recent credential and the older
-// chain is invisible.
-//
-// Without this guard the focal selection could silently flip between
-// chains as old credentials happen to sort differently.
-func TestDelegationGraph_MostRecentCredentialIsFocal(t *testing.T) {
+// chains, GetGraph now walks ALL credentials so every mission tree is
+// visible — not just the most recent one.
+func TestDelegationGraph_AllCredentialsVisible(t *testing.T) {
 	policyID := delegationPolicy(t, uid("focal-policy"), []string{"data:read"})
 
 	// Issue two unrelated root credentials for the same identity. Each
@@ -317,13 +314,14 @@ func TestDelegationGraph_MostRecentCredentialIsFocal(t *testing.T) {
 	body := decode(t, resp)
 
 	edges, _ := body["edges"].([]any)
-	require.Len(t, edges, 1,
-		"focal must walk only the most-recent credential's chain; the older chain is invisible")
-	gotJTI := edges[0].(map[string]any)["jti"].(string)
-	assert.Equal(t, jtiSecond, gotJTI,
-		"focal credential must be the most recent issuance")
-	assert.NotEqual(t, jtiFirst, gotJTI,
-		"older credential's chain must NOT be selected as focal")
+	require.Len(t, edges, 2,
+		"graph must include edges from both credentials / mission trees")
+	jtis := map[string]bool{}
+	for _, e := range edges {
+		jtis[e.(map[string]any)["jti"].(string)] = true
+	}
+	assert.True(t, jtis[jtiFirst], "first credential's edge must be in the graph")
+	assert.True(t, jtis[jtiSecond], "second credential's edge must be in the graph")
 }
 
 // TestDelegationGraph_RevokedCredentialAppears pins that the graph is
