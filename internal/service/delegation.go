@@ -144,6 +144,12 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 
 	// Walk every credential's delegation tree so the graph covers all
 	// mission chains, not just the most recent one.
+	//
+	// FIX: Previously only creds[0] (most recent) was walked, so identities
+	// with multiple credentials/missions only showed one tree in the graph.
+	// This loop fixes that but issues N×(WalkUp+WalkDown) queries — for
+	// identities with many credentials this may need rethinking (e.g. a
+	// single multi-root CTE, or pagination/lazy-load per mission).
 	var all []*domain.IssuedCredential
 	for _, c := range creds {
 		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
