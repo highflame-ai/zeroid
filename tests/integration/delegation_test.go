@@ -395,6 +395,7 @@ func TestRevokeCredential_NotFound_Returns404(t *testing.T) {
 	fakeID := uuid.New().String()
 	rev := post(t, adminPath("/credentials/"+fakeID+"/revoke"),
 		map[string]any{"reason": "test-404"}, adminHeaders())
+	defer func() { _ = rev.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, rev.StatusCode,
 		"revoke on a non-existent credential id must return 404 (was previously a silent 200)")
 
@@ -412,10 +413,12 @@ func TestRevokeCredential_NotFound_Returns404(t *testing.T) {
 
 	first := post(t, adminPath("/credentials/"+realID+"/revoke"),
 		map[string]any{"reason": "first"}, adminHeaders())
+	defer func() { _ = first.Body.Close() }()
 	require.Equal(t, http.StatusOK, first.StatusCode, "first revoke must succeed")
 
 	second := post(t, adminPath("/credentials/"+realID+"/revoke"),
 		map[string]any{"reason": "second"}, adminHeaders())
+	defer func() { _ = second.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, second.StatusCode,
 		"revoking an already-revoked credential must return 404 (zero rows mutated)")
 }
@@ -445,6 +448,7 @@ func TestRevokeCredential_TenantMismatch_Returns404(t *testing.T) {
 
 	rev := post(t, adminPath("/credentials/"+realID+"/revoke"),
 		map[string]any{"reason": "wrong-tenant"}, wrongHeaders)
+	defer func() { _ = rev.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, rev.StatusCode,
 		"revoke with mismatched tenant scope must return 404 (zero rows mutated)")
 }
