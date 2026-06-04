@@ -411,11 +411,7 @@ func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, 
 // a no-op success (DeactivateIdentity short-circuits the status-transition
 // guard).
 func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
-	if err := s.identitySvc.DeactivateIdentity(ctx, id, accountID, projectID); err != nil {
-		return nil, err
-	}
-
-	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
+	identity, err := s.identitySvc.DeactivateIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}

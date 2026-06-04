@@ -607,21 +607,27 @@ func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, proj
 // guard (deactivated → deactivated is rejected) and surface a spurious 400,
 // breaking the idempotency callers expect of DELETE. A missing identity
 // returns the repo's not-found error so the handler can map it to 404.
-func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID, projectID string) error {
+// Returns the resulting identity so callers that need to render a response
+// (e.g. AgentService.DeleteAgent) can reuse it instead of issuing a second
+// load.
+func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if identity.Status == domain.IdentityStatusDeactivated {
-		return nil
+		return identity, nil
 	}
 
 	status := domain.IdentityStatusDeactivated
 
-	_, err = s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	if err != nil {
+		return nil, err
+	}
 
-	return err
+	return updated, nil
 }
 
 // runDeactivationCleanup sweeps everything a deactivated or deleted identity
