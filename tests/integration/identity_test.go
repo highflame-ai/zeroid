@@ -205,7 +205,9 @@ func TestUpdateIdentityTrustLevel(t *testing.T) {
 	assert.Equal(t, "verified_third_party", body["trust_level"])
 }
 
-// TestDeleteIdentity verifies that DELETE /api/v1/identities/{id} deactivates the identity.
+// TestDeleteIdentity verifies that DELETE /api/v1/identities/{id} deactivates
+// the identity (soft delete) rather than hard-deleting it: the call returns
+// 204 and the identity row is retained with status=deactivated.
 func TestDeleteIdentity(t *testing.T) {
 	externalID := uid("delete-agent")
 	identity := registerIdentity(t, externalID, []string{"billing:read"})
@@ -214,6 +216,12 @@ func TestDeleteIdentity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	_ = resp.Body.Close()
+
+	// Soft delete: the row survives, flipped to deactivated (not 404/gone).
+	getResp := get(t, adminPath("/identities/"+identity.ID), adminHeaders())
+	require.Equal(t, http.StatusOK, getResp.StatusCode, "identity must still exist after a soft delete")
+	assert.Equal(t, "deactivated", decode(t, getResp)["status"],
+		"DELETE /identities/{id} must deactivate, not hard-delete")
 }
 
 func TestServerGetIdentity(t *testing.T) {
