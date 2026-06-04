@@ -256,6 +256,29 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 	return s.repo.GetByID(ctx, id, accountID, projectID)
 }
 
+// SetPublicKey replaces the identity's EC actor-assertion public key (the key
+// used to verify its self-signed assertion on the jwt_bearer and token_exchange
+// grants). The PEM is validated as an SPKI EC P-256 key. Persisted via
+// repo.Update so the AFTER UPDATE audit trigger records the change with the
+// caller as modified_by. Authorization — proof-of-possession for a self-service
+// rotation, or admin authority for a force-set — is the caller's
+// responsibility; this method only validates and persists. Returns the updated
+// identity.
+func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, projectID, publicKeyPEM string) (*domain.Identity, error) {
+	if err := validateECPublicKeyPEM(publicKeyPEM); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidIdentityField, err)
+	}
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	identity.PublicKeyPEM = publicKeyPEM
+	if err := s.repo.Update(ctx, identity); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
 // GetIdentityByExternalID retrieves an identity by its external_id within a tenant.
 func (s *IdentityService) GetIdentityByExternalID(ctx context.Context, externalID, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByExternalID(ctx, externalID, accountID, projectID)

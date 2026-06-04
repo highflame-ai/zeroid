@@ -111,6 +111,26 @@ func NewAPI(
 
 // NewHumaAPI creates a Huma API on the given chi router with goccy/go-json codec.
 func NewHumaAPI(router chi.Router) huma.API {
+	return humachi.New(router, zeroidHumaConfig())
+}
+
+// NewHumaAPISpecless creates a huma API that does NOT register the OpenAPI /
+// docs / schemas routes. Use it for a secondary route group mounted on a router
+// that already serves the canonical spec (e.g. the public agent self-service
+// group sits on the same root router as RegisterPublic). Without this, the
+// secondary instance's /openapi.json would shadow the canonical one
+// (chi last-registration wins), dropping the public OAuth paths from the spec.
+// Routes registered here are documented via the service contract + capability
+// spec rather than this instance's (absent) spec.
+func NewHumaAPISpecless(router chi.Router) huma.API {
+	config := zeroidHumaConfig()
+	config.OpenAPIPath = ""
+	config.DocsPath = ""
+	config.SchemasPath = ""
+	return humachi.New(router, config)
+}
+
+func zeroidHumaConfig() huma.Config {
 	config := huma.DefaultConfig("ZeroID", "1.0.0")
 	config.Info.Description = "Non-Human Identity (NHI) management — agent authentication, credential lifecycle, and delegation."
 
@@ -124,7 +144,7 @@ func NewHumaAPI(router chi.Router) huma.API {
 		},
 	}
 
-	return humachi.New(router, config)
+	return config
 }
 
 // prmURL returns the absolute URL of this server's RFC 9728 Protected
@@ -184,4 +204,13 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 // These run on the admin port behind an additional agent JWT verification layer.
 func (a *API) RegisterAgentAuth(api huma.API) {
 	a.registerProofGenerateRoute(api)
+}
+
+// RegisterAgentSelfService registers endpoints an agent calls with its OWN
+// access token (agent-auth middleware) rather than the internal service secret.
+// Unlike RegisterAgentAuth (proof generation), these are meant to be mounted on
+// the PUBLIC router so they are reachable on the public ingress — the deployer
+// wraps them in AgentAuthMiddleware, and tenant/identity come from token claims.
+func (a *API) RegisterAgentSelfService(api huma.API) {
+	a.registerAgentSelfServiceRoute(api)
 }
