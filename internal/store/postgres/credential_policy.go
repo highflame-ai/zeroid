@@ -99,11 +99,14 @@ func (r *CredentialPolicyRepository) GetDefaultByTenant(ctx context.Context, acc
 // ErrCredentialPolicyInUse) and reports ErrCredentialPolicyNotFound when no
 // policy matches the id within the tenant.
 func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
-	// Check whether any service key still references this policy. The keys
-	// table is service_keys (see migration 006); credential_policy_id, plus
-	// the account_id/project_id tenant scope, all live on that table.
+	// Check whether any service key still references this policy. Use the
+	// strongly-typed Bun model (domain.APIKey is bun:"table:service_keys",
+	// migration 006) rather than a string literal: the original bug was a
+	// hardcoded table-name typo, and Model() makes that class of error
+	// impossible. credential_policy_id plus the account_id/project_id tenant
+	// scope all live on service_keys.
 	count, err := r.db.NewSelect().
-		TableExpr("service_keys").
+		Model((*domain.APIKey)(nil)).
 		Where("credential_policy_id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -116,7 +119,7 @@ func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, 
 	}
 
 	res, err := r.db.NewDelete().
-		TableExpr("credential_policies").
+		Model((*domain.CredentialPolicy)(nil)).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
