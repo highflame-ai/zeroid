@@ -383,10 +383,10 @@ func TestDelegationGraph_RevokedCredentialAppears(t *testing.T) {
 //
 // Zero-row outcomes cover four real cases:
 //
-//	1. Wrong / never-existed credential id
-//	2. Tenant-scope mismatch (account_id / project_id headers don't match the row)
-//	3. Already revoked
-//	4. Already expired
+//  1. Wrong / never-existed credential id
+//  2. Tenant-scope mismatch (account_id / project_id headers don't match the row)
+//  3. Already revoked
+//  4. Already expired
 //
 // Pre-fix, all four returned 200 — leaving the caller convinced the revoke
 // happened when it hadn't. Now they all 404.
