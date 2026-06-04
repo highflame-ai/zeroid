@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,15 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 )
+
+// ErrCredentialPolicyNotFound is returned by Delete when no policy matches the
+// id within the caller's tenant (including cross-tenant attempts, which are
+// indistinguishable from a truly-absent policy by design).
+var ErrCredentialPolicyNotFound = errors.New("credential policy not found")
+
+// ErrCredentialPolicyInUse is returned by Delete when one or more service keys
+// still reference the policy. The policy is left intact.
+var ErrCredentialPolicyInUse = errors.New("credential policy is still referenced by service keys")
 
 // CredentialPolicyRepository handles database operations for credential policies.
 type CredentialPolicyRepository struct {
@@ -84,11 +94,19 @@ func (r *CredentialPolicyRepository) GetDefaultByTenant(ctx context.Context, acc
 	return policy, nil
 }
 
-// Delete removes a credential policy. Returns an error if any API keys still reference it.
+// Delete removes a credential policy, scoped to tenant. It refuses to delete a
+// policy that is still referenced by any service key (returns
+// ErrCredentialPolicyInUse) and reports ErrCredentialPolicyNotFound when no
+// policy matches the id within the tenant.
 func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
-	// Check if any API keys reference this policy.
+	// Check whether any service key still references this policy. Use the
+	// strongly-typed Bun model (domain.APIKey is bun:"table:service_keys",
+	// migration 006) rather than a string literal: the original bug was a
+	// hardcoded table-name typo, and Model() makes that class of error
+	// impossible. credential_policy_id plus the account_id/project_id tenant
+	// scope all live on service_keys.
 	count, err := r.db.NewSelect().
-		TableExpr("api_keys").
+		Model((*domain.APIKey)(nil)).
 		Where("credential_policy_id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
@@ -97,17 +115,24 @@ func (r *CredentialPolicyRepository) Delete(ctx context.Context, id, accountID, 
 		return fmt.Errorf("failed to check policy references: %w", err)
 	}
 	if count > 0 {
-		return fmt.Errorf("credential policy is still referenced by %d API keys", count)
+		return fmt.Errorf("%w: referenced by %d service key(s)", ErrCredentialPolicyInUse, count)
 	}
 
-	_, err = r.db.NewDelete().
-		TableExpr("credential_policies").
+	res, err := r.db.NewDelete().
+		Model((*domain.CredentialPolicy)(nil)).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to delete credential policy: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read delete result: %w", err)
+	}
+	if n == 0 {
+		return ErrCredentialPolicyNotFound
 	}
 	return nil
 }
