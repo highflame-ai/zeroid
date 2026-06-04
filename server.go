@@ -233,7 +233,7 @@ func NewServer(cfg Config) (*Server, error) {
 		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer)
 
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
@@ -321,6 +321,30 @@ func NewServer(cfg Config) (*Server, error) {
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
+	// AgentAuthMiddleware config — verifies an agent's own ZeroID-issued ES256
+	// access token and sets tenant/identity from the validated claims. Shared by
+	// the self-service group below (public) and the proof-generation group on the
+	// admin router further down.
+	agentAuthCfg := internalMiddleware.AgentAuthConfig{
+		PublicKey: jwksSvc.PublicKey(),
+		Issuer:    cfg.Token.Issuer,
+		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
+		// document so they can chain resource → PRM → AS metadata.
+		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
+	}
+
+	// Agent self-service group — authenticated by the agent's OWN access token
+	// (NOT the admin/internal secret) and mounted on the public router so agents
+	// can reach it directly on the public ingress. Tenant + identity come from the
+	// validated token claims (never headers). Holds POST /agents/self/public-key.
+	r.Group(func(r chi.Router) {
+		r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
+		// Specless: this group shares the root router with RegisterPublic, so it
+		// must not register a second /openapi.json that would shadow the canonical
+		// public spec.
+		apiHandler.RegisterAgentSelfService(handler.NewHumaAPISpecless(r))
+	})
+
 	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
 	adminPrefix := cfg.Server.GetAdminPathPrefix()
@@ -345,16 +369,9 @@ func NewServer(cfg Config) (*Server, error) {
 		humaAdmin := handler.NewHumaAPI(r)
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
-		// Agent-auth sub-group for proof generation (requires agent JWT).
+		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
+		// the agentAuthCfg defined above for the public self-service group.
 		r.Group(func(r chi.Router) {
-			agentAuthCfg := internalMiddleware.AgentAuthConfig{
-				PublicKey: jwksSvc.PublicKey(),
-				Issuer:    cfg.Token.Issuer,
-				// RFC 9728 §5.1 breadcrumb on 401s — points cold-start
-				// clients at the PRM document so they can chain
-				// resource → PRM → AS metadata without prior knowledge.
-				ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
-			}
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
 			humaAgentAuth := handler.NewHumaAPI(r)

@@ -12,19 +12,35 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// AgentService handles agent registration (atomic identity + API key creation).
+// AgentService handles agent registration (atomic identity + API key creation)
+// and self-service actor-key enrollment/rotation.
 type AgentService struct {
 	identitySvc *IdentityService
 	apiKeySvc   *APIKeyService
 	apiKeyRepo  *postgres.APIKeyRepository
+	// keyProofReplay records single-use jtis for actor-key-change proofs.
+	keyProofReplay keyProofReplayGuard
+	// issuer is this server's token issuer URL; the audience a self-service key
+	// proof must target is derived from it (see keyProofAudience).
+	issuer string
 }
 
-// NewAgentService creates a new AgentService.
-func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, apiKeyRepo *postgres.APIKeyRepository) *AgentService {
+// NewAgentService creates a new AgentService. keyProofReplay backs single-use
+// enforcement of actor-key-change proofs; issuer is the token issuer URL used to
+// derive the expected proof audience.
+func NewAgentService(
+	identitySvc *IdentityService,
+	apiKeySvc *APIKeyService,
+	apiKeyRepo *postgres.APIKeyRepository,
+	keyProofReplay keyProofReplayGuard,
+	issuer string,
+) *AgentService {
 	return &AgentService{
-		identitySvc: identitySvc,
-		apiKeySvc:   apiKeySvc,
-		apiKeyRepo:  apiKeyRepo,
+		identitySvc:    identitySvc,
+		apiKeySvc:      apiKeySvc,
+		apiKeyRepo:     apiKeyRepo,
+		keyProofReplay: keyProofReplay,
+		issuer:         issuer,
 	}
 }
 
@@ -117,6 +133,27 @@ type UpdateAgentRequest struct {
 	Labels       json.RawMessage `json:"labels,omitempty"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Status       *string         `json:"status,omitempty"`
+	// PublicKeyPEM, when non-nil, force-sets the identity's actor-assertion key.
+	// This is the admin recovery path: it is reachable only on the secret-gated
+	// management route (no proof-of-possession), so a tenant admin can replace a
+	// key the agent can no longer prove control of. Self-service rotation (with
+	// proof-of-possession) goes through SetPublicKey instead.
+	PublicKeyPEM *string `json:"public_key_pem,omitempty"`
+}
+
+// SetPublicKeyRequest carries a self-service actor-key enrollment or rotation.
+type SetPublicKeyRequest struct {
+	// NewPublicKeyPEM is the SPKI EC P-256 public key to enroll.
+	NewPublicKeyPEM string
+	// NewKeyProof is a compact ES256 JWS signed by the NEW private key, proving
+	// the caller controls the key being registered. Required for both first-set
+	// and rotation.
+	NewKeyProof string
+	// CurrentKeyProof is a compact ES256 JWS signed by the identity's CURRENT
+	// private key, authorizing the rotation (proof-of-possession, bound to the
+	// new key). Required only when the identity already has a key; ignored on
+	// first-set (trust-on-first-use).
+	CurrentKeyProof string
 }
 
 // RegisterAgent atomically creates an identity and linked API key.
@@ -266,8 +303,96 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 		return nil, err
 	}
 
+	// Admin force-set of the actor key (admin recovery path). Only the
+	// secret-gated management route can reach UpdateAgent, so this is authorized
+	// by admin authority — no proof-of-possession. Self-service rotation goes
+	// through SetPublicKey with proofs instead.
+	if req.PublicKeyPEM != nil {
+		identity, err = s.identitySvc.SetPublicKey(ctx, id, accountID, projectID, *req.PublicKeyPEM)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
 	resp := identityToAgentResponse(identity, keyPrefix)
+	return &resp, nil
+}
+
+// keyProofAudience is the aud value a self-service actor-key proof must carry.
+// Bound to the issuer + the public-key endpoint path so a proof minted for this
+// operation cannot be replayed against a different audience.
+func (s *AgentService) keyProofAudience() string {
+	return s.issuer + "/agents/self/public-key"
+}
+
+// SetPublicKey enrolls or rotates the actor-assertion public key for the
+// authenticated identity (self-service). identityID/accountID/projectID come
+// from the agent's own access-token claims — never from caller-supplied input —
+// so an agent can only set its own key.
+//
+//   - First-set (identity has no key): trust-on-first-use, authorized by the
+//     agent's access token. NewKeyProof proves control of the new key.
+//   - Rotation (identity already has a key): additionally requires
+//     CurrentKeyProof — proof-of-possession of the current key, bound to the new
+//     key (RFC 8555 §7.3.5), so a stolen access token alone (no current private
+//     key) cannot rotate an enrolled key.
+func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, projectID string, req SetPublicKeyRequest) (*AgentResponse, error) {
+	if req.NewPublicKeyPEM == "" {
+		return nil, fmt.Errorf("%w: new_public_key_pem is required", ErrInvalidIdentityField)
+	}
+	newKey, err := parseECPublicKeyPEM(req.NewPublicKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("%w: new_public_key_pem: %v", ErrInvalidIdentityField, err)
+	}
+	if req.NewKeyProof == "" {
+		return nil, fmt.Errorf("%w: new_key_proof is required", ErrKeyProofInvalid)
+	}
+
+	identity, err := s.identitySvc.GetIdentity(ctx, identityID, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if !identity.Status.IsUsable() {
+		return nil, fmt.Errorf("%w: identity is suspended or deactivated", ErrInvalidIdentityField)
+	}
+	if identity.IsExpired() {
+		return nil, fmt.Errorf("%w: identity is expired", ErrInvalidIdentityField)
+	}
+
+	aud := s.keyProofAudience()
+
+	// Always prove control of the NEW key (prevents binding a key the caller
+	// does not control).
+	if err := verifyActorKeyProof(ctx, req.NewKeyProof, newKey, aud, identity.WIMSEURI, "", s.keyProofReplay); err != nil {
+		return nil, fmt.Errorf("%w: new_key_proof: %v", ErrKeyProofInvalid, err)
+	}
+
+	// Rotation: an enrolled key may only be replaced by also proving possession
+	// of the current key, bound to this specific new key.
+	if identity.PublicKeyPEM != "" {
+		if req.CurrentKeyProof == "" {
+			return nil, fmt.Errorf("%w: current_key_proof is required to rotate an enrolled key", ErrKeyProofInvalid)
+		}
+		currentKey, err := parseECPublicKeyPEM(identity.PublicKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("stored public key is invalid: %w", err)
+		}
+		nkt, err := newKeyThumbprint(req.NewPublicKeyPEM)
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyActorKeyProof(ctx, req.CurrentKeyProof, currentKey, aud, identity.WIMSEURI, nkt, s.keyProofReplay); err != nil {
+			return nil, fmt.Errorf("%w: current_key_proof: %v", ErrKeyProofInvalid, err)
+		}
+	}
+
+	updated, err := s.identitySvc.SetPublicKey(ctx, identityID, accountID, projectID, req.NewPublicKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	keyPrefix := s.getKeyPrefix(ctx, updated.ID)
+	resp := identityToAgentResponse(updated, keyPrefix)
 	return &resp, nil
 }
 
