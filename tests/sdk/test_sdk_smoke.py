@@ -303,3 +303,125 @@ class TestErrorHandling:
     def test_introspect_invalid_token(self, client):
         result = client.tokens.introspect("invalid.token.value")
         assert result.active is False
+
+
+# ---------------------------------------------------------------------------
+# 6. OAuth client → client_credentials → RFC 8693 delegation
+#
+# Exercises the surface the quickstart notebook depends on, which the
+# agent/api_key path above does NOT cover: oauth_clients.create (confidential),
+# the client_credentials grant, and token_exchange delegation. Runs against the
+# live server so any SDK<->server contract drift on these endpoints fails here.
+# ---------------------------------------------------------------------------
+
+
+class TestOAuthClientCredentialsAndDelegation:
+    def test_client_credentials_and_delegation(self, client, zeroid_url):
+        import json
+        import urllib.request
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        import jwt as pyjwt
+
+        suffix = f"{os.getpid()}-{time.monotonic_ns()}"
+        orch_external_id = f"orch-{suffix}"
+
+        # 1. Orchestrator identity (client_credentials resolves the identity by
+        #    external_id == client_id, so the OAuth client_id must match this).
+        orchestrator = client.identities.create(
+            external_id=orch_external_id,
+            owner_user_id="sdk-smoke-test",
+            name="Smoke Orchestrator",
+            identity_type="agent",
+            sub_type="orchestrator",
+            trust_level="first_party",
+            allowed_scopes=["data:read", "data:write"],
+        )
+
+        # 2. Tool agent identity with an ECDSA P-256 public key (for the
+        #    self-signed actor assertion in the token exchange).
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub_pem = priv.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode()
+        tool_agent = client.identities.create(
+            external_id=f"tool-{suffix}",
+            owner_user_id="sdk-smoke-test",
+            name="Smoke Tool Agent",
+            identity_type="agent",
+            sub_type="tool_agent",
+            trust_level="first_party",
+            allowed_scopes=["data:read"],
+            public_key_pem=pub_pem,
+        )
+
+        oauth_client_id = None
+        try:
+            # 3. Confidential OAuth client — returns a client_secret for M2M.
+            created = client.oauth_clients.create(
+                client_id=orch_external_id,
+                name="Smoke Orchestrator Client",
+                confidential=True,
+                identity_id=orchestrator.id,
+                grant_types=[
+                    "client_credentials",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ],
+                scopes=["data:read", "data:write"],
+            )
+            oauth_client_id = created.client.id
+            assert created.client_secret, "confidential client must return a secret"
+            assert created.client.client_id == orch_external_id
+
+            # 4. client_credentials grant.
+            token = client.tokens.issue_client_credentials(
+                client_id=orch_external_id,
+                client_secret=created.client_secret,
+                scope="data:read",
+            )
+            assert token.access_token
+            assert token.token_type.lower() == "bearer"
+
+            # 5. Tool agent's self-signed actor assertion (RFC 7523: iss, sub,
+            #    aud, exp; self-signed → sub == iss == WIMSE URI).
+            with urllib.request.urlopen(
+                f"{zeroid_url}/.well-known/oauth-authorization-server", timeout=5
+            ) as resp:
+                issuer = json.load(resp)["issuer"]
+            now = int(time.time())
+            actor_assertion = pyjwt.encode(
+                {
+                    "iss": tool_agent.wimse_uri,
+                    "sub": tool_agent.wimse_uri,
+                    "aud": [issuer],
+                    "iat": now,
+                    "exp": now + 300,
+                },
+                priv,
+                algorithm="ES256",
+            )
+
+            # 6. RFC 8693 token exchange — orchestrator delegates to tool agent.
+            delegated = client.tokens.issue_token_exchange(
+                subject_token=token.access_token,
+                actor_token=actor_assertion,
+                scope="data:read",
+            )
+            assert delegated.access_token
+
+            # 7. Introspect: delegated token carries the act (delegation) chain.
+            introspection = client.tokens.introspect(delegated.access_token)
+            assert introspection.active is True
+            assert introspection.sub == tool_agent.wimse_uri
+            assert introspection.act and introspection.act.get("sub") == orchestrator.wimse_uri
+
+            # 8. Revoke → inactive.
+            client.tokens.revoke(delegated.access_token)
+            assert client.tokens.introspect(delegated.access_token).active is False
+        finally:
+            if oauth_client_id:
+                client.oauth_clients.delete(oauth_client_id)
+            client.identities.delete(tool_agent.id)
+            client.identities.delete(orchestrator.id)
