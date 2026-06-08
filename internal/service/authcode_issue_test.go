@@ -269,8 +269,23 @@ func TestRedirectURIAllowed(t *testing.T) {
 		{"exact match localhost", "http://localhost:17580/callback", true},
 		{"127.0.0.1 ↔ localhost equiv", "http://127.0.0.1:17580/callback", true},
 		{"exact match https", "https://app.example.com/oauth/callback", true},
-		{"wrong port", "http://localhost:17581/callback", false},
-		{"wrong path", "http://localhost:17580/other", false},
+
+		// RFC 8252 §7.3: any port is accepted on a loopback redirect, because
+		// the native/CLI app binds an ephemeral OS-assigned port.
+		{"loopback different port", "http://localhost:17581/callback", true},
+		{"loopback ephemeral high port", "http://localhost:54321/callback", true},
+		{"loopback 127.0.0.1 different port", "http://127.0.0.1:49999/callback", true},
+		{"loopback no port", "http://localhost/callback", true},
+
+		// Only the port floats — scheme / path / host / extras must still match.
+		{"loopback wrong path", "http://localhost:17580/other", false},
+		{"loopback wrong scheme", "https://localhost:17580/callback", false},
+		{"loopback with userinfo rejected", "http://evil@127.0.0.1:17580/callback", false},
+		{"loopback with query rejected", "http://localhost:17580/callback?x=1", false},
+		{"loopback look-alike host", "http://127.0.0.1.evil.com:17580/callback", false},
+
+		// Non-loopback hosts get NO port leniency — exact match only.
+		{"non-loopback different port", "https://app.example.com:9443/oauth/callback", false},
 		{"wrong host", "https://attacker.example.com/oauth/callback", false},
 		{"unregistered scheme", "http://app.example.com/oauth/callback", false},
 		{"empty candidate", "", false},
