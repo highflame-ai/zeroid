@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -1178,18 +1179,69 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	return signed, nil
 }
 
-// redirectURIAllowed reports whether candidate matches any of the
-// registered URIs under loopback normalization (RFC 8252 §7.3). Used by
-// IssueAuthCode at /oauth2/authorize time AND by authorizationCode at
-// /oauth2/token time so both ends apply the same allow-list rule.
+// redirectURIAllowed reports whether candidate matches one of the client's
+// registered redirect URIs. Used by IssueAuthCode at /oauth2/authorize time.
+//
+// Non-loopback URIs must match exactly (after normalizeLoopback's 127.0.0.1 ↔
+// localhost equivalence). LOOPBACK URIs are matched with the PORT IGNORED:
+// RFC 8252 §7.3 requires the authorization server to "allow any port to be
+// specified at the time of the request for loopback IP redirect URIs", because
+// a native / CLI app binds an ephemeral, OS-assigned port for its callback
+// listener and cannot reserve a fixed one in advance. So for a loopback
+// candidate we accept it when some registered loopback URI shares the same
+// scheme, host (treating 127.0.0.1, localhost and ::1 as equivalent), path and
+// query — only the port floats; userinfo and fragments are rejected.
+//
+// This is safe: the loopback interface is reachable only from the same host, so
+// no remote attacker can stand up a listener to intercept the redirect, and
+// PKCE binds the code to the verifier regardless. Without it, the embedded
+// Overwatch/ramparts Guardian (which listens on an ephemeral loopback port)
+// is rejected here even though its redirect is a legitimate loopback callback.
 func redirectURIAllowed(candidate string, registered []string) bool {
 	normCand := normalizeLoopback(candidate)
+
+	cu, cerr := url.Parse(candidate)
+	candLoopback := cerr == nil && isLoopbackHost(cu.Hostname())
+
 	for _, r := range registered {
 		if normalizeLoopback(r) == normCand {
 			return true
 		}
+
+		if !candLoopback {
+			continue
+		}
+
+		ru, rerr := url.Parse(r)
+		if rerr != nil || !isLoopbackHost(ru.Hostname()) {
+			continue
+		}
+
+		// Loopback: match everything but the port. Reject userinfo /
+		// fragments — registered redirect URIs carry neither, and the old
+		// Studio-side regex anchored them out too.
+		if cu.User == nil && cu.Fragment == "" &&
+			cu.Scheme == ru.Scheme && cu.Path == ru.Path && cu.RawQuery == ru.RawQuery {
+			return true
+		}
 	}
+
 	return false
+}
+
+// isLoopbackHost reports whether host is one of the canonical loopback forms a
+// native/CLI redirect URI uses, for RFC 8252 §7.3 port-agnostic matching. We
+// treat 127.0.0.1, localhost and ::1 as equivalent (the seed config registers
+// the 127.0.0.1 and localhost variants). Anything else — including a
+// look-alike like "127.0.0.1.evil.com" — is not loopback and falls through to
+// exact matching.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 // authorizationCode handles the PKCE authorization code grant (RFC 6749 section 4.1).
