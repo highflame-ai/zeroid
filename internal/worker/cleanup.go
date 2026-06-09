@@ -51,6 +51,13 @@ type CleanupWorker struct {
 // The identity-expiry sweep is wired separately via SetIdentityExpirer
 // after IdentityService is constructed.
 func NewCleanupWorker(db *bun.DB, backchannelRepo *postgres.BackchannelRequestRepository, interval, credRetention time.Duration) *CleanupWorker {
+	// A negative retention would make now.Add(-credRetention) a FUTURE
+	// cutoff and the worker would delete unexpired credentials. Clamp to
+	// zero so a misconfigured max TTL degrades to delete-at-expiry, never
+	// delete-before-expiry.
+	if credRetention < 0 {
+		credRetention = 0
+	}
 	return &CleanupWorker{db: db, backchannelRepo: backchannelRepo, interval: interval, credRetention: credRetention}
 }
 

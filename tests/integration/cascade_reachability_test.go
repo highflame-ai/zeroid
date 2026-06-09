@@ -36,13 +36,18 @@ import (
 )
 
 // tokenClaims extracts jti and exp from a token without verifying the
-// signature — fine for tests; the server signed it moments ago.
-func tokenClaims(t *testing.T, tokenStr string) (jti string, exp time.Time) {
+// signature — fine for tests; the server signed it moments ago. Fails fast
+// if either claim is absent: callers use jti to drive DB updates and exp in
+// assertions, and an empty/zero value would produce misleading results.
+func tokenClaims(t *testing.T, tokenStr string) (string, time.Time) {
 	t.Helper()
 	parsed, err := jwt.ParseInsecure([]byte(tokenStr))
 	require.NoError(t, err)
-	jti, _ = parsed.JwtID()
-	exp, _ = parsed.Expiration()
+	jti, ok := parsed.JwtID()
+	require.True(t, ok, "token missing jti claim")
+	require.NotEmpty(t, jti)
+	exp, ok := parsed.Expiration()
+	require.True(t, ok, "token missing exp claim")
 	return jti, exp
 }
 

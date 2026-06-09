@@ -111,7 +111,14 @@ func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedA
 		return nil, fmt.Errorf("proof token validation failed: %w", err)
 	}
 
+	// A WPT without a jti cannot participate in single-use enforcement —
+	// reject it as malformed rather than letting the empty string fall
+	// through to MarkUsed, where the inevitable zero-row claim would
+	// surface as a misleading ErrNonceReplayed.
 	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return nil, fmt.Errorf("proof token validation failed: missing jti claim")
+	}
 
 	// Single-use enforcement: claim the token via the conditional UPDATE in
 	// MarkUsed. Zero rows claimed means another verification got there first
