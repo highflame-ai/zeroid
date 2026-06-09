@@ -166,7 +166,7 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 	// constructor is out of scope to change. Revoked rows are retained as a
 	// tamper-evidence trail. Backed by idx_signing_credentials_retention (023).
 	signingRes, err := w.db.NewDelete().
-		TableExpr("signing_credentials").
+		Model((*domain.SigningCredential)(nil)).
 		Where("revoked = ?", false).
 		Where("audit_retention_until <= ?", now).
 		Exec(ctx)
