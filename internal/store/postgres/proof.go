@@ -38,7 +38,7 @@ func (r *ProofRepository) Create(ctx context.Context, pt *domain.ProofToken) err
 func (r *ProofRepository) MarkUsed(ctx context.Context, jti string) (int64, error) {
 	now := time.Now()
 	res, err := r.db.NewUpdate().
-		TableExpr("proof_tokens").
+		Model((*domain.ProofToken)(nil)).
 		Set("is_used = TRUE, used_at = ?", now).
 		Where("jti = ?", jti).
 		Where("is_used = FALSE").

@@ -179,7 +179,15 @@ func TestCascadeRevocationFromIdentityWithExpiredAnchor(t *testing.T) {
 	require.Equal(t, http.StatusCreated, signalResp.StatusCode)
 	_ = signalResp.Body.Close()
 
-	time.Sleep(100 * time.Millisecond)
+	// Signal-triggered revocation is asynchronous; poll instead of a fixed
+	// sleep so the test converges fast locally and tolerates CI load. The
+	// loop stays in the test goroutine because introspect uses require
+	// (FailNow must not be called from a polling goroutine, which rules
+	// out assert.Eventually here).
+	deadline := time.Now().Add(2 * time.Second)
+	for introspect(t, depth1Token)["active"].(bool) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	assert.False(t, introspect(t, depth1Token)["active"].(bool),
 		"delegated child must be revoked even though the anchor credential expired before the signal fired")
