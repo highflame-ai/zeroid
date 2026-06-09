@@ -154,8 +154,12 @@ func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage, allowPrivate
 			// previously always on, meaning production accepted plaintext
 			// loopback issuers. Production deployments leave allowPrivate
 			// false and only https issuers validate.
-			if u.Scheme != "https" && !(allowPrivate && isLoopbackHost(u.Host)) {
-				return fmt.Errorf("invalid oidc_token config: issuer[%d].url must use https (got %q)", i, u.Scheme)
+			if u.Scheme != "https" {
+				// Plain HTTP is only permitted for loopback issuers, and only
+				// when the dev/test carve-out (allowPrivate) is enabled.
+				if !allowPrivate || !isLoopbackHost(u.Host) {
+					return fmt.Errorf("invalid oidc_token config: issuer[%d].url must use https (got %q)", i, u.Scheme)
+				}
 			}
 		}
 	case domain.ProofTypeImageHash, domain.ProofTypeTPM:
