@@ -240,6 +240,14 @@ func runTests(m *testing.M) int {
 		Backchannel: zeroid.BackchannelConfig{
 			AllowPrivateNotificationEndpoints: true,
 		},
+		// The attestation OIDC verifier fixtures run a discovery + JWKS
+		// httptest server on 127.0.0.1, which the new SSRF guard blocks by
+		// default. Relax it for this test deployment, exactly as the
+		// Backchannel flag above does for loopback notification endpoints.
+		// Production deployments keep this false.
+		Attestation: zeroid.AttestationConfig{
+			AllowPrivateIssuerEndpoints: true,
+		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a
 		// product deployer supplies. ZeroID itself ships product-agnostic.

@@ -117,6 +117,17 @@ type IssueRequest struct {
 	// cnf.jkt claim binding the token to that key, and token_type is returned
 	// as "DPoP" instead of "Bearer" (RFC 9449 §6.1).
 	DPoPKeyThumbprint string
+	// ResolveIdentityPolicy asks IssueCredential to resolve and enforce the
+	// identity's policy when IdentityPolicyID is empty. The OAuth grant paths
+	// resolve the policy themselves (and only for grants gated at the identity
+	// layer — authorization_code/refresh_token/CIBA tokens minted for a client
+	// with no linked identity are deliberately governed by the client, not an
+	// identity policy). The three issuance paths that historically bypassed the
+	// ceiling — RotateCredential, the admin issue handler, and post-attestation
+	// verification — set this so the chokepoint resolves the identity's policy
+	// (own CredentialPolicyID, else tenant default) and enforces it. Leaving it
+	// false preserves the prior behavior for every other caller.
+	ResolveIdentityPolicy bool
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -273,23 +284,23 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		//
 		// Callers on the OAuth grant paths resolve the identity's policy
 		// themselves (via IdentityService.ResolveCredentialPolicy) and pass
-		// its ID in IdentityPolicyID. But three other issuance paths —
-		// RotateCredential, the admin issue handler, and post-attestation
-		// verification — historically left IdentityPolicyID empty, which
-		// turned this "authoritative chokepoint" into a no-op for them and
-		// let a since-tightened ceiling be bypassed.
-		//
-		// To make the chokepoint authoritative regardless of caller, resolve
-		// the policy here when none was supplied, mirroring
-		// ResolveCredentialPolicy exactly: prefer the identity's own
-		// CredentialPolicyID, otherwise fall back to the tenant default
-		// (EnsureDefaultPolicy). That fallback always yields a policy, so an
-		// identity that "has no policy configured" still issues — it's
-		// governed by the tenant default rather than being rejected. Callers
-		// that DO pass IdentityPolicyID keep using exactly that policy; we
-		// never re-resolve or override an explicit ID.
+		// its ID in IdentityPolicyID — and only do so for grants gated at the
+		// identity layer. Three other issuance paths — RotateCredential, the
+		// admin issue handler, and post-attestation verification — historically
+		// left IdentityPolicyID empty, which turned this "authoritative
+		// chokepoint" into a no-op for them and let a since-tightened ceiling be
+		// bypassed. They now set ResolveIdentityPolicy so the chokepoint
+		// resolves the governing policy when none was supplied, mirroring
+		// ResolveCredentialPolicy: prefer the identity's own CredentialPolicyID,
+		// else the tenant default (EnsureDefaultPolicy, which always yields a
+		// policy so a tenant that never configured one is governed by the
+		// default rather than rejected). Callers that pass IdentityPolicyID keep
+		// using exactly that policy; we never re-resolve or override it. Callers
+		// that neither pass an ID nor opt in are unaffected — preserving the
+		// client-gated behavior of authorization_code/refresh_token/CIBA tokens
+		// minted for clients with no linked identity.
 		identityPolicyID := req.IdentityPolicyID
-		if identityPolicyID == "" {
+		if identityPolicyID == "" && req.ResolveIdentityPolicy {
 			resolved, err := s.resolveIdentityPolicyID(ctx, req.Identity)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to resolve identity credential policy: %w", err)
@@ -668,10 +679,11 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 
 	// Issue a new one with the same parameters.
 	return s.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		Scopes:    old.Scopes,
-		TTL:       old.TTLSeconds,
-		GrantType: old.GrantType,
+		Identity:              identity,
+		Scopes:                old.Scopes,
+		TTL:                   old.TTLSeconds,
+		GrantType:             old.GrantType,
+		ResolveIdentityPolicy: true,
 	})
 }
 
