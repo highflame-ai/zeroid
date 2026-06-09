@@ -108,25 +108,26 @@ func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, db bun.ID
 	return token, nil
 }
 
-// RevokeFamily revokes all active tokens in a family (reuse detection response).
-func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
+// RevokeFamily revokes all active tokens in a family (reuse detection response)
+// and returns the rows it revoked so the service layer can fan out a
+// RevocationNotifier event per revoked token. Refresh tokens are opaque (hashed)
+// and carry no JWT id, so the row's UUID (RefreshToken.ID) serves as the stable,
+// unique revocation handle.
+func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID string) ([]*domain.RefreshToken, error) {
 	now := time.Now()
 
-	res, err := r.db.NewUpdate().
-		Model((*domain.RefreshToken)(nil)).
+	var revoked []*domain.RefreshToken
+	err := r.db.NewUpdate().
+		Model(&revoked).
 		Set("state = ?", domain.RefreshTokenStateRevoked).
 		Set("revoked_at = ?", now).
 		Where("family_id = ?", familyID).
 		Where("state = ?", domain.RefreshTokenStateActive).
-		Exec(ctx)
+		Returning("*").
+		Scan(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("failed to revoke refresh token family: %w", err)
+		return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)
 	}
 
-	count, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("failed to check family revocation result: %w", err)
-	}
-
-	return count, nil
+	return revoked, nil
 }

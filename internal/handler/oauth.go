@@ -13,6 +13,7 @@ import (
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // ── OAuth types ──────────────────────────────────────────────────────────────
@@ -42,7 +43,17 @@ type TokenInput struct {
 		ApplicationID string `json:"application_id,omitempty" doc:"Application scope (for external principal exchange)"`
 		// AdditionalClaims allows callers to inject arbitrary claims into the issued JWT.
 		// Keys must not collide with standard OAuth/ZeroID claims. Values are set as-is.
+		// The reserved authorization claims `role` and `privilege_scope` are rejected
+		// here (they can only be set via the dedicated fields below, on the trusted
+		// external-principal exchange path).
 		AdditionalClaims map[string]any `json:"additional_claims,omitempty" doc:"Arbitrary claims to include in the issued JWT"`
+		// Role and PrivilegeScope are authorization claims minted ONLY by the
+		// trusted-service external-principal exchange (RFC 8693 token-exchange
+		// with no actor_token), and only after the TrustedServiceValidator gate
+		// authorizes the caller. They are ignored on all other grants,
+		// and can never be injected via additional_claims (both keys are reserved).
+		Role           string   `json:"role,omitempty" doc:"Authorization role claim (trusted external-principal exchange only)"`
+		PrivilegeScope []string `json:"privilege_scope,omitempty" doc:"Authorization privilege scope claim (trusted external-principal exchange only)"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -239,7 +250,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	// proof key via cnf.jkt and token_type is returned as "DPoP" (RFC 9449).
 	var dpopThumbprint string
 	if input.DPoPProof != "" {
-		if a.dpopSvc == nil {
+		if a.dpopVerifier == nil {
 			return &TokenOutput{
 				Status: http.StatusBadRequest,
 				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: "DPoP is not enabled on this deployment"},
@@ -253,9 +264,15 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		if htu == "" {
 			htu = a.issuer + "/oauth2/token"
 		}
-		tp, dpopErr := a.dpopSvc.ValidateProof(ctx, http.MethodPost, htu, input.DPoPProof)
+		res, dpopErr := a.dpopVerifier.Validate(ctx, dpop.ValidateRequest{
+			ProofJWT: input.DPoPProof,
+			Method:   http.MethodPost,
+			URL:      htu,
+		})
 		if dpopErr != nil {
-			if errors.Is(dpopErr, service.ErrDPoPStorageFailure) {
+			// pkg/dpop.IsClientFault is false only for storage failures —
+			// everything else is a client-side 4xx. Storage failure → 5xx.
+			if !dpop.IsClientFault(dpopErr) {
 				log.Error().Err(dpopErr).Msg("DPoP JTI store unavailable")
 				return &TokenOutput{
 					Status: http.StatusInternalServerError,
@@ -267,7 +284,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 				Body:   oauthErrorBody{Error: oautherror.InvalidDPoPProof, ErrorDescription: dpopErr.Error()},
 			}, nil
 		}
-		dpopThumbprint = tp
+		dpopThumbprint = res.Thumbprint
 	}
 
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
@@ -287,6 +304,8 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		UserName:          input.Body.UserName,
 		ApplicationID:     input.Body.ApplicationID,
 		AdditionalClaims:  input.Body.AdditionalClaims,
+		Role:              input.Body.Role,
+		PrivilegeScope:    input.Body.PrivilegeScope,
 		Code:              input.Body.Code,
 		CodeVerifier:      input.Body.CodeVerifier,
 		RedirectURI:       input.Body.RedirectURI,

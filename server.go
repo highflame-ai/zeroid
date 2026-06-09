@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -26,6 +27,8 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
+
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
@@ -74,16 +77,29 @@ type Server struct {
 	backchannelSvc      *service.BackchannelService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
+	// revocationDispatcher fans out RevocationEvents
+	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
+	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
+	revocationDispatcher *service.RevocationDispatcher
 
 	// Cleanup
 	cleanupWorker *worker.CleanupWorker
 	workerCancel  context.CancelFunc
 
 	// Extensibility
-	mu              sync.RWMutex
-	claimsEnrichers []ClaimsEnricher
-	adminAuthState  *middlewareHolder
-	globalMWState   *middlewareHolder
+	mu                 sync.RWMutex
+	claimsEnrichers    []ClaimsEnricher
+	principalResolvers []namedPrincipalResolver
+	adminAuthState     *middlewareHolder
+	globalMWState      *middlewareHolder
+}
+
+// namedPrincipalResolver pairs a registered PrincipalResolver with the
+// deployer-supplied name used in /oauth2/authorize logs and metrics.
+// Stored in registration order so the chain walk is deterministic.
+type namedPrincipalResolver struct {
+	name string
+	fn   PrincipalResolver
 }
 
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
@@ -182,7 +198,7 @@ func NewServer(cfg Config) (*Server, error) {
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL)
-	signalSvc := service.NewSignalService(signalRepo, credentialRepo, identityRepo)
+	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
 		cfg.SigningCreds.MaxTTLSeconds,
@@ -197,6 +213,15 @@ func NewServer(cfg Config) (*Server, error) {
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
+
+	// RevocationNotifier plumbing. One shared
+	// dispatcher is handed to every service that performs revocation so a
+	// single Server.SetRevocationNotifier wires all paths. Default: no
+	// notifier installed ⇒ revocation behaviour is unchanged.
+	revocationDispatcher := service.NewRevocationDispatcher()
+	credentialSvc.SetRevocationDispatcher(revocationDispatcher)
+	refreshTokenSvc.SetRevocationDispatcher(revocationDispatcher)
+
 	authCodeIssuer := cfg.Token.AuthCodeIssuer
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
@@ -208,7 +233,7 @@ func NewServer(cfg Config) (*Server, error) {
 		AuthCodeIssuer: authCodeIssuer,
 	})
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo)
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer)
 
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
@@ -224,9 +249,18 @@ func NewServer(cfg Config) (*Server, error) {
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
-	// DPoP service — validates RFC 9449 proofs and enforces JTI replay protection
-	// via the dpop_jti table. Stateless beyond the DB it reads/writes.
-	dpopSvc := service.NewDPoPService(db)
+	// DPoP verifier — validates RFC 9449 proofs (and the bh extension claim)
+	// against the embedded jwk, with replay prevention via the dpop_jti table.
+	// Verifier logic lives in pkg/dpop (the public OSS primitive); the
+	// Postgres-backed ReplayStore impl lives in internal/store/postgres so
+	// pkg/dpop stays bun-free for downstream consumers that bring their own
+	// storage (Cerberus, Shield, Firehog).
+	dpopVerifier, err := dpop.NewVerifier(dpop.Config{
+		Store: postgres.NewDPoPReplayStore(db),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dpop verifier init: %w", err)
+	}
 
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -236,7 +270,7 @@ func NewServer(cfg Config) (*Server, error) {
 	apiHandler := handler.NewAPI(
 		identitySvc, credentialSvc, credentialPolicySvc,
 		attestationSvc, attestationPolicySvc, proofSvc, oauthSvc, oauthClientSvc,
-		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopSvc, delegationSvc, jwksSvc,
+		signalSvc, apiKeySvc, agentSvc, auditSvc, backchannelSvc, dpopVerifier, delegationSvc, jwksSvc,
 		signingCredSvc, db,
 		cfg.Token.Issuer,
 	)
@@ -287,6 +321,30 @@ func NewServer(cfg Config) (*Server, error) {
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
+	// AgentAuthMiddleware config — verifies an agent's own ZeroID-issued ES256
+	// access token and sets tenant/identity from the validated claims. Shared by
+	// the self-service group below (public) and the proof-generation group on the
+	// admin router further down.
+	agentAuthCfg := internalMiddleware.AgentAuthConfig{
+		PublicKey: jwksSvc.PublicKey(),
+		Issuer:    cfg.Token.Issuer,
+		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
+		// document so they can chain resource → PRM → AS metadata.
+		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
+	}
+
+	// Agent self-service group — authenticated by the agent's OWN access token
+	// (NOT the admin/internal secret) and mounted on the public router so agents
+	// can reach it directly on the public ingress. Tenant + identity come from the
+	// validated token claims (never headers). Holds POST /agents/self/public-key.
+	r.Group(func(r chi.Router) {
+		r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
+		// Specless: this group shares the root router with RegisterPublic, so it
+		// must not register a second /openapi.json that would shadow the canonical
+		// public spec.
+		apiHandler.RegisterAgentSelfService(handler.NewHumaAPISpecless(r))
+	})
+
 	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
 	adminPrefix := cfg.Server.GetAdminPathPrefix()
@@ -311,16 +369,9 @@ func NewServer(cfg Config) (*Server, error) {
 		humaAdmin := handler.NewHumaAPI(r)
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
-		// Agent-auth sub-group for proof generation (requires agent JWT).
+		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
+		// the agentAuthCfg defined above for the public self-service group.
 		r.Group(func(r chi.Router) {
-			agentAuthCfg := internalMiddleware.AgentAuthConfig{
-				PublicKey: jwksSvc.PublicKey(),
-				Issuer:    cfg.Token.Issuer,
-				// RFC 9728 §5.1 breadcrumb on 401s — points cold-start
-				// clients at the PRM document so they can chain
-				// resource → PRM → AS metadata without prior knowledge.
-				ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
-			}
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
 			humaAgentAuth := handler.NewHumaAPI(r)
@@ -342,25 +393,26 @@ func NewServer(cfg Config) (*Server, error) {
 	idleTimeout := parseDurationOrDefault(cfg.Server.IdleTimeout, 60*time.Second)
 
 	srv := &Server{
-		cfg:                 cfg,
-		db:                  db,
-		router:              r,
-		identitySvc:         identitySvc,
-		credentialSvc:       credentialSvc,
-		credentialPolicySvc: credentialPolicySvc,
-		attestationSvc:      attestationSvc,
-		proofSvc:            proofSvc,
-		oauthSvc:            oauthSvc,
-		oauthClientSvc:      oauthClientSvc,
-		signalSvc:           signalSvc,
-		apiKeySvc:           apiKeySvc,
-		agentSvc:            agentSvc,
-		backchannelSvc:      backchannelSvc,
-		jwksSvc:             jwksSvc,
-		refreshTokenSvc:     refreshTokenSvc,
-		cleanupWorker:       worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
-		adminAuthState:      authState,
-		globalMWState:       globalMW,
+		cfg:                  cfg,
+		db:                   db,
+		router:               r,
+		identitySvc:          identitySvc,
+		credentialSvc:        credentialSvc,
+		credentialPolicySvc:  credentialPolicySvc,
+		attestationSvc:       attestationSvc,
+		proofSvc:             proofSvc,
+		oauthSvc:             oauthSvc,
+		oauthClientSvc:       oauthClientSvc,
+		signalSvc:            signalSvc,
+		apiKeySvc:            apiKeySvc,
+		agentSvc:             agentSvc,
+		backchannelSvc:       backchannelSvc,
+		jwksSvc:              jwksSvc,
+		refreshTokenSvc:      refreshTokenSvc,
+		revocationDispatcher: revocationDispatcher,
+		cleanupWorker:        worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
+		adminAuthState:       authState,
+		globalMWState:        globalMW,
 		http: &http.Server{
 			Addr:         ":" + cfg.Server.Port,
 			Handler:      r,
@@ -375,6 +427,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
+
+	// Hand the principal-resolver chain walker to the API handler. The
+	// handler invokes this on every /oauth2/authorize request to walk
+	// the resolvers registered via Server.RegisterPrincipalResolver.
+	// Wired here (not in NewAPI) so srv exists for the method binding.
+	apiHandler.SetPrincipalResolverFunc(srv.resolvePrincipal)
 
 	return srv, nil
 }
@@ -438,6 +496,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.backchannelSvc.Stop()
 	}
 
+	// Cancel the revocation dispatcher's lifecycle context so detached
+	// RevocationNotifier goroutines wind down with the server.
+	if s.revocationDispatcher != nil {
+		s.revocationDispatcher.Stop()
+	}
+
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
@@ -469,8 +533,53 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 			ApplicationID:    req.ApplicationID,
 			Scope:            req.Scope,
 			AdditionalClaims: req.AdditionalClaims,
+			Role:             req.Role,
+			PrivilegeScope:   req.PrivilegeScope,
 		})
 	})
+}
+
+// ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
+// tenant + user context. Public wrapper over the internal
+// OAuthService.ResolveAPIKey — exposed at Server level so deployer-
+// supplied PrincipalResolvers (and any other consumer that needs to
+// authenticate an API key out-of-band from the /oauth2/token endpoint)
+// can call into zeroid's canonical resolution path without
+// reimplementing the hash + lookup + identity-status checks themselves.
+//
+// Returns:
+//   - (*APIKeyResolution, nil) on a valid, active, non-expired key
+//     whose linked identity (if any) is also usable.
+//   - (nil, error) when the key is unknown, deactivated, or linked to
+//     a suspended/expired identity. The error is shaped for direct
+//     surfacing from an OAuth-style handler (RFC 6749 §5.2 envelope
+//     via extractOAuthError).
+//
+// Same gates as apiKeyGrant runs at /oauth2/token time — a key whose
+// identity is suspended must not even authenticate at /oauth2/authorize,
+// let alone mint a token. The shared core (resolveAPIKeyContext) is
+// the single source of truth.
+//
+// Typical usage from a PrincipalResolver:
+//
+//	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+//	    key := req.Form("api_key")
+//	    if key == "" {
+//	        return nil, zeroid.ErrPrincipalNotApplicable
+//	    }
+//	    res, err := srv.ResolveAPIKey(ctx, key)
+//	    if err != nil {
+//	        return nil, err
+//	    }
+//	    return &zeroid.Principal{
+//	        AccountID: res.AccountID,
+//	        ProjectID: res.ProjectID,
+//	        UserID:    res.UserID,
+//	        Scopes:    res.Scopes,
+//	    }, nil
+//	})
+func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResolution, error) {
+	return s.oauthSvc.ResolveAPIKey(ctx, apiKey)
 }
 
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated user.
@@ -488,6 +597,8 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 		ApplicationID:    req.ApplicationID,
 		Scope:            req.Scope,
 		AdditionalClaims: req.AdditionalClaims,
+		Role:             req.Role,
+		PrivilegeScope:   req.PrivilegeScope,
 		TrustedService:   true,
 	})
 }
@@ -497,6 +608,87 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimsEnrichers = append(s.claimsEnrichers, enricher)
+}
+
+// RegisterPrincipalResolver registers a PrincipalResolver against the
+// /oauth2/authorize endpoint. Resolvers are tried in registration order;
+// the first to return a non-nil Principal wins. name is used for
+// log/metric attribution and must be non-empty.
+//
+// Typical usage from a deployer that owns api_key resolution:
+//
+//	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+//	    key := req.Form("api_key")
+//	    if key == "" {
+//	        return nil, zeroid.ErrPrincipalNotApplicable
+//	    }
+//	    res, err := srv.ResolveAPIKey(ctx, key)
+//	    if err != nil {
+//	        return nil, err
+//	    }
+//	    return &zeroid.Principal{
+//	        AccountID: res.AccountID,
+//	        ProjectID: res.ProjectID,
+//	        UserID:    res.UserID,
+//	        Scopes:    res.Scopes,
+//	    }, nil
+//	})
+//
+// Safe to call after NewServer and before Start. Multiple resolvers are
+// supported — register the most-specific first (e.g. session cookie
+// before api_key fallback) because order determines precedence on
+// overlapping requests.
+func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
+	if name == "" || r == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.principalResolvers = append(s.principalResolvers, namedPrincipalResolver{name: name, fn: r})
+}
+
+// resolvePrincipal walks the registered PrincipalResolver chain in
+// registration order, returning the first non-nil Principal. The
+// matchedName return is the resolver name that produced the Principal —
+// used by the /oauth2/authorize handler for log attribution.
+//
+// Errors:
+//   - No resolvers registered → returns
+//     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
+//     so the deployer sees a clear "you forgot to wire this up"
+//     signal, distinct from the 401 "credential didn't match" case.
+//   - All registered resolvers returning ErrPrincipalNotApplicable →
+//     returns (nil, "", nil). Handler maps to 401 invalid_client.
+//   - Any resolver returning a non-sentinel error → returns
+//     (nil, resolverName, err). The chain stops at the first such
+//     error; handler surfaces it as 401 invalid_client.
+func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
+	s.mu.RLock()
+	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
+	copy(resolvers, s.principalResolvers)
+	s.mu.RUnlock()
+
+	if len(resolvers) == 0 {
+		return nil, "", ErrNoResolversRegistered
+	}
+
+	for _, r := range resolvers {
+		p, err := r.fn(ctx, req)
+		if err != nil {
+			if errors.Is(err, ErrPrincipalNotApplicable) {
+				continue
+			}
+			return nil, r.name, err
+		}
+		if p != nil {
+			return p, r.name, nil
+		}
+		// nil principal + nil error: defensive — treat as "not applicable"
+		// rather than returning a nil Principal that downstream would
+		// have to nil-check anyway.
+	}
+
+	return nil, "", nil
 }
 
 // AdminAuth sets an optional authentication middleware for admin routes.
@@ -554,6 +746,58 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			AuthorizationDetails: n.AuthorizationDetails,
 		})
 	})
+}
+
+// SetRevocationNotifier wires the RevocationNotifier called after every
+// token/credential revocation commits. ZeroID ships
+// no built-in notifier and owns no fan-out (no Redis, no bus); pass a
+// deployer-supplied function that propagates the revocation to its own
+// infrastructure — typically publishing to a Redis deny-set channel so
+// resource servers can block the revoked JTI before its TTL elapses.
+//
+// The notifier fires exactly once per revoked JTI across every revocation
+// path: the RFC 7009 /oauth2/token/revoke flow, CredentialService.RevokeCredential
+// and RotateCredential, RevokeAllActiveForIdentity (identity deactivation), the
+// CAE high/critical-severity signal cascade, and refresh-token reuse/replay
+// revocation. A cascade revoking N tokens fires N times.
+//
+// Dispatch is asynchronous (detached goroutine parented on the server's
+// lifecycle context) so notifier latency never blocks the request that caused
+// the revocation; notifier errors are logged, not propagated. The revocation
+// itself has already committed before the notifier fires.
+//
+// Can be called any time after NewServer; safe to call concurrently. Passing
+// nil clears the notifier. When unset (the default), revocation behaviour is
+// unchanged — no new required config.
+func (s *Server) SetRevocationNotifier(fn RevocationNotifier) {
+	if s.revocationDispatcher == nil {
+		return
+	}
+	if fn == nil {
+		s.revocationDispatcher.SetNotifier(nil)
+		return
+	}
+	s.revocationDispatcher.SetNotifier(func(ctx context.Context, e service.RevocationEvent) error {
+		return fn(ctx, RevocationEvent{
+			JTI:        e.JTI,
+			IdentityID: e.IdentityID,
+			AccountID:  e.AccountID,
+			ProjectID:  e.ProjectID,
+			ExpiresAt:  e.ExpiresAt,
+			Reason:     e.Reason,
+			RevokedAt:  e.RevokedAt,
+		})
+	})
+}
+
+// SetRevocationNotifyDispatchSync forces synchronous revocation-notifier
+// dispatch. Test-only — production must keep async dispatch (the default) so
+// notifier latency cannot block the request that triggered the revocation.
+func (s *Server) SetRevocationNotifyDispatchSync(sync bool) {
+	if s.revocationDispatcher == nil {
+		return
+	}
+	s.revocationDispatcher.SetDispatchSync(sync)
 }
 
 // RegisterAuthorizationDetailValidator wires a deployer-supplied per-type
@@ -856,6 +1100,15 @@ var OAuthFormEndpoints = map[string]struct{}{
 	"/oauth2/token/introspect": {},
 	"/oauth2/token/revoke":     {},
 	"/oauth2/bc-authorize":     {},
+	// /oauth2/authorize is intentionally NOT here. Its handler is a
+	// plain chi route (not Huma) — see internal/handler/authorize.go —
+	// because the endpoint's principal-credential field set is
+	// resolver-dependent (api_key today, session cookie / mTLS
+	// tomorrow) and doesn't fit a static OpenAPI input schema. The
+	// chi handler parses the raw application/x-www-form-urlencoded
+	// body directly; routing it through this middleware would rewrite
+	// the form to JSON before the handler sees it, breaking form
+	// access.
 }
 
 // jsonShapedFormFields are OAuth form parameters whose value is itself JSON
@@ -968,22 +1221,44 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// nonJSONContentTypeExemptPaths lists endpoints that accept
+// non-application/json POST bodies. The body-size cap still applies to
+// these paths (preserved as a generic DoS guard); the Content-Type
+// enforcement is what's exempted.
+//
+// /oauth2/authorize is here because its chi handler reads raw
+// application/x-www-form-urlencoded bodies directly — see
+// internal/handler/authorize.go for why it's chi-not-Huma. Other
+// /oauth2/* endpoints (token, introspect, revoke, bc-authorize) get
+// their form-encoded bodies REWRITTEN to JSON by
+// oauthFormCompatMiddleware before requestValidationMiddleware runs,
+// so by the time the Content-Type check fires they look like JSON.
+// /oauth2/authorize is not in OAuthFormEndpoints (no rewrite), so it
+// arrives here still form-encoded and must be exempted explicitly.
+var nonJSONContentTypeExemptPaths = map[string]struct{}{
+	"/oauth2/authorize": {},
+}
+
 // requestValidationMiddleware limits request body size to 10 MiB and enforces
-// application/json Content-Type on mutating requests (POST, PUT, PATCH).
+// application/json Content-Type on mutating requests (POST, PUT, PATCH),
+// except for paths in nonJSONContentTypeExemptPaths which handle their
+// own content negotiation.
 func requestValidationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		const maxBodySize = 10 * 1024 * 1024
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 
 		if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-			ct := r.Header.Get("Content-Type")
-			if ct == "" {
-				writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
-				return
-			}
-			if !mediaTypeEquals(ct, "application/json") {
-				writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
-				return
+			if _, exempt := nonJSONContentTypeExemptPaths[r.URL.Path]; !exempt {
+				ct := r.Header.Get("Content-Type")
+				if ct == "" {
+					writeValidationError(w, r, "Content-Type header is required for "+r.Method+" requests")
+					return
+				}
+				if !mediaTypeEquals(ct, "application/json") {
+					writeValidationError(w, r, "Content-Type must be application/json, got: "+ct)
+					return
+				}
 			}
 		}
 

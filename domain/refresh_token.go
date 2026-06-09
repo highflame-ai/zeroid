@@ -44,4 +44,12 @@ type RefreshToken struct {
 	// Copied verbatim onto every successor row on rotation; checked against
 	// the presented proof inside the rotation transaction (RFC 9449 §5).
 	DPoPKeyThumbprint string `bun:"dpop_key_thumbprint,nullzero" json:"-"`
+	// MissionID is the delegation-tree identifier (issue #81) of the access
+	// token this refresh family was minted alongside. Copied verbatim onto
+	// every successor row on rotation and read back when the refresh grant
+	// issues a new access token, so a refreshed token inherits the original
+	// mission instead of re-rooting it. nullzero ⇒ empty Go string round-trips
+	// as SQL NULL (pre-migration families, or flows that carried no mission_id);
+	// the refresh path falls back to re-rooting for those. Opaque to consumers.
+	MissionID string `bun:"mission_id,nullzero" json:"mission_id,omitempty"`
 }

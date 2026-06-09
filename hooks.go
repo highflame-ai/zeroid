@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // ClaimsEnricher is called during JWT issuance to add custom claims.
@@ -30,7 +31,66 @@ type GrantRequest struct {
 	UserName         string
 	ApplicationID    string
 	AdditionalClaims map[string]any
+	// Role and PrivilegeScope are authorization claims
+	// minted into the `role` (string) and `privilege_scope` (array) JWT claims.
+	// They are honoured ONLY on the trusted-service external-principal exchange
+	// path (Server.ExternalPrincipalExchange, gated by TrustedServiceValidator)
+	// and can never be injected via AdditionalClaims (both names are reserved).
+	Role           string
+	PrivilegeScope []string
 }
+
+// Principal is the resolved caller at /oauth2/authorize — the tenant +
+// user binding that gets baked into the issued authorization code JWT.
+// Re-exported from internal/service so deployer code stays at the
+// top-level zeroid public surface; both names refer to the same type.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type Principal = service.Principal
+
+// AuthorizeRequest is the typed, read-only snapshot of the parsed
+// /oauth2/authorize request handed to every PrincipalResolver. Resolvers
+// see this — never net/http types — so the extensibility hook stays
+// consistent with zeroid's other typed-struct boundaries.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type AuthorizeRequest = service.AuthorizeRequest
+
+// PrincipalResolver authenticates the caller at /oauth2/authorize.
+// Registered via Server.RegisterPrincipalResolver and tried in
+// registration order; the first resolver to return a non-nil Principal
+// wins. Return ErrPrincipalNotApplicable to defer to the next resolver;
+// any other error fails the request with 401 invalid_client.
+//
+// See internal/service/principal.go for the canonical doc comment.
+type PrincipalResolver = service.PrincipalResolver
+
+// ErrPrincipalNotApplicable is the sentinel returned by a
+// PrincipalResolver that does not apply to the current request. zeroid
+// moves to the next registered resolver; when every resolver returns
+// this sentinel, the request fails with 401 invalid_client.
+var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
+
+// ErrNoResolversRegistered is the sentinel surfaced by zeroid when
+// /oauth2/authorize is reached but no PrincipalResolver has been
+// registered via Server.RegisterPrincipalResolver. The handler maps
+// this to 503 Service Unavailable so the deployer sees a clear
+// "you forgot to wire this up" signal rather than an ambiguous 401.
+//
+// Deployers don't typically observe this sentinel directly — it's
+// emitted by zeroid's chain walker and consumed by the handler. The
+// re-export exists so deployer tests can match on it via errors.Is.
+var ErrNoResolversRegistered = service.ErrNoResolversRegistered
+
+// APIKeyResolution is the public projection returned by
+// Server.ResolveAPIKey. Narrow + stable — does not leak zeroid
+// internals (*domain.Identity, *domain.APIKey row, credential-policy
+// records). Consumers map this onto whatever shape their layer needs
+// (typically zeroid.Principal in a PrincipalResolver implementation).
+//
+// See internal/service/oauth.go (APIKeyResolution definition) for the
+// canonical doc comment + field-level semantics.
+type APIKeyResolution = service.APIKeyResolution
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before
@@ -147,3 +207,71 @@ type BackchannelNotifier func(ctx context.Context, n BackchannelNotification) er
 // Validators run synchronously on the bc-authorize request path; keep them
 // fast (no network I/O, no DB queries beyond in-process caches).
 type AuthorizationDetailValidator func(raw json.RawMessage) error
+
+// RevocationEvent is the payload handed to a RevocationNotifier after a
+// token or credential has been revoked and the revocation has committed to
+// the database. Exactly one event is emitted per revoked JTI — a cascade
+// that revokes N credentials (e.g. an identity deactivation that walks the
+// delegation tree) fires N events, one per affected credential.
+//
+// zeroid ships no built-in fan-out for these events: it does not own a
+// Redis channel, a message bus, or any deny-set. The embedding application
+// sets a RevocationNotifier via
+// Server.SetRevocationNotifier and is responsible for whatever propagation
+// it needs — publishing to its own Redis channel, writing to a shared
+// deny-set, emitting a webhook, etc. This keeps zeroid Redis-agnostic by
+// design.
+//
+// Fields:
+//   - JTI is the revoked credential's `jti` claim — the deny-set key the
+//     subscriber should block. For refresh-token reuse revocation (which
+//     concerns opaque, hashed refresh tokens that carry no JWT id), JTI
+//     carries the refresh-token row's UUID instead, so the value is still a
+//     stable, unique handle for the revoked artifact.
+//   - IdentityID is the owning identity's UUID. Empty when the revoked
+//     credential was not tied to a stored identity row (e.g. a synthetic
+//     external-principal carrier) or, for refresh tokens, when no identity
+//     was linked.
+//   - AccountID / ProjectID scope the revocation to a tenant. Subscribers
+//     MUST key their deny-set by (account_id, project_id, jti) to preserve
+//     multi-tenant isolation.
+//   - ExpiresAt is the revoked artifact's own expiry. Subscribers can size
+//     their deny-set entry's TTL to this instant: once the token would have
+//     expired anyway, the deny-set entry can be dropped because verification
+//     fails on `exp` regardless.
+//   - Reason mirrors the revoke reason recorded on the row
+//     (e.g. "oauth2_revocation", "identity_deactivated",
+//     "auto-revoked by CAE signal …", "refresh_token_reuse").
+//   - RevokedAt is the wall-clock instant the revocation was applied.
+type RevocationEvent struct {
+	JTI        string    `json:"jti"`
+	IdentityID string    `json:"identity_id"`
+	AccountID  string    `json:"account_id"`
+	ProjectID  string    `json:"project_id"`
+	ExpiresAt  time.Time `json:"exp"`
+	Reason     string    `json:"reason"`
+	RevokedAt  time.Time `json:"revoked_at"`
+}
+
+// RevocationNotifier observes every token/credential revocation so the
+// embedding application can fan it out to its own infrastructure (a Redis
+// deny-set channel, a webhook, an audit pipeline). zeroid ships with no
+// built-in notifier; set one via Server.SetRevocationNotifier.
+//
+// The notifier fires AFTER the revocation has committed to the database, on
+// a detached goroutine, so its latency never blocks the request that caused
+// the revocation (RFC 7009 revoke, CAE signal ingest, refresh-token reuse
+// detection, identity deactivation). It is invoked exactly once per revoked
+// JTI: a cascade revoking N credentials fires N times.
+//
+// Returning an error is logged (zerolog, warn level) but is NOT propagated
+// to the caller — a failed fan-out must never roll back or fail the
+// revocation itself, which has already committed. The notifier MUST be
+// safe for concurrent invocation and MUST NOT block indefinitely; it runs
+// under a bounded-timeout context derived from the server's lifecycle
+// context (cancelled on Server.Shutdown).
+//
+// When no notifier is set (the default), revocation behaviour is unchanged
+// — there is no new required configuration and no behavioural difference for
+// existing deployers.
+type RevocationNotifier func(ctx context.Context, e RevocationEvent) error

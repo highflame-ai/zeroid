@@ -109,3 +109,107 @@ func verifyCodeChallenge(codeVerifier, codeChallenge string) bool {
 func normalizeLoopback(uri string) string {
 	return strings.Replace(uri, "://127.0.0.1:", "://localhost:", 1)
 }
+
+// AuthCodeTTL is the lifetime of an issued authorization code. RFC 6749
+// §4.1.2 recommends a maximum of 10 minutes; the conventional value across
+// mainstream OAuth providers is 5 minutes. Short TTL is the primary defense
+// against code interception — once the code is in the browser URL bar it's
+// already exposed to logs, referer headers, and extensions, so we want it
+// useless quickly.
+const AuthCodeTTL = 5 * time.Minute
+
+// AuthCodeSubject is the JWT subject string decodeAuthCodeJWT requires. Hard-
+// coded to bind the JWT shape to the auth-code grant — a token without this
+// subject (e.g. a regular access token someone tries to replay as an auth
+// code) is rejected before any tenant context is read.
+const AuthCodeSubject = "auth-code"
+
+// mintAuthCodeJWT is the symmetric counterpart to decodeAuthCodeJWT — it
+// produces an HS256 JWT containing the AuthCodeClaims shape that the decoder
+// reads. Pure function: no service receiver, no I/O, fully deterministic
+// given inputs (except for the time-derived jti). Callers (currently
+// OAuthService.IssueAuthCode) are responsible for validating the surrounding
+// OAuth context (client registration, redirect-uri allow-list, S256-only
+// challenge) before invoking the mint.
+//
+// The jti is derived from sha256(client_id|user_id|now-nano) — deterministic
+// enough for debug-traceability across logs, unique enough that two near-
+// simultaneous codes for the same client+user don't collide. zeroid's
+// Consume uses jti as the single-use key, so uniqueness is the only
+// correctness requirement.
+func mintAuthCodeJWT(claims *AuthCodeClaims, hmacSecret, issuer string, now time.Time) (string, error) {
+	if hmacSecret == "" {
+		return "", fmt.Errorf("authcode mint: hmac secret is empty")
+	}
+	if issuer == "" {
+		return "", fmt.Errorf("authcode mint: issuer is empty")
+	}
+	if claims == nil {
+		return "", fmt.Errorf("authcode mint: claims are nil")
+	}
+	if claims.ClientID == "" || claims.CodeChallenge == "" || claims.RedirectURI == "" {
+		return "", fmt.Errorf("authcode mint: client_id, code_challenge, redirect_uri are all required")
+	}
+	if claims.AccountID == "" {
+		return "", fmt.Errorf("authcode mint: account_id is required")
+	}
+
+	jti := claims.JTI
+	if jti == "" {
+		seed := fmt.Sprintf("%s|%s|%d", claims.ClientID, claims.UserID, now.UnixNano())
+		h := sha256.Sum256([]byte(seed))
+		// 32 hex chars — collision-resistant and short enough to fit in
+		// log lines without wrapping.
+		jti = hex.EncodeToString(h[:16])
+	}
+
+	exp := claims.ExpiresAt
+	if exp.IsZero() {
+		exp = now.Add(AuthCodeTTL)
+	}
+
+	builder := jwt.NewBuilder().
+		Issuer(issuer).
+		Subject(AuthCodeSubject).
+		JwtID(jti).
+		IssuedAt(now).
+		Expiration(exp).
+		Claim("cid", claims.ClientID).
+		Claim("cc", claims.CodeChallenge).
+		Claim("ruri", claims.RedirectURI).
+		Claim("aid", claims.AccountID)
+
+	if claims.UserID != "" {
+		builder = builder.Claim("uid", claims.UserID)
+	}
+	if claims.OrgID != "" {
+		builder = builder.Claim("oid", claims.OrgID)
+	}
+	if claims.ProjectID != "" {
+		builder = builder.Claim("pid", claims.ProjectID)
+	}
+	if len(claims.Scopes) > 0 {
+		// Stored as []any so jwx v4 serializes a JSON array. The decoder
+		// at decodeAuthCodeJWT accepts both []string and []any shapes
+		// (resilience against issuance-side changes), but we emit []any
+		// to match what JSON unmarshal naturally produces on the receive
+		// side — keeps the round-trip lossless.
+		anyScopes := make([]any, len(claims.Scopes))
+		for i, s := range claims.Scopes {
+			anyScopes[i] = s
+		}
+		builder = builder.Claim("scp", anyScopes)
+	}
+
+	tok, err := builder.Build()
+	if err != nil {
+		return "", fmt.Errorf("authcode mint: jwt build failed: %w", err)
+	}
+
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte(hmacSecret)))
+	if err != nil {
+		return "", fmt.Errorf("authcode mint: jwt sign failed: %w", err)
+	}
+
+	return string(signed), nil
+}

@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -74,6 +75,17 @@ var reservedClaims = map[string]bool{
 	// let a trusted-service caller mint a token that appears DPoP-bound to
 	// an attacker-chosen key thumbprint.
 	"cnf": true,
+	// Authorization claims. `role` and
+	// `privilege_scope` carry authorization weight downstream, so they must
+	// never be settable via the ungated additional_claims map on ANY grant —
+	// that would be a privilege-escalation vector for any caller that can
+	// reach the token endpoint. They are honoured ONLY on the trusted-service
+	// external-principal exchange path, set from dedicated request fields
+	// after the TrustedServiceValidator has authorised the caller (see
+	// ExternalPrincipalExchange). Reserving them here makes the additional_claims
+	// route fail closed regardless of which grant is in play.
+	"role":            true,
+	"privilege_scope": true,
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
@@ -166,6 +178,17 @@ type TokenRequest struct {
 	UserName         string         // user display name
 	ApplicationID    string         // optional application scope
 	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
+	// Role and PrivilegeScope are authorization claims
+	// that the trusted service (already authenticated via TrustedServiceValidator)
+	// may set on the issued token. They are minted into the `role` (string) and
+	// `privilege_scope` (array of strings) JWT claims ONLY on the trusted-service
+	// external-principal exchange path. They CANNOT be set via AdditionalClaims —
+	// both names are in reservedClaims — so an untrusted caller can never inject
+	// them. On any non-trusted path these fields are ignored (never reach the
+	// token), because only ExternalPrincipalExchange reads them and that function
+	// rejects untrusted callers before issuance.
+	Role           string   // authorization role claim (`role`)
+	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -682,12 +705,28 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		"trusted_by":     serviceName,
 	}
 	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
-	// Blocklist prevents overriding standard JWT/ZeroID claims.
+	// Blocklist prevents overriding standard JWT/ZeroID claims — including the
+	// reserved authorization claims `role` and `privilege_scope`, which can only
+	// be set via the dedicated request fields below, never through additional_claims.
 	for k, v := range req.AdditionalClaims {
 		if reservedClaims[k] {
 			continue
 		}
 		customClaims[k] = v
+	}
+
+	// Authorization claims. We are PAST the
+	// TrustedServiceValidator gate at the top of this function, so the caller
+	// is an authorised trusted service — only here may `role` / `privilege_scope`
+	// be minted. Set them from the dedicated request fields (not additional_claims,
+	// which is reserved-blocked) so an untrusted caller has no path to inject an
+	// authorization role. Empty values are omitted so legacy callers that don't
+	// supply them produce identical tokens to before (backward-compatible).
+	if req.Role != "" {
+		customClaims["role"] = req.Role
+	}
+	if len(req.PrivilegeScope) > 0 {
+		customClaims["privilege_scope"] = req.PrivilegeScope
 	}
 
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
@@ -718,19 +757,97 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	return accessToken, nil
 }
 
-// apiKeyGrant validates a zid_sk_* API key and issues an RS256 JWT.
-// Tenant is derived from the API key record — no caller-supplied headers needed.
-func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.APIKey == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "api_key is required for api_key grant")
-	}
+// APIKeyResolution is the public result of OAuthService.ResolveAPIKey —
+// a narrow, stable type that does not leak zeroid internals (Identity,
+// APIKey row, policy records). Consumers project this onto whatever
+// shape their layer needs (e.g. mapping to zeroid.Principal for the
+// /oauth2/authorize PrincipalResolver hook).
+//
+// The Scopes field is the api key's intrinsic scope set BEFORE policy
+// intersection — credential-policy and identity-policy narrowing happen
+// at issuance time and may produce a smaller effective set on the
+// minted token. Callers that just need "what tenant + user does this
+// key belong to" should ignore Scopes; callers that need to mirror
+// zeroid's pre-token-mint authority surface should treat this as the
+// starting point.
+type APIKeyResolution struct {
+	AccountID string
+	ProjectID string
+	// UserID is the human who created the API key (sk.CreatedBy) — i.e.
+	// the developer whose CLI is being used right now. Empty for keys
+	// minted programmatically without a creator.
+	UserID string
+	// Scopes is the api key's intrinsic scope set. Always non-nil
+	// (possibly len 0). Empty means "no per-key restriction";
+	// downstream policy may still narrow. Non-nil contract is to
+	// keep consumer code (range/len) safe without nil-checking and
+	// to JSON-marshal as `[]` rather than `null`.
+	Scopes []string
+	// KeyID is the API key's row UUID. Useful for audit/log
+	// attribution — never returned to end users.
+	KeyID string
+}
 
-	if !s.jwksSvc.HasRSAKeys() {
-		return nil, oauthServerError("api_key grant requires RSA keys to be configured", nil)
+// apiKeyContext is the rich internal result of resolveAPIKeyContext —
+// everything apiKeyGrant needs to continue past resolution into policy
+// + scope intersection + token mint. Not exported because Identity is
+// an internal-shaped type and consumers should use the public
+// APIKeyResolution projection instead.
+type apiKeyContext struct {
+	// Resolution is the narrow public projection — what ResolveAPIKey
+	// returns to deployers.
+	Resolution *APIKeyResolution
+	// APIKey is the resolved row, in case the caller needs metadata
+	// (expires_at, credential_policy_id) beyond the projection.
+	APIKey *domain.APIKey
+	// Identity is the linked identity record OR a synthetic minimal
+	// identity built from the api key's tenant scalars when the key
+	// has no linked identity. Never nil after a successful resolution.
+	Identity *domain.Identity
+}
+
+// ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
+// tenant context + user binding. This is the public surface used by
+// deployer-supplied PrincipalResolvers for the /oauth2/authorize
+// endpoint, and any other consumer that needs to authenticate an api
+// key out-of-band from the token endpoint.
+//
+// Returns:
+//   - (*APIKeyResolution, nil) on a valid, active, non-expired key.
+//   - (nil, *OAuthError) with code invalid_grant and HTTP 400 when the
+//     key is unknown, deactivated, or linked to a suspended/expired
+//     identity. Error is shaped for direct return from the
+//     /oauth2/authorize handler.
+//
+// Identity-state checks (IsUsable / IsExpired) match what apiKeyGrant
+// already enforces at token-mint time — a key whose identity is
+// suspended must not even authenticate at /authorize, let alone mint
+// a token. Same gate, same error shape.
+func (s *OAuthService) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResolution, error) {
+	rc, err := s.resolveAPIKeyContext(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	return rc.Resolution, nil
+}
+
+// resolveAPIKeyContext is the shared resolution core used by both
+// apiKeyGrant (which needs the rich Identity for policy intersection)
+// and ResolveAPIKey (which projects to the narrow public type). Kept
+// unexported because *domain.Identity is not part of zeroid's public
+// surface.
+//
+// The function never returns a nil Identity on success — it builds a
+// synthetic identity from the key's tenant scalars when the key has no
+// linked identity row, matching the established api_key behaviour. This
+// lets downstream callers always assume Identity is populated.
+func (s *OAuthService) resolveAPIKeyContext(ctx context.Context, apiKey string) (*apiKeyContext, error) {
+	if apiKey == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "api_key is required")
 	}
 
 	// Hash the API key with SHA-256 to look up in the database.
-	hash := sha256.Sum256([]byte(req.APIKey))
+	hash := sha256.Sum256([]byte(apiKey))
 	keyHash := hex.EncodeToString(hash[:])
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
@@ -766,6 +883,42 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			Status:    domain.IdentityStatusActive,
 		}
 	}
+
+	return &apiKeyContext{
+		Resolution: &APIKeyResolution{
+			AccountID: sk.AccountID,
+			ProjectID: sk.ProjectID,
+			UserID:    sk.CreatedBy,
+			// Always non-nil (possibly len 0) so consumers can range /
+			// len safely without nil-checking. JSON-marshals to `[]`
+			// instead of `null` — better API hygiene for downstream
+			// serializers. Defensive copy so caller mutation can't
+			// leak back into the api_key row's slice.
+			Scopes: append(make([]string, 0, len(sk.Scopes)), sk.Scopes...),
+			KeyID:  sk.ID,
+		},
+		APIKey:   sk,
+		Identity: identity,
+	}, nil
+}
+
+// apiKeyGrant validates a zid_sk_* API key and issues an RS256 JWT.
+// Tenant is derived from the API key record — no caller-supplied headers needed.
+func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	if req.APIKey == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "api_key is required for api_key grant")
+	}
+
+	if !s.jwksSvc.HasRSAKeys() {
+		return nil, oauthServerError("api_key grant requires RSA keys to be configured", nil)
+	}
+
+	rc, err := s.resolveAPIKeyContext(ctx, req.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	sk := rc.APIKey
+	identity := rc.Identity
 
 	// Resolve the identity policy (authority ceiling) whenever the key is
 	// linked to a real identity. api_key tokens then pass through both
@@ -845,6 +998,250 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	}()
 
 	return accessToken, nil
+}
+
+// IssueAuthCodeRequest is the input shape for OAuthService.IssueAuthCode —
+// the upstream half of the authorization_code grant. Callers (the /oauth2/
+// authorize handler in this repo, plus deployer code that wants to issue
+// codes programmatically) populate every field; zeroid enforces every
+// invariant the authorizationCode decoder later validates.
+//
+// All fields are required except OrgID and Scopes (both optional).
+type IssueAuthCodeRequest struct {
+	// ClientID identifies the OAuth client requesting the code. Must
+	// be registered, active, and have "authorization_code" in its
+	// GrantTypes — IssueAuthCode rejects clients that don't.
+	ClientID string
+
+	// RedirectURI is the callback URI the issued code's holder will
+	// receive at after token exchange. IssueAuthCode validates that it
+	// matches one of the client's pre-registered RedirectURIs
+	// (normalizeLoopback applied per RFC 8252). Mismatched URIs are
+	// rejected with invalid_request so an attacker cannot redirect the
+	// code to their own callback.
+	RedirectURI string
+
+	// CodeChallenge is the PKCE S256 challenge (RFC 7636 §4.2). Will
+	// be encoded into the auth code as the "cc" claim and verified at
+	// /oauth2/token against the caller-supplied code_verifier.
+	CodeChallenge string
+
+	// CodeChallengeMethod is the PKCE method. ONLY "S256" is accepted —
+	// "plain" (RFC 7636 §4.2) confers no protection and OAuth 2.1
+	// removes it entirely. Misconfigured CLI clients cannot downgrade
+	// themselves silently; "plain" returns invalid_request.
+	CodeChallengeMethod string
+
+	// AccountID and ProjectID are the tenant scalars baked into the
+	// auth code's "aid"/"pid" claims. AccountID is required; ProjectID
+	// is optional but strongly recommended (zeroid won't reject an
+	// empty pid, but downstream tenant-isolation gates may).
+	AccountID string
+	ProjectID string
+
+	// UserID is the human (or workload) the issued token will be bound
+	// to. Baked into the "uid" claim. May be empty for tenant-only
+	// tokens.
+	UserID string
+
+	// OrgID is an optional org-level scope above AccountID. Baked into
+	// the "oid" claim only when non-empty; omitted otherwise.
+	OrgID string
+
+	// Scopes is the pre-narrowed scope set this code authorizes the
+	// token exchange to mint. IssueAuthCode intersects this with the
+	// OAuth client's registered Scopes — a code can never authorize a
+	// scope the client itself isn't allowed. Empty means "no
+	// resolver-side narrowing"; the client's full registered scope
+	// surface is encoded.
+	Scopes []string
+}
+
+// IssueAuthCode is the upstream half of the OAuth 2.0 + PKCE
+// authorization_code grant — the symmetric counterpart to the
+// authorizationCode method below (which consumes codes at /oauth2/token).
+// It validates the OAuth context, intersects the requested scopes against
+// the client's registered allow-list, and mints a stateless HS256 JWT in
+// the AuthCodeClaims shape that decodeAuthCodeJWT reads. No row is
+// inserted at issuance — the authCodeRepo is touched only at consumption
+// time (ON CONFLICT (jti) DO NOTHING), so issuance is a pure signing
+// operation with no DB write and no race.
+//
+// Validation gates (in order):
+//
+//  1. Required fields: client_id, redirect_uri, code_challenge,
+//     code_challenge_method, account_id.
+//  2. code_challenge_method must be "S256" (plain rejected, OAuth 2.1).
+//  3. Client must exist + be active (GetPublicClient).
+//  4. Client must have "authorization_code" in its registered grant
+//     types.
+//  5. Redirect URI must match one of the client's registered URIs
+//     (loopback-normalized).
+//  6. HMAC secret must be configured on the service (deployer wired
+//     cfg.Token.HMACSecret).
+//
+// Returns a signed JWT on success, or an *OAuthError shaped for direct
+// surfacing from the /oauth2/authorize handler.
+func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
+	// Required-field gate.
+	if req.ClientID == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "client_id is required")
+	}
+	if req.RedirectURI == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "redirect_uri is required")
+	}
+	if req.CodeChallenge == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "code_challenge is required")
+	}
+	if req.CodeChallengeMethod == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "code_challenge_method is required")
+	}
+	if req.AccountID == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "account_id is required")
+	}
+
+	// S256-only. plain is deprecated (RFC 7636 §4.2) and removed in
+	// OAuth 2.1 — reject explicitly so misconfigured CLI clients
+	// cannot downgrade themselves silently.
+	if req.CodeChallengeMethod != "S256" {
+		return "", oauthBadRequest(oautherror.InvalidRequest,
+			"code_challenge_method must be S256 (plain is not supported)")
+	}
+
+	if s.hmacSecret == "" {
+		return "", oauthServerError("authorization_code issuance requires HMAC secret to be configured", nil)
+	}
+
+	// Client lookup. GetPublicClient verifies the client exists and is
+	// active; no secret is required because PKCE provides the proof of
+	// possession at exchange time.
+	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
+	if err != nil {
+		return "", oauthUnauthorized("unknown or inactive client_id", err)
+	}
+
+	// Grant-type allow-list. Same check that authorizationCode runs at
+	// exchange — applied here too so a client without the grant cannot
+	// even obtain a code, not just fail at exchange.
+	if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
+		return "", oauthBadRequest(oautherror.UnauthorizedClient,
+			"client is not authorized for authorization_code grant")
+	}
+
+	// Redirect-URI allow-list. The redirect_uri the caller supplies
+	// must be one the client pre-registered, otherwise an attacker
+	// who steals a code could redirect it to their own callback.
+	// normalizeLoopback handles the 127.0.0.1 ↔ localhost equivalence
+	// (RFC 8252 §7.3) so native-app CLI clients aren't tripped up by
+	// the form their loopback URI takes.
+	if !redirectURIAllowed(req.RedirectURI, oauthClient.RedirectURIs) {
+		return "", oauthBadRequest(oautherror.InvalidRequest,
+			"redirect_uri is not in the client's registered list")
+	}
+
+	// Scope intersection: the issued code can never authorize a scope
+	// the client itself isn't allowed. Empty req.Scopes means
+	// "no resolver-side narrowing" — pass through the client's full
+	// registered surface.
+	scopes := req.Scopes
+	if len(scopes) == 0 {
+		scopes = oauthClient.Scopes
+	} else {
+		scopes = intersectScopes(scopes, oauthClient.Scopes)
+	}
+
+	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
+	// as the issuance instant — mintAuthCodeJWT derives jti + exp from
+	// it. Centralising the timestamp here (rather than inside the pure
+	// mint helper) keeps the mint helper deterministic and testable
+	// with an injectable time.
+	now := time.Now()
+	claims := &AuthCodeClaims{
+		ExpiresAt:     now.Add(AuthCodeTTL),
+		ClientID:      req.ClientID,
+		CodeChallenge: req.CodeChallenge,
+		RedirectURI:   req.RedirectURI,
+		Scopes:        scopes,
+		UserID:        req.UserID,
+		OrgID:         req.OrgID,
+		AccountID:     req.AccountID,
+		ProjectID:     req.ProjectID,
+	}
+
+	signed, err := mintAuthCodeJWT(claims, s.hmacSecret, s.authCodeIssuer, now)
+	if err != nil {
+		// Reach here only when mintAuthCodeJWT's defensive checks
+		// trip — should not happen given the gates above. Surface as
+		// 500 (server-side misconfiguration) rather than 400.
+		return "", oauthServerError("failed to mint authorization code", err)
+	}
+
+	return signed, nil
+}
+
+// redirectURIAllowed reports whether candidate matches one of the client's
+// registered redirect URIs. Used by IssueAuthCode at /oauth2/authorize time.
+//
+// Non-loopback URIs must match exactly (after normalizeLoopback's 127.0.0.1 ↔
+// localhost equivalence). LOOPBACK URIs are matched with the PORT IGNORED:
+// RFC 8252 §7.3 requires the authorization server to "allow any port to be
+// specified at the time of the request for loopback IP redirect URIs", because
+// a native / CLI app binds an ephemeral, OS-assigned port for its callback
+// listener and cannot reserve a fixed one in advance. So for a loopback
+// candidate we accept it when some registered loopback URI shares the same
+// scheme, host (treating 127.0.0.1, localhost and ::1 as equivalent), path and
+// query — only the port floats; userinfo and fragments are rejected.
+//
+// This is safe: the loopback interface is reachable only from the same host, so
+// no remote attacker can stand up a listener to intercept the redirect, and
+// PKCE binds the code to the verifier regardless. Without it, the embedded
+// Overwatch/ramparts Guardian (which listens on an ephemeral loopback port)
+// is rejected here even though its redirect is a legitimate loopback callback.
+func redirectURIAllowed(candidate string, registered []string) bool {
+	normCand := normalizeLoopback(candidate)
+
+	cu, cerr := url.Parse(candidate)
+	candLoopback := cerr == nil && isLoopbackHost(cu.Hostname())
+
+	for _, r := range registered {
+		if normalizeLoopback(r) == normCand {
+			return true
+		}
+
+		if !candLoopback {
+			continue
+		}
+
+		ru, rerr := url.Parse(r)
+		if rerr != nil || !isLoopbackHost(ru.Hostname()) {
+			continue
+		}
+
+		// Loopback: match everything but the port. Reject userinfo /
+		// fragments — registered redirect URIs carry neither, and the old
+		// Studio-side regex anchored them out too.
+		if cu.User == nil && cu.Fragment == "" &&
+			cu.Scheme == ru.Scheme && cu.Path == ru.Path && cu.RawQuery == ru.RawQuery {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isLoopbackHost reports whether host is one of the canonical loopback forms a
+// native/CLI redirect URI uses, for RFC 8252 §7.3 port-agnostic matching. We
+// treat 127.0.0.1, localhost and ::1 as equivalent (the seed config registers
+// the 127.0.0.1 and localhost variants). Anything else — including a
+// look-alike like "127.0.0.1.evil.com" — is not loopback and falls through to
+// exact matching.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 // authorizationCode handles the PKCE authorization code grant (RFC 6749 section 4.1).
@@ -972,7 +1369,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
@@ -1004,6 +1401,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			Scopes:            strings.Join(authCode.Scopes, " "),
 			TTL:               oauthClient.RefreshTokenTTL,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			// Seed the family with the access token's mission so every later
+			// rotation (and the access token each one mints) stays inside the
+			// same delegation tree (issue #81).
+			MissionID: cred.MissionID,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -1046,7 +1447,7 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 	}
 
 	if record.RefreshFamilyID != nil && *record.RefreshFamilyID != "" && s.refreshTokenSvc != nil {
-		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID)
+		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID, "auth_code_replay")
 		if revokeErr != nil {
 			log.Error().Err(revokeErr).Str("family_id", *record.RefreshFamilyID).Msg("Auth code replay: failed to revoke refresh token family")
 		} else if count > 0 {
@@ -1140,6 +1541,12 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// Inherit the mission from the refresh family rather than re-rooting
+		// it (issue #81). A refresh is continuity of an existing grant, not a
+		// new delegation tree. Empty when the family predates this column —
+		// IssueCredential then falls back to defaulting mission_id to the new
+		// credential's own JTI (the pre-fix behavior).
+		MissionID: oldToken.MissionID,
 	})
 	if err != nil {
 		return nil, err
