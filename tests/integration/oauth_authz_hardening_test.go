@@ -173,9 +173,13 @@ func TestOAuthAuthzHardening_ScopelessClientCannotWiden(t *testing.T) {
 }
 
 // TestOAuthAuthzHardening_WrongClientIDDoesNotBrickSession proves finding #4:
-// a refresh presented with a WRONG client_id is rejected (invalid_grant) WITHOUT
-// consuming the token — the original refresh token (and thus the family) stays
-// usable. (Fails if the client_id binding check runs AFTER RotateRefreshToken.)
+// a refresh presented with a WRONG client_id is rejected WITHOUT consuming the
+// token — the original refresh token (and thus the family) stays usable.
+// (Fails if the client_id binding check / client resolution runs AFTER
+// RotateRefreshToken.) The wrong client_id here is unknown, so per RFC 6749
+// §5.2 it's rejected as invalid_client at client resolution (fail-closed:
+// an unresolvable named client must not skip confidential-client auth) before
+// the token is ever touched.
 func TestOAuthAuthzHardening_WrongClientIDDoesNotBrickSession(t *testing.T) {
 	// Use the existing public MCP client to mint a refresh token.
 	verifier, challenge := buildPKCEPair(t)
@@ -190,14 +194,16 @@ func TestOAuthAuthzHardening_WrongClientIDDoesNotBrickSession(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	rt := decode(t, resp)["refresh_token"].(string)
 
-	// Refresh with the WRONG client_id → invalid_grant, token NOT consumed.
+	// Refresh with a WRONG (unknown) client_id → rejected, token NOT consumed.
+	// An unknown client is invalid_client per RFC 6749 §5.2; the security
+	// property under test is that the token survives the rejection.
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": rt,
 		"client_id":     "some-other-client",
 	}, nil)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
+	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
 
 	// The original token must STILL be usable with the correct client_id —
 	// the wrong-client_id attempt must not have bricked the session.

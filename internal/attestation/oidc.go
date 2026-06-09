@@ -90,10 +90,11 @@ func NewOIDCVerifier(httpClient *http.Client) *OIDCVerifier {
 // It is the seam through which a dev/test deployment opts out of the guard;
 // production must leave it false. Returns the verifier for chaining.
 //
-// NOTE FOR INTEGRATORS: there is currently no config flag wiring this from
-// server startup. To gate it on operator config, add an attestation config
-// field (see report in the closing PR) and call SetAllowPrivate in
-// server.go's verifier construction. Until then the guard is always on.
+// Wired from operator config: server.go passes
+// cfg.Attestation.AllowPrivateIssuerEndpoints (env
+// ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS, default false) into both
+// this verifier and the PolicyService, so the write-time and verify-time
+// guards agree. The guard is on unless an operator explicitly opts out.
 func (v *OIDCVerifier) SetAllowPrivate(allow bool) *OIDCVerifier {
 	v.allowPrivate = allow
 	return v

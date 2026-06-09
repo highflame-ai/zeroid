@@ -1511,8 +1511,15 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
 			return nil, err
 		}
-	} else {
-		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("failed to get oauth client for TTL override, using defaults")
+	} else if req.ClientID != "" {
+		// A client_id was named but the client can't be resolved (deleted, or a
+		// transient lookup error). Fail closed: proceeding here would skip
+		// verifyConfidentialClientAuth entirely, letting a confidential client
+		// refresh with no secret after its registration is gone. The client_id
+		// binding check below also rejects any client_id that doesn't match the
+		// token's bound client, so a token genuinely issued without a client
+		// (req.ClientID == "") still refreshes via the no-op branch.
+		return nil, oauthBadRequest(oautherror.InvalidClient, "client_id does not resolve to a registered client")
 	}
 
 	if accessTTL <= 0 {
