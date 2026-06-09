@@ -1,0 +1,360 @@
+{
+  "title": "ZeroID Cascade Revocation",
+  "uid": "zeroid-cascade",
+  "version": 3,
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "time": { "from": "now-5m", "to": "now" },
+  "timepicker": {},
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Business",
+      "description": "orch-business and its entire subtree lives in this column.",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 3 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "zeroid_token_active{agent=\"orch-business\"}",
+        "legendFormat": "{{agent}}",
+        "instant": false, "range": true, "refId": "A"
+      }],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 2,
+      "title": "Platform",
+      "description": "orch-platform and its entire subtree lives in this column.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 3 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "zeroid_token_active{agent=\"orch-platform\"}",
+        "legendFormat": "{{agent}}",
+        "instant": false, "range": true, "refId": "A"
+      }],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 3,
+      "title": "↳ Specialists",
+      "description": "Children of orch-business. spec-legal flips red when the CAE signal fires.",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 3, "w": 12, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "zeroid_token_active{parent=\"orch-business\"}",
+        "legendFormat": "{{agent}}",
+        "instant": false, "range": true, "refId": "A"
+      }],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 4,
+      "title": "↳ Specialists",
+      "description": "Children of orch-platform. Unaffected by the spec-legal signal.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 3, "w": 12, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "zeroid_token_active{parent=\"orch-platform\"}",
+        "legendFormat": "{{agent}}",
+        "instant": false, "range": true, "refId": "A"
+      }],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 5,
+      "title": "↳ Tools",
+      "description": "Tool agents under orch-business. Grouped by specialist: finance | hr | legal← | sales. The legal cluster flips red on cascade.",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 7, "w": 12, "h": 6 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-finance\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-hr\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-legal\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-sales\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "D"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 6,
+      "title": "↳ Tools",
+      "description": "Tool agents under orch-platform. Grouped by specialist: engineering | security | data | ops. All stay green.",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 7, "w": 12, "h": 6 },
+      "options": {
+        "reduceOptions": { "calcs": ["last"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "red", "value": null },
+            { "color": "green", "value": 1 }
+          ]},
+          "mappings": [{ "type": "value", "options": {
+            "0": { "text": "REVOKED", "color": "red",   "index": 0 },
+            "1": { "text": "ACTIVE",  "color": "green", "index": 1 }
+          }}],
+          "unit": "short", "min": 0, "max": 1
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-engineering\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-security\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-data\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-operations\"}",
+          "legendFormat": "{{agent}}", "instant": false, "range": true, "refId": "D"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 7,
+      "title": "Cascade Subtree — spec-legal and its 3 tool agents",
+      "description": "Only the 4 agents in the revocation subtree. Fire the CAE signal to watch these lines drop to 0.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 13, "w": 24, "h": 8 },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "spanNulls": true,
+            "lineInterpolation": "stepAfter"
+          },
+          "color": { "mode": "palette-classic" },
+          "min": -0.1, "max": 1.1, "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{agent=\"spec-legal\"}",
+          "legendFormat": "spec-legal (target)",
+          "instant": false, "range": true, "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "zeroid_token_active{parent=\"spec-legal\"}",
+          "legendFormat": "{{agent}}",
+          "instant": false, "range": true, "refId": "B"
+        }
+      ],
+      "datasource": { "type": "prometheus", "uid": "prometheus" }
+    },
+
+    {
+      "id": 8,
+      "title": "Revoked Agents",
+      "description": "Agents whose token has been detected as revoked, with timestamp.",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 21, "w": 24, "h": 6 },
+      "options": {
+        "footer": { "show": false },
+        "sortBy": [{ "desc": true, "displayName": "Revoked At" }]
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              { "id": "displayName", "value": "Revoked At (unix)" },
+              { "id": "unit", "value": "dateTimeAsLocal" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "agent" },
+            "properties": [{ "id": "displayName", "value": "Agent" }]
+          }
+        ]
+      },
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "expr": "zeroid_token_revoked_at_seconds > 0",
+        "legendFormat": "{{agent}}",
+        "instant": true,
+        "refId": "A"
+      }],
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true, "__name__": true, "job": true, "instance": true, "parent": true
+            }
+          }
+        }
+      ]
+    }
+
+  ]
+}
