@@ -29,19 +29,28 @@ func (r *ProofRepository) Create(ctx context.Context, pt *domain.ProofToken) err
 	return nil
 }
 
-// MarkUsed sets is_used = TRUE and records used_at for the token with the given JTI.
-func (r *ProofRepository) MarkUsed(ctx context.Context, jti string) error {
+// MarkUsed sets is_used = TRUE and records used_at for the token with the
+// given JTI, returning the number of rows claimed. The conditional UPDATE is
+// the single-use enforcement point: 0 rows means another verification already
+// claimed the token (or the JTI is unknown), and the caller must treat that
+// as a replay. A separate read-then-check is not sufficient — two concurrent
+// verifications can both observe is_used = FALSE.
+func (r *ProofRepository) MarkUsed(ctx context.Context, jti string) (int64, error) {
 	now := time.Now()
-	_, err := r.db.NewUpdate().
+	res, err := r.db.NewUpdate().
 		TableExpr("proof_tokens").
 		Set("is_used = TRUE, used_at = ?", now).
 		Where("jti = ?", jti).
 		Where("is_used = FALSE").
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to mark proof token as used: %w", err)
+		return 0, fmt.Errorf("failed to mark proof token as used: %w", err)
 	}
-	return nil
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read proof token claim result: %w", err)
+	}
+	return affected, nil
 }
 
 // GetByJTI retrieves a proof token by its JWT ID.

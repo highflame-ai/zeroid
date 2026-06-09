@@ -410,7 +410,7 @@ func NewServer(cfg Config) (*Server, error) {
 		jwksSvc:              jwksSvc,
 		refreshTokenSvc:      refreshTokenSvc,
 		revocationDispatcher: revocationDispatcher,
-		cleanupWorker:        worker.NewCleanupWorker(db, backchannelRepo, time.Hour),
+		cleanupWorker:        worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
 		adminAuthState:       authState,
 		globalMWState:        globalMW,
 		http: &http.Server{
