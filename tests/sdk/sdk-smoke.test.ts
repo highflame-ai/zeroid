@@ -351,9 +351,13 @@ describe("OAuth client credentials + delegation", () => {
       expect(created.client_secret).toBeTruthy();
       expect(created.client.client_id).toBe(orchExternalId);
 
-      // 4. client_credentials grant.
+      // 4. client_credentials grant. Unlike the Python SDK, the published TS
+      // SDK does not fall back to the client-level tenant defaults for this
+      // grant, and the server requires both for tenant-scoped client lookup.
       const token = await client.tokens.issueClientCredentials(orchExternalId, created.client_secret, {
         scope: "data:read",
+        account_id: ACCOUNT_ID,
+        project_id: PROJECT_ID,
       });
       expect(token.access_token).toBeTruthy();
       expect(token.token_type.toLowerCase()).toBe("bearer");
