@@ -274,10 +274,19 @@ func (s *BackchannelService) SetPingDispatchSync(sync bool) {
 
 // CreateAuthRequest input for POST /oauth2/bc-authorize.
 type CreateAuthRequestInput struct {
-	ClientID  string
-	AccountID string
-	ProjectID string
-	LoginHint string
+	ClientID string
+	// ClientSecret authenticates the initiating client at bc-authorize.
+	// REQUIRED when the resolved client is confidential — bc-authorize fires
+	// the deployer's notifier (SMS/push prompts to a real end user), so an
+	// unauthenticated caller must not be able to spam approval prompts at
+	// arbitrary users using a confidential client's identity. Public clients
+	// (CIBA Core §7.1 permits them) carry no secret and may remain
+	// unauthenticated here; the trust anchor for token issuance is still the
+	// user's approval, not the client credential. Empty for public clients.
+	ClientSecret string
+	AccountID    string
+	ProjectID    string
+	LoginHint    string
 	// GroupHint is the CIBA extension parameter for role/group-targeted
 	// approval. Opaque to zeroid; the deployer's BackchannelNotifier
 	// owns interpretation (e.g. AuthN treats "highflame:role:finance_lead"
@@ -353,13 +362,45 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		)
 	}
 
-	// Validate client exists in the tenant scope. We don't enforce a
-	// client_secret check here: CIBA Core §7.1 allows public clients to
-	// initiate the flow, and the trust anchor for token issuance is the
-	// user's approval, not the client credential.
+	// Resolve the client. GetClientByClientID intentionally returns any
+	// client (public or confidential) WITHOUT an is_active filter (the
+	// underlying repo GetByClientID skips the check — tracked as a follow-up;
+	// see the explicit IsActive guard below), so we re-derive activeness here.
 	client, err := s.oauthClientSvc.GetClientByClientID(ctx, in.ClientID)
 	if err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID), err)
+	}
+
+	// Reject deactivated clients explicitly. GetClientByClientID does not
+	// filter on is_active (unlike GetPublicClient / VerifyClientSecret, which
+	// both do), so without this guard a deactivated client could still drive
+	// CIBA. Use the same opaque invalid_client surface as "unknown client" so
+	// we don't leak the activeness state of a client_id.
+	if !client.IsActive {
+		return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
+	}
+
+	// Authenticate confidential clients. CIBA Core §7.1 permits public clients
+	// to initiate the flow unauthenticated — the trust anchor for token
+	// issuance is the user's approval, not the client credential — but a
+	// CONFIDENTIAL client registered a secret precisely so it can be
+	// authenticated. bc-authorize fires the deployer's notifier (real SMS/push
+	// approval prompts to an end user), so allowing an unauthenticated party to
+	// initiate against a confidential client lets them spam prompts at
+	// arbitrary users under that client's identity. Require + verify the
+	// client_secret when the client is confidential. A client is confidential
+	// if it declares so or carries a stored secret hash (belt-and-suspenders).
+	if client.ClientType == "confidential" || client.ClientSecret != "" {
+		if in.ClientSecret == "" {
+			return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
+		}
+		// VerifyClientSecret re-loads by client_id, re-checks is_active, and
+		// compares the bcrypt hash. On any failure surface the opaque
+		// invalid_client so we don't distinguish "wrong secret" from
+		// "unknown/deactivated client".
+		if _, verr := s.oauthClientSvc.VerifyClientSecret(ctx, in.ClientID, in.ClientSecret); verr != nil {
+			return nil, oauthBadRequestCause(oautherror.InvalidClient, "client authentication failed", verr)
+		}
 	}
 
 	// Determine notification mode. CIBA Core §10 makes the delivery mode a
@@ -629,6 +670,17 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	if in.AuthReqID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id is required for grant_type=urn:openid:params:grant-type:ciba")
 	}
+	// Fail closed on the ownership check. CIBA Core §11 binds an auth_req_id to
+	// the client that initiated it; the polling client MUST identify itself so
+	// we can confirm ownership. The previous comparison was skipped entirely
+	// when in.ClientID was empty, so a polling caller that simply omitted
+	// client_id could redeem ANY approved auth_req_id it learned. Require a
+	// non-empty client_id on the redemption path and always compare it to the
+	// row — empty or mismatched both yield the same opaque "not issued to this
+	// client" error so we don't leak which auth_req_ids exist.
+	if in.ClientID == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id was not issued to this client")
+	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err != nil {
 		if errors.Is(err, postgres.ErrBackchannelRequestNotFound) {
@@ -636,7 +688,7 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		}
 		return nil, oauthServerError("failed to load backchannel auth request", err)
 	}
-	if in.ClientID != "" && row.ClientID != in.ClientID {
+	if row.ClientID != in.ClientID {
 		// Mismatch means a different client is polling — refuse without leaking detail.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id was not issued to this client")
 	}
@@ -651,6 +703,19 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	now := time.Now()
 	if now.After(row.ExpiresAt) && row.Status == domain.BackchannelStatusPending {
 		// Race against the sweep: surface expired_token immediately.
+		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
+	}
+	// An APPROVED row that has outlived both its own expires_at and the
+	// post-approval grace window must NOT mint a token. Without this an
+	// approved-but-unredeemed auth_req_id was redeemable forever (the PENDING
+	// guard above never fired for it and DeleteExpired used to retain approved
+	// rows indefinitely), so a leaked months-old handle still issued a token.
+	// Surface expired_token, matching the PENDING-row treatment. The MarkIssued
+	// guard enforces the same bound atomically at the DB layer; this check
+	// surfaces the right error code before we attempt the claim.
+	if row.Status == domain.BackchannelStatusApproved &&
+		now.After(row.ExpiresAt) &&
+		now.After(approvalRedemptionDeadline(row)) {
 		return nil, oauthBadRequest(oautherror.ExpiredToken, "the backchannel authentication request has expired")
 	}
 
@@ -706,7 +771,12 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// initiate a new bc-authorize. That's preferable to silently minting two
 	// tokens — the failure is loud (HTTP 500) and the client's
 	// retry-with-new-auth-req-id path handles it cleanly.
-	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID)
+	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
+	// additionally rejects an approved row that has outlived both expires_at
+	// and the post-approval grace window — the atomic DB-layer counterpart to
+	// the expired_token pre-check in Redeem. A row that lost that race (or any
+	// concurrent second redemption) yields affected=0 and is rejected below.
+	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
 	if mErr != nil {
 		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
 		return nil, oauthServerError("failed to commit issuance state", mErr)
@@ -1120,6 +1190,22 @@ func (s *BackchannelService) postCallback(ctx context.Context, row *domain.Backc
 		return
 	}
 	deliver()
+}
+
+// approvalRedemptionDeadline returns the latest instant at which an APPROVED
+// row may still be redeemed via the grace window: approved_at +
+// postgres.ApprovedRedemptionGrace. Falls back to created_at when approved_at
+// is somehow unset (defensive — an approved row always has approved_at
+// stamped). Redeem combines this with expires_at: a row is redeemable while it
+// is within EITHER its own expires_at OR this grace deadline. This mirrors the
+// SQL guard in postgres.MarkIssued so the service-side expired_token decision
+// and the atomic DB-side claim agree.
+func approvalRedemptionDeadline(row *domain.BackchannelAuthRequest) time.Time {
+	base := row.CreatedAt
+	if row.ApprovedAt != nil {
+		base = *row.ApprovedAt
+	}
+	return base.Add(postgres.ApprovedRedemptionGrace)
 }
 
 // mintAuthReqID returns a 32-byte URL-safe random handle. 256 bits of entropy
