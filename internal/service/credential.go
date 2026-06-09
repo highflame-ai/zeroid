@@ -270,16 +270,43 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 
 		// Identity policy — governance ceiling.
-		if req.IdentityPolicyID != "" {
-			policy, err := s.policySvc.GetPolicy(ctx, req.IdentityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+		//
+		// Callers on the OAuth grant paths resolve the identity's policy
+		// themselves (via IdentityService.ResolveCredentialPolicy) and pass
+		// its ID in IdentityPolicyID. But three other issuance paths —
+		// RotateCredential, the admin issue handler, and post-attestation
+		// verification — historically left IdentityPolicyID empty, which
+		// turned this "authoritative chokepoint" into a no-op for them and
+		// let a since-tightened ceiling be bypassed.
+		//
+		// To make the chokepoint authoritative regardless of caller, resolve
+		// the policy here when none was supplied, mirroring
+		// ResolveCredentialPolicy exactly: prefer the identity's own
+		// CredentialPolicyID, otherwise fall back to the tenant default
+		// (EnsureDefaultPolicy). That fallback always yields a policy, so an
+		// identity that "has no policy configured" still issues — it's
+		// governed by the tenant default rather than being rejected. Callers
+		// that DO pass IdentityPolicyID keep using exactly that policy; we
+		// never re-resolve or override an explicit ID.
+		identityPolicyID := req.IdentityPolicyID
+		if identityPolicyID == "" {
+			resolved, err := s.resolveIdentityPolicyID(ctx, req.Identity)
 			if err != nil {
-				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", req.IdentityPolicyID, err)
+				return nil, nil, fmt.Errorf("failed to resolve identity credential policy: %w", err)
+			}
+			identityPolicyID = resolved
+		}
+
+		if identityPolicyID != "" {
+			policy, err := s.policySvc.GetPolicy(ctx, identityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", identityPolicyID, err)
 			}
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
 					Str("identity_id", req.Identity.ID).
-					Str("policy_id", req.IdentityPolicyID).
+					Str("policy_id", identityPolicyID).
 					Str("policy_layer", "identity").
 					Msg("Identity policy enforcement denied issuance")
 				return nil, nil, err
@@ -288,8 +315,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 
 		// API key policy — per-credential restriction. Checked only when a
 		// distinct policy is supplied; if the API key inherits the identity
-		// policy we skip the redundant enforcement.
-		if req.CredentialPolicyID != "" && req.CredentialPolicyID != req.IdentityPolicyID {
+		// policy we skip the redundant enforcement. Compared against the
+		// resolved identity policy (not the raw request field) so the skip
+		// still fires when the identity policy was resolved at this layer.
+		if req.CredentialPolicyID != "" && req.CredentialPolicyID != identityPolicyID {
 			policy, err := s.policySvc.GetPolicy(ctx, req.CredentialPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
 			if err != nil {
 				return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
@@ -585,6 +614,37 @@ func (s *CredentialService) dispatchRevocations(ctx context.Context, revoked []p
 		})
 	}
 	s.revocationDispatcher.Dispatch(ctx, events)
+}
+
+// resolveIdentityPolicyID returns the ID of the credential policy that
+// governs this identity, to be used as the authority ceiling at the issuance
+// chokepoint when the caller didn't supply one explicitly.
+//
+// It mirrors IdentityService.ResolveCredentialPolicy: prefer the identity's
+// own CredentialPolicyID, otherwise fall back to the tenant default
+// (EnsureDefaultPolicy, which creates one on first use). The chokepoint owns
+// this resolution so every issuance path is governed even when its caller
+// forgot to resolve and pass IdentityPolicyID. CredentialService already holds
+// policySvc, so this introduces no new dependency and no import cycle (the
+// OAuth-side resolver lives on IdentityService, which depends on
+// CredentialService — reaching the other way would cycle).
+//
+// EnsureDefaultPolicy always returns a policy, so this never produces an
+// "unrestricted, no policy" outcome for a tenant that simply never configured
+// one — that tenant is governed by the permissive default policy, matching the
+// OAuth grant paths exactly.
+func (s *CredentialService) resolveIdentityPolicyID(ctx context.Context, identity *domain.Identity) (string, error) {
+	if s.policySvc == nil || identity == nil {
+		return "", nil
+	}
+	if identity.CredentialPolicyID != "" {
+		return identity.CredentialPolicyID, nil
+	}
+	policy, err := s.policySvc.EnsureDefaultPolicy(ctx, identity.AccountID, identity.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	return policy.ID, nil
 }
 
 // RotateCredential revokes an existing credential and immediately issues a new one for the same identity.
