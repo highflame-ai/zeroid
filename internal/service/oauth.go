@@ -1512,14 +1512,18 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			return nil, err
 		}
 	} else if req.ClientID != "" {
-		// A client_id was named but the client can't be resolved (deleted, or a
-		// transient lookup error). Fail closed: proceeding here would skip
-		// verifyConfidentialClientAuth entirely, letting a confidential client
-		// refresh with no secret after its registration is gone. The client_id
-		// binding check below also rejects any client_id that doesn't match the
-		// token's bound client, so a token genuinely issued without a client
-		// (req.ClientID == "") still refreshes via the no-op branch.
-		return nil, oauthBadRequest(oautherror.InvalidClient, "client_id does not resolve to a registered client")
+		// A client_id was named but the client can't be resolved. Fail closed:
+		// proceeding here would skip verifyConfidentialClientAuth entirely,
+		// letting a confidential client refresh with no secret after its
+		// registration is gone. The client_id binding check below also rejects
+		// any client_id that doesn't match the token's bound client, so a token
+		// genuinely issued without a client (req.ClientID == "") still refreshes
+		// via the no-op branch. A genuine "unknown client" is invalid_client; an
+		// operational lookup error is a server fault, not the client's.
+		if errors.Is(err, ErrOAuthClientNotFound) {
+			return nil, oauthBadRequest(oautherror.InvalidClient, "client_id does not resolve to a registered client")
+		}
+		return nil, oauthServerError("failed to resolve client for refresh grant", err)
 	}
 
 	if accessTTL <= 0 {
@@ -1827,7 +1831,9 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
 			return oauthUnauthorized("invalid client credentials", err)
 		}
-		return oauthUnauthorized("client verification failed", err)
+		// An unexpected (operational) error is a server fault, not a client
+		// authentication failure — don't mislead the client with a 401.
+		return oauthServerError("client verification failed", err)
 	}
 	return nil
 }
@@ -1843,27 +1849,44 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 // here because that would break the standalone deployment model and the
 // established tenant-header access pattern.
 //
-// Returns nil when no credentials were presented OR when presented credentials
-// verify. Returns an *OAuthError (invalid_client / 401) when a client_secret is
-// presented but does not verify, or when only one half of the credential pair
-// is supplied (a malformed authentication attempt, not an anonymous call).
+// Returns nil when no credentials were presented, when a registered PUBLIC
+// client presents just its client_id, or when a confidential client's
+// client_id + client_secret verify. Returns an *OAuthError (invalid_client /
+// 401) when a presented secret does not verify, when only a client_secret is
+// supplied without a client_id, or when a client_id without a secret does not
+// resolve to a public client. Operational failures surface as 500.
 func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
 	// Anonymous call — neither half presented. Preserve existing internal-path
 	// behavior; the caller falls through to the unauthenticated flow.
 	if clientID == "" && clientSecret == "" {
 		return nil
 	}
-	// A half-supplied credential pair is a malformed authentication attempt
-	// (RFC 6749 §2.3.1: both client_id and client_secret are required for
-	// client_secret_post). Reject rather than silently treating it as anonymous.
-	if clientID == "" || clientSecret == "" {
-		return oauthUnauthorized("client_id and client_secret must both be supplied", nil)
+	// A client_secret with no client_id is a malformed attempt — there is no
+	// client to authenticate. Reject rather than treat it as anonymous.
+	if clientID == "" {
+		return oauthUnauthorized("client_id is required when a client_secret is supplied", nil)
+	}
+	// client_id with no secret: valid only for a registered public client.
+	// RFC 7009 §2.1 / RFC 7662 §2.1 — public clients have no secret, and
+	// standard OAuth libraries attach client_id to revocation/introspection
+	// requests. A confidential client (or an unknown client_id) must present a
+	// secret, so this neither widens access nor lets a confidential client
+	// skip authentication.
+	if clientSecret == "" {
+		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
+			if errors.Is(err, ErrOAuthClientNotFound) {
+				return oauthUnauthorized("client authentication required", nil)
+			}
+			return oauthServerError("client verification failed", err)
+		}
+		return nil
 	}
 	if _, err := s.oauthClientSvc.VerifyClientSecret(ctx, clientID, clientSecret); err != nil {
 		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
 			return oauthUnauthorized("invalid client credentials", err)
 		}
-		return oauthUnauthorized("client verification failed", err)
+		// Operational failure — server fault, not a client auth failure.
+		return oauthServerError("client verification failed", err)
 	}
 	return nil
 }

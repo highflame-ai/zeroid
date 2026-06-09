@@ -302,3 +302,32 @@ func TestOAuthAuthzHardening_RevocationClientAuth(t *testing.T) {
 	_ = revokeResp.Body.Close()
 	assert.False(t, introspect(t, tokenA)["active"].(bool), "no-credential revocation must revoke the token")
 }
+
+// TestOAuthAuthzHardening_PublicClientRevocationWithoutSecret proves the
+// accept-and-verify posture honors RFC 7009 §2.1 / RFC 7662 §2.1 for public
+// clients: a registered public client presenting only its client_id (no
+// secret — which standard OAuth libraries attach to revocation requests) is
+// accepted, while a confidential client_id with no secret is rejected.
+func TestOAuthAuthzHardening_PublicClientRevocationWithoutSecret(t *testing.T) {
+	// Public client (testMCPClientID is registered without a secret) presenting
+	// only its client_id on revoke → accepted (RFC 7009 always-200), not 401.
+	resp := post(t, "/oauth2/token/revoke", map[string]any{
+		"token":     "some-unknown-token",
+		"client_id": testMCPClientID,
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"a public client presenting only client_id must be accepted on revoke")
+	_ = resp.Body.Close()
+
+	// Confidential client presenting client_id without its secret → rejected.
+	agentID := uid("revoke-conf-nosecret")
+	registerIdentity(t, agentID, []string{"data:read"})
+	conf := registerOAuthClient(t, agentID, []string{"data:read"})
+	resp = post(t, "/oauth2/token/revoke", map[string]any{
+		"token":     "some-unknown-token",
+		"client_id": conf.ClientID,
+	}, adminHeaders())
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"a confidential client must present its secret, not just client_id")
+	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+}
