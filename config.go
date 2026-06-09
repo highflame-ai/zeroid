@@ -80,6 +80,24 @@ type AttestationConfig struct {
 	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
 	// (the only real verifier shipped) is unaffected by this flag.
 	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
+
+	// AllowPrivateIssuerEndpoints relaxes the SSRF guard the OIDC
+	// attestation verifier applies to a proof's issuer endpoint (the URL
+	// it fetches OIDC discovery + JWKS from). Default false
+	// (production-safe).
+	//
+	// When false, the verifier rejects issuer endpoints that resolve to
+	// private, loopback, link-local, multicast, CGN, or unspecified IP
+	// ranges so an attacker-controlled proof can't make the server fetch
+	// internal URLs (SSRF).
+	//
+	// When true, that guard is disabled. Use ONLY in single-tenant
+	// test/dev deployments whose attestation issuer is itself on
+	// localhost / a private network. Production MUST keep this false.
+	//
+	// NOTE: this flag is the config surface only — the OIDC verifier in
+	// the attestation subsystem (server-side) must read it to take effect.
+	AllowPrivateIssuerEndpoints bool `koanf:"allow_private_issuer_endpoints"`
 }
 
 // SigningCredsConfig governs workload-attested ephemeral signing
@@ -300,7 +318,59 @@ func (c *Config) Validate() error {
 	if err := validateIssuer(c.Token.Issuer); err != nil {
 		return err
 	}
+
+	// Production-gated hardening. server.env had ZERO readers before this —
+	// it now governs the footgun defaults that are safe in dev but dangerous
+	// in production. The dev defaults stay intact so local/test workflows are
+	// unaffected; these checks only fire when the deployer declares production.
+	if isProductionEnv(c.Server.Env) {
+		// The dev stub accepts ANY submitted proof for image_hash/tpm. Its
+		// default is true (so dev demos work); leaving it on in production
+		// means accept-any attestation. Force an explicit opt-out.
+		if c.Attestation.AllowUnsafeDevStub {
+			return fmt.Errorf("attestation.allow_unsafe_dev_stub must be false in production (server.env=%q): the stub accepts ANY submitted proof for image_hash/tpm — set ZEROID_ALLOW_UNSAFE_DEV_STUB=false", c.Server.Env)
+		}
+		// token.issuer and wimse_domain ship with Highflame's hosted defaults.
+		// A production deploy that forgets to override them silently runs on
+		// Highflame's identity — require an explicit value.
+		if c.Token.Issuer == defaultIssuer {
+			return fmt.Errorf("token.issuer must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_ISSUER to this deployment's public URL", c.Server.Env, defaultIssuer)
+		}
+		if c.WIMSEDomain == defaultWIMSEDomain {
+			return fmt.Errorf("wimse_domain must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_WIMSE_DOMAIN to this deployment's trust domain", c.Server.Env, defaultWIMSEDomain)
+		}
+	}
+
+	// token.hmac_secret signs/verifies stateless authorization_code JWTs
+	// (HS256). The authorization_code grant is optional, so the secret is not
+	// globally required — but a weak secret is forgeable, so when one IS set
+	// we enforce a floor. 32 bytes matches the HS256 output size.
+	if c.Token.HMACSecret != "" && len(c.Token.HMACSecret) < 32 {
+		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
+	}
+
 	return nil
+}
+
+// defaultIssuer and defaultWIMSEDomain are the built-in dev defaults that the
+// production gate in Validate() rejects when left unchanged. They MUST match
+// the values set in loadDefaults() — kept as named constants so the gate and
+// the default can never drift.
+const (
+	defaultIssuer      = "https://auth.highflame.ai"
+	defaultWIMSEDomain = "highflame.ai"
+)
+
+// isProductionEnv reports whether server.env names a production deployment.
+// Accepts the common spellings ("production", "prod") case-insensitively so a
+// deployer can't accidentally dodge the production gate with "Production".
+func isProductionEnv(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "production", "prod":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateIssuer enforces RFC 8414 §2's shape constraints on Token.Issuer.
@@ -363,6 +433,18 @@ func rejectRemovedKeys(k *koanf.Koanf) error {
 	}
 	if os.Getenv("ZEROID_BASE_URL") != "" {
 		return fmt.Errorf("ZEROID_BASE_URL has been removed: set ZEROID_ISSUER to the full URL ZeroID is reached at (RFC 8414 §3 anchors discovery on the issuer URL). See CHANGELOG for migration notes")
+	}
+	// telemetry.endpoint / telemetry.insecure were removed when exporter
+	// configuration moved to the standard OTel SDK env vars
+	// (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE). They are no
+	// longer fields on TelemetryConfig, so koanf would silently drop them —
+	// reject loudly so a stale YAML doesn't quietly point telemetry at the
+	// wrong collector.
+	if k.Exists("telemetry.endpoint") {
+		return fmt.Errorf("telemetry.endpoint has been removed: exporter config moved to the OTel SDK env var OTEL_EXPORTER_OTLP_ENDPOINT. Remove it from config and set the env var instead")
+	}
+	if k.Exists("telemetry.insecure") {
+		return fmt.Errorf("telemetry.insecure has been removed: exporter config moved to the OTel SDK env var OTEL_EXPORTER_OTLP_INSECURE. Remove it from config and set the env var instead")
 	}
 	return nil
 }
@@ -436,12 +518,12 @@ func loadDefaults(k *koanf.Koanf) error {
 		// service, not the marketing site). Self-hosted deployments
 		// override via ZEROID_ISSUER or token.issuer in YAML. Local dev
 		// on localhost:8899 should set ZEROID_ISSUER=http://localhost:8899.
-		"token.issuer":      "https://auth.highflame.ai",
+		"token.issuer":      defaultIssuer,
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 
 		// WIMSE
-		"wimse_domain": "highflame.ai",
+		"wimse_domain": defaultWIMSEDomain,
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -456,6 +538,10 @@ func loadDefaults(k *koanf.Koanf) error {
 		// ZEROID_ALLOW_UNSAFE_DEV_STUB=false for deployments that don't
 		// submit those proof types (or once real verifiers land).
 		"attestation.allow_unsafe_dev_stub": true,
+		// SSRF guard on the OIDC verifier's issuer-endpoint fetch. Default
+		// false (production-safe); dev/test deployments whose attestation
+		// issuer is on localhost/a private network opt in.
+		"attestation.allow_private_issuer_endpoints": false,
 
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
@@ -483,9 +569,10 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT":              "server.port",
-		"ZEROID_ENV":               "server.env",
-		"ZEROID_ADMIN_PATH_PREFIX": "server.admin_path_prefix",
+		"ZEROID_PORT":                    "server.port",
+		"ZEROID_ENV":                     "server.env",
+		"ZEROID_ADMIN_PATH_PREFIX":       "server.admin_path_prefix",
+		"ZEROID_TRUST_FORWARDED_HEADERS": "server.trust_forwarded_headers",
 
 		// Database
 		"ZEROID_DATABASE_URL": "database.url",
@@ -514,12 +601,20 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_ISSUER":                "token.issuer",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
+		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
+		"ZEROID_HMAC_SECRET": "token.hmac_secret",
 
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
 
 		// Attestation
-		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
+		"ZEROID_ALLOW_UNSAFE_DEV_STUB":                      "attestation.allow_unsafe_dev_stub",
+		"ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS": "attestation.allow_private_issuer_endpoints",
+
+		// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
+		// test/dev deployments only. Production MUST leave this false.
+		"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
 
 		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
 		// directly by the OTel SDK (spec-compliant).
@@ -536,26 +631,47 @@ func loadEnvVars(k *koanf.Koanf) error {
 			continue
 		}
 
+		// Parse errors are returned, not swallowed: a typo'd typed env var
+		// (e.g. ZEROID_ALLOW_UNSAFE_DEV_STUB=flase) must NOT silently retain
+		// the default — for a security flag that means the accept-any
+		// attestation stub stays on. Fail loud at startup instead.
 		switch {
 		case strings.HasSuffix(configPath, ".enabled") ||
-			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
-			if boolVal, err := strconv.ParseBool(value); err == nil {
-				_ = k.Set(configPath, boolVal)
+			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub") ||
+			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
+			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints"):
+			boolVal, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)
+			}
+			if err := k.Set(configPath, boolVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		case strings.HasSuffix(configPath, ".max_open_conns") ||
 			strings.HasSuffix(configPath, ".max_idle_conns") ||
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
-			if intVal, err := strconv.Atoi(value); err == nil {
-				_ = k.Set(configPath, intVal)
+			intVal, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid integer", envVar, value)
+			}
+			if err := k.Set(configPath, intVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		case strings.HasSuffix(configPath, ".sampling_rate"):
-			if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
-				_ = k.Set(configPath, floatVal)
+			floatVal, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid float", envVar, value)
+			}
+			if err := k.Set(configPath, floatVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		default:
-			_ = k.Set(configPath, value)
+			if err := k.Set(configPath, value); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
+			}
 		}
 	}
 

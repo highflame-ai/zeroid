@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -139,6 +140,40 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired dpop jti records")
 	} else if n, err := dpopRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired dpop jti records")
+	}
+
+	// Refresh tokens: under rotation every refresh inserts a successor row and
+	// revokes its predecessor, so the table grows linearly with token traffic
+	// if never swept. Delete rows whose expires_at is past the reuse-detection
+	// grace window. Reuse detection (service/refresh_token.go) consults
+	// recently-revoked rows for RefreshTokenReuseGraceWindow after revocation to
+	// distinguish a benign concurrent retry from a replay attack; lagging the
+	// cutoff by that window guarantees we never delete a row reuse detection
+	// could still need. Expiry is the bound (rotation revokes well before
+	// expires_at), so a row past expires_at - graceWindow is safe to reap.
+	refreshRepo := postgres.NewRefreshTokenRepository(w.db)
+	if n, err := refreshRepo.DeleteExpired(ctx, now.Add(-domain.RefreshTokenReuseGraceWindow)); err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired refresh tokens")
+	} else if n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired refresh tokens")
+	}
+
+	// Signing credentials: prune non-revoked rows whose audit-retention window
+	// has fully elapsed. This mirrors SigningCredentialRepository.PruneExpiredRetention
+	// exactly (same WHERE: revoked = false AND audit_retention_until <= now) —
+	// replicated inline rather than wired through the repo because the worker is
+	// constructed in server.go without a SigningCredentialRepository and that
+	// constructor is out of scope to change. Revoked rows are retained as a
+	// tamper-evidence trail. Backed by idx_signing_credentials_retention (023).
+	signingRes, err := w.db.NewDelete().
+		TableExpr("signing_credentials").
+		Where("revoked = ?", false).
+		Where("audit_retention_until <= ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to prune expired signing credentials")
+	} else if n, err := signingRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: pruned expired signing credentials")
 	}
 
 	// CIBA backchannel requests:

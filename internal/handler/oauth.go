@@ -113,22 +113,39 @@ func extractOAuthError(err error) (code, description string, status int) {
 type IntrospectInput struct {
 	Body struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to introspect"`
+		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7662 §2.1
+		// authorization). When supplied they are verified (accept-and-verify
+		// posture); a bad secret is rejected with invalid_client. When omitted
+		// the endpoint preserves the internal/network-isolated access path.
+		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth)"`
+		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth)"`
 	}
 }
 
 type IntrospectOutput struct {
-	Body any // dynamic shape per RFC 7662
+	Status int
+	Body   any // dynamic shape per RFC 7662; oauthErrorBody on client-auth failure
 }
 
 type OAuthRevokeInput struct {
 	Body struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to revoke"`
+		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7009 §2.1
+		// authorization). Same accept-and-verify posture as introspection.
+		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth)"`
+		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth)"`
 	}
 }
 
 type OAuthRevokeOutput struct {
-	Body struct {
+	Status int
+	Body   struct {
 		Revoked bool `json:"revoked"`
+		// Error / ErrorDescription are populated only when presented client
+		// credentials fail verification (invalid_client). On every other path
+		// the RFC 7009 §2.2 "always 200" contract holds.
+		Error            string `json:"error,omitempty"`
+		ErrorDescription string `json:"error_description,omitempty"`
 	}
 }
 
@@ -326,17 +343,37 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 }
 
 func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*IntrospectOutput, error) {
-	result, err := a.oauthSvc.Introspect(ctx, input.Body.Token)
-	if err != nil {
-		return &IntrospectOutput{Body: map[string]any{"active": false}}, nil
+	// Accept-and-verify client auth (RFC 7662 §2.1). When credentials are
+	// presented they MUST verify; a bad secret is rejected with invalid_client.
+	// When absent, the existing internal/tenant-header access path is preserved.
+	if err := a.oauthSvc.VerifyPresentedClientAuth(ctx, input.Body.ClientID, input.Body.ClientSecret); err != nil {
+		code, desc, status := extractOAuthError(err)
+		return &IntrospectOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}, nil
 	}
 
-	return &IntrospectOutput{Body: result}, nil
+	result, err := a.oauthSvc.Introspect(ctx, input.Body.Token)
+	if err != nil {
+		return &IntrospectOutput{Status: http.StatusOK, Body: map[string]any{"active": false}}, nil
+	}
+
+	return &IntrospectOutput{Status: http.StatusOK, Body: result}, nil
 }
 
 func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevokeOutput, error) {
+	// Accept-and-verify client auth (RFC 7009 §2.1). A presented-but-wrong
+	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
+	// "always 200" contract holds (including for unknown/already-revoked tokens
+	// and anonymous internal-path callers).
+	if err := a.oauthSvc.VerifyPresentedClientAuth(ctx, input.Body.ClientID, input.Body.ClientSecret); err != nil {
+		_, desc, status := extractOAuthError(err)
+		out := &OAuthRevokeOutput{Status: status}
+		out.Body.Error = oautherror.InvalidClient
+		out.Body.ErrorDescription = desc
+		return out, nil
+	}
+
 	_ = a.oauthSvc.Revoke(ctx, input.Body.Token)
-	out := &OAuthRevokeOutput{}
+	out := &OAuthRevokeOutput{Status: http.StatusOK}
 	out.Body.Revoked = true
 	return out, nil
 }
