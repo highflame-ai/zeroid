@@ -207,15 +207,19 @@ func TestUpdateIdentityTrustLevel(t *testing.T) {
 
 // TestDeleteIdentity verifies that DELETE /api/v1/identities/{id} deactivates
 // the identity (soft delete) rather than hard-deleting it: the call returns
-// 204 and the identity row is retained with status=deactivated.
+// 200 with the deactivated identity as the body (the published SDKs parse it
+// — see identities.delete in highflame/zeroid and @highflame/sdk), and the
+// identity row is retained with status=deactivated.
 func TestDeleteIdentity(t *testing.T) {
 	externalID := uid("delete-agent")
 	identity := registerIdentity(t, externalID, []string{"billing:read"})
 
 	resp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+identity.ID), nil, adminHeaders())
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
-	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	deleted := decode(t, resp)
+	assert.Equal(t, identity.ID, deleted["id"], "DELETE must return the deactivated identity")
+	assert.Equal(t, "deactivated", deleted["status"])
 
 	// Soft delete: the row survives, flipped to deactivated (not 404/gone).
 	getResp := get(t, adminPath("/identities/"+identity.ID), adminHeaders())
