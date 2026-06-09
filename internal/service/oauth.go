@@ -228,6 +228,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.backchannelSvc.Redeem(ctx, RedeemInput{
 			AuthReqID:         req.AuthReqID,
 			ClientID:          req.ClientID,
+			ClientSecret:      req.ClientSecret,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
@@ -1506,22 +1507,29 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// possession with the refresh-token string alone and carries no secret.
 	var accessTTL, refreshTokenTTL int
 	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
+		// GetClientByClientID does not filter is_active (unlike GetPublicClient /
+		// VerifyClientSecret), and verifyConfidentialClientAuth is a no-op for
+		// public clients — so without this guard a deactivated PUBLIC client
+		// could keep rotating refresh tokens indefinitely. Same gate as the
+		// authorization_code path.
+		if !oauthClient.IsActive {
+			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+		}
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
 			return nil, err
 		}
-	} else if req.ClientID != "" {
-		// A client_id was named but the client can't be resolved. Fail closed:
-		// proceeding here would skip verifyConfidentialClientAuth entirely,
-		// letting a confidential client refresh with no secret after its
-		// registration is gone. The client_id binding check below also rejects
-		// any client_id that doesn't match the token's bound client, so a token
-		// genuinely issued without a client (req.ClientID == "") still refreshes
-		// via the no-op branch. A genuine "unknown client" is invalid_client; an
-		// operational lookup error is a server fault, not the client's.
+	} else {
+		// The named client_id (required by the entry guard above) can't be
+		// resolved. Fail closed: proceeding here would skip
+		// verifyConfidentialClientAuth entirely, letting a confidential client
+		// refresh with no secret after its registration is gone. A genuine
+		// "unknown client" is invalid_client (401, matching the
+		// authorization_code path); an operational lookup error is a server
+		// fault, not the client's.
 		if errors.Is(err, ErrOAuthClientNotFound) {
-			return nil, oauthBadRequest(oautherror.InvalidClient, "client_id does not resolve to a registered client")
+			return nil, oauthUnauthorized("client_id does not resolve to a registered client", nil)
 		}
 		return nil, oauthServerError("failed to resolve client for refresh grant", err)
 	}

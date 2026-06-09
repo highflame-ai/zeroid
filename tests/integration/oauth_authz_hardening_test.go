@@ -195,14 +195,15 @@ func TestOAuthAuthzHardening_WrongClientIDDoesNotBrickSession(t *testing.T) {
 	rt := decode(t, resp)["refresh_token"].(string)
 
 	// Refresh with a WRONG (unknown) client_id → rejected, token NOT consumed.
-	// An unknown client is invalid_client per RFC 6749 §5.2; the security
-	// property under test is that the token survives the rejection.
+	// An unknown client is invalid_client per RFC 6749 §5.2 (401, matching the
+	// authorization_code path); the security property under test is that the
+	// token survives the rejection.
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": rt,
 		"client_id":     "some-other-client",
 	}, nil)
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
 
 	// The original token must STILL be usable with the correct client_id —

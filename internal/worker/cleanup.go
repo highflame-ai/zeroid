@@ -159,20 +159,12 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 	}
 
 	// Signing credentials: prune non-revoked rows whose audit-retention window
-	// has fully elapsed. This mirrors SigningCredentialRepository.PruneExpiredRetention
-	// exactly (same WHERE: revoked = false AND audit_retention_until <= now) —
-	// replicated inline rather than wired through the repo because the worker is
-	// constructed in server.go without a SigningCredentialRepository and that
-	// constructor is out of scope to change. Revoked rows are retained as a
-	// tamper-evidence trail. Backed by idx_signing_credentials_retention (023).
-	signingRes, err := w.db.NewDelete().
-		Model((*domain.SigningCredential)(nil)).
-		Where("revoked = ?", false).
-		Where("audit_retention_until <= ?", now).
-		Exec(ctx)
-	if err != nil {
+	// has fully elapsed. Revoked rows are retained as a tamper-evidence trail.
+	// Backed by idx_signing_credentials_retention (023).
+	signingRepo := postgres.NewSigningCredentialRepository(w.db)
+	if n, err := signingRepo.PruneExpiredRetention(ctx, now); err != nil {
 		log.Error().Err(err).Msg("Cleanup: failed to prune expired signing credentials")
-	} else if n, err := signingRes.RowsAffected(); err == nil && n > 0 {
+	} else if n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: pruned expired signing credentials")
 	}
 

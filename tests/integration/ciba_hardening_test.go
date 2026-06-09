@@ -14,22 +14,19 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// TestCIBAHardening pins three security fixes in the CIBA flow. Each subtest is
+// TestCIBAHardening pins the security fixes in the CIBA flow. Each subtest is
 // written so it FAILS if its fix is reverted (the assertion comments call out
 // the pre-fix behaviour).
 //
 // The subtests drive the service layer directly (constructed over the shared
-// testDB) rather than through HTTP, for two reasons:
+// testDB) rather than through HTTP: the expiry subtests need to backdate
+// expires_at / approved_at, which HTTP cannot do. (The bc-authorize handler
+// does forward client_secret — BcAuthorizeInput in internal/handler/oauth.go —
+// so the confidential path is also reachable over HTTP; these tests predate
+// that wiring and exercising the fix where it lives is still the tighter
+// loop.)
 //
-//  1. The bc-authorize HTTP handler (internal/handler/oauth.go, BcAuthorizeInput)
-//     does NOT read or forward client_secret, so the confidential-client
-//     positive path ("correct secret → ok") is not reachable over HTTP until
-//     that handler grows a client_secret field. Testing the service directly
-//     exercises the fix where it lives.
-//  2. The expiry subtest needs to backdate expires_at / approved_at, which the
-//     service does for us via the repo but which HTTP cannot.
-//
-// All three fixes live in internal/service/backchannel.go and
+// The fixes live in internal/service/backchannel.go and
 // internal/store/postgres/backchannel_request.go.
 func TestCIBAHardening(t *testing.T) {
 	ctx := context.Background()
@@ -147,9 +144,10 @@ func TestCIBAHardening(t *testing.T) {
 		// Guardrail for FIX #2: an honest slow poll whose approval landed just
 		// before expiry must STILL be redeemable inside the grace window — the
 		// bound must not make approvals instantly un-redeemable. We assert the
-		// row is NOT reaped and Redeem does NOT return expired_token. (It will
-		// proceed to issuance, which requires a credential service — so we use
-		// MarkIssued directly to prove the DB-layer guard admits the row.)
+		// row is NOT reaped by DeleteExpired and that MarkIssued (the DB-layer
+		// redeemability guard Redeem relies on) admits it. Redeem itself isn't
+		// called here: past this guard it proceeds to token issuance, which
+		// needs a credential service this harness deliberately leaves nil.
 		clientID := uid("ciba-hard-grace")
 		registerTestOAuthClient(clientID, []string{"client_credentials"})
 
@@ -236,6 +234,54 @@ func TestCIBAHardening(t *testing.T) {
 		})
 		require.NoError(t, e4, "public client must remain unauthenticated at bc-authorize")
 		require.NotEmpty(t, pubOut.AuthReqID)
+	})
+
+	t.Run("Redeem_ConfidentialClientAuth", func(t *testing.T) {
+		// FIX #4: token-endpoint redemption must authenticate confidential
+		// clients (CIBA Core §10.2), symmetric with the bc-authorize check —
+		// otherwise a leaked auth_req_id alone mints the token for a
+		// confidential client. Pre-fix, Redeem checked only client_id
+		// ownership; the no-secret call below would have returned
+		// authorization_pending instead of invalid_client.
+		confClient := registerOAuthClient(t, uid("ciba-hard-redeem"), []string{"openid"})
+
+		out, err := bcSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
+			ClientID:     confClient.ClientID,
+			ClientSecret: confClient.ClientSecret,
+			AccountID:    testAccountID,
+			ProjectID:    testProjectID,
+			LoginHint:    "frank@example.com",
+			Scope:        "openid",
+		})
+		require.NoError(t, err)
+
+		// The row stays PENDING on purpose: a correct-secret Redeem then stops
+		// at authorization_pending, proving client auth passed and the polling
+		// state machine was reached — without needing the (nil) credential
+		// service that token issuance would require.
+
+		// Missing secret → invalid_client (NOT authorization_pending).
+		_, e1 := bcSvc.Redeem(ctx, service.RedeemInput{
+			AuthReqID: out.AuthReqID,
+			ClientID:  confClient.ClientID,
+		})
+		requireOAuthError(t, e1, oautherror.InvalidClient)
+
+		// Wrong secret → invalid_client.
+		_, e2 := bcSvc.Redeem(ctx, service.RedeemInput{
+			AuthReqID:    out.AuthReqID,
+			ClientID:     confClient.ClientID,
+			ClientSecret: "definitely-not-the-secret",
+		})
+		requireOAuthError(t, e2, oautherror.InvalidClient)
+
+		// Correct secret → past client auth, into the polling state machine.
+		_, e3 := bcSvc.Redeem(ctx, service.RedeemInput{
+			AuthReqID:    out.AuthReqID,
+			ClientID:     confClient.ClientID,
+			ClientSecret: confClient.ClientSecret,
+		})
+		requireOAuthError(t, e3, oautherror.AuthorizationPending)
 	})
 }
 

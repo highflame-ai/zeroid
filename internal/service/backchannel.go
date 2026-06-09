@@ -656,6 +656,11 @@ func (s *BackchannelService) dispatchResolution(ctx context.Context, row *domain
 type RedeemInput struct {
 	AuthReqID string
 	ClientID  string
+	// ClientSecret authenticates a confidential client at the token endpoint
+	// (OpenID CIBA Core §10.2: token requests follow standard OAuth client-
+	// authentication rules, same as refresh_token/authorization_code). Empty
+	// for public clients.
+	ClientSecret string
 	// DPoPKeyThumbprint forwards the proof key thumbprint from the token
 	// endpoint so a CIBA-redeemed token can still be DPoP-bound (RFC 9449).
 	// Non-empty when the polling /oauth2/token call carried a valid DPoP
@@ -681,6 +686,32 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	if in.ClientID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "auth_req_id was not issued to this client")
 	}
+
+	// Authenticate confidential clients at redemption (CIBA Core §10.2: the
+	// token request follows standard OAuth client-authentication rules, the
+	// same posture as the refresh_token/authorization_code grants). The
+	// initiation side (bc-authorize) already enforces this; without the
+	// symmetric check here a leaked auth_req_id alone would mint the token for
+	// a confidential client, defeating the defense-in-depth the secret
+	// provides. Runs BEFORE the row lookup so an unauthenticated caller learns
+	// nothing about which auth_req_ids exist. Same confidentiality test and
+	// opaque invalid_client surface as bc-authorize. An unresolvable client_id
+	// falls through — CIBA rows are only created for registered clients, so
+	// the row ownership check below rejects it with the usual opaque error.
+	if client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, in.ClientID); cerr == nil {
+		if !client.IsActive {
+			return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
+		}
+		if client.ClientType == "confidential" || client.ClientSecret != "" {
+			if in.ClientSecret == "" {
+				return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
+			}
+			if _, verr := s.oauthClientSvc.VerifyClientSecret(ctx, in.ClientID, in.ClientSecret); verr != nil {
+				return nil, oauthBadRequestCause(oautherror.InvalidClient, "client authentication failed", verr)
+			}
+		}
+	}
+
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
 	if err != nil {
 		if errors.Is(err, postgres.ErrBackchannelRequestNotFound) {

@@ -486,9 +486,12 @@ func ssrfGuardedTransport(allowPrivate func() bool) *http.Transport {
 					return nil, ErrPrivateAttestationEndpoint
 				}
 			} else {
-				// Resolver may hand back an IP literal as addr after a CGI
-				// rewrite, but for hostnames re-resolve here so a rebind
-				// between pre-flight check and dial is still caught.
+				// addr carries an IP literal only when the URL host was one
+				// (handled above). For hostnames, re-resolve here so a DNS
+				// rebind between the pre-flight check and this dial is still
+				// caught. The dialer below performs its own resolution, so a
+				// sub-millisecond rebind window remains — accepted residual
+				// risk for a host-based guard.
 				if err := resolveAndCheckHost(ctx, host); err != nil {
 					return nil, err
 				}

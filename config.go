@@ -95,8 +95,8 @@ type AttestationConfig struct {
 	// test/dev deployments whose attestation issuer is itself on
 	// localhost / a private network. Production MUST keep this false.
 	//
-	// NOTE: this flag is the config surface only — the OIDC verifier in
-	// the attestation subsystem (server-side) must read it to take effect.
+	// Wired at startup into both the OIDC verifier (fetch-time guard) and
+	// the attestation policy service (write-time URL validation).
 	AllowPrivateIssuerEndpoints bool `koanf:"allow_private_issuer_endpoints"`
 }
 
