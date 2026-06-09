@@ -581,16 +581,24 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// policy constraint set (delegation depth ceiling, required trust
 	// level, allowed grant types, max TTL) is enforced inside
 	// IssueCredential against actor.IdentityPolicyID.
+	//
+	// CredentialExpiresAt clamps the child's exp to the subject_token's:
+	// a delegated credential must never outlive its parent. Without this
+	// bound, an exchange near the end of the parent's lifetime mints a
+	// child that survives the parent's expiry — and once the parent row
+	// expires, the cascade-revocation walk can no longer reach the child
+	// (the traversal anchors on live ancestry).
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          actorIdentity,
-		IdentityPolicyID:  actorPolicy.ID,
-		Scopes:            scopes,
-		GrantType:         domain.GrantTypeTokenExchange,
-		DelegatedBy:       delegatedBy,
-		ParentJTI:         subjectJTI,
-		DelegationDepth:   parentDepth + 1,
-		MissionID:         missionID,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		Identity:            actorIdentity,
+		IdentityPolicyID:    actorPolicy.ID,
+		Scopes:              scopes,
+		GrantType:           domain.GrantTypeTokenExchange,
+		DelegatedBy:         delegatedBy,
+		ParentJTI:           subjectJTI,
+		DelegationDepth:     parentDepth + 1,
+		MissionID:           missionID,
+		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+		CredentialExpiresAt: &subjectCred.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
