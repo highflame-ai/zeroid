@@ -259,6 +259,18 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.UnauthorizedClient, "client not authorized for client_credentials grant")
 	}
 
+	// A client_credentials client registered with zero scopes can mint
+	// NOTHING — there is no human or delegation chain to fall back to here,
+	// so the client's registered scope set IS the entire authority ceiling.
+	// intersectScopes treats an empty allow-list as "no restriction" (RFC 6749
+	// §3.3 default) which is correct for the chained api_key/jwt_bearer/
+	// token_exchange paths (they have a separate identity/policy ceiling), but
+	// for client_credentials it would let a scope-less client echo arbitrary
+	// requested scopes. Deny outright instead of calling the shared helper.
+	if len(client.Scopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
+	}
+
 	// Parse and intersect requested scopes with the client's allowed scopes.
 	scopes := intersectScopes(parseScopeString(req.Scope), client.Scopes)
 
@@ -1282,11 +1294,24 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	// Look up the client in the registry — this is the authoritative check.
-	// GetPublicClient verifies the client is active and registered; no secret
-	// is required because PKCE provides the proof of possession.
-	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
+	// Resolve ANY client (public or confidential): an authorization_code client
+	// may be either. GetPublicClient filters to client_type='public', so a
+	// confidential code client would otherwise fail to resolve. Re-establish
+	// the active-client gate that GetPublicClient enforced.
+	oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
 	if err != nil {
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	}
+	if !oauthClient.IsActive {
+		return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+	}
+
+	// RFC 6749 §2.3/§10.4: a confidential client MUST authenticate with its
+	// client_secret even on the PKCE authorization_code path — PKCE proves
+	// possession of the code, the secret proves the client's identity (defense
+	// in depth). Public PKCE clients carry no secret and pass through unchanged.
+	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+		return nil, err
 	}
 
 	// Verify the client is authorised to use the authorization_code grant.
@@ -1475,11 +1500,17 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthServerError("refresh tokens not configured", nil)
 	}
 
-	// Look up client to get per-client TTL settings.
+	// Look up client to get per-client TTL settings AND to enforce client
+	// authentication. A confidential client MUST present its client_secret on
+	// the refresh_token grant (RFC 6749 §6/§10.4); a public client proves
+	// possession with the refresh-token string alone and carries no secret.
 	var accessTTL, refreshTokenTTL int
 	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
+		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+			return nil, err
+		}
 	} else {
 		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("failed to get oauth client for TTL override, using defaults")
 	}
@@ -1488,6 +1519,65 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		accessTTL = defaultAccessTokenTTLWithRefresh
 	}
 
+	// Pre-rotation validation (HIGH — session-bricking fix). The gates that can
+	// reject a request for an OTHERWISE-VALID token (client_id binding, identity
+	// status/expiry, policy resolution) now run AGAINST A NON-CONSUMING PEEK of
+	// the token, BEFORE RotateRefreshToken commits the claim. If a gate fails
+	// the token stays active, so the client can retry once the transient
+	// condition clears — a wrong client_id, a temporarily suspended identity, or
+	// a DB blip during policy resolution no longer revokes the family
+	// permanently (RFC 6749 §10.4). Previously these ran AFTER rotation: the
+	// successor was discarded on error, the client retried with the now-revoked
+	// old token, and reuse detection nuked the whole session.
+	//
+	// A failed peek means the token is NOT active (expired, revoked, or
+	// unknown). We deliberately DO NOT reject here — instead we fall through to
+	// RotateRefreshToken, whose claim path distinguishes the reuse grace window
+	// from a genuine RFC 6749 §10.4 replay (and revokes the family on the
+	// latter). Short-circuiting on the peek would silence reuse detection.
+	var (
+		identity         *domain.Identity
+		identityPolicyID string
+	)
+	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshToken(ctx, req.RefreshTokenStr); peekErr == nil {
+		// client_id binding check (RFC 6749 §10.4) — done on the peek so a
+		// mismatch does not consume the token.
+		if peeked.ClientID != req.ClientID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+
+		// Identity gate. The link came from the OAuth client at
+		// authorization_code time and was persisted on the refresh_token row.
+		// When present, the linked identity's status + expires_at gate
+		// refresh-grant issuance the same way they gate every other grant.
+		// Resolved here (before rotation) so a suspended/expired identity
+		// rejects the request without burning the token.
+		if peeked.IdentityID != nil && *peeked.IdentityID != "" {
+			linked, err := s.identitySvc.repo.GetByID(ctx, *peeked.IdentityID, peeked.AccountID, peeked.ProjectID)
+			if err != nil {
+				return nil, oauthBadRequestCause(oautherror.InvalidGrant, "refresh token references unknown identity", err)
+			}
+			if !linked.Status.IsUsable() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+			}
+			if linked.IsExpired() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+			}
+			identity = linked
+			policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+			if err != nil {
+				return nil, oauthServerError("failed to resolve identity credential policy", err)
+			}
+			identityPolicyID = policy.ID
+		}
+	}
+
+	// Pre-rotation gates passed (or the token was already inactive — in which
+	// case rotation's claim path returns the right error / fires reuse
+	// detection). NOW consume the token and mint the successor. The remaining
+	// failure surface (IssueCredential) is the only post-claim step; if it fails
+	// the successor was already inserted in the rotation transaction, so the
+	// client's retry trips the grace window rather than reuse detection.
 	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL, req.DPoPKeyThumbprint)
 	if err != nil {
 		// A DPoP binding mismatch is a proof failure, not an invalid refresh
@@ -1500,39 +1590,38 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid or expired refresh token", err)
 	}
 
-	if oldToken.ClientID != req.ClientID {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
-	}
-
-	// Identity gate. The link came from the OAuth client at authorization_code
-	// time and was persisted on the refresh_token row. When present, the
-	// linked identity's status + expires_at gate refresh-grant issuance the
-	// same way they gate every other grant. When absent, this is a human
-	// session with no identity row to check and we fall through to the
-	// synthetic carrier.
-	identity := &domain.Identity{
-		AccountID: oldToken.AccountID,
-		ProjectID: oldToken.ProjectID,
-		Status:    domain.IdentityStatusActive,
-	}
-	var identityPolicyID string
-	if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
-		linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
-		if err != nil {
-			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "refresh token references unknown identity", err)
+	// The peek-time identity resolution is the authoritative one. If the peek
+	// missed (rare: a benign race where the row activated between peek and
+	// claim) re-run the identity gate against the freshly claimed row so the
+	// gate is never skipped — the post-claim failure window here is acceptable
+	// because it only triggers on that race, and a gate failure now lands the
+	// caller in the grace window (successor already minted) rather than a
+	// permanent family revocation. A human session (no IdentityID) falls
+	// through to a synthetic carrier with no policy to resolve.
+	if identity == nil {
+		identity = &domain.Identity{
+			AccountID: oldToken.AccountID,
+			ProjectID: oldToken.ProjectID,
+			Status:    domain.IdentityStatusActive,
 		}
-		if !linked.Status.IsUsable() {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+		if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
+			linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
+			if err != nil {
+				return nil, oauthBadRequestCause(oautherror.InvalidGrant, "refresh token references unknown identity", err)
+			}
+			if !linked.Status.IsUsable() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+			}
+			if linked.IsExpired() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+			}
+			identity = linked
+			policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+			if err != nil {
+				return nil, oauthServerError("failed to resolve identity credential policy", err)
+			}
+			identityPolicyID = policy.ID
 		}
-		if linked.IsExpired() {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
-		}
-		identity = linked
-		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
-		if err != nil {
-			return nil, oauthServerError("failed to resolve identity credential policy", err)
-		}
-		identityPolicyID = policy.ID
 	}
 
 	// Inherit scopes from the original refresh token. Without this the
@@ -1706,6 +1795,70 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 		return "", "", fmt.Errorf("malformed WIMSE URI: expected spiffe://%s/{account}/{project}/{identity_type}/{id}", s.wimseDomain)
 	}
 	return parts[0], parts[1], nil
+}
+
+// verifyConfidentialClientAuth enforces RFC 6749 §2.3 / §10.4 client
+// authentication for an already-resolved OAuth client. When the client is
+// CONFIDENTIAL it MUST present and prove its client_secret before any grant
+// proceeds; a missing or wrong secret is rejected with invalid_client (HTTP
+// 401). PUBLIC clients carry no secret and pass through unchanged — they prove
+// possession by other means (PKCE on authorization_code, the refresh-token
+// string itself on refresh_token).
+//
+// VerifyClientSecret re-fetches the client by client_id and bcrypt-compares the
+// secret; the caller passes the already-resolved client purely to read its
+// ClientType. The re-fetch is intentional — VerifyClientSecret owns the
+// constant-time comparison and the active-client gate.
+func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
+	if client == nil || client.ClientType != "confidential" {
+		return nil
+	}
+	if clientSecret == "" {
+		return oauthUnauthorized("client_secret is required for confidential clients", nil)
+	}
+	if _, err := s.oauthClientSvc.VerifyClientSecret(ctx, clientID, clientSecret); err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return oauthUnauthorized("invalid client credentials", err)
+		}
+		return oauthUnauthorized("client verification failed", err)
+	}
+	return nil
+}
+
+// VerifyPresentedClientAuth implements the "accept-and-verify" client-auth
+// posture for the introspection (RFC 7662) and revocation (RFC 7009)
+// endpoints, which sit on the unauthenticated public group in this standalone
+// server. When a caller presents client credentials (client_id +
+// client_secret) they are VERIFIED and a bad secret is rejected with
+// invalid_client (HTTP 401). When NO client credentials are presented the call
+// is left to the existing internal/network-isolated path (tenant-header access,
+// service-to-service) — ZeroID does not hard-reject unauthenticated callers
+// here because that would break the standalone deployment model and the
+// established tenant-header access pattern.
+//
+// Returns nil when no credentials were presented OR when presented credentials
+// verify. Returns an *OAuthError (invalid_client / 401) when a client_secret is
+// presented but does not verify, or when only one half of the credential pair
+// is supplied (a malformed authentication attempt, not an anonymous call).
+func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
+	// Anonymous call — neither half presented. Preserve existing internal-path
+	// behavior; the caller falls through to the unauthenticated flow.
+	if clientID == "" && clientSecret == "" {
+		return nil
+	}
+	// A half-supplied credential pair is a malformed authentication attempt
+	// (RFC 6749 §2.3.1: both client_id and client_secret are required for
+	// client_secret_post). Reject rather than silently treating it as anonymous.
+	if clientID == "" || clientSecret == "" {
+		return oauthUnauthorized("client_id and client_secret must both be supplied", nil)
+	}
+	if _, err := s.oauthClientSvc.VerifyClientSecret(ctx, clientID, clientSecret); err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return oauthUnauthorized("invalid client credentials", err)
+		}
+		return oauthUnauthorized("client verification failed", err)
+	}
+	return nil
 }
 
 // parseScopeString splits a space-delimited scope string into a slice.
