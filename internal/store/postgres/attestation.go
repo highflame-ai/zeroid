@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/uptrace/bun"
 
@@ -81,6 +82,9 @@ func (r *AttestationRepository) GetByIDForUpdate(ctx context.Context, id, accoun
 
 // GetHighestVerifiedLevel returns the highest verified attestation level for an identity.
 // Returns an empty string if no verified attestation exists.
+// An attestation past its expires_at no longer counts, regardless of the
+// is_expired flag — the flag is only flipped by an out-of-band sweep, so the
+// wall-clock predicate is the enforcement that matters at policy-gate time.
 func (r *AttestationRepository) GetHighestVerifiedLevel(ctx context.Context, identityID string) (string, error) {
 	var level string
 	db := dbOrTx(ctx, r.db)
@@ -90,6 +94,7 @@ func (r *AttestationRepository) GetHighestVerifiedLevel(ctx context.Context, ide
 		Where("identity_id = ?", identityID).
 		Where("is_verified = TRUE").
 		Where("is_expired = FALSE").
+		Where("(expires_at IS NULL OR expires_at > ?)", time.Now()).
 		OrderExpr(`CASE level
 			WHEN 'hardware' THEN 3
 			WHEN 'platform' THEN 2
