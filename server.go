@@ -176,7 +176,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// to exercise demo flows that submit them. Production deployments
 	// leave AllowUnsafeDevStub off and those proof types stay unimplemented.
 	attestationVerifiers := attestation.NewRegistry()
-	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil).SetAllowPrivate(cfg.Attestation.AllowPrivateIssuerEndpoints))
 	if cfg.Attestation.AllowUnsafeDevStub {
 		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
 		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeImageHash))
@@ -208,7 +208,7 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.SigningCreds.WellKnownJWKSName,
 	)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
+	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers).SetAllowPrivate(cfg.Attestation.AllowPrivateIssuerEndpoints)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)

@@ -388,6 +388,7 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 type BcAuthorizeInput struct {
 	Body struct {
 		ClientID                string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
+		ClientSecret            string `json:"client_secret,omitempty" doc:"Client secret — REQUIRED for confidential clients (OpenID CIBA Core §7.1); omitted for public clients"`
 		AccountID               string `json:"account_id" required:"true" doc:"Tenant account ID"`
 		ProjectID               string `json:"project_id" required:"true" doc:"Tenant project ID"`
 		LoginHint               string `json:"login_hint,omitempty" doc:"User identifier (email, phone, user_id). Required IF group_hint is not supplied."`
@@ -426,6 +427,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
 		ClientID:                input.Body.ClientID,
+		ClientSecret:            input.Body.ClientSecret,
 		AccountID:               input.Body.AccountID,
 		ProjectID:               input.Body.ProjectID,
 		LoginHint:               input.Body.LoginHint,
