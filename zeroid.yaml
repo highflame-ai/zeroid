@@ -3,11 +3,20 @@
 
 server:
   port: "8899"
+  # env gates production-only safety checks in Validate(): when set to
+  # "production" (or "prod"), ZeroID refuses to start with the unsafe dev
+  # attestation stub on or with the built-in default issuer / wimse_domain
+  # left unchanged. Leave as "development" for local/test.
   env: development
   read_timeout: "15s"
   write_timeout: "15s"
   idle_timeout: "60s"
   shutdown_timeout_seconds: 30
+  # Trust X-Forwarded-Proto / X-Forwarded-Host when reconstructing the
+  # request URL for DPoP htu validation (RFC 9449 §4.3). Set true ONLY
+  # behind a trusted edge proxy that strips client-supplied values;
+  # leave false when ZeroID terminates TLS itself. Env: ZEROID_TRUST_FORWARDED_HEADERS
+  trust_forwarded_headers: false
 
 database:
   url: "postgres://zeroid:zeroid@localhost:5432/zeroid?sslmode=disable"
@@ -39,6 +48,12 @@ token:
   issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
+  # hmac_secret signs/verifies stateless authorization_code JWTs (HS256).
+  # Only needed if the authorization_code grant is enabled. When set it
+  # MUST be at least 32 bytes (Validate() rejects shorter secrets — a short
+  # secret is forgeable, and a leak forges auth codes). Prefer the env var
+  # ZEROID_HMAC_SECRET over committing a secret to YAML.
+  # hmac_secret: ""
 
 wimse_domain: "highflame.ai"
 
@@ -48,10 +63,12 @@ wimse_domain: "highflame.ai"
 
 telemetry:
   enabled: false
-  endpoint: "localhost:4317"
-  insecure: true
   service_name: "zeroid"
   sampling_rate: 1.0
+  # NOTE: exporter endpoint / TLS are NOT configured here. They are read
+  # by the OTel SDK from the standard env vars OTEL_EXPORTER_OTLP_ENDPOINT
+  # and OTEL_EXPORTER_OTLP_INSECURE. The old telemetry.endpoint /
+  # telemetry.insecure keys were removed — setting them now fails startup.
 
 logging:
   level: "debug"
@@ -65,3 +82,21 @@ logging:
 # ZEROID_ALLOW_UNSAFE_DEV_STUB=false).
 attestation:
   allow_unsafe_dev_stub: true
+  # Relaxes the SSRF guard the OIDC verifier applies to a proof's issuer
+  # endpoint (the URL it fetches OIDC discovery + JWKS from). Default false
+  # rejects issuers resolving to private/loopback/link-local IPs. Set true
+  # ONLY in single-tenant dev/test where the attestation issuer is itself
+  # on localhost / a private network. Production MUST keep this false.
+  # Env: ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS
+  allow_private_issuer_endpoints: false
+
+# CIBA (OpenID Client-Initiated Backchannel Authentication) settings.
+backchannel:
+  # Relaxes the SSRF guard on CIBA outbound client_notification_endpoint
+  # destinations. Default false rejects endpoints resolving to
+  # private/loopback/link-local IPs (re-checked at request time as a
+  # DNS-rebinding defense). Set true ONLY in single-tenant dev/test that
+  # registers endpoints like https://localhost:9000/. Production MUST keep
+  # this false (see GHSA-599q-j34m-33vc).
+  # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
+  allow_private_notification_endpoints: false
