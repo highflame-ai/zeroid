@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
+import { generateKeyPairSync, createSign } from "node:crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -290,5 +291,121 @@ describe("Error handling", () => {
     const client = new ZeroIDClient({ baseUrl, accountId: ACCOUNT_ID, projectId: PROJECT_ID });
     const result = await client.tokens.introspect("invalid.token.value");
     expect(result.active).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. OAuth client → client_credentials → RFC 8693 delegation
+//
+// Covers the surface the quickstart depends on that the agent/api_key path
+// above does NOT: oauthClients.create (confidential), the client_credentials
+// grant, and token_exchange delegation. Fully live — any SDK<->server contract
+// drift on these endpoints fails here.
+// ---------------------------------------------------------------------------
+
+describe("OAuth client credentials + delegation", () => {
+  it("create client → client_credentials → token exchange → introspect → revoke", async () => {
+    const client = new ZeroIDClient({ baseUrl, accountId: ACCOUNT_ID, projectId: PROJECT_ID });
+    const suffix = `${process.pid}-${Date.now()}`;
+    const orchExternalId = `orch-ts-${suffix}`;
+
+    // 1. Orchestrator identity. client_credentials resolves the identity by
+    //    external_id === client_id, so the OAuth client_id must match this.
+    const orchestrator = await client.identities.create({
+      external_id: orchExternalId,
+      owner_user_id: "sdk-smoke-test",
+      name: "TS Smoke Orchestrator",
+      identity_type: "agent",
+      sub_type: "orchestrator",
+      trust_level: "first_party",
+      allowed_scopes: ["data:read", "data:write"],
+    });
+
+    // 2. Tool agent identity with an ECDSA P-256 public key (for the
+    //    self-signed actor assertion in the token exchange).
+    const { publicKey, privateKey } = generateKeyPairSync("ec", { namedCurve: "P-256" });
+    const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+    const toolAgent = await client.identities.create({
+      external_id: `tool-ts-${suffix}`,
+      owner_user_id: "sdk-smoke-test",
+      name: "TS Smoke Tool Agent",
+      identity_type: "agent",
+      sub_type: "tool_agent",
+      trust_level: "first_party",
+      allowed_scopes: ["data:read"],
+      public_key_pem: publicKeyPem,
+    });
+
+    let oauthClientId: string | undefined;
+    try {
+      // 3. Confidential OAuth client — server returns a client_secret for M2M.
+      const created = await client.oauthClients.create({
+        client_id: orchExternalId,
+        name: "TS Smoke Orchestrator Client",
+        confidential: true,
+        identity_id: orchestrator.id,
+        grant_types: ["client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"],
+        scopes: ["data:read", "data:write"],
+      });
+      oauthClientId = created.client.id;
+      expect(created.client_secret).toBeTruthy();
+      expect(created.client.client_id).toBe(orchExternalId);
+
+      // 4. client_credentials grant. Unlike the Python SDK, the published TS
+      // SDK does not fall back to the client-level tenant defaults for this
+      // grant, and the server requires both for tenant-scoped client lookup.
+      const token = await client.tokens.issueClientCredentials(orchExternalId, created.client_secret, {
+        scope: "data:read",
+        account_id: ACCOUNT_ID,
+        project_id: PROJECT_ID,
+      });
+      expect(token.access_token).toBeTruthy();
+      expect(token.token_type.toLowerCase()).toBe("bearer");
+
+      // 5. Tool agent's self-signed actor assertion (RFC 7523: iss, sub, aud,
+      //    exp; self-signed → sub === iss === WIMSE URI). ES256 via node:crypto
+      //    with IEEE-P1363 (raw r||s) encoding as JWS requires.
+      const wellKnown = await (
+        await fetch(`${baseUrl}/.well-known/oauth-authorization-server`)
+      ).json();
+      const issuer = wellKnown.issuer as string;
+      const now = Math.floor(Date.now() / 1000);
+      const b64url = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+      const signingInput =
+        `${b64url({ alg: "ES256", typ: "JWT" })}.` +
+        `${b64url({
+          iss: toolAgent.wimse_uri,
+          sub: toolAgent.wimse_uri,
+          aud: [issuer],
+          iat: now,
+          exp: now + 300,
+        })}`;
+      const signature = createSign("SHA256")
+        .update(signingInput)
+        .sign({ key: privateKey, dsaEncoding: "ieee-p1363" })
+        .toString("base64url");
+      const actorAssertion = `${signingInput}.${signature}`;
+
+      // 6. RFC 8693 token exchange — orchestrator delegates to tool agent.
+      const delegated = await client.tokens.issueTokenExchange(token.access_token, actorAssertion, {
+        scope: "data:read",
+      });
+      expect(delegated.access_token).toBeTruthy();
+
+      // 7. Introspect: delegated token carries the act (delegation) chain.
+      const introspection = await client.tokens.introspect(delegated.access_token);
+      expect(introspection.active).toBe(true);
+      expect(introspection.sub).toBe(toolAgent.wimse_uri);
+      expect(introspection.act?.sub).toBe(orchestrator.wimse_uri);
+
+      // 8. Revoke → inactive.
+      await client.tokens.revoke(delegated.access_token);
+      const after = await client.tokens.introspect(delegated.access_token);
+      expect(after.active).toBe(false);
+    } finally {
+      if (oauthClientId) await client.oauthClients.delete(oauthClientId);
+      await client.identities.delete(toolAgent.id);
+      await client.identities.delete(orchestrator.id);
+    }
   });
 });
