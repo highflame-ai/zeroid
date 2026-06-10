@@ -125,8 +125,10 @@ func (r *RefreshTokenRepository) DeleteExpired(ctx context.Context, before time.
 		return 0, fmt.Errorf("failed to delete expired refresh tokens: %w", err)
 	}
 
-	n, _ := res.RowsAffected()
-
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to read expired-refresh-token delete result: %w", err)
+	}
 	return n, nil
 }
 

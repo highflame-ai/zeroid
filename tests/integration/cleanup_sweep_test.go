@@ -64,7 +64,6 @@ func refreshTokenExists(t *testing.T, id string) bool {
 func TestCleanupSweepsExpiredRefreshTokensPastGraceWindow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
-	grace := domain.RefreshTokenReuseGraceWindow
 
 	// (1) Long-expired, revoked: expires_at far beyond the cutoff → DELETE.
 	revokedAt := now.Add(-time.Hour)
@@ -76,14 +75,17 @@ func TestCleanupSweepsExpiredRefreshTokensPastGraceWindow(t *testing.T) {
 	)
 
 	// (2) Revoked, but expires_at sits INSIDE the grace window (cutoff = now -
-	// grace; this row's expires_at is now - grace/2 > cutoff) → RETAIN. This is
-	// the reuse-forensics guard: a row whose expiry is more recent than the
-	// grace lag must survive the sweep.
-	recentRevokedAt := now.Add(-grace / 2)
+	// grace; this row's expires_at is now - 1s > cutoff) → RETAIN. This is the
+	// reuse-forensics guard: a row whose expiry is more recent than the grace
+	// lag must survive the sweep. We use a fixed 1s offset (not grace/2) so the
+	// margin between this expiry and the cutoff is ~grace-1s ≈ 9s — large
+	// enough that a slow CI runner delaying between `now` here and the cleanup
+	// worker's own time.Now() can't push the row past the cutoff and flake.
+	recentRevokedAt := now.Add(-1 * time.Second)
 	withinGrace := insertRefreshTokenRow(t,
 		uid("rt-within-grace"),
 		domain.RefreshTokenStateRevoked,
-		now.Add(-grace/2),
+		now.Add(-1*time.Second),
 		&recentRevokedAt,
 	)
 

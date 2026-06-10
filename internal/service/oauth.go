@@ -1829,7 +1829,15 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 // ClientType. The re-fetch is intentional — VerifyClientSecret owns the
 // constant-time comparison and the active-client gate.
 func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
-	if client == nil || client.ClientType != "confidential" {
+	if client == nil {
+		return nil
+	}
+	// A client is confidential if it declares so OR carries a stored secret
+	// hash. The second clause is belt-and-suspenders against an inconsistent
+	// row (secret set but client_type != "confidential"), which would
+	// otherwise skip secret verification and allow an unintended bypass. Same
+	// test the CIBA bc-authorize/redeem paths use.
+	if client.ClientType != "confidential" && client.ClientSecret == "" {
 		return nil
 	}
 	if clientSecret == "" {

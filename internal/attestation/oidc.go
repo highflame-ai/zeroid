@@ -476,28 +476,41 @@ func ssrfGuardedTransport(allowPrivate func() bool) *http.Transport {
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if !allowPrivate() {
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				host = addr
+		if allowPrivate() {
+			return dialer.DialContext(ctx, network, addr)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			host, port = addr, ""
+		}
+		// IP-literal host: validate and dial it directly.
+		if ip := net.ParseIP(host); ip != nil {
+			if isBlockedIP(ip) {
+				return nil, ErrPrivateAttestationEndpoint
 			}
-			if ip := net.ParseIP(host); ip != nil {
-				if isBlockedIP(ip) {
-					return nil, ErrPrivateAttestationEndpoint
-				}
-			} else {
-				// addr carries an IP literal only when the URL host was one
-				// (handled above). For hostnames, re-resolve here so a DNS
-				// rebind between the pre-flight check and this dial is still
-				// caught. The dialer below performs its own resolution, so a
-				// sub-millisecond rebind window remains — accepted residual
-				// risk for a host-based guard.
-				if err := resolveAndCheckHost(ctx, host); err != nil {
-					return nil, err
-				}
+			return dialer.DialContext(ctx, network, addr)
+		}
+		// Hostname: resolve ONCE, validate every answer, then dial a
+		// validated IP literal — not the hostname — so the kernel connects to
+		// exactly the address we checked. Re-resolving and dialing the
+		// hostname again (letting net.Dialer resolve a third time) would leave
+		// a DNS-rebinding window between the check and the connect; pinning the
+		// dial to the validated IP closes it. TLS still verifies against the
+		// original hostname because the Transport sets ServerName from the URL,
+		// not from the dial address.
+		ips, err := lookupIPs(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("attestation issuer host resolution failed: %w", err)
+		}
+		if len(ips) == 0 {
+			return nil, ErrPrivateAttestationEndpoint
+		}
+		for _, ip := range ips {
+			if isBlockedIP(ip) {
+				return nil, ErrPrivateAttestationEndpoint
 			}
 		}
-		return dialer.DialContext(ctx, network, addr)
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
 	}
 	return base
 }

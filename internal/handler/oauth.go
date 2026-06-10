@@ -365,9 +365,12 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 	// "always 200" contract holds (including for unknown/already-revoked tokens
 	// and anonymous internal-path callers).
 	if err := a.oauthSvc.VerifyPresentedClientAuth(ctx, input.Body.ClientID, input.Body.ClientSecret); err != nil {
-		_, desc, status := extractOAuthError(err)
+		code, desc, status := extractOAuthError(err)
 		out := &OAuthRevokeOutput{Status: status}
-		out.Body.Error = oautherror.InvalidClient
+		// Use the error's own code, not a hardcoded invalid_client — an
+		// operational failure maps to a 500/server_error and must not be
+		// labelled as a client authentication failure.
+		out.Body.Error = code
 		out.Body.ErrorDescription = desc
 		return out, nil
 	}
