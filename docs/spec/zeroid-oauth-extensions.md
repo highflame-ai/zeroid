@@ -122,8 +122,9 @@ This document uses the following terms:
 - **Delegation tree** — the set of credentials reachable from a root credential
   by following `parent_jti` edges. Identified by `mission_id` (Section 5.4).
 - **Deployer** — the operator embedding the ZeroID library/service and supplying
-  its pluggable hooks (`BackchannelNotifier`, `TrustedServiceValidator`,
-  `RevocationNotifier`, `ClaimsEnricher`, grant handlers).
+  its pluggable hooks (`PrincipalResolver`, `BackchannelNotifier`,
+  `TrustedServiceValidator`, `RevocationNotifier`, `ClaimsEnricher`, grant
+  handlers).
 - **Trusted service** — an internal caller that has passed the deployer's
   `TrustedServiceValidator` gate (Section 5.5).
 
@@ -389,6 +390,17 @@ ZeroID validates the assertion signature against the actor identity's registered
 ES256 public key before issuing. The issued token's `act.sub` is set to the
 orchestrator's WIMSE URI (Section 4.4 case 1).
 
+The registered key itself is enrolled and rotated self-service via
+`POST /agents/self/public-key` (caller authenticated by its access token; an
+identity can only manage its own key). First enrollment is trust-on-first-use:
+the request carries the new SPKI EC P-256 key (PEM) plus a `new_key_proof` —
+a short-lived, replay-guarded ES256 JWS signed by the *new* key proving
+control. Rotation of an already-enrolled key additionally **REQUIRES** a
+`current_key_proof` signed by the *incumbent* key, carrying an `nkt` claim
+(base64url SHA-256 thumbprint of the new key's SPKI DER) binding old key to
+new — so possession of a stolen access token alone cannot swap an enrolled
+key.
+
 ### 5.4 `mission_id` — delegation-tree identifier
 
 `mission_id` is an opaque, stable identifier shared by every credential in a
@@ -397,6 +409,9 @@ delegation tree:
 - On a first-issuance grant (no inbound `mission_id`), ZeroID sets
   `mission_id` to the new credential's own `jti`, making it the tree root.
 - On `token_exchange`, the value propagates verbatim from the subject token.
+- On `refresh_token`, the value propagates from the rotated token's stored
+  `mission_id` — a refresh continues an existing grant, it does not originate
+  a new delegation tree.
 
 The value is opaque to consumers. The "root happens to be a JTI" detail is an
 implementation artifact and **MUST NOT** be relied on through any API.
