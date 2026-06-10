@@ -57,16 +57,19 @@ to ZeroID deployments.
 
 ## 1. Introduction
 
-OAuth 2.x and OIDC authenticate a *human to a service*. They have no native
-model for a credential whose holder is an autonomous agent, for one agent
-delegating an attenuated subset of its authority to another, for the resulting
-multi-hop chain to remain cryptographically attributable, or for an agent to
-pause mid-task and obtain a human's out-of-band approval.
+OAuth 2.x and OIDC were designed around delegating a *user's* access to
+clients and authenticating humans to services; their non-human grants
+(`client_credentials`, JWT-bearer) model a flat machine credential. None of
+them natively model a credential whose holder is an autonomous agent, one agent
+delegating an attenuated subset of its authority to another, the resulting
+multi-hop chain remaining cryptographically attributable, or an agent pausing
+mid-task to obtain a human's out-of-band approval.
 
 ZeroID exists to solve **Agent Identity**. Human identity (the domain of
-OAuth/OIDC IdPs) and general workload / machine identity (the domain of
-SPIFFE/SPIRE, cloud IAM, and secret managers) are separate, mature ecosystems;
-ZeroID builds on their primitives — WIMSE/SPIFFE URIs, OIDC, RFC 8693 — and
+OpenID Providers and enterprise IdPs) and general workload / machine identity
+(the domain of SPIFFE/SPIRE, cloud IAM, and secret managers) are separate,
+mature ecosystems; ZeroID builds on their primitives — WIMSE/SPIFFE URIs,
+OIDC, RFC 8693 — and
 federates with them rather than replacing them. What it adds is the
 agent-shaped layer those baselines do not model.
 
