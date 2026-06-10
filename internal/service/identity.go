@@ -235,6 +235,14 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 
 	if err := s.repo.Create(ctx, identity); err != nil {
 		if isDuplicateKeyError(err) {
+			// Distinguish a collision with a DEACTIVATED (soft-deleted) identity
+			// — which is actionable via reactivation — from a live duplicate.
+			// Best-effort: if the lookup fails, fall back to the generic error.
+			if existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); gerr == nil &&
+				existing != nil && existing.Status == domain.IdentityStatusDeactivated {
+				return nil, &IdentityDeactivatedConflictError{ExternalID: req.ExternalID, ExistingID: existing.ID}
+			}
+
 			return nil, ErrIdentityAlreadyExists
 		}
 		return nil, fmt.Errorf("failed to register identity: %w", err)
@@ -254,6 +262,29 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 // GetIdentity retrieves an identity by ID.
 func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByID(ctx, id, accountID, projectID)
+}
+
+// SetPublicKey replaces the identity's EC actor-assertion public key (the key
+// used to verify its self-signed assertion on the jwt_bearer and token_exchange
+// grants). The PEM is validated as an SPKI EC P-256 key. Persisted via
+// repo.Update so the AFTER UPDATE audit trigger records the change with the
+// caller as modified_by. Authorization — proof-of-possession for a self-service
+// rotation, or admin authority for a force-set — is the caller's
+// responsibility; this method only validates and persists. Returns the updated
+// identity.
+func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, projectID, publicKeyPEM string) (*domain.Identity, error) {
+	if err := validateECPublicKeyPEM(publicKeyPEM); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidIdentityField, err)
+	}
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	identity.PublicKeyPEM = publicKeyPEM
+	if err := s.repo.Update(ctx, identity); err != nil {
+		return nil, err
+	}
+	return identity, nil
 }
 
 // GetIdentityByExternalID retrieves an identity by its external_id within a tenant.
@@ -544,14 +575,24 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 	return count, nil
 }
 
-// DeleteIdentity permanently removes an identity and cascades to related records.
+// PurgeIdentity permanently removes an identity row (hard delete) and cascades
+// to related records. It is reserved for the compensating rollback of a
+// half-created identity (see AgentService.RegisterAgent).
+//
+// User-facing deletes must NOT call this: DELETE /identities/{id} and
+// DELETE /agents/registry/{id} are SOFT deletes (DeactivateIdentity /
+// DeactivateAgent) per the platform "never hard DELETE" convention, which also
+// preserves the audit trail. A hard delete additionally trips the
+// non-cascading service_keys FK on existing deployments (authn#109); that is
+// safe in the rollback path only because it runs before any service key is
+// persisted (CreateKey writes its row last).
 //
 // Cleanup runs before the DB delete: API keys are revoked, active credentials
 // are cascade-revoked, and a retirement CAE signal is emitted. This ensures
 // tokens issued to the identity stop working at the same moment the identity
 // is removed, not just whenever they happen to TTL-expire (which can be up to
 // 90 days for api_key tokens).
-func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, projectID string) error {
+func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, projectID string) error {
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		// Fall through to Delete so callers get the same not-found semantics.
@@ -559,6 +600,42 @@ func (s *IdentityService) DeleteIdentity(ctx context.Context, id, accountID, pro
 	}
 	s.runDeactivationCleanup(ctx, identity, "identity_deleted")
 	return s.repo.Delete(ctx, id, accountID, projectID)
+}
+
+// DeactivateIdentity is the soft delete: it flips the identity to the
+// deactivated status via the shared UpdateIdentity path, which sweeps linked
+// API keys, cascade-revokes active credentials, and emits the retirement CAE
+// signal on a fresh transition. This is what DELETE /identities/{id} and
+// DELETE /agents/registry/{id} resolve to — the identity row is RETAINED
+// (preserving the audit trail) and no hard DELETE is issued, so the
+// non-cascading service_keys FK (authn#109) is never touched.
+//
+// Idempotent: an already-deactivated identity is a no-op success. Without this
+// short-circuit a repeated DELETE would hit UpdateIdentity's status-transition
+// guard (deactivated → deactivated is rejected) and surface a spurious 400,
+// breaking the idempotency callers expect of DELETE. A missing identity
+// returns the repo's not-found error so the handler can map it to 404.
+// Returns the resulting identity so callers that need to render a response
+// (e.g. AgentService.DeleteAgent) can reuse it instead of issuing a second
+// load.
+func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	if identity.Status == domain.IdentityStatusDeactivated {
+		return identity, nil
+	}
+
+	status := domain.IdentityStatusDeactivated
+
+	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	if err != nil {
+		return nil, err
+	}
+
+	return updated, nil
 }
 
 // runDeactivationCleanup sweeps everything a deactivated or deleted identity

@@ -30,16 +30,35 @@ type CleanupWorker struct {
 	backchannelRepo *postgres.BackchannelRequestRepository
 	expirer         IdentityExpirer
 	interval        time.Duration
+	credRetention   time.Duration
 }
 
 // NewCleanupWorker creates a cleanup worker with the given tick interval.
 // backchannelRepo is required so the worker can flip expired CIBA requests
 // to status='expired' (so an in-flight poll sees expired_token before the
 // row is reaped) and then delete the resolved rows.
+//
+// credRetention is how long expired issued_credentials rows are retained
+// before deletion. Expired rows are not just garbage: their parent_jti
+// edges are the path the cascade-revocation walk takes to reach still-live
+// delegated descendants. Deleting a parent row at the moment of expiry
+// severs that edge and strands any child that outlives it. token_exchange
+// now clamps child expiry to the parent's, so retaining for the max token
+// TTL guarantees every edge survives as long as any descendant could —
+// including legacy chains issued before the clamp. Callers pass the
+// configured token max TTL.
+//
 // The identity-expiry sweep is wired separately via SetIdentityExpirer
 // after IdentityService is constructed.
-func NewCleanupWorker(db *bun.DB, backchannelRepo *postgres.BackchannelRequestRepository, interval time.Duration) *CleanupWorker {
-	return &CleanupWorker{db: db, backchannelRepo: backchannelRepo, interval: interval}
+func NewCleanupWorker(db *bun.DB, backchannelRepo *postgres.BackchannelRequestRepository, interval, credRetention time.Duration) *CleanupWorker {
+	// A negative retention would make now.Add(-credRetention) a FUTURE
+	// cutoff and the worker would delete unexpired credentials. Clamp to
+	// zero so a misconfigured max TTL degrades to delete-at-expiry, never
+	// delete-before-expiry.
+	if credRetention < 0 {
+		credRetention = 0
+	}
+	return &CleanupWorker{db: db, backchannelRepo: backchannelRepo, interval: interval, credRetention: credRetention}
 }
 
 // SetIdentityExpirer installs the identity-expiry sweep callback. Nil
@@ -74,10 +93,13 @@ func (w *CleanupWorker) Run(ctx context.Context) {
 func (w *CleanupWorker) RunOnce(ctx context.Context) {
 	now := time.Now()
 
-	// Delete all expired credentials regardless of revocation status.
+	// Delete expired credentials regardless of revocation status, but only
+	// after the retention window: parent_jti edges on expired rows are still
+	// needed by the cascade-revocation walk to reach live descendants (see
+	// NewCleanupWorker).
 	credRes, err := w.db.NewDelete().
 		TableExpr("issued_credentials").
-		Where("expires_at < ?", now).
+		Where("expires_at < ?", now.Add(-w.credRetention)).
 		Exec(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired credentials")

@@ -1,0 +1,188 @@
+name: Release pkg/dpop - Zeroid
+
+# Cuts a new release of the nested pkg/dpop module, INDEPENDENT of
+# zeroid's release cadence. zeroid's go.mod pins pkg/dpop to a
+# specific version; this workflow updates that pin when pkg/dpop/
+# source has changed.
+#
+# When to use this:
+#   - You changed something in pkg/dpop/ source code.
+#   - The release.yml's drift guard caught you trying to ship zeroid
+#     with mismatched pkg/dpop source.
+#   - You explicitly want to publish a new pkg/dpop version for
+#     downstream consumers (Cerberus, Shield, Firehog).
+#
+# When NOT to use this:
+#   - Regular zeroid release that didn't touch pkg/dpop/. Just click
+#     Publish in the GitHub UI as usual.
+#
+# What it does:
+#   1. Tags pkg/dpop/vX.Y.Z at current main HEAD.
+#   2. Opens a PR titled "devops: bump pkg/dpop to vX.Y.Z" that
+#      updates zeroid/go.mod's require directive for pkg/dpop.
+#      You review + merge that PR; afterwards your next zeroid
+#      release ships with the new pkg/dpop reference.
+#
+# Note: pkg/authjwt does NOT have an analogous workflow because
+# it's import-only-from-tests; its version reference in
+# zeroid/go.mod is invisible to downstream consumers and never
+# needs to be a real version. pkg/authjwt is clubbed with zeroid
+# releases via release.yml's tag-pkg/authjwt step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'pkg/dpop release version (vMAJOR.MINOR.PATCH, e.g. v1.6.1)'
+        required: true
+        type: string
+
+env:
+  GO_VER: "1.26.0"
+  GOEXPERIMENT: "jsonv2"
+  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-dpop:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate version format
+        shell: bash
+        run: |-
+          if [[ ! "${{ inputs.version }}" =~ ${{ env.REGEX_PATTERN }} ]]; then
+            echo "::error::version must match vMAJOR.MINOR.PATCH; got ${{ inputs.version }}"
+            exit 1
+          fi
+
+      - name: Create App token
+        uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: Setup Golang
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      - name: Configure git
+        shell: bash
+        run: |-
+          git config user.name "highflame-release-bot[bot]"
+          git config user.email "${{ steps.token.outputs.app-slug }}[bot]@users.noreply.github.com"
+
+      # Step 1: tag pkg/dpop at current main HEAD. Idempotent.
+      # Load-bearing — step 3's `go mod tidy` needs this tag to be
+      # resolvable.
+      - name: Tag pkg/dpop at current main HEAD
+        shell: bash
+        run: |-
+          VERSION="${{ inputs.version }}"
+          SUBTAG="pkg/dpop/${VERSION}"
+          if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
+            echo "Tag ${SUBTAG} already exists, skipping"
+          else
+            git tag "${SUBTAG}"
+            git push origin "${SUBTAG}"
+            echo "Created and pushed tag ${SUBTAG}"
+          fi
+
+      # Step 2: branch off main for the pkg/dpop ref-bump.
+      - name: Create release-prep branch
+        shell: bash
+        run: |-
+          BRANCH="release-dpop/${{ inputs.version }}"
+          if git ls-remote --exit-code --heads origin "${BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH}"
+            git checkout "${BRANCH}"
+            git pull --ff-only origin "${BRANCH}"
+          else
+            git checkout -b "${BRANCH}"
+          fi
+
+      # Step 3: bump zeroid/go.mod's pkg/dpop reference.
+      - name: Bump pkg/dpop ref in go.mod
+        shell: bash
+        run: |-
+          VERSION="${{ inputs.version }}"
+          go mod edit -require=github.com/highflame-ai/zeroid/pkg/dpop@${VERSION}
+          GOFLAGS="-mod=mod" go mod tidy
+          echo "--- go.mod diff ---"
+          git diff go.mod
+          echo "--- go.sum diff (truncated) ---"
+          git diff go.sum | head -40
+
+      - name: Commit + push branch
+        shell: bash
+        run: |-
+          VERSION="${{ inputs.version }}"
+          BRANCH="release-dpop/${VERSION}"
+          if git diff --quiet go.mod go.sum; then
+            echo "::notice::go.mod + go.sum already match pkg/dpop ${VERSION} — nothing to commit."
+          else
+            git add go.mod go.sum
+            git commit -m "devops: bump pkg/dpop to ${VERSION}"
+            git push origin "${BRANCH}"
+          fi
+
+      - name: Open PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ inputs.version }}
+        run: |-
+          BRANCH="release-dpop/${VERSION}"
+          EXISTING_PR=$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // ""')
+          if [[ -n "${EXISTING_PR}" ]]; then
+            echo "::notice::PR already open for ${BRANCH}: #${EXISTING_PR}"
+            exit 0
+          fi
+          BODY_FILE=$(mktemp)
+          cat >"${BODY_FILE}" <<EOF
+          Auto-generated by release-dpop.yml. Bumps zeroid/go.mod's pkg/dpop reference to **${VERSION}**.
+
+          ## What this PR contains
+
+          - \`go.mod\`: \`pkg/dpop\` require directive updated to ${VERSION}
+          - \`go.sum\`: corresponding hashes updated
+
+          Nothing else. If the diff shows any other file changed, something's wrong — investigate before merging.
+
+          ## Sub-module tag (already pushed)
+
+          \`pkg/dpop/${VERSION}\` was tagged at the current main HEAD (the commit this PR branches from). After this PR merges, that tag and zeroid's go.mod reference will be in sync.
+
+          ## What happens after merge
+
+          Nothing automatic. The next zeroid release (cut via the normal GitHub UI flow) will ship with this updated pkg/dpop reference. No special handling required.
+
+          ## Abandoning this release
+
+          If this PR is closed without merging, the orphan \`pkg/dpop/${VERSION}\` tag can be deleted:
+
+          \`\`\`bash
+          git push --delete origin pkg/dpop/${VERSION}
+          \`\`\`
+          EOF
+          sed -i 's/^          //' "${BODY_FILE}"
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "${BRANCH}" \
+            --title "devops: bump pkg/dpop to ${VERSION}" \
+            --body-file "${BODY_FILE}")
+          rm -f "${BODY_FILE}"
+          echo "::notice::Opened pkg/dpop bump PR: ${PR_URL}"

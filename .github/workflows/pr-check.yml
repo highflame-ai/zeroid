@@ -169,12 +169,23 @@ jobs:
         with:
           node-version: ${{ env.NODE_VER }}
 
-      - name: Run Go tests in tests/
+      # Unit tests live next to their packages (pkg/dpop, pkg/authjwt,
+      # internal/service, domain, config) and were previously not run in CI
+      # at all — only ./tests/... was. Run them with the race detector
+      # (which requires cgo) to cover the concurrency-sensitive surfaces.
+      - name: Run Go unit tests (race detector)
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
         shell: bash
         run: |-
-          go test ./tests/... -v -count=1 -timeout=120s
+          go test $(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
+
+      - name: Run Go integration tests in tests/
+        env:
+          CGO_ENABLED: 1
+        shell: bash
+        run: |-
+          go test ./tests/... -v -race -count=1 -timeout=600s
 
       - name: Install Python SDK smoke dependencies
         shell: bash

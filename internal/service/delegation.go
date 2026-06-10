@@ -46,20 +46,28 @@ type GraphNode struct {
 // identities. ScopesIn/ScopesOut/Attenuated are the scope-attenuation
 // triple; for root credentials (no parent) ScopesIn equals ScopesOut and
 // Attenuated is empty.
+//
+// RevokedAt and RevokeReason surface the durable audit fields from the
+// underlying credential row — populated only when IsRevoked is true so
+// downstream UIs can render "revoked at T by reason R" without a second
+// round-trip to the credential repository. Both are omitempty so the wire
+// shape stays unchanged for unrevoked edges.
 type GraphEdge struct {
-	From            string    `json:"from,omitempty"`
-	To              string    `json:"to,omitempty"`
-	JTI             string    `json:"jti"`
-	ParentJTI       string    `json:"parent_jti,omitempty"`
-	MissionID       string    `json:"mission_id,omitempty"`
-	IssuedAt        time.Time `json:"issued_at"`
-	ExpiresAt       time.Time `json:"expires_at"`
-	GrantType       string    `json:"grant_type"`
-	DelegationDepth int       `json:"delegation_depth"`
-	ScopesIn        []string  `json:"scopes_in"`
-	ScopesOut       []string  `json:"scopes_out"`
-	Attenuated      []string  `json:"attenuated"`
-	IsRevoked       bool      `json:"is_revoked"`
+	From            string     `json:"from,omitempty"`
+	To              string     `json:"to,omitempty"`
+	JTI             string     `json:"jti"`
+	ParentJTI       string     `json:"parent_jti,omitempty"`
+	MissionID       string     `json:"mission_id,omitempty"`
+	IssuedAt        time.Time  `json:"issued_at"`
+	ExpiresAt       time.Time  `json:"expires_at"`
+	GrantType       string     `json:"grant_type"`
+	DelegationDepth int        `json:"delegation_depth"`
+	ScopesIn        []string   `json:"scopes_in"`
+	ScopesOut       []string   `json:"scopes_out"`
+	Attenuated      []string   `json:"attenuated"`
+	IsRevoked       bool       `json:"is_revoked"`
+	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason    string     `json:"revoke_reason,omitempty"`
 }
 
 // Graph is the response shape for /delegations/graph — a depth-bounded
@@ -142,21 +150,40 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		}, nil
 	}
 
-	// creds is ordered issued_at DESC by ListByIdentity, so creds[0] is
-	// the most recent. Anchor the walk on its jti.
-	focal := creds[0]
-
-	up, err := s.delegRepo.WalkUp(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
+	// Walk every credential's delegation tree so the graph covers all
+	// mission chains, not just the most recent one.
+	//
+	// FIX: Previously only creds[0] (most recent) was walked, so identities
+	// with multiple credentials/missions only showed one tree in the graph.
+	// This loop fixes that but issues N×(WalkUp+WalkDown) queries — for
+	// identities with many credentials this may need rethinking (e.g. a
+	// single multi-root CTE, or pagination/lazy-load per mission).
+	seen := make(map[string]struct{})
+	var all []*domain.IssuedCredential
+	for _, c := range creds {
+		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		down, err := s.delegRepo.WalkDown(ctx, c.JTI, accountID, projectID, depth)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range up {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
+		for _, item := range down {
+			if _, ok := seen[item.JTI]; !ok {
+				seen[item.JTI] = struct{}{}
+				all = append(all, item)
+			}
+		}
 	}
-	down, err := s.delegRepo.WalkDown(ctx, focal.JTI, accountID, projectID, depth)
-	if err != nil {
-		return nil, err
-	}
 
-	merged := mergeByJTI(up, down)
-	graph := s.buildGraph(ctx, merged, accountID, projectID, identityID)
+	graph := s.buildGraph(ctx, all, accountID, projectID, identityID)
 	return graph, nil
 }
 
@@ -318,10 +345,12 @@ func credentialToEdge(c *domain.IssuedCredential) *GraphEdge {
 		// ScopesIn defaults to ScopesOut for root credentials so the
 		// triple is always populated; the parent-lookup branch
 		// overwrites this for non-root edges.
-		ScopesIn:   scopesOut,
-		ScopesOut:  scopesOut,
-		Attenuated: []string{},
-		IsRevoked:  c.IsRevoked,
+		ScopesIn:     scopesOut,
+		ScopesOut:    scopesOut,
+		Attenuated:   []string{},
+		IsRevoked:    c.IsRevoked,
+		RevokedAt:    c.RevokedAt,
+		RevokeReason: c.RevokeReason,
 	}
 }
 

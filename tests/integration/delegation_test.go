@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -268,14 +269,11 @@ func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
 		"A's parent (orch) is beyond the depth cap; edge.from must be empty")
 }
 
-// TestDelegationGraph_MostRecentCredentialIsFocal pins the Option-B
+// TestDelegationGraph_AllCredentialsVisible pins the Option-B
 // design choice: when an identity participates in multiple unrelated
-// chains, GetGraph centers on the most recent credential and the older
-// chain is invisible.
-//
-// Without this guard the focal selection could silently flip between
-// chains as old credentials happen to sort differently.
-func TestDelegationGraph_MostRecentCredentialIsFocal(t *testing.T) {
+// chains, GetGraph now walks ALL credentials so every mission tree is
+// visible — not just the most recent one.
+func TestDelegationGraph_AllCredentialsVisible(t *testing.T) {
 	policyID := delegationPolicy(t, uid("focal-policy"), []string{"data:read"})
 
 	// Issue two unrelated root credentials for the same identity. Each
@@ -317,13 +315,14 @@ func TestDelegationGraph_MostRecentCredentialIsFocal(t *testing.T) {
 	body := decode(t, resp)
 
 	edges, _ := body["edges"].([]any)
-	require.Len(t, edges, 1,
-		"focal must walk only the most-recent credential's chain; the older chain is invisible")
-	gotJTI := edges[0].(map[string]any)["jti"].(string)
-	assert.Equal(t, jtiSecond, gotJTI,
-		"focal credential must be the most recent issuance")
-	assert.NotEqual(t, jtiFirst, gotJTI,
-		"older credential's chain must NOT be selected as focal")
+	require.Len(t, edges, 2,
+		"graph must include edges from both credentials / mission trees")
+	jtis := map[string]bool{}
+	for _, e := range edges {
+		jtis[e.(map[string]any)["jti"].(string)] = true
+	}
+	assert.True(t, jtis[jtiFirst], "first credential's edge must be in the graph")
+	assert.True(t, jtis[jtiSecond], "second credential's edge must be in the graph")
 }
 
 // TestDelegationGraph_RevokedCredentialAppears pins that the graph is
@@ -364,6 +363,92 @@ func TestDelegationGraph_RevokedCredentialAppears(t *testing.T) {
 	require.NotNil(t, aEdge, "A's edge must still appear after revocation")
 	assert.True(t, aEdge["is_revoked"].(bool),
 		"revoked credential's edge must carry is_revoked=true")
+
+	// The revoke audit fields must surface alongside is_revoked so
+	// downstream UIs can render "revoked at T by reason R" without a
+	// second round-trip to the credential repository.
+	revokedAt, ok := aEdge["revoked_at"].(string)
+	assert.True(t, ok && revokedAt != "",
+		"revoked credential's edge must carry a non-empty revoked_at timestamp")
+	assert.Equal(t, "test-revoke", aEdge["revoke_reason"],
+		"revoked credential's edge must carry the revoke_reason")
+}
+
+// TestRevokeCredential_NotFound_Returns404 pins the bug fix for what was
+// previously a silent 200-OK no-op: when the revoke endpoint's cascade
+// matches zero rows, the handler returns 404 instead of cheerfully
+// reporting "revoked: true".
+//
+// Zero-row outcomes cover four real cases:
+//
+//  1. Wrong / never-existed credential id
+//  2. Tenant-scope mismatch (account_id / project_id headers don't match the row)
+//  3. Already revoked
+//  4. Already expired
+//
+// Pre-fix, all four returned 200 — leaving the caller convinced the revoke
+// happened when it hadn't. Now they all 404.
+func TestRevokeCredential_NotFound_Returns404(t *testing.T) {
+	// Case 1: completely fictional credential id under a real tenant.
+	fakeID := uuid.New().String()
+	rev := post(t, adminPath("/credentials/"+fakeID+"/revoke"),
+		map[string]any{"reason": "test-404"}, adminHeaders())
+	defer func() { _ = rev.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, rev.StatusCode,
+		"revoke on a non-existent credential id must return 404 (was previously a silent 200)")
+
+	// Case 3: already-revoked. Mint a real credential, revoke it once
+	// (200), then revoke it again — the SQL function's is_revoked = FALSE
+	// filter skips it, returning 0 rows.
+	policyID := delegationPolicy(t, uid("revoke-404-policy"), []string{"data:read"})
+	identityID, _, _ := issueRootCredential(t, policyID, "revoke-404", []string{"data:read"})
+
+	credResp := get(t, adminPath("/credentials?identity_id="+identityID), adminHeaders())
+	require.Equal(t, http.StatusOK, credResp.StatusCode)
+	creds := decode(t, credResp)["credentials"].([]any)
+	require.NotEmpty(t, creds, "identity must have at least one credential")
+	realID := creds[0].(map[string]any)["id"].(string)
+
+	first := post(t, adminPath("/credentials/"+realID+"/revoke"),
+		map[string]any{"reason": "first"}, adminHeaders())
+	defer func() { _ = first.Body.Close() }()
+	require.Equal(t, http.StatusOK, first.StatusCode, "first revoke must succeed")
+
+	second := post(t, adminPath("/credentials/"+realID+"/revoke"),
+		map[string]any{"reason": "second"}, adminHeaders())
+	defer func() { _ = second.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, second.StatusCode,
+		"revoking an already-revoked credential must return 404 (zero rows mutated)")
+}
+
+// TestRevokeCredential_TenantMismatch_Returns404 pins that a revoke
+// request with the wrong X-Account-ID / X-Project-ID also produces a 404
+// — the SQL cascade filters on both, so a mismatched tenant matches zero
+// rows. Pre-fix this was the silent 200 most likely to bite in production
+// where Studio → Admin → AuthN may pass the wrong tenant scope for the
+// credential being revoked.
+func TestRevokeCredential_TenantMismatch_Returns404(t *testing.T) {
+	policyID := delegationPolicy(t, uid("revoke-mismatch-policy"), []string{"data:read"})
+	identityID, _, _ := issueRootCredential(t, policyID, "revoke-mismatch", []string{"data:read"})
+
+	credResp := get(t, adminPath("/credentials?identity_id="+identityID), adminHeaders())
+	require.Equal(t, http.StatusOK, credResp.StatusCode)
+	creds := decode(t, credResp)["credentials"].([]any)
+	require.NotEmpty(t, creds, "identity must have at least one credential")
+	realID := creds[0].(map[string]any)["id"].(string)
+
+	// Forge wrong-tenant headers by overriding the X-Account-ID +
+	// X-Project-ID on the request. The internal-service auth still
+	// matches; only the tenant scope differs.
+	wrongHeaders := adminHeaders()
+	wrongHeaders["X-Account-ID"] = "wrong-account-id"
+	wrongHeaders["X-Project-ID"] = uuid.New().String()
+
+	rev := post(t, adminPath("/credentials/"+realID+"/revoke"),
+		map[string]any{"reason": "wrong-tenant"}, wrongHeaders)
+	defer func() { _ = rev.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, rev.StatusCode,
+		"revoke with mismatched tenant scope must return 404 (zero rows mutated)")
 }
 
 // TestDelegationGraph_DepthOutOfRange_Rejected pins the Huma-side
