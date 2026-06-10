@@ -104,10 +104,17 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 	return identity, nil
 }
 
-// List returns identities for a tenant, optionally filtered by identity_type(s) and label.
-// The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
-// and filters using JSONB containment: labels @> {"key": "value"}.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) ([]*domain.Identity, int, error) {
+// List returns identities for a tenant, optionally filtered by identity_type(s),
+// label, and metadata.
+//
+// The label parameter accepts "key:value" format (e.g. "product:guardrails") and
+// filters using JSONB containment: labels @> {"key": "value"}.
+//
+// The metadata parameter accepts either "key" — key presence (jsonb_exists) — or
+// "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
+// e.g. to list identities that have a redteam_target object configured, whose
+// value is not a scalar and so can't be matched by containment.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -127,6 +134,19 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		}
 		labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
 		q = q.Where("labels @> ?::jsonb", string(labelJSON))
+	}
+	if metadata != "" {
+		parts := strings.SplitN(metadata, ":", 2)
+		if parts[0] == "" {
+			return nil, 0, fmt.Errorf("invalid metadata filter: expected key or key:value, got %q", metadata)
+		}
+		if len(parts) == 2 {
+			metaJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
+			q = q.Where("metadata @> ?::jsonb", string(metaJSON))
+		} else {
+			// key-presence: identities whose metadata has this top-level key.
+			q = q.Where("jsonb_exists(metadata, ?)", parts[0])
+		}
 	}
 	if trustLevel != "" {
 		q = q.Where("trust_level = ?", trustLevel)

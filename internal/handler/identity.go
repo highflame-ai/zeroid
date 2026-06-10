@@ -69,6 +69,7 @@ type ListIdentitiesInput struct {
 	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
 	IsActive     string   `query:"is_active" doc:"Filter by active status"`
 	Search       string   `query:"search" doc:"Search by name or external_id"`
+	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -333,7 +334,7 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	}
 	offset := max(input.Offset, 0)
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
