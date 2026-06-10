@@ -233,6 +233,26 @@ type TokenConfig struct {
 	// AuthCodeIssuer is the expected issuer claim in auth code JWTs.
 	// Defaults to Token.Issuer when empty.
 	AuthCodeIssuer string `koanf:"auth_code_issuer"`
+
+	// AllowUnauthenticatedTokenInspection controls whether the introspection
+	// (RFC 7662) and revocation (RFC 7009) endpoints accept anonymous callers.
+	//
+	// RFC 7662 §2.1 says the introspection endpoint MUST require some form of
+	// authorization (token-scanning defense); RFC 7009 §2.1 requires client
+	// authentication on revocation. When this is false, ZeroID enforces that:
+	// a caller MUST present client credentials, and an anonymous call is
+	// rejected with invalid_client.
+	//
+	// Default true preserves the accept-and-verify posture (anonymous allowed,
+	// presented credentials still verified) for the standalone, network-
+	// isolated deployment model and local development. Validate() REJECTS true
+	// when server.env is production, so production deployments are strict
+	// (spec-compliant) by default and must consciously keep this false — the
+	// same production-gate pattern as AllowUnsafeDevStub and the default
+	// issuer. A production deployment that genuinely relies on network
+	// isolation should authenticate these endpoints at its own edge
+	// (Server.Use) rather than serving them unauthenticated from ZeroID.
+	AllowUnauthenticatedTokenInspection bool `koanf:"allow_unauthenticated_token_inspection"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
@@ -338,6 +358,14 @@ func (c *Config) Validate() error {
 		}
 		if c.WIMSEDomain == defaultWIMSEDomain {
 			return fmt.Errorf("wimse_domain must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_WIMSE_DOMAIN to this deployment's trust domain", c.Server.Env, defaultWIMSEDomain)
+		}
+		// Introspection (RFC 7662 §2.1) and revocation (RFC 7009 §2.1) MUST
+		// require caller authorization. The default leaves them accept-and-
+		// verify (anonymous allowed) for the standalone/dev model; production
+		// must not serve an unauthenticated token-scanning / force-revoke
+		// surface. Force the explicit opt-out.
+		if c.Token.AllowUnauthenticatedTokenInspection {
+			return fmt.Errorf("token.allow_unauthenticated_token_inspection must be false in production (server.env=%q): RFC 7662 §2.1 / RFC 7009 §2.1 require caller authentication on introspection/revocation — set ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION=false (authenticate these endpoints at your edge if you rely on network isolation)", c.Server.Env)
 		}
 	}
 
@@ -521,6 +549,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"token.issuer":      defaultIssuer,
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
+		// Accept-and-verify on introspect/revoke by default (dev/standalone).
+		// Validate() forces this false in production (RFC 7662/7009).
+		"token.allow_unauthenticated_token_inspection": true,
 
 		// WIMSE
 		"wimse_domain": defaultWIMSEDomain,
@@ -604,6 +635,9 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
 		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
 		"ZEROID_HMAC_SECRET": "token.hmac_secret",
+		// Strict client auth on introspection/revocation (RFC 7662/7009).
+		// Default true (accept-and-verify); Validate() forces false in production.
+		"ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION": "token.allow_unauthenticated_token_inspection",
 
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
@@ -640,7 +674,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub") ||
 			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
 			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
-			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints"):
+			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {
 				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)

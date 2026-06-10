@@ -132,6 +132,7 @@ func TestLoadEnvVarsBadTypedValues(t *testing.T) {
 		{"bad_bool_trust_fwd", "ZEROID_TRUST_FORWARDED_HEADERS", "yepp", "not a valid bool"},
 		{"bad_bool_backchannel", "ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS", "maybe", "not a valid bool"},
 		{"bad_bool_private_issuer", "ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS", "nah", "not a valid bool"},
+		{"bad_bool_unauth_inspect", "ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION", "nope", "not a valid bool"},
 		{"bad_int_ttl", "ZEROID_TOKEN_TTL_SECONDS", "soon", "not a valid integer"},
 		{"bad_float_sampling", "OTEL_TRACES_SAMPLER_ARG", "lots", "not a valid float"},
 	}
@@ -157,10 +158,14 @@ func TestLoadEnvVarsGoodTypedValues(t *testing.T) {
 	t.Setenv("ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS", "true")
 	t.Setenv("ZEROID_HMAC_SECRET", "this-is-a-sufficiently-long-secret-key")
 	t.Setenv("ZEROID_ALLOW_UNSAFE_DEV_STUB", "false")
+	t.Setenv("ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION", "false")
 
 	cfg, err := LoadConfig("")
 	if err != nil {
 		t.Fatalf("LoadConfig with valid env vars failed: %v", err)
+	}
+	if cfg.Token.AllowUnauthenticatedTokenInspection {
+		t.Error("ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION=false did not reach token config")
 	}
 	if !cfg.Server.TrustForwardedHeaders {
 		t.Error("ZEROID_TRUST_FORWARDED_HEADERS=true did not reach server.trust_forwarded_headers")
@@ -272,6 +277,30 @@ func TestValidateProductionGate(t *testing.T) {
 		cfg.WIMSEDomain = "acme.example"
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("production with explicit safe values must pass: %v", err)
+		}
+	})
+
+	t.Run("production_rejects_unauthenticated_inspection", func(t *testing.T) {
+		// RFC 7662 §2.1 / RFC 7009 §2.1: production must not serve an
+		// unauthenticated introspection/revocation surface.
+		cfg := baseValidConfig(t)
+		cfg.Server.Env = "production"
+		cfg.Attestation.AllowUnsafeDevStub = false
+		cfg.Token.Issuer = "https://auth.acme.example"
+		cfg.WIMSEDomain = "acme.example"
+		cfg.Token.AllowUnauthenticatedTokenInspection = true
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "allow_unauthenticated_token_inspection must be false in production") {
+			t.Fatalf("production + unauthenticated token inspection must be rejected, got: %v", err)
+		}
+	})
+
+	t.Run("dev_allows_unauthenticated_inspection", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Server.Env = "development"
+		cfg.Token.AllowUnauthenticatedTokenInspection = true
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("dev must allow unauthenticated token inspection: %v", err)
 		}
 	})
 }

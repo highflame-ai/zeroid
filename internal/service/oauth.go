@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
@@ -47,6 +48,13 @@ type OAuthService struct {
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
+	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
+	// MUST present client credentials. When false the endpoints accept-and-
+	// verify (anonymous allowed, presented credentials still verified). atomic
+	// so a test can flip it on a shared server without racing concurrent
+	// introspect/revoke reads under -race.
+	requireTokenInspectionAuth atomic.Bool
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -144,6 +152,16 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+}
+
+// SetRequireTokenInspectionAuth toggles strict client authentication on the
+// introspection (RFC 7662) and revocation (RFC 7009) endpoints. When true,
+// anonymous callers are rejected; when false, the accept-and-verify posture
+// is used (anonymous allowed, presented credentials still verified). Wired
+// from config at startup (server.go) and flippable at runtime so a test can
+// exercise both modes on a shared server without standing up a second one.
+func (s *OAuthService) SetRequireTokenInspectionAuth(require bool) {
+	s.requireTokenInspectionAuth.Store(require)
 }
 
 // RegisterGrant registers a custom grant type handler on the OAuth service.
@@ -1872,9 +1890,18 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 // supplied without a client_id, or when a client_id without a secret does not
 // resolve to a public client. Operational failures surface as 500.
 func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
-	// Anonymous call — neither half presented. Preserve existing internal-path
-	// behavior; the caller falls through to the unauthenticated flow.
+	// Anonymous call — neither half presented.
 	if clientID == "" && clientSecret == "" {
+		// Strict mode (RFC 7662 §2.1 / RFC 7009 §2.1): the endpoint MUST
+		// require some form of authorization — reject the anonymous caller.
+		// Enabled by default in production (config gate). When disabled, the
+		// existing internal/network-isolated path is preserved (anonymous
+		// allowed); ZeroID clients are global (not tenant-scoped), so a
+		// tenant cross-check against the caller is not expressible via client
+		// auth alone — gating access is the surface this closes.
+		if s.requireTokenInspectionAuth.Load() {
+			return oauthUnauthorized("client authentication is required for this endpoint", nil)
+		}
 		return nil
 	}
 	// A client_secret with no client_id is a malformed attempt — there is no

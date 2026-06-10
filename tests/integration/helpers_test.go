@@ -225,6 +225,13 @@ func runTests(m *testing.M) int {
 			MaxTTL:         90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
 			HMACSecret:     testHMACSecret,
 			AuthCodeIssuer: testIssuer,
+			// Accept-and-verify posture for the suite (this is the LoadConfig
+			// default, but a struct literal doesn't get koanf defaults — so set
+			// it explicitly, else the suite would run strict and every
+			// anonymous introspect()/revoke() helper call would 401). The
+			// strict-mode path is exercised by toggling
+			// SetRequireTokenInspectionAuth in its dedicated test.
+			AllowUnauthenticatedTokenInspection: true,
 		},
 		Telemetry: zeroid.TelemetryConfig{
 			Enabled: false,

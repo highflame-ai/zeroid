@@ -55,6 +55,18 @@ token:
   # ZEROID_HMAC_SECRET over committing a secret to YAML.
   # hmac_secret: ""
 
+  # allow_unauthenticated_token_inspection controls whether the introspection
+  # (RFC 7662) and revocation (RFC 7009) endpoints accept anonymous callers.
+  # true  → accept-and-verify: anonymous allowed, presented client credentials
+  #         still verified. Suitable for a standalone, network-isolated
+  #         deployment or local development.
+  # false → strict: a caller MUST present client credentials; anonymous calls
+  #         are rejected with invalid_client (RFC 7662 §2.1 / RFC 7009 §2.1).
+  # Default true, BUT Validate() rejects true when server.env=production, so
+  # production is spec-compliant (strict) by default. Env override:
+  # ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION.
+  allow_unauthenticated_token_inspection: true
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (/api/v1/*) have no built-in auth.

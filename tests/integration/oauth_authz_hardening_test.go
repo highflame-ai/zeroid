@@ -332,3 +332,64 @@ func TestOAuthAuthzHardening_PublicClientRevocationWithoutSecret(t *testing.T) {
 		"a confidential client must present its secret, not just client_id")
 	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
 }
+
+// TestOAuthAuthzHardening_StrictModeRejectsAnonymousInspection pins the
+// config-gated hard-require (RFC 7662 §2.1 / RFC 7009 §2.1, issue #201). With
+// token.allow_unauthenticated_token_inspection=false (forced in production by
+// Validate), introspection and revocation MUST reject an anonymous caller;
+// a caller presenting valid credentials still works. The harness default is
+// accept-and-verify, so the subtest flips strict mode on for its duration.
+func TestOAuthAuthzHardening_StrictModeRejectsAnonymousInspection(t *testing.T) {
+	testZeroIDServer.SetRequireTokenInspectionAuth(true)
+	t.Cleanup(func() { testZeroIDServer.SetRequireTokenInspectionAuth(false) })
+
+	// Mint a token to inspect/revoke, via a confidential client we can also
+	// authenticate with.
+	agentID := uid("strict-inspect")
+	registerIdentity(t, agentID, []string{"data:read"})
+	client := registerOAuthClient(t, agentID, []string{"data:read"})
+	mintResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, mintResp.StatusCode)
+	token := decode(t, mintResp)["access_token"].(string)
+
+	// Anonymous introspection → rejected (401 invalid_client) in strict mode.
+	resp := post(t, "/oauth2/token/introspect", map[string]string{"token": token}, adminHeaders())
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"strict mode must reject anonymous introspection")
+	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+
+	// Anonymous revocation → rejected too (gate runs before the RFC 7009 §2.2
+	// always-200 contract).
+	resp = post(t, "/oauth2/token/revoke", map[string]string{"token": token}, adminHeaders())
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"strict mode must reject anonymous revocation")
+	assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+
+	// Token must NOT have been revoked by the rejected call.
+	introResp := post(t, "/oauth2/token/introspect", map[string]any{
+		"token":         token,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+	}, nil)
+	require.Equal(t, http.StatusOK, introResp.StatusCode,
+		"authenticated introspection must work in strict mode")
+	assert.Equal(t, true, decode(t, introResp)["active"],
+		"token must still be active — the rejected anonymous revoke must not have revoked it")
+
+	// Authenticated revocation works and the RFC 7009 §2.2 200 holds.
+	revResp := post(t, "/oauth2/token/revoke", map[string]any{
+		"token":         token,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+	}, nil)
+	require.Equal(t, http.StatusOK, revResp.StatusCode,
+		"authenticated revocation must succeed")
+	_ = revResp.Body.Close()
+}

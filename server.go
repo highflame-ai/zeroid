@@ -232,6 +232,11 @@ func NewServer(cfg Config) (*Server, error) {
 		HMACSecret:     cfg.Token.HMACSecret,
 		AuthCodeIssuer: authCodeIssuer,
 	})
+	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
+	// require it whenever unauthenticated inspection is NOT allowed. Validate()
+	// forces allow_unauthenticated_token_inspection=false in production, so
+	// production is strict by default.
+	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer)
 
@@ -850,6 +855,15 @@ func (s *Server) SetBackchannelNotifyDispatchSync(sync bool) {
 // configuration and never call this.
 func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
+}
+
+// SetRequireTokenInspectionAuth toggles strict client authentication on the
+// introspection (RFC 7662) and revocation (RFC 7009) endpoints. Mirrors the
+// token.allow_unauthenticated_token_inspection config gate (require ==
+// !allow); exposed so integration tests can exercise both postures on one
+// server without restarting it.
+func (s *Server) SetRequireTokenInspectionAuth(require bool) {
+	s.oauthSvc.SetRequireTokenInspectionAuth(require)
 }
 
 // SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used
