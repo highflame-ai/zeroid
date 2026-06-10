@@ -90,6 +90,7 @@ type ListAgentsInput struct {
 	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
 	IsActive     string   `query:"is_active" doc:"Filter by active status"`
 	Search       string   `query:"search" doc:"Search by name or external_id"`
+	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -357,7 +358,7 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Limit, input.Offset)
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
 	}
