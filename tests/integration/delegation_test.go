@@ -222,19 +222,16 @@ func TestDelegationGraph_NoCredentials_SingleNode(t *testing.T) {
 	assert.Empty(t, edges, "no-credential identity yields no edges")
 }
 
-// TestDelegationGraph_DepthLimitsTheWalk pins the depth-bound invariant
-// on the recursive CTE: a 4-hop chain queried with depth=1 from the
-// middle node returns ONLY the focal credential plus one hop in each
-// direction. The root and the deepest leaf must be absent.
+// TestDelegationGraph_FullTreeFromAnyNode verifies that the graph
+// endpoint always returns the complete delegation tree regardless of
+// which node in the chain is requested. GetGraph walks up to the root
+// (uncapped) then walks the entire tree down from root, so every node
+// in the chain is visible — siblings, ancestors, and descendants.
+// MaxGraphNodes (500) is the only size cap.
 //
-// This is the most important correctness test in the file: a CTE that
-// silently ignored its depth cap would still return a "valid-looking"
-// response, just oversized — which is exactly the failure mode that
-// makes a 500-credential mission OOM the Studio renderer.
-//
-// Chain: orch → A → B → C → D, request graph for B with depth=1.
-// Expected: {A, B, C} only (D and orch must be missing).
-func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
+// Chain: orch → A → B → C → D, request graph for B (middle node).
+// Expected: all 5 nodes {orch, A, B, C, D} with focal_id = B's identity.
+func TestDelegationGraph_FullTreeFromAnyNode(t *testing.T) {
 	policyID := delegationPolicy(t, uid("deleg-depth-policy"), []string{"data:read"})
 
 	orchID, _, orchTok := issueRootCredential(t, policyID, "depth-orch", []string{"data:read"})
@@ -252,21 +249,14 @@ func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
 	body := decode(t, resp)
 
 	ids := nodeIDs(body)
-	assert.Contains(t, ids, aID, "depth=1 from B must include A (1 hop up)")
-	assert.Contains(t, ids, bID, "depth=1 from B must include B (focal)")
-	assert.Contains(t, ids, cID, "depth=1 from B must include C (1 hop down)")
-	assert.NotContains(t, ids, orchID,
-		"depth=1 from B must NOT include orchestrator (2 hops up)")
-	assert.NotContains(t, ids, dID,
-		"depth=1 from B must NOT include D (2 hops down)")
-	assert.Len(t, ids, 3, "depth=1 must yield exactly 3 nodes — no more, no fewer")
+	assert.Contains(t, ids, orchID, "full tree must include orch (root)")
+	assert.Contains(t, ids, aID, "full tree must include A")
+	assert.Contains(t, ids, bID, "full tree must include B (focal)")
+	assert.Contains(t, ids, cID, "full tree must include C")
+	assert.Contains(t, ids, dID, "full tree must include D (leaf)")
+	assert.Len(t, ids, 5, "full tree must yield all 5 nodes in the chain")
 
-	// A's parent (orchestrator) is outside the walked set, so A's edge
-	// must carry from="" — surfaces the depth boundary to the client.
-	aEdge := edgeMap(body)[aID]
-	require.NotNil(t, aEdge, "A's edge must be present")
-	assert.Empty(t, aEdge["from"],
-		"A's parent (orch) is beyond the depth cap; edge.from must be empty")
+	assert.Equal(t, bID, body["focal_id"], "focal_id must be the requested identity")
 }
 
 // TestDelegationGraph_AllCredentialsVisible pins the Option-B
@@ -833,27 +823,22 @@ func TestDelegationChains_InvalidParams_Rejected(t *testing.T) {
 	}
 }
 
-// TestDelegationGraph_BranchedMissionIsolation pins the lineage-segmentation
-// invariant that motivated rsharath's review: within a single mission, two
-// sibling branches must not bleed into each other's graph. Sibling branches
-// share mission_id but live in different parent_jti lineages, so a walker
-// that joined purely on mission_id (instead of parent_jti) would silently
-// mix them.
-//
-// This test passes against both the pre-change and post-change SQL — it's a
-// regression guard. The new mission_id predicate in WalkUp / WalkDown is an
-// AND (not an OR) against the existing parent_jti join, so sibling rows in
-// the same mission are still excluded by the parent_jti edge.
+// TestDelegationGraph_SiblingsVisibleInFullTree verifies that the
+// full-tree graph includes sibling branches. When viewing B1's graph,
+// the walk goes up to root (orch), then down from root — discovering
+// both B1 and B2. This is the intended UX: users need to see the full
+// delegation tree to assess blast radius and understand the complete
+// identity hierarchy.
 //
 // Shape:
 //
 //	orch (root, mission M)
 //	  ├── B1  (parent_jti = orch.jti, mission M)
-//	  └── B2  (parent_jti = orch.jti, mission M)  ← must NOT show up in B1's graph
-func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
+//	  └── B2  (parent_jti = orch.jti, mission M)  ← MUST show up in B1's graph
+func TestDelegationGraph_SiblingsVisibleInFullTree(t *testing.T) {
 	policyID := delegationPolicy(t, uid("branched-policy"), []string{"data:read"})
 
-	_, _, orchTok := issueRootCredential(t, policyID, "branched-orch", []string{"data:read"})
+	orchID, _, orchTok := issueRootCredential(t, policyID, "branched-orch", []string{"data:read"})
 	b1ID, _, _ := exchangeToken(t, policyID, "branched-b1",
 		[]string{"data:read"}, []string{"data:read"}, orchTok)
 	b2ID, _, _ := exchangeToken(t, policyID, "branched-b2",
@@ -864,9 +849,13 @@ func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
 	body := decode(t, resp)
 
 	ids := nodeIDs(body)
+	assert.Contains(t, ids, orchID, "root (orch) must be in the graph")
 	assert.Contains(t, ids, b1ID, "B1 (focal) must be in its own graph")
-	assert.NotContains(t, ids, b2ID,
-		"B2 is a sibling branch under the same mission as B1; must NOT appear in B1's graph")
+	assert.Contains(t, ids, b2ID,
+		"B2 is a sibling branch; must appear in B1's full-tree graph")
+	assert.Len(t, ids, 3, "full tree must yield all 3 nodes")
+
+	assert.Equal(t, b1ID, body["focal_id"], "focal_id must be B1")
 }
 
 // TestDelegationGraph_CrossMissionBoundary is the test that drives the

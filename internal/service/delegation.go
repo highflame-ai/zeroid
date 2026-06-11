@@ -120,14 +120,7 @@ func NewDelegationService(credRepo *postgres.CredentialRepository, delegRepo *po
 //
 // When the identity has issued no credentials yet, returns a one-node
 // graph (just the identity, no edges).
-func (s *DelegationService) GetGraph(ctx context.Context, identityID string, depth int, accountID, projectID string) (*Graph, error) {
-	if depth < 1 {
-		depth = 1
-	}
-	if depth > MaxGraphDepth {
-		depth = MaxGraphDepth
-	}
-
+func (s *DelegationService) GetGraph(ctx context.Context, identityID string, _ int, accountID, projectID string) (*Graph, error) {
 	creds, err := s.credRepo.ListByIdentity(ctx, identityID, accountID, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("look up focal identity credentials: %w", err)
@@ -184,7 +177,7 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 			}
 			seen[rootJTI+"_walked"] = struct{}{}
 
-			down, err := s.delegRepo.WalkDown(ctx, rootJTI, accountID, projectID, depth)
+			down, err := s.delegRepo.WalkDown(ctx, rootJTI, accountID, projectID, MaxGraphDepth)
 			if err != nil {
 				return nil, err
 			}
