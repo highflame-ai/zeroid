@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -45,6 +46,16 @@ type DelegationChainsOutput struct {
 	}
 }
 
+type IdentityDepthsInput struct {
+	IdentityIDs string `query:"identity_ids" required:"true" doc:"Comma-separated identity UUIDs"`
+}
+
+type IdentityDepthsOutput struct {
+	Body struct {
+		Depths []*postgres.IdentityDepth `json:"depths"`
+	}
+}
+
 // ── Delegation routes ────────────────────────────────────────────────────────
 
 func (a *API) registerDelegationRoutes(api huma.API) {
@@ -74,6 +85,15 @@ func (a *API) registerDelegationRoutes(api huma.API) {
 		Description: "Returns one summary row per delegation tree (grouped by mission_id, falling back to root JTI for legacy credentials), ordered by last activity DESC. Defaults to the last 30 days.",
 		Tags:        []string{"Delegations"},
 	}, a.delegationChainsOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "delegation-identity-depths",
+		Method:      http.MethodGet,
+		Path:        "/delegations/identity-depths",
+		Summary:     "Max delegation depth per identity",
+		Description: "Returns the maximum delegation_depth from issued_credentials for each of the given identity IDs. Identities with no credentials are omitted.",
+		Tags:        []string{"Delegations"},
+	}, a.delegationIdentityDepthsOp)
 }
 
 func (a *API) delegationGraphOp(ctx context.Context, input *DelegationGraphInput) (*DelegationGraphOutput, error) {
@@ -124,5 +144,36 @@ func (a *API) delegationChainsOp(ctx context.Context, input *DelegationChainsInp
 
 	out := &DelegationChainsOutput{}
 	out.Body.Chains = chains
+	return out, nil
+}
+
+func (a *API) delegationIdentityDepthsOp(ctx context.Context, input *IdentityDepthsInput) (*IdentityDepthsOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	ids := strings.Split(input.IdentityIDs, ",")
+	filtered := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		out := &IdentityDepthsOutput{}
+		out.Body.Depths = []*postgres.IdentityDepth{}
+		return out, nil
+	}
+
+	depths, err := a.delegationSvc.IdentityDepths(ctx, filtered, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get identity depths")
+		return nil, huma.Error500InternalServerError("failed to get identity depths")
+	}
+
+	out := &IdentityDepthsOutput{}
+	out.Body.Depths = depths
 	return out, nil
 }
