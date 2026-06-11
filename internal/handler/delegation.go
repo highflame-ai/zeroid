@@ -3,11 +3,13 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
@@ -157,9 +159,13 @@ func (a *API) delegationIdentityDepthsOp(ctx context.Context, input *IdentityDep
 	filtered := make([]string, 0, len(ids))
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
-		if id != "" {
-			filtered = append(filtered, id)
+		if id == "" {
+			continue
 		}
+		if _, err := uuid.Parse(id); err != nil {
+			return nil, huma.Error400BadRequest(fmt.Sprintf("invalid identity ID %q: must be a valid UUID", id))
+		}
+		filtered = append(filtered, id)
 	}
 	if len(filtered) == 0 {
 		out := &IdentityDepthsOutput{}
