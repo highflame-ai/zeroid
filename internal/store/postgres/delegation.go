@@ -220,7 +220,7 @@ func (r *DelegationRepository) MaxDepthByIdentities(ctx context.Context, account
 		  AND project_id = ?
 		  AND identity_id IN (?)
 		GROUP BY identity_id`
-	if err := db.NewRaw(q, accountID, projectID, bun.In(identityIDs)).Scan(ctx, &rows); err != nil {
+	if err := db.NewRaw(q, accountID, projectID, bun.List(identityIDs)).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("max depth by identities: %w", err)
 	}
 	return rows, nil

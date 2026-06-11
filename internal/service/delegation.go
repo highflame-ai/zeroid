@@ -178,20 +178,13 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		}
 
 		// Walk down from each root to build the full tree.
-		// The down-walk depth must reach at least the focal credential
-		// plus the user-requested depth below it, otherwise deep focal
-		// nodes get silently truncated.
-		downDepth := (len(up) - 1) + depth
-		if downDepth > MaxGraphDepth {
-			downDepth = MaxGraphDepth
-		}
 		for _, rootJTI := range roots {
 			if _, ok := seen[rootJTI+"_walked"]; ok {
 				continue // already walked this root
 			}
 			seen[rootJTI+"_walked"] = struct{}{}
 
-			down, err := s.delegRepo.WalkDown(ctx, rootJTI, accountID, projectID, downDepth)
+			down, err := s.delegRepo.WalkDown(ctx, rootJTI, accountID, projectID, depth)
 			if err != nil {
 				return nil, err
 			}
