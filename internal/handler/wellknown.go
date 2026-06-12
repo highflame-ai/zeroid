@@ -131,9 +131,9 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// RFC 8414 — client auth methods accepted by the introspection and
 		// revocation endpoints (client_secret_basic via Authorization header,
 		// client_secret_post via body fields).
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
-		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
-		"response_types_supported":                      []string{"token"},
+		"introspection_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
+		"revocation_endpoint_auth_methods_supported":       []string{"client_secret_post", "client_secret_basic"},
+		"response_types_supported":                         []string{"token"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
