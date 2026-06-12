@@ -1057,3 +1057,365 @@ func TestDelegationGraph_CrossMissionSiblings(t *testing.T) {
 	assert.Len(t, ids, 3)
 	assert.Equal(t, aID, body["focal_id"])
 }
+
+// ── Identity-depths endpoint tests ───────────────────────────────────────────
+
+// TestIdentityDepths_HappyPath issues credentials at different depths for
+// two identities and verifies the batch endpoint returns the correct max
+// delegation_depth for each.
+func TestIdentityDepths_HappyPath(t *testing.T) {
+	policyID := delegationPolicy(t, uid("depths-policy"), []string{"data:read"})
+
+	// Root at depth 0, child at depth 1.
+	rootID, _, rootTok := issueRootCredential(t, policyID, "depths-root",
+		[]string{"data:read"})
+	childID, _, _ := exchangeToken(t, policyID, "depths-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	resp := get(t,
+		adminPath("/delegations/identity-depths?identity_ids="+rootID+","+childID),
+		adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	depths := body["depths"].([]any)
+	depthMap := make(map[string]int)
+	for _, d := range depths {
+		m := d.(map[string]any)
+		depthMap[m["identity_id"].(string)] = int(m["max_depth"].(float64))
+	}
+	assert.Equal(t, 0, depthMap[rootID], "root identity depth must be 0")
+	assert.Equal(t, 1, depthMap[childID], "child identity depth must be 1")
+}
+
+// TestIdentityDepths_EmptyInput returns an empty array, not an error.
+func TestIdentityDepths_EmptyInput(t *testing.T) {
+	resp := get(t,
+		adminPath("/delegations/identity-depths?identity_ids="),
+		adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	depths := body["depths"].([]any)
+	assert.Len(t, depths, 0, "empty identity_ids must return empty array")
+}
+
+// TestIdentityDepths_MalformedUUID returns 400 for non-UUID input.
+func TestIdentityDepths_MalformedUUID(t *testing.T) {
+	for _, bad := range []string{"not-a-uuid", "123", "abc"} {
+		resp := get(t,
+			adminPath("/delegations/identity-depths?identity_ids="+bad),
+			adminHeaders())
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"identity_ids=%q must be rejected with 400", bad)
+		_ = resp.Body.Close()
+	}
+}
+
+// TestIdentityDepths_NoCredentials verifies identities with no issued
+// credentials are omitted from the response (not returned with depth 0).
+func TestIdentityDepths_NoCredentials(t *testing.T) {
+	extID := uid("depths-nocreds")
+	identityID := registerIdentityWithPolicy(t, extID, "", "",
+		[]string{"data:read"}, adminHeaders())
+
+	resp := get(t,
+		adminPath("/delegations/identity-depths?identity_ids="+identityID),
+		adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	depths := body["depths"].([]any)
+	assert.Len(t, depths, 0,
+		"identity with no credentials must be omitted from depths response")
+}
+
+// TestIdentityDepths_TenantIsolation verifies depths from another tenant
+// are not returned. Uses the default test tenant's identity but queries
+// from a different tenant scope.
+func TestIdentityDepths_TenantIsolation(t *testing.T) {
+	policyID := delegationPolicy(t, uid("depths-iso-policy"), []string{"data:read"})
+
+	// Issue a root credential under the default test tenant.
+	rootID, _, _ := issueRootCredential(t, policyID, "depths-iso-root",
+		[]string{"data:read"})
+
+	// Verify it's visible from the default tenant.
+	resp := get(t,
+		adminPath("/delegations/identity-depths?identity_ids="+rootID),
+		adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	depths := body["depths"].([]any)
+	require.Len(t, depths, 1, "default tenant must see its own identity depth")
+
+	// Query the same identity from a different tenant — should get nothing.
+	otherTenant := tenantHeaders("acct-depths-other-"+uid(""), "proj-depths-other-"+uid(""))
+	resp2 := get(t,
+		adminPath("/delegations/identity-depths?identity_ids="+rootID),
+		otherTenant)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	body2 := decode(t, resp2)
+	depths2 := body2["depths"].([]any)
+	assert.Len(t, depths2, 0,
+		"other tenant must not see default tenant's identity depths")
+}
+
+// ── Agent delegation_depth tests ─────────────────────────────────────────────
+
+// TestGetAgent_DelegationDepth verifies that GET /agents/registry/:id
+// includes delegation_depth matching the identity's max credential depth.
+func TestGetAgent_DelegationDepth(t *testing.T) {
+	policyID := delegationPolicy(t, uid("agent-depth-policy"), []string{"data:read"})
+
+	rootID, _, rootTok := issueRootCredential(t, policyID, "agent-depth-root",
+		[]string{"data:read"})
+	childID, _, _ := exchangeToken(t, policyID, "agent-depth-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Root agent: delegation_depth should be 0.
+	resp := get(t, adminPath("/agents/registry/"+rootID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.EqualValues(t, 0, body["delegation_depth"],
+		"root agent delegation_depth must be 0")
+
+	// Child agent: delegation_depth should be 1.
+	resp = get(t, adminPath("/agents/registry/"+childID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	assert.EqualValues(t, 1, body["delegation_depth"],
+		"child agent delegation_depth must be 1")
+}
+
+// TestGetAgent_DelegationDepth_NoCredentials verifies an agent with no
+// issued credentials returns delegation_depth: 0.
+func TestGetAgent_DelegationDepth_NoCredentials(t *testing.T) {
+	reg := registerAgent(t, uid("agent-depth-nocred"))
+
+	resp := get(t, adminPath("/agents/registry/"+reg.AgentID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.EqualValues(t, 0, body["delegation_depth"],
+		"agent with no credentials must have delegation_depth 0")
+}
+
+// TestListAgents_DelegationDepth verifies that GET /agents/registry (list)
+// includes delegation_depth per agent via the batch fetch path.
+func TestListAgents_DelegationDepth(t *testing.T) {
+	policyID := delegationPolicy(t, uid("list-depth-policy"), []string{"data:read"})
+
+	_, _, rootTok := issueRootCredential(t, policyID, "list-depth-root",
+		[]string{"data:read"})
+	childID, _, _ := exchangeToken(t, policyID, "list-depth-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	resp := get(t, adminPath("/agents/registry"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	agents := body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		if m["id"] == childID {
+			assert.EqualValues(t, 1, m["delegation_depth"],
+				"child agent in list must have delegation_depth 1")
+			return
+		}
+	}
+	t.Fatalf("child agent %s not found in agent list response", childID)
+}
+
+// ── Graph walk coverage (non-mission_id) ─────────────────────────────────────
+
+// TestDelegationGraph_FromRoot_FullTree queries the graph from the root
+// identity to confirm the up-walk-then-down-walk path works correctly
+// when the focal identity IS the root (up-walk returns just the root,
+// down-walk fans out).
+func TestDelegationGraph_FromRoot_FullTree(t *testing.T) {
+	policyID := delegationPolicy(t, uid("root-graph-policy"), []string{"data:read"})
+
+	rootID, _, rootTok := issueRootCredential(t, policyID, "root-graph-root",
+		[]string{"data:read"})
+	aID, _, _ := exchangeToken(t, policyID, "root-graph-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, _, _ := exchangeToken(t, policyID, "root-graph-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+rootID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root (focal) must appear")
+	assert.Contains(t, ids, aID, "child A must appear")
+	assert.Contains(t, ids, bID, "child B must appear")
+	assert.Len(t, ids, 3)
+	assert.Equal(t, rootID, body["focal_id"])
+}
+
+// ── Sibling-root expansion & batched WalkDownMulti tests ─────────────────────
+
+// TestDelegationGraph_SiblingRootExpansion verifies the core bug fix:
+// when a parent identity has multiple independent root credentials and
+// children are delegated off different roots, querying from any child
+// must show ALL siblings — even those delegated from a different root
+// credential of the same parent identity.
+//
+// Tree shape (same parent identity, two separate root credentials):
+//
+//	Parent identity
+//	  ├── RootCred1 (client_credentials)
+//	  │     ├── ChildA (token_exchange)
+//	  │     └── ChildB (token_exchange)
+//	  └── RootCred2 (client_credentials)
+//	        └── ChildC (token_exchange)
+//
+// Querying from ChildC must show Parent, ChildA, ChildB, and ChildC.
+func TestDelegationGraph_SiblingRootExpansion(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-root-policy"), []string{"data:read"})
+
+	// Issue two independent root credentials for the same parent identity.
+	parentExtID := uid("sib-root-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	// Root credential 1.
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	// Root credential 2 (same identity, new client_credentials grant).
+	resp2 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	rootTok2 := decode(t, resp2)["access_token"].(string)
+
+	// Delegate children off different root credentials.
+	aID, _, _ := exchangeToken(t, policyID, "sib-root-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	bID, _, _ := exchangeToken(t, policyID, "sib-root-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	cID, _, _ := exchangeToken(t, policyID, "sib-root-c",
+		[]string{"data:read"}, []string{"data:read"}, rootTok2)
+
+	// Query from ChildC — must see all siblings including A and B
+	// which were delegated off a different root credential.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+cID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, aID, "child A (from root1) must appear")
+	assert.Contains(t, ids, bID, "child B (from root1) must appear")
+	assert.Contains(t, ids, cID, "child C (focal, from root2) must appear")
+	assert.Equal(t, cID, body["focal_id"])
+}
+
+// TestDelegationGraph_SiblingRootExpansion_FromSibling is the reverse
+// direction: query from ChildA (root1) and verify ChildC (root2) appears.
+func TestDelegationGraph_SiblingRootExpansion_FromSibling(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-rev-policy"), []string{"data:read"})
+
+	parentExtID := uid("sib-rev-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	resp2 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	rootTok2 := decode(t, resp2)["access_token"].(string)
+
+	aID, _, _ := exchangeToken(t, policyID, "sib-rev-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	cID, _, _ := exchangeToken(t, policyID, "sib-rev-c",
+		[]string{"data:read"}, []string{"data:read"}, rootTok2)
+
+	// Query from ChildA — must see ChildC from the sibling root.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+aID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, aID, "child A (focal) must appear")
+	assert.Contains(t, ids, cID, "child C (from sibling root) must appear")
+	assert.Equal(t, aID, body["focal_id"])
+}
+
+// TestDelegationGraph_SiblingRoot_NoChildren verifies that sibling root
+// credentials with no children don't cause issues — they appear as edges
+// in the graph (parent → parent via root credential) but don't add
+// spurious nodes.
+func TestDelegationGraph_SiblingRoot_NoChildren(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-empty-policy"), []string{"data:read"})
+
+	parentExtID := uid("sib-empty-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	// Issue 3 root credentials, only the first has a child.
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "client_credentials", "account_id": testAccountID,
+		"project_id": testProjectID, "client_id": client.ClientID,
+		"client_secret": client.ClientSecret, "scope": "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	// 2nd and 3rd root credentials — no children.
+	for i := 0; i < 2; i++ {
+		r := post(t, "/oauth2/token", map[string]any{
+			"grant_type": "client_credentials", "account_id": testAccountID,
+			"project_id": testProjectID, "client_id": client.ClientID,
+			"client_secret": client.ClientSecret, "scope": "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, r.StatusCode)
+		_ = r.Body.Close()
+	}
+
+	childID, _, _ := exchangeToken(t, policyID, "sib-empty-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+childID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, childID, "child must appear")
+	// Empty sibling roots contribute edges (parent→parent) but no extra nodes
+	// beyond the parent. The graph must not error or return unexpected nodes.
+}

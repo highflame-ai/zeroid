@@ -153,6 +153,45 @@ func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID
 	return creds, nil
 }
 
+// WalkDownMulti is the batched variant of WalkDown — it seeds the
+// recursive CTE with multiple root JTIs at once, avoiding one query per
+// root. All roots share the same tenant scope and depth cap. Results are
+// ordered depth ASC, issued_at ASC (same as WalkDown).
+func (r *DelegationRepository) WalkDownMulti(ctx context.Context, startJTIs []string, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
+	if len(startJTIs) == 0 {
+		return nil, nil
+	}
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	var creds []*domain.IssuedCredential
+	db := dbOrTx(ctx, r.db)
+	const q = `
+		WITH RECURSIVE chain(id, jti, depth) AS (
+			SELECT id, jti, 0
+			FROM issued_credentials
+			WHERE jti IN (?)
+			  AND account_id = ?
+			  AND project_id = ?
+			UNION ALL
+			SELECT ic.id, ic.jti, chain.depth + 1
+			FROM issued_credentials ic
+			JOIN chain ON ic.parent_jti = chain.jti
+			WHERE ic.account_id = ?
+			  AND ic.project_id = ?
+			  AND chain.depth < ?
+		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+		SELECT ic.*
+		FROM issued_credentials ic
+		JOIN chain ON ic.id = chain.id
+		WHERE NOT chain.is_cycle
+		ORDER BY chain.depth ASC, ic.issued_at ASC`
+	if err := db.NewRaw(q, bun.List(startJTIs), accountID, projectID, accountID, projectID, maxDepth).Scan(ctx, &creds); err != nil {
+		return nil, fmt.Errorf("walk-down-multi delegation chain: %w", err)
+	}
+	return creds, nil
+}
+
 // ListChains returns one summary row per delegation tree active in the
 // [since, until) window, ordered by last activity descending. limit
 // caps the result set.
