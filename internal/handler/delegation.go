@@ -104,6 +104,10 @@ func (a *API) delegationGraphOp(ctx context.Context, input *DelegationGraphInput
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
+	if input.Depth != 3 { // non-default depth value — the param is now ignored
+		log.Warn().Int("depth", input.Depth).Str("identity_id", input.IdentityID).
+			Msg("depth parameter is deprecated and ignored; graph always returns the full tree")
+	}
 	g, err := a.delegationSvc.GetGraph(ctx, input.IdentityID, input.Depth, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		log.Error().Err(err).
@@ -155,6 +159,7 @@ func (a *API) delegationIdentityDepthsOp(ctx context.Context, input *IdentityDep
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
+	const maxIdentityIDs = 100
 	ids := strings.Split(input.IdentityIDs, ",")
 	filtered := make([]string, 0, len(ids))
 	for _, id := range ids {
@@ -166,6 +171,9 @@ func (a *API) delegationIdentityDepthsOp(ctx context.Context, input *IdentityDep
 			return nil, huma.Error400BadRequest(fmt.Sprintf("invalid identity ID %q: must be a valid UUID", id))
 		}
 		filtered = append(filtered, id)
+	}
+	if len(filtered) > maxIdentityIDs {
+		return nil, huma.Error400BadRequest(fmt.Sprintf("too many identity IDs: max %d, got %d", maxIdentityIDs, len(filtered)))
 	}
 	if len(filtered) == 0 {
 		out := &IdentityDepthsOutput{}

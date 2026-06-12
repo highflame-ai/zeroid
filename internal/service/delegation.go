@@ -163,13 +163,27 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, _ i
 	// seeded with N roots) instead of N separate queries.
 	const maxUpWalkDepth = 100 // linear chain, safe to go deep
 	walkedRoots := make(map[string]struct{})
+	walkedUp := make(map[string]struct{}) // JTIs already used as WalkUp seeds
 	var allRoots []string
 
 	for _, c := range creds {
+		// Skip credentials already visited by a prior WalkUp — they share
+		// the same ancestor chain so walking again is redundant.
+		if _, done := walkedUp[c.JTI]; done {
+			continue
+		}
+		walkedUp[c.JTI] = struct{}{}
+
 		// Walk up to find the root credential(s).
 		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, maxUpWalkDepth)
 		if err != nil {
 			return nil, err
+		}
+
+		// Mark all credentials in this chain as visited so we don't
+		// re-walk from a sibling credential in the same chain.
+		for _, u := range up {
+			walkedUp[u.JTI] = struct{}{}
 		}
 
 		// Find root credentials — those with no parent_jti.
@@ -272,7 +286,7 @@ func (s *DelegationService) expandRootsByIdentity(
 		}
 		for _, sc := range siblingCreds {
 			if sc.ParentJTI == "" && sc.JTI != rootJTI {
-				if _, already := seen[sc.JTI+"_walked"]; !already {
+				if _, already := seen[sc.JTI]; !already {
 					expanded = append(expanded, sc.JTI)
 				}
 			}
