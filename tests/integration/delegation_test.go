@@ -887,9 +887,8 @@ func TestDelegationGraph_CrossMissionBoundary(t *testing.T) {
 	// Rewrite the orchestrator's mission_id so it no longer matches B's.
 	// B's mission_id was propagated from the orch token at exchange time;
 	// flipping orch's value after the fact creates the synthetic
-	// cross-mission boundary the predicate must catch. Using a literal
-	// distinct value (not NULL) ensures the IS NOT DISTINCT FROM check
-	// evaluates to FALSE on the recursive step.
+	// cross-mission boundary. The up-walk must still cross this boundary
+	// via parent_jti to reach the true root.
 	ctx := context.Background()
 	_, err := testDB.NewUpdate().
 		Table("issued_credentials").
@@ -904,6 +903,157 @@ func TestDelegationGraph_CrossMissionBoundary(t *testing.T) {
 
 	ids := nodeIDs(body)
 	assert.Contains(t, ids, bID, "B (focal) must always appear in its own graph")
-	assert.NotContains(t, ids, orchID,
-		"orch lives in a different mission than B; the recursive predicate must prune it")
+	assert.Contains(t, ids, orchID,
+		"orch must be reachable across mission boundary via parent_jti")
+}
+
+// TestDelegationGraph_CrossMissionUpwardWalk builds a 3-node chain where
+// the root has a different mission_id than its descendants. Querying
+// from the deepest node must still reach the root via WalkUp and then
+// WalkDown must return the full tree.
+//
+// Chain shape:
+//
+//	Root (mission X)  →  Child (mission Y)  →  Grandchild (mission Y)
+func TestDelegationGraph_CrossMissionUpwardWalk(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-up-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-up-root",
+		[]string{"data:read"})
+	childID, _, childTok := exchangeToken(t, policyID, "cross-up-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	gcID, _, _ := exchangeToken(t, policyID, "cross-up-gc",
+		[]string{"data:read"}, []string{"data:read"}, childTok)
+
+	// Diverge root's mission_id from the rest of the chain.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "diverged-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	// Query from grandchild — must walk up across mission boundary to root.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+gcID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root must be reachable across mission boundary")
+	assert.Contains(t, ids, childID, "child must appear")
+	assert.Contains(t, ids, gcID, "grandchild (focal) must appear")
+	assert.Len(t, ids, 3, "full tree must yield all 3 nodes")
+	assert.Equal(t, gcID, body["focal_id"])
+}
+
+// TestDelegationGraph_CrossMissionMultipleHops builds a 4-node chain
+// where every node has a different mission_id. Querying from the leaf
+// must traverse all mission boundaries.
+//
+// Chain shape:
+//
+//	Root (mission A) → A (mission B) → B (mission C) → C (mission D)
+func TestDelegationGraph_CrossMissionMultipleHops(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-multi-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-multi-root",
+		[]string{"data:read"})
+	aID, aJTI, aTok := exchangeToken(t, policyID, "cross-multi-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, bJTI, bTok := exchangeToken(t, policyID, "cross-multi-b",
+		[]string{"data:read"}, []string{"data:read"}, aTok)
+	cID, _, _ := exchangeToken(t, policyID, "cross-multi-c",
+		[]string{"data:read"}, []string{"data:read"}, bTok)
+
+	// Give each node a unique mission_id.
+	ctx := context.Background()
+	for i, jti := range []string{rootJTI, aJTI, bJTI} {
+		_, err := testDB.NewUpdate().
+			Table("issued_credentials").
+			Set("mission_id = ?", fmt.Sprintf("mission-%d-%s", i, uid(""))).
+			Where("jti = ?", jti).
+			Exec(ctx)
+		require.NoError(t, err)
+	}
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+cID+"&depth=5"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root across 3 mission boundaries")
+	assert.Contains(t, ids, aID, "A across 2 mission boundaries")
+	assert.Contains(t, ids, bID, "B across 1 mission boundary")
+	assert.Contains(t, ids, cID, "C (focal)")
+	assert.Len(t, ids, 4, "all 4 nodes must be reachable")
+}
+
+// TestDelegationByJTI_CrossMissionBoundary verifies that the /by-jti
+// endpoint (which uses WalkUp internally) crosses mission boundaries.
+func TestDelegationByJTI_CrossMissionBoundary(t *testing.T) {
+	policyID := delegationPolicy(t, uid("byjti-cross-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "byjti-cross-root",
+		[]string{"data:read"})
+	childID, childJTI, _ := exchangeToken(t, policyID, "byjti-cross-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Diverge root's mission_id.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "byjti-other-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	resp := get(t, adminPath("/delegations/by-jti/"+childJTI), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root must be in by-jti lineage across mission boundary")
+	assert.Contains(t, ids, childID, "child must be in by-jti lineage")
+}
+
+// TestDelegationGraph_CrossMissionSiblings verifies that when the root
+// has a different mission_id, querying from one child still shows the
+// sibling subtree (WalkUp reaches root, WalkDown fans out to both).
+//
+// Tree shape:
+//
+//	Root (mission X)
+//	  ├── A (mission Y)
+//	  └── B (mission Z)
+func TestDelegationGraph_CrossMissionSiblings(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-sib-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-sib-root",
+		[]string{"data:read"})
+	aID, _, _ := exchangeToken(t, policyID, "cross-sib-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, _, _ := exchangeToken(t, policyID, "cross-sib-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Diverge root's mission_id from both children.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "sib-root-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	// Query from A — should see root and sibling B.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+aID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root reachable across mission boundary")
+	assert.Contains(t, ids, aID, "A (focal)")
+	assert.Contains(t, ids, bID, "sibling B visible via WalkDown from root")
+	assert.Len(t, ids, 3)
+	assert.Equal(t, aID, body["focal_id"])
 }

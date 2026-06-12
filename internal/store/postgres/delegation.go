@@ -68,13 +68,12 @@ type ChainSummary struct {
 // would not be reachable because the recursive step filters on
 // `ic.account_id` / `ic.project_id`.
 //
-// The recursive step also constrains `ic.mission_id = chain.mission_id` so
-// the planner prunes to a single mission's rows via
-// idx_issued_credentials_mission_id instead of scanning the tenant slice on
-// every iteration. parent_jti still drives lineage segmentation — branched
-// missions (sibling token_exchanges off the same parent) share mission_id
-// but live in different parent_jti chains, and the join on
-// `ic.jti = chain.parent_jti` keeps them apart.
+// Like WalkDown, this query does NOT constrain by mission_id because
+// parent credentials may belong to a different mission when a sub-agent
+// starts a new mission_id. The up-walk is single-parent (each credential
+// has at most one parent_jti), so there is no fan-out to constrain —
+// the structural parent_jti chain is sufficient and tenant scoping keeps
+// the walk bounded.
 func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
@@ -83,19 +82,18 @@ func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, 
 	db := dbOrTx(ctx, r.db)
 	// Order DESC so root (highest depth) appears first.
 	const q = `
-		WITH RECURSIVE chain(id, jti, parent_jti, depth, mission_id) AS (
-			SELECT id, jti, parent_jti, 0, mission_id
+		WITH RECURSIVE chain(id, jti, parent_jti, depth) AS (
+			SELECT id, jti, parent_jti, 0
 			FROM issued_credentials
 			WHERE jti = ?
 			  AND account_id = ?
 			  AND project_id = ?
 			UNION ALL
-			SELECT ic.id, ic.jti, ic.parent_jti, chain.depth + 1, ic.mission_id
+			SELECT ic.id, ic.jti, ic.parent_jti, chain.depth + 1
 			FROM issued_credentials ic
 			JOIN chain ON ic.jti = chain.parent_jti
 			WHERE ic.account_id = ?
 			  AND ic.project_id = ?
-			  AND ic.mission_id = chain.mission_id
 			  AND chain.depth < ?
 		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
 		SELECT ic.*
