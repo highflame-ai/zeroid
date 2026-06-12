@@ -108,24 +108,19 @@ func NewDelegationService(credRepo *postgres.CredentialRepository, delegRepo *po
 	}
 }
 
-// GetGraph returns the depth-bounded local subgraph centered on
-// identityID. The focal credential is identityID's most recent
-// credential; the walk proceeds up `depth` hops via parent_jti and
-// down `depth` hops via reverse parent_jti. Identities are enriched in
-// one batch query.
+// GetGraph returns the full delegation tree for the identity identified
+// by identityID. The algorithm walks up from the focal identity's
+// credentials to find the root(s) (credentials with no parent_jti),
+// then walks down from each root to build the complete tree. The focal
+// identity is returned as FocalID so the UI can highlight it.
+//
+// The up-walk is uncapped (uses maxUpWalkDepth = 100) because it is
+// linear — each credential has at most one parent. The down-walk uses
+// MaxGraphDepth to bound fan-out. MaxGraphNodes caps the total response.
 //
 // When the identity has issued no credentials yet, returns a one-node
-// graph (just the identity, no edges). When the credential count
-// exceeds MaxGraphNodes after the walk, Truncated is set on the
-// response; credentials are capped at MaxGraphNodes.
-func (s *DelegationService) GetGraph(ctx context.Context, identityID string, depth int, accountID, projectID string) (*Graph, error) {
-	if depth < 1 {
-		depth = 1
-	}
-	if depth > MaxGraphDepth {
-		depth = MaxGraphDepth
-	}
-
+// graph (just the identity, no edges).
+func (s *DelegationService) GetGraph(ctx context.Context, identityID string, _ int, accountID, projectID string) (*Graph, error) {
 	creds, err := s.credRepo.ListByIdentity(ctx, identityID, accountID, projectID)
 	if err != nil {
 		return nil, fmt.Errorf("look up focal identity credentials: %w", err)
@@ -150,41 +145,154 @@ func (s *DelegationService) GetGraph(ctx context.Context, identityID string, dep
 		}, nil
 	}
 
-	// Walk every credential's delegation tree so the graph covers all
-	// mission chains, not just the most recent one.
+	// For each credential, walk up to the root (uncapped — linear chain,
+	// negligible cost), then walk the entire tree down from that root.
+	// This ensures the graph shows the full tree including siblings and
+	// their subtrees, not just the focal identity's direct ancestors and
+	// descendants.
 	//
-	// FIX: Previously only creds[0] (most recent) was walked, so identities
-	// with multiple credentials/missions only showed one tree in the graph.
-	// This loop fixes that but issues N×(WalkUp+WalkDown) queries — for
-	// identities with many credentials this may need rethinking (e.g. a
-	// single multi-root CTE, or pagination/lazy-load per mission).
-	seen := make(map[string]struct{})
-	var all []*domain.IssuedCredential
+	// A single identity may hold multiple independent root credentials
+	// (e.g. each Claude Code session issues a fresh client_credentials
+	// token). When the focal credential's parent_jti points at one of
+	// those roots, the other roots (and their subtrees) would be invisible
+	// if we only walked down from the single root we reached. To fix this,
+	// after finding a root credential we also list ALL credentials for the
+	// root's identity and include them as additional roots.
+	//
+	// All roots are batched into a single WalkDownMulti call (one CTE
+	// seeded with N roots) instead of N separate queries.
+	const maxUpWalkDepth = 100 // linear chain, safe to go deep
+	walkedRoots := make(map[string]struct{})
+	walkedUp := make(map[string]struct{}) // JTIs already used as WalkUp seeds
+	var allRoots []string
+
 	for _, c := range creds {
-		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, depth)
+		// Skip credentials already visited by a prior WalkUp — they share
+		// the same ancestor chain so walking again is redundant.
+		if _, done := walkedUp[c.JTI]; done {
+			continue
+		}
+		walkedUp[c.JTI] = struct{}{}
+
+		// Walk up to find the root credential(s).
+		up, err := s.delegRepo.WalkUp(ctx, c.JTI, accountID, projectID, maxUpWalkDepth)
 		if err != nil {
 			return nil, err
 		}
-		down, err := s.delegRepo.WalkDown(ctx, c.JTI, accountID, projectID, depth)
-		if err != nil {
-			return nil, err
+
+		// Mark all credentials in this chain as visited so we don't
+		// re-walk from a sibling credential in the same chain.
+		for _, u := range up {
+			walkedUp[u.JTI] = struct{}{}
 		}
-		for _, item := range up {
-			if _, ok := seen[item.JTI]; !ok {
-				seen[item.JTI] = struct{}{}
-				all = append(all, item)
-			}
+
+		// Find root credentials — those with no parent_jti.
+		roots := findRoots(up)
+		if len(roots) == 0 {
+			roots = []string{c.JTI}
 		}
-		for _, item := range down {
-			if _, ok := seen[item.JTI]; !ok {
-				seen[item.JTI] = struct{}{}
-				all = append(all, item)
+
+		// Expand roots: for each root credential, find ALL credentials
+		// belonging to the same identity so we also walk down from sibling
+		// root credentials. This handles the case where a parent identity
+		// has multiple independent root tokens.
+		expandedRoots := s.expandRootsByIdentity(ctx, up, roots, accountID, projectID, walkedRoots)
+
+		for _, rootJTI := range expandedRoots {
+			if _, ok := walkedRoots[rootJTI]; ok {
+				continue
 			}
+			walkedRoots[rootJTI] = struct{}{}
+			allRoots = append(allRoots, rootJTI)
+		}
+	}
+
+	// Single batched walk-down from all collected roots.
+	down, err := s.delegRepo.WalkDownMulti(ctx, allRoots, accountID, projectID, MaxGraphDepth)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(down))
+	var all []*domain.IssuedCredential
+	for _, item := range down {
+		if _, ok := seen[item.JTI]; !ok {
+			seen[item.JTI] = struct{}{}
+			all = append(all, item)
 		}
 	}
 
 	graph := s.buildGraph(ctx, all, accountID, projectID, identityID)
 	return graph, nil
+}
+
+// findRoots returns the JTIs of credentials that have no parent
+// (ParentJTI is empty). These are the roots of delegation trees.
+func findRoots(creds []*domain.IssuedCredential) []string {
+	var roots []string
+	for _, c := range creds {
+		if c.ParentJTI == "" {
+			roots = append(roots, c.JTI)
+		}
+	}
+	return roots
+}
+
+// expandRootsByIdentity takes the root JTIs found via WalkUp and expands
+// them: for each root credential, it looks up ALL credentials belonging
+// to that root's identity and includes any that are also roots (no
+// parent_jti). This handles the common case where a parent identity
+// holds multiple independent root credentials (e.g. repeated
+// client_credentials grants across sessions) and child delegations are
+// spread across different root JTIs of the same identity.
+//
+// The `up` slice is the full WalkUp result (used to find root identity
+// IDs without an extra DB call). `seen` is checked to skip identities
+// already expanded.
+func (s *DelegationService) expandRootsByIdentity(
+	ctx context.Context,
+	up []*domain.IssuedCredential,
+	roots []string,
+	accountID, projectID string,
+	seen map[string]struct{},
+) []string {
+	// Index the WalkUp results by JTI to resolve root JTI → identity.
+	byJTI := make(map[string]*domain.IssuedCredential, len(up))
+	for _, c := range up {
+		byJTI[c.JTI] = c
+	}
+
+	expanded := make([]string, 0, len(roots))
+	expandedIdentities := make(map[string]struct{})
+
+	for _, rootJTI := range roots {
+		expanded = append(expanded, rootJTI)
+
+		rootCred, ok := byJTI[rootJTI]
+		if !ok || rootCred.IdentityID == nil || *rootCred.IdentityID == "" {
+			continue
+		}
+		identityID := *rootCred.IdentityID
+		if _, done := expandedIdentities[identityID]; done {
+			continue
+		}
+		expandedIdentities[identityID] = struct{}{}
+
+		// List all credentials for this identity to find sibling roots.
+		siblingCreds, err := s.credRepo.ListByIdentity(ctx, identityID, accountID, projectID)
+		if err != nil {
+			log.Warn().Err(err).Str("identity_id", identityID).
+				Msg("failed to expand root identity credentials; continuing with known roots")
+			continue
+		}
+		for _, sc := range siblingCreds {
+			if sc.ParentJTI == "" && sc.JTI != rootJTI {
+				if _, already := seen[sc.JTI]; !already {
+					expanded = append(expanded, sc.JTI)
+				}
+			}
+		}
+	}
+	return expanded
 }
 
 // WalkByJTI returns the full lineage from root to the credential
@@ -224,6 +332,12 @@ func (s *DelegationService) ListChains(ctx context.Context, since, until time.Ti
 		limit = 500
 	}
 	return s.delegRepo.ListChains(ctx, accountID, projectID, since, until, limit)
+}
+
+// IdentityDepths returns the maximum delegation depth per identity for the
+// given identity IDs. Identities with no credentials are omitted.
+func (s *DelegationService) IdentityDepths(ctx context.Context, identityIDs []string, accountID, projectID string) ([]*postgres.IdentityDepth, error) {
+	return s.delegRepo.MaxDepthByIdentities(ctx, accountID, projectID, identityIDs)
 }
 
 // buildGraph turns a flat ordered credential list into the

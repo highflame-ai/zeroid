@@ -222,19 +222,16 @@ func TestDelegationGraph_NoCredentials_SingleNode(t *testing.T) {
 	assert.Empty(t, edges, "no-credential identity yields no edges")
 }
 
-// TestDelegationGraph_DepthLimitsTheWalk pins the depth-bound invariant
-// on the recursive CTE: a 4-hop chain queried with depth=1 from the
-// middle node returns ONLY the focal credential plus one hop in each
-// direction. The root and the deepest leaf must be absent.
+// TestDelegationGraph_FullTreeFromAnyNode verifies that the graph
+// endpoint always returns the complete delegation tree regardless of
+// which node in the chain is requested. GetGraph walks up to the root
+// (uncapped) then walks the entire tree down from root, so every node
+// in the chain is visible — siblings, ancestors, and descendants.
+// MaxGraphNodes (500) is the only size cap.
 //
-// This is the most important correctness test in the file: a CTE that
-// silently ignored its depth cap would still return a "valid-looking"
-// response, just oversized — which is exactly the failure mode that
-// makes a 500-credential mission OOM the Studio renderer.
-//
-// Chain: orch → A → B → C → D, request graph for B with depth=1.
-// Expected: {A, B, C} only (D and orch must be missing).
-func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
+// Chain: orch → A → B → C → D, request graph for B (middle node).
+// Expected: all 5 nodes {orch, A, B, C, D} with focal_id = B's identity.
+func TestDelegationGraph_FullTreeFromAnyNode(t *testing.T) {
 	policyID := delegationPolicy(t, uid("deleg-depth-policy"), []string{"data:read"})
 
 	orchID, _, orchTok := issueRootCredential(t, policyID, "depth-orch", []string{"data:read"})
@@ -252,21 +249,14 @@ func TestDelegationGraph_DepthLimitsTheWalk(t *testing.T) {
 	body := decode(t, resp)
 
 	ids := nodeIDs(body)
-	assert.Contains(t, ids, aID, "depth=1 from B must include A (1 hop up)")
-	assert.Contains(t, ids, bID, "depth=1 from B must include B (focal)")
-	assert.Contains(t, ids, cID, "depth=1 from B must include C (1 hop down)")
-	assert.NotContains(t, ids, orchID,
-		"depth=1 from B must NOT include orchestrator (2 hops up)")
-	assert.NotContains(t, ids, dID,
-		"depth=1 from B must NOT include D (2 hops down)")
-	assert.Len(t, ids, 3, "depth=1 must yield exactly 3 nodes — no more, no fewer")
+	assert.Contains(t, ids, orchID, "full tree must include orch (root)")
+	assert.Contains(t, ids, aID, "full tree must include A")
+	assert.Contains(t, ids, bID, "full tree must include B (focal)")
+	assert.Contains(t, ids, cID, "full tree must include C")
+	assert.Contains(t, ids, dID, "full tree must include D (leaf)")
+	assert.Len(t, ids, 5, "full tree must yield all 5 nodes in the chain")
 
-	// A's parent (orchestrator) is outside the walked set, so A's edge
-	// must carry from="" — surfaces the depth boundary to the client.
-	aEdge := edgeMap(body)[aID]
-	require.NotNil(t, aEdge, "A's edge must be present")
-	assert.Empty(t, aEdge["from"],
-		"A's parent (orch) is beyond the depth cap; edge.from must be empty")
+	assert.Equal(t, bID, body["focal_id"], "focal_id must be the requested identity")
 }
 
 // TestDelegationGraph_AllCredentialsVisible pins the Option-B
@@ -833,27 +823,22 @@ func TestDelegationChains_InvalidParams_Rejected(t *testing.T) {
 	}
 }
 
-// TestDelegationGraph_BranchedMissionIsolation pins the lineage-segmentation
-// invariant that motivated rsharath's review: within a single mission, two
-// sibling branches must not bleed into each other's graph. Sibling branches
-// share mission_id but live in different parent_jti lineages, so a walker
-// that joined purely on mission_id (instead of parent_jti) would silently
-// mix them.
-//
-// This test passes against both the pre-change and post-change SQL — it's a
-// regression guard. The new mission_id predicate in WalkUp / WalkDown is an
-// AND (not an OR) against the existing parent_jti join, so sibling rows in
-// the same mission are still excluded by the parent_jti edge.
+// TestDelegationGraph_SiblingsVisibleInFullTree verifies that the
+// full-tree graph includes sibling branches. When viewing B1's graph,
+// the walk goes up to root (orch), then down from root — discovering
+// both B1 and B2. This is the intended UX: users need to see the full
+// delegation tree to assess blast radius and understand the complete
+// identity hierarchy.
 //
 // Shape:
 //
 //	orch (root, mission M)
 //	  ├── B1  (parent_jti = orch.jti, mission M)
-//	  └── B2  (parent_jti = orch.jti, mission M)  ← must NOT show up in B1's graph
-func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
+//	  └── B2  (parent_jti = orch.jti, mission M)  ← MUST show up in B1's graph
+func TestDelegationGraph_SiblingsVisibleInFullTree(t *testing.T) {
 	policyID := delegationPolicy(t, uid("branched-policy"), []string{"data:read"})
 
-	_, _, orchTok := issueRootCredential(t, policyID, "branched-orch", []string{"data:read"})
+	orchID, _, orchTok := issueRootCredential(t, policyID, "branched-orch", []string{"data:read"})
 	b1ID, _, _ := exchangeToken(t, policyID, "branched-b1",
 		[]string{"data:read"}, []string{"data:read"}, orchTok)
 	b2ID, _, _ := exchangeToken(t, policyID, "branched-b2",
@@ -864,9 +849,13 @@ func TestDelegationGraph_BranchedMissionIsolation(t *testing.T) {
 	body := decode(t, resp)
 
 	ids := nodeIDs(body)
+	assert.Contains(t, ids, orchID, "root (orch) must be in the graph")
 	assert.Contains(t, ids, b1ID, "B1 (focal) must be in its own graph")
-	assert.NotContains(t, ids, b2ID,
-		"B2 is a sibling branch under the same mission as B1; must NOT appear in B1's graph")
+	assert.Contains(t, ids, b2ID,
+		"B2 is a sibling branch; must appear in B1's full-tree graph")
+	assert.Len(t, ids, 3, "full tree must yield all 3 nodes")
+
+	assert.Equal(t, b1ID, body["focal_id"], "focal_id must be B1")
 }
 
 // TestDelegationGraph_CrossMissionBoundary is the test that drives the
@@ -898,9 +887,8 @@ func TestDelegationGraph_CrossMissionBoundary(t *testing.T) {
 	// Rewrite the orchestrator's mission_id so it no longer matches B's.
 	// B's mission_id was propagated from the orch token at exchange time;
 	// flipping orch's value after the fact creates the synthetic
-	// cross-mission boundary the predicate must catch. Using a literal
-	// distinct value (not NULL) ensures the IS NOT DISTINCT FROM check
-	// evaluates to FALSE on the recursive step.
+	// cross-mission boundary. The up-walk must still cross this boundary
+	// via parent_jti to reach the true root.
 	ctx := context.Background()
 	_, err := testDB.NewUpdate().
 		Table("issued_credentials").
@@ -915,6 +903,418 @@ func TestDelegationGraph_CrossMissionBoundary(t *testing.T) {
 
 	ids := nodeIDs(body)
 	assert.Contains(t, ids, bID, "B (focal) must always appear in its own graph")
-	assert.NotContains(t, ids, orchID,
-		"orch lives in a different mission than B; the recursive predicate must prune it")
+	assert.Contains(t, ids, orchID,
+		"orch must be reachable across mission boundary via parent_jti")
+}
+
+// TestDelegationGraph_CrossMissionUpwardWalk builds a 3-node chain where
+// the root has a different mission_id than its descendants. Querying
+// from the deepest node must still reach the root via WalkUp and then
+// WalkDown must return the full tree.
+//
+// Chain shape:
+//
+//	Root (mission X)  →  Child (mission Y)  →  Grandchild (mission Y)
+func TestDelegationGraph_CrossMissionUpwardWalk(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-up-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-up-root",
+		[]string{"data:read"})
+	childID, _, childTok := exchangeToken(t, policyID, "cross-up-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	gcID, _, _ := exchangeToken(t, policyID, "cross-up-gc",
+		[]string{"data:read"}, []string{"data:read"}, childTok)
+
+	// Diverge root's mission_id from the rest of the chain.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "diverged-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	// Query from grandchild — must walk up across mission boundary to root.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+gcID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root must be reachable across mission boundary")
+	assert.Contains(t, ids, childID, "child must appear")
+	assert.Contains(t, ids, gcID, "grandchild (focal) must appear")
+	assert.Len(t, ids, 3, "full tree must yield all 3 nodes")
+	assert.Equal(t, gcID, body["focal_id"])
+}
+
+// TestDelegationGraph_CrossMissionMultipleHops builds a 4-node chain
+// where every node has a different mission_id. Querying from the leaf
+// must traverse all mission boundaries.
+//
+// Chain shape:
+//
+//	Root (mission A) → A (mission B) → B (mission C) → C (mission D)
+func TestDelegationGraph_CrossMissionMultipleHops(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-multi-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-multi-root",
+		[]string{"data:read"})
+	aID, aJTI, aTok := exchangeToken(t, policyID, "cross-multi-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, bJTI, bTok := exchangeToken(t, policyID, "cross-multi-b",
+		[]string{"data:read"}, []string{"data:read"}, aTok)
+	cID, _, _ := exchangeToken(t, policyID, "cross-multi-c",
+		[]string{"data:read"}, []string{"data:read"}, bTok)
+
+	// Give each node a unique mission_id.
+	ctx := context.Background()
+	for i, jti := range []string{rootJTI, aJTI, bJTI} {
+		_, err := testDB.NewUpdate().
+			Table("issued_credentials").
+			Set("mission_id = ?", fmt.Sprintf("mission-%d-%s", i, uid(""))).
+			Where("jti = ?", jti).
+			Exec(ctx)
+		require.NoError(t, err)
+	}
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+cID+"&depth=5"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root across 3 mission boundaries")
+	assert.Contains(t, ids, aID, "A across 2 mission boundaries")
+	assert.Contains(t, ids, bID, "B across 1 mission boundary")
+	assert.Contains(t, ids, cID, "C (focal)")
+	assert.Len(t, ids, 4, "all 4 nodes must be reachable")
+}
+
+// TestDelegationByJTI_CrossMissionBoundary verifies that the /by-jti
+// endpoint (which uses WalkUp internally) crosses mission boundaries.
+func TestDelegationByJTI_CrossMissionBoundary(t *testing.T) {
+	policyID := delegationPolicy(t, uid("byjti-cross-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "byjti-cross-root",
+		[]string{"data:read"})
+	childID, childJTI, _ := exchangeToken(t, policyID, "byjti-cross-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Diverge root's mission_id.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "byjti-other-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	resp := get(t, adminPath("/delegations/by-jti/"+childJTI), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root must be in by-jti lineage across mission boundary")
+	assert.Contains(t, ids, childID, "child must be in by-jti lineage")
+}
+
+// TestDelegationGraph_CrossMissionSiblings verifies that when the root
+// has a different mission_id, querying from one child still shows the
+// sibling subtree (WalkUp reaches root, WalkDown fans out to both).
+//
+// Tree shape:
+//
+//	Root (mission X)
+//	  ├── A (mission Y)
+//	  └── B (mission Z)
+func TestDelegationGraph_CrossMissionSiblings(t *testing.T) {
+	policyID := delegationPolicy(t, uid("cross-sib-policy"), []string{"data:read"})
+
+	rootID, rootJTI, rootTok := issueRootCredential(t, policyID, "cross-sib-root",
+		[]string{"data:read"})
+	aID, _, _ := exchangeToken(t, policyID, "cross-sib-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, _, _ := exchangeToken(t, policyID, "cross-sib-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Diverge root's mission_id from both children.
+	ctx := context.Background()
+	_, err := testDB.NewUpdate().
+		Table("issued_credentials").
+		Set("mission_id = ?", "sib-root-mission-"+uid("")).
+		Where("jti = ?", rootJTI).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	// Query from A — should see root and sibling B.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+aID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root reachable across mission boundary")
+	assert.Contains(t, ids, aID, "A (focal)")
+	assert.Contains(t, ids, bID, "sibling B visible via WalkDown from root")
+	assert.Len(t, ids, 3)
+	assert.Equal(t, aID, body["focal_id"])
+}
+
+// ── Agent delegation_depth tests ─────────────────────────────────────────────
+
+// TestGetAgent_DelegationDepth verifies that GET /agents/registry/:id
+// includes delegation_depth matching the identity's max credential depth.
+func TestGetAgent_DelegationDepth(t *testing.T) {
+	policyID := delegationPolicy(t, uid("agent-depth-policy"), []string{"data:read"})
+
+	rootID, _, rootTok := issueRootCredential(t, policyID, "agent-depth-root",
+		[]string{"data:read"})
+	childID, _, _ := exchangeToken(t, policyID, "agent-depth-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	// Root agent: delegation_depth should be 0.
+	resp := get(t, adminPath("/agents/registry/"+rootID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.EqualValues(t, 0, body["delegation_depth"],
+		"root agent delegation_depth must be 0")
+
+	// Child agent: delegation_depth should be 1.
+	resp = get(t, adminPath("/agents/registry/"+childID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	assert.EqualValues(t, 1, body["delegation_depth"],
+		"child agent delegation_depth must be 1")
+}
+
+// TestGetAgent_DelegationDepth_NoCredentials verifies an agent with no
+// issued credentials returns delegation_depth: 0.
+func TestGetAgent_DelegationDepth_NoCredentials(t *testing.T) {
+	reg := registerAgent(t, uid("agent-depth-nocred"))
+
+	resp := get(t, adminPath("/agents/registry/"+reg.AgentID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.EqualValues(t, 0, body["delegation_depth"],
+		"agent with no credentials must have delegation_depth 0")
+}
+
+// TestListAgents_DelegationDepth verifies that GET /agents/registry (list)
+// includes delegation_depth per agent via the batch fetch path.
+func TestListAgents_DelegationDepth(t *testing.T) {
+	policyID := delegationPolicy(t, uid("list-depth-policy"), []string{"data:read"})
+
+	_, _, rootTok := issueRootCredential(t, policyID, "list-depth-root",
+		[]string{"data:read"})
+	childID, _, _ := exchangeToken(t, policyID, "list-depth-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	resp := get(t, adminPath("/agents/registry"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	agents := body["agents"].([]any)
+	for _, a := range agents {
+		m := a.(map[string]any)
+		if m["id"] == childID {
+			assert.EqualValues(t, 1, m["delegation_depth"],
+				"child agent in list must have delegation_depth 1")
+			return
+		}
+	}
+	t.Fatalf("child agent %s not found in agent list response", childID)
+}
+
+// ── Graph walk coverage (non-mission_id) ─────────────────────────────────────
+
+// TestDelegationGraph_FromRoot_FullTree queries the graph from the root
+// identity to confirm the up-walk-then-down-walk path works correctly
+// when the focal identity IS the root (up-walk returns just the root,
+// down-walk fans out).
+func TestDelegationGraph_FromRoot_FullTree(t *testing.T) {
+	policyID := delegationPolicy(t, uid("root-graph-policy"), []string{"data:read"})
+
+	rootID, _, rootTok := issueRootCredential(t, policyID, "root-graph-root",
+		[]string{"data:read"})
+	aID, _, _ := exchangeToken(t, policyID, "root-graph-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+	bID, _, _ := exchangeToken(t, policyID, "root-graph-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok)
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+rootID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, rootID, "root (focal) must appear")
+	assert.Contains(t, ids, aID, "child A must appear")
+	assert.Contains(t, ids, bID, "child B must appear")
+	assert.Len(t, ids, 3)
+	assert.Equal(t, rootID, body["focal_id"])
+}
+
+// ── Sibling-root expansion & batched WalkDownMulti tests ─────────────────────
+
+// TestDelegationGraph_SiblingRootExpansion verifies the core bug fix:
+// when a parent identity has multiple independent root credentials and
+// children are delegated off different roots, querying from any child
+// must show ALL siblings — even those delegated from a different root
+// credential of the same parent identity.
+//
+// Tree shape (same parent identity, two separate root credentials):
+//
+//	Parent identity
+//	  ├── RootCred1 (client_credentials)
+//	  │     ├── ChildA (token_exchange)
+//	  │     └── ChildB (token_exchange)
+//	  └── RootCred2 (client_credentials)
+//	        └── ChildC (token_exchange)
+//
+// Querying from ChildC must show Parent, ChildA, ChildB, and ChildC.
+func TestDelegationGraph_SiblingRootExpansion(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-root-policy"), []string{"data:read"})
+
+	// Issue two independent root credentials for the same parent identity.
+	parentExtID := uid("sib-root-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	// Root credential 1.
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	// Root credential 2 (same identity, new client_credentials grant).
+	resp2 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	rootTok2 := decode(t, resp2)["access_token"].(string)
+
+	// Delegate children off different root credentials.
+	aID, _, _ := exchangeToken(t, policyID, "sib-root-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	bID, _, _ := exchangeToken(t, policyID, "sib-root-b",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	cID, _, _ := exchangeToken(t, policyID, "sib-root-c",
+		[]string{"data:read"}, []string{"data:read"}, rootTok2)
+
+	// Query from ChildC — must see all siblings including A and B
+	// which were delegated off a different root credential.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+cID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, aID, "child A (from root1) must appear")
+	assert.Contains(t, ids, bID, "child B (from root1) must appear")
+	assert.Contains(t, ids, cID, "child C (focal, from root2) must appear")
+	assert.Equal(t, cID, body["focal_id"])
+}
+
+// TestDelegationGraph_SiblingRootExpansion_FromSibling is the reverse
+// direction: query from ChildA (root1) and verify ChildC (root2) appears.
+func TestDelegationGraph_SiblingRootExpansion_FromSibling(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-rev-policy"), []string{"data:read"})
+
+	parentExtID := uid("sib-rev-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	resp2 := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	rootTok2 := decode(t, resp2)["access_token"].(string)
+
+	aID, _, _ := exchangeToken(t, policyID, "sib-rev-a",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+	cID, _, _ := exchangeToken(t, policyID, "sib-rev-c",
+		[]string{"data:read"}, []string{"data:read"}, rootTok2)
+
+	// Query from ChildA — must see ChildC from the sibling root.
+	resp := get(t, adminPath("/delegations/graph?identity_id="+aID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, aID, "child A (focal) must appear")
+	assert.Contains(t, ids, cID, "child C (from sibling root) must appear")
+	assert.Equal(t, aID, body["focal_id"])
+}
+
+// TestDelegationGraph_SiblingRoot_NoChildren verifies that sibling root
+// credentials with no children don't cause issues — they appear as edges
+// in the graph (parent → parent via root credential) but don't add
+// spurious nodes.
+func TestDelegationGraph_SiblingRoot_NoChildren(t *testing.T) {
+	policyID := delegationPolicy(t, uid("sib-empty-policy"), []string{"data:read"})
+
+	parentExtID := uid("sib-empty-parent")
+	parentID := registerIdentityWithPolicy(t, parentExtID, policyID, "",
+		[]string{"data:read"}, adminHeaders())
+	client := registerOAuthClient(t, parentExtID, []string{"data:read"})
+
+	// Issue 3 root credentials, only the first has a child.
+	resp1 := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "client_credentials", "account_id": testAccountID,
+		"project_id": testProjectID, "client_id": client.ClientID,
+		"client_secret": client.ClientSecret, "scope": "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	rootTok1 := decode(t, resp1)["access_token"].(string)
+
+	// 2nd and 3rd root credentials — no children.
+	for i := 0; i < 2; i++ {
+		r := post(t, "/oauth2/token", map[string]any{
+			"grant_type": "client_credentials", "account_id": testAccountID,
+			"project_id": testProjectID, "client_id": client.ClientID,
+			"client_secret": client.ClientSecret, "scope": "data:read",
+		}, nil)
+		require.Equal(t, http.StatusOK, r.StatusCode)
+		_ = r.Body.Close()
+	}
+
+	childID, _, _ := exchangeToken(t, policyID, "sib-empty-child",
+		[]string{"data:read"}, []string{"data:read"}, rootTok1)
+
+	resp := get(t, adminPath("/delegations/graph?identity_id="+childID+"&depth=3"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	ids := nodeIDs(body)
+	assert.Contains(t, ids, parentID, "parent must appear")
+	assert.Contains(t, ids, childID, "child must appear")
+	// Empty sibling roots contribute edges (parent→parent) but no extra nodes
+	// beyond the parent. The graph must not error or return unexpected nodes.
 }

@@ -238,7 +238,12 @@ func NewServer(cfg Config) (*Server, error) {
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer)
+	// DelegationService is read-only over credentialRepo / delegationRepo /
+	// identityRepo and has no service dependencies of its own.
+	// Created before AgentService so depths can be included in agent list responses.
+	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
+
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer, delegationSvc)
 
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
@@ -266,10 +271,6 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dpop verifier init: %w", err)
 	}
-
-	// DelegationService is read-only over credentialRepo / delegationRepo /
-	// identityRepo and has no service dependencies of its own.
-	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
 
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
