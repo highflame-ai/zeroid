@@ -240,7 +240,10 @@ func (a *API) dcrDeleteOp(ctx context.Context, input *DCRDeleteInput) (*DCROutpu
 		log.Error().Err(err).Str("client_id", input.ClientID).Msg("dynamic client delete failed")
 		return a.dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to delete client registration"}), nil
 	}
-	return &DCROutput{Status: http.StatusNoContent, Body: nil}, nil
+	// Empty []byte, not nil: huma writes []byte bodies raw, while an untyped
+	// nil Body panics in SchemaLinkTransformer (recovered, but it spams every
+	// DCR delete with a stack trace). RFC 7592 §2.3 still gets its bodyless 204.
+	return &DCROutput{Status: http.StatusNoContent, Body: []byte{}}, nil
 }
 
 // ── DCR helpers ──────────────────────────────────────────────────────────────

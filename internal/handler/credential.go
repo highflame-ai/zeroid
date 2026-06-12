@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -208,6 +209,13 @@ func (a *API) revokeCredentialOp(ctx context.Context, input *RevokeCredentialInp
 	}
 
 	if err := a.credSvc.RevokeCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, input.Body.Reason); err != nil {
+		if errors.Is(err, service.ErrCredentialNotFound) {
+			// Zero rows matched. Could be: wrong id, tenant-scope mismatch,
+			// already revoked, or already expired. All four are "this revoke
+			// did not mutate state" — surface as 404 so the caller knows,
+			// instead of the previous silent 200-OK.
+			return nil, huma.Error404NotFound("credential not found, already revoked, or expired")
+		}
 		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to revoke credential")
 		return nil, huma.Error500InternalServerError("failed to revoke credential")
 	}

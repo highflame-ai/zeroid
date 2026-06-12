@@ -23,6 +23,11 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
+// ErrPolicyInUse is returned by DeletePolicy when the policy is still
+// referenced by one or more service keys. Maps to 409 Conflict at the HTTP
+// boundary — the delete is refused, the policy is left intact.
+var ErrPolicyInUse = errors.New("credential policy is still in use")
+
 // ErrInvalidPolicyField marks caller-fixable input errors emitted by
 // UpdatePolicy when the tri-state expires_at PATCH string fails to parse
 // (malformed RFC3339) or is backdated. Maps to 400 at the HTTP boundary.
@@ -276,9 +281,23 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	return policy, nil
 }
 
-// DeletePolicy deletes a credential policy if no identities reference it.
+// DeletePolicy deletes a credential policy if no service keys reference it.
+// It translates the store-layer sentinels into the service-layer sentinels the
+// handler maps to HTTP status codes:
+//   - ErrPolicyInUse     → still referenced by at least one service key (409)
+//   - ErrPolicyNotFound  → no policy with this id in the tenant (404)
 func (s *CredentialPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
-	return s.repo.Delete(ctx, id, accountID, projectID)
+	err := s.repo.Delete(ctx, id, accountID, projectID)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, postgres.ErrCredentialPolicyInUse):
+		return fmt.Errorf("%w: %w", ErrPolicyInUse, err)
+	case errors.Is(err, postgres.ErrCredentialPolicyNotFound):
+		return ErrPolicyNotFound
+	default:
+		return err
+	}
 }
 
 // EnforcePolicy checks all six credential policy constraints against an issuance request.

@@ -10,7 +10,13 @@ env:
   # jwx v4 needs the encoding/json/v2 experiment (Go 1.26+).
   GOEXPERIMENT: "jsonv2"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  RELEASE_NAME: ${{ github.event.release.name }}
+  # release.tag_name is the git tag (e.g. v1.7.0) — what consumers
+  # `go get`. Not release.name, which is the human-readable display
+  # title and can be customised in the UI to something like
+  # "v1.7.0 — PKCE PrincipalResolver" that would fail the tag-format
+  # regex. tag_name is the load-bearing identifier for every gate in
+  # this workflow.
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -35,10 +41,10 @@ jobs:
         id: validate_tag
         shell: bash
         run: |-
-          if [[ "${{ env.RELEASE_NAME }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
-            echo "Valid version format: ${{ env.RELEASE_NAME }}"
+          if [[ "${{ env.RELEASE_TAG }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_TAG }}"
           else
-            echo "Invalid version format: ${{ env.RELEASE_NAME }}"
+            echo "Invalid version format: ${{ env.RELEASE_TAG }}"
             exit 1
           fi
 
@@ -66,7 +72,7 @@ jobs:
         run: |-
           go install github.com/caarlos0/svu/v3@latest
           EXPECTED="$(svu next)"
-          ACTUAL="${{ env.RELEASE_NAME }}"
+          ACTUAL="${{ env.RELEASE_TAG }}"
           echo "Published tag : ${ACTUAL}"
           echo "svu next      : ${EXPECTED}"
           # sort -V picks the highest of the two; if EXPECTED is
@@ -84,6 +90,57 @@ jobs:
             echo "Release tag matches svu recommendation."
           fi
 
+      # pkg/dpop drift guard. zeroid is a Go module that contains a
+      # nested published module at pkg/dpop, and zeroid's non-test
+      # code imports it — downstream consumers pull pkg/dpop
+      # transitively. The release cadences are intentionally
+      # DECOUPLED: zeroid/go.mod pins pkg/dpop to a specific released
+      # version (not the zeroid release tag). When pkg/dpop/ source
+      # changes, the maintainer runs release-dpop.yml to cut a new
+      # pkg/dpop release and open a PR bumping zeroid's reference.
+      # See RELEASING.md.
+      #
+      # This guard catches the foot-gun: if pkg/dpop/ source on main
+      # has diverged from the version zeroid/go.mod references, that
+      # means pkg/dpop changed but the release-dpop dance was never
+      # run. Releasing zeroid in that state ships a binary that
+      # references the OLD pkg/dpop (whatever the proxy serves for
+      # the pinned tag) while in-repo tests passed against the NEW
+      # local source — a silent regression. Fail loudly instead.
+      #
+      # pkg/authjwt is NOT checked because it's imported only from
+      # tests/integration. Go does not follow test imports across
+      # module boundaries, so its version reference (currently
+      # v0.0.0 placeholder) is invisible to downstream consumers
+      # and cannot break anything. The pkg/authjwt tag is still
+      # created by tag-submodules at every zeroid release for
+      # convenience.
+      - name: Verify pkg/dpop/ source matches the version in go.mod
+        shell: bash
+        run: |-
+          MODPATH="github.com/highflame-ai/zeroid/pkg/dpop"
+          REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
+          if [[ -z "${REF}" ]]; then
+            echo "::error::go.mod has no require directive for ${MODPATH}"
+            exit 1
+          fi
+          TAG="pkg/dpop/${REF}"
+          if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
+            echo "::error::go.mod references ${MODPATH} ${REF} but tag ${TAG} does not exist."
+            echo "::error::This usually means the pkg/dpop release-dpop dance was started but not completed."
+            echo "::error::Either fix go.mod to reference an existing pkg/dpop tag, or run release-dpop.yml."
+            exit 1
+          fi
+          if ! git diff --quiet "${TAG}" -- pkg/dpop/; then
+            echo "::error::pkg/dpop/ source has drifted from ${TAG} but go.mod still references it."
+            echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
+            echo "::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update zeroid/go.mod's reference:"
+            echo "::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>"
+            echo "::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release."
+            exit 1
+          fi
+          echo "✓ pkg/dpop/ source matches ${TAG} — safe to release"
+
   tag-submodules:
     needs:
       - highflame-validate
@@ -97,10 +154,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Tag pkg/authjwt sub-module
+      # Tag pkg/authjwt at the release commit. pkg/authjwt is
+      # CLUBBED with zeroid releases — its version moves in lockstep
+      # with zeroid's because it's imported only from tests/integration
+      # (not transitively visible to downstream consumers) and so its
+      # version reference in zeroid/go.mod cannot break anything. Any
+      # external consumer who imports pkg/authjwt directly gets the
+      # tag at the zeroid release commit, which is the most recent
+      # source.
+      #
+      # pkg/dpop is NOT tagged here. It has DECOUPLED release cadence
+      # because it IS transitively visible to downstream consumers,
+      # and zeroid/go.mod references a specific pinned pkg/dpop
+      # version. Tagging pkg/dpop only happens via release-dpop.yml
+      # when its source actually changes. The highflame-validate
+      # job above guards against pkg/dpop source drifting from the
+      # pinned version.
+      - name: Tag pkg/authjwt at release commit
         shell: bash
         run: |
-          VERSION="${{ env.RELEASE_NAME }}"
+          VERSION="${{ env.RELEASE_TAG }}"
           SUBTAG="pkg/authjwt/${VERSION}"
           if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
             echo "Tag ${SUBTAG} already exists, skipping"

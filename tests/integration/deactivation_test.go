@@ -221,9 +221,10 @@ func TestAdminIssueOnDeactivatedIdentityRejected(t *testing.T) {
 	assert.Less(t, issueResp.StatusCode, 600)
 }
 
-// TestDeleteIdentityRunsCleanup verifies DeleteIdentity sweeps linked tokens
-// before removing the identity row. Otherwise, credentials with the deleted
-// identity_id would survive (FK set to NULL) and remain valid until TTL.
+// TestDeleteIdentityRunsCleanup verifies DELETE /identities/{id} sweeps linked
+// tokens. The endpoint is a soft delete (deactivate): the identity row is
+// retained but its credentials are revoked, so tokens stop working immediately
+// rather than surviving until TTL.
 func TestDeleteIdentityRunsCleanup(t *testing.T) {
 	ext := uid("delete-cleanup")
 	reg := registerAgent(t, ext)
@@ -236,14 +237,19 @@ func TestDeleteIdentityRunsCleanup(t *testing.T) {
 	token := decode(t, issueResp)["access_token"].(string)
 	require.True(t, introspect(t, token)["active"].(bool))
 
-	// DELETE /identities/{id} — permanent removal.
+	// DELETE /identities/{id} — soft delete (deactivate).
 	delResp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+reg.AgentID), nil, adminHeaders())
 	require.NoError(t, err)
 	require.True(t, delResp.StatusCode >= 200 && delResp.StatusCode < 300,
 		"DELETE /identities/{id} should succeed")
 	_ = delResp.Body.Close()
 
-	// Token must be revoked — cleanup ran before delete.
+	// The identity row is retained, flipped to deactivated (soft delete).
+	getResp := get(t, adminPath("/identities/"+reg.AgentID), adminHeaders())
+	require.Equal(t, http.StatusOK, getResp.StatusCode, "identity must still exist after a soft delete")
+	assert.Equal(t, "deactivated", decode(t, getResp)["status"])
+
+	// Token must be revoked — cleanup ran on deactivation.
 	assert.False(t, introspect(t, token)["active"].(bool),
-		"DELETE /identities must revoke credentials before removing the identity row")
+		"DELETE /identities must revoke credentials")
 }

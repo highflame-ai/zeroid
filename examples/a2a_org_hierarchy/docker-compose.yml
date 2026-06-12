@@ -1,0 +1,792 @@
+services:
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine3.22
+    container_name: cascade-db
+    restart: on-failure
+    environment:
+      POSTGRES_USER: zeroid
+      POSTGRES_PASSWORD: zeroid
+      POSTGRES_DB: zeroid
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeroid -d zeroid"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  zeroid:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    image: highflame-zeroid:latest
+    container_name: cascade-zeroid
+    restart: on-failure
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    environment:
+      ZEROID_DATABASE_URL: "postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable"
+      ZEROID_PRIVATE_KEY_PATH: "/keys/private.pem"
+      ZEROID_PUBLIC_KEY_PATH: "/keys/public.pem"
+      ZEROID_RSA_PRIVATE_KEY_PATH: "/keys/rsa_private.pem"
+      ZEROID_RSA_PUBLIC_KEY_PATH: "/keys/rsa_public.pem"
+    ports:
+      - "8899:8899"
+    volumes:
+      - ../../keys:/keys:ro
+      - ../../zeroid.yaml:/etc/zeroid/zeroid.yaml:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8899/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    command: ["/app/zeroid", "-config", "/etc/zeroid/zeroid.yaml"]
+
+  # ── Provisioner (one-shot) ──────────────────────────────────────────────────
+  # Registers all 32 agents, builds the delegation chain, writes /shared/manifest.json
+  provisioner:
+    depends_on:
+      zeroid:
+        condition: service_healthy
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-provisioner
+    command: ["python", "/app/provision.py"]
+    environment:
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      ZEROID_ADMIN_API_KEY: "${ZEROID_ADMIN_API_KEY:-demo-admin-key}"
+      MANIFEST_PATH: "/shared/manifest.json"
+      HIERARCHY_PATH: "/app/hierarchy.yaml"
+    volumes:
+      - shared-data:/shared
+    networks:
+      - cascade-net
+
+  # ── Observability ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: cascade-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - cascade-net
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: cascade-grafana
+    restart: unless-stopped
+    ports:
+      - "3100:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/cascade.json
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 2s
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - cascade-net
+
+  # ── Tier 1: Orchestrators ──────────────────────────────────────────────────
+  orch-business:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-orch-business
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: orch-business
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://spec-finance:8080,http://spec-hr:8080,http://spec-legal:8080,http://spec-sales:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  orch-platform:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-orch-platform
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: orch-platform
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://spec-engineering:8080,http://spec-security:8080,http://spec-data:8080,http://spec-operations:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── Tier 2: Specialists ────────────────────────────────────────────────────
+  spec-finance:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-finance
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-finance
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-invoice-processor:8080,http://tool-budget-tracker:8080,http://tool-payroll-agent:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-hr:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-hr
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-hr
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-recruiter:8080,http://tool-performance-tracker:8080,http://tool-onboarding-agent:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-legal:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-legal
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-legal
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-contract-reviewer:8080,http://tool-compliance-checker:8080,http://tool-ip-tracker:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-sales:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-sales
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-sales
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-crm-syncer:8080,http://tool-lead-scorer:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-engineering:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-engineering
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-engineering
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-code-reviewer:8080,http://tool-dependency-scanner:8080,http://tool-test-runner:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-security:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-security
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-security
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-siem-collector:8080,http://tool-threat-intel:8080,http://tool-audit-logger:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-data:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-data
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-data
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-pipeline-runner:8080,http://tool-schema-validator:8080,http://tool-reporting-agent:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  spec-operations:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-spec-operations
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: spec-operations
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: "http://tool-deploy-agent:8080,http://tool-infra-monitor:8080"
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── Tier 3: Tool Agents ────────────────────────────────────────────────────
+  # Finance tools
+  tool-invoice-processor:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-invoice-processor
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-invoice-processor
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-budget-tracker:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-budget-tracker
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-budget-tracker
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-payroll-agent:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-payroll-agent
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-payroll-agent
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # HR tools
+  tool-recruiter:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-recruiter
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-recruiter
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-performance-tracker:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-performance-tracker
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-performance-tracker
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-onboarding-agent:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-onboarding-agent
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-onboarding-agent
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Legal tools — these cascade-revoke when spec-legal is signaled
+  tool-contract-reviewer:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-contract-reviewer
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-contract-reviewer
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-compliance-checker:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-compliance-checker
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-compliance-checker
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-ip-tracker:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-ip-tracker
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-ip-tracker
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Sales tools
+  tool-crm-syncer:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-crm-syncer
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-crm-syncer
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-lead-scorer:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-lead-scorer
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-lead-scorer
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Engineering tools
+  tool-code-reviewer:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-code-reviewer
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-code-reviewer
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-dependency-scanner:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-dependency-scanner
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-dependency-scanner
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-test-runner:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-test-runner
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-test-runner
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Security tools
+  tool-siem-collector:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-siem-collector
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-siem-collector
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-threat-intel:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-threat-intel
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-threat-intel
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-audit-logger:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-audit-logger
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-audit-logger
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Data tools
+  tool-pipeline-runner:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-pipeline-runner
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-pipeline-runner
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-schema-validator:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-schema-validator
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-schema-validator
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-reporting-agent:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-reporting-agent
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-reporting-agent
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  # Operations tools
+  tool-deploy-agent:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-deploy-agent
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-deploy-agent
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+  tool-infra-monitor:
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cascade-infra-monitor
+    restart: unless-stopped
+    environment:
+      AGENT_NAME: tool-infra-monitor
+      ZEROID_BASE_URL: "http://zeroid:8899"
+      MANIFEST_PATH: "/shared/manifest.json"
+      CHILD_URLS: ""
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      - cascade-net
+
+networks:
+  cascade-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  shared-data:

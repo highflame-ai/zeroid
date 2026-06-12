@@ -1,0 +1,57 @@
+global:
+  scrape_interval: 2s
+  evaluation_interval: 2s
+  scrape_timeout: 2s
+
+scrape_configs:
+  - job_name: cascade-agents
+    static_configs:
+      - targets:
+          # Tier 1 — Orchestrators
+          - orch-business:8080
+          - orch-platform:8080
+          # Tier 2 — Specialists
+          - spec-finance:8080
+          - spec-hr:8080
+          - spec-legal:8080
+          - spec-sales:8080
+          - spec-engineering:8080
+          - spec-security:8080
+          - spec-data:8080
+          - spec-operations:8080
+          # Tier 3 — Finance tools
+          - tool-invoice-processor:8080
+          - tool-budget-tracker:8080
+          - tool-payroll-agent:8080
+          # Tier 3 — HR tools
+          - tool-recruiter:8080
+          - tool-performance-tracker:8080
+          - tool-onboarding-agent:8080
+          # Tier 3 — Legal tools (cascade target)
+          - tool-contract-reviewer:8080
+          - tool-compliance-checker:8080
+          - tool-ip-tracker:8080
+          # Tier 3 — Sales tools
+          - tool-crm-syncer:8080
+          - tool-lead-scorer:8080
+          # Tier 3 — Engineering tools
+          - tool-code-reviewer:8080
+          - tool-dependency-scanner:8080
+          - tool-test-runner:8080
+          # Tier 3 — Security tools
+          - tool-siem-collector:8080
+          - tool-threat-intel:8080
+          - tool-audit-logger:8080
+          # Tier 3 — Data tools
+          - tool-pipeline-runner:8080
+          - tool-schema-validator:8080
+          - tool-reporting-agent:8080
+          # Tier 3 — Operations tools
+          - tool-deploy-agent:8080
+          - tool-infra-monitor:8080
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: "([^:]+):.*"
+        replacement: "${1}"
+    metrics_path: /metrics

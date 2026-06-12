@@ -52,6 +52,11 @@ type RefreshTokenParams struct {
 	// proof; every later rotation must present a proof signed by the same
 	// key. Empty ⇒ unbound (Bearer).
 	DPoPKeyThumbprint string
+	// MissionID is the delegation-tree identifier (issue #81) of the access
+	// token issued alongside this refresh token. Persisted on the family so
+	// every rotation can re-emit it, keeping a refreshing session inside one
+	// mission. Empty ⇒ no mission to carry (refresh falls back to re-rooting).
+	MissionID string
 }
 
 // ErrDPoPBindingMismatch is returned when a refresh-token rotation presents a
@@ -90,6 +95,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		State:             domain.RefreshTokenStateActive,
 		ExpiresAt:         expiresAt,
 		DPoPKeyThumbprint: params.DPoPKeyThumbprint,
+		MissionID:         params.MissionID,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -162,6 +168,11 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			// opt-in at original issuance. See docs/dpop-and-dcr.md
 			// "Refresh-token binding" for the full rationale.
 			DPoPKeyThumbprint: c.DPoPKeyThumbprint,
+			// Carry the delegation tree forward (issue #81). Without this the
+			// mission would survive the first refresh (seeded on the family at
+			// issuance) but be lost on the second rotation, re-fragmenting the
+			// tree. Copied verbatim like the DPoP thumbprint above.
+			MissionID: c.MissionID,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})

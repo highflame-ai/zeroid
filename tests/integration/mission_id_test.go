@@ -129,6 +129,70 @@ func TestMissionID_ChainPropagation(t *testing.T) {
 		"credentials must be ordered root → leaves by delegation_depth")
 }
 
+// TestMissionID_SurvivesRefresh pins the issue #81 refresh-continuity
+// invariant: a refresh is continuity of an existing grant, not the
+// origination of a new delegation tree, so the refreshed access token must
+// inherit the original mission_id rather than re-rooting it.
+//
+// Regression guard for the refresh_token grant defaulting mission_id to the
+// freshly minted credential's own JTI — which fragmented a single workflow's
+// delegation tree into N missions, breaking GET /credentials?mission_id= for
+// any session that refreshed mid-flight.
+//
+// Flow (MCP client — issues refresh tokens):
+//
+//	authorization_code   → root mission (mission_id = access token's own jti)
+//	   └── refresh_token  → must carry the SAME mission_id   (touch-point: issuance seed)
+//	          └── refresh_token  → must STILL carry it       (touch-point: rotation copy)
+//
+// The second refresh is load-bearing: it proves mission_id is copied onto the
+// successor row on rotation, not merely seeded once at issuance.
+func TestMissionID_SurvivesRefresh(t *testing.T) {
+	// ── Step 1: authorization_code (MCP client) → access token + refresh token. ──
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, "user-mission-rt", testRedirectURI, challenge, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	initial := decode(t, resp)
+
+	rootMission := decodeJWTUnsafe(t, initial["access_token"].(string))["mission_id"].(string)
+	require.NotEmpty(t, rootMission, "authorization_code access token must carry a mission_id")
+	refreshToken := initial["refresh_token"].(string)
+
+	// ── Step 2: first refresh → mission_id must be inherited, not re-rooted. ──
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+		"client_id":     testMCPClientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	refreshed := decode(t, resp)
+
+	refreshedMission := decodeJWTUnsafe(t, refreshed["access_token"].(string))["mission_id"]
+	assert.Equal(t, rootMission, refreshedMission,
+		"refreshed access token must inherit the original mission_id, not re-root it")
+	refreshToken2 := refreshed["refresh_token"].(string)
+
+	// ── Step 3: second refresh → mission_id must STILL hold (rotation copy). ──
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken2,
+		"client_id":     testMCPClientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	refreshed2 := decode(t, resp)
+
+	assert.Equal(t, rootMission, decodeJWTUnsafe(t, refreshed2["access_token"].(string))["mission_id"],
+		"mission_id must survive a second rotation — proves it is copied onto the successor row, not just seeded once")
+}
+
 // TestMissionID_RejectAmbiguousFilter pins the handler-level guard:
 // the new mission_id query is mutually exclusive with the existing
 // identity_id query. Both omitted = 400 (no dump-everything path).

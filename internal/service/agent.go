@@ -12,19 +12,35 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// AgentService handles agent registration (atomic identity + API key creation).
+// AgentService handles agent registration (atomic identity + API key creation)
+// and self-service actor-key enrollment/rotation.
 type AgentService struct {
 	identitySvc *IdentityService
 	apiKeySvc   *APIKeyService
 	apiKeyRepo  *postgres.APIKeyRepository
+	// keyProofReplay records single-use jtis for actor-key-change proofs.
+	keyProofReplay keyProofReplayGuard
+	// issuer is this server's token issuer URL; the audience a self-service key
+	// proof must target is derived from it (see keyProofAudience).
+	issuer string
 }
 
-// NewAgentService creates a new AgentService.
-func NewAgentService(identitySvc *IdentityService, apiKeySvc *APIKeyService, apiKeyRepo *postgres.APIKeyRepository) *AgentService {
+// NewAgentService creates a new AgentService. keyProofReplay backs single-use
+// enforcement of actor-key-change proofs; issuer is the token issuer URL used to
+// derive the expected proof audience.
+func NewAgentService(
+	identitySvc *IdentityService,
+	apiKeySvc *APIKeyService,
+	apiKeyRepo *postgres.APIKeyRepository,
+	keyProofReplay keyProofReplayGuard,
+	issuer string,
+) *AgentService {
 	return &AgentService{
-		identitySvc: identitySvc,
-		apiKeySvc:   apiKeySvc,
-		apiKeyRepo:  apiKeyRepo,
+		identitySvc:    identitySvc,
+		apiKeySvc:      apiKeySvc,
+		apiKeyRepo:     apiKeyRepo,
+		keyProofReplay: keyProofReplay,
+		issuer:         issuer,
 	}
 }
 
@@ -117,6 +133,27 @@ type UpdateAgentRequest struct {
 	Labels       json.RawMessage `json:"labels,omitempty"`
 	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	Status       *string         `json:"status,omitempty"`
+	// PublicKeyPEM, when non-nil, force-sets the identity's actor-assertion key.
+	// This is the admin recovery path: it is reachable only on the secret-gated
+	// management route (no proof-of-possession), so a tenant admin can replace a
+	// key the agent can no longer prove control of. Self-service rotation (with
+	// proof-of-possession) goes through SetPublicKey instead.
+	PublicKeyPEM *string `json:"public_key_pem,omitempty"`
+}
+
+// SetPublicKeyRequest carries a self-service actor-key enrollment or rotation.
+type SetPublicKeyRequest struct {
+	// NewPublicKeyPEM is the SPKI EC P-256 public key to enroll.
+	NewPublicKeyPEM string
+	// NewKeyProof is a compact ES256 JWS signed by the NEW private key, proving
+	// the caller controls the key being registered. Required for both first-set
+	// and rotation.
+	NewKeyProof string
+	// CurrentKeyProof is a compact ES256 JWS signed by the identity's CURRENT
+	// private key, authorizing the rotation (proof-of-possession, bound to the
+	// new key). Required only when the identity already has a key; ignored on
+	// first-set (trust-on-first-use).
+	CurrentKeyProof string
 }
 
 // RegisterAgent atomically creates an identity and linked API key.
@@ -175,8 +212,12 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		ExpiresAt:          req.ExpiresAt,
 	})
 	if err != nil {
-		// Compensating action — deactivate the identity if key creation fails.
-		_ = s.identitySvc.DeleteIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
+		// Compensating action — hard-purge the half-created identity if key
+		// creation fails. Purge (not deactivate) is correct here: registration
+		// did not complete, so no deactivated ghost should linger holding the
+		// external_id. Safe against the service_keys FK because CreateKey
+		// persists its row last — a failure never leaves a service key behind.
+		_ = s.identitySvc.PurgeIdentity(ctx, identity.ID, req.AccountID, req.ProjectID)
 		return nil, fmt.Errorf("failed to create API key: %w", err)
 	}
 
@@ -204,8 +245,9 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 	return &resp, nil
 }
 
-// ListAgents lists agents for a tenant, optionally filtered by identity_type(s) and label.
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) (*AgentListResponse, error) {
+// ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
+// label, and metadata (key presence or key:value).
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -213,7 +255,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		offset = 0
 	}
 
-	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, limit, offset)
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -261,6 +303,13 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 		Labels:       req.Labels,
 		Metadata:     req.Metadata,
 		Status:       status,
+		// Admin force-set of the actor key (admin recovery path) — validated and
+		// applied in the same update (UpdateIdentity validates PublicKeyPEM when
+		// non-empty). derefStr(nil) is "", which UpdateIdentity treats as "leave
+		// unchanged". Only the secret-gated management route reaches UpdateAgent,
+		// so this is authorized by admin authority with no proof-of-possession;
+		// self-service rotation (with proofs) goes through SetPublicKey instead.
+		PublicKeyPEM: derefStr(req.PublicKeyPEM),
 	})
 	if err != nil {
 		return nil, err
@@ -271,19 +320,106 @@ func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID
 	return &resp, nil
 }
 
-// DeleteAgent deactivates an agent and revokes its keys.
+// keyProofAudience is the aud value a self-service actor-key proof must carry.
+// Bound to the issuer + the public-key endpoint path so a proof minted for this
+// operation cannot be replayed against a different audience.
+func (s *AgentService) keyProofAudience() string {
+	return s.issuer + "/agents/self/public-key"
+}
+
+// SetPublicKey enrolls or rotates the actor-assertion public key for the
+// authenticated identity (self-service). identityID/accountID/projectID come
+// from the agent's own access-token claims — never from caller-supplied input —
+// so an agent can only set its own key.
+//
+//   - First-set (identity has no key): trust-on-first-use, authorized by the
+//     agent's access token. NewKeyProof proves control of the new key.
+//   - Rotation (identity already has a key): additionally requires
+//     CurrentKeyProof — proof-of-possession of the current key, bound to the new
+//     key (RFC 8555 §7.3.5), so a stolen access token alone (no current private
+//     key) cannot rotate an enrolled key.
+func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, projectID string, req SetPublicKeyRequest) (*AgentResponse, error) {
+	if req.NewPublicKeyPEM == "" {
+		return nil, fmt.Errorf("%w: new_public_key_pem is required", ErrInvalidIdentityField)
+	}
+	newKey, err := parseECPublicKeyPEM(req.NewPublicKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("%w: new_public_key_pem: %v", ErrInvalidIdentityField, err)
+	}
+	if req.NewKeyProof == "" {
+		return nil, fmt.Errorf("%w: new_key_proof is required", ErrKeyProofInvalid)
+	}
+
+	identity, err := s.identitySvc.GetIdentity(ctx, identityID, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if !identity.Status.IsUsable() {
+		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
+	}
+	if identity.IsExpired() {
+		return nil, fmt.Errorf("%w: identity %s", domain.ErrIdentityExpired, identity.ID)
+	}
+
+	aud := s.keyProofAudience()
+
+	// Always prove control of the NEW key (prevents binding a key the caller
+	// does not control).
+	if err := verifyActorKeyProof(ctx, req.NewKeyProof, newKey, aud, identity.WIMSEURI, "", s.keyProofReplay); err != nil {
+		return nil, fmt.Errorf("%w: new_key_proof: %v", ErrKeyProofInvalid, err)
+	}
+
+	// Rotation: an enrolled key may only be replaced by also proving possession
+	// of the current key, bound to this specific new key.
+	if identity.PublicKeyPEM != "" {
+		if req.CurrentKeyProof == "" {
+			return nil, fmt.Errorf("%w: current_key_proof is required to rotate an enrolled key", ErrKeyProofInvalid)
+		}
+		currentKey, err := parseECPublicKeyPEM(identity.PublicKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("stored public key is invalid: %w", err)
+		}
+		nkt, err := newKeyThumbprint(req.NewPublicKeyPEM)
+		if err != nil {
+			return nil, err
+		}
+		if err := verifyActorKeyProof(ctx, req.CurrentKeyProof, currentKey, aud, identity.WIMSEURI, nkt, s.keyProofReplay); err != nil {
+			return nil, fmt.Errorf("%w: current_key_proof: %v", ErrKeyProofInvalid, err)
+		}
+	}
+
+	updated, err := s.identitySvc.SetPublicKey(ctx, identityID, accountID, projectID, req.NewPublicKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+	keyPrefix := s.getKeyPrefix(ctx, updated.ID)
+	resp := identityToAgentResponse(updated, keyPrefix)
+	return &resp, nil
+}
+
+// DeleteAgent soft-deletes an agent. DELETE on the registry deactivates the
+// identity rather than issuing a hard DELETE — matching the endpoint's "soft
+// delete" contract and the platform "never hard DELETE" convention.
+// Deactivation sweeps the agent's API keys, cascade-revokes active
+// credentials, and emits the retirement CAE signal (see DeactivateAgent /
+// IdentityService.runDeactivationCleanup), so it is behaviourally the same as
+// POST /agents/registry/{id}/deactivate.
+//
+// A hard delete here previously returned 500 for any agent that had a service
+// key, because service_keys carries a non-cascading FK to identities on
+// existing deployments (authn#109). Deactivation sidesteps that entirely and
+// keeps the audit trail. Idempotent: deleting an already-deactivated agent is
+// a no-op success (DeactivateIdentity short-circuits the status-transition
+// guard).
 func (s *AgentService) DeleteAgent(ctx context.Context, id, accountID, projectID string) (*AgentResponse, error) {
-	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
+	identity, err := s.identitySvc.DeactivateIdentity(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Hard delete — cascades to api_keys, credentials, etc. via FK ON DELETE CASCADE.
-	if err := s.identitySvc.DeleteIdentity(ctx, id, accountID, projectID); err != nil {
-		return nil, err
-	}
+	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
+	resp := identityToAgentResponse(identity, keyPrefix)
 
-	resp := identityToAgentResponse(identity, "")
 	return &resp, nil
 }
 

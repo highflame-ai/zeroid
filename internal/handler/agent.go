@@ -90,6 +90,7 @@ type ListAgentsInput struct {
 	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
 	IsActive     string   `query:"is_active" doc:"Filter by active status"`
 	Search       string   `query:"search" doc:"Search by name or external_id"`
+	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -113,6 +114,11 @@ type UpdateAgentInput struct {
 		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 		Status       *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
 		UpdatedBy    string          `json:"updated_by,omitempty" doc:"User ID of the updater"`
+		// PublicKeyPEM force-sets the actor-assertion key without proof-of-
+		// possession — the admin recovery path. This route is secret-gated
+		// (management API), so admin authority is the authorization. Agents
+		// rotate their own key via POST /agents/self/public-key with proofs.
+		PublicKeyPEM *string `json:"public_key_pem,omitempty" doc:"Force-set the agent's actor-assertion public key (admin recovery; no proof-of-possession)."`
 	}
 }
 
@@ -198,6 +204,71 @@ func (a *API) registerAgentRoutes(api huma.API) {
 	}, a.rotateAgentKeyOp)
 }
 
+// registerAgentSelfServiceRoute registers the agent self-service actor-key
+// endpoint. It MUST be mounted on the public router behind AgentAuthMiddleware
+// (not the secret-gated admin group) so an agent can reach it directly with its
+// own access token. The identity is taken from the validated token claims, never
+// from the path — an agent can only set its own key.
+func (a *API) registerAgentSelfServiceRoute(api huma.API) {
+	huma.Register(api, huma.Operation{
+		OperationID: "set-own-public-key",
+		Method:      http.MethodPost,
+		Path:        "/agents/self/public-key",
+		Summary:     "Enroll or rotate the calling agent's actor-assertion public key",
+		Tags:        []string{"Agents"},
+	}, a.setOwnPublicKeyOp)
+}
+
+// SetOwnPublicKeyInput is the body for POST /agents/self/public-key. The target
+// identity is the authenticated caller (from its access token), so there is no
+// id in the path or body.
+type SetOwnPublicKeyInput struct {
+	Body struct {
+		NewPublicKeyPEM string `json:"new_public_key_pem" required:"true" minLength:"1" doc:"SPKI EC P-256 public key (PEM) to enroll or rotate to."`
+		NewKeyProof     string `json:"new_key_proof" required:"true" minLength:"1" doc:"Compact ES256 JWS signed by the NEW key, proving control of it. Claims: aud=<issuer>/agents/self/public-key, sub=<caller WIMSE URI>, plus jti, iat, exp (lifetime <= 2m)."`
+		CurrentKeyProof string `json:"current_key_proof,omitempty" doc:"Required only when rotating an already-enrolled key: compact ES256 JWS signed by the CURRENT key, same claims plus nkt=base64url(SHA-256(new SPKI DER)) binding it to the new key."`
+	}
+}
+
+type SetOwnPublicKeyOutput struct {
+	Body *service.AgentResponse
+}
+
+// setOwnPublicKeyOp enrolls or rotates the actor-assertion public key for the
+// authenticated agent identity (self-service). Identity + tenant come from the
+// agent's own access-token claims (AgentAuthMiddleware), never from caller input.
+func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput) (*SetOwnPublicKeyOutput, error) {
+	claims, ok := internalMiddleware.GetAgentClaims(ctx)
+	if !ok || claims.IdentityID == "" {
+		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+
+	// Attribute the key change to the agent itself in the audit trail (this
+	// endpoint runs outside TenantContextMiddleware, so modified_by is otherwise
+	// unset).
+	ctx = internalMiddleware.SetCallerName(ctx, claims.Subject)
+
+	resp, err := a.agentSvc.SetPublicKey(ctx, claims.IdentityID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
+		NewPublicKeyPEM: input.Body.NewPublicKeyPEM,
+		NewKeyProof:     input.Body.NewKeyProof,
+		CurrentKeyProof: input.Body.CurrentKeyProof,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrKeyProofInvalid):
+			return nil, huma.Error403Forbidden(err.Error())
+		case errors.Is(err, service.ErrInvalidIdentityField):
+			return nil, huma.Error400BadRequest(err.Error())
+		default:
+			// mapErr maps not-found to 404, domain.ErrIdentityExpired /
+			// ErrIdentityNotUsable to 400, and logs + 500s anything unexpected —
+			// keeping status codes consistent with the other agent handlers.
+			return nil, mapErr(err)
+		}
+	}
+	return &SetOwnPublicKeyOutput{Body: resp}, nil
+}
+
 func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*RegisterAgentOutput, error) {
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
@@ -232,6 +303,17 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
+		// A collision with a soft-deleted identity is actionable — surface the
+		// existing id so the caller can reactivate it instead of being stuck
+		// behind an opaque 409 for a row hidden from the active registry view.
+		var deactErr *service.IdentityDeactivatedConflictError
+		if errors.As(err, &deactErr) {
+			return nil, huma.Error409Conflict(deactErr.Error(), &huma.ErrorDetail{
+				Message:  "reactivate the deactivated identity (POST /agents/registry/{id}/activate) or register with a different external_id",
+				Location: "body.external_id",
+				Value:    deactErr.ExistingID,
+			})
+		}
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("identity with this external_id already exists")
 		}
@@ -276,7 +358,7 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Limit, input.Offset)
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -302,6 +384,7 @@ func (a *API) updateAgentOp(ctx context.Context, input *UpdateAgentInput) (*GetA
 		Labels:       input.Body.Labels,
 		Metadata:     input.Body.Metadata,
 		Status:       input.Body.Status,
+		PublicKeyPEM: input.Body.PublicKeyPEM,
 	})
 	if err != nil {
 		return nil, mapErr(err)
