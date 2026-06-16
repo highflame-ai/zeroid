@@ -198,11 +198,11 @@ func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 	case IdentityStatusActive:
 		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusSuspended:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		return target == IdentityStatusActive || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusDeactivated:
 		return target == IdentityStatusActive
 	case IdentityStatusExpired:
-		return false // terminal
+		return target == IdentityStatusDeactivated
 	default:
 		return false
 	}
