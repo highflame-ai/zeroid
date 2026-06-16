@@ -443,7 +443,7 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(IdentityStatusActive), Label: "Active", Description: "Fully operational"},
 			{Value: string(IdentityStatusSuspended), Label: "Suspended", Description: "Temporarily disabled"},
 			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Permanently disabled"},
-		{Value: string(IdentityStatusExpired), Label: "Expired", Description: "Time-bound authority lapsed"},
+			{Value: string(IdentityStatusExpired), Label: "Expired", Description: "Time-bound authority lapsed"},
 		},
 	}
 }
