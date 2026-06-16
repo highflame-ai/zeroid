@@ -560,13 +560,13 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
 	count := 0
 	for _, row := range expired {
-		claimed, identity, err := s.repo.ExpireIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
+		claimed, identity, err := s.repo.DeactivateIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
 		if err != nil {
 			log.Warn().Err(err).
 				Str("identity_id", row.ID).
 				Str("account_id", row.AccountID).
 				Str("project_id", row.ProjectID).
-				Msg("sweep: failed to expire identity")
+				Msg("sweep: failed to deactivate expired identity")
 			continue
 		}
 		if !claimed {
@@ -576,7 +576,7 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 		count++
 	}
 	if count > 0 {
-		log.Info().Int("count", count).Msg("sweep: expired identities")
+		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
 	}
 	return count, nil
 }
