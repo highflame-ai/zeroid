@@ -114,7 +114,7 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
 // e.g. to list identities that have a redteam_target object configured, whose
 // value is not a scalar and so can't be matched by containment.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, origin string, limit, offset int) ([]*domain.Identity, int, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -148,10 +148,10 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 			q = q.Where("jsonb_exists(metadata, ?)", parts[0])
 		}
 	}
-	switch origin {
-	case "manual":
+	switch identityClass {
+	case "custom":
 		q = q.Where("NOT jsonb_exists(metadata, 'created_via')")
-	case "auto":
+	case "code_agent":
 		q = q.Where("jsonb_exists(metadata, 'created_via')")
 	}
 	if trustLevel != "" {
@@ -200,7 +200,7 @@ type IdentityFacets struct {
 	IdentityTypes []FacetValue `json:"identity_types"`
 	TrustLevels   []FacetValue `json:"trust_levels"`
 	Statuses      []FacetValue `json:"statuses"`
-	Origins       []FacetValue `json:"origins"`
+	IdentityClasses []FacetValue `json:"identity_classes"`
 	CreatedBy     []FacetValue `json:"created_by"`
 }
 
@@ -254,20 +254,20 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 	}
 	facets.Statuses = statusFacets
 
-	// origin (manual vs auto-created, based on metadata.created_via)
-	var originFacets []FacetValue
+	// identity class (custom vs code_agent, based on metadata.created_via)
+	var classFacets []FacetValue
 	err = db.NewSelect().TableExpr("identities").
-		ColumnExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'auto' ELSE 'manual' END AS value").
+		ColumnExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END AS value").
 		ColumnExpr("COUNT(*) AS count").
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
-		GroupExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'auto' ELSE 'manual' END").
+		GroupExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END").
 		OrderExpr("count DESC").
-		Scan(ctx, &originFacets)
+		Scan(ctx, &classFacets)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get origin facets: %w", err)
+		return nil, fmt.Errorf("failed to get identity_class facets: %w", err)
 	}
-	facets.Origins = originFacets
+	facets.IdentityClasses = classFacets
 
 	// created_by (owner_user_id)
 	var createdByFacets []FacetValue
