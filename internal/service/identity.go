@@ -318,6 +318,11 @@ func (s *IdentityService) ListIdentities(ctx context.Context, accountID, project
 	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, origin, limit, offset)
 }
 
+// GetFacets returns grouped counts for each filterable identity dimension.
+func (s *IdentityService) GetFacets(ctx context.Context, accountID, projectID string) (*postgres.IdentityFacets, error) {
+	return s.repo.GetFacets(ctx, accountID, projectID)
+}
+
 // ListExpiringSoon returns active identities whose expires_at falls within
 // now..now+within. Used by GET /expiring-soon.
 func (s *IdentityService) ListExpiringSoon(ctx context.Context, accountID, projectID string, now time.Time, within time.Duration) ([]*domain.Identity, error) {

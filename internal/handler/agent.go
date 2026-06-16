@@ -14,6 +14,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
@@ -100,6 +101,10 @@ type ListAgentsOutput struct {
 	Body *service.AgentListResponse
 }
 
+type AgentFacetsOutput struct {
+	Body *postgres.IdentityFacets
+}
+
 type UpdateAgentInput struct {
 	ID   string `path:"id" doc:"Agent identity UUID"`
 	Body struct {
@@ -162,6 +167,14 @@ func (a *API) registerAgentRoutes(api huma.API) {
 		Summary:     "List agents for the current tenant",
 		Tags:        []string{"Agents"},
 	}, a.listAgentsOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "agent-facets",
+		Method:      http.MethodGet,
+		Path:        "/agents/registry/facets",
+		Summary:     "Get aggregated filter counts for identity dimensions",
+		Tags:        []string{"Agents"},
+	}, a.agentFacetsOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "update-agent",
@@ -369,6 +382,20 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 	}
 
 	return &ListAgentsOutput{Body: resp}, nil
+}
+
+func (a *API) agentFacetsOp(ctx context.Context, input *struct{}) (*AgentFacetsOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	facets, err := a.agentSvc.GetIdentityFacets(ctx, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+
+	return &AgentFacetsOutput{Body: facets}, nil
 }
 
 func (a *API) updateAgentOp(ctx context.Context, input *UpdateAgentInput) (*GetAgentOutput, error) {

@@ -304,6 +304,11 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 	}, nil
 }
 
+// GetIdentityFacets returns grouped counts for each filterable identity dimension.
+func (s *AgentService) GetIdentityFacets(ctx context.Context, accountID, projectID string) (*postgres.IdentityFacets, error) {
+	return s.identitySvc.GetFacets(ctx, accountID, projectID)
+}
+
 // UpdateAgent updates an agent identity with PATCH semantics.
 func (s *AgentService) UpdateAgent(ctx context.Context, id, accountID, projectID string, req UpdateAgentRequest) (*AgentResponse, error) {
 	var subType domain.SubType
