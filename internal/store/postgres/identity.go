@@ -114,7 +114,7 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
 // e.g. to list identities that have a redteam_target object configured, whose
 // value is not a scalar and so can't be matched by containment.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) ([]*domain.Identity, int, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, origin string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -147,6 +147,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 			// key-presence: identities whose metadata has this top-level key.
 			q = q.Where("jsonb_exists(metadata, ?)", parts[0])
 		}
+	}
+	switch origin {
+	case "manual":
+		q = q.Where("NOT jsonb_exists(metadata, 'created_via')")
+	case "auto":
+		q = q.Where("jsonb_exists(metadata, 'created_via')")
 	}
 	if trustLevel != "" {
 		q = q.Where("trust_level = ?", trustLevel)

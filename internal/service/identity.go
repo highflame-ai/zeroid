@@ -314,8 +314,8 @@ func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, a
 
 // ListIdentities returns identities for a tenant, optionally filtered by
 // identity_type(s), label, and metadata (key presence or key:value).
-func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) ([]*domain.Identity, int, error) {
-	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, limit, offset)
+func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, origin string, limit, offset int) ([]*domain.Identity, int, error) {
+	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, origin, limit, offset)
 }
 
 // ListExpiringSoon returns active identities whose expires_at falls within
