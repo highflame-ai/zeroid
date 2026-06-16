@@ -277,38 +277,6 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 	return true, identity, nil
 }
 
-// ExpireIfActive atomically transitions an active identity to expired. Returns
-// (true, identity) when the row was claimed, (false, nil) when someone else
-// already transitioned it.
-func (r *IdentityRepository) ExpireIfActive(ctx context.Context, id, accountID, projectID string) (claimed bool, identity *domain.Identity, err error) {
-	db := dbOrTx(ctx, r.db)
-	identity = &domain.Identity{}
-	q := db.NewUpdate().Model(identity).
-		Set("status = ?", string(domain.IdentityStatusExpired)).
-		Set("updated_at = ?", time.Now())
-	if callerID := middleware.GetCallerName(ctx); callerID != "" {
-		q = q.Set("modified_by = ?", callerID)
-	}
-	res, err := q.
-		Where("id = ?", id).
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Where("status = ?", string(domain.IdentityStatusActive)).
-		Returning("*").
-		Exec(ctx)
-	if err != nil {
-		return false, nil, fmt.Errorf("expire-if-active: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, nil, fmt.Errorf("expire-if-active rows: %w", err)
-	}
-	if n == 0 {
-		return false, nil, nil
-	}
-	return true, identity, nil
-}
-
 // ListExpiredActive returns identities whose expires_at has passed while
 // their status is still 'active'. Used by the cleanup worker's identity
 // sweep. The partial index on (expires_at) WHERE status='active' makes
