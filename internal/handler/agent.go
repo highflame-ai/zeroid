@@ -85,16 +85,16 @@ type GetAgentOutput struct {
 }
 
 type ListAgentsInput struct {
-	AgentType    string   `query:"agent_type" doc:"Filter by agent type"`
-	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
-	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
-	IsActive     string   `query:"is_active" doc:"Filter by active status"`
-	Search       string   `query:"search" doc:"Search by name or external_id"`
-	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
-	IdentityClass string  `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
-	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
-	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
+	AgentType     string   `query:"agent_type" doc:"Filter by agent type"`
+	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel    string   `query:"trust_level" doc:"Filter by trust level"`
+	IsActive      string   `query:"is_active" doc:"Filter by active status"`
+	Search        string   `query:"search" doc:"Search by name or external_id"`
+	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
+	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
 
 type ListAgentsOutput struct {

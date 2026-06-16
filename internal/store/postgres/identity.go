@@ -197,11 +197,11 @@ type FacetValue struct {
 
 // IdentityFacets holds grouped counts for identity filter dimensions.
 type IdentityFacets struct {
-	IdentityTypes []FacetValue `json:"identity_types"`
-	TrustLevels   []FacetValue `json:"trust_levels"`
-	Statuses      []FacetValue `json:"statuses"`
+	IdentityTypes   []FacetValue `json:"identity_types"`
+	TrustLevels     []FacetValue `json:"trust_levels"`
+	Statuses        []FacetValue `json:"statuses"`
 	IdentityClasses []FacetValue `json:"identity_classes"`
-	CreatedBy     []FacetValue `json:"created_by"`
+	CreatedBy       []FacetValue `json:"created_by"`
 }
 
 // GetFacets returns grouped counts for each filterable dimension, scoped to a tenant.
