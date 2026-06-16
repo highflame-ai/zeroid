@@ -179,6 +179,15 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Soft-deletes the identity and returns the deactivated record. The published SDKs (highflame on PyPI, @highflame/sdk on npm) parse the response as an Identity, so this must stay 200 + body — a 204 breaks them.",
 		Tags:        []string{"Identities"},
 	}, a.deleteIdentityOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "expire-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/{id}/expire",
+		Summary:     "Expire an active identity (time-bound authority lapsed)",
+		Description: "Transitions an active identity to expired status and runs cleanup (revoke credentials, API keys, emit CAE signal). Used by Cerberus on subagent session stop.",
+		Tags:        []string{"Identities"},
+	}, a.expireIdentityOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -431,6 +440,21 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	identity, err := a.identitySvc.DeactivateIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to deactivate identity")
+		return nil, mapErr(err)
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	identity, err := a.identitySvc.ExpireIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to expire identity")
 		return nil, mapErr(err)
 	}
 

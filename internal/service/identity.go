@@ -468,13 +468,18 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		return nil, err
 	}
 
-	// Fresh transition into deactivated: sweep linked API keys, cascade-revoke
-	// active credentials, and emit a retirement signal. Centralized here so
-	// every update path (PUT /identities/{id}, AgentService.DeactivateAgent,
-	// or any programmatic caller) runs the same cleanup.
+	// Fresh transition into deactivated or expired: sweep linked API keys,
+	// cascade-revoke active credentials, and emit a retirement/expiry signal.
+	// Centralized here so every update path (PUT /identities/{id},
+	// AgentService.DeactivateAgent, or any programmatic caller) runs the same
+	// cleanup.
 	if priorStatus != domain.IdentityStatusDeactivated &&
 		identity.Status == domain.IdentityStatusDeactivated {
 		s.runDeactivationCleanup(ctx, identity, "identity_deactivated")
+	}
+	if priorStatus != domain.IdentityStatusExpired &&
+		identity.Status == domain.IdentityStatusExpired {
+		s.runDeactivationCleanup(ctx, identity, "expired")
 	}
 	return identity, nil
 }
@@ -555,13 +560,13 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"expired_sweep")
 	count := 0
 	for _, row := range expired {
-		claimed, identity, err := s.repo.DeactivateIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
+		claimed, identity, err := s.repo.ExpireIfActive(ctx, row.ID, row.AccountID, row.ProjectID)
 		if err != nil {
 			log.Warn().Err(err).
 				Str("identity_id", row.ID).
 				Str("account_id", row.AccountID).
 				Str("project_id", row.ProjectID).
-				Msg("sweep: failed to deactivate expired identity")
+				Msg("sweep: failed to expire identity")
 			continue
 		}
 		if !claimed {
@@ -571,7 +576,7 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 		count++
 	}
 	if count > 0 {
-		log.Info().Int("count", count).Msg("sweep: deactivated expired identities")
+		log.Info().Int("count", count).Msg("sweep: expired identities")
 	}
 	return count, nil
 }
@@ -630,6 +635,28 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	}
 
 	status := domain.IdentityStatusDeactivated
+
+	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	if err != nil {
+		return nil, err
+	}
+
+	return updated, nil
+}
+
+// ExpireIdentity transitions an active identity to expired. It runs the same
+// cleanup cascade as deactivation (revoke keys, credentials, emit CAE signal).
+func (s *IdentityService) ExpireIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	if identity.Status == domain.IdentityStatusExpired {
+		return identity, nil
+	}
+
+	status := domain.IdentityStatusExpired
 
 	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 	if err != nil {
