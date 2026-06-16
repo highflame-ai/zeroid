@@ -335,6 +335,10 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	}
 	offset := max(input.Offset, 0)
 
+	if input.Origin != "" && input.Origin != "manual" && input.Origin != "auto" {
+		return nil, huma.Error400BadRequest("invalid origin: must be manual or auto")
+	}
+
 	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.Origin, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")

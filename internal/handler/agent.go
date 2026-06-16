@@ -359,6 +359,10 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
+	if input.Origin != "" && input.Origin != "manual" && input.Origin != "auto" {
+		return nil, huma.Error400BadRequest("invalid origin: must be manual or auto")
+	}
+
 	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.Origin, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
