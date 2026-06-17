@@ -64,14 +64,15 @@ type GetIdentityByWIMSEInput struct {
 }
 
 type ListIdentitiesInput struct {
-	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
-	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
-	IsActive     string   `query:"is_active" doc:"Filter by active status"`
-	Search       string   `query:"search" doc:"Search by name or external_id"`
-	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
-	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
-	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
+	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel    string   `query:"trust_level" doc:"Filter by trust level"`
+	IsActive      string   `query:"is_active" doc:"Filter by active status"`
+	Search        string   `query:"search" doc:"Search by name or external_id"`
+	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
+	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
 
 type IdentityListOutput struct {
@@ -343,7 +344,11 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	}
 	offset := max(input.Offset, 0)
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, limit, offset)
+	if input.IdentityClass != "" && input.IdentityClass != "custom" && input.IdentityClass != "code_agent" {
+		return nil, huma.Error400BadRequest("invalid identity_class: must be custom or code_agent")
+	}
+
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")

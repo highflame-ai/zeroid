@@ -14,6 +14,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
@@ -84,19 +85,24 @@ type GetAgentOutput struct {
 }
 
 type ListAgentsInput struct {
-	AgentType    string   `query:"agent_type" doc:"Filter by agent type"`
-	IdentityType []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
-	Label        string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel   string   `query:"trust_level" doc:"Filter by trust level"`
-	IsActive     string   `query:"is_active" doc:"Filter by active status"`
-	Search       string   `query:"search" doc:"Search by name or external_id"`
-	Metadata     string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
-	Limit        int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
-	Offset       int      `query:"offset" default:"0" doc:"Offset for pagination"`
+	AgentType     string   `query:"agent_type" doc:"Filter by agent type"`
+	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel    string   `query:"trust_level" doc:"Filter by trust level"`
+	IsActive      string   `query:"is_active" doc:"Filter by active status"`
+	Search        string   `query:"search" doc:"Search by name or external_id"`
+	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
+	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
 
 type ListAgentsOutput struct {
 	Body *service.AgentListResponse
+}
+
+type AgentFacetsOutput struct {
+	Body *postgres.IdentityFacets
 }
 
 type UpdateAgentInput struct {
@@ -161,6 +167,14 @@ func (a *API) registerAgentRoutes(api huma.API) {
 		Summary:     "List agents for the current tenant",
 		Tags:        []string{"Agents"},
 	}, a.listAgentsOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "agent-facets",
+		Method:      http.MethodGet,
+		Path:        "/agents/registry/facets",
+		Summary:     "Get aggregated filter counts for identity dimensions",
+		Tags:        []string{"Agents"},
+	}, a.agentFacetsOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "update-agent",
@@ -358,12 +372,30 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.Limit, input.Offset)
+	if input.IdentityClass != "" && input.IdentityClass != "custom" && input.IdentityClass != "code_agent" {
+		return nil, huma.Error400BadRequest("invalid identity_class: must be custom or code_agent")
+	}
+
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 
 	return &ListAgentsOutput{Body: resp}, nil
+}
+
+func (a *API) agentFacetsOp(ctx context.Context, input *struct{}) (*AgentFacetsOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	facets, err := a.agentSvc.GetIdentityFacets(ctx, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+
+	return &AgentFacetsOutput{Body: facets}, nil
 }
 
 func (a *API) updateAgentOp(ctx context.Context, input *UpdateAgentInput) (*GetAgentOutput, error) {
