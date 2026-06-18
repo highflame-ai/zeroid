@@ -314,8 +314,13 @@ func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, a
 
 // ListIdentities returns identities for a tenant, optionally filtered by
 // identity_type(s), label, and metadata (key presence or key:value).
-func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) ([]*domain.Identity, int, error) {
-	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, limit, offset)
+func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) ([]*domain.Identity, int, error) {
+	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, limit, offset)
+}
+
+// GetFacets returns grouped counts for each filterable identity dimension.
+func (s *IdentityService) GetFacets(ctx context.Context, accountID, projectID string) (*postgres.IdentityFacets, error) {
+	return s.repo.GetFacets(ctx, accountID, projectID)
 }
 
 // ListExpiringSoon returns active identities whose expires_at falls within
@@ -468,13 +473,18 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		return nil, err
 	}
 
-	// Fresh transition into deactivated: sweep linked API keys, cascade-revoke
-	// active credentials, and emit a retirement signal. Centralized here so
-	// every update path (PUT /identities/{id}, AgentService.DeactivateAgent,
-	// or any programmatic caller) runs the same cleanup.
+	// Fresh transition into deactivated or expired: sweep linked API keys,
+	// cascade-revoke active credentials, and emit a retirement/expiry signal.
+	// Centralized here so every update path (PUT /identities/{id},
+	// AgentService.DeactivateAgent, or any programmatic caller) runs the same
+	// cleanup.
 	if priorStatus != domain.IdentityStatusDeactivated &&
 		identity.Status == domain.IdentityStatusDeactivated {
 		s.runDeactivationCleanup(ctx, identity, "identity_deactivated")
+	}
+	if priorStatus != domain.IdentityStatusExpired &&
+		identity.Status == domain.IdentityStatusExpired {
+		s.runDeactivationCleanup(ctx, identity, "expired")
 	}
 	return identity, nil
 }
@@ -630,6 +640,28 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	}
 
 	status := domain.IdentityStatusDeactivated
+
+	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	if err != nil {
+		return nil, err
+	}
+
+	return updated, nil
+}
+
+// ExpireIdentity transitions an active identity to expired. It runs the same
+// cleanup cascade as deactivation (revoke keys, credentials, emit CAE signal).
+func (s *IdentityService) ExpireIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	if identity.Status == domain.IdentityStatusExpired {
+		return identity, nil
+	}
+
+	status := domain.IdentityStatusExpired
 
 	updated, err := s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 	if err != nil {
