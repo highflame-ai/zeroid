@@ -3,6 +3,8 @@ package integration_test
 import (
 	"encoding/base64"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -130,6 +132,94 @@ func TestInspectionBasicAuth_MalformedBasicHeaderRejected(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	body := decode(t, resp)
 	assert.Equal(t, "invalid_request", body["error"])
+}
+
+// ── client_secret_basic over application/x-www-form-urlencoded ───────────────
+//
+// The JSON cases above use post(); these mirror the meaningful ones over the
+// form wire, since form-encoding is the canonical content type for these
+// endpoints (RFC 6749 §2.3 / 7662 §2.1 / 7009 §2.1) and the realistic shape a
+// stock OAuth client pairs with a Basic header. The form body and the
+// Authorization header are decoded by independent paths (the form-compat
+// middleware vs the huma header binding), so exercising them together is the
+// gap these cover. The malformed-header and metadata cases are content-type
+// agnostic (header parsing is identical; metadata is a GET), so they are not
+// duplicated.
+
+// postFormWithHeaders posts a form-encoded body with extra headers. postForm in
+// oauth_form_compat_test.go sets no headers, so this is its header-carrying
+// analogue — the form equivalent of post(body, headers).
+func postFormWithHeaders(t *testing.T, path string, form url.Values, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, testServer.URL+path, strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+// TestInspectionBasicAuth_IntrospectAcceptsBasic_Form is the form-encoded twin
+// of TestInspectionBasicAuth_IntrospectAcceptsBasic.
+func TestInspectionBasicAuth_IntrospectAcceptsBasic_Form(t *testing.T) {
+	token, client := inspectionFixture(t, "basic-introspect-form")
+
+	resp := postFormWithHeaders(t, "/oauth2/token/introspect",
+		url.Values{"token": {token}},
+		basicAuthHeader(client.ClientID, client.ClientSecret))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, true, body["active"], "valid token introspected with form body + Basic auth must be active")
+}
+
+// TestInspectionBasicAuth_IntrospectRejectsWrongBasicSecret_Form is the
+// form-encoded twin of the wrong-secret rejection.
+func TestInspectionBasicAuth_IntrospectRejectsWrongBasicSecret_Form(t *testing.T) {
+	token, client := inspectionFixture(t, "basic-introspect-form-bad")
+
+	resp := postFormWithHeaders(t, "/oauth2/token/introspect",
+		url.Values{"token": {token}},
+		basicAuthHeader(client.ClientID, "definitely-the-wrong-secret"))
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Contains(t, resp.Header.Get("WWW-Authenticate"), "Basic",
+		"401 on a Basic attempt must carry a Basic WWW-Authenticate challenge (RFC 6749 §5.2)")
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_client", body["error"])
+}
+
+// TestInspectionBasicAuth_RejectsBothMethods_Form verifies the one-method rule
+// (RFC 6749 §2.3) holds when the duplicate credentials arrive as form fields
+// alongside a Basic header.
+func TestInspectionBasicAuth_RejectsBothMethods_Form(t *testing.T) {
+	token, client := inspectionFixture(t, "basic-both-methods-form")
+
+	resp := postFormWithHeaders(t, "/oauth2/token/introspect",
+		url.Values{
+			"token":         {token},
+			"client_id":     {client.ClientID},
+			"client_secret": {client.ClientSecret},
+		},
+		basicAuthHeader(client.ClientID, client.ClientSecret))
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_request", body["error"])
+}
+
+// TestInspectionBasicAuth_RevokeAcceptsBasic_Form is the form-encoded twin of
+// the revoke happy path; confirms the token is actually revoked.
+func TestInspectionBasicAuth_RevokeAcceptsBasic_Form(t *testing.T) {
+	token, client := inspectionFixture(t, "basic-revoke-form")
+
+	resp := postFormWithHeaders(t, "/oauth2/token/revoke",
+		url.Values{"token": {token}},
+		basicAuthHeader(client.ClientID, client.ClientSecret))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	assert.False(t, introspect(t, token)["active"].(bool), "token must be inactive after form+Basic-authed revoke")
 }
 
 // TestInspectionBasicAuth_MetadataAdvertisesAuthMethods verifies the RFC 8414
