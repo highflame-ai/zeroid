@@ -53,6 +53,50 @@ func TestValidateWIMSEURI(t *testing.T) {
 	})
 }
 
+// TestIdentityStatusExpired_Valid confirms expired is a valid status.
+func TestIdentityStatusExpired_Valid(t *testing.T) {
+	if !IdentityStatusExpired.Valid() {
+		t.Fatal("IdentityStatusExpired.Valid() = false, want true")
+	}
+}
+
+// TestIdentityStatusExpired_IsUsable confirms expired identities cannot authenticate.
+func TestIdentityStatusExpired_IsUsable(t *testing.T) {
+	if IdentityStatusExpired.IsUsable() {
+		t.Fatal("IdentityStatusExpired.IsUsable() = true, want false")
+	}
+}
+
+// TestCanTransitionTo_Expired pins the expired state machine transitions.
+func TestCanTransitionTo_Expired(t *testing.T) {
+	tests := []struct {
+		from   IdentityStatus
+		to     IdentityStatus
+		expect bool
+	}{
+		// Into expired
+		{IdentityStatusActive, IdentityStatusExpired, true},
+		{IdentityStatusSuspended, IdentityStatusExpired, true},
+		{IdentityStatusPending, IdentityStatusExpired, false},
+		{IdentityStatusDeactivated, IdentityStatusExpired, false},
+		// Out of expired
+		{IdentityStatusExpired, IdentityStatusDeactivated, true},
+		{IdentityStatusExpired, IdentityStatusActive, false},
+		{IdentityStatusExpired, IdentityStatusSuspended, false},
+		{IdentityStatusExpired, IdentityStatusPending, false},
+		{IdentityStatusExpired, IdentityStatusExpired, false},
+	}
+	for _, tc := range tests {
+		name := string(tc.from) + " → " + string(tc.to)
+		t.Run(name, func(t *testing.T) {
+			got := tc.from.CanTransitionTo(tc.to)
+			if got != tc.expect {
+				t.Fatalf("CanTransitionTo = %v, want %v", got, tc.expect)
+			}
+		})
+	}
+}
+
 // TestBuildWIMSEURI_LengthCap pins the SPIFFE §2.4 invariant: any URI that
 // would exceed MaxSPIFFEIDBytes is rejected at construction time, returning
 // ErrSPIFFEIDTooLong so callers can errors.Is. Three cases — happy path, the

@@ -271,8 +271,9 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		}
 
 		issued, issuedCred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-			Identity:  identity,
-			GrantType: domain.GrantTypeClientCredentials,
+			Identity:              identity,
+			GrantType:             domain.GrantTypeClientCredentials,
+			ResolveIdentityPolicy: true,
 		})
 		if err != nil {
 			return fmt.Errorf("failed to issue post-attestation credential: %w", err)

@@ -68,13 +68,12 @@ type ChainSummary struct {
 // would not be reachable because the recursive step filters on
 // `ic.account_id` / `ic.project_id`.
 //
-// The recursive step also constrains `ic.mission_id = chain.mission_id` so
-// the planner prunes to a single mission's rows via
-// idx_issued_credentials_mission_id instead of scanning the tenant slice on
-// every iteration. parent_jti still drives lineage segmentation — branched
-// missions (sibling token_exchanges off the same parent) share mission_id
-// but live in different parent_jti chains, and the join on
-// `ic.jti = chain.parent_jti` keeps them apart.
+// Like WalkDown, this query does NOT constrain by mission_id because
+// parent credentials may belong to a different mission when a sub-agent
+// starts a new mission_id. The up-walk is single-parent (each credential
+// has at most one parent_jti), so there is no fan-out to constrain —
+// the structural parent_jti chain is sufficient and tenant scoping keeps
+// the walk bounded.
 func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
@@ -83,19 +82,18 @@ func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, 
 	db := dbOrTx(ctx, r.db)
 	// Order DESC so root (highest depth) appears first.
 	const q = `
-		WITH RECURSIVE chain(id, jti, parent_jti, depth, mission_id) AS (
-			SELECT id, jti, parent_jti, 0, mission_id
+		WITH RECURSIVE chain(id, jti, parent_jti, depth) AS (
+			SELECT id, jti, parent_jti, 0
 			FROM issued_credentials
 			WHERE jti = ?
 			  AND account_id = ?
 			  AND project_id = ?
 			UNION ALL
-			SELECT ic.id, ic.jti, ic.parent_jti, chain.depth + 1, ic.mission_id
+			SELECT ic.id, ic.jti, ic.parent_jti, chain.depth + 1
 			FROM issued_credentials ic
 			JOIN chain ON ic.jti = chain.parent_jti
 			WHERE ic.account_id = ?
 			  AND ic.project_id = ?
-			  AND ic.mission_id = chain.mission_id
 			  AND chain.depth < ?
 		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
 		SELECT ic.*
@@ -116,9 +114,13 @@ func (r *DelegationRepository) WalkUp(ctx context.Context, startJTI, accountID, 
 //
 // The recursive step joins `ic.parent_jti = chain.jti` to find the
 // children of each row in the chain. Same CYCLE + depth-cap safety as
-// WalkUp. Same tenant scoping on every join. The
-// `ic.mission_id = chain.mission_id` predicate plays the same role here as
-// in WalkUp — see that function for the rationale.
+// WalkUp. Same tenant scoping on every join.
+//
+// Unlike WalkUp, this query does NOT constrain by mission_id because
+// child delegations may start new missions (different mission_id from
+// their parent). The parent_jti join is structurally unique and
+// sufficient to define the tree — mission_id filtering would silently
+// prune legitimate subtrees.
 func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
 	if maxDepth < 0 {
 		maxDepth = 0
@@ -126,19 +128,18 @@ func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID
 	var creds []*domain.IssuedCredential
 	db := dbOrTx(ctx, r.db)
 	const q = `
-		WITH RECURSIVE chain(id, jti, depth, mission_id) AS (
-			SELECT id, jti, 0, mission_id
+		WITH RECURSIVE chain(id, jti, depth) AS (
+			SELECT id, jti, 0
 			FROM issued_credentials
 			WHERE jti = ?
 			  AND account_id = ?
 			  AND project_id = ?
 			UNION ALL
-			SELECT ic.id, ic.jti, chain.depth + 1, ic.mission_id
+			SELECT ic.id, ic.jti, chain.depth + 1
 			FROM issued_credentials ic
 			JOIN chain ON ic.parent_jti = chain.jti
 			WHERE ic.account_id = ?
 			  AND ic.project_id = ?
-			  AND ic.mission_id = chain.mission_id
 			  AND chain.depth < ?
 		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
 		SELECT ic.*
@@ -148,6 +149,45 @@ func (r *DelegationRepository) WalkDown(ctx context.Context, startJTI, accountID
 		ORDER BY chain.depth ASC, ic.issued_at ASC`
 	if err := db.NewRaw(q, startJTI, accountID, projectID, accountID, projectID, maxDepth).Scan(ctx, &creds); err != nil {
 		return nil, fmt.Errorf("walk-down delegation chain: %w", err)
+	}
+	return creds, nil
+}
+
+// WalkDownMulti is the batched variant of WalkDown — it seeds the
+// recursive CTE with multiple root JTIs at once, avoiding one query per
+// root. All roots share the same tenant scope and depth cap. Results are
+// ordered depth ASC, issued_at ASC (same as WalkDown).
+func (r *DelegationRepository) WalkDownMulti(ctx context.Context, startJTIs []string, accountID, projectID string, maxDepth int) ([]*domain.IssuedCredential, error) {
+	if len(startJTIs) == 0 {
+		return nil, nil
+	}
+	if maxDepth < 0 {
+		maxDepth = 0
+	}
+	var creds []*domain.IssuedCredential
+	db := dbOrTx(ctx, r.db)
+	const q = `
+		WITH RECURSIVE chain(id, jti, depth) AS (
+			SELECT id, jti, 0
+			FROM issued_credentials
+			WHERE jti IN (?)
+			  AND account_id = ?
+			  AND project_id = ?
+			UNION ALL
+			SELECT ic.id, ic.jti, chain.depth + 1
+			FROM issued_credentials ic
+			JOIN chain ON ic.parent_jti = chain.jti
+			WHERE ic.account_id = ?
+			  AND ic.project_id = ?
+			  AND chain.depth < ?
+		) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+		SELECT ic.*
+		FROM issued_credentials ic
+		JOIN chain ON ic.id = chain.id
+		WHERE NOT chain.is_cycle
+		ORDER BY chain.depth ASC, ic.issued_at ASC`
+	if err := db.NewRaw(q, bun.List(startJTIs), accountID, projectID, accountID, projectID, maxDepth).Scan(ctx, &creds); err != nil {
+		return nil, fmt.Errorf("walk-down-multi delegation chain: %w", err)
 	}
 	return creds, nil
 }
@@ -188,6 +228,37 @@ func (r *DelegationRepository) ListChains(ctx context.Context, accountID, projec
 		LIMIT ?`
 	if err := db.NewRaw(q, accountID, projectID, since, until, limit).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("list delegation chains: %w", err)
+	}
+	return rows, nil
+}
+
+// IdentityDepth is one row of the identity-depths response — the maximum
+// delegation_depth observed across all issued credentials for a given identity.
+type IdentityDepth struct {
+	IdentityID string `bun:"identity_id" json:"identity_id"`
+	MaxDepth   int    `bun:"max_depth"   json:"max_depth"`
+}
+
+// MaxDepthByIdentities returns the maximum delegation_depth per identity
+// for the given identity IDs within a tenant. Identities with no
+// credentials are omitted from the result.
+func (r *DelegationRepository) MaxDepthByIdentities(ctx context.Context, accountID, projectID string, identityIDs []string) ([]*IdentityDepth, error) {
+	if len(identityIDs) == 0 {
+		return nil, nil
+	}
+	var rows []*IdentityDepth
+	db := dbOrTx(ctx, r.db)
+	const q = `
+		SELECT
+			identity_id,
+			MAX(delegation_depth)::int AS max_depth
+		FROM issued_credentials
+		WHERE account_id = ?
+		  AND project_id = ?
+		  AND identity_id IN (?)
+		GROUP BY identity_id`
+	if err := db.NewRaw(q, accountID, projectID, bun.List(identityIDs)).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("max depth by identities: %w", err)
 	}
 	return rows, nil
 }

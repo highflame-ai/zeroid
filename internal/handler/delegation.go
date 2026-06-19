@@ -82,6 +82,10 @@ func (a *API) delegationGraphOp(ctx context.Context, input *DelegationGraphInput
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
+	if input.Depth != 3 { // non-default depth value — the param is now ignored
+		log.Warn().Int("depth", input.Depth).Str("identity_id", input.IdentityID).
+			Msg("depth parameter is deprecated and ignored; graph always returns the full tree")
+	}
 	g, err := a.delegationSvc.GetGraph(ctx, input.IdentityID, input.Depth, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		log.Error().Err(err).

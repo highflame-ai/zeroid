@@ -176,7 +176,7 @@ func NewServer(cfg Config) (*Server, error) {
 	// to exercise demo flows that submit them. Production deployments
 	// leave AllowUnsafeDevStub off and those proof types stay unimplemented.
 	attestationVerifiers := attestation.NewRegistry()
-	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil))
+	attestationVerifiers.Register(attestation.NewOIDCVerifier(nil).SetAllowPrivate(cfg.Attestation.AllowPrivateIssuerEndpoints))
 	if cfg.Attestation.AllowUnsafeDevStub {
 		log.Warn().Msg("ATTESTATION: AllowUnsafeDevStub is enabled — any submitted proof will verify. DO NOT enable in production.")
 		attestationVerifiers.Register(attestation.NewDevStubVerifier(domain.ProofTypeImageHash))
@@ -208,7 +208,7 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.SigningCreds.WellKnownJWKSName,
 	)
 	identitySvc := service.NewIdentityService(identityRepo, credentialPolicySvc, apiKeyRepo, credentialSvc, signalSvc, cfg.WIMSEDomain)
-	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers)
+	attestationPolicySvc := attestation.NewPolicyService(attestationPolicyRepo, attestationVerifiers).SetAllowPrivate(cfg.Attestation.AllowPrivateIssuerEndpoints)
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
@@ -232,8 +232,18 @@ func NewServer(cfg Config) (*Server, error) {
 		HMACSecret:     cfg.Token.HMACSecret,
 		AuthCodeIssuer: authCodeIssuer,
 	})
+	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
+	// require it whenever unauthenticated inspection is NOT allowed. Validate()
+	// forces allow_unauthenticated_token_inspection=false in production, so
+	// production is strict by default.
+	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer)
+	// DelegationService is read-only over credentialRepo / delegationRepo /
+	// identityRepo and has no service dependencies of its own.
+	// Created before AgentService so depths can be included in agent list responses.
+	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
+
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer, delegationSvc)
 
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
@@ -261,10 +271,6 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dpop verifier init: %w", err)
 	}
-
-	// DelegationService is read-only over credentialRepo / delegationRepo /
-	// identityRepo and has no service dependencies of its own.
-	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
 
 	// Create shared API handler.
 	apiHandler := handler.NewAPI(
@@ -850,6 +856,15 @@ func (s *Server) SetBackchannelNotifyDispatchSync(sync bool) {
 // configuration and never call this.
 func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
+}
+
+// SetRequireTokenInspectionAuth toggles strict client authentication on the
+// introspection (RFC 7662) and revocation (RFC 7009) endpoints. Mirrors the
+// token.allow_unauthenticated_token_inspection config gate (require ==
+// !allow); exposed so integration tests can exercise both postures on one
+// server without restarting it.
+func (s *Server) SetRequireTokenInspectionAuth(require bool) {
+	s.oauthSvc.SetRequireTokenInspectionAuth(require)
 }
 
 // SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used
