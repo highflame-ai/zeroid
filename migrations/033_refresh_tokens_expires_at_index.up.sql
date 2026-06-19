@@ -1,4 +1,4 @@
--- 032_refresh_tokens_expires_at_index.up.sql
+-- 033_refresh_tokens_expires_at_index.up.sql
 -- Index refresh_tokens.expires_at to support the cleanup worker's expiry sweep.
 --
 -- Under refresh-token rotation every refresh inserts a successor row and
