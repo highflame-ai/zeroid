@@ -32,13 +32,31 @@ var ErrInvalidPolicy = errors.New("invalid attestation policy")
 type PolicyService struct {
 	repo      *postgres.AttestationPolicyRepository
 	verifiers *Registry
+
+	// allowPrivate carves out the loopback/private-issuer exception at
+	// write time (an issuer URL like http://localhost:8080/ over plaintext).
+	// Default false (production-safe): only https issuers pass validation,
+	// matching the verifier's runtime SSRF guard. Set true ONLY in dev/test
+	// via SetAllowPrivate. Must track the verifier's allowPrivate flag — see
+	// the integrator note on OIDCVerifier.SetAllowPrivate.
+	allowPrivate bool
 }
 
 // NewPolicyService creates a new policy service. The verifier registry
 // is required so UpsertPolicy can reject policies for proof types that
-// have no verifier wired.
+// have no verifier wired. allowPrivate defaults to false; see
+// SetAllowPrivate to opt into the dev/test loopback carve-out.
 func NewPolicyService(repo *postgres.AttestationPolicyRepository, verifiers *Registry) *PolicyService {
 	return &PolicyService{repo: repo, verifiers: verifiers}
+}
+
+// SetAllowPrivate toggles whether non-https loopback issuer URLs are accepted
+// at policy write time. Production must leave it false. Pair it with
+// OIDCVerifier.SetAllowPrivate so write-time validation and verify-time
+// fetching agree. Returns the service for chaining.
+func (s *PolicyService) SetAllowPrivate(allow bool) *PolicyService {
+	s.allowPrivate = allow
+	return s
 }
 
 // UpsertPolicyRequest captures the payload accepted by the admin API.
@@ -75,7 +93,7 @@ func (s *PolicyService) UpsertPolicy(ctx context.Context, req UpsertPolicyReques
 	// Validate the per-proof-type config shape up front so bad configs can't
 	// sit in the DB until a /verify call finally trips on them. Catches
 	// typos, wrong types, missing issuer URLs, etc. at write time.
-	if err := validatePolicyConfig(req.ProofType, req.Config); err != nil {
+	if err := validatePolicyConfig(req.ProofType, req.Config, s.allowPrivate); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidPolicy, err)
 	}
 
@@ -104,7 +122,12 @@ func (s *PolicyService) UpsertPolicy(ctx context.Context, req UpsertPolicyReques
 // Parsing the JSONB into its typed Go struct catches the obvious "this will
 // never verify successfully" cases (missing issuer list, non-https issuer
 // URL, malformed URL, etc.) before the config reaches the verifier.
-func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage) error {
+//
+// allowPrivate gates the non-https loopback carve-out: when false (production
+// default) every issuer URL must be https, matching the verifier's runtime
+// SSRF guard. The previous unconditional carve-out let http://localhost
+// issuers persist in production.
+func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage, allowPrivate bool) error {
 	switch pt {
 	case domain.ProofTypeOIDCToken:
 		var oidc domain.OIDCPolicyConfig
@@ -124,12 +147,19 @@ func validatePolicyConfig(pt domain.ProofType, cfg json.RawMessage) error {
 			}
 			// OIDC discovery is unauthenticated — if we'd fetch jwks_uri
 			// over plain HTTP, a DNS or network attacker could substitute
-			// their own keys and forge any workload identity. Require TLS
-			// except for loopback addresses, which are safe to serve over
-			// HTTP because traffic never leaves the machine — useful for
-			// local dev and httptest-based integration tests.
-			if u.Scheme != "https" && !isLoopbackHost(u.Host) {
-				return fmt.Errorf("invalid oidc_token config: issuer[%d].url must use https (got %q)", i, u.Scheme)
+			// their own keys and forge any workload identity. Require TLS.
+			//
+			// The loopback-over-HTTP carve-out (http://localhost) is now
+			// gated behind allowPrivate: it's a dev/test convenience and was
+			// previously always on, meaning production accepted plaintext
+			// loopback issuers. Production deployments leave allowPrivate
+			// false and only https issuers validate.
+			if u.Scheme != "https" {
+				// Plain HTTP is only permitted for loopback issuers, and only
+				// when the dev/test carve-out (allowPrivate) is enabled.
+				if !allowPrivate || !isLoopbackHost(u.Host) {
+					return fmt.Errorf("invalid oidc_token config: issuer[%d].url must use https (got %q)", i, u.Scheme)
+				}
 			}
 		}
 	case domain.ProofTypeImageHash, domain.ProofTypeTPM:
