@@ -203,8 +203,11 @@ only by the attestation framework (see `docs/attestation.md`); it cannot be
 self-asserted.
 
 `status` (the `status` claim): `pending` → `active` ⇄ `suspended` →
-`deactivated`. Tokens are issued only for an `active` identity; the cleanup
-worker and CAE cascade move identities out of `active` fail-closed.
+`deactivated`, plus `expired` for a time-bound identity whose `expires_at` has
+passed. Tokens are issued only for an `active` identity; the cleanup worker and
+CAE cascade move identities out of `active` fail-closed (an expired identity is
+swept to `expired` and its live credentials are cascade-revoked; see Section 9's
+`identity_expired` signal).
 
 ## 4. JWT Claim Extensions
 
@@ -302,12 +305,15 @@ a caller (Section 8).
 
 ### 4.6 Exchange-provenance claims
 
-Set by the trusted-service external-principal exchange (Section 5.5):
+Set by the token-exchange principal paths — the trusted-service external-principal
+broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
 
 | Claim | Type | Value | Description |
 |---|---|---|---|
-| `token_exchange` | string | `external_principal` or `ciba` | Marks a synthesised-principal token and which path minted it. |
+| `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
 | `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
+| `user_id_iss` | string | upstream `iss` | **IdP-granular provenance** — the issuer URL of the upstream OpenID Provider that authenticated the subject, copied verbatim from the verified ID token. Only on the `external_id_token` path (Section 5.6). Lets a consumer answer "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). Reserved (Section 8) so a caller cannot forge it. |
+| `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
 | `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
 | `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
 
@@ -433,7 +439,64 @@ mode:
 - Emits `token_exchange=external_principal` and `trusted_by=<service>`.
 - Is RS256-signed with a short (900 s) TTL.
 
-### 5.6 Cascade revocation
+### 5.6 Direct OIDC ID-token federation (external issuer)
+
+ZeroID adds a third exchange mode that verifies an upstream OpenID Provider's
+**ID token directly**, rather than trusting a relay to have verified it
+(contrast Section 5.5). This is the spec-aligned preferred path for ingesting
+upstream *user* identity: RFC 8693 defines
+`urn:ietf:params:oauth:token-type:id_token` precisely for a receiver that
+verifies the ID token itself, and it preserves IdP-granular provenance
+(`user_id_iss`, Section 4.6) that the broker path cannot — per NIST SP 800-63C
+§4.1 a federation assertion must name the IdP that authenticated the subject,
+not an aggregator.
+
+A request selects this mode with `subject_token_type =
+urn:ietf:params:oauth:token-type:id_token` and `subject_token` set to the
+upstream ID token. The mode:
+
+- Is gated by a deployer-configured allowlist of **external issuers**
+  (`external_issuers`), keyed by the upstream `iss`. A token whose `iss` is not
+  configured **MUST** be rejected (`invalid_request`). The
+  `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
+  here — the JWKS signature check, issuer allowlist, and audience binding *are*
+  the trust anchor.
+- **MUST** verify the ID token's signature against the issuer's JWKS (fetched
+  from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
+  absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
+  matched issuer), `aud` (equal to the issuer's configured `audience`), `exp`,
+  `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
+  library honors but does not require them). A 60-second clock skew is tolerated.
+- **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
+  Section 7.2) and outside the issuer's configured `algorithms` (default
+  `RS256`, `ES256`, `PS256`); `none` and HMAC are rejected.
+- Caps replay: the ID token's `iat` **MUST** be within the issuer's
+  `max_token_age` (default 10 minutes).
+- Binds the upstream token to a ZeroID tenant via the issuer's
+  **`allowed_accounts`** — a **REQUIRED, non-empty** list; the request's
+  `account_id` **MUST** appear in it. Because the ID token's `aud` binds it to
+  ZeroID-the-RP (not to a tenant) and `account_id` is caller-supplied on the
+  public token endpoint, an empty allowlist would let a token validly issued
+  for one tenant be exchanged under another; ZeroID rejects an empty
+  `allowed_accounts` at config load (fail closed).
+- Maps the principal from the issuer's `claim_mapping` (`user_id` REQUIRED,
+  becomes `sub`; OPTIONAL `email`, `name`).
+- Emits `token_exchange=external_id_token` and `user_id_iss=<upstream iss>`, and
+  propagates `auth_time`/`acr`/`amr` per the issuer's `propagate_claims`
+  (Section 4.6). Is RS256-signed with a short (900 s) TTL and is governed by the
+  tenant credential-policy ceiling (the tenant default policy when no
+  `application_id` resolves a specific identity).
+- Fetches JWKS through an SSRF-guarded HTTP client: an issuer/`jwks_uri` host
+  resolving to a private/loopback/link-local/metadata address is rejected unless
+  the issuer sets `allow_private_endpoints` (for a deliberately internal IdP).
+  See Section 12.
+
+Out of scope: the interactive OIDC redirect/authentication flow is the
+deployer's responsibility — ZeroID is a token-exchange endpoint, not a
+browser-facing OIDC relying party. SAML and OpenID Federation trust chains are
+also out of scope; trusted issuers are configured explicitly.
+
+### 5.7 Cascade revocation
 
 Revoking any credential revokes the entire subtree beneath it (all credentials
 whose `parent_jti` chain reaches the revoked `jti`). Revoking an identity
@@ -568,7 +631,7 @@ account_id project_id user_id owner_user_id external_id identity_type
 sub_type trust_level status name framework version publisher capabilities
 scopes grant_type delegation_depth user_email user_name
 # ZeroID internal / provenance
-act token_exchange trusted_by
+act token_exchange trusted_by user_id_iss
 # RFC 9449 sender-constraint
 cnf
 # Authorization (gated)
@@ -612,7 +675,7 @@ is a ZeroID-defined extension.
 
 `severity` ∈ { `low`, `medium`, `high`, `critical` }. A signal of severity
 `high` or `critical` triggers credential revocation (and cascade per
-Section 5.6).
+Section 5.7).
 
 ### 9.3 Signal shape and scoping
 
@@ -637,7 +700,14 @@ directions**, neither of which uses a long-lived secret:
   standard, externally-verifiable token + JWKS surface — no provider-specific
   code on either side.
 
-This section specifies both wire contracts.
+This section specifies both wire contracts. It concerns **workload** identity:
+an upstream *platform* OIDC token presented as an attestation that elevates an
+identity's trust level. It is distinct from direct OIDC **user**-identity
+federation (Section 5.6), where an upstream *user* ID token is exchanged for a
+ZeroID principal token via `token_exchange`; that path mints a token for the
+authenticated user rather than attesting a workload. Both verify an upstream
+issuer's signature against a configured JWKS and apply the same SSRF guard on
+the issuer/`jwks_uri` fetch (Section 12).
 
 ### 10.1 Inbound — proof types
 
@@ -808,6 +878,18 @@ lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
   arbitrary `user_id`s and is gated **only** by `TrustedServiceValidator`. The
   deployer **MUST** restrict that gate to genuinely trusted internal callers; it
   is effectively an impersonation capability.
+- **Direct OIDC federation moves the trust anchor to the IdP signature.** The
+  `id_token` exchange mode (5.6) deliberately has **no** `TrustedServiceValidator`
+  gate; trust rests entirely on (a) the upstream signature verified against a
+  configured JWKS, (b) the `iss` matching a configured issuer, (c) `aud` binding
+  to this ZeroID, and (d) the JWS `alg` being pinned to the asymmetric allow-list
+  (so a public verification key cannot be abused as an HMAC secret, and `none` is
+  refused). Two further controls are load-bearing and **MUST NOT** be relaxed in
+  multi-tenant deployments: `allowed_accounts` is required and non-empty (an empty
+  list is rejected at config load) — without it, a token validly issued for one
+  tenant could be exchanged under another, since `aud` binds only to ZeroID-the-RP
+  and `account_id` is caller-supplied; and the JWKS fetch is SSRF-guarded, with
+  `allow_private_endpoints` reserved for a deliberately internal IdP.
 - **Cascade revocation latency.** Revocation cascade and the `RevocationNotifier`
   fan-out are asynchronous; a resource server requiring hard real-time
   revocation **MUST** introspect rather than rely solely on local JWT
@@ -853,6 +935,8 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `cnf` | object | §4.5 (Std: RFC 9449) |
 | `token_exchange` | string | §4.6, §4.7 |
 | `trusted_by` | string | §4.6 |
+| `user_id_iss` | string | §4.6, §5.6 |
+| `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |
 | `backchannel_client_id` | string | §4.7 |
@@ -867,6 +951,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `authorization_details` | `/oauth2/bc-authorize` | §6.2 |
 | `role`, `privilege_scope` | `/oauth2/token` (ext-principal exchange) | §5.5, §8 |
 | `additional_claims` | `/oauth2/token` (ext-principal exchange) | §4.8, §8 |
+| `subject_token_type` = `urn:ietf:params:oauth:token-type:id_token` | `/oauth2/token` (direct OIDC federation) | §5.6 (Std: RFC 8693) |
 
 ### 13.3 DPoP proof claim
 
