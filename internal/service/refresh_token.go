@@ -109,6 +109,28 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 	}, nil
 }
 
+// PeekRefreshToken returns the active, non-expired refresh-token row for the
+// presented raw token WITHOUT consuming (revoking) it. It is the non-mutating
+// counterpart to RotateRefreshToken's claim step: the caller can read binding
+// metadata (ClientID, IdentityID, tenant scalars) and run pre-rotation gates
+// (client_id binding, identity status/expiry) before committing the rotation.
+//
+// Crucially, a gate that fails AFTER a Peek leaves the token UNTOUCHED — the
+// client can retry with the same token once the transient condition clears.
+// This avoids the session-bricking failure mode where the rotation committed
+// (old token revoked, successor inserted) before a post-claim gate ran, then
+// discarded the successor on error: the client would then retry with a
+// now-revoked token and trip reuse detection, nuking the whole family over a
+// transient mistake (RFC 6749 §10.4).
+//
+// Returns an error if no active, non-expired token matches (expired, revoked,
+// or unknown). The caller maps this to invalid_grant; it does NOT trigger
+// reuse detection (that only fires inside RotateRefreshToken's claim path,
+// which distinguishes the grace window).
+func (s *RefreshTokenService) PeekRefreshToken(ctx context.Context, rawToken string) (*domain.RefreshToken, error) {
+	return s.repo.GetByTokenHash(ctx, hashRefreshToken(rawToken))
+}
+
 // RotateRefreshToken validates the presented token, revokes it, and issues a new one.
 // Implements reuse detection: if a revoked token is presented, the entire family is revoked.
 //

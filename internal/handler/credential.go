@@ -137,11 +137,12 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 	}
 
 	accessToken, cred, err := a.credSvc.IssueCredential(ctx, service.IssueRequest{
-		Identity:  identity,
-		Scopes:    input.Body.Scopes,
-		TTL:       input.Body.TTL,
-		GrantType: grantType,
-		Audience:  input.Body.Audience,
+		Identity:              identity,
+		Scopes:                input.Body.Scopes,
+		TTL:                   input.Body.TTL,
+		GrantType:             grantType,
+		Audience:              input.Body.Audience,
+		ResolveIdentityPolicy: true,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to issue credential")

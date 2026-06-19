@@ -170,6 +170,7 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 //
 //	pending → active → suspended → active (reactivation)
 //	                 → deactivated (terminal)
+//	                 → expired (terminal — time-bound authority lapsed)
 //	pending → deactivated (registration rejected)
 type IdentityStatus string
 
@@ -178,11 +179,12 @@ const (
 	IdentityStatusActive      IdentityStatus = "active"
 	IdentityStatusSuspended   IdentityStatus = "suspended"
 	IdentityStatusDeactivated IdentityStatus = "deactivated"
+	IdentityStatusExpired     IdentityStatus = "expired"
 )
 
 func (s IdentityStatus) Valid() bool {
 	switch s {
-	case IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated:
+	case IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated, IdentityStatusExpired:
 		return true
 	}
 	return false
@@ -194,11 +196,13 @@ func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 	case IdentityStatusPending:
 		return target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusActive:
-		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated
+		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusSuspended:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		return target == IdentityStatusActive || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusDeactivated:
 		return target == IdentityStatusActive
+	case IdentityStatusExpired:
+		return target == IdentityStatusDeactivated
 	default:
 		return false
 	}
@@ -439,6 +443,7 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(IdentityStatusActive), Label: "Active", Description: "Fully operational"},
 			{Value: string(IdentityStatusSuspended), Label: "Suspended", Description: "Temporarily disabled"},
 			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Permanently disabled"},
+			{Value: string(IdentityStatusExpired), Label: "Expired", Description: "Time-bound authority lapsed"},
 		},
 	}
 }

@@ -22,7 +22,8 @@ type AgentService struct {
 	keyProofReplay keyProofReplayGuard
 	// issuer is this server's token issuer URL; the audience a self-service key
 	// proof must target is derived from it (see keyProofAudience).
-	issuer string
+	issuer        string
+	delegationSvc *DelegationService
 }
 
 // NewAgentService creates a new AgentService. keyProofReplay backs single-use
@@ -34,6 +35,7 @@ func NewAgentService(
 	apiKeyRepo *postgres.APIKeyRepository,
 	keyProofReplay keyProofReplayGuard,
 	issuer string,
+	delegationSvc *DelegationService,
 ) *AgentService {
 	return &AgentService{
 		identitySvc:    identitySvc,
@@ -41,6 +43,7 @@ func NewAgentService(
 		apiKeyRepo:     apiKeyRepo,
 		keyProofReplay: keyProofReplay,
 		issuer:         issuer,
+		delegationSvc:  delegationSvc,
 	}
 }
 
@@ -104,6 +107,7 @@ type AgentResponse struct {
 	CreatedAt          time.Time             `json:"created_at"`
 	CreatedBy          string                `json:"created_by"`
 	UpdatedAt          time.Time             `json:"updated_at"`
+	DelegationDepth    int                   `json:"delegation_depth"`
 }
 
 // AgentRegistrationResponse is returned on agent creation — includes plaintext API key.
@@ -242,12 +246,20 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 
 	keyPrefix := s.getKeyPrefix(ctx, identity.ID)
 	resp := identityToAgentResponse(identity, keyPrefix)
+	if s.delegationSvc != nil {
+		depths, err := s.delegationSvc.IdentityDepths(ctx, []string{identity.ID}, accountID, projectID)
+		if err != nil {
+			log.Warn().Err(err).Str("identity_id", identity.ID).Msg("failed to fetch delegation depth for agent")
+		} else if len(depths) > 0 {
+			resp.DelegationDepth = depths[0].MaxDepth
+		}
+	}
 	return &resp, nil
 }
 
 // ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
 // label, and metadata (key presence or key:value).
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) (*AgentListResponse, error) {
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -255,15 +267,33 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		offset = 0
 	}
 
-	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, limit, offset)
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, limit, offset)
 	if err != nil {
 		return nil, err
+	}
+
+	// Batch-fetch delegation depths for all returned identities.
+	identityIDs := make([]string, len(identities))
+	for i, id := range identities {
+		identityIDs[i] = id.ID
+	}
+	depthMap := make(map[string]int)
+	if s.delegationSvc != nil && len(identityIDs) > 0 {
+		depths, err := s.delegationSvc.IdentityDepths(ctx, identityIDs, accountID, projectID)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to fetch delegation depths, continuing without")
+		} else {
+			for _, d := range depths {
+				depthMap[d.IdentityID] = d.MaxDepth
+			}
+		}
 	}
 
 	agents := make([]AgentResponse, len(identities))
 	for i, id := range identities {
 		keyPrefix := s.getKeyPrefix(ctx, id.ID)
 		agents[i] = identityToAgentResponse(id, keyPrefix)
+		agents[i].DelegationDepth = depthMap[id.ID]
 	}
 
 	return &AgentListResponse{
@@ -272,6 +302,11 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		Limit:  limit,
 		Offset: offset,
 	}, nil
+}
+
+// GetIdentityFacets returns grouped counts for each filterable identity dimension.
+func (s *AgentService) GetIdentityFacets(ctx context.Context, accountID, projectID string) (*postgres.IdentityFacets, error) {
+	return s.identitySvc.GetFacets(ctx, accountID, projectID)
 }
 
 // UpdateAgent updates an agent identity with PATCH semantics.

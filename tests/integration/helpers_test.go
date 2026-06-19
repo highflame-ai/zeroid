@@ -225,6 +225,13 @@ func runTests(m *testing.M) int {
 			MaxTTL:         90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
 			HMACSecret:     testHMACSecret,
 			AuthCodeIssuer: testIssuer,
+			// Accept-and-verify posture for the suite (this is the LoadConfig
+			// default, but a struct literal doesn't get koanf defaults — so set
+			// it explicitly, else the suite would run strict and every
+			// anonymous introspect()/revoke() helper call would 401). The
+			// strict-mode path is exercised by toggling
+			// SetRequireTokenInspectionAuth in its dedicated test.
+			AllowUnauthenticatedTokenInspection: true,
 		},
 		Telemetry: zeroid.TelemetryConfig{
 			Enabled: false,
@@ -239,6 +246,14 @@ func runTests(m *testing.M) int {
 		// false — see GHSA-599q-j34m-33vc.
 		Backchannel: zeroid.BackchannelConfig{
 			AllowPrivateNotificationEndpoints: true,
+		},
+		// The attestation OIDC verifier fixtures run a discovery + JWKS
+		// httptest server on 127.0.0.1, which the new SSRF guard blocks by
+		// default. Relax it for this test deployment, exactly as the
+		// Backchannel flag above does for loopback notification endpoints.
+		// Production deployments keep this false.
+		Attestation: zeroid.AttestationConfig{
+			AllowPrivateIssuerEndpoints: true,
 		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a

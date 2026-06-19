@@ -114,7 +114,7 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
 // e.g. to list identities that have a redteam_target object configured, whose
 // value is not a scalar and so can't be matched by containment.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata string, limit, offset int) ([]*domain.Identity, int, error) {
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -147,6 +147,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 			// key-presence: identities whose metadata has this top-level key.
 			q = q.Where("jsonb_exists(metadata, ?)", parts[0])
 		}
+	}
+	switch identityClass {
+	case "custom":
+		q = q.Where("NOT jsonb_exists(metadata, 'created_via')")
+	case "code_agent":
+		q = q.Where("jsonb_exists(metadata, 'created_via')")
 	}
 	if trustLevel != "" {
 		q = q.Where("trust_level = ?", trustLevel)
@@ -181,6 +187,105 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		return nil, 0, fmt.Errorf("failed to list identities: %w", err)
 	}
 	return identities, total, nil
+}
+
+// FacetValue is a single value+count pair in a faceted aggregation.
+type FacetValue struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+// IdentityFacets holds grouped counts for identity filter dimensions.
+type IdentityFacets struct {
+	IdentityTypes   []FacetValue `json:"identity_types"`
+	TrustLevels     []FacetValue `json:"trust_levels"`
+	Statuses        []FacetValue `json:"statuses"`
+	IdentityClasses []FacetValue `json:"identity_classes"`
+	CreatedBy       []FacetValue `json:"created_by"`
+}
+
+// GetFacets returns grouped counts for each filterable dimension, scoped to a tenant.
+func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID string) (*IdentityFacets, error) {
+	db := dbOrTx(ctx, r.db)
+	facets := &IdentityFacets{}
+
+	// identity_type
+	var typeFacets []FacetValue
+	err := db.NewSelect().TableExpr("identities").
+		ColumnExpr("identity_type AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		GroupExpr("identity_type").
+		OrderExpr("count DESC").
+		Scan(ctx, &typeFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity_type facets: %w", err)
+	}
+	facets.IdentityTypes = typeFacets
+
+	// trust_level
+	var trustFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("trust_level AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		GroupExpr("trust_level").
+		OrderExpr("count DESC").
+		Scan(ctx, &trustFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trust_level facets: %w", err)
+	}
+	facets.TrustLevels = trustFacets
+
+	// status
+	var statusFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("status AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		GroupExpr("status").
+		OrderExpr("count DESC").
+		Scan(ctx, &statusFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status facets: %w", err)
+	}
+	facets.Statuses = statusFacets
+
+	// identity class (custom vs code_agent, based on metadata.created_via)
+	var classFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		GroupExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END").
+		OrderExpr("count DESC").
+		Scan(ctx, &classFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity_class facets: %w", err)
+	}
+	facets.IdentityClasses = classFacets
+
+	// created_by (owner_user_id)
+	var createdByFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("COALESCE(NULLIF(owner_user_id, ''), created_by) AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("COALESCE(NULLIF(owner_user_id, ''), created_by) != ''").
+		GroupExpr("COALESCE(NULLIF(owner_user_id, ''), created_by)").
+		OrderExpr("count DESC").
+		Scan(ctx, &createdByFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get created_by facets: %w", err)
+	}
+	facets.CreatedBy = createdByFacets
+
+	return facets, nil
 }
 
 // Update saves changes to an existing identity. Participates in a caller-

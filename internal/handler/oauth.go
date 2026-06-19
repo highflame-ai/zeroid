@@ -2,9 +2,12 @@ package handler
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -111,25 +114,97 @@ func extractOAuthError(err error) (code, description string, status int) {
 }
 
 type IntrospectInput struct {
-	Body struct {
+	// Authorization carries OPTIONAL client_secret_basic credentials
+	// (RFC 6749 §2.3.1: `Basic base64(urlencode(id):urlencode(secret))`).
+	// Body client_id/client_secret remain the client_secret_post path; a
+	// request using both methods at once is rejected per RFC 6749 §2.3.
+	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
+	Body          struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to introspect"`
+		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7662 §2.1
+		// authorization). When supplied they are verified (accept-and-verify
+		// posture); a bad secret is rejected with invalid_client. When omitted
+		// the endpoint preserves the internal/network-isolated access path.
+		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
+		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
 	}
 }
 
 type IntrospectOutput struct {
-	Body any // dynamic shape per RFC 7662
+	Status int
+	// WWWAuthenticate is set on 401 only when the failed attempt used the
+	// Authorization header (RFC 6749 §5.2: MUST echo the scheme back).
+	WWWAuthenticate string `header:"WWW-Authenticate"`
+	Body            any    // dynamic shape per RFC 7662; oauthErrorBody on client-auth failure
 }
 
 type OAuthRevokeInput struct {
-	Body struct {
+	// Authorization — same optional client_secret_basic support as
+	// IntrospectInput (RFC 7009 §2.1 client authorization).
+	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
+	Body          struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to revoke"`
+		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7009 §2.1
+		// authorization). Same accept-and-verify posture as introspection.
+		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
+		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
 	}
 }
 
 type OAuthRevokeOutput struct {
-	Body struct {
+	Status int
+	// WWWAuthenticate — see IntrospectOutput.
+	WWWAuthenticate string `header:"WWW-Authenticate"`
+	Body            struct {
 		Revoked bool `json:"revoked"`
+		// Error / ErrorDescription are populated only when presented client
+		// credentials fail verification (invalid_client). On every other path
+		// the RFC 7009 §2.2 "always 200" contract holds.
+		Error            string `json:"error,omitempty"`
+		ErrorDescription string `json:"error_description,omitempty"`
 	}
+}
+
+// basicAuthChallenge is the WWW-Authenticate value returned when a Basic
+// client-auth attempt fails (RFC 6749 §5.2).
+const basicAuthChallenge = `Basic realm="zeroid", charset="UTF-8"`
+
+// resolveInspectionClientAuth merges the two supported client authentication
+// methods on the introspection/revocation endpoints: client_secret_basic
+// (Authorization header) and client_secret_post (body fields). Returns the
+// effective credentials plus whether the Basic header was the source (drives
+// the RFC 6749 §5.2 WWW-Authenticate echo on failure).
+//
+// Per RFC 6749 §2.3 a client MUST NOT use more than one method in a single
+// request — presenting both is rejected as invalid_request. Non-Basic
+// Authorization schemes are ignored (treated as not presented) so bearer
+// headers from generic middleware don't break the anonymous internal path.
+// Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
+func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
+	badRequest := func(desc string) *service.OAuthError {
+		return &service.OAuthError{Code: oautherror.InvalidRequest, Description: desc, HTTPStatus: http.StatusBadRequest}
+	}
+	const prefix = "Basic "
+	if len(authorization) < len(prefix) || !strings.EqualFold(authorization[:len(prefix)], prefix) {
+		return bodyClientID, bodyClientSecret, false, nil
+	}
+	if bodyClientID != "" || bodyClientSecret != "" {
+		return "", "", true, badRequest("only one client authentication method may be used per request (RFC 6749 §2.3)")
+	}
+	raw, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(authorization[len(prefix):]))
+	if decErr != nil {
+		return "", "", true, badRequest("malformed Basic authorization header")
+	}
+	id, secret, ok := strings.Cut(string(raw), ":")
+	if !ok {
+		return "", "", true, badRequest("malformed Basic authorization header")
+	}
+	id, idErr := url.QueryUnescape(id)
+	secret, secErr := url.QueryUnescape(secret)
+	if idErr != nil || secErr != nil {
+		return "", "", true, badRequest("malformed Basic authorization header")
+	}
+	return id, secret, true, nil
 }
 
 // ── OAuth routes ─────────────────────────────────────────────────────────────
@@ -326,17 +401,57 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 }
 
 func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*IntrospectOutput, error) {
-	result, err := a.oauthSvc.Introspect(ctx, input.Body.Token)
+	// Accept-and-verify client auth (RFC 7662 §2.1) via client_secret_basic
+	// (Authorization header) or client_secret_post (body). When credentials are
+	// presented they MUST verify; a bad secret is rejected with invalid_client.
+	// When absent, the existing internal/tenant-header access path is preserved.
+	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	if err == nil {
+		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+	}
 	if err != nil {
-		return &IntrospectOutput{Body: map[string]any{"active": false}}, nil
+		code, desc, status := extractOAuthError(err)
+		out := &IntrospectOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
 	}
 
-	return &IntrospectOutput{Body: result}, nil
+	result, err := a.oauthSvc.Introspect(ctx, input.Body.Token)
+	if err != nil {
+		return &IntrospectOutput{Status: http.StatusOK, Body: map[string]any{"active": false}}, nil
+	}
+
+	return &IntrospectOutput{Status: http.StatusOK, Body: result}, nil
 }
 
 func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevokeOutput, error) {
+	// Accept-and-verify client auth (RFC 7009 §2.1) via client_secret_basic
+	// (Authorization header) or client_secret_post (body). A presented-but-wrong
+	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
+	// "always 200" contract holds (including for unknown/already-revoked tokens
+	// and anonymous internal-path callers).
+	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	if err == nil {
+		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+	}
+	if err != nil {
+		code, desc, status := extractOAuthError(err)
+		out := &OAuthRevokeOutput{Status: status}
+		// Use the error's own code, not a hardcoded invalid_client — an
+		// operational failure maps to a 500/server_error and must not be
+		// labelled as a client authentication failure.
+		out.Body.Error = code
+		out.Body.ErrorDescription = desc
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
+	}
+
 	_ = a.oauthSvc.Revoke(ctx, input.Body.Token)
-	out := &OAuthRevokeOutput{}
+	out := &OAuthRevokeOutput{Status: http.StatusOK}
 	out.Body.Revoked = true
 	return out, nil
 }
@@ -351,6 +466,7 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 type BcAuthorizeInput struct {
 	Body struct {
 		ClientID                string `json:"client_id" required:"true" doc:"OAuth client initiating the backchannel request"`
+		ClientSecret            string `json:"client_secret,omitempty" doc:"Client secret — REQUIRED for confidential clients (OpenID CIBA Core §7.1); omitted for public clients"`
 		AccountID               string `json:"account_id" required:"true" doc:"Tenant account ID"`
 		ProjectID               string `json:"project_id" required:"true" doc:"Tenant project ID"`
 		LoginHint               string `json:"login_hint,omitempty" doc:"User identifier (email, phone, user_id). Required IF group_hint is not supplied."`
@@ -389,6 +505,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
 		ClientID:                input.Body.ClientID,
+		ClientSecret:            input.Body.ClientSecret,
 		AccountID:               input.Body.AccountID,
 		ProjectID:               input.Body.ProjectID,
 		LoginHint:               input.Body.LoginHint,
