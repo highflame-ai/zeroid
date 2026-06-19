@@ -1,4 +1,4 @@
-# ZeroID OAuth 2.0 / OIDC Extensions for Agent Identity
+# ZeroID OAuth 2.0 / OpenID Connect Extensions for Agent Identity
 
 | | |
 |---|---|
@@ -57,7 +57,7 @@ to ZeroID deployments.
 
 ## 1. Introduction
 
-OAuth 2.x and OIDC were designed around delegating a *user's* access to
+OAuth 2.x and OpenID Connect were designed around delegating a *user's* access to
 clients and authenticating humans to services; their non-human grants
 (`client_credentials`, JWT-bearer) model a flat machine credential. None of
 them natively model a credential whose holder is an autonomous agent, one agent
@@ -69,7 +69,7 @@ ZeroID exists to solve **Agent Identity**. Human identity (the domain of
 OpenID Providers and enterprise IdPs) and general workload / machine identity
 (the domain of SPIFFE/SPIRE, cloud IAM, and secret managers) are separate,
 mature ecosystems; ZeroID builds on their primitives — WIMSE/SPIFFE URIs,
-OIDC, RFC 8693 — and
+OpenID Connect, RFC 8693 — and
 federates with them rather than replacing them. What it adds is the
 agent-shaped layer those baselines do not model.
 
