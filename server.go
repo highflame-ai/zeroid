@@ -38,6 +38,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 	"github.com/highflame-ai/zeroid/internal/telemetry"
 	"github.com/highflame-ai/zeroid/internal/worker"
+	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
 // middlewareHolder stores an optional middleware in a thread-safe way.
@@ -77,6 +78,12 @@ type Server struct {
 	backchannelSvc      *service.BackchannelService
 	jwksSvc             *signing.JWKSService
 	refreshTokenSvc     *service.RefreshTokenService
+
+	// External OIDC IdP federation (issue #88). Holds a JWKS client per
+	// configured trusted upstream issuer. Nil when no external_issuers are
+	// configured.
+	externalIssuerRegistry *service.ExternalIssuerRegistry
+
 	// revocationDispatcher fans out RevocationEvents
 	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
 	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
@@ -102,9 +109,35 @@ type namedPrincipalResolver struct {
 	fn   PrincipalResolver
 }
 
+// ServerOption configures NewServer. Provided for narrow build-time
+// concerns that can't reasonably be expressed in Config (e.g. injecting a
+// custom HTTP client into the external-issuer JWKS fetch path for tests).
+type ServerOption func(*serverOptions)
+
+// serverOptions is the internal accumulator behind ServerOption.
+type serverOptions struct {
+	externalIssuerJWKSOpts []authjwt.JWKSOption
+}
+
+// WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
+// external-issuer registry built inside NewServer. Intended primarily for
+// tests that need to bypass TLS verification when pointing the registry at
+// a fake JWKS server (httptest.NewTLSServer); production deployers should
+// not need this.
+func WithExternalIssuerJWKSOption(opt authjwt.JWKSOption) ServerOption {
+	return func(o *serverOptions) {
+		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
+	}
+}
+
 // NewServer initializes all ZeroID subsystems: database, migrations, signing keys,
 // repositories, services, handlers, and the HTTP router.
-func NewServer(cfg Config) (*Server, error) {
+func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
+	options := serverOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	initLogging(cfg.Logging.Level)
 
 	if err := cfg.Validate(); err != nil {
@@ -237,6 +270,22 @@ func NewServer(cfg Config) (*Server, error) {
 	// forces allow_unauthenticated_token_inspection=false in production, so
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
+
+	// Build the external-issuer registry when the deployer has configured
+	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
+	// fail on an unreachable issuer, to survive transient IdP outages during
+	// deploy); an issuer that never loads fails closed at token-exchange time.
+	var externalIssuerRegistry *service.ExternalIssuerRegistry
+	if len(cfg.ExternalIssuers) > 0 {
+		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers, options.externalIssuerJWKSOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize external OIDC issuer registry (issue #88): %w", err)
+		}
+		oauthSvc.SetExternalIssuerRegistry(registry)
+		externalIssuerRegistry = registry
+		log.Info().Int("count", len(cfg.ExternalIssuers)).Msg("Direct OIDC IdP federation enabled")
+	}
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -399,26 +448,27 @@ func NewServer(cfg Config) (*Server, error) {
 	idleTimeout := parseDurationOrDefault(cfg.Server.IdleTimeout, 60*time.Second)
 
 	srv := &Server{
-		cfg:                  cfg,
-		db:                   db,
-		router:               r,
-		identitySvc:          identitySvc,
-		credentialSvc:        credentialSvc,
-		credentialPolicySvc:  credentialPolicySvc,
-		attestationSvc:       attestationSvc,
-		proofSvc:             proofSvc,
-		oauthSvc:             oauthSvc,
-		oauthClientSvc:       oauthClientSvc,
-		signalSvc:            signalSvc,
-		apiKeySvc:            apiKeySvc,
-		agentSvc:             agentSvc,
-		backchannelSvc:       backchannelSvc,
-		jwksSvc:              jwksSvc,
-		refreshTokenSvc:      refreshTokenSvc,
-		revocationDispatcher: revocationDispatcher,
-		cleanupWorker:        worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
-		adminAuthState:       authState,
-		globalMWState:        globalMW,
+		cfg:                    cfg,
+		db:                     db,
+		router:                 r,
+		identitySvc:            identitySvc,
+		credentialSvc:          credentialSvc,
+		credentialPolicySvc:    credentialPolicySvc,
+		attestationSvc:         attestationSvc,
+		proofSvc:               proofSvc,
+		oauthSvc:               oauthSvc,
+		oauthClientSvc:         oauthClientSvc,
+		signalSvc:              signalSvc,
+		apiKeySvc:              apiKeySvc,
+		agentSvc:               agentSvc,
+		backchannelSvc:         backchannelSvc,
+		jwksSvc:                jwksSvc,
+		refreshTokenSvc:        refreshTokenSvc,
+		externalIssuerRegistry: externalIssuerRegistry,
+		revocationDispatcher:   revocationDispatcher,
+		cleanupWorker:          worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
+		adminAuthState:         authState,
+		globalMWState:          globalMW,
 		http: &http.Server{
 			Addr:         ":" + cfg.Server.Port,
 			Handler:      r,
@@ -493,6 +543,10 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.workerCancel != nil {
 		s.workerCancel()
+	}
+
+	if s.externalIssuerRegistry != nil {
+		s.externalIssuerRegistry.Close()
 	}
 
 	// Cancel the CIBA backchannel service's lifecycle context so detached

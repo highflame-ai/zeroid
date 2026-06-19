@@ -13,6 +13,8 @@ import (
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -43,6 +45,13 @@ type Config struct {
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+
+	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
+	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
+	// looks up the upstream iss in this list, fetches the issuer's JWKS, and
+	// verifies the ID token before minting a ZeroID token. Empty list (default)
+	// disables direct federation — only the broker path remains available.
+	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -377,6 +386,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
 	}
 
+	seen := make(map[string]struct{}, len(c.ExternalIssuers))
+	for i := range c.ExternalIssuers {
+		c.ExternalIssuers[i].Defaults()
+		if err := c.ExternalIssuers[i].Validate(); err != nil {
+			return fmt.Errorf("external_issuers[%d]: %w", i, err)
+		}
+		iss := c.ExternalIssuers[i].Issuer
+		if _, dup := seen[iss]; dup {
+			return fmt.Errorf("external_issuers[%d]: duplicate issuer %q", i, iss)
+		}
+		seen[iss] = struct{}{}
+	}
 	return nil
 }
 
