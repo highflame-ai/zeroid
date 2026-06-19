@@ -69,8 +69,41 @@ func TestExternalIssuerConfigDefaults(t *testing.T) {
 	if got, want := cfg.JWKSCacheTTL, 5*time.Minute; got != want {
 		t.Errorf("JWKSCacheTTL default = %s, want %s", got, want)
 	}
-	if len(cfg.Algorithms) != 2 {
-		t.Errorf("Algorithms default len = %d, want 2 (RS256, ES256)", len(cfg.Algorithms))
+	if got, want := strings.Join(cfg.Algorithms, ","), "RS256,ES256,PS256"; got != want {
+		t.Errorf("Algorithms default = %q, want %q", got, want)
+	}
+}
+
+// TestExternalIssuerConfigValidateRejectsUnsupportedAlg locks in that the
+// alg allow-list is enforced at config load (the doc promises it), and that
+// a jwks_cache_ttl below the authjwt floor is rejected rather than silently
+// clamped.
+func TestExternalIssuerConfigValidateRejectsUnsupportedAlg(t *testing.T) {
+	base := func() ExternalIssuerConfig {
+		return ExternalIssuerConfig{
+			Issuer:       "https://idp.example.com",
+			JWKSURI:      "https://idp.example.com/jwks",
+			Audience:     "https://zeroid.example.com",
+			ClaimMapping: map[string]string{"user_id": "sub"},
+		}
+	}
+
+	bad := base()
+	bad.Algorithms = []string{"RS256", "HS256"}
+	if err := bad.Validate(); err == nil {
+		t.Errorf("Validate must reject unsupported algorithm HS256")
+	}
+
+	tooShort := base()
+	tooShort.JWKSCacheTTL = 5 * time.Second
+	if err := tooShort.Validate(); err == nil {
+		t.Errorf("Validate must reject jwks_cache_ttl below the 30s floor")
+	}
+
+	ok := base()
+	ok.Defaults()
+	if err := ok.Validate(); err != nil {
+		t.Errorf("default config must validate, got %v", err)
 	}
 }
 

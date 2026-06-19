@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,12 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
 )
+
+// externalIDTokenClockSkew is the leeway allowed when validating the upstream
+// ID token's exp/nbf/iat against ZeroID's clock. Per issue #88 (and standard
+// OIDC practice) a small skew absorbs clock drift between the IdP and ZeroID
+// so federation isn't brittle to sub-minute differences.
+const externalIDTokenClockSkew = 60 * time.Second
 
 // SubjectTokenTypeIDToken is the RFC 8693 subject_token_type for an OIDC ID
 // token. ZeroID dispatches token-exchange requests carrying this type to the
@@ -133,6 +140,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		jwt.WithValidate(true),
 		jwt.WithIssuer(upstreamIss),
 		jwt.WithAudience(cfg.Audience),
+		jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 	)
 	if err != nil {
 		// On unknown kid, refresh the JWKS once and retry — handles upstream
@@ -144,11 +152,23 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 				jwt.WithValidate(true),
 				jwt.WithIssuer(upstreamIss),
 				jwt.WithAudience(cfg.Audience),
+				jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 			)
 		}
 		if err != nil {
 			return nil, oauthBadRequestCause("invalid_grant", "subject_token verification failed", err)
 		}
+	}
+
+	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires
+	// both sub and exp on an assertion. Enforce their presence explicitly so a
+	// token without an expiry (replayable forever) or without a subject is
+	// rejected rather than silently accepted.
+	if _, ok := verified.Subject(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "subject_token missing required sub claim")
+	}
+	if _, ok := verified.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", "subject_token missing required exp claim")
 	}
 
 	// Stale-token cap. exp guards future-side; iat guards past-side. We
@@ -209,18 +229,35 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		customClaims[k] = v
 	}
 
+	// Resolve the identity's credential policy when we have a real identity
+	// row, so issuance enforces the same policy ceiling (allowed scopes, max
+	// TTL, trust level, policy expiry) as every other grant. The synthetic
+	// carrier identity (no application_id) has no row, hence no policy. Mirrors
+	// ExternalPrincipalExchange — without this the federation path would be a
+	// policy-bypass hole.
+	var identityPolicyID string
+	if identity.ID != "" {
+		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+		if err != nil {
+			return nil, oauthServerError("failed to resolve identity credential policy", err)
+		}
+		identityPolicyID = policy.ID
+	}
+
 	scopes := parseScopeString(req.Scope)
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:        identity,
-		GrantType:       domain.GrantTypeTokenExchange,
-		Scopes:          scopes,
-		UseRS256:        true,
-		SubjectOverride: userID,
-		UserEmail:       userEmail,
-		UserName:        userName,
-		ApplicationID:   req.ApplicationID,
-		TTL:             900, // 15 minutes — same short-lived posture as the broker path
-		CustomClaims:    customClaims,
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeTokenExchange,
+		Scopes:            scopes,
+		UseRS256:          true,
+		SubjectOverride:   userID,
+		UserEmail:         userEmail,
+		UserName:          userName,
+		ApplicationID:     req.ApplicationID,
+		TTL:               900, // 15 minutes — same short-lived posture as the broker path
+		CustomClaims:      customClaims,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
@@ -257,10 +294,21 @@ func (s *OAuthService) resolveExternalPrincipalIdentity(ctx context.Context, req
 	}
 	resolved, err := s.identitySvc.GetIdentity(ctx, req.ApplicationID, req.AccountID, req.ProjectID)
 	if err != nil {
-		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("application_id %s not found or access denied", req.ApplicationID))
+		// Distinguish "row not found / wrong tenant" (client error, 400) from
+		// a transient infrastructure failure (server error, 500 — retriable).
+		// The repository wraps sql.ErrNoRows for both genuine-missing and
+		// IDOR-protected cross-tenant lookups; anything else is an infra
+		// problem the client can't act on. Mirrors ExternalPrincipalExchange.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, oauthBadRequestCause("invalid_request", fmt.Sprintf("application_id %s not found or access denied", req.ApplicationID), err)
+		}
+		return nil, oauthServerError(fmt.Sprintf("failed to look up application_id %s", req.ApplicationID), err)
 	}
 	if !resolved.Status.IsUsable() {
 		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+	}
+	if resolved.IsExpired() {
+		return nil, oauthBadRequest("invalid_grant", "identity_expired")
 	}
 	return resolved, nil
 }
@@ -290,6 +338,12 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 		return strconv.FormatFloat(tv, 'f', -1, 64), true
 	case int64:
 		return strconv.FormatInt(tv, 10), true
+	case int:
+		return strconv.Itoa(tv), true
+	case json.Number:
+		// Present when the upstream claims were decoded with UseNumber();
+		// preserves the exact textual form without float rounding.
+		return tv.String(), true
 	}
 	return "", false
 }

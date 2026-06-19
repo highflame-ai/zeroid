@@ -53,8 +53,7 @@ identity in the caller's tenant — same IDOR guard the broker path uses.
 | Claim            | Source                                              | Purpose                                                    |
 | ---------------- | --------------------------------------------------- | ---------------------------------------------------------- |
 | `iss`            | ZeroID's configured issuer                          | Standard.                                                  |
-| `sub`            | Upstream → `claim_mapping.user_id`                  | The principal — same identifier downstream services check. |
-| `user_id`        | Upstream → `claim_mapping.user_id`                  | Stable subject identifier.                                 |
+| `sub`            | Upstream → `claim_mapping.user_id`                  | The principal — the stable subject identifier downstream services check. (The token-endpoint JSON response also echoes it as `user_id`; the JWT itself carries it only as `sub`.) |
 | `user_id_iss`    | Upstream `iss`                                      | **IdP-granular provenance** — the headline addition.       |
 | `user_email`     | Upstream → `claim_mapping.email`                    | Optional.                                                  |
 | `user_name`      | Upstream → `claim_mapping.name`                     | Optional.                                                  |

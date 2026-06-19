@@ -66,9 +66,10 @@ type ExternalIssuerConfig struct {
 	// PropagateClaims is the explicit allow-list of upstream claims to
 	// copy onto the issued ZeroID token. Only auth_time, acr, and amr are
 	// recognized in v1 — these are RFC 9068 authentication-context claims
-	// and only meaningful when copied through directly from the IdP.
-	// Anything else is ignored. We never default-fill these claims; if the
-	// upstream omitted them, ZeroID does not synthesize them.
+	// and only meaningful when copied through directly from the IdP. Any other
+	// entry is rejected by Validate() at config load. We never default-fill
+	// these claims; if the upstream omitted them, ZeroID does not synthesize
+	// them.
 	PropagateClaims []string `koanf:"propagate_claims"`
 
 	// AllowPrivateEndpoints relaxes the SSRF guard applied to this issuer's
@@ -107,8 +108,24 @@ func (e *ExternalIssuerConfig) Validate() error {
 	if e.JWKSCacheTTL < 0 {
 		return fmt.Errorf("external_issuer %s: jwks_cache_ttl must be > 0", e.Issuer)
 	}
+	// pkg/authjwt clamps refresh intervals below 30s; a configured value under
+	// that floor would be silently ignored, so reject it rather than surprise
+	// the deployer. Zero is allowed — Defaults() fills it with 5m.
+	if e.JWKSCacheTTL > 0 && e.JWKSCacheTTL < 30*time.Second {
+		return fmt.Errorf("external_issuer %s: jwks_cache_ttl must be at least 30s (got %s)", e.Issuer, e.JWKSCacheTTL)
+	}
 	if _, ok := e.ClaimMapping["user_id"]; !ok {
 		return fmt.Errorf("external_issuer %s: claim_mapping.user_id is required (need a stable subject identifier)", e.Issuer)
+	}
+	// Only RS256/ES256/PS256 are supported by the verifier (jwtalg's asymmetric
+	// allow-list). Reject unsupported entries at config load instead of failing
+	// every exchange at runtime.
+	for _, alg := range e.Algorithms {
+		switch alg {
+		case "RS256", "ES256", "PS256":
+		default:
+			return fmt.Errorf("external_issuer %s: algorithm %q is not supported (allowed: RS256, ES256, PS256)", e.Issuer, alg)
+		}
 	}
 	for _, claim := range e.PropagateClaims {
 		switch claim {
@@ -124,7 +141,9 @@ func (e *ExternalIssuerConfig) Validate() error {
 // fills zero-valued fields.
 func (e *ExternalIssuerConfig) Defaults() {
 	if len(e.Algorithms) == 0 {
-		e.Algorithms = []string{"RS256", "ES256"}
+		// PS256 alongside RS256/ES256: widely used by Google/Okta/Entra and
+		// recommended by FAPI, so it belongs in the out-of-the-box set.
+		e.Algorithms = []string{"RS256", "ES256", "PS256"}
 	}
 	if e.MaxTokenAge == 0 {
 		e.MaxTokenAge = 10 * time.Minute
