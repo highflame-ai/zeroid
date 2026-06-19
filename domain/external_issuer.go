@@ -58,9 +58,16 @@ type ExternalIssuerConfig struct {
 	//	  email:   email
 	ClaimMapping map[string]string `koanf:"claim_mapping"`
 
-	// AllowedAccounts limits the tenants that may use this issuer. When
-	// non-empty, the request's account_id must appear in this list. Empty
-	// means any tenant may use it.
+	// AllowedAccounts is the REQUIRED, non-empty list of tenants permitted to
+	// exchange tokens from this issuer. The request's account_id must appear
+	// here. It is the only thing that binds an upstream ID token to a ZeroID
+	// tenant: the token's aud binds it to ZeroID-the-RP, not to a specific
+	// account, and account_id is caller-supplied on the (public) token
+	// endpoint — so a globally-trusted issuer with no tenant binding would let
+	// a token validly issued for tenant A's user be exchanged under tenant B.
+	// Validate() rejects an empty list (fail closed): the deployer must declare
+	// which tenants each IdP serves. For a single-tenant deployment, list that
+	// one account explicitly.
 	AllowedAccounts []string `koanf:"allowed_accounts"`
 
 	// PropagateClaims is the explicit allow-list of upstream claims to
@@ -117,6 +124,20 @@ func (e *ExternalIssuerConfig) Validate() error {
 	if _, ok := e.ClaimMapping["user_id"]; !ok {
 		return fmt.Errorf("external_issuer %s: claim_mapping.user_id is required (need a stable subject identifier)", e.Issuer)
 	}
+	// allowed_accounts is required and non-empty: it is the only binding of an
+	// upstream token to a ZeroID tenant. An empty list would mean "any tenant
+	// may exchange this IdP's tokens", which lets a token issued for one tenant
+	// be replayed under another (the upstream aud only binds to ZeroID-the-RP,
+	// not to an account_id). Fail closed — force the deployer to declare the
+	// tenants each issuer serves.
+	if len(e.AllowedAccounts) == 0 {
+		return fmt.Errorf("external_issuer %s: allowed_accounts is required and must be non-empty (it binds this IdP's tokens to specific tenants; an empty list would let a token issued for one tenant be exchanged under another)", e.Issuer)
+	}
+	for _, acct := range e.AllowedAccounts {
+		if acct == "" {
+			return fmt.Errorf("external_issuer %s: allowed_accounts must not contain empty entries", e.Issuer)
+		}
+	}
 	// Only RS256/ES256/PS256 are supported by the verifier (jwtalg's asymmetric
 	// allow-list). Reject unsupported entries at config load instead of failing
 	// every exchange at runtime.
@@ -154,11 +175,10 @@ func (e *ExternalIssuerConfig) Defaults() {
 }
 
 // AccountAllowed reports whether the given tenant is permitted to exchange
-// tokens issued by this IdP. Empty AllowedAccounts means any tenant.
+// tokens issued by this IdP. Fail closed: an empty AllowedAccounts denies all
+// tenants. Validate() already rejects an empty list at config load, so this is
+// defense-in-depth against a registry built from unvalidated config.
 func (e *ExternalIssuerConfig) AccountAllowed(accountID string) bool {
-	if len(e.AllowedAccounts) == 0 {
-		return true
-	}
 	for _, a := range e.AllowedAccounts {
 		if a == accountID {
 			return true

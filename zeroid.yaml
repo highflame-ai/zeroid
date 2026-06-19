@@ -127,6 +127,6 @@ backchannel:
 #     claim_mapping:
 #       user_id:        sub
 #       email:          email
-#     allowed_accounts: []   # empty = any tenant
+#     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch

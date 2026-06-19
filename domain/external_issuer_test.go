@@ -12,10 +12,11 @@ import (
 func TestExternalIssuerConfigValidate(t *testing.T) {
 	good := func() ExternalIssuerConfig {
 		return ExternalIssuerConfig{
-			Issuer:       "https://auth.example.okta.com",
-			JWKSURI:      "https://auth.example.okta.com/.well-known/jwks.json",
-			Audience:     "https://zeroid.example.com",
-			ClaimMapping: map[string]string{"user_id": "sub"},
+			Issuer:          "https://auth.example.okta.com",
+			JWKSURI:         "https://auth.example.okta.com/.well-known/jwks.json",
+			Audience:        "https://zeroid.example.com",
+			ClaimMapping:    map[string]string{"user_id": "sub"},
+			AllowedAccounts: []string{"acct-1"},
 		}
 	}
 
@@ -30,6 +31,10 @@ func TestExternalIssuerConfigValidate(t *testing.T) {
 		{name: "missing jwks_uri", mutate: func(c *ExternalIssuerConfig) { c.JWKSURI = "" }, wantErr: "jwks_uri is required"},
 		{name: "missing audience", mutate: func(c *ExternalIssuerConfig) { c.Audience = "" }, wantErr: "audience is required"},
 		{name: "missing user_id mapping", mutate: func(c *ExternalIssuerConfig) { c.ClaimMapping = map[string]string{} }, wantErr: "claim_mapping.user_id is required"},
+		{name: "missing allowed_accounts", mutate: func(c *ExternalIssuerConfig) { c.AllowedAccounts = nil }, wantErr: "allowed_accounts is required"},
+		{name: "empty allowed_accounts entry", mutate: func(c *ExternalIssuerConfig) {
+			c.AllowedAccounts = []string{""}
+		}, wantErr: "must not contain empty entries"},
 		{name: "unsupported propagate claim", mutate: func(c *ExternalIssuerConfig) {
 			c.PropagateClaims = []string{"groups"}
 		}, wantErr: "propagate_claims entry"},
@@ -81,10 +86,11 @@ func TestExternalIssuerConfigDefaults(t *testing.T) {
 func TestExternalIssuerConfigValidateRejectsUnsupportedAlg(t *testing.T) {
 	base := func() ExternalIssuerConfig {
 		return ExternalIssuerConfig{
-			Issuer:       "https://idp.example.com",
-			JWKSURI:      "https://idp.example.com/jwks",
-			Audience:     "https://zeroid.example.com",
-			ClaimMapping: map[string]string{"user_id": "sub"},
+			Issuer:          "https://idp.example.com",
+			JWKSURI:         "https://idp.example.com/jwks",
+			Audience:        "https://zeroid.example.com",
+			ClaimMapping:    map[string]string{"user_id": "sub"},
+			AllowedAccounts: []string{"acct-1"},
 		}
 	}
 
@@ -108,10 +114,10 @@ func TestExternalIssuerConfigValidateRejectsUnsupportedAlg(t *testing.T) {
 }
 
 func TestExternalIssuerConfigAccountAllowed(t *testing.T) {
-	t.Run("empty allow-list permits any tenant", func(t *testing.T) {
+	t.Run("empty allow-list denies all tenants (fail closed)", func(t *testing.T) {
 		cfg := ExternalIssuerConfig{}
-		if !cfg.AccountAllowed("any-tenant") {
-			t.Fatalf("empty AllowedAccounts must permit any tenant")
+		if cfg.AccountAllowed("any-tenant") {
+			t.Fatalf("empty AllowedAccounts must deny all tenants (fail closed)")
 		}
 	})
 	t.Run("non-empty allow-list gates membership", func(t *testing.T) {

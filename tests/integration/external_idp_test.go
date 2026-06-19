@@ -60,6 +60,7 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 			"user_id": "sub",
 			"email":   "email",
 		},
+		AllowedAccounts: []string{"acct-fed-001"},
 		PropagateClaims: []string{"auth_time", "acr", "amr"},
 	})
 	defer fedHTTPSrv.Close()

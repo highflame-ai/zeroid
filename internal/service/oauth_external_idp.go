@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -129,14 +130,24 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	// Verify signature, exp, nbf, iss, and aud against the configured IdP
-	// in one Parse call. WithKeySet picks the right key by kid+alg from
-	// the JWKS we cache for this issuer.
+	// in one Parse call. WithKeySet picks the right key by kid from the JWKS
+	// we cache for this issuer.
+	//
+	// WithInferAlgorithmFromKey is REQUIRED, not optional: jwx selects the
+	// verification alg from the JWK's `alg` member, but many production IdPs
+	// (Microsoft Entra ID is the canonical example) publish JWKS keys with no
+	// `alg` member at all. Without inference, jwx supplies no key for those and
+	// every verification fails — i.e. federation would silently never work
+	// against Entra. Inference is safe here because checkExternalIDTokenAlg has
+	// already pinned the token header alg to the asymmetric allow-list above,
+	// and jwx's infer path additionally rejects any header alg the key type
+	// cannot produce — so HS*/none still cannot slip through.
 	keySet := entry.JWKS.KeySet()
 	if keySet == nil || keySet.Len() == 0 {
 		return nil, oauthServerError(fmt.Sprintf("JWKS for issuer %s is empty", upstreamIss), nil)
 	}
 	verified, err := jwt.Parse([]byte(req.SubjectToken),
-		jwt.WithKeySet(keySet),
+		jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(upstreamIss),
 		jwt.WithAudience(cfg.Audience),
@@ -148,7 +159,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		if kid := extractJWSKeyID(req.SubjectToken); kid != "" && entry.JWKS.RefreshIfMissing(ctx, kid) {
 			keySet = entry.JWKS.KeySet()
 			verified, err = jwt.Parse([]byte(req.SubjectToken),
-				jwt.WithKeySet(keySet),
+				jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(upstreamIss),
 				jwt.WithAudience(cfg.Audience),
@@ -231,10 +242,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	// Resolve the identity's credential policy when we have a real identity
 	// row, so issuance enforces the same policy ceiling (allowed scopes, max
-	// TTL, trust level, policy expiry) as every other grant. The synthetic
-	// carrier identity (no application_id) has no row, hence no policy. Mirrors
-	// ExternalPrincipalExchange — without this the federation path would be a
-	// policy-bypass hole.
+	// TTL, trust level, policy expiry) as every other grant.
 	var identityPolicyID string
 	if identity.ID != "" {
 		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
@@ -246,18 +254,27 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	scopes := parseScopeString(req.Scope)
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeTokenExchange,
-		Scopes:            scopes,
-		UseRS256:          true,
-		SubjectOverride:   userID,
-		UserEmail:         userEmail,
-		UserName:          userName,
-		ApplicationID:     req.ApplicationID,
-		TTL:               900, // 15 minutes — same short-lived posture as the broker path
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Govern the synthetic-carrier path (no application_id, so no identity
+		// row and no IdentityPolicyID above) by the tenant default policy.
+		// resolveIdentityPolicyID falls back to EnsureDefaultPolicy on the
+		// request's account_id/project_id, so requested scopes are gated by the
+		// tenant policy ceiling instead of passing through ungated. Without
+		// this, any holder of a valid upstream token could request arbitrary
+		// scopes on the no-application_id path — a weaker gate than the broker
+		// path, which is at least fronted by TrustedServiceValidator.
+		ResolveIdentityPolicy: true,
+		GrantType:             domain.GrantTypeTokenExchange,
+		Scopes:                scopes,
+		UseRS256:              true,
+		SubjectOverride:       userID,
+		UserEmail:             userEmail,
+		UserName:              userName,
+		ApplicationID:         req.ApplicationID,
+		TTL:                   900, // 15 minutes — same short-lived posture as the broker path
+		CustomClaims:          customClaims,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
