@@ -80,10 +80,11 @@ func TestExternalIssuerRegistry_LifecycleAndLookup(t *testing.T) {
 	defer jwks.Close()
 
 	cfg := domain.ExternalIssuerConfig{
-		Issuer:       "https://auth.example.test",
-		JWKSURI:      jwks.URL(),
-		Audience:     "https://zeroid.example.test",
-		ClaimMapping: map[string]string{"user_id": "sub"},
+		Issuer:          "https://auth.example.test",
+		JWKSURI:         jwks.URL(),
+		Audience:        "https://zeroid.example.test",
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct"},
 	}
 	cfg.Defaults()
 	if err := cfg.Validate(); err != nil {
