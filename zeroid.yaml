@@ -112,3 +112,21 @@ backchannel:
   # this false (see GHSA-599q-j34m-33vc).
   # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
   allow_private_notification_endpoints: false
+
+# Direct OIDC IdP federation (issue #88).
+# Each entry registers a trusted upstream issuer for RFC 8693 token exchange
+# with subject_token_type=urn:ietf:params:oauth:token-type:id_token.
+# When empty (default), only the broker path remains available.
+# external_issuers:
+#   - issuer:           "https://auth.example.okta.com"
+#     jwks_uri:         "https://auth.example.okta.com/.well-known/jwks.json"
+#     audience:         "https://zeroid.example.com"
+#     algorithms:       ["RS256", "ES256"]
+#     max_token_age:    10m
+#     jwks_cache_ttl:   5m
+#     claim_mapping:
+#       user_id:        sub
+#       email:          email
+#     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
+#     propagate_claims: ["auth_time", "acr", "amr"]
+#     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch
