@@ -18,7 +18,8 @@ type IdentityExpirer interface {
 }
 
 // CleanupWorker periodically removes expired issued_credentials, proof_tokens,
-// and auth_codes rows, and sweeps expired identities into status=deactivated
+// auth_codes, refresh_tokens, and dpop_jti rows, and sweeps expired identities
+// into status=deactivated
 // via IdentityService.SweepExpiredIdentities (an atomic conditional UPDATE
 // claim followed by the existing runDeactivationCleanup cascade).
 // Running the cleanup prevents unbounded table growth since credentials have
@@ -126,6 +127,24 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired auth codes")
 	} else if n, err := authCodeRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired auth codes")
+	}
+
+	// Refresh tokens past expiry are unusable: every lookup requires
+	// expires_at > now (refresh_token.go GetByTokenHash/ClaimByTokenHash), and
+	// reuse detection only needs a revoked row while the token could still be
+	// replayed within its validity. Once expired, drop it — under rotation the
+	// table otherwise grows one row per refresh forever. Filter is backed by
+	// idx_refresh_tokens_expires_at (migration 033). No retention window: unlike
+	// issued_credentials (whose expired rows hold parent_jti edges the cascade
+	// walk still needs), refresh_tokens have no cross-row dependency.
+	refreshRes, err := w.db.NewDelete().
+		TableExpr("refresh_tokens").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired refresh tokens")
+	} else if n, err := refreshRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired refresh tokens")
 	}
 
 	// DPoP JTIs are only needed within the freshness window (RFC 9449 §4.2).
