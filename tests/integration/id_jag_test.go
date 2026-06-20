@@ -104,6 +104,36 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"])
 	})
 
+	t.Run("resource as RFC 8707 array → aud is the full authorized set", func(t *testing.T) {
+		now := time.Now()
+		const mcpResource2 = "https://mcp-server-2.idjag.test"
+		// RFC 8707 permits `resource` as an array; some IdPs emit even a single
+		// resource as a one-element array. Accept it and audience-restrict to
+		// every resource the IdP authorized (D4).
+		idjag := signIDJAG(t, map[string]any{
+			"iss":      upstreamIss,
+			"aud":      federationAud,
+			"sub":      "00uMULTIRES01",
+			"resource": []any{mcpResource, mcpResource2},
+			"scope":    "tools:read",
+			"iat":      now.Unix(),
+			"exp":      now.Add(5 * time.Minute).Unix(),
+		})
+
+		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"subject":    idjag,
+			"account_id": fedCfg.AccountID,
+			"project_id": fedCfg.ProjectID,
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"an array-valued resource is valid per RFC 8707; body=%s", resp.RawBody)
+
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.ElementsMatch(t, []any{mcpResource, mcpResource2}, claims["aud"],
+			"minted aud must contain every resource in the ID-JAG resource array")
+	})
+
 	t.Run("missing resource fails closed (invalid_grant)", func(t *testing.T) {
 		now := time.Now()
 		idjag := signIDJAG(t, map[string]any{
@@ -223,4 +253,55 @@ func TestIDJAG_NHISelfSignedRegression(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, accessTok)
 	require.Equal(t, identity.WIMSEURI, claims["sub"], "NHI token sub must be the agent WIMSE URI")
 	require.NotEqual(t, "id_jag", claims["token_exchange"], "NHI token must not carry the ID-JAG fingerprint")
+}
+
+// TestIDJAG_ConfigurableScopeClaim proves the ID-JAG path sources scopes from
+// the claim NAME configured in ClaimMapping["scope"] (defaulting to "scope"),
+// so IdPs that emit scopes under a non-standard name — e.g. Microsoft Entra's
+// `scp` — work without code changes (ADR 0010 D3).
+func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
+	upstreamIss := "https://corp-idp-scp.idjag.test"
+	federationAud := "https://zeroid.idjag.test"
+	const mcpResource = "https://mcp-server.idjag.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:   upstreamIss,
+		JWKSURI:  upstream.JWKSURL(),
+		Audience: federationAud,
+		ClaimMapping: map[string]string{
+			"user_id": "sub",
+			// Entra emits scopes under `scp`, not the standard `scope`. The
+			// claim NAME is configurable; the ID-JAG path must read from it.
+			"scope": "scp",
+		},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	now := time.Now()
+	idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+		"iss":      upstreamIss,
+		"aud":      federationAud,
+		"sub":      "00uENTRASCP01",
+		"resource": mcpResource,
+		"scp":      "tools:read tools:exec", // non-standard scope claim name
+		"iat":      now.Unix(),
+		"exp":      now.Add(5 * time.Minute).Unix(),
+	})
+
+	resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"subject":    idjag,
+		"account_id": fedCfg.AccountID,
+		"project_id": fedCfg.ProjectID,
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+
+	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+	require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"],
+		"scopes must be sourced from the ClaimMapping-configured scope claim (scp)")
 }

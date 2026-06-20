@@ -129,12 +129,14 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
 
 	// Audience restriction (D4, MUST). The minted token's aud is the ID-JAG's
-	// `resource` claim — the target MCP server. Fail closed if absent/empty: an
-	// unbound MCP access token could be replayed against any resource server
-	// (RFC 8707). `resource` is a standard string claim on the ID-JAG, not a
-	// ClaimMapping target — the spec names it directly.
-	resource, ok := extractMappedClaimString(rawClaims, "resource")
-	if !ok || resource == "" {
+	// `resource` claim — the target MCP server(s). Fail closed if absent/empty:
+	// an unbound MCP access token could be replayed against any resource server.
+	// Per RFC 8707 `resource` may be a single string or an array (some IdPs emit
+	// even a single resource as a one-element array), so accept both shapes and
+	// audience-restrict to the full set the IdP authorized. `resource` is a
+	// standard claim named directly by the spec, not a ClaimMapping target.
+	resources, ok := extractMappedClaimStrings(rawClaims, "resource")
+	if !ok || len(resources) == 0 {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing required resource claim — cannot audience-restrict the minted token")
 	}
 
@@ -191,14 +193,20 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		identityPolicyID = policy.ID
 	}
 
-	// Scopes come from the ID-JAG's `scope` claim — the IdP already evaluated
+	// Scopes come from the ID-JAG's scope claim — the IdP already evaluated
 	// policy and scoped the grant (ADR 0010). The minted token's scopes are
 	// that set, gated through the identity-policy ceiling as defense in depth
 	// (a real identity row enforces it via IssueCredential; the synthetic
 	// service-identity carrier is governed by the tenant default policy through
-	// ResolveIdentityPolicy below). The `scope` claim may be a space-delimited
-	// string (standard) or a string array — extractMappedClaimStrings handles both.
-	scopes, _ := extractMappedClaimStrings(rawClaims, "scope")
+	// ResolveIdentityPolicy below). The value may be a space-delimited string
+	// (standard) or an array — extractMappedClaimStrings handles both. The claim
+	// NAME is configurable via ClaimMapping["scope"] (some IdPs emit it under a
+	// non-standard name, e.g. Microsoft Entra's `scp`), defaulting to "scope".
+	scopeClaim := cfg.ClaimMapping["scope"]
+	if scopeClaim == "" {
+		scopeClaim = "scope"
+	}
+	scopes, _ := extractMappedClaimStrings(rawClaims, scopeClaim)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:         identity,
@@ -210,9 +218,9 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		ResolveIdentityPolicy: true,
 		GrantType:             domain.GrantTypeJWTBearer,
 		Scopes:                scopes,
-		// Audience-restrict to the ID-JAG resource (D4). IssueCredential stamps
-		// this verbatim as the aud claim instead of defaulting to the issuer URL.
-		Audience:          []string{resource},
+		// Audience-restrict to the ID-JAG resource(s) (D4). IssueCredential stamps
+		// these verbatim as the aud claim instead of defaulting to the issuer URL.
+		Audience:          resources,
 		UseRS256:          true,
 		SubjectOverride:   userID,
 		UserEmail:         userEmail,
@@ -235,7 +243,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		Str("account_id", req.AccountID).
 		Str("project_id", req.ProjectID).
 		Str("user_id", userID).
-		Str("resource", resource).
+		Strs("resources", resources).
 		Msg("ID-JAG jwt-bearer exchange succeeded")
 
 	return accessToken, nil
