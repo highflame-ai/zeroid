@@ -126,6 +126,34 @@ func TestExtractMappedClaimStrings(t *testing.T) {
 	})
 }
 
+// TestExtractResourceClaim verifies the ID-JAG `resource` claim is read per
+// RFC 8707: a string is ONE resource taken ATOMICALLY (never space-split like a
+// scope string), and an array is multi-valued. This is the bug-guard for the
+// audience-restriction path (D4) — splitting a string resource would forge
+// bogus audiences.
+func TestExtractResourceClaim(t *testing.T) {
+	t.Run("string resource is atomic, not space-split", func(t *testing.T) {
+		// A scope-style split would wrongly yield two entries here.
+		got, ok := extractResourceClaim(map[string]any{"resource": "https://mcp.example.com/a b"})
+		if !ok || len(got) != 1 || got[0] != "https://mcp.example.com/a b" {
+			t.Fatalf("string resource must be a single atomic value, got %v (ok=%v)", got, ok)
+		}
+	})
+
+	t.Run("array resource preserved", func(t *testing.T) {
+		got, ok := extractResourceClaim(map[string]any{"resource": []any{"https://a", "https://b"}})
+		if !ok || len(got) != 2 || got[0] != "https://a" || got[1] != "https://b" {
+			t.Fatalf("array resource must be preserved, got %v (ok=%v)", got, ok)
+		}
+	})
+
+	t.Run("absent resource returns false", func(t *testing.T) {
+		if _, ok := extractResourceClaim(map[string]any{}); ok {
+			t.Fatalf("expected ok=false when resource is absent")
+		}
+	})
+}
+
 // idJAGTestRegistry builds a single-issuer registry pointed at a fake JWKS,
 // returning the registry plus the upstream signer so a test can mint a
 // validly-signed ID-JAG.

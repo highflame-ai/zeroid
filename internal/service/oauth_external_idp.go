@@ -435,6 +435,37 @@ func extractMappedClaimStrings(claims map[string]any, path string) ([]string, bo
 	return nil, false
 }
 
+// extractResourceClaim reads the ID-JAG `resource` claim, which per RFC 8707 is
+// EITHER a single resource URI (string) OR an array of them. Unlike a scope
+// claim, a string value is a SINGLE resource — it is NOT space-delimited — so it
+// is taken atomically rather than split on whitespace (a resource URI may
+// legitimately contain encoded content; splitting it would forge bogus
+// audiences). Returns ok=false when the claim is absent; blank entries dropped.
+func extractResourceClaim(claims map[string]any) ([]string, bool) {
+	v, ok := claims["resource"]
+	if !ok {
+		return nil, false
+	}
+	switch tv := v.(type) {
+	case string:
+		if s := strings.TrimSpace(tv); s != "" {
+			return []string{s}, true
+		}
+		return nil, true
+	case []string:
+		return tv, true
+	case []any:
+		out := make([]string, 0, len(tv))
+		for _, e := range tv {
+			if s, ok := extractMappedClaimString(map[string]any{"_": e}, "_"); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
 // checkExternalIDTokenAlg enforces the JWT-SVID §3 asymmetric allow-list
 // (via jwtalg.Validate — also rejects alg=none and HS*) and then narrows
 // further if the deployer configured a per-issuer allow-list. Runs before

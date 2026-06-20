@@ -131,11 +131,12 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Audience restriction (D4, MUST). The minted token's aud is the ID-JAG's
 	// `resource` claim — the target MCP server(s). Fail closed if absent/empty:
 	// an unbound MCP access token could be replayed against any resource server.
-	// Per RFC 8707 `resource` may be a single string or an array (some IdPs emit
-	// even a single resource as a one-element array), so accept both shapes and
-	// audience-restrict to the full set the IdP authorized. `resource` is a
-	// standard claim named directly by the spec, not a ClaimMapping target.
-	resources, ok := extractMappedClaimStrings(rawClaims, "resource")
+	// Per RFC 8707 `resource` is a single URI string OR an array of them — a
+	// string is ONE resource (taken atomically, NOT space-split like `scope`).
+	// extractResourceClaim handles both shapes; we audience-restrict to the full
+	// set the IdP authorized. `resource` is a standard claim named directly by
+	// the spec, not a ClaimMapping target.
+	resources, ok := extractResourceClaim(rawClaims)
 	if !ok || len(resources) == 0 {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing required resource claim — cannot audience-restrict the minted token")
 	}
