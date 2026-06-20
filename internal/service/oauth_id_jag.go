@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // idJAGTyp is the JWS `typ` header value that identifies an assertion as an
@@ -106,6 +108,24 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
 	}
 
+	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
+	// not be redeemable by another party: the draft (with §9.1) requires
+	// redemption to come from an authenticated confidential client. Require
+	// client_id (no client auth presented → invalid_client) and verify the
+	// secret via the same path client_credentials uses, mirroring its sentinel
+	// mapping. The client_id-binding half of D2b runs after the ID-JAG is
+	// verified (we need its client_id claim).
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("ID-JAG redemption requires confidential client authentication", nil)
+	}
+	authedClient, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	if err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return nil, oauthUnauthorized("invalid client credentials", err)
+		}
+		return nil, oauthUnauthorized("client verification failed", err)
+	}
+
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
@@ -116,6 +136,18 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 
 	rawClaims := tokenClaimsAsMap(verified)
+
+	// client_id binding (ADR 0010 D2b). Signature validity alone is not enough:
+	// the ID-JAG's `client_id` claim MUST equal the authenticated client, so a
+	// stolen-but-validly-signed ID-JAG cannot be redeemed by a different client
+	// at the mint boundary. This binding (not the signature) is the control.
+	idJAGClientID, _ := extractMappedClaimString(rawClaims, "client_id")
+	if idJAGClientID == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing client_id claim")
+	}
+	if idJAGClientID != authedClient.ClientID {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG client_id does not match the authenticated client")
+	}
 
 	// Identity mapping (D3). user_id is required (validated at config load);
 	// resolve the external subject through ClaimMapping. Fail closed when it is
@@ -208,6 +240,34 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		scopeClaim = "scope"
 	}
 	scopes, _ := extractMappedClaimStrings(rawClaims, scopeClaim)
+
+	// Single-use enforcement (ADR 0010 D2a) — CONSUMED LAST, only after every
+	// other check (D2b client auth + client_id binding, ID-JAG validation,
+	// identity mapping, resource, policy resolution) has passed and immediately
+	// before issuance. A request that fails an earlier check must NOT consume the
+	// jti, or an attacker could burn a victim's single-use grant by deliberately
+	// failing a later-but-not-last check. The store INSERT is the atomic
+	// check-and-mark: a replay surfaces as ErrIDJAGReplay.
+	if s.idJAGReplayStore == nil {
+		// Fail closed: ID-JAG is single-use and we cannot enforce that without a
+		// replay store. Never mint while replay protection is unavailable.
+		return nil, oauthServerError("ID-JAG replay store is not configured", nil)
+	}
+	jti, ok := verified.JwtID()
+	if !ok || jti == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
+	}
+	// expires_at is the ID-JAG's own exp: past it the grant fails its exp check
+	// before the jti is consulted, so the row is no longer load-bearing and the
+	// cleanup worker may reap it. validateExternalAssertion already required exp
+	// to be present, so this lookup succeeds.
+	jtiExpiry, _ := verified.Expiration()
+	if err := s.idJAGReplayStore.Insert(ctx, jti, jtiExpiry); err != nil {
+		if errors.Is(err, postgres.ErrIDJAGReplay) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+		}
+		return nil, oauthServerError("failed to record ID-JAG single-use jti", err)
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:         identity,

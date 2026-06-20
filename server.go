@@ -286,6 +286,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		log.Info().Int("count", len(cfg.ExternalIssuers)).Msg("Direct OIDC IdP federation enabled")
 	}
 
+	// ID-JAG single-use replay store (ADR 0010 D2a). Wired unconditionally — the
+	// idJAGBearer path consumes the ID-JAG jti against this store as its final
+	// gate, and ID-JAG redemption is only reachable when external issuers are
+	// configured anyway. Wiring it always (not only when ExternalIssuers is
+	// non-empty) guarantees the path can never run with a nil store and silently
+	// skip replay protection. Backed by the id_jag_jti table (migration 034),
+	// swept by the cleanup worker.
+	oauthSvc.SetIDJAGReplayStore(postgres.NewIDJAGReplayStore(db))
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.

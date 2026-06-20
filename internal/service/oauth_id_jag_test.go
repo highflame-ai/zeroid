@@ -195,30 +195,53 @@ func signIDJAG(t *testing.T, jwks *fakeJWKSServer, claims map[string]any) string
 	return signWithTyp(t, jwks.curPriv, "idjag-kid-1", idJAGTyp, claims)
 }
 
-// requireInvalidGrant asserts the error carries an *OAuthError with code
-// invalid_grant / 400 — the fail-closed contract for the ID-JAG path.
-func requireInvalidGrant(t *testing.T, err error) {
+// requireOAuthError asserts the error carries an *OAuthError with the given code
+// and HTTP status — the fail-closed contract for the ID-JAG path.
+func requireOAuthError(t *testing.T, err error, wantCode string, wantStatus int) {
 	t.Helper()
 	if err == nil {
-		t.Fatalf("expected invalid_grant error, got nil")
+		t.Fatalf("expected %s error, got nil", wantCode)
 	}
 	var oauthErr *OAuthError
 	if !errors.As(err, &oauthErr) {
 		t.Fatalf("expected *OAuthError in chain, got %T: %v", err, err)
 	}
-	if oauthErr.Code != "invalid_grant" {
-		t.Errorf("Code = %q, want invalid_grant; err=%v", oauthErr.Code, err)
+	if oauthErr.Code != wantCode {
+		t.Errorf("Code = %q, want %s; err=%v", oauthErr.Code, wantCode, err)
 	}
-	if oauthErr.HTTPStatus != http.StatusBadRequest {
-		t.Errorf("HTTPStatus = %d, want 400", oauthErr.HTTPStatus)
+	if oauthErr.HTTPStatus != wantStatus {
+		t.Errorf("HTTPStatus = %d, want %d", oauthErr.HTTPStatus, wantStatus)
 	}
+}
+
+// requireInvalidGrant asserts the error is invalid_grant / 400.
+func requireInvalidGrant(t *testing.T, err error) {
+	t.Helper()
+	requireOAuthError(t, err, "invalid_grant", http.StatusBadRequest)
+}
+
+// requireInvalidClient asserts the error is invalid_client / 401 — the D2b
+// confidential-client-auth fail-closed contract.
+func requireInvalidClient(t *testing.T, err error) {
+	t.Helper()
+	requireOAuthError(t, err, "invalid_client", http.StatusUnauthorized)
 }
 
 // The following tests exercise idJAGBearer's fail-closed gates that fire BEFORE
 // any token mint — so they need only a registry, no DB / CredentialService.
-// The end-to-end happy path (mapped claims + aud==resource) is covered by the
-// integration test (tests/integration/id_jag_test.go) where a full server with
-// a real DB is available.
+//
+// Gate order (idJAGBearer): external-issuers configured → tenant fields present
+// → issuer lookup → tenant binding (AllowedAccounts) → D2b confidential client
+// auth → ID-JAG signature/claim validation → D2b client_id binding → identity
+// mapping → resource (D4) → … → D2a single-use jti (consumed LAST). The
+// UnknownIssuer and TenantBinding gates fire BEFORE client auth, so those tests
+// need no client. Everything from ID-JAG validation onward (bad signature,
+// missing resource, unmappable identity, client_id binding, jti replay) is now
+// gated behind D2b client auth, which requires a real oauth_clients row — so the
+// fail-closed coverage for those gates lives in the integration suite
+// (tests/integration/id_jag_test.go) where a full server with a real DB is
+// available. The unit tests here pin the DB-free gates plus the D2b client-auth
+// gate itself.
 
 func TestIDJAGBearer_UnknownIssuer_InvalidGrant(t *testing.T) {
 	const acct = "acct-idjag"
@@ -250,14 +273,18 @@ func TestIDJAGBearer_UnknownIssuer_InvalidGrant(t *testing.T) {
 	}
 }
 
-func TestIDJAGBearer_BadSignature_InvalidGrant(t *testing.T) {
+// TestIDJAGBearer_NoClientAuth_InvalidClient pins the D2b confidential-client
+// gate: a redemption that presents NO client_id is rejected with invalid_client
+// (401) BEFORE any ID-JAG validation or mint. Fail-closed proof that a leaked
+// ID-JAG cannot be redeemed without authenticating a confidential client. This
+// gate fires after the tenant binding and before ID-JAG signature validation, so
+// it needs only a registry (no DB).
+func TestIDJAGBearer_NoClientAuth_InvalidClient(t *testing.T) {
 	const acct = "acct-idjag"
-	registry, _, iss, aud := idJAGTestRegistry(t, acct)
+	registry, jwks, iss, aud := idJAGTestRegistry(t, acct)
 
-	// Sign with a DIFFERENT key than the JWKS publishes → signature verify fails.
-	wrongKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	now := time.Now()
-	forged := signWithTyp(t, wrongKey, "idjag-kid-1", idJAGTyp, map[string]any{
+	idjag := signIDJAG(t, jwks, map[string]any{
 		"iss":      iss,
 		"sub":      "alice",
 		"aud":      aud,
@@ -267,12 +294,13 @@ func TestIDJAGBearer_BadSignature_InvalidGrant(t *testing.T) {
 	})
 
 	svc := &OAuthService{externalIssuerRegistry: registry}
+	// No ClientID presented → invalid_client, before any signature/JWKS work.
 	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   forged,
+		Subject:   idjag,
 		AccountID: acct,
 		ProjectID: "proj",
 	})
-	requireInvalidGrant(t, err)
+	requireInvalidClient(t, err)
 }
 
 func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
@@ -299,80 +327,12 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 	requireInvalidGrant(t, err)
 }
 
-func TestIDJAGBearer_MissingResource_InvalidGrant(t *testing.T) {
-	const acct = "acct-idjag"
-	registry, jwks, iss, aud := idJAGTestRegistry(t, acct)
-
-	now := time.Now()
-	// A perfectly valid, correctly-signed ID-JAG that simply omits `resource`.
-	// The audience-restriction MUST (D4) makes this fail closed: there is no
-	// MCP server to bind the minted token's aud to.
-	noResource := signIDJAG(t, jwks, map[string]any{
-		"iss": iss,
-		"sub": "alice",
-		"aud": aud,
-		"iat": now.Unix(),
-		"exp": now.Add(5 * time.Minute).Unix(),
-	})
-
-	svc := &OAuthService{externalIssuerRegistry: registry}
-	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   noResource,
-		AccountID: acct,
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
-}
-
-func TestIDJAGBearer_UnmappableIdentity_InvalidGrant(t *testing.T) {
-	const acct = "acct-idjag"
-	_, _, iss, aud := idJAGTestRegistry(t, acct)
-
-	now := time.Now()
-	// The ID-JAG is validly signed and carries `sub` (so the RFC 7523 §3
-	// presence check passes), but ClaimMapping routes user_id to
-	// "preferred_username", which the assertion does NOT carry → the external
-	// identity cannot be mapped → fail closed (D3). This isolates the *mapping*
-	// failure from the presence check (which also requires `sub`).
-	const kid = "idjag-kid-2"
-	jwks2 := newFakeJWKSServer(t, kid)
-	t.Cleanup(jwks2.Close)
-	cfg := domain.ExternalIssuerConfig{
-		Issuer:          iss + "-2",
-		JWKSURI:         jwks2.URL(),
-		Audience:        aud,
-		ClaimMapping:    map[string]string{"user_id": "preferred_username"},
-		AllowedAccounts: []string{acct},
-	}
-	cfg.Defaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validate cfg: %v", err)
-	}
-	registry2, err := NewExternalIssuerRegistry(
-		context.Background(),
-		[]domain.ExternalIssuerConfig{cfg},
-		authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)),
-	)
-	if err != nil {
-		t.Fatalf("registry: %v", err)
-	}
-	t.Cleanup(registry2.Close)
-
-	// Has sub (so presence check passes) but NO preferred_username (so mapping fails).
-	idjag := signWithTyp(t, jwks2.curPriv, kid, idJAGTyp, map[string]any{
-		"iss":      iss + "-2",
-		"sub":      "opaque-subject",
-		"aud":      aud,
-		"resource": "https://mcp.example.test",
-		"iat":      now.Unix(),
-		"exp":      now.Add(5 * time.Minute).Unix(),
-	})
-
-	svc := &OAuthService{externalIssuerRegistry: registry2}
-	_, err = svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   idjag,
-		AccountID: acct,
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
-}
+// NOTE: the deep-gate fail-closed unit tests that previously lived here —
+// bad signature, missing resource (D4), and unmappable identity (D3) — exercised
+// gates that now sit BEHIND the D2b confidential-client-auth gate. Driving them
+// requires a real oauth_clients row (VerifyClientSecret), which the DB-free
+// service unit harness cannot provide. Their fail-closed coverage moved to the
+// integration suite (tests/integration/id_jag_test.go: "bad signature fails
+// closed", "missing resource fails closed", plus the D2a replay / missing-jti
+// and D2b bad-secret / client_id-mismatch cases), where a full server with a
+// real DB authenticates the client first and then reaches each deeper gate.
