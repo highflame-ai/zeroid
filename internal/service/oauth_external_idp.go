@@ -111,86 +111,15 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
 	}
 
-	// Algorithm allowlist gate. Read the JWS header before signature
-	// verification — defense-in-depth against alg confusion. Any alg outside
-	// the configured set (or outside the small whitelist of secure asymmetric
-	// algs we actually support) is rejected.
-	if err := checkExternalIDTokenAlg(req.SubjectToken, cfg.Algorithms); err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "subject_token uses a disallowed algorithm", err)
-	}
-
-	// Ensure the issuer's JWKS is loaded. authjwt warms up best-effort at
-	// startup and refreshes in the background (it deliberately does not fail
-	// construction on an unreachable JWKS, to survive transient IdP blips).
-	// This synchronous load covers the case where the startup warm-up failed,
-	// so the first request self-heals rather than failing. A genuinely
-	// unreachable IdP returns an error here and we fail closed.
-	if err := entry.JWKS.EnsureLoaded(ctx); err != nil {
-		return nil, oauthServerError(fmt.Sprintf("failed to load JWKS for issuer %s", upstreamIss), err)
-	}
-
-	// Verify signature, exp, nbf, iss, and aud against the configured IdP
-	// in one Parse call. WithKeySet picks the right key by kid from the JWKS
-	// we cache for this issuer.
-	//
-	// WithInferAlgorithmFromKey is REQUIRED, not optional: jwx selects the
-	// verification alg from the JWK's `alg` member, but many production IdPs
-	// (Microsoft Entra ID is the canonical example) publish JWKS keys with no
-	// `alg` member at all. Without inference, jwx supplies no key for those and
-	// every verification fails — i.e. federation would silently never work
-	// against Entra. Inference is safe here because checkExternalIDTokenAlg has
-	// already pinned the token header alg to the asymmetric allow-list above,
-	// and jwx's infer path additionally rejects any header alg the key type
-	// cannot produce — so HS*/none still cannot slip through.
-	keySet := entry.JWKS.KeySet()
-	if keySet == nil || keySet.Len() == 0 {
-		return nil, oauthServerError(fmt.Sprintf("JWKS for issuer %s is empty", upstreamIss), nil)
-	}
-	verified, err := jwt.Parse([]byte(req.SubjectToken),
-		jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
-		jwt.WithValidate(true),
-		jwt.WithIssuer(upstreamIss),
-		jwt.WithAudience(cfg.Audience),
-		jwt.WithAcceptableSkew(externalIDTokenClockSkew),
-	)
+	// Verify the upstream ID token against its configured IdP — signature
+	// (JWKS), iss, aud, exp/nbf, alg allow-list, MaxTokenAge, and the
+	// presence of sub/exp/iat. This is the #88 federation substrate, shared
+	// verbatim with the ID-JAG jwt-bearer path (validateExternalAssertion).
+	// "subject_token" is the field name in the error strings because that is
+	// what an id_token-exchange caller presents.
+	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token")
 	if err != nil {
-		// On unknown kid, refresh the JWKS once and retry — handles upstream
-		// key rotation without requiring a server restart.
-		if kid := extractJWSKeyID(req.SubjectToken); kid != "" && entry.JWKS.RefreshIfMissing(ctx, kid) {
-			keySet = entry.JWKS.KeySet()
-			verified, err = jwt.Parse([]byte(req.SubjectToken),
-				jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
-				jwt.WithValidate(true),
-				jwt.WithIssuer(upstreamIss),
-				jwt.WithAudience(cfg.Audience),
-				jwt.WithAcceptableSkew(externalIDTokenClockSkew),
-			)
-		}
-		if err != nil {
-			return nil, oauthBadRequestCause("invalid_grant", "subject_token verification failed", err)
-		}
-	}
-
-	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires
-	// both sub and exp on an assertion. Enforce their presence explicitly so a
-	// token without an expiry (replayable forever) or without a subject is
-	// rejected rather than silently accepted.
-	if _, ok := verified.Subject(); !ok {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing required sub claim")
-	}
-	if _, ok := verified.Expiration(); !ok {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing required exp claim")
-	}
-
-	// Stale-token cap. exp guards future-side; iat guards past-side. We
-	// require iat present and not older than max_token_age — the upstream
-	// signed it for a fresh authentication, not a replay from days ago.
-	iat, iatPresent := verified.IssuedAt()
-	if !iatPresent || iat.IsZero() {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing iat claim")
-	}
-	if age := time.Since(iat); age > cfg.MaxTokenAge {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token age %s exceeds max_token_age %s", age.Round(time.Second), cfg.MaxTokenAge))
+		return nil, err
 	}
 
 	// Claim mapping. user_id is required (validated at config load); other
@@ -294,6 +223,113 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	return accessToken, nil
 }
 
+// validateExternalAssertion runs the #88 external-IdP validation substrate
+// against a single externally-signed assertion: the JWS algorithm allow-list
+// gate, a synchronous best-effort JWKS load, full signature + iss + aud +
+// exp/nbf verification (with a one-shot JWKS refresh + retry on an unknown
+// kid to absorb upstream key rotation), and the RFC 7523 §3 presence checks
+// for sub/exp plus the iat-based MaxTokenAge stale-token cap.
+//
+// It is the single security-critical verification routine shared by BOTH
+// external-IdP ingestion paths:
+//   - externalIDTokenExchange (RFC 8693 subject_token_type=id_token, #88)
+//   - idJAGBearer (RFC 7523 jwt-bearer carrying an MCP ID-JAG, ADR 0010)
+//
+// so neither path can drift from the other. The issuer lookup and the
+// AllowedAccounts tenant binding stay in each caller, because their OAuth
+// error-code semantics differ (id_token: invalid_request for an unconfigured
+// issuer; ID-JAG: invalid_grant, fail-closed). fieldName names the assertion
+// in error strings ("subject_token" vs "assertion") so callers surface the
+// right wire field. On success the verified token is returned for claim
+// mapping; on any failure an *OAuthError shaped for direct return.
+func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string) (jwt.Token, error) {
+	cfg := entry.Config
+
+	// Algorithm allowlist gate. Read the JWS header before signature
+	// verification — defense-in-depth against alg confusion. Any alg outside
+	// the configured set (or outside the small whitelist of secure asymmetric
+	// algs we actually support) is rejected.
+	if err := checkExternalIDTokenAlg(assertion, cfg.Algorithms); err != nil {
+		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("%s uses a disallowed algorithm", fieldName), err)
+	}
+
+	// Ensure the issuer's JWKS is loaded. authjwt warms up best-effort at
+	// startup and refreshes in the background (it deliberately does not fail
+	// construction on an unreachable JWKS, to survive transient IdP blips).
+	// This synchronous load covers the case where the startup warm-up failed,
+	// so the first request self-heals rather than failing. A genuinely
+	// unreachable IdP returns an error here and we fail closed.
+	if err := entry.JWKS.EnsureLoaded(ctx); err != nil {
+		return nil, oauthServerError(fmt.Sprintf("failed to load JWKS for issuer %s", cfg.Issuer), err)
+	}
+
+	// Verify signature, exp, nbf, iss, and aud against the configured IdP
+	// in one Parse call. WithKeySet picks the right key by kid from the JWKS
+	// we cache for this issuer.
+	//
+	// WithInferAlgorithmFromKey is REQUIRED, not optional: jwx selects the
+	// verification alg from the JWK's `alg` member, but many production IdPs
+	// (Microsoft Entra ID is the canonical example) publish JWKS keys with no
+	// `alg` member at all. Without inference, jwx supplies no key for those and
+	// every verification fails — i.e. federation would silently never work
+	// against Entra. Inference is safe here because checkExternalIDTokenAlg has
+	// already pinned the token header alg to the asymmetric allow-list above,
+	// and jwx's infer path additionally rejects any header alg the key type
+	// cannot produce — so HS*/none still cannot slip through.
+	keySet := entry.JWKS.KeySet()
+	if keySet == nil || keySet.Len() == 0 {
+		return nil, oauthServerError(fmt.Sprintf("JWKS for issuer %s is empty", cfg.Issuer), nil)
+	}
+	verified, err := jwt.Parse([]byte(assertion),
+		jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
+		jwt.WithValidate(true),
+		jwt.WithIssuer(cfg.Issuer),
+		jwt.WithAudience(cfg.Audience),
+		jwt.WithAcceptableSkew(externalIDTokenClockSkew),
+	)
+	if err != nil {
+		// On unknown kid, refresh the JWKS once and retry — handles upstream
+		// key rotation without requiring a server restart.
+		if kid := extractJWSKeyID(assertion); kid != "" && entry.JWKS.RefreshIfMissing(ctx, kid) {
+			keySet = entry.JWKS.KeySet()
+			verified, err = jwt.Parse([]byte(assertion),
+				jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
+				jwt.WithValidate(true),
+				jwt.WithIssuer(cfg.Issuer),
+				jwt.WithAudience(cfg.Audience),
+				jwt.WithAcceptableSkew(externalIDTokenClockSkew),
+			)
+		}
+		if err != nil {
+			return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("%s verification failed", fieldName), err)
+		}
+	}
+
+	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires
+	// both sub and exp on an assertion. Enforce their presence explicitly so a
+	// token without an expiry (replayable forever) or without a subject is
+	// rejected rather than silently accepted.
+	if _, ok := verified.Subject(); !ok {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing required sub claim", fieldName))
+	}
+	if _, ok := verified.Expiration(); !ok {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing required exp claim", fieldName))
+	}
+
+	// Stale-token cap. exp guards future-side; iat guards past-side. We
+	// require iat present and not older than max_token_age — the upstream
+	// signed it for a fresh authentication, not a replay from days ago.
+	iat, iatPresent := verified.IssuedAt()
+	if !iatPresent || iat.IsZero() {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing iat claim", fieldName))
+	}
+	if age := time.Since(iat); age > cfg.MaxTokenAge {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s age %s exceeds max_token_age %s", fieldName, age.Round(time.Second), cfg.MaxTokenAge))
+	}
+
+	return verified, nil
+}
+
 // resolveExternalPrincipalIdentity factors out the identity-resolution step
 // shared between the broker and direct-federation paths. ApplicationID, when
 // provided, must resolve to an active identity in the caller's tenant; this
@@ -365,6 +401,40 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 	return "", false
 }
 
+// extractMappedClaimStrings reads a claim that may be either a space-delimited
+// string (the standard `scope` shape, RFC 8693) or a JSON array (the shape some
+// IdPs emit for multi-valued claims like groups / privilege_scope). Returns
+// ok=false when the path is empty (no mapping configured) or the claim is
+// absent; an empty/whitespace-only value yields (nil-or-empty, true). Each
+// element is coerced via extractMappedClaimString's single-value rules so
+// numeric entries are stringified consistently with the rest of the mapping
+// surface.
+func extractMappedClaimStrings(claims map[string]any, path string) ([]string, bool) {
+	if path == "" {
+		return nil, false
+	}
+	v, ok := claims[path]
+	if !ok {
+		return nil, false
+	}
+	switch tv := v.(type) {
+	case string:
+		// Space-delimited (scope-style). strings.Fields drops empties.
+		return parseScopeString(tv), true
+	case []string:
+		return tv, true
+	case []any:
+		out := make([]string, 0, len(tv))
+		for _, e := range tv {
+			if s, ok := extractMappedClaimString(map[string]any{"_": e}, "_"); ok {
+				out = append(out, s)
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
 // checkExternalIDTokenAlg enforces the JWT-SVID §3 asymmetric allow-list
 // (via jwtalg.Validate — also rejects alg=none and HS*) and then narrows
 // further if the deployer configured a per-issuer allow-list. Runs before
@@ -411,6 +481,7 @@ func readJWSAlg(tokenStr string) string {
 type jwtHeader struct {
 	Alg string `json:"alg"`
 	Kid string `json:"kid"`
+	Typ string `json:"typ"`
 }
 
 // tokenClaimsAsMap materializes every claim on a v4 jwt.Token into a plain

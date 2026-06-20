@@ -342,6 +342,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
+	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
+	// whose JWS typ header is oauth-id-jag+jwt is an Identity Assertion
+	// Authorization Grant signed by a corporate IdP — it MUST be validated
+	// against that IdP's JWKS (the #88 external-issuer substrate), NOT this
+	// path's registered-per-identity public key. Branch before any NHI-specific
+	// work so the two validation modes stay cleanly separate (D2: the branch
+	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
+	// NHI self-signed behavior below.
+	if isIDJAGAssertion(req.Subject) {
+		return s.idJAGBearer(ctx, req)
+	}
+
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
 	if err := jwtalg.Validate(req.Subject); err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
