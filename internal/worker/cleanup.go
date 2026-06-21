@@ -142,6 +142,21 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired dpop jti records")
 	}
 
+	// ID-JAG redeemed jti records (ADR 0010 D2a) are only needed within the
+	// grant's own freshness window: past expires_at (the ID-JAG exp) the grant
+	// would fail its exp check before the jti is ever consulted, so the row is
+	// no longer load-bearing. Purge expired rows to bound table growth under
+	// high ID-JAG redemption volume — same single-use sweep as dpop_jti above.
+	idJAGRes, err := w.db.NewDelete().
+		TableExpr("id_jag_jti").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired id_jag jti records")
+	} else if n, err := idJAGRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired id_jag jti records")
+	}
+
 	// Refresh tokens: under rotation every refresh inserts a successor row and
 	// revokes its predecessor, so the table grows linearly with token traffic
 	// if never swept. Delete rows whose expires_at is past the reuse-detection
