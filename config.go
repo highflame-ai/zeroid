@@ -396,7 +396,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-
 // isProductionEnv reports whether server.env names a production deployment.
 // Accepts the common spellings ("production", "prod") case-insensitively so a
 // deployer can't accidentally dodge the production gate with "Production".
