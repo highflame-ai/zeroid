@@ -359,15 +359,10 @@ func (c *Config) Validate() error {
 		if c.Attestation.AllowUnsafeDevStub {
 			return fmt.Errorf("attestation.allow_unsafe_dev_stub must be false in production (server.env=%q): the stub accepts ANY submitted proof for image_hash/tpm — set ZEROID_ALLOW_UNSAFE_DEV_STUB=false", c.Server.Env)
 		}
-		// token.issuer and wimse_domain ship with Highflame's hosted defaults.
-		// A production deploy that forgets to override them silently runs on
-		// Highflame's identity — require an explicit value.
-		if c.Token.Issuer == defaultIssuer {
-			return fmt.Errorf("token.issuer must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_ISSUER to this deployment's public URL", c.Server.Env, defaultIssuer)
-		}
-		if c.WIMSEDomain == defaultWIMSEDomain {
-			return fmt.Errorf("wimse_domain must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_WIMSE_DOMAIN to this deployment's trust domain", c.Server.Env, defaultWIMSEDomain)
-		}
+		// token.issuer and wimse_domain are validated by validateIssuer()
+		// and validateWIMSEDomain() above (empty/malformed → reject).
+		// No default-value comparison here — the built-in default may
+		// legitimately be the deployer's intended production value.
 		// Introspection (RFC 7662 §2.1) and revocation (RFC 7009 §2.1) MUST
 		// require caller authorization. The default leaves them accept-and-
 		// verify (anonymous allowed) for the standalone/dev model; production
@@ -401,14 +396,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// defaultIssuer and defaultWIMSEDomain are the built-in dev defaults that the
-// production gate in Validate() rejects when left unchanged. They MUST match
-// the values set in loadDefaults() — kept as named constants so the gate and
-// the default can never drift.
-const (
-	defaultIssuer      = "https://auth.highflame.ai"
-	defaultWIMSEDomain = "highflame.ai"
-)
 
 // isProductionEnv reports whether server.env names a production deployment.
 // Accepts the common spellings ("production", "prod") case-insensitively so a
@@ -562,20 +549,15 @@ func loadDefaults(k *koanf.Koanf) error {
 		"keys.rsa_public_key_path":  "",
 		"keys.rsa_key_id":           "v1",
 
-		// Token
-		// Default points at Highflame's hosted ZeroID URL (the actual
-		// service, not the marketing site). Self-hosted deployments
-		// override via ZEROID_ISSUER or token.issuer in YAML. Local dev
-		// on localhost:8899 should set ZEROID_ISSUER=http://localhost:8899.
-		"token.issuer":      defaultIssuer,
+		// Token — no default for token.issuer or wimse_domain; every
+		// deployment must set them explicitly via ZEROID_ISSUER /
+		// ZEROID_WIMSE_DOMAIN or YAML. validateIssuer() and
+		// validateWIMSEDomain() reject empty values at startup.
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
-
-		// WIMSE
-		"wimse_domain": defaultWIMSEDomain,
 
 		// Telemetry
 		"telemetry.enabled":       false,

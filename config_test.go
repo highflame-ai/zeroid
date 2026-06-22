@@ -217,14 +217,12 @@ func TestRejectRemovedTelemetryKeys(t *testing.T) {
 // server.env rejects the unsafe dev stub and the unchanged default
 // issuer / wimse_domain, while dev leaves all three alone.
 func TestValidateProductionGate(t *testing.T) {
-	t.Run("dev_allows_stub_and_defaults", func(t *testing.T) {
+	t.Run("dev_allows_stub", func(t *testing.T) {
 		cfg := baseValidConfig(t)
 		cfg.Server.Env = "development"
 		cfg.Attestation.AllowUnsafeDevStub = true
-		cfg.Token.Issuer = defaultIssuer
-		cfg.WIMSEDomain = defaultWIMSEDomain
 		if err := cfg.Validate(); err != nil {
-			t.Fatalf("dev config must pass with stub on and default issuer/domain: %v", err)
+			t.Fatalf("dev config must pass with stub on: %v", err)
 		}
 	})
 
@@ -247,36 +245,12 @@ func TestValidateProductionGate(t *testing.T) {
 		}
 	})
 
-	t.Run("production_rejects_default_issuer", func(t *testing.T) {
+	t.Run("production_passes_with_valid_config", func(t *testing.T) {
 		cfg := baseValidConfig(t)
 		cfg.Server.Env = "production"
 		cfg.Attestation.AllowUnsafeDevStub = false
-		cfg.Token.Issuer = defaultIssuer
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "token.issuer must be set explicitly in production") {
-			t.Fatalf("production + default issuer must be rejected, got: %v", err)
-		}
-	})
-
-	t.Run("production_rejects_default_wimse_domain", func(t *testing.T) {
-		cfg := baseValidConfig(t)
-		cfg.Server.Env = "production"
-		cfg.Attestation.AllowUnsafeDevStub = false
-		cfg.WIMSEDomain = defaultWIMSEDomain
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "wimse_domain must be set explicitly in production") {
-			t.Fatalf("production + default wimse_domain must be rejected, got: %v", err)
-		}
-	})
-
-	t.Run("production_passes_with_explicit_values", func(t *testing.T) {
-		cfg := baseValidConfig(t)
-		cfg.Server.Env = "production"
-		cfg.Attestation.AllowUnsafeDevStub = false
-		cfg.Token.Issuer = "https://auth.acme.example"
-		cfg.WIMSEDomain = "acme.example"
 		if err := cfg.Validate(); err != nil {
-			t.Fatalf("production with explicit safe values must pass: %v", err)
+			t.Fatalf("production with valid config must pass: %v", err)
 		}
 	})
 
