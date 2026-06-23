@@ -95,7 +95,7 @@ SDK / Cedar / DB contract for no functional gain).
 | `pending` | **Established** | false | Registered & **owned**, governable, not yet granted rights. The "adopted" state. |
 | `active` | **Active** | **true** | Granted rights: credential enrolled (CAP-IDN-012) or reconciled via EMA. The "managed" state. |
 | `suspended` | **Suspended** | false | Reversible halt. |
-| `deactivated` / `expired` | **Archived** | false | Terminal, soft-deleted, audit-retained. The offboarded state. |
+| `deactivated` / `expired` | **Archived** | false | Soft-deleted, audit-retained, reactivatable (`deactivated → active`). The offboarded state. |
 
 **Transitions** (extending `CanTransitionTo`):
 
@@ -124,10 +124,11 @@ auto-transfer-to-manager when an owner leaves).
 OWASP ranks **improper offboarding NHI1** — the single highest NHI risk. SCIM (RFC 7644
 §3.6) makes delete `SHALL`/`MUST`; NIST SP 800-63B-4 requires a CSP to **`SHALL` promptly
 invalidate** authenticators when the subscriber account ceases to exist. We honor this via
-the `deactivated`/`expired` (ISO "Archived") terminal states: identities are **soft-deleted
+the `deactivated`/`expired` (ISO "Archived") states: identities are **soft-deleted
 and audit-retained** (consistent with the platform `is_active` convention), **never
-hard-deleted**, and the `IsUsable()==active` gate guarantees an archived identity can never
-authenticate.
+hard-deleted** — recoverable via reactivation rather than strictly terminal — and the
+`IsUsable()==active` gate guarantees an archived identity can never authenticate while in
+that state.
 
 ## Standards basis (synthesis)
 
