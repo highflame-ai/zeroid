@@ -96,13 +96,13 @@ func validateECPublicKeyPEM(keyPEM string) error {
 
 // RegisterIdentityRequest holds parameters for identity registration.
 type RegisterIdentityRequest struct {
-	AccountID     string
-	ProjectID     string
-	ExternalID    string
-	Name          string
-	TrustLevel    domain.TrustLevel
-	IdentityType  domain.IdentityType
-	SubType       domain.SubType
+	AccountID    string
+	ProjectID    string
+	ExternalID   string
+	Name         string
+	TrustLevel   domain.TrustLevel
+	IdentityType domain.IdentityType
+	SubType      domain.SubType
 	// Origin is the provenance discriminator. Empty defaults to `native`. When
 	// external (a discovery ecosystem like `okta`), the identity is created in
 	// the `discovered` state and OwnerUserID is OPTIONAL — ownerless is the
