@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "eslint": "^9",
+    "eslint": "^10",
     "msw": "^2",
     "tsup": "^8",
     "tsx": "^4",
