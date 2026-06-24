@@ -316,7 +316,7 @@ type DiscoveredIdentityRequest struct {
 
 // UpsertDiscoveredIdentity idempotently ingests an identity observed in an
 // external IdP. It is the discovery service's write path into the one identity
-// registry (ADR 0009 D2 / identity-lifecycle.md "Reconciliation is structural"):
+// registry (see docs/identity-lifecycle.md, "Reconciliation is structural"):
 // keyed on (account_id, project_id, external_id), a re-sync reconciles to the
 // SAME row rather than creating a duplicate or 409ing.
 //

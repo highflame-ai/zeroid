@@ -1,4 +1,4 @@
-// Discovery inventory lifecycle (ADR 0009 D2 / docs/identity-lifecycle.md):
+// Discovery inventory lifecycle (see docs/identity-lifecycle.md):
 // ingest a discovered identity, reconcile idempotently, then drive it through
 // adopt / dismiss. Pins the `discovered` state + `origin` provenance contract
 // the discovery service and Studio depend on.

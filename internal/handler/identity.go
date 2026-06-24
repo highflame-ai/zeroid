@@ -192,8 +192,8 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Tags:        []string{"Identities"},
 	}, a.expireIdentityOp)
 
-	// Discovery: ingestion + lifecycle (ADR 0009 D2 / docs/identity-lifecycle.md).
-	// The discovery service (a separate service, ADR 0009 D1) writes discovered
+	// Discovery: ingestion + lifecycle (see docs/identity-lifecycle.md).
+	// The discovery connector service (a separate service) writes discovered
 	// identities into this one registry; adopt/dismiss drive them out of the
 	// pre-authoritative `discovered` state.
 	huma.Register(api, huma.Operation{

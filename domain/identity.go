@@ -295,7 +295,7 @@ func (s IdentityStatus) IsUsable() bool {
 // Origin — provenance discriminator (native vs discovered)
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Origin records where an identity came from (ADR 0009 D2 /
+// Origin records where an identity came from (see
 // docs/identity-lifecycle.md): `native` — ZeroID issued it — versus an external
 // ecosystem we observed it in via a discovery connector. It is orthogonal to
 // status: `origin` is provenance, `status` is lifecycle. A discovered agent and
@@ -372,7 +372,7 @@ type Identity struct {
 	TrustLevel   TrustLevel     `bun:"trust_level,type:varchar(50)"   json:"trust_level"`
 	Status       IdentityStatus `bun:"status,type:varchar(50)"        json:"status"`
 
-	// Origin is the provenance discriminator (ADR 0009 D2 /
+	// Origin is the provenance discriminator (see
 	// docs/identity-lifecycle.md): `native` (ZeroID issued it) vs an external
 	// ecosystem an identity was discovered in (`okta`, `entra`,
 	// `google_workspace`, …). External-origin identities enter the lifecycle in

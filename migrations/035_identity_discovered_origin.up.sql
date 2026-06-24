@@ -1,5 +1,5 @@
 -- 035: identity discovery support — add the `discovered` lifecycle state and
--- the `origin` provenance discriminator (ADR 0009 D2 / docs/identity-lifecycle.md).
+-- the `origin` provenance discriminator (see docs/identity-lifecycle.md).
 --
 -- `discovered` sits below `pending` in the ISO/IEC 24760-shaped lifecycle: an
 -- identity observed in an external IdP via a discovery connector — owner-optional
