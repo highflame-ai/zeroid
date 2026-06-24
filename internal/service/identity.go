@@ -364,7 +364,14 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		// upsert stays idempotent under races.
 		var deactErr *IdentityDeactivatedConflictError
 		if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactErr) {
-			if existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); gerr == nil && existing != nil {
+			existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID)
+			// Only a genuine "no row" result lets us fall through to the
+			// original conflict error. An operational DB failure (connection
+			// loss, timeout) must surface as-is, not be masked as a 409.
+			if gerr != nil && !errors.Is(gerr, sql.ErrNoRows) {
+				return nil, false, gerr
+			}
+			if gerr == nil && existing != nil {
 				return s.reconcileDiscovered(ctx, existing, req)
 			}
 		}
@@ -589,7 +596,12 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	// Capture prior status so we can tell whether the update is a fresh
 	// transition into deactivated (in which case cleanup must run).
 	priorStatus := identity.Status
-	if req.Status != nil {
+	// A status PATCH that names the current status is a no-op, not a transition:
+	// CanTransitionTo is pure topology and rejects self-transitions, so without
+	// this guard an idempotent retry (e.g. re-adopting an already-pending
+	// identity) would fail with "invalid status transition". Skip the transition
+	// and owner-at-adopt checks when the target equals the current status.
+	if req.Status != nil && *req.Status != identity.Status {
 		if !identity.Status.CanTransitionTo(*req.Status) {
 			return nil, fmt.Errorf("invalid status transition: %s → %s", identity.Status, *req.Status)
 		}
