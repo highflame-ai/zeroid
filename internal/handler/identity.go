@@ -71,6 +71,8 @@ type ListIdentitiesInput struct {
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
+	Status        string   `query:"status" doc:"Filter by exact lifecycle status (e.g. discovered, pending, active). The discovery adoption inbox is status=discovered."`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -102,7 +104,7 @@ type UpdateIdentityInput struct {
 		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
-		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
+		Status             *string         `json:"status,omitempty" enum:"pending,active,suspended,deactivated" doc:"Identity status. pending adopts a discovered identity (requires owner_user_id); discovered is entry-only (not settable here)."`
 		// CoSAI §3.2 + NIST SP 800-63. Pointer so callers can distinguish
 		// "not set" (omit) from "clear to unclassified" (explicit "").
 		CapabilityTier *string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
@@ -189,6 +191,37 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Transitions an active identity to expired status and runs cleanup (revoke credentials, API keys, emit CAE signal). Used by Cerberus on subagent session stop.",
 		Tags:        []string{"Identities"},
 	}, a.expireIdentityOp)
+
+	// Discovery: ingestion + lifecycle (ADR 0009 D2 / docs/identity-lifecycle.md).
+	// The discovery service (a separate service, ADR 0009 D1) writes discovered
+	// identities into this one registry; adopt/dismiss drive them out of the
+	// pre-authoritative `discovered` state.
+	huma.Register(api, huma.Operation{
+		OperationID: "ingest-discovered-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered",
+		Summary:     "Ingest (idempotent upsert) an identity discovered in an external IdP",
+		Description: "Idempotent on (account, project, external_id): a re-sync reconciles to the same row rather than 409ing. Creates the identity in the `discovered` state (owner-optional, credential-less, not usable). Called by the discovery connector framework, not end users.",
+		Tags:        []string{"Identities"},
+	}, a.ingestDiscoveredIdentityOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "adopt-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/{id}/adopt",
+		Summary:     "Adopt a discovered identity (assign an owner; discovered → pending)",
+		Description: "Assigns the accountable human owner (and optionally a credential policy) and moves the identity from `discovered` to `pending`. Owner is mandatory — adoption is the act of making an external agent accountable. The identity remains non-usable until activated.",
+		Tags:        []string{"Identities"},
+	}, a.adoptIdentityOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "dismiss-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/{id}/dismiss",
+		Summary:     "Dismiss a discovered identity as out-of-scope (discovered → deactivated)",
+		Description: "Archives a discovered identity an operator has marked out of scope (audit-retained, never hard-deleted). Idempotent. Only valid for identities still in the `discovered` state.",
+		Tags:        []string{"Identities"},
+	}, a.dismissIdentityOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -347,8 +380,16 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if input.IdentityClass != "" && input.IdentityClass != "custom" && input.IdentityClass != "code_agent" {
 		return nil, huma.Error400BadRequest("invalid identity_class: must be custom or code_agent")
 	}
+	// "external" is the sentinel for any non-native provenance; otherwise the
+	// origin must be a syntactically valid ecosystem identifier.
+	if input.Origin != "" && input.Origin != "external" && !domain.ValidOrigin(input.Origin) {
+		return nil, huma.Error400BadRequest("invalid origin: must be \"external\" or a lowercase ecosystem identifier (e.g. okta)")
+	}
+	if input.Status != "" && !domain.IdentityStatus(input.Status).Valid() {
+		return nil, huma.Error400BadRequest("invalid status filter")
+	}
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, input.Status, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
@@ -460,6 +501,144 @@ func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	identity, err := a.identitySvc.ExpireIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to expire identity")
+		return nil, mapErr(err)
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+// ── Discovery: ingestion + lifecycle ──────────────────────────────────────────
+
+type CreateDiscoveredIdentityInput struct {
+	Body struct {
+		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
+		Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
+		Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
+		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+		OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
+		Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
+		Version      string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
+		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+	}
+}
+
+// DiscoveredIdentityOutput carries the upserted identity plus whether this call
+// created it (vs reconciled an existing row) so the discovery service can track
+// per-sync create/update counts.
+type DiscoveredIdentityOutput struct {
+	Body struct {
+		Identity *domain.Identity `json:"identity"`
+		Created  bool             `json:"created"`
+	}
+}
+
+func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDiscoveredIdentityInput) (*DiscoveredIdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	origin := domain.Origin(input.Body.Origin)
+	if !origin.IsExternal() {
+		return nil, huma.Error400BadRequest("origin must be an external ecosystem (not 'native') for a discovered identity")
+	}
+
+	trustLevel := domain.TrustLevel(input.Body.TrustLevel)
+	if trustLevel != "" && !trustLevel.Valid() {
+		return nil, huma.Error400BadRequest("invalid trust_level")
+	}
+	identityType := domain.IdentityType(input.Body.IdentityType)
+	if identityType != "" && !identityType.Valid() {
+		return nil, huma.Error400BadRequest("invalid identity_type")
+	}
+	subType := domain.SubType(input.Body.SubType)
+	if subType != "" && !subType.ValidForIdentityType(identityType) {
+		return nil, huma.Error400BadRequest("invalid sub_type for the given identity_type")
+	}
+
+	identity, created, err := a.identitySvc.UpsertDiscoveredIdentity(ctx, service.DiscoveredIdentityRequest{
+		AccountID:    tenant.AccountID,
+		ProjectID:    tenant.ProjectID,
+		ExternalID:   input.Body.ExternalID,
+		Origin:       origin,
+		Name:         input.Body.Name,
+		IdentityType: identityType,
+		SubType:      subType,
+		TrustLevel:   trustLevel,
+		OwnerUserID:  input.Body.OwnerUserID,
+		Framework:    input.Body.Framework,
+		Version:      input.Body.Version,
+		Publisher:    input.Body.Publisher,
+		Description:  input.Body.Description,
+		Capabilities: input.Body.Capabilities,
+		Labels:       input.Body.Labels,
+		Metadata:     input.Body.Metadata,
+		CreatedBy:    internalMiddleware.GetCallerName(ctx),
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityAlreadyExists) {
+			return nil, huma.Error409Conflict("external_id already belongs to a native identity in this tenant")
+		}
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Str("origin", input.Body.Origin).Msg("failed to ingest discovered identity")
+		return nil, huma.Error500InternalServerError("failed to ingest discovered identity")
+	}
+
+	out := &DiscoveredIdentityOutput{}
+	out.Body.Identity = identity
+	out.Body.Created = created
+	return out, nil
+}
+
+type AdoptIdentityInput struct {
+	ID   string `path:"id" doc:"Identity UUID"`
+	Body struct {
+		OwnerUserID        string `json:"owner_user_id" required:"true" minLength:"1" doc:"Human owner to make accountable for the adopted identity"`
+		CredentialPolicyID string `json:"credential_policy_id,omitempty" doc:"Optional identity policy to assign at adoption; defaults to the tenant default"`
+	}
+}
+
+func (a *API) adoptIdentityOp(ctx context.Context, input *AdoptIdentityInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	identity, err := a.identitySvc.AdoptIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID, input.Body.OwnerUserID, input.Body.CredentialPolicyID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to adopt identity")
+		return nil, mapErr(err)
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+func (a *API) dismissIdentityOp(ctx context.Context, input *IdentityIDInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	identity, err := a.identitySvc.DismissIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to dismiss identity")
 		return nil, mapErr(err)
 	}
 

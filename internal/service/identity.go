@@ -103,6 +103,12 @@ type RegisterIdentityRequest struct {
 	TrustLevel    domain.TrustLevel
 	IdentityType  domain.IdentityType
 	SubType       domain.SubType
+	// Origin is the provenance discriminator. Empty defaults to `native`. When
+	// external (a discovery ecosystem like `okta`), the identity is created in
+	// the `discovered` state and OwnerUserID is OPTIONAL — ownerless is the
+	// posture signal discovery exists to surface, not a validation error
+	// (identity-lifecycle.md "Ownership: relaxed for discovered only").
+	Origin        domain.Origin
 	OwnerUserID   string
 	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
 	PublicKeyPEM  string
@@ -131,10 +137,35 @@ type RegisterIdentityRequest struct {
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
+//
+// Origin drives two things: a `native` identity is created `active` and MUST
+// have an owner; an external-origin (discovered) identity is created in the
+// `discovered` state — credential-less, not usable, owner OPTIONAL — until it
+// is adopted (identity-lifecycle.md). The discovery service reaches this path
+// through UpsertDiscoveredIdentity (idempotent on external_id), not directly.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
-	if req.OwnerUserID == "" {
+	if req.Origin == "" {
+		req.Origin = domain.OriginNative
+	}
+	if !domain.ValidOrigin(string(req.Origin)) {
+		return nil, fmt.Errorf("%w: invalid origin: %q (allowed: a lowercase identifier, e.g. native, okta, entra)", ErrInvalidIdentityField, req.Origin)
+	}
+	discovered := req.Origin.IsExternal()
+
+	// Ownership is mandatory for native identities and relaxed for discovered
+	// (ownerless is the posture signal). It becomes mandatory again at adoption
+	// (discovered → pending/active), enforced in UpdateIdentity.
+	if !discovered && req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
+
+	// A discovered identity is pre-authoritative; a native one is active on
+	// registration (the historical default).
+	initialStatus := domain.IdentityStatusActive
+	if discovered {
+		initialStatus = domain.IdentityStatusDiscovered
+	}
+
 	if req.TrustLevel == "" {
 		req.TrustLevel = domain.TrustLevelUnverified
 	}
@@ -212,7 +243,8 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		IdentityType:       req.IdentityType,
 		SubType:            req.SubType,
 		TrustLevel:         req.TrustLevel,
-		Status:             domain.IdentityStatusActive,
+		Status:             initialStatus,
+		Origin:             req.Origin,
 		OwnerUserID:        req.OwnerUserID,
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
@@ -257,6 +289,133 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		Msg("Identity registered")
 
 	return identity, nil
+}
+
+// DiscoveredIdentityRequest is the ingestion payload from a discovery connector
+// — the descriptive fields enumerated from an external IdP. Owner is OPTIONAL
+// (ownerless is the discovery posture signal). Origin MUST be external.
+type DiscoveredIdentityRequest struct {
+	AccountID    string
+	ProjectID    string
+	ExternalID   string // the IdP object id — the reconciliation key
+	Origin       domain.Origin
+	Name         string
+	IdentityType domain.IdentityType
+	SubType      domain.SubType
+	TrustLevel   domain.TrustLevel
+	OwnerUserID  string // optional
+	Framework    string
+	Version      string
+	Publisher    string
+	Description  string
+	Capabilities json.RawMessage
+	Labels       json.RawMessage
+	Metadata     json.RawMessage
+	CreatedBy    string
+}
+
+// UpsertDiscoveredIdentity idempotently ingests an identity observed in an
+// external IdP. It is the discovery service's write path into the one identity
+// registry (ADR 0009 D2 / identity-lifecycle.md "Reconciliation is structural"):
+// keyed on (account_id, project_id, external_id), a re-sync reconciles to the
+// SAME row rather than creating a duplicate or 409ing.
+//
+//   - new external_id              → create in the `discovered` state.
+//   - existing (still discovered)  → refresh the connector-sourced descriptive
+//     fields; lifecycle untouched.
+//   - existing (already adopted or dismissed) → refresh only non-authoritative
+//     descriptive fields and NEVER regress status / owner / policy. The agent
+//     EMA/ID-JAG reconnects onto this same row; a deliberately dismissed row is
+//     not silently resurrected.
+//
+// Returns the resulting identity and whether it was newly created.
+func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	if !req.Origin.IsExternal() {
+		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
+	}
+
+	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
+		return s.reconcileDiscovered(ctx, existing, req)
+	}
+
+	identity, err := s.RegisterIdentity(ctx, RegisterIdentityRequest{
+		AccountID:    req.AccountID,
+		ProjectID:    req.ProjectID,
+		ExternalID:   req.ExternalID,
+		Name:         req.Name,
+		TrustLevel:   req.TrustLevel,
+		IdentityType: req.IdentityType,
+		SubType:      req.SubType,
+		Origin:       req.Origin,
+		OwnerUserID:  req.OwnerUserID,
+		Framework:    req.Framework,
+		Version:      req.Version,
+		Publisher:    req.Publisher,
+		Description:  req.Description,
+		Capabilities: req.Capabilities,
+		Labels:       req.Labels,
+		Metadata:     req.Metadata,
+		CreatedBy:    req.CreatedBy,
+	})
+	if err != nil {
+		// A concurrent sync may have created the row between our lookup and
+		// Create. Fold any "already exists" signal (live duplicate or a
+		// soft-deleted/dismissed collision) back into the reconcile path so the
+		// upsert stays idempotent under races.
+		var deactErr *IdentityDeactivatedConflictError
+		if errors.Is(err, ErrIdentityAlreadyExists) || errors.As(err, &deactErr) {
+			if existing, gerr := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); gerr == nil && existing != nil {
+				return s.reconcileDiscovered(ctx, existing, req)
+			}
+		}
+		return nil, false, err
+	}
+	return identity, true, nil
+}
+
+// reconcileDiscovered refreshes the connector-sourced descriptive fields on an
+// existing row without touching lifecycle, ownership, policy, or origin. Only
+// non-empty inputs overwrite, so a connector that omits a field leaves the
+// curated value intact. Returns (identity, created=false).
+//
+// A native-origin row that happens to share this external_id is a genuine
+// collision, not the same agent: discovery must never mutate a natively-managed
+// identity, so we reject rather than clobber. A row that began as discovered
+// keeps its external origin even after adoption/activation (origin is immutable
+// provenance), so the EMA/ID-JAG reconnect still lands here.
+func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *domain.Identity, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	if !identity.Origin.IsExternal() {
+		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
+	}
+	if req.Name != "" {
+		identity.Name = req.Name
+	}
+	if req.Description != "" {
+		identity.Description = req.Description
+	}
+	if req.Framework != "" {
+		identity.Framework = req.Framework
+	}
+	if req.Publisher != "" {
+		identity.Publisher = req.Publisher
+	}
+	if req.Version != "" {
+		identity.Version = req.Version
+	}
+	if len(req.Labels) > 0 {
+		identity.Labels = req.Labels
+	}
+	if len(req.Capabilities) > 0 {
+		identity.Capabilities = req.Capabilities
+	}
+	if len(req.Metadata) > 0 {
+		identity.Metadata = req.Metadata
+	}
+	identity.UpdatedAt = time.Now()
+	if err := s.repo.Update(ctx, identity); err != nil {
+		return nil, false, err
+	}
+	return identity, false, nil
 }
 
 // GetIdentity retrieves an identity by ID.
@@ -313,9 +472,13 @@ func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, a
 }
 
 // ListIdentities returns identities for a tenant, optionally filtered by
-// identity_type(s), label, and metadata (key presence or key:value).
-func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) ([]*domain.Identity, int, error) {
-	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, limit, offset)
+// identity_type(s), label, metadata (key presence or key:value), origin
+// (provenance, e.g. okta — or the sentinel "external" for any non-native), and
+// status (e.g. discovered). origin + status are the discovery-inventory filters:
+// status=discovered surfaces the adoption inbox, origin=<idp> drills into one
+// ecosystem.
+func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass, origin, status string, limit, offset int) ([]*domain.Identity, int, error) {
+	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, origin, status, limit, offset)
 }
 
 // GetFacets returns grouped counts for each filterable identity dimension.
@@ -429,6 +592,17 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.Status != nil {
 		if !identity.Status.CanTransitionTo(*req.Status) {
 			return nil, fmt.Errorf("invalid status transition: %s → %s", identity.Status, *req.Status)
+		}
+		// Adopting (discovered → pending) or directly activating
+		// (discovered → active) makes a human accountable for the identity —
+		// the platform NHI ownership invariant, relaxed only while discovered,
+		// becomes mandatory at this transition (identity-lifecycle.md). The
+		// owner may be supplied in this same request (applied above), so we
+		// check the resolved value, not the request field.
+		if priorStatus == domain.IdentityStatusDiscovered &&
+			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) &&
+			identity.OwnerUserID == "" {
+			return nil, fmt.Errorf("%w: adopting a discovered identity requires an owner_user_id", ErrInvalidIdentityField)
 		}
 		identity.Status = *req.Status
 	}
@@ -669,6 +843,51 @@ func (s *IdentityService) ExpireIdentity(ctx context.Context, id, accountID, pro
 	}
 
 	return updated, nil
+}
+
+// AdoptIdentity adopts a discovered identity (discovered → pending): it assigns
+// the accountable human owner (CSA "Ownership Assignment" / ISO "Enrolment")
+// and, optionally, a credential policy, moving the identity out of the
+// pre-authoritative `discovered` state into the governed-but-not-yet-granted
+// `pending` state. Owner is mandatory — adoption IS the act of making an
+// external agent accountable (identity-lifecycle.md). The identity stays
+// non-usable (IsUsable is false for pending) until a subsequent activation.
+// Reuses UpdateIdentity so the transition guard, the owner-at-adopt check, and
+// the audit trail all apply.
+func (s *IdentityService) AdoptIdentity(ctx context.Context, id, accountID, projectID, ownerUserID, credentialPolicyID string) (*domain.Identity, error) {
+	if ownerUserID == "" {
+		return nil, fmt.Errorf("%w: adopting a discovered identity requires an owner_user_id", ErrInvalidIdentityField)
+	}
+	status := domain.IdentityStatusPending
+	req := UpdateIdentityRequest{OwnerUserID: ownerUserID, Status: &status}
+	if credentialPolicyID != "" {
+		req.CredentialPolicyID = &credentialPolicyID
+	}
+	return s.UpdateIdentity(ctx, id, accountID, projectID, req)
+}
+
+// DismissIdentity dismisses a discovered identity (discovered → deactivated):
+// an operator marks an externally-observed agent out of scope. The row is
+// archived (audit-retained, never hard-deleted) per the offboarding obligation.
+// A discovered identity holds no credential, so the shared deactivation cleanup
+// finds nothing to revoke and only emits the lifecycle CAE signal.
+//
+// Idempotent: an already-dismissed (deactivated) identity is a no-op success.
+// Only a discovered identity can be dismissed; deactivating a live identity is
+// DeactivateIdentity's job, not this one.
+func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
+	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if identity.Status == domain.IdentityStatusDeactivated {
+		return identity, nil
+	}
+	if identity.Status != domain.IdentityStatusDiscovered {
+		return nil, fmt.Errorf("%w: only a discovered identity can be dismissed (status=%s); use delete to deactivate a live identity", ErrInvalidIdentityField, identity.Status)
+	}
+	status := domain.IdentityStatusDeactivated
+	return s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 }
 
 // runDeactivationCleanup sweeps everything a deactivated or deleted identity

@@ -267,7 +267,9 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		offset = 0
 	}
 
-	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, limit, offset)
+	// The agent registry list does not expose the origin/status discovery
+	// filters (those are the identity-inventory surface), so pass them empty.
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, "", "", limit, offset)
 	if err != nil {
 		return nil, err
 	}

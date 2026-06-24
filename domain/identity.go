@@ -166,15 +166,34 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 
 // IdentityStatus represents the lifecycle state of an identity.
 //
+// The enum is an ISO/IEC 24760-1 §7.2-shaped identity lifecycle. `discovered`
+// sits *below* "Established" — there is no SDO state for a pre-authoritative
+// identity, so it is genuine prior art from ITIL/CMDB + CSPM/CIEM discovery.
+// See docs/identity-lifecycle.md for the full standards mapping and the
+// rationale for one registry (native ∪ discovered) keyed on `origin`+`status`.
+//
 // State machine:
 //
-//	pending → active → suspended → active (reactivation)
-//	                 → deactivated (terminal)
-//	                 → expired (terminal — time-bound authority lapsed)
-//	pending → deactivated (registration rejected)
+//	discovered → pending  (adopt — a human owner is assigned)
+//	           → active    (direct activation — first EMA/ID-JAG mint adopts+grants)
+//	           → deactivated (dismiss — operator marks out-of-scope, audit-retained)
+//	pending    → active → suspended → active (reactivation)
+//	                    → deactivated (terminal-ish — reactivatable)
+//	                    → expired (time-bound authority lapsed)
+//	pending    → deactivated (registration rejected)
+//
+// `discovered` is an *entry-only* state: discovery writes it at ingestion and
+// nothing transitions back into it. ISO mapping (24760 → ours):
+// Established=pending, Active=active, Suspended=suspended, Archived=deactivated/expired.
 type IdentityStatus string
 
 const (
+	// IdentityStatusDiscovered is the pre-authoritative state for an identity
+	// observed in an external IdP via a discovery connector (origin != native).
+	// It is owner-OPTIONAL, credential-less, and NOT usable (IsUsable is false):
+	// a discovered row is a posture signal, never an auth principal, until it is
+	// adopted (→pending) or directly activated (→active). identity-lifecycle.md.
+	IdentityStatusDiscovered  IdentityStatus = "discovered"
 	IdentityStatusPending     IdentityStatus = "pending"
 	IdentityStatusActive      IdentityStatus = "active"
 	IdentityStatusSuspended   IdentityStatus = "suspended"
@@ -184,7 +203,7 @@ const (
 
 func (s IdentityStatus) Valid() bool {
 	switch s {
-	case IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated, IdentityStatusExpired:
+	case IdentityStatusDiscovered, IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated, IdentityStatusExpired:
 		return true
 	}
 	return false
@@ -193,6 +212,11 @@ func (s IdentityStatus) Valid() bool {
 // CanTransitionTo reports whether the identity can move from its current status to the target.
 func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 	switch s {
+	case IdentityStatusDiscovered:
+		// adopt (→pending), direct activation (→active), dismiss (→deactivated).
+		// Adoption/activation additionally require an owner — enforced at the
+		// service layer, not here (this method is pure status topology).
+		return target == IdentityStatusPending || target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusPending:
 		return target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusActive:
@@ -256,9 +280,71 @@ func ValidIAL(v string) bool {
 	return false
 }
 
-// IsUsable reports whether an identity in this status can authenticate and receive tokens.
+// IsUsable reports whether an identity in this status can authenticate and
+// receive tokens. Only `active` is usable — `discovered` and `pending` are
+// explicitly NOT usable, which is the platform's safety gate: a discovered
+// (untrusted, externally-observed) row can never mint a credential regardless
+// of how it was written, so table separation isn't needed to keep external
+// data away from credentialed identities (identity-lifecycle.md "Safety is
+// already enforced by status").
 func (s IdentityStatus) IsUsable() bool {
 	return s == IdentityStatusActive
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Origin — provenance discriminator (native vs discovered)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Origin records where an identity came from (ADR 0009 D2 /
+// docs/identity-lifecycle.md): `native` — ZeroID issued it — versus an external
+// ecosystem we observed it in via a discovery connector. It is orthogonal to
+// status: `origin` is provenance, `status` is lifecycle. A discovered agent and
+// a native agent are rows in the *same* registry, distinguished by this field
+// plus status — there is no separate discovered store.
+//
+// The external-ecosystem set is OPEN: each new IdP connector in the discovery
+// service contributes a value, so validation (ValidOrigin) checks shape, not
+// membership. The closed-enum columns (status, trust_level, identity_type) are
+// platform-owned and change rarely; coupling a ZeroID release to every new
+// connector via a hard origin enum would be the wrong trade.
+type Origin string
+
+const (
+	// OriginNative is the default — an identity ZeroID registered itself.
+	OriginNative Origin = "native"
+	// The launch discovery connectors. More are added by the discovery service
+	// without a ZeroID change (ValidOrigin accepts any clean identifier).
+	OriginOkta            Origin = "okta"
+	OriginEntra           Origin = "entra"
+	OriginGoogleWorkspace Origin = "google_workspace"
+)
+
+// IsExternal reports whether the identity was discovered in an external IdP
+// (origin is set and not `native`). External-origin identities enter the
+// lifecycle in `discovered` and may be owner-less until adopted.
+func (o Origin) IsExternal() bool {
+	return o != "" && o != OriginNative
+}
+
+// ValidOrigin reports whether v is a syntactically valid origin: a non-empty
+// lowercase identifier (a–z, 0–9, underscore). Membership is intentionally not
+// checked — the external-ecosystem set is open (see Origin). Empty is invalid
+// at the storage boundary; the service layer defaults an unset origin to
+// `native` before validation.
+func ValidOrigin(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -285,6 +371,13 @@ type Identity struct {
 	SubType      SubType        `bun:"sub_type,type:varchar(50)"      json:"sub_type,omitempty"`
 	TrustLevel   TrustLevel     `bun:"trust_level,type:varchar(50)"   json:"trust_level"`
 	Status       IdentityStatus `bun:"status,type:varchar(50)"        json:"status"`
+
+	// Origin is the provenance discriminator (ADR 0009 D2 /
+	// docs/identity-lifecycle.md): `native` (ZeroID issued it) vs an external
+	// ecosystem an identity was discovered in (`okta`, `entra`,
+	// `google_workspace`, …). External-origin identities enter the lifecycle in
+	// `discovered` and may be owner-less until adopted. Defaults to `native`.
+	Origin Origin `bun:"origin,type:varchar(50),notnull,default:'native'" json:"origin"`
 
 	// Ownership and governance.
 	//
@@ -388,6 +481,10 @@ type IdentitySchema struct {
 	IdentityTypes []IdentityTypeSchema `json:"identity_types"`
 	TrustLevels   []SchemaOption       `json:"trust_levels"`
 	Statuses      []SchemaOption       `json:"statuses"`
+	// Origins lists the known provenance values. The external set is open
+	// (grows with discovery connectors), so this is the launch set, not a
+	// closed enum — clients should render unknown origins gracefully.
+	Origins []SchemaOption `json:"origins"`
 }
 
 // GetIdentitySchema returns the canonical identity schema.
@@ -439,11 +536,18 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(TrustLevelUnverified), Label: "Unverified", Description: "Unknown identities — restricted access"},
 		},
 		Statuses: []SchemaOption{
-			{Value: string(IdentityStatusPending), Label: "Pending", Description: "Awaiting activation"},
+			{Value: string(IdentityStatusDiscovered), Label: "Discovered", Description: "Observed in an external IdP — owner-optional, credential-less, not usable until adopted"},
+			{Value: string(IdentityStatusPending), Label: "Pending", Description: "Adopted (owned & governable) — awaiting activation"},
 			{Value: string(IdentityStatusActive), Label: "Active", Description: "Fully operational"},
 			{Value: string(IdentityStatusSuspended), Label: "Suspended", Description: "Temporarily disabled"},
-			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Permanently disabled"},
+			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Soft-deleted (audit-retained, reactivatable)"},
 			{Value: string(IdentityStatusExpired), Label: "Expired", Description: "Time-bound authority lapsed"},
+		},
+		Origins: []SchemaOption{
+			{Value: string(OriginNative), Label: "Native", Description: "Registered directly in ZeroID"},
+			{Value: string(OriginOkta), Label: "Okta", Description: "Discovered via the Okta connector"},
+			{Value: string(OriginEntra), Label: "Microsoft Entra", Description: "Discovered via the Microsoft Entra connector"},
+			{Value: string(OriginGoogleWorkspace), Label: "Google Workspace", Description: "Discovered via the Google Workspace connector"},
 		},
 	}
 }
