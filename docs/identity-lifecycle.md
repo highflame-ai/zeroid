@@ -13,7 +13,7 @@ enumerate via a connector) is **not** a separate inventory — it is an identity
 the same store as a native agent, distinguished by two orthogonal fields:
 
 - **`origin`** — provenance: `native` (we issued it) vs an external ecosystem
-  (`okta` / `entra` / `google_workspace` / …). ADR 0009 D2.
+  (`okta` / `entra` / `google_workspace` / …).
 - **`status`** — lifecycle state, extending the existing `IdentityStatus` machine with one
   new state, `discovered`, that sits *below* the existing states.
 
@@ -27,7 +27,7 @@ the same store as a native agent, distinguished by two orthogonal fields:
                                       ▼
                                    pending  ◀── (ISO "Established": owned, governed,
                                    │             not yet granted rights → IsUsable=false)
-              activate = credential enrolled (CAP-IDN-012) OR first EMA/ID-JAG mint
+              activate = credential enrolled OR first EMA/ID-JAG mint
               (ISO "Activation" · SCIM create+active=true)
                                       ▼
                                    active ──maintenance/rotation──┐
@@ -50,8 +50,8 @@ manager model. It is the headline posture signal for `discovered`.
 ## Why one registry (not a separate discovered store)
 
 The alternative — discovered identities in a separate table, merged with native at read
-time (the original in-`highflame-admin` `discovered_agents` design) — was rejected on
-**standards** and **production** grounds, independent of any ADR:
+time (an earlier design that kept discovered agents in their own `discovered_agents`
+table) — was rejected on **standards** and **production** grounds:
 
 - **Standards.** ISO/IEC 24760-1 §7.2 models *one identity that changes state*, not two
   registries. ITIL/CMDB — the only framework with a discovered *staging* area —
@@ -67,7 +67,8 @@ time (the original in-`highflame-admin` `discovered_agents` design) — was reje
   `(account_id, project_id, external_id)` with a stable WIMSE URI
   (`spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}`). A
   discovered agent's `external_id` is its IdP object id; the **same** agent arriving later
-  through EMA / ID-JAG reconciles to the **same** row on that key. A separate store would
+  through enterprise-managed federation (EMA / ID-JAG) reconciles to the **same** row on
+  that key. A separate store would
   have to re-implement this key and merge on every read, forever — the duplicate/
   inconsistency bug class we are explicitly avoiding.
 - **Safety is already enforced by status, not by table separation.** `IsUsable()` is true
@@ -93,7 +94,7 @@ SDK / Cedar / DB contract for no functional gain).
 | --- | --- | --- | --- |
 | **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no Highflame credential. |
 | `pending` | **Established** | false | Registered & **owned**, governable, not yet granted rights. The "adopted" state. |
-| `active` | **Active** | **true** | Granted rights: credential enrolled (CAP-IDN-012) or reconciled via EMA. The "managed" state. |
+| `active` | **Active** | **true** | Granted rights: credential enrolled or reconciled via EMA. The "managed" state. |
 | `suspended` | **Suspended** | false | Reversible halt. |
 | `deactivated` / `expired` | **Archived** | false | Soft-deleted, audit-retained, reactivatable (`deactivated → active`). The offboarded state. |
 
@@ -112,7 +113,7 @@ SDK / Cedar / DB contract for no functional gain).
 ## Ownership: relaxed for `discovered` only
 
 The platform invariant "every NHI must have a human owner accountable for its lifecycle"
-([cross-cutting/non-human-identity.md](https://github.com/highflame-ai/highflame-architecture/blob/main/cross-cutting/non-human-identity.md)) is **relaxed for `discovered` only**:
+is **relaxed for `discovered` only**:
 ownerless is the *posture signal* discovery exists to surface, not a validation error.
 **Owner becomes mandatory at `pending` (adoption) onward** — adoption *is* the act of
 making an external agent accountable. This matches CSA's explicit "Ownership Assignment"
@@ -137,7 +138,7 @@ that state.
 | `discovered` | ITIL/CMDB (discovered CI → reconcile) | CSA "Discovery", Okta "Discover unknown agents", CIEM "Account & Entitlements Discovery" |
 | adopt (`→pending`) | **ISO/IEC 24760-1** "Enrolment→Established" | CSA **"Ownership Assignment"**, Entra owner/sponsor |
 | `pending` / Established | **ISO/IEC 24760-1 "Established"** | "registered, not yet granted rights" |
-| `active` / Active | **ISO/IEC 24760-1 "Active"** = **SCIM `active=true`** | SPIFFE SVID-issued, NIST 800-63B "binding", CAP-IDN-012 key enrollment |
+| `active` / Active | **ISO/IEC 24760-1 "Active"** = **SCIM `active=true`** | SPIFFE SVID-issued, NIST 800-63B "binding", key enrollment |
 | `suspended` | **ISO/IEC 24760-1 "Suspended"** = **SCIM `active=false`** | NIST SP 800-63B-4 authenticator suspension (reversible) |
 | `deactivated`/`expired` / Archived | **ISO/IEC 24760-1 "Archived"** | CSA "Decommissioning", **OWASP NHI1**, SCIM `DELETE SHALL`, NIST 800-63B "SHALL invalidate" |
 | `ownerless` (flag) | CSA / IGA "orphaned" | Entra auto-transfer-to-manager, OWASP NHI1 |
@@ -154,11 +155,11 @@ the NHI-specific phase vocabulary, notably the explicit "Ownership Assignment" =
 ## Out of scope (here)
 
 - **Source write-back** (revoke/disable a discovered agent in its home IdP) — requires its
-  own ADR + security review (ADR 0009 D7).
-- **In-path enforcement** of a discovered agent's traffic — firehog's domain, not the
-  identity layer (ADR 0009 D5).
+  own design + security review.
+- **In-path enforcement** of a discovered agent's traffic — the in-path enforcement
+  gateway's domain, not the identity layer.
 - **Connector mechanics** (per-IdP adapters, credential custody) — the discovery service,
-  not ZeroID (ADR 0009 D1/D4). ZeroID only owns the *inventory* and its lifecycle.
+  not ZeroID. ZeroID only owns the *inventory* and its lifecycle.
 
 ## References
 
@@ -173,8 +174,3 @@ Standards & frameworks:
 - IETF WIMSE architecture (workload identity provisioning/lifecycle): https://datatracker.ietf.org/doc/html/draft-ietf-wimse-arch-07 · SPIFFE/SPIRE concepts: https://spiffe.io/docs/latest/spire-about/spire-concepts/
 - Microsoft Entra Agent ID (owner/sponsor, lifecycle): https://learn.microsoft.com/en-us/entra/agent-id/what-are-agent-identities
 - Okta for AI Agents (Discover → Onboard → Protect → Govern): https://www.okta.com/products/govern-ai-agent-identity/
-
-Internal:
-- ADR 0009 — Agent discovery connectors in a dedicated integration service; inventory in the identity domain (highflame-architecture, `adrs/0009-agent-discovery-integration-service.md`)
-- CAP-IDN-012 (actor keys enrollable after registration), CAP-IDN-013 (registry callable on AuthN with a tenant service credential), INV-IDN-002 (tenant from validated claims, never headers)
-- `cross-cutting/non-human-identity.md` — the platform NHI lifecycle (Register → Authenticate → Operate → Govern → Retire); this doc is the ZeroID-owned state model underneath it.
