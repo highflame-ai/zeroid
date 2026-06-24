@@ -48,6 +48,8 @@ ZeroID is identity infrastructure for autonomous agents: a system that issues cr
 
 Each agent gets a stable, globally unique identity URI. When one agent delegates to another, scope is automatically attenuated—the sub-agent can only receive permissions the orchestrator already holds, capped by the sub-agent's own policy. Every token carries the full on-behalf-of chain: who authorized it, what scope was granted, and how deep the delegation goes. Every action is attributable, cryptographically.
 
+**Scope — Agent Identity, specifically.** ZeroID is not a human-IAM (Okta, Entra, Clerk) and not a general workload/NHI platform (SPIFFE/SPIRE, cloud IAM, secret managers). Those are mature, separate ecosystems; ZeroID builds on their primitives—WIMSE/SPIFFE URIs, OIDC, RFC 8693—and federates with them. What it adds is the agent-shaped layer they don't model: per-agent identity, attenuated delegation across agent chains, a trust tier derived from attestation, the on-behalf-of `act` chain, and real-time revocation with cascade. The non-agent principals an agent interacts with—the services, applications, and MCP servers it calls—are registered as first-class identities too, but in service of agent scenarios. The agent is what ZeroID exists for.
+
 At Highflame, we have been using ZeroID to power our Agent Control & Governance Platform for several months now and we are contributing this to open source to further the state of the industry to solve this important problem. 
 
 **The model:**
@@ -925,6 +927,8 @@ Full interactive docs at `GET /docs` when running.
 
 ZeroID implements the complete stack for production agent identity systems. No proprietary protocols.  
 References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Identity-Management-for-Agentic-AI.pdf)
+
+The extensions ZeroID layers on these baseline specs — the additional JWT claims, the CIBA `group_hint` parameter, the DPoP `bh` claim, RFC 8693 attenuation/depth semantics, the WIMSE URI scheme, reserved-claims gating, CAE signal types, and the non-standard endpoints — are specified normatively in [`docs/spec/zeroid-oauth-extensions.md`](docs/spec/zeroid-oauth-extensions.md).
 
 | Standard | RFC / Spec | Used For |
 |----------|-----------|----------|
