@@ -321,10 +321,15 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 	facets.Origins = originFacets
 
 	// ownerless count — the discovery posture signal (no human owner assigned).
+	// Scoped to live identities: an archived (deactivated/expired) row is
+	// owner-less by nature, so counting it would inflate the posture signal with
+	// rows that are no longer actionable.
 	ownerless, err := db.NewSelect().TableExpr("identities").
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		Where("COALESCE(owner_user_id, '') = ''").
+		Where("status != ?", string(domain.IdentityStatusDeactivated)).
+		Where("status != ?", string(domain.IdentityStatusExpired)).
 		Count(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ownerless count: %w", err)

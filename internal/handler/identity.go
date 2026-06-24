@@ -548,6 +548,12 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 	if !origin.IsExternal() {
 		return nil, huma.Error400BadRequest("origin must be an external ecosystem (not 'native') for a discovered identity")
 	}
+	// Validate origin shape up front so an invalid value is rejected consistently
+	// whether this ingest creates a new row or reconciles an existing one (the
+	// reconcile path never reaches RegisterIdentity's ValidOrigin check).
+	if !domain.ValidOrigin(input.Body.Origin) {
+		return nil, huma.Error400BadRequest("invalid origin: must be a lowercase ecosystem identifier (e.g. okta, entra, google_workspace)")
+	}
 
 	trustLevel := domain.TrustLevel(input.Body.TrustLevel)
 	if trustLevel != "" && !trustLevel.Valid() {

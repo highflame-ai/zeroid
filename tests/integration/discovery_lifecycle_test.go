@@ -181,3 +181,125 @@ func TestDiscovered_NativeRegistrationUnchanged(t *testing.T) {
 	assert.Equal(t, "active", body["status"])
 	assert.Equal(t, "native", body["origin"])
 }
+
+// TestDiscovered_ReingestDoesNotRegressAdopted pins the headline upsert
+// guarantee: once a discovered identity is adopted, a connector re-sync refreshes
+// descriptive fields but never regresses lifecycle or drops the owner.
+func TestDiscovered_ReingestDoesNotRegressAdopted(t *testing.T) {
+	ext := uid("adopted-resync")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta", "name": "v1"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-owner",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "pending", decode(t, resp)["status"])
+
+	// Re-sync must reconcile to the same row, keep it pending, keep the owner,
+	// and still refresh descriptive fields.
+	second := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta", "name": "v2"})
+	assert.Equal(t, false, second["created"])
+	got := second["identity"].(map[string]any)
+	assert.Equal(t, id, got["id"], "re-sync reconciles to the same row")
+	assert.Equal(t, "pending", got["status"], "re-sync must not regress an adopted identity")
+	assert.Equal(t, "user-owner", got["owner_user_id"], "re-sync must preserve the owner")
+	assert.Equal(t, "v2", got["name"], "re-sync still refreshes descriptive fields")
+}
+
+// TestDiscovered_ReingestDoesNotResurrectDismissed verifies a deliberately
+// dismissed agent is not silently brought back by a later sync.
+func TestDiscovered_ReingestDoesNotResurrectDismissed(t *testing.T) {
+	ext := uid("dismissed-resync")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "deactivated", decode(t, resp)["status"])
+
+	second := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	assert.Equal(t, false, second["created"])
+	assert.Equal(t, "deactivated", second["identity"].(map[string]any)["status"],
+		"a dismissed identity must stay dismissed on re-sync")
+}
+
+// TestDiscovered_AdoptThenActivate walks the full path to a usable identity:
+// discovered → pending (adopt) → active.
+func TestDiscovered_AdoptThenActivate(t *testing.T) {
+	ext := uid("activate-me")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-owner",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "pending", decode(t, resp)["status"])
+
+	resp, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{
+		"status": "active",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "active", decode(t, resp)["status"], "pending → active completes the path to a usable identity")
+}
+
+// TestDiscovered_DismissNonDiscoveredRejected verifies dismiss is only for
+// discovered identities — a live native identity is deactivated via DELETE.
+func TestDiscovered_DismissNonDiscoveredRejected(t *testing.T) {
+	reg := registerIdentity(t, uid("native-dismiss"), nil)
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+reg.ID+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"dismiss must refuse a non-discovered identity")
+	_ = resp.Body.Close()
+}
+
+// TestDiscovered_Facets verifies the discovery posture facets: the origin
+// breakdown and the ownerless count.
+func TestDiscovered_Facets(t *testing.T) {
+	ingestDiscovered(t, map[string]any{"external_id": uid("facet-okta"), "origin": "okta"})
+
+	resp := get(t, adminPath("/agents/registry/facets"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	origins, ok := body["origins"].([]any)
+	require.True(t, ok, "facets must include an origins breakdown")
+	var oktaCount float64
+	for _, raw := range origins {
+		f := raw.(map[string]any)
+		if f["value"] == "okta" {
+			oktaCount = f["count"].(float64)
+		}
+	}
+	assert.Greater(t, oktaCount, float64(0), "origins facet must count the okta-discovered identity")
+
+	ownerless, ok := body["ownerless"].(float64)
+	require.True(t, ok, "facets must include an ownerless count")
+	assert.Greater(t, ownerless, float64(0), "ownerless count must reflect the ownerless discovered identity")
+}
+
+// TestDiscovered_IngestRejectsInvalidOriginShape verifies an origin that isn't a
+// clean lowercase identifier is rejected (consistently, regardless of whether a
+// row already exists).
+func TestDiscovered_IngestRejectsInvalidOriginShape(t *testing.T) {
+	resp := post(t, adminPath("/identities/discovered"), map[string]any{
+		"external_id": uid("bad-shape"),
+		"origin":      "Okta-Prod",
+	}, adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
+}
+
+// TestDiscovered_ListRejectsInvalidStatusFilter verifies the list endpoint
+// validates the status filter rather than silently returning nothing.
+func TestDiscovered_ListRejectsInvalidStatusFilter(t *testing.T) {
+	resp := get(t, adminPath("/identities?status=bogus"), adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
+}
