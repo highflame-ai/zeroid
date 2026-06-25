@@ -513,6 +513,13 @@ func (s *IdentityService) PruneStaleDiscovered(ctx context.Context, accountID, p
 	if notSeenSince.IsZero() {
 		return 0, fmt.Errorf("%w: prune requires not_seen_since", ErrInvalidIdentityField)
 	}
+	// not_seen_since is the sync-start time and must be in the past — a connector
+	// bug sending a future timestamp would otherwise deactivate every still-
+	// discovered row of the source (everything is "older" than the future). Guard
+	// it like the expires_at-in-the-future foot-gun (security-review hardening).
+	if notSeenSince.After(time.Now()) {
+		return 0, fmt.Errorf("%w: not_seen_since must not be in the future (got %s)", ErrInvalidIdentityField, notSeenSince.UTC().Format(time.RFC3339))
+	}
 	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_prune")
 	n, err := s.repo.DeactivateStaleDiscovered(ctx, accountID, projectID, string(origin), sourceID, notSeenSince)
 	if err != nil {

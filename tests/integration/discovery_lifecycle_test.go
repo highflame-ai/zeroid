@@ -434,9 +434,10 @@ func TestDiscovered_PruneIsSourceScoped(t *testing.T) {
 	aID := a["identity"].(map[string]any)["id"].(string)
 	bID := b["identity"].(map[string]any)["id"].(string)
 
-	// not_seen_since in the future → every source-A discovered row is stale.
-	future := time.Now().UTC().Add(time.Hour)
-	n := pruneStale(t, "okta", srcA, future.Format(time.RFC3339Nano))
+	// not_seen_since = now (after the ingests): every source-A discovered row is
+	// stale; source B's rows are a different source and untouched.
+	pruneAt := time.Now().UTC()
+	n := pruneStale(t, "okta", srcA, pruneAt.Format(time.RFC3339Nano))
 	assert.Equal(t, 1, n, "prune only affects source A")
 	assert.Equal(t, "deactivated", identityStatus(t, aID))
 	assert.Equal(t, "discovered", identityStatus(t, bID), "source B is untouched by source A's prune")
@@ -453,9 +454,22 @@ func TestDiscovered_PruneLeavesAdoptedUntouched(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	future := time.Now().UTC().Add(time.Hour)
-	pruneStale(t, "okta", src, future.Format(time.RFC3339Nano))
+	pruneAt := time.Now().UTC()
+	pruneStale(t, "okta", src, pruneAt.Format(time.RFC3339Nano))
 	assert.Equal(t, "pending", identityStatus(t, id), "prune never touches an adopted identity")
+}
+
+// TestDiscovered_PruneRejectsFutureTimestamp verifies a future not_seen_since is
+// rejected — it would otherwise deactivate every still-discovered row of the
+// source (a connector-bug foot-gun).
+func TestDiscovered_PruneRejectsFutureTimestamp(t *testing.T) {
+	resp := post(t, adminPath("/identities/discovered/prune"), map[string]any{
+		"origin":         "okta",
+		"source_id":      "conn-x",
+		"not_seen_since": time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}, adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
 }
 
 // TestDiscovered_PruneRejectsNativeOrigin verifies a prune can't be scoped to
