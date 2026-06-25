@@ -47,6 +47,40 @@ the same store as a native agent, distinguished by two orthogonal fields:
 leaves), not a primary state — matching CSA / IGA "orphaned" and Entra's auto-transfer-to-
 manager model. It is the headline posture signal for `discovered`.
 
+## What discovery can and can't do (trust model)
+
+Discovering an agent observed in an external IdP creates an **inert inventory record**, never
+an authentication principal. From ZeroID's perspective a discovered (third-party) identity is a
+row in the same registry as native ones, but deliberately constrained:
+
+- **It cannot authenticate or be issued any credential or token.** A discovered identity is in
+  the `discovered` state, and `IsUsable()` is true **only** for `active`. Every issuance path —
+  the OAuth grants, the JWT/SVID it would otherwise mint, API keys, proof tokens, attestation —
+  checks that gate, so a `discovered` (or `pending`) identity is rejected everywhere. Ingesting
+  an agent mints nothing bound to it.
+- **It is clearly marked as not first-party.** `origin` records the external ecosystem it was
+  observed in, `trust_level` defaults to `unverified`, and the row is credential-less. A
+  discovered identity is never indistinguishable from a natively-registered, first-party one.
+- **It becomes a usable principal only through explicit human action.** To ever authenticate it
+  must be **adopted** (a human owner is assigned — mandatory at that step) *and* **activated** (a
+  credential is enrolled, or it is reconciled through a federated mint). Both are gated lifecycle
+  transitions; until then the identity is posture/inventory only.
+- **A poisoned or malicious discovered record is a data-quality issue, not an auth bypass.** The
+  boundary is the `active`+credential gate, not table separation, so the worst an attacker-
+  influenced discovered row can do is add noise to the inventory — it cannot impersonate,
+  escalate, or obtain a token.
+- **It is tenant-scoped and write-validated.** Every row and query carries `account_id` +
+  `project_id`; discovery writes only through the validated identity APIs (with a guard that
+  refuses to overwrite a native identity sharing an `external_id`), never raw DB.
+
+**On the WIMSE/SPIFFE URI.** A discovered identity is assigned a WIMSE URI
+(`spiffe://{domain}/{account_id}/{project_id}/{identity_type}/{external_id}`) at ingestion,
+because it is the stable reconciliation key — the same agent arriving again (a re-sync, or later
+through a federated mint) resolves to the same row, and the identifier does not change when the
+identity is adopted or activated. The URI existing in the registry is **not** a trust grant: no
+SVID or token is ever issued for it while it is discovered or pending. The authentication
+boundary is the `active` state plus an enrolled credential, reached only via human adoption.
+
 ## Why one registry (not a separate discovered store)
 
 The alternative — discovered identities in a separate table, merged with native at read
