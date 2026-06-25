@@ -222,6 +222,27 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Archives a discovered identity an operator has marked out of scope (audit-retained, never hard-deleted). Idempotent. Only valid for identities still in the `discovered` state.",
 		Tags:        []string{"Identities"},
 	}, a.dismissIdentityOp)
+
+	// Connector-sync write path: bulk ingest + stale prune. A discovery sync
+	// upserts everything it enumerated (batch), then prunes the rows it no longer
+	// sees (prune) — the two halves of a reconcile.
+	huma.Register(api, huma.Operation{
+		OperationID: "ingest-discovered-identities-batch",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/batch",
+		Summary:     "Bulk idempotent upsert of discovered identities (one connector sync)",
+		Description: "Best-effort: each agent is upserted independently (same idempotency + no-clobber-native guard as the single ingest); per-agent failures are reported, not fatal. Capped per request — page larger syncs.",
+		Tags:        []string{"Identities"},
+	}, a.ingestDiscoveredBatchOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "prune-stale-discovered",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/prune",
+		Summary:     "Deactivate discovered identities a sync no longer sees (offboarding)",
+		Description: "Scoped to one (origin, source_id): deactivates only still-`discovered` rows last seen before `not_seen_since`. Never touches adopted/active identities, and never another connector's rows. The offboarding half of a connector reconcile.",
+		Tags:        []string{"Identities"},
+	}, a.pruneStaleDiscoveredOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -513,6 +534,7 @@ type CreateDiscoveredIdentityInput struct {
 	Body struct {
 		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
 		Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
+		SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
 		Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
 		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
 		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
@@ -573,6 +595,7 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 		ProjectID:    tenant.ProjectID,
 		ExternalID:   input.Body.ExternalID,
 		Origin:       origin,
+		SourceID:     input.Body.SourceID,
 		Name:         input.Body.Name,
 		IdentityType: identityType,
 		SubType:      subType,
@@ -649,4 +672,117 @@ func (a *API) dismissIdentityOp(ctx context.Context, input *IdentityIDInput) (*I
 	}
 
 	return &IdentityOutput{Body: identity}, nil
+}
+
+// ── Discovery connector-sync: bulk ingest + stale prune ───────────────────────
+
+// DiscoveredAgentItem is one agent in a bulk discovery ingest — the same shape
+// as the single-ingest body.
+type DiscoveredAgentItem struct {
+	ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
+	Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
+	SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
+	Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
+	IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+	SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
+	TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+	OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner"`
+	Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
+	Version      string          `json:"version,omitempty" doc:"Agent version"`
+	Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher"`
+	Description  string          `json:"description,omitempty" doc:"Description"`
+	Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
+	Labels       json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+	Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+}
+
+type BatchDiscoveredInput struct {
+	Body struct {
+		Agents []DiscoveredAgentItem `json:"agents" required:"true" minItems:"1" doc:"Discovered agents enumerated by one connector sync"`
+	}
+}
+
+type BatchDiscoveredOutput struct {
+	Body *service.BulkDiscoveredResult
+}
+
+func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscoveredInput) (*BatchDiscoveredOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+	createdBy := internalMiddleware.GetCallerName(ctx)
+
+	reqs := make([]service.DiscoveredIdentityRequest, 0, len(input.Body.Agents))
+	for _, item := range input.Body.Agents {
+		reqs = append(reqs, service.DiscoveredIdentityRequest{
+			AccountID:    tenant.AccountID,
+			ProjectID:    tenant.ProjectID,
+			ExternalID:   item.ExternalID,
+			Origin:       domain.Origin(item.Origin),
+			SourceID:     item.SourceID,
+			Name:         item.Name,
+			IdentityType: domain.IdentityType(item.IdentityType),
+			SubType:      domain.SubType(item.SubType),
+			TrustLevel:   domain.TrustLevel(item.TrustLevel),
+			OwnerUserID:  item.OwnerUserID,
+			Framework:    item.Framework,
+			Version:      item.Version,
+			Publisher:    item.Publisher,
+			Description:  item.Description,
+			Capabilities: item.Capabilities,
+			Labels:       item.Labels,
+			Metadata:     item.Metadata,
+			CreatedBy:    createdBy,
+		})
+	}
+
+	result, err := a.identitySvc.BulkUpsertDiscoveredIdentities(ctx, reqs)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Int("count", len(reqs)).Msg("failed bulk discovered ingest")
+		return nil, huma.Error500InternalServerError("failed to ingest discovered identities")
+	}
+	return &BatchDiscoveredOutput{Body: result}, nil
+}
+
+type PruneDiscoveredInput struct {
+	Body struct {
+		Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem to prune within (e.g. okta)"`
+		SourceID     string `json:"source_id" required:"true" minLength:"1" doc:"Discovery source instance (connector) whose sweep this is — scopes the prune to one source"`
+		NotSeenSince string `json:"not_seen_since" required:"true" doc:"RFC3339 timestamp (the sync start). Still-discovered rows of this source last updated before this are deactivated."`
+	}
+}
+
+type PruneDiscoveredOutput struct {
+	Body struct {
+		Deactivated int `json:"deactivated"`
+	}
+}
+
+func (a *API) pruneStaleDiscoveredOp(ctx context.Context, input *PruneDiscoveredInput) (*PruneDiscoveredOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	notSeenSince, perr := time.Parse(time.RFC3339, input.Body.NotSeenSince)
+	if perr != nil {
+		return nil, huma.Error400BadRequest("invalid not_seen_since: must be an RFC3339 timestamp")
+	}
+
+	n, err := a.identitySvc.PruneStaleDiscovered(ctx, tenant.AccountID, tenant.ProjectID, domain.Origin(input.Body.Origin), input.Body.SourceID, notSeenSince)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Msg("failed to prune stale discovered identities")
+		return nil, huma.Error500InternalServerError("failed to prune stale discovered identities")
+	}
+
+	out := &PruneDiscoveredOutput{}
+	out.Body.Deactivated = n
+	return out, nil
 }

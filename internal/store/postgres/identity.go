@@ -433,6 +433,40 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 	return true, identity, nil
 }
 
+// DeactivateStaleDiscovered flips to 'deactivated' every still-`discovered`
+// identity from the given (origin, source_id) whose updated_at predates
+// notSeenSince — the rows a connector sync no longer reported. It is a bulk
+// status flip (discovered rows hold no credential, so nothing to cascade); the
+// caller_name on the context stamps modified_by so the audit trigger records who
+// pruned. Scoped by source_id so one connector's sweep never touches another's
+// agents of the same origin. Returns the number of rows deactivated.
+func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where("updated_at < ?", notSeenSince).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // ListExpiredActive returns identities whose expires_at has passed while
 // their status is still 'active'. Used by the cleanup worker's identity
 // sweep. The partial index on (expires_at) WHERE status='active' makes

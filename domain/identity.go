@@ -379,6 +379,13 @@ type Identity struct {
 	// `discovered` and may be owner-less until adopted. Defaults to `native`.
 	Origin Origin `bun:"origin,type:varchar(50),notnull,default:'native'" json:"origin"`
 
+	// SourceID identifies the discovery source instance (e.g. a specific
+	// connector) that ingested this identity, so a sync can prune only the rows
+	// it owns when a tenant runs several connectors of the same origin. Opaque to
+	// ZeroID — the discovery service assigns it. Empty/NULL for native
+	// identities and for discovered rows ingested without a source.
+	SourceID string `bun:"source_id,type:varchar(255),nullzero" json:"source_id,omitempty"`
+
 	// Ownership and governance.
 	//
 	// CredentialPolicyID is the identity policy — the authority ceiling for

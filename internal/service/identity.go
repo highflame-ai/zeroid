@@ -108,7 +108,11 @@ type RegisterIdentityRequest struct {
 	// the `discovered` state and OwnerUserID is OPTIONAL — ownerless is the
 	// posture signal discovery exists to surface, not a validation error
 	// (identity-lifecycle.md "Ownership: relaxed for discovered only").
-	Origin        domain.Origin
+	Origin domain.Origin
+	// SourceID identifies the discovery source instance (connector) for a
+	// discovered identity, so a sync can prune only its own rows. Empty for
+	// native identities.
+	SourceID      string
 	OwnerUserID   string
 	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
 	PublicKeyPEM  string
@@ -245,6 +249,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		TrustLevel:         req.TrustLevel,
 		Status:             initialStatus,
 		Origin:             req.Origin,
+		SourceID:           req.SourceID,
 		OwnerUserID:        req.OwnerUserID,
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
@@ -299,6 +304,7 @@ type DiscoveredIdentityRequest struct {
 	ProjectID    string
 	ExternalID   string // the IdP object id — the reconciliation key
 	Origin       domain.Origin
+	SourceID     string // the discovery source instance (connector) — enables source-scoped pruning
 	Name         string
 	IdentityType domain.IdentityType
 	SubType      domain.SubType
@@ -333,6 +339,12 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	if !req.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
 	}
+	// Validate shape here too (not only in RegisterIdentity), so a malformed
+	// origin is rejected on the reconcile path and in a bulk batch, not just on
+	// first create.
+	if !domain.ValidOrigin(string(req.Origin)) {
+		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
+	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
 		return s.reconcileDiscovered(ctx, existing, req)
@@ -347,6 +359,7 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		IdentityType: req.IdentityType,
 		SubType:      req.SubType,
 		Origin:       req.Origin,
+		SourceID:     req.SourceID,
 		OwnerUserID:  req.OwnerUserID,
 		Framework:    req.Framework,
 		Version:      req.Version,
@@ -394,6 +407,12 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
 	}
+	// Adopt a source_id only when the row doesn't already have one (e.g. it was
+	// ingested manually first, then a connector picked it up). Never overwrite a
+	// non-empty source_id, so one connector can't claim another's row.
+	if identity.SourceID == "" && req.SourceID != "" {
+		identity.SourceID = req.SourceID
+	}
 	if req.Name != "" {
 		identity.Name = req.Name
 	}
@@ -423,6 +442,87 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 		return nil, false, err
 	}
 	return identity, false, nil
+}
+
+// BulkDiscoveredFailure records one agent that failed to ingest, by external_id.
+type BulkDiscoveredFailure struct {
+	ExternalID string `json:"external_id"`
+	Error      string `json:"error"`
+}
+
+// BulkDiscoveredResult summarizes a bulk discovery ingest.
+type BulkDiscoveredResult struct {
+	Created    int                     `json:"created"`
+	Reconciled int                     `json:"reconciled"`
+	Failed     []BulkDiscoveredFailure `json:"failed"`
+}
+
+// MaxDiscoveredBatchSize caps a single bulk ingest so one request can't be
+// unbounded. A connector with more agents pages across multiple batches.
+const MaxDiscoveredBatchSize = 1000
+
+// BulkUpsertDiscoveredIdentities ingests many discovered identities in one call
+// — the connector-sync write path. Each agent goes through the same idempotent
+// UpsertDiscoveredIdentity, so the no-clobber-native guard and create-vs-
+// reconcile logic apply per row. It is best-effort: a per-agent failure is
+// recorded in the result and does not abort the batch, so a connector ingests
+// everything it can and reports the rest.
+func (s *IdentityService) BulkUpsertDiscoveredIdentities(ctx context.Context, reqs []DiscoveredIdentityRequest) (*BulkDiscoveredResult, error) {
+	if len(reqs) > MaxDiscoveredBatchSize {
+		return nil, fmt.Errorf("%w: batch of %d exceeds the maximum of %d", ErrInvalidIdentityField, len(reqs), MaxDiscoveredBatchSize)
+	}
+	result := &BulkDiscoveredResult{Failed: []BulkDiscoveredFailure{}}
+	for _, req := range reqs {
+		_, created, err := s.UpsertDiscoveredIdentity(ctx, req)
+		if err != nil {
+			result.Failed = append(result.Failed, BulkDiscoveredFailure{ExternalID: req.ExternalID, Error: err.Error()})
+			continue
+		}
+		if created {
+			result.Created++
+		} else {
+			result.Reconciled++
+		}
+	}
+	return result, nil
+}
+
+// PruneStaleDiscovered deactivates discovered identities a connector sync no
+// longer observed — the offboarding half of a reconcile (OWASP NHI1). It targets
+// ONLY rows that are:
+//   - still in the `discovered` state — an adopted/active agent that vanished
+//     from its source is a governance decision for its owner, never an automatic
+//     deactivation;
+//   - tagged with this (origin, source_id) — so one connector's sweep never
+//     touches another connector's agents of the same origin;
+//   - last touched before notSeenSince — i.e. not refreshed by this sync's
+//     upserts (the connector records notSeenSince at sync start, then upserts,
+//     then calls prune).
+//
+// origin and sourceID are required, so a prune is always scoped to one source
+// and can never sweep the whole tenant. Discovered rows hold no credential, so
+// this is a plain bulk status flip (no cascade revoke). Returns the count
+// deactivated.
+func (s *IdentityService) PruneStaleDiscovered(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string, notSeenSince time.Time) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: prune requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: prune requires a source_id (a prune is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	if notSeenSince.IsZero() {
+		return 0, fmt.Errorf("%w: prune requires not_seen_since", ErrInvalidIdentityField)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_prune")
+	n, err := s.repo.DeactivateStaleDiscovered(ctx, accountID, projectID, string(origin), sourceID, notSeenSince)
+	if err != nil {
+		return 0, fmt.Errorf("prune stale discovered: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery prune: deactivated stale discovered identities")
+	}
+	return n, nil
 }
 
 // GetIdentity retrieves an identity by ID.

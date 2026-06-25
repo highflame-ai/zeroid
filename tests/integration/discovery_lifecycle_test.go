@@ -8,6 +8,7 @@ package integration_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -300,6 +301,142 @@ func TestDiscovered_IngestRejectsInvalidOriginShape(t *testing.T) {
 // validates the status filter rather than silently returning nothing.
 func TestDiscovered_ListRejectsInvalidStatusFilter(t *testing.T) {
 	resp := get(t, adminPath("/identities?status=bogus"), adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
+}
+
+// ── Connector-sync: bulk ingest + stale prune ────────────────────────────────
+
+// ingestBatch POSTs /identities/discovered/batch and returns the decoded
+// {created, reconciled, failed} summary.
+func ingestBatch(t *testing.T, agents []map[string]any) map[string]any {
+	t.Helper()
+	resp := post(t, adminPath("/identities/discovered/batch"), map[string]any{"agents": agents}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode, "bulk ingest: expected 200")
+	return decode(t, resp)
+}
+
+// pruneStale POSTs /identities/discovered/prune and returns the deactivated count.
+func pruneStale(t *testing.T, origin, sourceID, notSeenSince string) int {
+	t.Helper()
+	resp := post(t, adminPath("/identities/discovered/prune"), map[string]any{
+		"origin": origin, "source_id": sourceID, "not_seen_since": notSeenSince,
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode, "prune: expected 200")
+	return int(decode(t, resp)["deactivated"].(float64))
+}
+
+// identityStatus GETs an identity by id and returns its status.
+func identityStatus(t *testing.T, id string) string {
+	t.Helper()
+	resp := get(t, adminPath("/identities/"+id), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return decode(t, resp)["status"].(string)
+}
+
+// TestDiscovered_BulkIngest verifies bulk upsert creates all agents and a
+// re-batch reconciles them (idempotent).
+func TestDiscovered_BulkIngest(t *testing.T) {
+	src := uid("bulk-src")
+	a, b := uid("bulk-a"), uid("bulk-b")
+	res := ingestBatch(t, []map[string]any{
+		{"external_id": a, "origin": "okta", "source_id": src, "name": "A"},
+		{"external_id": b, "origin": "entra", "source_id": src, "name": "B"},
+	})
+	assert.Equal(t, float64(2), res["created"])
+	assert.Equal(t, float64(0), res["reconciled"])
+	assert.Empty(t, res["failed"], "no failures expected")
+
+	res2 := ingestBatch(t, []map[string]any{
+		{"external_id": a, "origin": "okta", "source_id": src},
+		{"external_id": b, "origin": "entra", "source_id": src},
+	})
+	assert.Equal(t, float64(0), res2["created"], "re-batch creates nothing")
+	assert.Equal(t, float64(2), res2["reconciled"], "re-batch reconciles both")
+}
+
+// TestDiscovered_SourceIDRoundtrip verifies source_id is stored and returned.
+func TestDiscovered_SourceIDRoundtrip(t *testing.T) {
+	src := uid("conn-id")
+	out := ingestDiscovered(t, map[string]any{"external_id": uid("with-src"), "origin": "okta", "source_id": src})
+	identity := out["identity"].(map[string]any)
+	assert.Equal(t, src, identity["source_id"], "source_id set on ingest")
+
+	resp := get(t, adminPath("/identities/"+identity["id"].(string)), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, src, decode(t, resp)["source_id"], "source_id round-trips through GET")
+}
+
+// TestDiscovered_PruneStale verifies a sync's prune deactivates exactly the
+// discovered rows it no longer saw (last updated before the sync start), and
+// leaves the re-seen ones discovered.
+func TestDiscovered_PruneStale(t *testing.T) {
+	src := uid("prune-src")
+	keepExt, staleExt := uid("keep"), uid("stale")
+	keep := ingestDiscovered(t, map[string]any{"external_id": keepExt, "origin": "okta", "source_id": src})
+	stale := ingestDiscovered(t, map[string]any{"external_id": staleExt, "origin": "okta", "source_id": src})
+	keepID := keep["identity"].(map[string]any)["id"].(string)
+	staleID := stale["identity"].(map[string]any)["id"].(string)
+
+	// The connector records the sync start, then re-ingests only what it still
+	// sees ("keep"), advancing keep's updated_at past the sync start.
+	syncStart := time.Now().UTC()
+	ingestDiscovered(t, map[string]any{"external_id": keepExt, "origin": "okta", "source_id": src})
+
+	n := pruneStale(t, "okta", src, syncStart.Format(time.RFC3339Nano))
+	assert.Equal(t, 1, n, "exactly the not-re-seen identity is pruned")
+	assert.Equal(t, "discovered", identityStatus(t, keepID), "re-seen identity stays discovered")
+	assert.Equal(t, "deactivated", identityStatus(t, staleID), "stale identity is deactivated")
+}
+
+// TestDiscovered_PruneIsSourceScoped verifies a prune for one source never
+// touches another connector's agents of the same origin.
+func TestDiscovered_PruneIsSourceScoped(t *testing.T) {
+	srcA, srcB := uid("connA"), uid("connB")
+	a := ingestDiscovered(t, map[string]any{"external_id": uid("a"), "origin": "okta", "source_id": srcA})
+	b := ingestDiscovered(t, map[string]any{"external_id": uid("b"), "origin": "okta", "source_id": srcB})
+	aID := a["identity"].(map[string]any)["id"].(string)
+	bID := b["identity"].(map[string]any)["id"].(string)
+
+	// not_seen_since in the future → every source-A discovered row is stale.
+	future := time.Now().UTC().Add(time.Hour)
+	n := pruneStale(t, "okta", srcA, future.Format(time.RFC3339Nano))
+	assert.Equal(t, 1, n, "prune only affects source A")
+	assert.Equal(t, "deactivated", identityStatus(t, aID))
+	assert.Equal(t, "discovered", identityStatus(t, bID), "source B is untouched by source A's prune")
+}
+
+// TestDiscovered_PruneLeavesAdoptedUntouched verifies prune only acts on
+// still-discovered rows — an adopted identity is never auto-deactivated.
+func TestDiscovered_PruneLeavesAdoptedUntouched(t *testing.T) {
+	src := uid("adopt-src")
+	out := ingestDiscovered(t, map[string]any{"external_id": uid("adopted"), "origin": "okta", "source_id": src})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{"owner_user_id": "user-owner"}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	future := time.Now().UTC().Add(time.Hour)
+	pruneStale(t, "okta", src, future.Format(time.RFC3339Nano))
+	assert.Equal(t, "pending", identityStatus(t, id), "prune never touches an adopted identity")
+}
+
+// TestDiscovered_PruneRejectsNativeOrigin verifies a prune can't be scoped to
+// native — it only operates on discovered (external) inventory.
+func TestDiscovered_PruneRejectsNativeOrigin(t *testing.T) {
+	resp := post(t, adminPath("/identities/discovered/prune"), map[string]any{
+		"origin": "native", "source_id": "conn-x", "not_seen_since": time.Now().UTC().Format(time.RFC3339Nano),
+	}, adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
+}
+
+// TestDiscovered_PruneRejectsBadTimestamp verifies not_seen_since must be RFC3339.
+func TestDiscovered_PruneRejectsBadTimestamp(t *testing.T) {
+	resp := post(t, adminPath("/identities/discovered/prune"), map[string]any{
+		"origin": "okta", "source_id": "conn-x", "not_seen_since": "not-a-timestamp",
+	}, adminHeaders())
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	_ = resp.Body.Close()
 }
