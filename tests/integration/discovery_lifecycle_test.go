@@ -305,6 +305,42 @@ func TestDiscovered_ListRejectsInvalidStatusFilter(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestDiscovered_AgentsEndpointSurfacesOrigin pins that the /agents/registry
+// list (the endpoint admin/Studio proxy for the inventory) surfaces `origin` on
+// each agent and honors the origin/status filters — not just the /identities
+// surface. Without this the unified native∪discovered inventory wouldn't reach
+// Studio through admin.
+func TestDiscovered_AgentsEndpointSurfacesOrigin(t *testing.T) {
+	ext := uid("agents-origin")
+	ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+
+	find := func(path string) (bool, string, string) {
+		resp := get(t, adminPath(path), adminHeaders())
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		body := decode(t, resp)
+		for _, raw := range body["agents"].([]any) {
+			a := raw.(map[string]any)
+			if a["external_id"] == ext {
+				return true, a["origin"].(string), a["status"].(string)
+			}
+		}
+		return false, "", ""
+	}
+
+	ok, origin, status := find("/agents/registry?origin=okta&limit=100")
+	assert.True(t, ok, "origin=okta filter must surface the discovered agent via /agents/registry")
+	assert.Equal(t, "okta", origin, "the agents endpoint must surface origin")
+	assert.Equal(t, "discovered", status)
+
+	okStatus, _, _ := find("/agents/registry?status=discovered&limit=100")
+	assert.True(t, okStatus, "status=discovered filter must work on /agents/registry")
+
+	// Invalid origin filter is rejected (not silently empty).
+	bad := get(t, adminPath("/agents/registry?origin=Okta-Prod"), adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, bad.StatusCode)
+	_ = bad.Body.Close()
+}
+
 // ── Connector-sync: bulk ingest + stale prune ────────────────────────────────
 
 // ingestBatch POSTs /identities/discovered/batch and returns the decoded
