@@ -114,7 +114,11 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
 // e.g. to list identities that have a redteam_target object configured, whose
 // value is not a scalar and so can't be matched by containment.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass string, limit, offset int) ([]*domain.Identity, int, error) {
+// The origin filter accepts an exact ecosystem (e.g. "okta") or the sentinel
+// "external" — any non-native (discovered) provenance. The status filter is an
+// exact lifecycle match (e.g. "discovered") — the discovery adoption inbox is
+// status="discovered". Both are independent of the legacy is_active boolean.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass, origin, status string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -156,6 +160,16 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	}
 	if trustLevel != "" {
 		q = q.Where("trust_level = ?", trustLevel)
+	}
+	if origin != "" {
+		if origin == "external" {
+			q = q.Where("origin <> ?", string(domain.OriginNative))
+		} else {
+			q = q.Where("origin = ?", origin)
+		}
+	}
+	if status != "" {
+		q = q.Where("status = ?", status)
 	}
 	if isActive != "" {
 		if active, err := strconv.ParseBool(isActive); err == nil {
@@ -202,6 +216,12 @@ type IdentityFacets struct {
 	Statuses        []FacetValue `json:"statuses"`
 	IdentityClasses []FacetValue `json:"identity_classes"`
 	CreatedBy       []FacetValue `json:"created_by"`
+	// Origins is the provenance breakdown (native vs each discovery ecosystem).
+	Origins []FacetValue `json:"origins"`
+	// Ownerless is the count of identities with no human owner — the headline
+	// discovery posture signal (an orphaned/never-adopted identity). Derived
+	// from owner_user_id being empty (identity-lifecycle.md "ownerless").
+	Ownerless int `json:"ownerless"`
 }
 
 // GetFacets returns grouped counts for each filterable dimension, scoped to a tenant.
@@ -284,6 +304,37 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 		return nil, fmt.Errorf("failed to get created_by facets: %w", err)
 	}
 	facets.CreatedBy = createdByFacets
+
+	// origin (provenance: native vs each discovery ecosystem)
+	var originFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("origin AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		GroupExpr("origin").
+		OrderExpr("count DESC").
+		Scan(ctx, &originFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get origin facets: %w", err)
+	}
+	facets.Origins = originFacets
+
+	// ownerless count — the discovery posture signal (no human owner assigned).
+	// Scoped to live identities: an archived (deactivated/expired) row is
+	// owner-less by nature, so counting it would inflate the posture signal with
+	// rows that are no longer actionable.
+	ownerless, err := db.NewSelect().TableExpr("identities").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("COALESCE(owner_user_id, '') = ''").
+		Where("status != ?", string(domain.IdentityStatusDeactivated)).
+		Where("status != ?", string(domain.IdentityStatusExpired)).
+		Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ownerless count: %w", err)
+	}
+	facets.Ownerless = ownerless
 
 	return facets, nil
 }
@@ -380,6 +431,40 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 		return false, nil, nil
 	}
 	return true, identity, nil
+}
+
+// DeactivateStaleDiscovered flips to 'deactivated' every still-`discovered`
+// identity from the given (origin, source_id) whose updated_at predates
+// notSeenSince — the rows a connector sync no longer reported. It is a bulk
+// status flip (discovered rows hold no credential, so nothing to cascade); the
+// caller_name on the context stamps modified_by so the audit trigger records who
+// pruned. Scoped by source_id so one connector's sweep never touches another's
+// agents of the same origin. Returns the number of rows deactivated.
+func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where("updated_at < ?", notSeenSince).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered rows: %w", err)
+	}
+	return int(n), nil
 }
 
 // ListExpiredActive returns identities whose expires_at has passed while

@@ -71,6 +71,8 @@ type ListIdentitiesInput struct {
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
+	Status        string   `query:"status" doc:"Filter by exact lifecycle status (e.g. discovered, pending, active). The discovery adoption inbox is status=discovered."`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -102,7 +104,7 @@ type UpdateIdentityInput struct {
 		Capabilities       json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
 		Labels             json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
-		Status             *string         `json:"status,omitempty" enum:"active,suspended,deactivated" doc:"Identity status"`
+		Status             *string         `json:"status,omitempty" enum:"pending,active,suspended,deactivated" doc:"Identity status. pending adopts a discovered identity (requires owner_user_id); discovered is entry-only (not settable here)."`
 		// CoSAI §3.2 + NIST SP 800-63. Pointer so callers can distinguish
 		// "not set" (omit) from "clear to unclassified" (explicit "").
 		CapabilityTier *string `json:"capability_tier,omitempty" enum:"low,high" doc:"CoSAI §3.2 capability tier"`
@@ -189,6 +191,58 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Transitions an active identity to expired status and runs cleanup (revoke credentials, API keys, emit CAE signal). Used by Cerberus on subagent session stop.",
 		Tags:        []string{"Identities"},
 	}, a.expireIdentityOp)
+
+	// Discovery: ingestion + lifecycle (see docs/identity-lifecycle.md).
+	// The discovery connector service (a separate service) writes discovered
+	// identities into this one registry; adopt/dismiss drive them out of the
+	// pre-authoritative `discovered` state.
+	huma.Register(api, huma.Operation{
+		OperationID: "ingest-discovered-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered",
+		Summary:     "Ingest (idempotent upsert) an identity discovered in an external IdP",
+		Description: "Idempotent on (account, project, external_id): a re-sync reconciles to the same row rather than 409ing. Creates the identity in the `discovered` state (owner-optional, credential-less, not usable). Called by the discovery connector framework, not end users.",
+		Tags:        []string{"Identities"},
+	}, a.ingestDiscoveredIdentityOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "adopt-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/{id}/adopt",
+		Summary:     "Adopt a discovered identity (assign an owner; discovered → pending)",
+		Description: "Assigns the accountable human owner (and optionally a credential policy) and moves the identity from `discovered` to `pending`. Owner is mandatory — adoption is the act of making an external agent accountable. The identity remains non-usable until activated.",
+		Tags:        []string{"Identities"},
+	}, a.adoptIdentityOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "dismiss-identity",
+		Method:      http.MethodPost,
+		Path:        "/identities/{id}/dismiss",
+		Summary:     "Dismiss a discovered identity as out-of-scope (discovered → deactivated)",
+		Description: "Archives a discovered identity an operator has marked out of scope (audit-retained, never hard-deleted). Idempotent. Only valid for identities still in the `discovered` state.",
+		Tags:        []string{"Identities"},
+	}, a.dismissIdentityOp)
+
+	// Connector-sync write path: bulk ingest + stale prune. A discovery sync
+	// upserts everything it enumerated (batch), then prunes the rows it no longer
+	// sees (prune) — the two halves of a reconcile.
+	huma.Register(api, huma.Operation{
+		OperationID: "ingest-discovered-identities-batch",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/batch",
+		Summary:     "Bulk idempotent upsert of discovered identities (one connector sync)",
+		Description: "Best-effort: each agent is upserted independently (same idempotency + no-clobber-native guard as the single ingest); per-agent failures are reported, not fatal. Capped per request — page larger syncs.",
+		Tags:        []string{"Identities"},
+	}, a.ingestDiscoveredBatchOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "prune-stale-discovered",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/prune",
+		Summary:     "Deactivate discovered identities a sync no longer sees (offboarding)",
+		Description: "Scoped to one (origin, source_id): deactivates only still-`discovered` rows last seen before `not_seen_since`. Never touches adopted/active identities, and never another connector's rows. The offboarding half of a connector reconcile.",
+		Tags:        []string{"Identities"},
+	}, a.pruneStaleDiscoveredOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -347,8 +401,16 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if input.IdentityClass != "" && input.IdentityClass != "custom" && input.IdentityClass != "code_agent" {
 		return nil, huma.Error400BadRequest("invalid identity_class: must be custom or code_agent")
 	}
+	// "external" is the sentinel for any non-native provenance; otherwise the
+	// origin must be a syntactically valid ecosystem identifier.
+	if input.Origin != "" && input.Origin != "external" && !domain.ValidOrigin(input.Origin) {
+		return nil, huma.Error400BadRequest("invalid origin: must be \"external\" or a lowercase ecosystem identifier (e.g. okta)")
+	}
+	if input.Status != "" && !domain.IdentityStatus(input.Status).Valid() {
+		return nil, huma.Error400BadRequest("invalid status filter")
+	}
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, input.Status, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
@@ -464,4 +526,263 @@ func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	}
 
 	return &IdentityOutput{Body: identity}, nil
+}
+
+// ── Discovery: ingestion + lifecycle ──────────────────────────────────────────
+
+type CreateDiscoveredIdentityInput struct {
+	Body struct {
+		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
+		Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
+		SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
+		Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
+		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+		OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
+		Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
+		Version      string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
+		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+	}
+}
+
+// DiscoveredIdentityOutput carries the upserted identity plus whether this call
+// created it (vs reconciled an existing row) so the discovery service can track
+// per-sync create/update counts.
+type DiscoveredIdentityOutput struct {
+	Body struct {
+		Identity *domain.Identity `json:"identity"`
+		Created  bool             `json:"created"`
+	}
+}
+
+func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDiscoveredIdentityInput) (*DiscoveredIdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	origin := domain.Origin(input.Body.Origin)
+	if !origin.IsExternal() {
+		return nil, huma.Error400BadRequest("origin must be an external ecosystem (not 'native') for a discovered identity")
+	}
+	// Validate origin shape up front so an invalid value is rejected consistently
+	// whether this ingest creates a new row or reconciles an existing one (the
+	// reconcile path never reaches RegisterIdentity's ValidOrigin check).
+	if !domain.ValidOrigin(input.Body.Origin) {
+		return nil, huma.Error400BadRequest("invalid origin: must be a lowercase ecosystem identifier (e.g. okta, entra, google_workspace)")
+	}
+
+	trustLevel := domain.TrustLevel(input.Body.TrustLevel)
+	if trustLevel != "" && !trustLevel.Valid() {
+		return nil, huma.Error400BadRequest("invalid trust_level")
+	}
+	identityType := domain.IdentityType(input.Body.IdentityType)
+	if identityType != "" && !identityType.Valid() {
+		return nil, huma.Error400BadRequest("invalid identity_type")
+	}
+	subType := domain.SubType(input.Body.SubType)
+	if subType != "" && !subType.ValidForIdentityType(identityType) {
+		return nil, huma.Error400BadRequest("invalid sub_type for the given identity_type")
+	}
+
+	identity, created, err := a.identitySvc.UpsertDiscoveredIdentity(ctx, service.DiscoveredIdentityRequest{
+		AccountID:    tenant.AccountID,
+		ProjectID:    tenant.ProjectID,
+		ExternalID:   input.Body.ExternalID,
+		Origin:       origin,
+		SourceID:     input.Body.SourceID,
+		Name:         input.Body.Name,
+		IdentityType: identityType,
+		SubType:      subType,
+		TrustLevel:   trustLevel,
+		OwnerUserID:  input.Body.OwnerUserID,
+		Framework:    input.Body.Framework,
+		Version:      input.Body.Version,
+		Publisher:    input.Body.Publisher,
+		Description:  input.Body.Description,
+		Capabilities: input.Body.Capabilities,
+		Labels:       input.Body.Labels,
+		Metadata:     input.Body.Metadata,
+		CreatedBy:    internalMiddleware.GetCallerName(ctx),
+	})
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityAlreadyExists) {
+			return nil, huma.Error409Conflict("external_id already belongs to a native identity in this tenant")
+		}
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Str("external_id", input.Body.ExternalID).Str("origin", input.Body.Origin).Msg("failed to ingest discovered identity")
+		return nil, huma.Error500InternalServerError("failed to ingest discovered identity")
+	}
+
+	out := &DiscoveredIdentityOutput{}
+	out.Body.Identity = identity
+	out.Body.Created = created
+	return out, nil
+}
+
+type AdoptIdentityInput struct {
+	ID   string `path:"id" doc:"Identity UUID"`
+	Body struct {
+		OwnerUserID        string `json:"owner_user_id" required:"true" minLength:"1" doc:"Human owner to make accountable for the adopted identity"`
+		CredentialPolicyID string `json:"credential_policy_id,omitempty" doc:"Optional identity policy to assign at adoption; defaults to the tenant default"`
+	}
+}
+
+func (a *API) adoptIdentityOp(ctx context.Context, input *AdoptIdentityInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	identity, err := a.identitySvc.AdoptIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID, input.Body.OwnerUserID, input.Body.CredentialPolicyID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
+		}
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to adopt identity")
+		return nil, mapErr(err)
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+func (a *API) dismissIdentityOp(ctx context.Context, input *IdentityIDInput) (*IdentityOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	identity, err := a.identitySvc.DismissIdentity(ctx, input.ID, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Str("identity_id", input.ID).Msg("failed to dismiss identity")
+		return nil, mapErr(err)
+	}
+
+	return &IdentityOutput{Body: identity}, nil
+}
+
+// ── Discovery connector-sync: bulk ingest + stale prune ───────────────────────
+
+// DiscoveredAgentItem is one agent in a bulk discovery ingest — the same shape
+// as the single-ingest body.
+type DiscoveredAgentItem struct {
+	ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
+	Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
+	SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
+	Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
+	IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+	SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
+	TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+	OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner"`
+	Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
+	Version      string          `json:"version,omitempty" doc:"Agent version"`
+	Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher"`
+	Description  string          `json:"description,omitempty" doc:"Description"`
+	Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
+	Labels       json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+	Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+}
+
+type BatchDiscoveredInput struct {
+	Body struct {
+		Agents []DiscoveredAgentItem `json:"agents" required:"true" minItems:"1" doc:"Discovered agents enumerated by one connector sync"`
+	}
+}
+
+type BatchDiscoveredOutput struct {
+	Body *service.BulkDiscoveredResult
+}
+
+func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscoveredInput) (*BatchDiscoveredOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+	createdBy := internalMiddleware.GetCallerName(ctx)
+
+	reqs := make([]service.DiscoveredIdentityRequest, 0, len(input.Body.Agents))
+	for _, item := range input.Body.Agents {
+		reqs = append(reqs, service.DiscoveredIdentityRequest{
+			AccountID:    tenant.AccountID,
+			ProjectID:    tenant.ProjectID,
+			ExternalID:   item.ExternalID,
+			Origin:       domain.Origin(item.Origin),
+			SourceID:     item.SourceID,
+			Name:         item.Name,
+			IdentityType: domain.IdentityType(item.IdentityType),
+			SubType:      domain.SubType(item.SubType),
+			TrustLevel:   domain.TrustLevel(item.TrustLevel),
+			OwnerUserID:  item.OwnerUserID,
+			Framework:    item.Framework,
+			Version:      item.Version,
+			Publisher:    item.Publisher,
+			Description:  item.Description,
+			Capabilities: item.Capabilities,
+			Labels:       item.Labels,
+			Metadata:     item.Metadata,
+			CreatedBy:    createdBy,
+		})
+	}
+
+	result, err := a.identitySvc.BulkUpsertDiscoveredIdentities(ctx, reqs)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Int("count", len(reqs)).Msg("failed bulk discovered ingest")
+		return nil, huma.Error500InternalServerError("failed to ingest discovered identities")
+	}
+	return &BatchDiscoveredOutput{Body: result}, nil
+}
+
+type PruneDiscoveredInput struct {
+	Body struct {
+		Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem to prune within (e.g. okta)"`
+		SourceID     string `json:"source_id" required:"true" minLength:"1" doc:"Discovery source instance (connector) whose sweep this is — scopes the prune to one source"`
+		NotSeenSince string `json:"not_seen_since" required:"true" doc:"RFC3339 timestamp (the sync start). Still-discovered rows of this source last updated before this are deactivated."`
+	}
+}
+
+type PruneDiscoveredOutput struct {
+	Body struct {
+		Deactivated int `json:"deactivated"`
+	}
+}
+
+func (a *API) pruneStaleDiscoveredOp(ctx context.Context, input *PruneDiscoveredInput) (*PruneDiscoveredOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	notSeenSince, perr := time.Parse(time.RFC3339, input.Body.NotSeenSince)
+	if perr != nil {
+		return nil, huma.Error400BadRequest("invalid not_seen_since: must be an RFC3339 timestamp")
+	}
+
+	n, err := a.identitySvc.PruneStaleDiscovered(ctx, tenant.AccountID, tenant.ProjectID, domain.Origin(input.Body.Origin), input.Body.SourceID, notSeenSince)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Msg("failed to prune stale discovered identities")
+		return nil, huma.Error500InternalServerError("failed to prune stale discovered identities")
+	}
+
+	out := &PruneDiscoveredOutput{}
+	out.Body.Deactivated = n
+	return out, nil
 }
