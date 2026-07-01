@@ -177,7 +177,7 @@ func redactErrorValues(paths ...string) huma.Transformer {
 		}
 		if em, ok := v.(*huma.ErrorModel); ok {
 			for _, detail := range em.Errors {
-				if detail.Value != nil {
+				if detail != nil && detail.Value != nil {
 					detail.Value = "[redacted]"
 				}
 			}

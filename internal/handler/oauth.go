@@ -491,6 +491,9 @@ type BcAuthorizeInput struct {
 		// to the BackchannelNotifier hook for typed approval-prompt
 		// rendering. Empty / omitted keeps the legacy CIBA flow unchanged.
 		AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty" doc:"RFC 9396 Rich Authorization Requests payload (JSON array of typed objects)"`
+		// CIBA Core 1.0 §7.1 inherits RFC 6749 §3.1's ignore-unrecognized-params
+		// posture, same as TokenInput/IntrospectInput/OAuthRevokeInput.
+		_ struct{} `additionalProperties:"true"`
 	}
 }
 

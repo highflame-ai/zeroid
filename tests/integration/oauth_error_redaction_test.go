@@ -82,6 +82,22 @@ func TestOAuthIntrospectIgnoresUnknownParams(t *testing.T) {
 	assert.False(t, body["active"].(bool), "not a real token, so introspection reports inactive")
 }
 
+func TestOAuthBcAuthorizeIgnoresUnknownParams(t *testing.T) {
+	clientID := setupCIBAClient(t)
+
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id":             clientID,
+		"account_id":            testAccountID,
+		"project_id":            testProjectID,
+		"group_hint":            "highflame:role:finance_lead",
+		"scope":                 "openid",
+		"not_a_real_ciba_field": "123",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"unrecognized request parameters must be ignored, not rejected (RFC 6749 §3.1, "+
+			"inherited by CIBA Core 1.0 §7.1)")
+}
+
 func TestOAuthRevokeIgnoresUnknownParams(t *testing.T) {
 	resp := post(t, "/oauth2/token/revoke", map[string]any{
 		"token": "12345",
