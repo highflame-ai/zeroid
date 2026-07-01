@@ -144,7 +144,46 @@ func zeroidHumaConfig() huma.Config {
 		},
 	}
 
+	// Huma's schema validator echoes the offending request body back in
+	// ErrorDetail.Value on every failure path (unexpected property, missing
+	// required field, etc.) — see danielgtaylor/huma/v2 validate.go, the
+	// res.Add(path, m, ...) calls pass the whole parent object, not just the
+	// field in question. On the credential-bearing OAuth endpoints that
+	// reflects the caller's token/secret straight into the response (and
+	// anything downstream that logs it). Redact it there; leave it intact
+	// elsewhere, where echoing the bad value back is legitimate debugging aid.
+	config.Transformers = append(config.Transformers, redactErrorValues(
+		"/oauth2/token",
+		"/oauth2/token/introspect",
+		"/oauth2/token/revoke",
+		"/oauth2/bc-authorize",
+	))
+
 	return config
+}
+
+// redactErrorValues returns a huma.Transformer that blanks every
+// huma.ErrorDetail.Value on responses to the given paths, so validation
+// failures never echo submitted credential material back to the caller (or
+// into anything that logs the response body).
+func redactErrorValues(paths ...string) huma.Transformer {
+	redact := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		redact[p] = true
+	}
+	return func(ctx huma.Context, status string, v any) (any, error) {
+		if !redact[ctx.Operation().Path] {
+			return v, nil
+		}
+		if em, ok := v.(*huma.ErrorModel); ok {
+			for _, detail := range em.Errors {
+				if detail.Value != nil {
+					detail.Value = "[redacted]"
+				}
+			}
+		}
+		return v, nil
+	}
 }
 
 // prmURL returns the absolute URL of this server's RFC 9728 Protected

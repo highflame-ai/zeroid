@@ -65,6 +65,9 @@ type TokenInput struct {
 		RefreshToken string `json:"refresh_token,omitempty" doc:"Refresh token (zid_rt_*)"`
 		// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 		AuthReqID string `json:"auth_req_id,omitempty" doc:"Backchannel auth_req_id returned from /oauth2/bc-authorize"`
+		// RFC 6749 §3.1: the server MUST ignore unrecognized request
+		// parameters rather than rejecting the request outright.
+		_ struct{} `additionalProperties:"true"`
 	}
 }
 
@@ -127,6 +130,8 @@ type IntrospectInput struct {
 		// the endpoint preserves the internal/network-isolated access path.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// RFC 7662 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
+		_ struct{} `additionalProperties:"true"`
 	}
 }
 
@@ -148,6 +153,8 @@ type OAuthRevokeInput struct {
 		// authorization). Same accept-and-verify posture as introspection.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// RFC 7009 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
+		_ struct{} `additionalProperties:"true"`
 	}
 }
 
