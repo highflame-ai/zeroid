@@ -97,6 +97,7 @@ type AgentResponse struct {
 	TrustLevel         domain.TrustLevel     `json:"trust_level"`
 	Status             domain.IdentityStatus `json:"status"`
 	Origin             domain.Origin         `json:"origin"`
+	OwnerUserID        string                `json:"owner_user_id,omitempty"`
 	CredentialPolicyID string                `json:"credential_policy_id,omitempty"`
 	Framework          string                `json:"framework"`
 	Version            string                `json:"version"`
@@ -569,6 +570,7 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 		TrustLevel:         identity.TrustLevel,
 		Status:             identity.Status,
 		Origin:             identity.Origin,
+		OwnerUserID:        identity.OwnerUserID,
 		CredentialPolicyID: identity.CredentialPolicyID,
 		Framework:          identity.Framework,
 		Version:            identity.Version,
