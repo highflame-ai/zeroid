@@ -94,4 +94,11 @@ type IssuedCredential struct {
 	// Bearer tokens. When non-empty, the access token carries a cnf.jkt claim
 	// and must be presented with a valid DPoP proof at the protected resource.
 	DPoPKeyThumbprint string `bun:"dpop_key_thumbprint,type:text" json:"dpop_key_thumbprint,omitempty"`
+	// AuditRetentionUntil is the evidence clock, decoupled from ExpiresAt
+	// (the operational clock): how long the row remains queryable so the
+	// delegation graph (parent_jti walks, mission_id aggregates) survives
+	// token expiry. The cleanup worker prunes on this, not ExpiresAt. Nil on
+	// rows written before migration 037; those fall back to the legacy
+	// expires_at prune rule.
+	AuditRetentionUntil *time.Time `bun:"audit_retention_until" json:"audit_retention_until,omitempty"`
 }

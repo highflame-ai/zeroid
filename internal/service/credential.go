@@ -26,6 +26,11 @@ type CredentialService struct {
 	issuer          string
 	defaultTTL      int
 	maxTTL          int
+	// auditRetention is how long past expiry an issued_credentials row
+	// stays queryable (the evidence clock the cleanup worker prunes on),
+	// so the delegation graph survives token expiry. From
+	// token.audit_retention_days.
+	auditRetention time.Duration
 	// revocationDispatcher fans out a RevocationEvent per revoked JTI to the
 	// deployer-supplied RevocationNotifier after each revocation commits.
 	// Shared with RefreshTokenService so one Server.SetRevocationNotifier call
@@ -41,8 +46,15 @@ func NewCredentialService(
 	policySvc *CredentialPolicyService,
 	attestationRepo *postgres.AttestationRepository,
 	issuer string,
-	defaultTTL, maxTTL int,
+	defaultTTL, maxTTL, auditRetentionDays int,
 ) *CredentialService {
+	// A non-positive retention would stamp AuditRetentionUntil at or before
+	// expiry, silently degrading the graph back to delete-at-expiry. Clamp
+	// to the shipped default instead — misconfiguration must not erase
+	// evidence.
+	if auditRetentionDays <= 0 {
+		auditRetentionDays = 400
+	}
 	return &CredentialService{
 		repo:            repo,
 		jwksSvc:         jwksSvc,
@@ -51,6 +63,7 @@ func NewCredentialService(
 		issuer:          issuer,
 		defaultTTL:      defaultTTL,
 		maxTTL:          maxTTL,
+		auditRetention:  time.Duration(auditRetentionDays) * 24 * time.Hour,
 	}
 }
 
@@ -474,7 +487,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		return nil, nil, fmt.Errorf("failed to sign JWT: %w", signErr)
 	}
 
-	// Persist credential record
+	// Persist credential record. AuditRetentionUntil (evidence clock) is
+	// stamped at issuance so the row outlives the token: the delegation
+	// graph reads expired rows within the retention window (see the
+	// cleanup worker's two-clock prune).
+	auditRetentionUntil := expiresAt.Add(s.auditRetention)
 	cred := &domain.IssuedCredential{
 		ID:                  uuid.New().String(),
 		IdentityID:          stringPtrOrNil(req.Identity.ID),
@@ -492,6 +509,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		DelegatedByWIMSEURI: req.DelegatedBy,
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+		AuditRetentionUntil: &auditRetentionUntil,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {

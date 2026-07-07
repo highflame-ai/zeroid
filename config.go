@@ -236,6 +236,15 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// AuditRetentionDays is how long an issued_credentials row remains
+	// queryable AFTER the token expires. The two clocks are deliberately
+	// decoupled (same model as signing_credentials): expires_at bounds how
+	// long the token authenticates; expires_at + AuditRetentionDays bounds
+	// how long the delegation graph can still answer historical questions
+	// about it. The cleanup worker prunes on the audit clock, never on
+	// expiry alone. See domain.IssuedCredential.AuditRetentionUntil.
+	AuditRetentionDays int `koanf:"audit_retention_days"`
+
 	// authorization_code grant configuration.
 	// HMACSecret is the shared secret used to sign and verify auth code JWTs (HS256).
 	HMACSecret string `koanf:"hmac_secret"`
@@ -554,6 +563,10 @@ func loadDefaults(k *koanf.Koanf) error {
 		// validateWIMSEDomain() reject empty values at startup.
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
+		// Delegation-graph evidence clock: issued_credentials rows stay
+		// queryable this long past token expiry (mirrors
+		// signing_credentials.audit_retention_days).
+		"token.audit_retention_days": 400,
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
@@ -634,6 +647,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_ISSUER":                "token.issuer",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		// Evidence clock for issued_credentials (delegation-graph retention).
+		"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
 		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
 		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
 		"ZEROID_HMAC_SECRET": "token.hmac_secret",
