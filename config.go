@@ -390,6 +390,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
 	}
 
+	// token.audit_retention_days is a day count converted to time.Duration
+	// (days × 24h in nanoseconds); past ~106751 days the multiplication
+	// overflows int64 into a NEGATIVE duration, which would stamp
+	// AuditRetentionUntil before expiry and silently erase the evidence
+	// window the knob exists to guarantee. 36500 (~100y) is a generous
+	// practical ceiling. 0 means "use the shipped default (400)".
+	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > 36500 {
+		return fmt.Errorf("token.audit_retention_days must be between 0 and 36500, got %d: it is the delegation-graph evidence-retention window in days (0 = default 400)", c.Token.AuditRetentionDays)
+	}
+
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
 	for i := range c.ExternalIssuers {
 		c.ExternalIssuers[i].Defaults()

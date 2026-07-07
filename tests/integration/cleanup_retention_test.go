@@ -144,6 +144,49 @@ func TestDelegationGraphSurvivesTokenExpiry(t *testing.T) {
 	assert.Contains(t, downJTIs, childJTI, "walk-down from the expired root must still reach the live child")
 }
 
+// TestRotateRejectsExpiredCredential pins the guard that keeps audit
+// retention from widening the rotation surface: rows now outlive expiry by
+// ~400 days, and RotateCredential's revoke half is a silent no-op on an
+// expired row (the cascade anchor requires expires_at > revoked_at) — so
+// without the guard, "rotate" would mint a live token off a long-dead
+// credential. An expired credential must be rejected, left unrevoked, and
+// no replacement minted.
+func TestRotateRejectsExpiredCredential(t *testing.T) {
+	ctx := context.Background()
+
+	policyID := delegationPolicy(t, uid("rotate-expired-policy"), []string{"mcp:read"})
+	identityID, jti, _ := issueRootCredential(t, policyID, "rotate-expired", []string{"mcp:read"})
+
+	var cred domain.IssuedCredential
+	require.NoError(t, testDB.NewSelect().Model(&cred).Where("jti = ?", jti).Scan(ctx))
+
+	// Age the credential past expiry directly — the API cannot mint an
+	// already-expired token.
+	_, err := testDB.NewUpdate().
+		Model((*domain.IssuedCredential)(nil)).
+		Set("expires_at = ?", time.Now().Add(-time.Hour)).
+		Where("id = ?", cred.ID).
+		Exec(ctx)
+	require.NoError(t, err)
+
+	resp := post(t, adminPath("/credentials/"+cred.ID+"/rotate"), nil, adminHeaders())
+	defer func() { _ = resp.Body.Close() }()
+	assert.GreaterOrEqual(t, resp.StatusCode, 400,
+		"rotating an expired credential must fail, not resurrect it")
+
+	// The expired row must be untouched: not retro-revoked, and no
+	// replacement credential minted for the identity.
+	require.NoError(t, testDB.NewSelect().Model(&cred).Where("id = ?", cred.ID).Scan(ctx))
+	assert.False(t, cred.IsRevoked, "failed rotation must not retro-revoke the expired row")
+
+	n, err := testDB.NewSelect().
+		Model((*domain.IssuedCredential)(nil)).
+		Where("identity_id = ?", identityID).
+		Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "failed rotation must not mint a replacement credential")
+}
+
 // TestIssuedCredentialStampedWithAuditRetention proves the write path: a
 // credential minted through the real issuance flow carries a non-NULL
 // audit_retention_until strictly beyond its expires_at, so every new row

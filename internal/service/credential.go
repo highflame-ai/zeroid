@@ -686,6 +686,14 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 	if old.IsRevoked {
 		return nil, nil, fmt.Errorf("credential is already revoked")
 	}
+	// An expired credential cannot be rotated: the revoke half would be a
+	// silent no-op (the cascade anchor requires expires_at > revoked_at) and
+	// "rotate" would degrade to minting a fresh token off a dead row. Rows
+	// now outlive expiry by the audit-retention window, so without this
+	// guard a long-dead credential would stay rotatable for ~400 days.
+	if time.Now().After(old.ExpiresAt) {
+		return nil, nil, fmt.Errorf("credential is expired; issue a new credential instead of rotating")
+	}
 
 	// Revoke the old credential (cascades to descendants and fires the
 	// RevocationNotifier per affected JTI, same as any other revoke path).
