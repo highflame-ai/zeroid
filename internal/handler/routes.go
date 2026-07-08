@@ -237,6 +237,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerExpiringSoonRoute(api)
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
+	a.registerCodeAgentAdminRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).
@@ -252,4 +253,5 @@ func (a *API) RegisterAgentAuth(api huma.API) {
 // wraps them in AgentAuthMiddleware, and tenant/identity come from token claims.
 func (a *API) RegisterAgentSelfService(api huma.API) {
 	a.registerAgentSelfServiceRoute(api)
+	a.registerCodeAgentAttestRoute(api)
 }

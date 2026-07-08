@@ -24,6 +24,10 @@ type AgentService struct {
 	// proof must target is derived from it (see keyProofAudience).
 	issuer        string
 	delegationSvc *DelegationService
+	// credentialSvc mints the first access token during code-agent bootstrap
+	// (RegisterCodeAgentFromBootstrap) so a freshly registered agent leaves
+	// the bootstrap call already able to authenticate.
+	credentialSvc *CredentialService
 }
 
 // NewAgentService creates a new AgentService. keyProofReplay backs single-use
@@ -36,6 +40,7 @@ func NewAgentService(
 	keyProofReplay keyProofReplayGuard,
 	issuer string,
 	delegationSvc *DelegationService,
+	credentialSvc *CredentialService,
 ) *AgentService {
 	return &AgentService{
 		identitySvc:    identitySvc,
@@ -44,6 +49,7 @@ func NewAgentService(
 		keyProofReplay: keyProofReplay,
 		issuer:         issuer,
 		delegationSvc:  delegationSvc,
+		credentialSvc:  credentialSvc,
 	}
 }
 

@@ -27,6 +27,14 @@ const (
 	GrantTypeRefreshToken GrantType = "refresh_token"
 )
 
+// ScopeZeroIDBootstrap is the single-purpose OAuth scope that authorizes
+// code-agent bootstrap: registering a code-agent identity from a developer
+// machine and minting its first access token (POST /code-agents/bootstrap).
+// It grants nothing else — a bootstrap-scoped token is not accepted by any
+// other endpoint, so a leaked developer bootstrap token cannot read or manage
+// existing identities.
+const ScopeZeroIDBootstrap = "zeroid:bootstrap"
+
 // urnToShortGrantType maps OAuth2 URN grant type identifiers to their canonical short forms.
 var urnToShortGrantType = map[string]GrantType{
 	"urn:ietf:params:oauth:grant-type:jwt-bearer":     GrantTypeJWTBearer,

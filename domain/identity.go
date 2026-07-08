@@ -441,6 +441,19 @@ type Identity struct {
 	RiskTier       string `bun:"risk_tier,type:varchar(20),nullzero"       json:"risk_tier,omitempty"`
 	IAL            string `bun:"ial,type:varchar(20),nullzero"             json:"ial,omitempty"`
 
+	// Code-agent bootstrap (migration 038). BootstrapMachineID records the
+	// developer machine this code agent was bootstrapped from, enabling
+	// revoke-by-machine (lost/compromised laptop → deactivate every agent it
+	// spawned). LastAttestedAt + AttestationEvidence track attestation
+	// freshness: the agent periodically re-attests its runtime environment
+	// via POST /code-agents/{id}/attest. All three are NULL for anything
+	// that is not a bootstrapped code agent (`nullzero` keeps the empty Go
+	// string as SQL NULL so the partial bootstrap-machine index and the
+	// IS NOT NULL listing filters stay correct).
+	BootstrapMachineID  string          `bun:"bootstrap_machine_id,type:varchar(255),nullzero" json:"bootstrap_machine_id,omitempty"`
+	LastAttestedAt      *time.Time      `bun:"last_attested_at" json:"last_attested_at,omitempty"`
+	AttestationEvidence json.RawMessage `bun:"attestation_evidence,type:jsonb" json:"attestation_evidence,omitempty"`
+
 	// ExpiresAt time-bounds the grant of authority itself (NOT the JWT it
 	// issues). NULL means "no expiry" — the historical default. When set,
 	// IssueCredential rejects new tokens past this time and the cleanup

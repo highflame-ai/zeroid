@@ -467,6 +467,114 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 	return int(n), nil
 }
 
+// SetBootstrapInfo stamps the code-agent bootstrap columns (migration 038):
+// the developer machine the agent's custody key lives on plus the initial
+// attestation timestamp (bootstrap counts as the first attestation). Tenant-
+// scoped; returns a not-found error when no row matched so the service layer
+// can surface a 404 instead of silently succeeding.
+func (r *IdentityRepository) SetBootstrapInfo(ctx context.Context, id, accountID, projectID, machineID string, attestedAt time.Time) error {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("bootstrap_machine_id = ?", machineID).
+		Set("last_attested_at = ?", attestedAt).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to set bootstrap info: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("set bootstrap info rows: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("identity %s not found", id)
+	}
+	return nil
+}
+
+// RecordAttestation refreshes a code agent's attestation state: bumps
+// last_attested_at and replaces attestation_evidence with the latest
+// evidence document (opaque JSON — ZeroID stores it, policy elsewhere
+// decides on staleness). Tenant-scoped; 0 rows matched is a not-found error
+// so the handler can 404.
+func (r *IdentityRepository) RecordAttestation(ctx context.Context, id, accountID, projectID string, evidence json.RawMessage, attestedAt time.Time) error {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("last_attested_at = ?", attestedAt).
+		Set("attestation_evidence = ?::jsonb", string(evidence)).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to record attestation: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("record attestation rows: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("identity %s not found", id)
+	}
+	return nil
+}
+
+// ListActiveByBootstrapMachine returns the ACTIVE code agents bootstrapped
+// from the given machine, optionally narrowed to one owner. Backs
+// revoke-by-machine (lost/compromised laptop → deactivate everything it
+// spawned); the partial idx_identities_bootstrap_machine index keeps the
+// scan O(code-agent-rows).
+func (r *IdentityRepository) ListActiveByBootstrapMachine(ctx context.Context, accountID, projectID, machineID, ownerUserID string) ([]*domain.Identity, error) {
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	q := db.NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("bootstrap_machine_id = ?", machineID).
+		Where("status = ?", string(domain.IdentityStatusActive))
+	if ownerUserID != "" {
+		q = q.Where("owner_user_id = ?", ownerUserID)
+	}
+	if err := q.OrderExpr("created_at DESC").Scan(ctx); err != nil {
+		return nil, fmt.Errorf("failed to list identities by bootstrap machine: %w", err)
+	}
+	return identities, nil
+}
+
+// ListBootstrappedByOwner returns every bootstrapped code agent (agent-type
+// identity with a bootstrap_machine_id) owned by the given developer — the
+// "my code agents" inventory view. All statuses are returned so revoked
+// agents remain visible in the developer's history.
+func (r *IdentityRepository) ListBootstrappedByOwner(ctx context.Context, accountID, projectID, ownerUserID string) ([]*domain.Identity, error) {
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("owner_user_id = ?", ownerUserID).
+		Where("identity_type = ?", string(domain.IdentityTypeAgent)).
+		Where("bootstrap_machine_id IS NOT NULL").
+		OrderExpr("created_at DESC").
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("failed to list bootstrapped identities by owner: %w", err)
+	}
+	return identities, nil
+}
+
 // ListExpiredActive returns identities whose expires_at has passed while
 // their status is still 'active'. Used by the cleanup worker's identity
 // sweep. The partial index on (expires_at) WHERE status='active' makes

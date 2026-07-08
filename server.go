@@ -301,7 +301,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Created before AgentService so depths can be included in agent list responses.
 	delegationSvc := service.NewDelegationService(credentialRepo, delegationRepo, identityRepo)
 
-	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer, delegationSvc)
+	agentSvc := service.NewAgentService(identitySvc, apiKeySvc, apiKeyRepo, postgres.NewDPoPReplayStore(db), cfg.Token.Issuer, delegationSvc, credentialSvc)
 
 	// BackchannelService (CIBA) is constructed after oauthSvc/credentialSvc and
 	// then wired back into oauthSvc.SetBackchannelService — the CIBA grant
@@ -400,13 +400,35 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Agent self-service group — authenticated by the agent's OWN access token
 	// (NOT the admin/internal secret) and mounted on the public router so agents
 	// can reach it directly on the public ingress. Tenant + identity come from the
-	// validated token claims (never headers). Holds POST /agents/self/public-key.
+	// validated token claims (never headers). Holds POST /agents/self/public-key
+	// and POST /code-agents/{id}/attest.
 	r.Group(func(r chi.Router) {
 		r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 		// Specless: this group shares the root router with RegisterPublic, so it
 		// must not register a second /openapi.json that would shadow the canonical
 		// public spec.
 		apiHandler.RegisterAgentSelfService(handler.NewHumaAPISpecless(r))
+	})
+
+	// Code-agent bootstrap group — authenticated by a zeroid:bootstrap-scoped
+	// developer token (BootstrapAuthMiddleware) and mounted on the public router
+	// so a code agent on a developer machine can reach it on the public ingress.
+	// Tenant + owner come from the validated token claims (never the body).
+	// Holds POST /code-agents/bootstrap. RS256 fallback covers the PKCE-minted
+	// developer token (authorization_code issues RS256); deployments without
+	// RSA keys simply accept ES256 bootstrap tokens only.
+	bootstrapAuthCfg := internalMiddleware.BootstrapAuthConfig{
+		ECPublicKey:         jwksSvc.PublicKey(),
+		Issuer:              cfg.Token.Issuer,
+		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
+	}
+	if jwksSvc.HasRSAKeys() {
+		bootstrapAuthCfg.RSAPublicKey = jwksSvc.RSAPublicKey()
+	}
+	r.Group(func(r chi.Router) {
+		r.Use(internalMiddleware.BootstrapAuthMiddleware(bootstrapAuthCfg))
+		// Specless for the same reason as the self-service group above.
+		apiHandler.RegisterCodeAgentBootstrap(handler.NewHumaAPISpecless(r))
 	})
 
 	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
