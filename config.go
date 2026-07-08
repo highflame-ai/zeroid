@@ -243,6 +243,11 @@ type TokenConfig struct {
 	// how long the delegation graph can still answer historical questions
 	// about it. The cleanup worker prunes on the audit clock, never on
 	// expiry alone. See domain.IssuedCredential.AuditRetentionUntil.
+	//
+	// Floor: the cleanup worker ANDs this evidence clock with the
+	// cascade-walk clock (Token.MaxTTL). A value below MaxTTL (~90d) has no
+	// effect on deletion timing — MaxTTL is the effective floor. 0 selects
+	// domain.DefaultAuditRetentionDays; see Validate for the accepted range.
 	AuditRetentionDays int `koanf:"audit_retention_days"`
 
 	// authorization_code grant configuration.
@@ -394,10 +399,10 @@ func (c *Config) Validate() error {
 	// (days × 24h in nanoseconds); past ~106751 days the multiplication
 	// overflows int64 into a NEGATIVE duration, which would stamp
 	// AuditRetentionUntil before expiry and silently erase the evidence
-	// window the knob exists to guarantee. 36500 (~100y) is a generous
-	// practical ceiling. 0 means "use the shipped default (400)".
-	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > 36500 {
-		return fmt.Errorf("token.audit_retention_days must be between 0 and 36500, got %d: it is the delegation-graph evidence-retention window in days (0 = default 400)", c.Token.AuditRetentionDays)
+	// window the knob exists to guarantee. Bounds shared with the service
+	// clamp via domain. 0 means "use domain.DefaultAuditRetentionDays".
+	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > domain.MaxAuditRetentionDays {
+		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
 	}
 
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
@@ -574,9 +579,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
 		// Delegation-graph evidence clock: issued_credentials rows stay
-		// queryable this long past token expiry (mirrors
-		// signing_credentials.audit_retention_days).
-		"token.audit_retention_days": 400,
+		// queryable this long past token expiry. Single source of truth in
+		// domain so the default can't drift from the service clamp / Validate.
+		"token.audit_retention_days": domain.DefaultAuditRetentionDays,
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
@@ -714,6 +719,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".max_idle_conns") ||
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
+			strings.HasSuffix(configPath, ".audit_retention_days") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
 			intVal, err := strconv.Atoi(value)
 			if err != nil {

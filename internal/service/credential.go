@@ -48,12 +48,17 @@ func NewCredentialService(
 	issuer string,
 	defaultTTL, maxTTL, auditRetentionDays int,
 ) *CredentialService {
-	// A non-positive retention would stamp AuditRetentionUntil at or before
-	// expiry, silently degrading the graph back to delete-at-expiry. Clamp
-	// to the shipped default instead — misconfiguration must not erase
-	// evidence.
+	// Clamp defensively: this constructor is also reached from tests and
+	// external tools that bypass Config.Validate. A non-positive value would
+	// stamp AuditRetentionUntil at or before expiry (degrading the graph back
+	// to delete-at-expiry); an enormous value would overflow the
+	// days→Duration multiplication into a negative duration (same effect,
+	// worse). Both collapse to safe bounds — misconfiguration must never
+	// erase evidence. Bounds shared with Config.Validate via domain.
 	if auditRetentionDays <= 0 {
-		auditRetentionDays = 400
+		auditRetentionDays = domain.DefaultAuditRetentionDays
+	} else if auditRetentionDays > domain.MaxAuditRetentionDays {
+		auditRetentionDays = domain.MaxAuditRetentionDays
 	}
 	return &CredentialService{
 		repo:            repo,
@@ -683,16 +688,18 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 	if err != nil {
 		return nil, nil, fmt.Errorf("credential not found: %w", err)
 	}
+	// Both terminal-state rejections wrap a sentinel so the handler maps
+	// them to 409, not 500: with rows now outliving their tokens by the
+	// audit-retention window, rotating a long-dead credential is a routine
+	// client mistake, not a server fault, and must not fire 5xx alerting.
 	if old.IsRevoked {
-		return nil, nil, fmt.Errorf("credential is already revoked")
+		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialAlreadyRevoked)
 	}
 	// An expired credential cannot be rotated: the revoke half would be a
 	// silent no-op (the cascade anchor requires expires_at > revoked_at) and
-	// "rotate" would degrade to minting a fresh token off a dead row. Rows
-	// now outlive expiry by the audit-retention window, so without this
-	// guard a long-dead credential would stay rotatable for ~400 days.
+	// "rotate" would degrade to minting a fresh token off a dead row.
 	if time.Now().After(old.ExpiresAt) {
-		return nil, nil, fmt.Errorf("credential is expired; issue a new credential instead of rotating")
+		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialExpired)
 	}
 
 	// Revoke the old credential (cascades to descendants and fires the

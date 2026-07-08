@@ -6,6 +6,25 @@ import (
 	"github.com/uptrace/bun"
 )
 
+// Audit-retention window bounds for issued_credentials. One source of truth
+// for the "evidence clock" default and ceiling, referenced by the koanf
+// default, Config.Validate, and CredentialService's clamp so the three can't
+// silently diverge.
+const (
+	// DefaultAuditRetentionDays is the retention applied when
+	// token.audit_retention_days is absent or 0. ~400 days mirrors the
+	// signing-credentials retention default. NOTE: migration 037's backfill
+	// hardcodes 400 (a migration can't read config); a deployment running a
+	// non-default window must re-stamp historical rows out-of-band.
+	DefaultAuditRetentionDays = 400
+	// MaxAuditRetentionDays caps the window. Past ~106751 days the
+	// days→time.Duration conversion overflows int64 into a negative
+	// duration, which would stamp retention BEFORE expiry and erase the
+	// evidence window the knob exists to protect. 36500 (~100y) is a
+	// generous practical ceiling well below the overflow point.
+	MaxAuditRetentionDays = 36500
+)
+
 // GrantType represents the OAuth2 grant type used to issue a credential.
 type GrantType string
 

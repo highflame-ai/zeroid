@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -171,8 +172,10 @@ func TestRotateRejectsExpiredCredential(t *testing.T) {
 
 	resp := post(t, adminPath("/credentials/"+cred.ID+"/rotate"), nil, adminHeaders())
 	defer func() { _ = resp.Body.Close() }()
-	assert.GreaterOrEqual(t, resp.StatusCode, 400,
-		"rotating an expired credential must fail, not resurrect it")
+	// 409 Conflict, not 5xx: rotating a dead credential is a terminal-state
+	// client mistake, not a server fault (it must not fire 5xx alerting).
+	assert.Equal(t, http.StatusConflict, resp.StatusCode,
+		"rotating an expired credential must return 409, not resurrect it or 500")
 
 	// The expired row must be untouched: not retro-revoked, and no
 	// replacement credential minted for the identity.
