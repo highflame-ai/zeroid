@@ -408,13 +408,17 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if input.Origin != "" && input.Origin != "external" && !domain.ValidOrigin(input.Origin) {
 		return nil, huma.Error400BadRequest("invalid origin: must be \"external\" or a lowercase ecosystem identifier (e.g. okta)")
 	}
-	for _, s := range input.Status {
-		if s != "" && !domain.IdentityStatus(s).Valid() {
+	identityTypes := splitCSV(input.IdentityType)
+	statuses := splitCSV(input.Status)
+	trustLevels := splitCSV(input.TrustLevel)
+
+	for _, s := range statuses {
+		if !domain.IdentityStatus(s).Valid() {
 			return nil, huma.Error400BadRequest("invalid status filter")
 		}
 	}
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, input.Status, input.OwnerUserID, input.Ownerless, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
