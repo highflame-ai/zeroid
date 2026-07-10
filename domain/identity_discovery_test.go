@@ -136,3 +136,49 @@ func TestGetIdentitySchema_DiscoveryAdditions(t *testing.T) {
 		}
 	}
 }
+
+// TestCanRetypeDiscovered pins the re-typing rule: a connector re-sync may
+// re-classify a still-`discovered` row (the CAP-DSC-003 fix for identities
+// imported before the classifier could type them), but must never touch an
+// adopted row or write an invalid (identity_type, sub_type) pair.
+func TestCanRetypeDiscovered(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  IdentityStatus
+		curType IdentityType
+		newType IdentityType
+		curSub  SubType
+		want    bool
+	}{
+		// The fix: a discovered OAuth app (sub_type empty — the oauth_app marker
+		// lives in a label, not the domain sub_type) upgrades to mcp_server.
+		{"discovered application → mcp_server", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeMCPServer, "", true},
+		{"discovered agent → mcp_server", IdentityStatusDiscovered, IdentityTypeAgent, IdentityTypeMCPServer, "", true},
+		{"discovered application → agent", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeAgent, "", true},
+
+		// No-op: same type is not a re-type.
+		{"discovered application → application", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeApplication, "", false},
+
+		// Adopted rows are protected — type may be human-curated past discovered.
+		{"pending application → mcp_server", IdentityStatusPending, IdentityTypeApplication, IdentityTypeMCPServer, "", false},
+		{"active mcp_server → application", IdentityStatusActive, IdentityTypeMCPServer, IdentityTypeApplication, "", false},
+		{"deactivated application → mcp_server", IdentityStatusDeactivated, IdentityTypeApplication, IdentityTypeMCPServer, "", false},
+
+		// Invalid target type is refused.
+		{"discovered application → empty", IdentityStatusDiscovered, IdentityTypeApplication, "", "", false},
+		{"discovered application → bogus", IdentityStatusDiscovered, IdentityTypeApplication, "bogus", "", false},
+
+		// Never persist an invalid (type, sub_type) pair: mcp_server requires an
+		// empty sub_type, so a row carrying an application sub_type is not flipped.
+		{"discovered application(custom) → mcp_server", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeMCPServer, SubTypeCustom, false},
+		{"discovered application(custom) → agent", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeAgent, SubTypeCustom, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanRetypeDiscovered(tc.status, tc.curType, tc.newType, tc.curSub); got != tc.want {
+				t.Fatalf("CanRetypeDiscovered(%q, %q, %q, %q) = %v, want %v",
+					tc.status, tc.curType, tc.newType, tc.curSub, got, tc.want)
+			}
+		})
+	}
+}

@@ -437,6 +437,14 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if len(req.Metadata) > 0 {
 		identity.Metadata = req.Metadata
 	}
+	// Re-type a still-discovered row from the connector's current classification
+	// (e.g. application → mcp_server once it's recognised as an MCP server,
+	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows and any
+	// invalid (identity_type, sub_type) pair untouched. The refreshed metadata
+	// above already carries the new typing_source, so this completes the flip.
+	if domain.CanRetypeDiscovered(identity.Status, identity.IdentityType, req.IdentityType, identity.SubType) {
+		identity.IdentityType = req.IdentityType
+	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, false, err
