@@ -66,13 +66,15 @@ type GetIdentityByWIMSEInput struct {
 type ListIdentitiesInput struct {
 	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
 	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel    string   `query:"trust_level" doc:"Filter by trust level"`
+	TrustLevel    []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple (e.g. unverified,verified_third_party)."`
 	IsActive      string   `query:"is_active" doc:"Filter by active status"`
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
 	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
-	Status        string   `query:"status" doc:"Filter by exact lifecycle status (e.g. discovered, pending, active). The discovery adoption inbox is status=discovered."`
+	Status        []string `query:"status" doc:"Filter by exact lifecycle status. Comma-separated for multiple (e.g. discovered,pending,active)."`
+	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
+	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true/false)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -406,11 +408,13 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if input.Origin != "" && input.Origin != "external" && !domain.ValidOrigin(input.Origin) {
 		return nil, huma.Error400BadRequest("invalid origin: must be \"external\" or a lowercase ecosystem identifier (e.g. okta)")
 	}
-	if input.Status != "" && !domain.IdentityStatus(input.Status).Valid() {
-		return nil, huma.Error400BadRequest("invalid status filter")
+	for _, s := range input.Status {
+		if s != "" && !domain.IdentityStatus(s).Valid() {
+			return nil, huma.Error400BadRequest("invalid status filter")
+		}
 	}
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, input.Status, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, input.Status, input.OwnerUserID, input.Ownerless, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
