@@ -442,8 +442,15 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows and any
 	// invalid (identity_type, sub_type) pair untouched. The refreshed metadata
 	// above already carries the new typing_source, so this completes the flip.
+	// The WIMSE URI embeds identity_type as a path segment, so it must be rebuilt
+	// in lockstep or by-URI resolution (GetIdentityByWIMSEURI) breaks.
 	if domain.CanRetypeDiscovered(identity.Status, identity.IdentityType, req.IdentityType, identity.SubType) {
+		newURI, err := domain.BuildWIMSEURI(s.wimseDomain, identity.AccountID, identity.ProjectID, req.IdentityType, identity.ExternalID)
+		if err != nil {
+			return nil, false, err
+		}
 		identity.IdentityType = req.IdentityType
+		identity.WIMSEURI = newURI
 	}
 	identity.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, identity); err != nil {
