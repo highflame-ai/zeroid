@@ -74,7 +74,7 @@ type ListIdentitiesInput struct {
 	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
 	Status        []string `query:"status" doc:"Filter by exact lifecycle status. Comma-separated for multiple (e.g. discovered,pending,active)."`
 	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
-	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true/false)"`
+	Ownerless     string   `query:"ownerless" enum:"true,false" doc:"Filter for identities with no owner (true/false)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -415,6 +415,11 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	for _, s := range statuses {
 		if !domain.IdentityStatus(s).Valid() {
 			return nil, huma.Error400BadRequest("invalid status filter")
+		}
+	}
+	for _, tl := range trustLevels {
+		if !domain.TrustLevel(tl).Valid() {
+			return nil, huma.Error400BadRequest("invalid trust_level filter")
 		}
 	}
 
