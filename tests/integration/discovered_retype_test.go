@@ -85,3 +85,36 @@ func TestDiscoveredRetype_AdoptedRowNotRetyped(t *testing.T) {
 	require.Equal(t, "application", after["identity_type"], "adopted rows must never be re-typed on re-sync")
 	require.Equal(t, adoptedURI, after["wimse_uri"], "adopted row's wimse_uri must stay put")
 }
+
+// TestDiscoveredRetype_AgentToMCPServerClearsDefaultedSubType pins the sub_type
+// fix: a row ingested as an agent is stored with a defaulted tool_agent sub_type
+// (invalid for mcp_server). A re-sync classifying it as mcp_server (with the
+// connector's empty sub_type) must still re-type it — validating the incoming
+// sub_type, not the stored one — and clear the now-invalid sub_type, rather than
+// pinning the row to agent forever.
+func TestDiscoveredRetype_AgentToMCPServerClearsDefaultedSubType(t *testing.T) {
+	ext := uid("okta-agent-mcp")
+
+	// First sync: ingested as an agent → create defaults sub_type to tool_agent.
+	first := ingestDiscovered(t, map[string]any{
+		"external_id":   ext,
+		"origin":        "okta",
+		"identity_type": "agent",
+		"name":          "Mislabeled MCP",
+	})["identity"].(map[string]any)
+	require.Equal(t, "agent", first["identity_type"])
+	require.Equal(t, "tool_agent", first["sub_type"], "agent ingest defaults sub_type to tool_agent")
+
+	// Re-sync: now classified mcp_server, connector sends no sub_type.
+	second := ingestDiscovered(t, map[string]any{
+		"external_id":   ext,
+		"origin":        "okta",
+		"identity_type": "mcp_server",
+		"name":          "Mislabeled MCP",
+	})["identity"].(map[string]any)
+	require.Equal(t, first["id"], second["id"])
+	require.Equal(t, "mcp_server", second["identity_type"],
+		"an agent-ingested row must still re-type to mcp_server (incoming sub_type is validated, not the stored tool_agent)")
+	require.Empty(t, second["sub_type"], "the now-invalid tool_agent sub_type must be cleared on re-type")
+	require.Contains(t, second["wimse_uri"].(string), "/mcp_server/", "wimse_uri rebuilt for the new type")
+}

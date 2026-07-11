@@ -439,17 +439,20 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	}
 	// Re-type a still-discovered row from the connector's current classification
 	// (e.g. application → mcp_server once it's recognised as an MCP server,
-	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows and any
-	// invalid (identity_type, sub_type) pair untouched. The refreshed metadata
-	// above already carries the new typing_source, so this completes the flip.
-	// The WIMSE URI embeds identity_type as a path segment, so it must be rebuilt
-	// in lockstep or by-URI resolution (GetIdentityByWIMSEURI) breaks.
-	if domain.CanRetypeDiscovered(identity.Status, identity.IdentityType, req.IdentityType, identity.SubType) {
+	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows untouched and
+	// validates the incoming (identity_type, sub_type) pair. Adopt both from the
+	// connector so the pair stays consistent — e.g. a row that was ingested as
+	// agent (defaulted to a tool_agent sub_type, invalid for mcp_server) has its
+	// sub_type cleared as it flips, rather than being pinned to agent. The WIMSE
+	// URI embeds identity_type as a path segment, so it is rebuilt in lockstep or
+	// by-URI resolution (GetIdentityByWIMSEURI) breaks.
+	if domain.CanRetypeDiscovered(identity.Status, identity.IdentityType, req.IdentityType, req.SubType) {
 		newURI, err := domain.BuildWIMSEURI(s.wimseDomain, identity.AccountID, identity.ProjectID, req.IdentityType, identity.ExternalID)
 		if err != nil {
 			return nil, false, err
 		}
 		identity.IdentityType = req.IdentityType
+		identity.SubType = req.SubType
 		identity.WIMSEURI = newURI
 	}
 	identity.UpdatedAt = time.Now()
