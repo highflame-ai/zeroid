@@ -22,38 +22,36 @@ func filterFixture(t *testing.T) string {
 	t.Helper()
 	label := uid("filter-suite")
 
-	// Native: active, first_party, owned
-	post(t, adminPath("/agents/register"), map[string]any{
+	// Native: active, first_party, owned (via /identities which accepts owner_user_id)
+	post(t, adminPath("/identities"), map[string]any{
 		"external_id":   uid("ff-active-fp"),
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
 		"trust_level":   "first_party",
 		"name":          "Active FP Agent",
-		"created_by":    "test-user",
 		"owner_user_id": "user_owner_1",
 		"labels":        map[string]string{"suite": label},
 	}, adminHeaders())
 
 	// Native: active, unverified, owned
-	post(t, adminPath("/agents/register"), map[string]any{
+	post(t, adminPath("/identities"), map[string]any{
 		"external_id":   uid("ff-active-uv"),
 		"identity_type": "agent",
 		"sub_type":      "tool_agent",
 		"trust_level":   "unverified",
 		"name":          "Active UV Agent",
-		"created_by":    "test-user",
 		"owner_user_id": "user_owner_2",
 		"labels":        map[string]string{"suite": label},
 	}, adminHeaders())
 
 	// Native: active, unverified, ownerless — then deactivated to test multi-status
-	resp := post(t, adminPath("/agents/register"), map[string]any{
+	resp := post(t, adminPath("/identities"), map[string]any{
 		"external_id":   uid("ff-deactivated"),
 		"identity_type": "agent",
 		"sub_type":      "autonomous",
 		"trust_level":   "unverified",
 		"name":          "Deactivated Agent",
-		"created_by":    "test-user",
+		"owner_user_id": "user_deactivate",
 		"labels":        map[string]string{"suite": label},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
@@ -63,6 +61,17 @@ func filterFixture(t *testing.T) string {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, deactResp.StatusCode)
 	_ = deactResp.Body.Close()
+
+	// Native: active, unverified, ownerless (via /agents/register — no owner_user_id)
+	post(t, adminPath("/agents/register"), map[string]any{
+		"external_id":   uid("ff-ownerless"),
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "unverified",
+		"name":          "Ownerless Agent",
+		"created_by":    "test-user",
+		"labels":        map[string]string{"suite": label},
+	}, adminHeaders())
 
 	// Discovered: ownerless, origin=okta
 	ingestDiscovered(t, map[string]any{
