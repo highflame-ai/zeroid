@@ -57,7 +57,7 @@ func filterFixture(t *testing.T) string {
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	deactivateBody := decode(t, resp)
 	deactivateID := deactivateBody["id"].(string)
-	deactResp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+deactivateID+"/deactivate"), nil, adminHeaders())
+	deactResp, err := doRaw(t, http.MethodDelete, adminPath("/identities/"+deactivateID), nil, adminHeaders())
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, deactResp.StatusCode)
 	_ = deactResp.Body.Close()
