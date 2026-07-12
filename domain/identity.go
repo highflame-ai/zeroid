@@ -246,7 +246,8 @@ func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 		// service layer, not here (this method is pure status topology).
 		return target == IdentityStatusPending || target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusPending:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		// activate (→active), dismiss (→discovered, reverts adoption), deactivate (→deactivated).
+		return target == IdentityStatusActive || target == IdentityStatusDiscovered || target == IdentityStatusDeactivated
 	case IdentityStatusActive:
 		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusSuspended:

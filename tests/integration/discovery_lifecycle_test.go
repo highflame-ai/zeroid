@@ -249,8 +249,46 @@ func TestDiscovered_AdoptThenActivate(t *testing.T) {
 	assert.Equal(t, "active", decode(t, resp)["status"], "pending → active completes the path to a usable identity")
 }
 
+// TestPending_DismissRevertsToDiscovered verifies that dismissing a pending
+// identity reverts the adoption: status returns to discovered, owner is cleared,
+// and the identity reappears in the adoption inbox.
+func TestPending_DismissRevertsToDiscovered(t *testing.T) {
+	ext := uid("pending-dismiss")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	// Adopt → pending
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-to-revert",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "pending", decode(t, resp)["status"])
+
+	// Dismiss from pending → should revert to discovered, clearing owner
+	resp, err = doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "discovered", body["status"], "dismiss from pending reverts to discovered")
+	assert.Equal(t, "", body["owner_user_id"], "owner is cleared on dismiss from pending")
+
+	// The identity should now appear in the adoption inbox again
+	assert.True(t, func() bool {
+		r := get(t, adminPath("/identities?status=discovered&limit=100"), adminHeaders())
+		require.Equal(t, http.StatusOK, r.StatusCode)
+		b := decode(t, r)
+		for _, raw := range b["identities"].([]any) {
+			if raw.(map[string]any)["id"] == id {
+				return true
+			}
+		}
+		return false
+	}(), "dismissed-from-pending identity must reappear in the adoption inbox")
+}
+
 // TestDiscovered_DismissNonDiscoveredRejected verifies dismiss is only for
-// discovered identities — a live native identity is deactivated via DELETE.
+// discovered or pending identities — a live native identity is deactivated via DELETE.
 func TestDiscovered_DismissNonDiscoveredRejected(t *testing.T) {
 	reg := registerIdentity(t, uid("native-dismiss"), nil)
 	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+reg.ID+"/dismiss"), nil, adminHeaders())
