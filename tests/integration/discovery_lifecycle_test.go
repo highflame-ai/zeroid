@@ -287,6 +287,188 @@ func TestPending_DismissRevertsToDiscovered(t *testing.T) {
 	}(), "dismissed-from-pending identity must reappear in the adoption inbox")
 }
 
+// TestPending_DismissRestoresExactDiscoveredState verifies that after dismiss
+// from pending, every field matches the state of a freshly ingested discovered
+// identity: status=discovered, owner cleared, credential_policy_id = tenant
+// default (not NULL), wimse_uri/origin/external_id all unchanged.
+func TestPending_DismissRestoresExactDiscoveredState(t *testing.T) {
+	ext := uid("dismiss-state-check")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	ingestedIdentity := out["identity"].(map[string]any)
+	id := ingestedIdentity["id"].(string)
+
+	// Capture the fields that must survive the adopt→dismiss round-trip unchanged.
+	ingestedPolicyID := ingestedIdentity["credential_policy_id"].(string)
+	ingestedWIMSE := ingestedIdentity["wimse_uri"].(string)
+	ingestedOrigin := ingestedIdentity["origin"].(string)
+	ingestedExtID := ingestedIdentity["external_id"].(string)
+
+	require.NotEmpty(t, ingestedPolicyID, "freshly ingested discovered identity must have credential_policy_id (tenant default)")
+
+	// Adopt with the default policy (no explicit policy supplied).
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-state-check",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "pending", decode(t, resp)["status"])
+
+	// Dismiss from pending.
+	resp, err = doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	assert.Equal(t, "discovered", body["status"], "status must revert to discovered")
+	assert.Equal(t, "", body["owner_user_id"], "owner_user_id must be cleared")
+	assert.Equal(t, ingestedPolicyID, body["credential_policy_id"],
+		"credential_policy_id must be the tenant default (same as at ingest), not NULL")
+	assert.Equal(t, ingestedWIMSE, body["wimse_uri"], "wimse_uri must be immutable through the lifecycle")
+	assert.Equal(t, ingestedOrigin, body["origin"], "origin must be immutable through the lifecycle")
+	assert.Equal(t, ingestedExtID, body["external_id"], "external_id must be immutable through the lifecycle")
+}
+
+// TestPending_DismissWithCustomPolicyRevertsToTenantDefault verifies that
+// when adoption sets a specific (non-default) credential policy, dismiss
+// reverts to the tenant default — not to the custom policy, and not to NULL.
+func TestPending_DismissWithCustomPolicyRevertsToTenantDefault(t *testing.T) {
+	ext := uid("dismiss-custom-policy")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+	ingestedPolicyID := out["identity"].(map[string]any)["credential_policy_id"].(string)
+	require.NotEmpty(t, ingestedPolicyID, "ingest must set the tenant default policy")
+
+	// Create a custom policy and adopt with it.
+	customPolicyID := createCredentialPolicy(t, uid("custom-policy"), adminHeaders())
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id":        "user-custom-policy",
+		"credential_policy_id": customPolicyID,
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	adopted := decode(t, resp)
+	require.Equal(t, "pending", adopted["status"])
+	require.Equal(t, customPolicyID, adopted["credential_policy_id"],
+		"adopt should apply the custom policy")
+
+	// Dismiss — should revert to the tenant default, not keep the custom policy.
+	resp, err = doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	assert.Equal(t, "discovered", body["status"])
+	assert.Equal(t, ingestedPolicyID, body["credential_policy_id"],
+		"dismiss must restore the tenant default policy, not retain the custom adoption policy")
+	assert.NotEqual(t, customPolicyID, body["credential_policy_id"],
+		"custom policy from adoption must not persist after dismiss")
+}
+
+// TestPending_DismissAllowsReAdoption verifies the full second adopt cycle:
+// dismiss from pending returns the identity to discovered so it can be
+// re-adopted and activated without any stale state blocking the path.
+func TestPending_DismissAllowsReAdoption(t *testing.T) {
+	ext := uid("readopt-me")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	adopt := func(owner string) {
+		t.Helper()
+		resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+			"owner_user_id": owner,
+		}, adminHeaders())
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "pending", decode(t, resp)["status"])
+	}
+	dismiss := func() {
+		t.Helper()
+		resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, "discovered", decode(t, resp)["status"])
+	}
+
+	// First cycle: adopt → dismiss.
+	adopt("user-first-owner")
+	dismiss()
+
+	// Second cycle: re-adopt with a different owner → activate.
+	adopt("user-second-owner")
+
+	resp, err := doRaw(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{
+		"status": "active",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "active", body["status"], "re-adopted identity must be activatable")
+	assert.Equal(t, "user-second-owner", body["owner_user_id"], "second owner must be set after re-adoption")
+}
+
+// TestPending_DismissedIdentityNotResurrectedByReIngest verifies that after
+// pending → dismiss (→ discovered), a connector re-sync keeps the identity
+// in discovered and does not alter its status or owner.
+func TestPending_DismissedIdentityNotResurrectedByReIngest(t *testing.T) {
+	ext := uid("dismiss-reingest")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	// Adopt → pending.
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-to-dismiss",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Dismiss → discovered.
+	resp, err = doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "discovered", decode(t, resp)["status"])
+
+	// Re-ingest: connector sees the same agent again.
+	second := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta", "name": "updated-name"})
+	assert.Equal(t, false, second["created"], "re-ingest must reconcile to the same row")
+	got := second["identity"].(map[string]any)
+	assert.Equal(t, id, got["id"], "re-ingest must not create a new row")
+	assert.Equal(t, "discovered", got["status"],
+		"re-ingest after dismiss-from-pending must keep status=discovered")
+	assert.Equal(t, "", got["owner_user_id"],
+		"re-ingest must not restore the cleared owner")
+}
+
+// TestPending_ActiveExternalAgentCannotBeDismissed verifies that an adopted
+// and activated external agent (status=active) is rejected by dismiss — dismiss
+// is only for discovered or pending identities.
+func TestPending_ActiveExternalAgentCannotBeDismissed(t *testing.T) {
+	ext := uid("active-external-dismiss")
+	out := ingestDiscovered(t, map[string]any{"external_id": ext, "origin": "okta"})
+	id := out["identity"].(map[string]any)["id"].(string)
+
+	// Adopt → pending.
+	resp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-owner",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Activate → active.
+	resp, err = doRaw(t, http.MethodPatch, adminPath("/identities/"+id), map[string]any{
+		"status": "active",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "active", decode(t, resp)["status"])
+
+	// Dismiss must be rejected for an active external agent.
+	resp, err = doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/dismiss"), nil, adminHeaders())
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"dismiss must refuse an active external agent — use deactivate instead")
+	_ = resp.Body.Close()
+}
+
 // TestDiscovered_DismissNonDiscoveredRejected verifies dismiss is only for
 // discovered or pending identities — a live native identity is deactivated via DELETE.
 func TestDiscovered_DismissNonDiscoveredRejected(t *testing.T) {
