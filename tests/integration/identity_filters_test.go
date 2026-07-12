@@ -62,22 +62,13 @@ func filterFixture(t *testing.T) string {
 	require.Equal(t, http.StatusOK, deactResp.StatusCode)
 	_ = deactResp.Body.Close()
 
-	// Native: active, unverified, ownerless (via /agents/register — no owner_user_id)
-	post(t, adminPath("/agents/register"), map[string]any{
-		"external_id":   uid("ff-ownerless"),
-		"identity_type": "agent",
-		"sub_type":      "autonomous",
-		"trust_level":   "unverified",
-		"name":          "Ownerless Agent",
-		"created_by":    "test-user",
-		"labels":        map[string]string{"suite": label},
-	}, adminHeaders())
-
-	// Discovered: ownerless, origin=okta
+	// Discovered: ownerless by definition (no owner until adopted), origin=okta.
+	// Labels are set so the suite filter can scope queries to this fixture.
 	ingestDiscovered(t, map[string]any{
 		"external_id": uid("ff-discovered"),
 		"origin":      "okta",
 		"name":        "Discovered Okta Agent",
+		"labels":      map[string]string{"suite": label},
 	})
 
 	return label
@@ -170,7 +161,9 @@ func TestIdentityFilter_OwnerUserID(t *testing.T) {
 func TestIdentityFilter_OwnerlessTrue(t *testing.T) {
 	label := filterFixture(t)
 
-	resp := get(t, adminPath("/agents/registry?ownerless=true&label=suite:"+label), adminHeaders())
+	// Native agents require an owner, so ownerless identities are always
+	// discovered. Query with status=discovered to include them.
+	resp := get(t, adminPath("/agents/registry?ownerless=true&status=discovered&label=suite:"+label), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body := decode(t, resp)
 	agents := body["agents"].([]any)
