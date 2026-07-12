@@ -1027,7 +1027,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		status := domain.IdentityStatusDeactivated
 		return s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 	}
-	if identity.Status == domain.IdentityStatusPending {
+	if identity.Status.CanTransitionTo(domain.IdentityStatusDiscovered) {
 		// Revert the adoption: clear owner, restore the tenant default credential
 		// policy, and move back to discovered. Every discovered identity has the
 		// tenant default policy from birth (set by resolveIdentityPolicyID at
