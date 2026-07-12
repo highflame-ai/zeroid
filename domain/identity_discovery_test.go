@@ -136,3 +136,56 @@ func TestGetIdentitySchema_DiscoveryAdditions(t *testing.T) {
 		}
 	}
 }
+
+// TestCanRetypeDiscovered pins the re-typing rule: a connector re-sync may
+// re-classify a still-`discovered` row to (newType, newSub) — the CAP-DSC-003
+// fix for identities imported before the classifier could type them — but must
+// never touch an adopted row or accept an invalid (identity_type, sub_type) pair.
+// The 4th arg is the connector's INCOMING sub_type (adopted alongside the type),
+// not the stored one — see the agent→mcp_server case.
+func TestCanRetypeDiscovered(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  IdentityStatus
+		curType IdentityType
+		newType IdentityType
+		newSub  SubType
+		want    bool
+	}{
+		// The fix: a discovered OAuth app (connector sends an empty sub_type — the
+		// oauth_app marker lives in a label, not the domain sub_type) upgrades to
+		// mcp_server.
+		{"discovered application → mcp_server", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeMCPServer, "", true},
+		// A row ingested as agent carries a defaulted tool_agent sub_type, but the
+		// connector re-syncs it with an empty sub_type — validating the INCOMING
+		// sub_type (not the stored tool_agent) lets it flip and clears the sub_type.
+		// Keying on the stored sub_type would pin such rows to agent forever.
+		{"discovered agent → mcp_server (incoming empty sub)", IdentityStatusDiscovered, IdentityTypeAgent, IdentityTypeMCPServer, "", true},
+		{"discovered mcp_server → agent (incoming valid agent sub)", IdentityStatusDiscovered, IdentityTypeMCPServer, IdentityTypeAgent, SubTypeToolAgent, true},
+
+		// No-op: same type is not a re-type.
+		{"discovered application → application", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeApplication, "", false},
+
+		// Adopted rows are protected — type may be human-curated past discovered.
+		{"pending application → mcp_server", IdentityStatusPending, IdentityTypeApplication, IdentityTypeMCPServer, "", false},
+		{"active mcp_server → application", IdentityStatusActive, IdentityTypeMCPServer, IdentityTypeApplication, "", false},
+		{"deactivated application → mcp_server", IdentityStatusDeactivated, IdentityTypeApplication, IdentityTypeMCPServer, "", false},
+
+		// Invalid target type is refused.
+		{"discovered application → empty", IdentityStatusDiscovered, IdentityTypeApplication, "", "", false},
+		{"discovered application → bogus", IdentityStatusDiscovered, IdentityTypeApplication, "bogus", "", false},
+
+		// Never accept an invalid (type, sub_type) pair: mcp_server requires an
+		// empty sub_type, and an application/agent sub_type is invalid for it.
+		{"discovered application → mcp_server (incoming custom sub)", IdentityStatusDiscovered, IdentityTypeApplication, IdentityTypeMCPServer, SubTypeCustom, false},
+		{"discovered agent → application (incoming agent-only sub)", IdentityStatusDiscovered, IdentityTypeAgent, IdentityTypeApplication, SubTypeOrchestrator, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanRetypeDiscovered(tc.status, tc.curType, tc.newType, tc.newSub); got != tc.want {
+				t.Fatalf("CanRetypeDiscovered(%q, %q, %q, %q) = %v, want %v",
+					tc.status, tc.curType, tc.newType, tc.newSub, got, tc.want)
+			}
+		})
+	}
+}

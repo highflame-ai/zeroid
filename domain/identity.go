@@ -160,6 +160,34 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 	}
 }
 
+// CanRetypeDiscovered reports whether a connector re-sync may re-classify a
+// still-`discovered` identity to (newType, newSub).
+//
+// While a row sits in the discovered inbox it is a credential-less posture
+// signal (never an auth principal), so the connector remains the source of truth
+// for its classification. This lets an improved or late classification (e.g.
+// application → mcp_server once the connector recognises it, CAP-DSC-003) reach
+// identities ingested before the classifier could type them — the reconcile path
+// otherwise leaves identity_type untouched. Once a row is adopted (status !=
+// discovered) its type may be human-curated, so it is never re-typed.
+//
+// newSub is the connector's incoming sub_type for the new classification. The
+// re-type adopts (newType, newSub) as a pair — the same (type, sub_type)
+// validation the create path applies — and the caller sets sub_type = newSub
+// alongside identity_type so the pair stays consistent. This is why the check is
+// on newSub, not the stored sub_type: a row ingested as agent gets a defaulted
+// tool_agent sub_type, which is invalid for mcp_server; validating (and
+// overwriting) with the connector's incoming sub_type (empty for the sync path)
+// lets that row re-type and clears the now-invalid sub_type, instead of being
+// silently pinned to agent forever. A no-op (newType == curType), an unknown
+// newType, or an (newType, newSub) pair the schema rejects all return false.
+func CanRetypeDiscovered(status IdentityStatus, curType, newType IdentityType, newSub SubType) bool {
+	return status == IdentityStatusDiscovered &&
+		newType.Valid() &&
+		newType != curType &&
+		newSub.ValidForIdentityType(newType)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Identity Status — lifecycle state machine
 // ──────────────────────────────────────────────────────────────────────────────
