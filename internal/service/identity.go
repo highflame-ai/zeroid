@@ -609,8 +609,8 @@ func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, a
 // status (e.g. discovered). origin + status are the discovery-inventory filters:
 // status=discovered surfaces the adoption inbox, origin=<idp> drills into one
 // ecosystem.
-func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass, origin, status string, limit, offset int) ([]*domain.Identity, int, error) {
-	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, origin, status, limit, offset)
+func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) ([]*domain.Identity, int, error) {
+	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
 }
 
 // GetFacets returns grouped counts for each filterable identity dimension.

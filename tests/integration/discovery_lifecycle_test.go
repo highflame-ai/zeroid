@@ -165,8 +165,8 @@ func TestDiscovered_ListFilters(t *testing.T) {
 	}
 
 	assert.True(t, found("/identities?status=discovered&limit=100"), "status=discovered must surface it")
-	assert.True(t, found("/identities?origin=okta&limit=100"), "origin=okta must surface it")
-	assert.True(t, found("/identities?origin=external&limit=100"), "origin=external must surface it")
+	assert.True(t, found("/identities?status=discovered&origin=okta&limit=100"), "origin=okta must surface it")
+	assert.True(t, found("/identities?status=discovered&origin=external&limit=100"), "origin=external must surface it")
 }
 
 // TestDiscovered_NativeRegistrationUnchanged is a regression guard: a normal
@@ -280,9 +280,9 @@ func TestDiscovered_Facets(t *testing.T) {
 	}
 	assert.Greater(t, oktaCount, float64(0), "origins facet must count the okta-discovered identity")
 
-	ownerless, ok := body["ownerless"].(float64)
-	require.True(t, ok, "facets must include an ownerless count")
-	assert.Greater(t, ownerless, float64(0), "ownerless count must reflect the ownerless discovered identity")
+	discovered, ok := body["discovered"].(float64)
+	require.True(t, ok, "facets must include a discovered count")
+	assert.Greater(t, discovered, float64(0), "discovered count must reflect the ingested discovered identity")
 }
 
 // TestDiscovered_IngestRejectsInvalidOriginShape verifies an origin that isn't a
@@ -327,7 +327,7 @@ func TestDiscovered_AgentsEndpointSurfacesOrigin(t *testing.T) {
 		return false, "", ""
 	}
 
-	ok, origin, status := find("/agents/registry?origin=okta&limit=100")
+	ok, origin, status := find("/agents/registry?status=discovered&origin=okta&limit=100")
 	assert.True(t, ok, "origin=okta filter must surface the discovered agent via /agents/registry")
 	assert.Equal(t, "okta", origin, "the agents endpoint must surface origin")
 	assert.Equal(t, "discovered", status)

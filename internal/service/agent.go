@@ -261,7 +261,7 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 
 // ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
 // label, and metadata (key presence or key:value).
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search, metadata, identityClass, origin, status string, limit, offset int) (*AgentListResponse, error) {
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -272,7 +272,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 	// origin/status surface the unified native∪discovered inventory through the
 	// agent registry list (the endpoint admin/Studio proxy) — same filters the
 	// identities list exposes.
-	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevel, isActive, search, metadata, identityClass, origin, status, limit, offset)
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
 	if err != nil {
 		return nil, err
 	}
