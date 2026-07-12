@@ -1003,15 +1003,18 @@ func (s *IdentityService) AdoptIdentity(ctx context.Context, id, accountID, proj
 	return s.UpdateIdentity(ctx, id, accountID, projectID, req)
 }
 
-// DismissIdentity dismisses a discovered identity (discovered → deactivated):
-// an operator marks an externally-observed agent out of scope. The row is
-// archived (audit-retained, never hard-deleted) per the offboarding obligation.
-// A discovered identity holds no credential, so the shared deactivation cleanup
-// finds nothing to revoke and only emits the lifecycle CAE signal.
+// DismissIdentity handles two dismiss paths:
+//
+//   - discovered → deactivated: an operator marks an externally-observed agent
+//     out of scope. The row is archived (audit-retained, never hard-deleted).
+//
+//   - pending → discovered: an operator reverts an adoption. The owner and
+//     credential policy are cleared and the identity returns to the adoption
+//     inbox so it can be re-adopted or dismissed later.
 //
 // Idempotent: an already-dismissed (deactivated) identity is a no-op success.
-// Only a discovered identity can be dismissed; deactivating a live identity is
-// DeactivateIdentity's job, not this one.
+// Active, suspended, or expired identities cannot be dismissed — use
+// DeactivateIdentity for those.
 func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
@@ -1020,11 +1023,32 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 	if identity.Status == domain.IdentityStatusDeactivated {
 		return identity, nil
 	}
-	if identity.Status != domain.IdentityStatusDiscovered {
-		return nil, fmt.Errorf("%w: only a discovered identity can be dismissed (status=%s); use delete to deactivate a live identity", ErrInvalidIdentityField, identity.Status)
+	if identity.Status == domain.IdentityStatusDiscovered {
+		status := domain.IdentityStatusDeactivated
+		return s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 	}
-	status := domain.IdentityStatusDeactivated
-	return s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
+	if identity.Status.CanTransitionTo(domain.IdentityStatusDiscovered) {
+		// Revert the adoption: clear owner, restore the tenant default credential
+		// policy, and move back to discovered. Every discovered identity has the
+		// tenant default policy from birth (set by resolveIdentityPolicyID at
+		// ingest), so we restore that rather than clearing to NULL — which would
+		// produce a state that normal ingest never creates.
+		// UpdateIdentity cannot clear OwnerUserID (empty string is a no-op there),
+		// so we modify the domain struct directly and persist via the repo.
+		defaultPolicyID, err := s.resolveIdentityPolicyID(ctx, identity.AccountID, identity.ProjectID, "")
+		if err != nil {
+			return nil, fmt.Errorf("resolve default policy on dismiss: %w", err)
+		}
+		identity.Status = domain.IdentityStatusDiscovered
+		identity.OwnerUserID = ""
+		identity.CredentialPolicyID = defaultPolicyID
+		identity.UpdatedAt = time.Now()
+		if err := s.repo.Update(ctx, identity); err != nil {
+			return nil, err
+		}
+		return identity, nil
+	}
+	return nil, fmt.Errorf("%w: dismiss is only valid for discovered or pending identities (status=%s); use delete to deactivate a live identity", ErrInvalidIdentityField, identity.Status)
 }
 
 // runDeactivationCleanup sweeps everything a deactivated or deleted identity

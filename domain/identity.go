@@ -209,9 +209,10 @@ func CanRetypeDiscovered(status IdentityStatus, curType, newType IdentityType, n
 //	                    → deactivated (terminal-ish — reactivatable)
 //	                    → expired (time-bound authority lapsed)
 //	pending    → deactivated (registration rejected)
+//	pending    → discovered (dismiss reverts adoption — agent returns to adoption inbox)
 //
-// `discovered` is an *entry-only* state: discovery writes it at ingestion and
-// nothing transitions back into it. ISO mapping (24760 → ours):
+// `discovered` is the normal entry state but can also be re-entered from `pending`
+// when an adoption is reverted (dismiss). ISO mapping (24760 → ours):
 // Established=pending, Active=active, Suspended=suspended, Archived=deactivated/expired.
 type IdentityStatus string
 
@@ -246,7 +247,8 @@ func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 		// service layer, not here (this method is pure status topology).
 		return target == IdentityStatusPending || target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusPending:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		// activate (→active), dismiss (→discovered, reverts adoption), deactivate (→deactivated).
+		return target == IdentityStatusActive || target == IdentityStatusDiscovered || target == IdentityStatusDeactivated
 	case IdentityStatusActive:
 		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusSuspended:
