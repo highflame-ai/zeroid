@@ -1028,12 +1028,20 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		return s.UpdateIdentity(ctx, id, accountID, projectID, UpdateIdentityRequest{Status: &status})
 	}
 	if identity.Status == domain.IdentityStatusPending {
-		// Revert the adoption: clear owner and credential policy, move back to discovered.
-		// UpdateIdentity cannot clear OwnerUserID (empty string is a no-op there), so
-		// we modify the domain struct directly and persist via the repo.
+		// Revert the adoption: clear owner, restore the tenant default credential
+		// policy, and move back to discovered. Every discovered identity has the
+		// tenant default policy from birth (set by resolveIdentityPolicyID at
+		// ingest), so we restore that rather than clearing to NULL — which would
+		// produce a state that normal ingest never creates.
+		// UpdateIdentity cannot clear OwnerUserID (empty string is a no-op there),
+		// so we modify the domain struct directly and persist via the repo.
+		defaultPolicyID, err := s.resolveIdentityPolicyID(ctx, identity.AccountID, identity.ProjectID, "")
+		if err != nil {
+			return nil, fmt.Errorf("resolve default policy on dismiss: %w", err)
+		}
 		identity.Status = domain.IdentityStatusDiscovered
 		identity.OwnerUserID = ""
-		identity.CredentialPolicyID = ""
+		identity.CredentialPolicyID = defaultPolicyID
 		identity.UpdatedAt = time.Now()
 		if err := s.repo.Update(ctx, identity); err != nil {
 			return nil, err
