@@ -30,6 +30,12 @@ var ErrIdentityNotUsable = errors.New("identity is not usable")
 // at the service layer so handlers can errors.Is and map to 4xx.
 var ErrCredentialExpired = errors.New("credential_expired")
 
+// ErrCredentialAlreadyRevoked is returned when an operation (e.g. rotation)
+// is attempted on a credential that is already revoked. Terminal state, not
+// a server fault — handlers map it to 409, same pattern as the sentinels
+// above.
+var ErrCredentialAlreadyRevoked = errors.New("credential_already_revoked")
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Trust Level
 // ──────────────────────────────────────────────────────────────────────────────

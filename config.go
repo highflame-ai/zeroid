@@ -236,6 +236,20 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// AuditRetentionDays is how long an issued_credentials row remains
+	// queryable AFTER the token expires. The two clocks are deliberately
+	// decoupled (same model as signing_credentials): expires_at bounds how
+	// long the token authenticates; expires_at + AuditRetentionDays bounds
+	// how long the delegation graph can still answer historical questions
+	// about it. The cleanup worker prunes on the audit clock, never on
+	// expiry alone. See domain.IssuedCredential.AuditRetentionUntil.
+	//
+	// Floor: the cleanup worker ANDs this evidence clock with the
+	// cascade-walk clock (Token.MaxTTL). A value below MaxTTL (~90d) has no
+	// effect on deletion timing — MaxTTL is the effective floor. 0 selects
+	// domain.DefaultAuditRetentionDays; see Validate for the accepted range.
+	AuditRetentionDays int `koanf:"audit_retention_days"`
+
 	// authorization_code grant configuration.
 	// HMACSecret is the shared secret used to sign and verify auth code JWTs (HS256).
 	HMACSecret string `koanf:"hmac_secret"`
@@ -379,6 +393,16 @@ func (c *Config) Validate() error {
 	// we enforce a floor. 32 bytes matches the HS256 output size.
 	if c.Token.HMACSecret != "" && len(c.Token.HMACSecret) < 32 {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
+	}
+
+	// token.audit_retention_days is a day count converted to time.Duration
+	// (days × 24h in nanoseconds); past ~106751 days the multiplication
+	// overflows int64 into a NEGATIVE duration, which would stamp
+	// AuditRetentionUntil before expiry and silently erase the evidence
+	// window the knob exists to guarantee. Bounds shared with the service
+	// clamp via domain. 0 means "use domain.DefaultAuditRetentionDays".
+	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > domain.MaxAuditRetentionDays {
+		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
 	}
 
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
@@ -554,6 +578,10 @@ func loadDefaults(k *koanf.Koanf) error {
 		// validateWIMSEDomain() reject empty values at startup.
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
+		// Delegation-graph evidence clock: issued_credentials rows stay
+		// queryable this long past token expiry. Single source of truth in
+		// domain so the default can't drift from the service clamp / Validate.
+		"token.audit_retention_days": domain.DefaultAuditRetentionDays,
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
@@ -634,6 +662,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_ISSUER":                "token.issuer",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		// Evidence clock for issued_credentials (delegation-graph retention).
+		"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
 		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
 		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
 		"ZEROID_HMAC_SECRET": "token.hmac_secret",
@@ -689,6 +719,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".max_idle_conns") ||
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
+			strings.HasSuffix(configPath, ".audit_retention_days") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
 			intVal, err := strconv.Atoi(value)
 			if err != nil {
