@@ -105,6 +105,8 @@ func TestSubagentDelegation_AttenuatedChildToken(t *testing.T) {
 	// by-jti walk: the child's edge must reference the parent (root) jti.
 	assert.Equal(t, rootJTI, parent["jti"], "sanity: root token jti must equal the returned rootJTI")
 	chainResp := get(t, adminPath("/delegations/by-jti/"+url.PathEscape(childJTI)), adminHeaders())
+	require.NotNil(t, chainResp)
+	defer func() { _ = chainResp.Body.Close() }()
 	require.Equal(t, http.StatusOK, chainResp.StatusCode)
 	chain := decode(t, chainResp)
 	edges, _ := chain["edges"].([]any)
@@ -145,6 +147,7 @@ func TestSubagentDelegation_OverBroadScopeRejected(t *testing.T) {
 		[]string{"tools:read", "tools:write"}, // child ceiling permits write…
 		[]string{"tools:write"},               // …but the parent never held it
 		rootTok)
+	require.NotNil(t, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
@@ -171,6 +174,7 @@ func TestSubagentDelegation_EmptyRequestGrantsNothing(t *testing.T) {
 		[]string{"tools:read"}, // child ceiling permits read…
 		[]string{},             // …but the subagent requests no scopes at all
 		rootTok)
+	require.NotNil(t, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
@@ -201,6 +205,7 @@ func TestSubagentDelegation_DepthCapRejected(t *testing.T) {
 	// Depth 2 exceeds the child policy's max_delegation_depth (1) — rejected.
 	resp := attemptSubagentExchange(t, capPolicy, "s9-depth-b",
 		[]string{"tools:read"}, []string{"tools:read"}, tokA)
+	require.NotNil(t, resp)
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
