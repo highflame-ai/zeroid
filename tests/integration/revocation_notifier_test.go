@@ -140,7 +140,11 @@ func credentialIDForJTI(t *testing.T, identityID, jti string) string {
 	creds, ok := body["credentials"].([]any)
 	require.True(t, ok, "list credentials must return a credentials array")
 	for _, c := range creds {
-		cred, _ := c.(map[string]any)
+		cred, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+
 		if cred["jti"] == jti {
 			id, idOK := cred["id"].(string)
 			require.True(t, idOK, "credential must carry a string id")
