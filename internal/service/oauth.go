@@ -609,34 +609,58 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthServerError("failed to resolve actor credential policy", err)
 	}
 
-	// Step 4: Compute the granted scopes as the three-way intersection of
-	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes. When
-	// the policy declares no scope restriction we fall back to the legacy
-	// identity.AllowedScopes for backward compat during the deprecation
-	// window. The orchestrator's granted scopes remain authoritative for
-	// what can be delegated — a sub-agent can never receive more than its
-	// principal currently holds, per RFC 8693 intent.
+	// Step 4: Compute the granted scopes. The rule depends on WHO the subject
+	// (delegator) is:
+	//
+	//   - Agent orchestrator → sub-agent: three-way intersection
+	//     requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes. The
+	//     orchestrator's granted scopes cap the child — a sub-agent can never
+	//     receive more than its principal currently holds (RFC 8693 intent).
+	//
+	//   - Human delegator → agent: requested ∩ actor.policy.allowed_scopes. The
+	//     human is recorded in the act-chain as the accountable delegator, NOT a
+	//     scope ceiling. A developer's login scopes (e.g. account:read) are
+	//     orthogonal to an agent's operational authority, which is defined by the
+	//     agent's OWN credential policy; capping by the human's scopes would zero
+	//     out an agent whose human happens to hold unrelated scopes. The agent
+	//     must therefore carry an explicit policy — no allowed_scopes means no
+	//     delegable authority (fail closed).
+	//
+	// When the actor policy declares no scope restriction we fall back to the
+	// legacy identity.AllowedScopes for backward compat during the deprecation
+	// window.
 	requestedScopes := parseScopeString(req.Scope)
 	actorAllowed := effectiveAllowedScopes(actorPolicy, actorIdentity)
-	orchSet := make(map[string]bool, len(subjectCred.Scopes))
-	for _, s := range subjectCred.Scopes {
-		orchSet[s] = true
+	actorSet := make(map[string]bool, len(actorAllowed))
+	for _, s := range actorAllowed {
+		actorSet[s] = true
 	}
+
+	// The delegator is an agent orchestrator only when the subject token itself
+	// is an agent identity (identity_type=agent, stamped at mint). A human PKCE
+	// / IdP session carries a non-agent identity_type, so it is treated as a
+	// pure delegator and does not cap the agent's operational scopes.
+	subjectIDType, _ := jwt.Get[string](subjectParsed, "identity_type")
+	subjectIsAgentPrincipal := subjectIDType == string(domain.IdentityTypeAgent)
+
 	var scopes []string
-	if len(actorAllowed) == 0 {
-		// Actor has no scope restriction → intersection is requested ∩ orchestrator.
+	if subjectIsAgentPrincipal {
+		orchSet := make(map[string]bool, len(subjectCred.Scopes))
+		for _, s := range subjectCred.Scopes {
+			orchSet[s] = true
+		}
 		for _, s := range requestedScopes {
-			if orchSet[s] {
+			if orchSet[s] && (len(actorAllowed) == 0 || actorSet[s]) {
 				scopes = append(scopes, s)
 			}
 		}
 	} else {
-		actorSet := make(map[string]bool, len(actorAllowed))
-		for _, s := range actorAllowed {
-			actorSet[s] = true
+		if len(actorAllowed) == 0 {
+			return nil, oauthBadRequest(oautherror.InvalidScope,
+				"actor identity has no allowed_scopes; a credential policy is required for human-delegated token exchange")
 		}
 		for _, s := range requestedScopes {
-			if orchSet[s] && actorSet[s] {
+			if actorSet[s] {
 				scopes = append(scopes, s)
 			}
 		}
