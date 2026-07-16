@@ -127,3 +127,36 @@ func TestRFC8414_S3_WellKnownPathIsExact(t *testing.T) {
 	assert.True(t, strings.HasPrefix(contentType, "application/json"),
 		"AS metadata MUST be served as application/json; got %q", contentType)
 }
+
+// ── ADR 0010 — MCP Enterprise-Managed Authorization (ID-JAG) ────────────────
+
+// TestADR0010_IDJAGGrantProfileAdvertised verifies the AS metadata advertises
+// the ID-JAG authorization grant profile (ADR 0010 D6). EMA-capable MCP clients
+// read authorization_grant_profiles_supported to discover that this AS accepts
+// an Identity Assertion Authorization Grant via the jwt-bearer grant.
+func TestADR0010_IDJAGGrantProfileAdvertised(t *testing.T) {
+	body := fetchASMetadata(t)
+
+	// jwt-bearer (the grant the ID-JAG is presented through) must still be listed.
+	grants, _ := body["grant_types_supported"].([]any)
+	foundJWTBearer := false
+	for _, g := range grants {
+		if s, _ := g.(string); s == "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+			foundJWTBearer = true
+		}
+	}
+	require.True(t, foundJWTBearer,
+		"grant_types_supported MUST still advertise jwt-bearer (the ID-JAG presentation grant)")
+
+	// The new field: the ID-JAG grant profile URN.
+	profiles, ok := body["authorization_grant_profiles_supported"].([]any)
+	require.True(t, ok, "authorization_grant_profiles_supported MUST be present (ADR 0010 D6)")
+	found := false
+	for _, p := range profiles {
+		if s, _ := p.(string); s == "urn:ietf:params:oauth:grant-profile:id-jag" {
+			found = true
+		}
+	}
+	require.True(t, found,
+		"authorization_grant_profiles_supported MUST advertise the ID-JAG grant profile")
+}

@@ -53,6 +53,15 @@ type OAuthService struct {
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
+	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
+	// every other check passes) so a replayed ID-JAG is rejected with
+	// invalid_grant. Wired after construction via SetIDJAGReplayStore. Nil when
+	// ID-JAG federation is not configured; idJAGBearer already fails closed in
+	// that case (no external issuers → no ID-JAG path), so a nil store can never
+	// silently skip replay protection while ID-JAG is actually in use — but the
+	// handler also guards against nil defensively (fail closed).
+	idJAGReplayStore IDJAGReplayStore
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -64,6 +73,18 @@ type OAuthService struct {
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
 type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
+
+// IDJAGReplayStore is the durable single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Insert records a previously-unredeemed jti and MUST
+// return a replay sentinel (postgres.ErrIDJAGReplay) when the jti is already
+// present. The check-and-insert must be atomic (a unique-constraint violation
+// is the replay signal) — a non-atomic read-then-write is a TOCTOU bug that
+// defeats the single-use guarantee. The concrete impl is
+// postgres.IDJAGReplayStore; an interface here keeps the service testable and
+// the dependency narrow.
+type IDJAGReplayStore interface {
+	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+}
 
 // Default token TTLs (used when per-client TTL is not configured).
 const (
@@ -157,6 +178,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+}
+
+// SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Required whenever ID-JAG federation is enabled — the
+// idJAGBearer path consumes jti against this store as its final gate. Wired in
+// server.go alongside the external-issuer registry.
+func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
+	s.idJAGReplayStore = store
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
@@ -340,6 +369,18 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Subject == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
+	}
+
+	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
+	// whose JWS typ header is oauth-id-jag+jwt is an Identity Assertion
+	// Authorization Grant signed by a corporate IdP — it MUST be validated
+	// against that IdP's JWKS (the #88 external-issuer substrate), NOT this
+	// path's registered-per-identity public key. Branch before any NHI-specific
+	// work so the two validation modes stay cleanly separate (D2: the branch
+	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
+	// NHI self-signed behavior below.
+	if isIDJAGAssertion(req.Subject) {
+		return s.idJAGBearer(ctx, req)
 	}
 
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.

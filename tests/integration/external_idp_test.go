@@ -273,7 +273,10 @@ func newFederationServer(t *testing.T, issuer domain.ExternalIssuerConfig) (*zer
 type tokenResponse struct {
 	StatusCode  int
 	AccessToken string
-	RawBody     string
+	// Error is the RFC 6749 §5.2 error code on a failed token response (e.g.
+	// invalid_grant). Empty on success.
+	Error   string
+	RawBody string
 }
 
 func postFederation(t *testing.T, baseURL string, body map[string]any) tokenResponse {
@@ -295,10 +298,12 @@ func postFederation(t *testing.T, baseURL string, body map[string]any) tokenResp
 		return tokenResponse{StatusCode: resp.StatusCode, RawBody: fmt.Sprintf("%v", err)}
 	}
 	at, _ := raw["access_token"].(string)
+	errCode, _ := raw["error"].(string)
 	rawBytes, _ := json.Marshal(raw)
 	return tokenResponse{
 		StatusCode:  resp.StatusCode,
 		AccessToken: at,
+		Error:       errCode,
 		RawBody:     string(rawBytes),
 	}
 }

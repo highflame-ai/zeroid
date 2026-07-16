@@ -248,6 +248,13 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 
 	accessToken, newCred, err := a.credSvc.RotateCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, identity)
 	if err != nil {
+		// Terminal-state rejections are client mistakes, not server faults:
+		// map them to 409 so they neither fire 5xx alerting nor tell the
+		// caller to retry something that can never succeed. A dead
+		// credential can't be rotated — the caller must issue a new one.
+		if errors.Is(err, domain.ErrCredentialExpired) || errors.Is(err, domain.ErrCredentialAlreadyRevoked) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
 		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to rotate credential")
 		return nil, huma.Error500InternalServerError("failed to rotate credential")
 	}

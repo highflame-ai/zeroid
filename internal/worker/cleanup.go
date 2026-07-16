@@ -23,9 +23,12 @@ type IdentityExpirer interface {
 // via IdentityService.SweepExpiredIdentities (an atomic conditional UPDATE
 // claim followed by the existing runDeactivationCleanup cascade).
 // Running the cleanup prevents unbounded table growth since credentials have
-// a finite TTL. Safe to run multiple instances concurrently — DELETE WHERE
-// is idempotent and the DeactivateIfActive claim guarantees only one worker
-// fires the cascade per expired identity.
+// a finite TTL. issued_credentials rows are additionally retained until
+// their audit_retention_until evidence clock elapses, so the delegation
+// graph survives token expiry (two-clock model, mirroring
+// signing_credentials). Safe to run multiple instances concurrently —
+// DELETE WHERE is idempotent and the DeactivateIfActive claim guarantees
+// only one worker fires the cascade per expired identity.
 type CleanupWorker struct {
 	db              *bun.DB
 	backchannelRepo *postgres.BackchannelRequestRepository
@@ -95,12 +98,20 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 	now := time.Now()
 
 	// Delete expired credentials regardless of revocation status, but only
-	// after the retention window: parent_jti edges on expired rows are still
-	// needed by the cascade-revocation walk to reach live descendants (see
-	// NewCleanupWorker).
+	// once BOTH clocks have elapsed:
+	//   - expires_at + credRetention — the cascade-walk clock: parent_jti
+	//     edges on expired rows are still needed by the cascade-revocation
+	//     walk to reach live descendants (see NewCleanupWorker);
+	//   - audit_retention_until — the evidence clock: the delegation graph
+	//     (WalkUp/WalkDown/ListChains) reads expired rows within the audit
+	//     window, so historical chains stay answerable long after expiry.
+	// Rows written before migration 037 carry NULL audit_retention_until and
+	// fall back to the legacy expires_at-only rule. Backed by
+	// idx_issued_credentials_expires_at + idx_issued_credentials_retention.
 	credRes, err := w.db.NewDelete().
 		TableExpr("issued_credentials").
 		Where("expires_at < ?", now.Add(-w.credRetention)).
+		Where("(audit_retention_until IS NULL OR audit_retention_until < ?)", now).
 		Exec(ctx)
 	if err != nil {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired credentials")
@@ -140,6 +151,21 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired dpop jti records")
 	} else if n, err := dpopRes.RowsAffected(); err == nil && n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired dpop jti records")
+	}
+
+	// ID-JAG redeemed jti records (ADR 0010 D2a) are only needed within the
+	// grant's own freshness window: past expires_at (the ID-JAG exp) the grant
+	// would fail its exp check before the jti is ever consulted, so the row is
+	// no longer load-bearing. Purge expired rows to bound table growth under
+	// high ID-JAG redemption volume — same single-use sweep as dpop_jti above.
+	idJAGRes, err := w.db.NewDelete().
+		TableExpr("id_jag_jti").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired id_jag jti records")
+	} else if n, err := idJAGRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired id_jag jti records")
 	}
 
 	// Refresh tokens: under rotation every refresh inserts a successor row and
