@@ -26,8 +26,8 @@ func TestIdentityStatusDiscovered_IsUsable(t *testing.T) {
 
 // TestCanTransitionTo_Discovered pins the discovered state machine: adopt
 // (→pending), direct activation (→active), and dismiss (→deactivated) are the
-// only legal moves out, and `discovered` is entry-only — nothing transitions
-// into it.
+// primary moves out. Dismiss from pending (→discovered) is also legal — it
+// reverts an adoption so the agent reappears in the adoption inbox.
 func TestCanTransitionTo_Discovered(t *testing.T) {
 	tests := []struct {
 		from   IdentityStatus
@@ -42,8 +42,8 @@ func TestCanTransitionTo_Discovered(t *testing.T) {
 		{IdentityStatusDiscovered, IdentityStatusSuspended, false},
 		{IdentityStatusDiscovered, IdentityStatusExpired, false},
 		{IdentityStatusDiscovered, IdentityStatusDiscovered, false},
-		// Into discovered — entry-only, never reachable by transition.
-		{IdentityStatusPending, IdentityStatusDiscovered, false},
+		// Into discovered — only pending can revert to discovered (dismiss from pending).
+		{IdentityStatusPending, IdentityStatusDiscovered, true},
 		{IdentityStatusActive, IdentityStatusDiscovered, false},
 		{IdentityStatusSuspended, IdentityStatusDiscovered, false},
 		{IdentityStatusDeactivated, IdentityStatusDiscovered, false},
