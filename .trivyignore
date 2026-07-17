@@ -8,3 +8,14 @@
 #
 # Will be resolved when testcontainers-go releases a version using docker v29+.
 CVE-2026-34040
+
+# CVE-2026-41567, CVE-2026-42306: Moby / Docker Engine HIGH advisories with no
+# fixed version published upstream (Trivy status: "affected").
+# github.com/docker/docker v28.5.2+incompatible is a test-only INDIRECT dep,
+# pulled via github.com/golang-migrate/migrate/v4/database/postgres (test) →
+# github.com/dhui/dktest, which spins up a PostgreSQL container for migration
+# integration tests. The Docker client is never imported by production code and
+# requires local daemon access not present in the deployed image.
+# Revisit when an upstream fix ships or dktest/golang-migrate drops docker v28.
+CVE-2026-41567
+CVE-2026-42306

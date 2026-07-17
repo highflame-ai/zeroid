@@ -515,6 +515,24 @@ func ssrfGuardedTransport(allowPrivate func() bool) *http.Transport {
 	return base
 }
 
+// NewSSRFGuardedHTTPClient returns an *http.Client whose dialer rejects any
+// connection resolving to a private/loopback/link-local/metadata/reserved
+// address (see isBlockedIP) — the same DNS-rebinding-safe guard the OIDC
+// verifier applies to issuer/jwks_uri fetches. allowPrivate=true disables the
+// blocklist for single-tenant dev/test or a deliberately internal upstream.
+//
+// Exported so other server-side outbound fetchers (e.g. the direct-OIDC-
+// federation external-issuer JWKS registry, issue #88) reuse one audited
+// implementation rather than duplicating the blocklist. The block sentinel is
+// ErrPrivateAttestationEndpoint regardless of caller; callers that surface it
+// should wrap it with their own context.
+func NewSSRFGuardedHTTPClient(allowPrivate bool) *http.Client {
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: ssrfGuardedTransport(func() bool { return allowPrivate }),
+	}
+}
+
 // isBlockedIP returns true for any IP that must never be a verify-time fetch
 // target. Mirrors the CIBA notification guard's blocklist:
 //

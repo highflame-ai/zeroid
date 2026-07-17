@@ -13,6 +13,8 @@ import (
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -43,6 +45,13 @@ type Config struct {
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+
+	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
+	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
+	// looks up the upstream iss in this list, fetches the issuer's JWKS, and
+	// verifies the ID token before minting a ZeroID token. Empty list (default)
+	// disables direct federation — only the broker path remains available.
+	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -227,6 +236,20 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// AuditRetentionDays is how long an issued_credentials row remains
+	// queryable AFTER the token expires. The two clocks are deliberately
+	// decoupled (same model as signing_credentials): expires_at bounds how
+	// long the token authenticates; expires_at + AuditRetentionDays bounds
+	// how long the delegation graph can still answer historical questions
+	// about it. The cleanup worker prunes on the audit clock, never on
+	// expiry alone. See domain.IssuedCredential.AuditRetentionUntil.
+	//
+	// Floor: the cleanup worker ANDs this evidence clock with the
+	// cascade-walk clock (Token.MaxTTL). A value below MaxTTL (~90d) has no
+	// effect on deletion timing — MaxTTL is the effective floor. 0 selects
+	// domain.DefaultAuditRetentionDays; see Validate for the accepted range.
+	AuditRetentionDays int `koanf:"audit_retention_days"`
+
 	// authorization_code grant configuration.
 	// HMACSecret is the shared secret used to sign and verify auth code JWTs (HS256).
 	HMACSecret string `koanf:"hmac_secret"`
@@ -350,15 +373,10 @@ func (c *Config) Validate() error {
 		if c.Attestation.AllowUnsafeDevStub {
 			return fmt.Errorf("attestation.allow_unsafe_dev_stub must be false in production (server.env=%q): the stub accepts ANY submitted proof for image_hash/tpm — set ZEROID_ALLOW_UNSAFE_DEV_STUB=false", c.Server.Env)
 		}
-		// token.issuer and wimse_domain ship with Highflame's hosted defaults.
-		// A production deploy that forgets to override them silently runs on
-		// Highflame's identity — require an explicit value.
-		if c.Token.Issuer == defaultIssuer {
-			return fmt.Errorf("token.issuer must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_ISSUER to this deployment's public URL", c.Server.Env, defaultIssuer)
-		}
-		if c.WIMSEDomain == defaultWIMSEDomain {
-			return fmt.Errorf("wimse_domain must be set explicitly in production (server.env=%q): it still has the built-in default %q — set ZEROID_WIMSE_DOMAIN to this deployment's trust domain", c.Server.Env, defaultWIMSEDomain)
-		}
+		// token.issuer and wimse_domain are validated by validateIssuer()
+		// and validateWIMSEDomain() above (empty/malformed → reject).
+		// No default-value comparison here — the built-in default may
+		// legitimately be the deployer's intended production value.
 		// Introspection (RFC 7662 §2.1) and revocation (RFC 7009 §2.1) MUST
 		// require caller authorization. The default leaves them accept-and-
 		// verify (anonymous allowed) for the standalone/dev model; production
@@ -377,17 +395,30 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
 	}
 
+	// token.audit_retention_days is a day count converted to time.Duration
+	// (days × 24h in nanoseconds); past ~106751 days the multiplication
+	// overflows int64 into a NEGATIVE duration, which would stamp
+	// AuditRetentionUntil before expiry and silently erase the evidence
+	// window the knob exists to guarantee. Bounds shared with the service
+	// clamp via domain. 0 means "use domain.DefaultAuditRetentionDays".
+	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > domain.MaxAuditRetentionDays {
+		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
+	}
+
+	seen := make(map[string]struct{}, len(c.ExternalIssuers))
+	for i := range c.ExternalIssuers {
+		c.ExternalIssuers[i].Defaults()
+		if err := c.ExternalIssuers[i].Validate(); err != nil {
+			return fmt.Errorf("external_issuers[%d]: %w", i, err)
+		}
+		iss := c.ExternalIssuers[i].Issuer
+		if _, dup := seen[iss]; dup {
+			return fmt.Errorf("external_issuers[%d]: duplicate issuer %q", i, iss)
+		}
+		seen[iss] = struct{}{}
+	}
 	return nil
 }
-
-// defaultIssuer and defaultWIMSEDomain are the built-in dev defaults that the
-// production gate in Validate() rejects when left unchanged. They MUST match
-// the values set in loadDefaults() — kept as named constants so the gate and
-// the default can never drift.
-const (
-	defaultIssuer      = "https://auth.highflame.ai"
-	defaultWIMSEDomain = "highflame.ai"
-)
 
 // isProductionEnv reports whether server.env names a production deployment.
 // Accepts the common spellings ("production", "prod") case-insensitively so a
@@ -541,20 +572,19 @@ func loadDefaults(k *koanf.Koanf) error {
 		"keys.rsa_public_key_path":  "",
 		"keys.rsa_key_id":           "v1",
 
-		// Token
-		// Default points at Highflame's hosted ZeroID URL (the actual
-		// service, not the marketing site). Self-hosted deployments
-		// override via ZEROID_ISSUER or token.issuer in YAML. Local dev
-		// on localhost:8899 should set ZEROID_ISSUER=http://localhost:8899.
-		"token.issuer":      defaultIssuer,
+		// Token — no default for token.issuer or wimse_domain; every
+		// deployment must set them explicitly via ZEROID_ISSUER /
+		// ZEROID_WIMSE_DOMAIN or YAML. validateIssuer() and
+		// validateWIMSEDomain() reject empty values at startup.
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
+		// Delegation-graph evidence clock: issued_credentials rows stay
+		// queryable this long past token expiry. Single source of truth in
+		// domain so the default can't drift from the service clamp / Validate.
+		"token.audit_retention_days": domain.DefaultAuditRetentionDays,
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
-
-		// WIMSE
-		"wimse_domain": defaultWIMSEDomain,
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -632,6 +662,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 		"ZEROID_ISSUER":                "token.issuer",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		// Evidence clock for issued_credentials (delegation-graph retention).
+		"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
 		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
 		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
 		"ZEROID_HMAC_SECRET": "token.hmac_secret",
@@ -687,6 +719,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".max_idle_conns") ||
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
+			strings.HasSuffix(configPath, ".audit_retention_days") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
 			intVal, err := strconv.Atoi(value)
 			if err != nil {

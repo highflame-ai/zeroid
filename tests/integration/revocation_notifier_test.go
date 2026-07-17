@@ -128,6 +128,101 @@ func TestRevocationNotifier_FiresOncePerJTIOnCascade(t *testing.T) {
 	}
 }
 
+// credentialIDForJTI resolves the issued_credentials UUID for a given jti by
+// listing an identity's credentials. The admin POST /credentials/{id}/revoke
+// endpoint keys on the credential id, while RevocationEvents key on jti — this
+// bridges the two so the cascade test can revoke by id and assert by jti.
+func credentialIDForJTI(t *testing.T, identityID, jti string) string {
+	t.Helper()
+	resp := get(t, adminPath("/credentials?identity_id="+identityID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	creds, ok := body["credentials"].([]any)
+	require.True(t, ok, "list credentials must return a credentials array")
+	for _, c := range creds {
+		cred, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if cred["jti"] == jti {
+			id, idOK := cred["id"].(string)
+			require.True(t, idOK, "credential must carry a string id")
+			return id
+		}
+	}
+	t.Fatalf("no credential with jti=%s found for identity=%s", jti, identityID)
+	return ""
+}
+
+// TestRevocationNotifier_FiresOnCredentialRevokeCascade verifies the admin
+// POST /credentials/{id}/revoke path fires exactly one RevocationEvent per
+// revoked JTI across a delegation tree. This is the exact path in
+// highflame-authn#138: revoking a ROOT credential must cascade to its
+// token-exchange descendant and emit an event for BOTH jtis, so Shield's
+// deny-set drops the whole subtree rather than just the root. The sibling
+// TestRevocationNotifier_FiresOncePerJTIOnCascade covers the CAE-signal
+// (RevokeAllActiveForIdentity) cascade; this covers the operator-driven admin
+// credential-revoke (RevokeCredential) cascade, which no prior test exercised.
+func TestRevocationNotifier_FiresOnCredentialRevokeCascade(t *testing.T) {
+	// root (client_credentials, no parent) → sub-agent (token_exchange, parent_jti=root)
+	rootID := uid("revnotify-credrevoke-root")
+	registerIdentity(t, rootID, []string{"data:read"})
+	rootClient := registerOAuthClient(t, rootID, []string{"data:read"})
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     rootClient.ClientID,
+		"client_secret": rootClient.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rootToken := decode(t, resp)["access_token"].(string)
+	rootJTI := jtiOf(t, rootToken)
+	rootIdentityID := identityIDFromToken(t, rootToken)
+
+	subKey := generateKey(t)
+	subIdentity := registerIdentity(t, uid("revnotify-credrevoke-sub"), []string{"data:read"}, ecPublicKeyPEM(t, subKey))
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": rootToken,
+		"actor_token":   buildAssertion(t, subKey, subIdentity.WIMSEURI),
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	subToken := decode(t, resp)["access_token"].(string)
+	subJTI := jtiOf(t, subToken)
+
+	require.NotEqual(t, rootJTI, subJTI)
+	require.Empty(t, revocationCapture.forJTI(rootJTI), "no event before revoke")
+	require.Empty(t, revocationCapture.forJTI(subJTI), "no event before revoke")
+
+	// Resolve the ROOT credential's UUID — the revoke endpoint keys on the
+	// issued_credentials id, not the jti.
+	rootCredID := credentialIDForJTI(t, rootIdentityID, rootJTI)
+
+	// The exact call in authn#138: operator revokes the root credential.
+	revokeResp := post(t, adminPath("/credentials/"+rootCredID+"/revoke"),
+		map[string]any{"reason": "cred_revoke_cascade_test"}, adminHeaders())
+	require.Equal(t, http.StatusOK, revokeResp.StatusCode)
+	_ = revokeResp.Body.Close()
+
+	// Synchronous dispatch (set in TestMain) ⇒ events are already captured.
+	rootEvents := revocationCapture.forJTI(rootJTI)
+	subEvents := revocationCapture.forJTI(subJTI)
+	require.Len(t, rootEvents, 1, "root JTI must fire exactly one event on admin credential-revoke")
+	require.Len(t, subEvents, 1, "cascaded descendant JTI must fire — the deny-set must drop the whole subtree (authn#138)")
+
+	for _, e := range append(rootEvents, subEvents...) {
+		assert.Equal(t, testAccountID, e.AccountID)
+		assert.Equal(t, testProjectID, e.ProjectID)
+		assert.Equal(t, "cred_revoke_cascade_test", e.Reason)
+		assert.False(t, e.ExpiresAt.IsZero(), "ExpiresAt must be populated so subscribers can size deny-set TTL")
+		assert.False(t, e.RevokedAt.IsZero(), "RevokedAt must be populated")
+	}
+}
+
 // TestRevocationNotifier_FiresOnRefreshReuse verifies the refresh-token
 // reuse-detection path emits revocation events when a revoked refresh token is
 // replayed (the whole family is revoked).

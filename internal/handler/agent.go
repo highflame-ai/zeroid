@@ -84,15 +84,34 @@ type GetAgentOutput struct {
 	Body *service.AgentResponse
 }
 
+// splitCSV expands comma-separated values in a []string slice so callers can
+// use either ?status=a,b or ?status=a&status=b.
+func splitCSV(vals []string) []string {
+	var out []string
+	for _, v := range vals {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
 type ListAgentsInput struct {
 	AgentType     string   `query:"agent_type" doc:"Filter by agent type"`
 	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
 	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel    string   `query:"trust_level" doc:"Filter by trust level"`
+	TrustLevel    []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple."`
 	IsActive      string   `query:"is_active" doc:"Filter by active status"`
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
+	Status        []string `query:"status" doc:"Filter by lifecycle status. Comma-separated for multiple."`
+	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
+	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -375,8 +394,30 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 	if input.IdentityClass != "" && input.IdentityClass != "custom" && input.IdentityClass != "code_agent" {
 		return nil, huma.Error400BadRequest("invalid identity_class: must be custom or code_agent")
 	}
+	// "external" is the sentinel for any non-native provenance; otherwise the
+	// origin must be a syntactically valid ecosystem identifier.
+	if input.Origin != "" && input.Origin != "external" && !domain.ValidOrigin(input.Origin) {
+		return nil, huma.Error400BadRequest("invalid origin: must be \"external\" or a lowercase ecosystem identifier (e.g. okta)")
+	}
+	identityTypes := splitCSV(input.IdentityType)
+	statuses := splitCSV(input.Status)
+	trustLevels := splitCSV(input.TrustLevel)
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, input.IdentityType, input.Label, input.TrustLevel, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Limit, input.Offset)
+	for _, s := range statuses {
+		if !domain.IdentityStatus(s).Valid() {
+			return nil, huma.Error400BadRequest("invalid status filter")
+		}
+	}
+	for _, tl := range trustLevels {
+		if !domain.TrustLevel(tl).Valid() {
+			return nil, huma.Error400BadRequest("invalid trust_level filter")
+		}
+	}
+	if input.Ownerless != "" && input.Ownerless != "true" && input.Ownerless != "false" {
+		return nil, huma.Error400BadRequest("invalid ownerless filter: must be true or false")
+	}
+
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, input.Limit, input.Offset)
 	if err != nil {
 		return nil, mapErr(err)
 	}

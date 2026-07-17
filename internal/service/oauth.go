@@ -45,9 +45,23 @@ type OAuthService struct {
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
 	customGrants map[string]CustomGrantHandler
+	// externalIssuerRegistry resolves direct-federation token-exchange
+	// requests (subject_token_type=id_token) to a configured upstream IdP.
+	// Nil when no external_issuers are configured — direct federation is
+	// disabled in that case and only the broker path remains.
+	externalIssuerRegistry *ExternalIssuerRegistry
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
+	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
+	// every other check passes) so a replayed ID-JAG is rejected with
+	// invalid_grant. Wired after construction via SetIDJAGReplayStore. Nil when
+	// ID-JAG federation is not configured; idJAGBearer already fails closed in
+	// that case (no external issuers → no ID-JAG path), so a nil store can never
+	// silently skip replay protection while ID-JAG is actually in use — but the
+	// handler also guards against nil defensively (fail closed).
+	idJAGReplayStore IDJAGReplayStore
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -59,6 +73,18 @@ type OAuthService struct {
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
 type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
+
+// IDJAGReplayStore is the durable single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Insert records a previously-unredeemed jti and MUST
+// return a replay sentinel (postgres.ErrIDJAGReplay) when the jti is already
+// present. The check-and-insert must be atomic (a unique-constraint violation
+// is the replay signal) — a non-atomic read-then-write is a TOCTOU bug that
+// defeats the single-use guarantee. The concrete impl is
+// postgres.IDJAGReplayStore; an interface here keeps the service testable and
+// the dependency narrow.
+type IDJAGReplayStore interface {
+	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+}
 
 // Default token TTLs (used when per-client TTL is not configured).
 const (
@@ -77,7 +103,7 @@ var reservedClaims = map[string]bool{
 	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
-	"act": true, "token_exchange": true, "trusted_by": true,
+	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to
@@ -152,6 +178,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+}
+
+// SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Required whenever ID-JAG federation is enabled — the
+// idJAGBearer path consumes jti against this store as its final gate. Wired in
+// server.go alongside the external-issuer registry.
+func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
+	s.idJAGReplayStore = store
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
@@ -337,6 +371,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
 	}
 
+	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
+	// whose JWS typ header is oauth-id-jag+jwt is an Identity Assertion
+	// Authorization Grant signed by a corporate IdP — it MUST be validated
+	// against that IdP's JWKS (the #88 external-issuer substrate), NOT this
+	// path's registered-per-identity public key. Branch before any NHI-specific
+	// work so the two validation modes stay cleanly separate (D2: the branch
+	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
+	// NHI self-signed behavior below.
+	if isIDJAGAssertion(req.Subject) {
+		return s.idJAGBearer(ctx, req)
+	}
+
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
 	if err := jwtalg.Validate(req.Subject); err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
@@ -447,10 +493,21 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject_token is required for token_exchange grant")
 	}
 
-	// RFC 8693 defines two exchange modes:
-	//   1. NHI delegation: subject_token (orchestrator) + actor_token (sub-agent) → delegated token
-	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
-	// Mode is determined by the presence of actor_token.
+	// RFC 8693 defines several exchange modes:
+	//   1. Direct OIDC federation (issue #88): subject_token_type=id_token →
+	//      ZeroID itself verifies the upstream IdP's signature against a
+	//      configured JWKS. The TrustedServiceValidator hook is *not* used —
+	//      this path is the trust anchor. Dispatch happens before the
+	//      actor_token check because direct federation never carries one.
+	//   2. NHI delegation: subject_token (orchestrator) + actor_token
+	//      (sub-agent) → delegated token.
+	//   3. External principal exchange (broker): subject_token from a
+	//      trusted upstream service → zeroid token. ZeroID gates on the
+	//      caller via TrustedServiceValidator and trusts the relay to
+	//      have done the IdP-side verification.
+	if req.SubjectTokenType == SubjectTokenTypeIDToken {
+		return s.externalIDTokenExchange(ctx, req)
+	}
 	if req.ActorToken == "" {
 		return s.ExternalPrincipalExchange(ctx, req)
 	}

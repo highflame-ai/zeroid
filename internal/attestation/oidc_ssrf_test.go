@@ -232,3 +232,34 @@ func (rt *recordingTransport) RoundTrip(_ *http.Request) (*http.Response, error)
 	rt.onRoundTrip()
 	return nil, errors.New("recordingTransport: network must not be reached")
 }
+
+// TestNewSSRFGuardedHTTPClient covers the exported constructor reused by the
+// direct-OIDC-federation external-issuer JWKS registry (issue #88): the guard
+// blocks a loopback target by default and allows it only when allowPrivate is
+// set. A plain-HTTP loopback server is used so the dial-time block is isolated
+// from any TLS-verification failure.
+func TestNewSSRFGuardedHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Default (guarded): loopback must be refused at dial time.
+	guarded := NewSSRFGuardedHTTPClient(false)
+	if _, err := guarded.Get(srv.URL); err == nil {
+		t.Fatalf("guarded client must refuse a loopback target; got nil error")
+	} else if !errors.Is(err, ErrPrivateAttestationEndpoint) {
+		t.Fatalf("expected ErrPrivateAttestationEndpoint, got %v", err)
+	}
+
+	// Relaxed (allowPrivate): the same loopback target must connect.
+	relaxed := NewSSRFGuardedHTTPClient(true)
+	resp, err := relaxed.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("relaxed client must allow loopback; got %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+}

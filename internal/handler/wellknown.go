@@ -125,6 +125,15 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 			"api_key",
 			"urn:openid:params:grant-type:ciba",
 		},
+		// MCP Enterprise-Managed Authorization (ADR 0010 D6): advertise the
+		// ID-JAG authorization grant profile so EMA-capable clients discover
+		// that this AS accepts an Identity Assertion Authorization Grant
+		// (presented via the jwt-bearer grant above). Distinct from
+		// grant_types_supported — the profile names *how* the jwt-bearer grant
+		// is used, not a new grant_type.
+		"authorization_grant_profiles_supported": []string{
+			"urn:ietf:params:oauth:grant-profile:id-jag",
+		},
 		"jwks_uri":               a.issuer + "/.well-known/jwks.json",
 		"introspection_endpoint": a.issuer + "/oauth2/token/introspect",
 		"revocation_endpoint":    a.issuer + "/oauth2/token/revoke",
