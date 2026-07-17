@@ -201,7 +201,7 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	}
 	if search != "" {
 		if _, err := uuid.Parse(search); err == nil {
-			q = q.Where("id = ?", search)
+			q = q.Where("(id = ? OR external_id = ?)", search, search)
 		} else {
 			searchPattern := "%" + search + "%"
 			q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)

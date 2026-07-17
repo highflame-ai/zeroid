@@ -383,13 +383,32 @@ func TestIdentityFilter_SearchByUUID(t *testing.T) {
 	require.GreaterOrEqual(t, len(agents), 1)
 	agentID := agents[0].(map[string]any)["id"].(string)
 
-	// Search by exact UUID should return that single agent
+	// Search by internal UUID should return that single agent
 	resp = get(t, adminPath("/agents/registry?search="+agentID), adminHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	body = decode(t, resp)
 	agents = body["agents"].([]any)
 	require.Equal(t, 1, len(agents), "UUID search should return exactly one agent")
 	assert.Equal(t, agentID, agents[0].(map[string]any)["id"].(string))
+
+	// Search by external_id that is a UUID (common for Entra ID / Azure AD)
+	externalUUID := "00000000-0000-0000-0000-000000000001"
+	post(t, adminPath("/identities"), map[string]any{
+		"external_id":   externalUUID,
+		"identity_type": "agent",
+		"sub_type":      "autonomous",
+		"trust_level":   "first_party",
+		"name":          "UUID External ID Agent",
+		"owner_user_id": "user_owner_uuid",
+		"labels":        map[string]string{"suite": label},
+	}, adminHeaders())
+
+	resp = get(t, adminPath("/agents/registry?search="+externalUUID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	agents = body["agents"].([]any)
+	require.Equal(t, 1, len(agents), "UUID external_id search should return exactly one agent")
+	assert.Equal(t, externalUUID, agents[0].(map[string]any)["external_id"].(string))
 }
 
 func TestIdentityFilter_SearchSpecialChars(t *testing.T) {
