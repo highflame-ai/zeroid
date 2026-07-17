@@ -64,6 +64,22 @@ func (r *CredentialPolicyRepository) GetByID(ctx context.Context, id, accountID,
 	return policy, nil
 }
 
+// CreateDerived inserts an auto-derived policy (source + source_key set), or does
+// NOTHING if one with the same (source, source_key) already exists, reporting
+// whether a row was inserted. Uses ON CONFLICT DO NOTHING so a duplicate does not
+// raise an error — which would poison an enclosing transaction — making the
+// service's find-or-create both race- and transaction-safe.
+func (r *CredentialPolicyRepository) CreateDerived(ctx context.Context, policy *domain.CredentialPolicy) (bool, error) {
+	res, err := dbOrTx(ctx, r.db).NewInsert().Model(policy).
+		On("CONFLICT DO NOTHING").
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to create derived credential policy: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // GetBySourceKey retrieves the auto-derived credential policy identified by
 // (source, source_key) within a tenant, or nil (no error) when none exists. Used
 // for idempotent find-or-create of derived policies (a partial unique index makes

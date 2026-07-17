@@ -165,16 +165,27 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		UpdatedAt:           time.Now(),
 	}
 
-	if err := s.repo.Create(ctx, policy); err != nil {
-		if isDuplicateKeyError(err) {
-			// Idempotent find-or-create for derived policies: a concurrent or prior
-			// adoption of the same posture already created it → return the existing
-			// row keyed by (source, source_key) rather than surfacing a conflict.
-			if req.SourceKey != "" {
-				if existing, gerr := s.repo.GetBySourceKey(ctx, req.AccountID, req.ProjectID, req.Source, req.SourceKey); gerr == nil && existing != nil {
-					return existing, nil
-				}
+	if req.SourceKey != "" {
+		// Derived policies are idempotent by (source, source_key). ON CONFLICT DO
+		// NOTHING means a concurrent/prior adoption of the same posture doesn't
+		// error (which would poison an enclosing transaction); if we didn't insert,
+		// return the existing row.
+		inserted, err := s.repo.CreateDerived(ctx, policy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create credential policy: %w", err)
+		}
+		if !inserted {
+			existing, gerr := s.repo.GetBySourceKey(ctx, req.AccountID, req.ProjectID, req.Source, req.SourceKey)
+			if gerr != nil {
+				return nil, fmt.Errorf("failed to fetch existing derived credential policy: %w", gerr)
 			}
+			if existing == nil {
+				return nil, ErrPolicyNameConflict // no insert and no existing row — treat as a conflict
+			}
+			return existing, nil
+		}
+	} else if err := s.repo.Create(ctx, policy); err != nil {
+		if isDuplicateKeyError(err) {
 			return nil, ErrPolicyNameConflict
 		}
 		return nil, fmt.Errorf("failed to create credential policy: %w", err)
