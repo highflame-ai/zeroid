@@ -111,6 +111,11 @@ type CreatePolicyRequest struct {
 	RequiredTrustLevel  string
 	RequiredAttestation string
 	MaxDelegationDepth  int
+	// Source + SourceKey mark an auto-derived policy (e.g. Source="discovery").
+	// When SourceKey is set, CreatePolicy is idempotent: a conflicting create
+	// returns the existing policy with that (source, source_key) instead of erroring.
+	Source    string
+	SourceKey string
 	// ExpiresAt time-bounds the policy. Nil means "no expiry".
 	ExpiresAt *time.Time
 }
@@ -152,6 +157,8 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		RequiredTrustLevel:  req.RequiredTrustLevel,
 		RequiredAttestation: req.RequiredAttestation,
 		MaxDelegationDepth:  req.MaxDelegationDepth,
+		Source:              req.Source,
+		SourceKey:           req.SourceKey,
 		IsActive:            true,
 		ExpiresAt:           req.ExpiresAt,
 		CreatedAt:           time.Now(),
@@ -160,6 +167,14 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 
 	if err := s.repo.Create(ctx, policy); err != nil {
 		if isDuplicateKeyError(err) {
+			// Idempotent find-or-create for derived policies: a concurrent or prior
+			// adoption of the same posture already created it → return the existing
+			// row keyed by (source, source_key) rather than surfacing a conflict.
+			if req.SourceKey != "" {
+				if existing, gerr := s.repo.GetBySourceKey(ctx, req.AccountID, req.ProjectID, req.Source, req.SourceKey); gerr == nil && existing != nil {
+					return existing, nil
+				}
+			}
 			return nil, ErrPolicyNameConflict
 		}
 		return nil, fmt.Errorf("failed to create credential policy: %w", err)

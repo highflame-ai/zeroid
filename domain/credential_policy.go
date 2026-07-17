@@ -60,7 +60,14 @@ type CredentialPolicy struct {
 	RequiredTrustLevel  string   `bun:"required_trust_level,type:varchar(50)"  json:"required_trust_level,omitempty"`
 	RequiredAttestation string   `bun:"required_attestation,type:varchar(50)"  json:"required_attestation,omitempty"`
 	MaxDelegationDepth  int      `bun:"max_delegation_depth"             json:"max_delegation_depth"`
-	IsActive            bool     `bun:"is_active"                        json:"is_active"`
+	// Source names what created this policy — e.g. "discovery" for one auto-derived
+	// at adoption. Empty/NULL for user-authored policies.
+	Source string `bun:"source,type:varchar(50)"      json:"source,omitempty"`
+	// SourceKey is a derived policy's stable dedup identity WITHIN its source (a
+	// posture hash), so re-derivation reuses the same row while the display name
+	// stays human-readable. Unique per (account, project, source) when set.
+	SourceKey string `bun:"source_key,type:varchar(255)" json:"source_key,omitempty"`
+	IsActive  bool   `bun:"is_active"                    json:"is_active"`
 	// ExpiresAt time-bounds the policy. EnforcePolicy treats an expired
 	// policy the same as an inactive one — identity policy, per-key policy,
 	// or both. NULL means "no expiry".

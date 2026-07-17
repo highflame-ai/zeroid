@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -59,6 +60,28 @@ func (r *CredentialPolicyRepository) GetByID(ctx context.Context, id, accountID,
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get credential policy: %w", err)
+	}
+	return policy, nil
+}
+
+// GetBySourceKey retrieves the auto-derived credential policy identified by
+// (source, source_key) within a tenant, or nil (no error) when none exists. Used
+// for idempotent find-or-create of derived policies (a partial unique index makes
+// the pair unique when source is set).
+func (r *CredentialPolicyRepository) GetBySourceKey(ctx context.Context, accountID, projectID, source, sourceKey string) (*domain.CredentialPolicy, error) {
+	policy := &domain.CredentialPolicy{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(policy).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("source = ?", source).
+		Where("source_key = ?", sourceKey).
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get credential policy by source key: %w", err)
 	}
 	return policy, nil
 }
