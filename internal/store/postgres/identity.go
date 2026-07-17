@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -199,8 +200,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		}
 	}
 	if search != "" {
-		searchPattern := "%" + search + "%"
-		q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		if _, err := uuid.Parse(search); err == nil {
+			q = q.Where("id = ?", search)
+		} else {
+			searchPattern := "%" + search + "%"
+			q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		}
 	}
 
 	total, err := q.Count(ctx)

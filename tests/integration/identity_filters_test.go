@@ -372,6 +372,26 @@ func TestIdentityFilter_LimitOne(t *testing.T) {
 	assert.Greater(t, total, float64(1), "total should reflect all matching, not just page")
 }
 
+func TestIdentityFilter_SearchByUUID(t *testing.T) {
+	label := filterFixture(t)
+
+	// First, get an agent to obtain its UUID
+	resp := get(t, adminPath("/agents/registry?label=suite:"+label+"&limit=1"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	agents := body["agents"].([]any)
+	require.GreaterOrEqual(t, len(agents), 1)
+	agentID := agents[0].(map[string]any)["id"].(string)
+
+	// Search by exact UUID should return that single agent
+	resp = get(t, adminPath("/agents/registry?search="+agentID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body = decode(t, resp)
+	agents = body["agents"].([]any)
+	require.Equal(t, 1, len(agents), "UUID search should return exactly one agent")
+	assert.Equal(t, agentID, agents[0].(map[string]any)["id"].(string))
+}
+
 func TestIdentityFilter_SearchSpecialChars(t *testing.T) {
 	// Special characters in search should not cause errors
 	resp := get(t, adminPath("/agents/registry?search=%25test%27"), adminHeaders())
