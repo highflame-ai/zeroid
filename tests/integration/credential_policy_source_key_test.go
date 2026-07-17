@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestCredentialPolicySourceKeyMigrationApplied asserts migration 037 added the
+// TestCredentialPolicySourceKeyMigrationApplied asserts migration 038 added the
 // source/source_key columns and the two partial unique indexes.
 func TestCredentialPolicySourceKeyMigrationApplied(t *testing.T) {
 	ctx := context.Background()
@@ -22,7 +22,7 @@ func TestCredentialPolicySourceKeyMigrationApplied(t *testing.T) {
 			Where("indexname = ?", idx).
 			Scan(ctx, &n)
 		require.NoError(t, err)
-		assert.Equal(t, 1, n, "migration 037 must create partial unique index %s", idx)
+		assert.Equal(t, 1, n, "migration 038 must create partial unique index %s", idx)
 	}
 
 	for _, col := range []string{"source", "source_key"} {
@@ -34,7 +34,7 @@ func TestCredentialPolicySourceKeyMigrationApplied(t *testing.T) {
 			Where("column_name = ?", col).
 			Scan(ctx, &n)
 		require.NoError(t, err)
-		assert.Equal(t, 1, n, "migration 037 must add credential_policies.%s", col)
+		assert.Equal(t, 1, n, "migration 038 must add credential_policies.%s", col)
 	}
 }
 
