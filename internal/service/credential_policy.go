@@ -111,6 +111,11 @@ type CreatePolicyRequest struct {
 	RequiredTrustLevel  string
 	RequiredAttestation string
 	MaxDelegationDepth  int
+	// Source + SourceKey mark an auto-derived policy (e.g. Source="discovery").
+	// When SourceKey is set, CreatePolicy is idempotent: a conflicting create
+	// returns the existing policy with that (source, source_key) instead of erroring.
+	Source    string
+	SourceKey string
 	// ExpiresAt time-bounds the policy. Nil means "no expiry".
 	ExpiresAt *time.Time
 }
@@ -152,13 +157,34 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		RequiredTrustLevel:  req.RequiredTrustLevel,
 		RequiredAttestation: req.RequiredAttestation,
 		MaxDelegationDepth:  req.MaxDelegationDepth,
+		Source:              req.Source,
+		SourceKey:           req.SourceKey,
 		IsActive:            true,
 		ExpiresAt:           req.ExpiresAt,
 		CreatedAt:           time.Now(),
 		UpdatedAt:           time.Now(),
 	}
 
-	if err := s.repo.Create(ctx, policy); err != nil {
+	if req.SourceKey != "" {
+		// Derived policies are idempotent by (source, source_key). ON CONFLICT DO
+		// NOTHING means a concurrent/prior adoption of the same posture doesn't
+		// error (which would poison an enclosing transaction); if we didn't insert,
+		// return the existing row.
+		inserted, err := s.repo.CreateDerived(ctx, policy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create credential policy: %w", err)
+		}
+		if !inserted {
+			existing, gerr := s.repo.GetBySourceKey(ctx, req.AccountID, req.ProjectID, req.Source, req.SourceKey)
+			if gerr != nil {
+				return nil, fmt.Errorf("failed to fetch existing derived credential policy: %w", gerr)
+			}
+			if existing == nil {
+				return nil, ErrPolicyNameConflict // no insert and no existing row — treat as a conflict
+			}
+			return existing, nil
+		}
+	} else if err := s.repo.Create(ctx, policy); err != nil {
 		if isDuplicateKeyError(err) {
 			return nil, ErrPolicyNameConflict
 		}
