@@ -604,6 +604,7 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 			AdditionalClaims: req.AdditionalClaims,
 			Role:             req.Role,
 			PrivilegeScope:   req.PrivilegeScope,
+			Audience:         req.Audience,
 		})
 	})
 }
@@ -668,6 +669,7 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 		AdditionalClaims: req.AdditionalClaims,
 		Role:             req.Role,
 		PrivilegeScope:   req.PrivilegeScope,
+		Audience:         req.Audience,
 		TrustedService:   true,
 	})
 }

@@ -122,6 +122,37 @@ var reservedClaims = map[string]bool{
 	"privilege_scope": true,
 }
 
+// audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
+// Studio requests it on the user_session/external-principal exchange so a
+// short-lived, user-identity JWT can drive the codeoid daemon's web operator
+// surface. The name is the ONLY input a caller supplies — it maps to exactly
+// one fixed scope set (audienceScopeProfiles) that this server defines.
+const audienceCodeoid = "codeoid"
+
+// audienceScopeProfiles maps a server-defined audience name to the fixed,
+// hard-coded scope set minted for that audience on the trusted external-principal
+// exchange. This is deliberately NOT caller-supplied: an audience name resolves
+// to exactly one scope profile here, so a caller can never request arbitrary
+// scopes by naming an audience. Adding a new audience is a single-entry change.
+//
+// codeoid: the web-operator scope set the codeoid daemon re-verifies (via JWKS)
+// and reads from the token's `scopes` claim to authorize embedded-UI actions.
+var audienceScopeProfiles = map[string][]string{
+	audienceCodeoid: {
+		"session:list",
+		"session:create",
+		"session:attach",
+		"session:watch",
+		"session:send",
+		"session:interrupt",
+		"session:approve",
+		"session:destroy",
+		"session:read",
+		"session:dispatch",
+		"fs:read",
+	},
+}
+
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
@@ -241,6 +272,16 @@ type TokenRequest struct {
 	// rejects untrusted callers before issuance.
 	Role           string   // authorization role claim (`role`)
 	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
+	// Audience is an OPTIONAL, server-recognized audience profile name (e.g.
+	// "codeoid"). Honoured ONLY on the trusted external-principal exchange:
+	// when it matches a known profile in audienceScopeProfiles, the issued
+	// token carries `aud` = the audience name plus that profile's fixed scope
+	// set in the `scopes` claim. Arbitrary caller scopes are never honoured for
+	// a profiled audience — the audience name is the whole input. An empty or
+	// unknown value leaves issuance unchanged (default `aud` = issuer, scopes
+	// from Scope). Like Role/PrivilegeScope this is a dedicated field, never
+	// settable via AdditionalClaims (`aud`/`scopes` are reserved).
+	Audience string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -828,11 +869,25 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
+
+	// Audience profile (e.g. "codeoid"): the audience NAME maps to a fixed,
+	// server-defined scope set + `aud` claim (audienceScopeProfiles). This is
+	// the ONLY place these scopes come from — arbitrary caller-supplied scopes
+	// are never honoured for a profiled audience, so a profiled token cannot be
+	// widened past the hard-coded set. An empty/unknown audience leaves both
+	// `scopes` (from req.Scope) and `aud` (defaults to the issuer) unchanged.
+	var audience []string
+	if profile, ok := audienceScopeProfiles[req.Audience]; ok {
+		scopes = slices.Clone(profile)
+		audience = []string{req.Audience}
+	}
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
 		Scopes:            scopes,
+		Audience:          audience,
 		UseRS256:          true,
 		SubjectOverride:   req.UserID,
 		UserEmail:         req.UserEmail,

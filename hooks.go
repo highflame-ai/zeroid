@@ -38,6 +38,14 @@ type GrantRequest struct {
 	// and can never be injected via AdditionalClaims (both names are reserved).
 	Role           string
 	PrivilegeScope []string
+	// Audience is an OPTIONAL, server-recognized audience-profile name (e.g.
+	// "codeoid"). On the trusted external-principal exchange
+	// (Server.ExternalPrincipalExchange) a recognized value stamps the issued
+	// token's `aud` claim and adds that profile's fixed, server-defined scope
+	// set to the `scopes` claim. Callers never supply scopes through this
+	// field — the name maps to a hard-coded profile inside zeroid. Empty or
+	// unknown values leave issuance unchanged.
+	Audience string
 }
 
 // Principal is the resolved caller at /oauth2/authorize — the tenant +
