@@ -61,8 +61,9 @@ type TokenInput struct {
 		// "codeoid"). Honoured only on the trusted external-principal exchange:
 		// a recognized value stamps `aud` = the name and adds that profile's
 		// fixed scope set to the issued token. Callers cannot supply scopes via
-		// this field — the name maps to a hard-coded profile server-side. Empty
-		// or unknown values leave issuance unchanged.
+		// this field — the name maps to a hard-coded profile server-side. An
+		// empty value leaves issuance unchanged; a non-empty value that names
+		// no known profile is rejected with `invalid_target` (RFC 8693).
 		Audience string `json:"audience,omitempty" doc:"Audience profile name (trusted external-principal exchange only)"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`

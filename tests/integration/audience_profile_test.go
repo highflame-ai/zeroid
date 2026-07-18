@@ -139,18 +139,17 @@ func TestExternalPrincipalExchange_AudienceProfile(t *testing.T) {
 			"no audience ⇒ no codeoid scopes on the token")
 	})
 
-	t.Run("unknown audience is ignored (default aud, no scopes injected)", func(t *testing.T) {
+	t.Run("unknown audience is rejected with invalid_target", func(t *testing.T) {
 		b := baseExchange("plain-user-004")
 		b["audience"] = "not-a-real-profile"
 
 		resp := post(t, "/oauth2/token", b, trusted)
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-		claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
-		_ = resp.Body.Close()
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"a non-empty audience that names no known profile must be rejected, "+
+				"not silently downgraded to a default token")
+		body := decode(t, resp)
 
-		assert.Equal(t, []string{testIssuer}, audienceOf(t, claims),
-			"an unknown audience must not stamp aud — issuance is unchanged")
-		assert.Empty(t, scopesOf(t, claims),
-			"an unknown audience must not inject any scopes")
+		assert.Equal(t, "invalid_target", body["error"],
+			"RFC 8693 §2.2.2: an unrecognized audience is rejected with invalid_target")
 	})
 }

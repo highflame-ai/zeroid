@@ -43,8 +43,10 @@ type GrantRequest struct {
 	// (Server.ExternalPrincipalExchange) a recognized value stamps the issued
 	// token's `aud` claim and adds that profile's fixed, server-defined scope
 	// set to the `scopes` claim. Callers never supply scopes through this
-	// field — the name maps to a hard-coded profile inside zeroid. Empty or
-	// unknown values leave issuance unchanged.
+	// field — the name maps to a hard-coded profile inside zeroid. An empty
+	// value leaves issuance unchanged; a non-empty value that names no known
+	// profile is rejected with `invalid_target` (RFC 8693) rather than
+	// silently downgraded to a default token.
 	Audience string
 }
 

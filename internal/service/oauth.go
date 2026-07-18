@@ -277,10 +277,12 @@ type TokenRequest struct {
 	// when it matches a known profile in audienceScopeProfiles, the issued
 	// token carries `aud` = the audience name plus that profile's fixed scope
 	// set in the `scopes` claim. Arbitrary caller scopes are never honoured for
-	// a profiled audience — the audience name is the whole input. An empty or
-	// unknown value leaves issuance unchanged (default `aud` = issuer, scopes
-	// from Scope). Like Role/PrivilegeScope this is a dedicated field, never
-	// settable via AdditionalClaims (`aud`/`scopes` are reserved).
+	// a profiled audience — the audience name is the whole input. An empty
+	// value leaves issuance unchanged (default `aud` = issuer, scopes from
+	// Scope); a non-empty value that names no known profile is rejected with
+	// `invalid_target` (RFC 8693) rather than silently downgraded. Like
+	// Role/PrivilegeScope this is a dedicated field, never settable via
+	// AdditionalClaims (`aud`/`scopes` are reserved).
 	Audience string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
@@ -874,10 +876,22 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// server-defined scope set + `aud` claim (audienceScopeProfiles). This is
 	// the ONLY place these scopes come from — arbitrary caller-supplied scopes
 	// are never honoured for a profiled audience, so a profiled token cannot be
-	// widened past the hard-coded set. An empty/unknown audience leaves both
-	// `scopes` (from req.Scope) and `aud` (defaults to the issuer) unchanged.
+	// widened past the hard-coded set. slices.Clone hands the token a private
+	// copy so the shared profile can never be mutated through an issued token.
+	//
+	// Empty audience is backward-compatible: issuance is unchanged (`scopes`
+	// from req.Scope, `aud` defaults to the issuer) — legacy callers that pass
+	// no audience get exactly the token they got before. A non-empty audience
+	// that names no known profile is rejected with `invalid_target` (RFC 8693
+	// §2.1/§2.2.2) rather than silently downgraded: a caller that asked for a
+	// scoped audience must not be handed an unscoped/misscoped token believing
+	// it got the profile it requested (scope-confusion / privilege-escalation).
 	var audience []string
-	if profile, ok := audienceScopeProfiles[req.Audience]; ok {
+	if req.Audience != "" {
+		profile, ok := audienceScopeProfiles[req.Audience]
+		if !ok {
+			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
+		}
 		scopes = slices.Clone(profile)
 		audience = []string{req.Audience}
 	}
