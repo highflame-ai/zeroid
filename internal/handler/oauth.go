@@ -57,6 +57,14 @@ type TokenInput struct {
 		// and can never be injected via additional_claims (both keys are reserved).
 		Role           string   `json:"role,omitempty" doc:"Authorization role claim (trusted external-principal exchange only)"`
 		PrivilegeScope []string `json:"privilege_scope,omitempty" doc:"Authorization privilege scope claim (trusted external-principal exchange only)"`
+		// Audience is an OPTIONAL, server-recognized audience-profile name (e.g.
+		// "codeoid"). Honoured only on the trusted external-principal exchange:
+		// a recognized value stamps `aud` = the name and adds that profile's
+		// fixed scope set to the issued token. Callers cannot supply scopes via
+		// this field — the name maps to a hard-coded profile server-side. An
+		// empty value leaves issuance unchanged; a non-empty value that names
+		// no known profile is rejected with `invalid_target` (RFC 8693).
+		Audience string `json:"audience,omitempty" doc:"Audience profile name (trusted external-principal exchange only)"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -388,6 +396,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		AdditionalClaims:  input.Body.AdditionalClaims,
 		Role:              input.Body.Role,
 		PrivilegeScope:    input.Body.PrivilegeScope,
+		Audience:          input.Body.Audience,
 		Code:              input.Body.Code,
 		CodeVerifier:      input.Body.CodeVerifier,
 		RedirectURI:       input.Body.RedirectURI,

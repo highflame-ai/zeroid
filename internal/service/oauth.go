@@ -41,6 +41,11 @@ type OAuthService struct {
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
 	hmacSecret      string // HS256 shared secret for auth code JWT verification
 	authCodeIssuer  string // expected issuer in auth code JWTs
+	// audienceScopeProfiles maps an external-principal-exchange audience name to
+	// its server-defined scope set (built-in defaults + deployer config, merged
+	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
+	// treated as the built-in defaults.
+	audienceScopeProfiles map[string][]string
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -122,6 +127,99 @@ var reservedClaims = map[string]bool{
 	"privilege_scope": true,
 }
 
+// audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
+// Studio requests it on the user_session/external-principal exchange so a
+// short-lived, user-identity JWT can drive the codeoid daemon's web operator
+// surface. The name is the ONLY input a caller supplies — it maps to exactly
+// one server-defined scope profile (never caller-supplied scopes).
+const audienceCodeoid = "codeoid"
+
+// audienceAgentSandbox is the audience profile for provisioning a per-sandbox
+// workload identity. A trusted broker (e.g. highflame-forge) requests it on the
+// user_session exchange to obtain a short-lived, user-identity token that
+// registers a per-sandbox agent identity (POST /agents/register) in the user's
+// OWN tenant — the workload-identity mint (forge #25). Deliberately harness-
+// AGNOSTIC (any agent workspace, not just codeoid) and scoped to just
+// `nhi:manage` — the ONE capability the register call needs; the registered
+// badge's own scopes are set separately in the register request.
+const audienceAgentSandbox = "agent-sandbox"
+
+// defaultAudienceScopeProfiles is the BUILT-IN fallback map of audience name →
+// the fixed scope set minted for that audience on the trusted external-principal
+// exchange. Deployers ADD or OVERRIDE profiles via config
+// (Config.AudienceScopeProfiles → ResolveAudienceScopeProfiles), so a NEW
+// audience is a reviewed CONFIG change, not a code release. It stays
+// server-defined either way (never caller-supplied): a caller only names an
+// audience, which resolves to exactly one profile the deployer controls.
+var defaultAudienceScopeProfiles = map[string][]string{
+	// codeoid: the web-operator scope set the codeoid daemon re-verifies (via
+	// JWKS) and reads from the `scopes` claim to authorize embedded-UI actions.
+	audienceCodeoid: {
+		"session:list",
+		"session:create",
+		"session:attach",
+		"session:watch",
+		"session:send",
+		"session:interrupt",
+		"session:approve",
+		"session:destroy",
+		"session:read",
+		"session:dispatch",
+		"fs:read",
+	},
+	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
+	// to register a per-sandbox identity on the user's behalf.
+	audienceAgentSandbox: {
+		"nhi:manage",
+	},
+}
+
+// allowedProfileScopes bounds what ANY audience profile (built-in default OR
+// deployer config) may grant, so a config entry can never invent authority the
+// server doesn't recognize. A profile scope outside this set fails startup
+// (ResolveAudienceScopeProfiles, fail closed).
+var allowedProfileScopes = map[string]bool{
+	"session:list":      true,
+	"session:create":    true,
+	"session:attach":    true,
+	"session:watch":     true,
+	"session:send":      true,
+	"session:interrupt": true,
+	"session:approve":   true,
+	"session:destroy":   true,
+	"session:read":      true,
+	"session:dispatch":  true,
+	"fs:read":           true,
+	"nhi:manage":        true,
+}
+
+// ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
+// the built-in defaults and validates that every granted scope is in
+// allowedProfileScopes. It returns an error (→ startup failure, fail closed) on
+// an empty audience name or an unrecognized scope, so a config typo/mistake can
+// never silently widen authority. Called once at server construction; the merged
+// result is stored on the OAuthService. A nil/empty config yields the defaults.
+func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]string, error) {
+	out := make(map[string][]string, len(defaultAudienceScopeProfiles)+len(configured))
+	for aud, scopes := range defaultAudienceScopeProfiles {
+		out[aud] = slices.Clone(scopes)
+	}
+	for aud, scopes := range configured {
+		if strings.TrimSpace(aud) == "" {
+			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		for _, sc := range scopes {
+			if !allowedProfileScopes[sc] {
+				return nil, fmt.Errorf(
+					"audience_scope_profiles[%q]: scope %q is not in the server's allowed profile-scope set",
+					aud, sc)
+			}
+		}
+		out[aud] = slices.Clone(scopes)
+	}
+	return out, nil
+}
+
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
@@ -133,6 +231,10 @@ type OAuthServiceConfig struct {
 	WIMSEDomain    string
 	HMACSecret     string
 	AuthCodeIssuer string
+	// AudienceScopeProfiles is the merged+validated audience→scope map for the
+	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
+	// back to the built-in defaults.
+	AudienceScopeProfiles map[string][]string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -162,8 +264,19 @@ func NewOAuthService(
 		wimseDomain:             cfg.WIMSEDomain,
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
+		audienceScopeProfiles:   audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
+}
+
+// audienceProfilesOrDefault returns the configured profiles, or the built-in
+// defaults when nil — so direct NewOAuthService callers (e.g. tests) that don't
+// set them still resolve the standard audiences.
+func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
+	if configured == nil {
+		return defaultAudienceScopeProfiles
+	}
+	return configured
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
@@ -241,6 +354,18 @@ type TokenRequest struct {
 	// rejects untrusted callers before issuance.
 	Role           string   // authorization role claim (`role`)
 	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
+	// Audience is an OPTIONAL, server-recognized audience profile name (e.g.
+	// "codeoid"). Honoured ONLY on the trusted external-principal exchange:
+	// when it matches a known profile in audienceScopeProfiles, the issued
+	// token carries `aud` = the audience name plus that profile's fixed scope
+	// set in the `scopes` claim. Arbitrary caller scopes are never honoured for
+	// a profiled audience — the audience name is the whole input. An empty
+	// value leaves issuance unchanged (default `aud` = issuer, scopes from
+	// Scope); a non-empty value that names no known profile is rejected with
+	// `invalid_target` (RFC 8693) rather than silently downgraded. Like
+	// Role/PrivilegeScope this is a dedicated field, never settable via
+	// AdditionalClaims (`aud`/`scopes` are reserved).
+	Audience string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -828,11 +953,37 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
+
+	// Audience profile (e.g. "codeoid"): the audience NAME maps to a fixed,
+	// server-defined scope set + `aud` claim (audienceScopeProfiles). This is
+	// the ONLY place these scopes come from — arbitrary caller-supplied scopes
+	// are never honoured for a profiled audience, so a profiled token cannot be
+	// widened past the hard-coded set. slices.Clone hands the token a private
+	// copy so the shared profile can never be mutated through an issued token.
+	//
+	// Empty audience is backward-compatible: issuance is unchanged (`scopes`
+	// from req.Scope, `aud` defaults to the issuer) — legacy callers that pass
+	// no audience get exactly the token they got before. A non-empty audience
+	// that names no known profile is rejected with `invalid_target` (RFC 8693
+	// §2.1/§2.2.2) rather than silently downgraded: a caller that asked for a
+	// scoped audience must not be handed an unscoped/misscoped token believing
+	// it got the profile it requested (scope-confusion / privilege-escalation).
+	var audience []string
+	if req.Audience != "" {
+		profile, ok := s.audienceScopeProfiles[req.Audience]
+		if !ok {
+			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
+		}
+		scopes = slices.Clone(profile)
+		audience = []string{req.Audience}
+	}
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
 		Scopes:            scopes,
+		Audience:          audience,
 		UseRS256:          true,
 		SubjectOverride:   req.UserID,
 		UserEmail:         req.UserEmail,

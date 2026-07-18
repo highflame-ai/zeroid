@@ -81,6 +81,17 @@ const (
 	ServerError = "server_error"
 )
 
+// ── RFC 8693 §2.2.2 — OAuth 2.0 Token Exchange error codes ──────────────────
+// https://www.rfc-editor.org/rfc/rfc8693#section-2.2.2
+const (
+	// InvalidTarget indicates the authorization server cannot issue a token for
+	// the target service(s) named by the request's `resource` or `audience`
+	// parameter because the requested target is unknown, unrecognized, or
+	// unsupported. Per RFC 8693 §2.1 an unrecognized target SHOULD be rejected
+	// with this code rather than silently downgraded to a default token.
+	InvalidTarget = "invalid_target"
+)
+
 // ── RFC 6750 §3.1 — Bearer Token error codes ────────────────────────────────
 // https://www.rfc-editor.org/rfc/rfc6750#section-3.1
 const (

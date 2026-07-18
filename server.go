@@ -259,11 +259,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
 	}
+	// Merge deployer-configured audience→scope profiles over the built-in defaults
+	// and validate every scope against the allowlist (fail closed at startup).
+	audienceScopeProfiles, err := service.ResolveAudienceScopeProfiles(cfg.AudienceScopeProfiles)
+	if err != nil {
+		return nil, fmt.Errorf("audience scope profiles: %w", err)
+	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, authCodeRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
-		Issuer:         cfg.Token.Issuer,
-		WIMSEDomain:    cfg.WIMSEDomain,
-		HMACSecret:     cfg.Token.HMACSecret,
-		AuthCodeIssuer: authCodeIssuer,
+		Issuer:                cfg.Token.Issuer,
+		WIMSEDomain:           cfg.WIMSEDomain,
+		HMACSecret:            cfg.Token.HMACSecret,
+		AuthCodeIssuer:        authCodeIssuer,
+		AudienceScopeProfiles: audienceScopeProfiles,
 	})
 	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
 	// require it whenever unauthenticated inspection is NOT allowed. Validate()
@@ -604,6 +611,7 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 			AdditionalClaims: req.AdditionalClaims,
 			Role:             req.Role,
 			PrivilegeScope:   req.PrivilegeScope,
+			Audience:         req.Audience,
 		})
 	})
 }
@@ -668,6 +676,7 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 		AdditionalClaims: req.AdditionalClaims,
 		Role:             req.Role,
 		PrivilegeScope:   req.PrivilegeScope,
+		Audience:         req.Audience,
 		TrustedService:   true,
 	})
 }
