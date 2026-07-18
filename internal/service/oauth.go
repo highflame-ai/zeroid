@@ -129,6 +129,15 @@ var reservedClaims = map[string]bool{
 // one fixed scope set (audienceScopeProfiles) that this server defines.
 const audienceCodeoid = "codeoid"
 
+// audienceCodeoidRuntime is the audience profile for the codeoid RUNTIME NHI
+// surface. A trusted broker (highflame-forge) requests it on the user_session
+// exchange to obtain a short-lived, user-identity JWT that registers the
+// per-sandbox agent identity (POST /agents/register) in the user's OWN tenant —
+// the workload-identity mint (forge #25). Same web-operator session scopes as
+// `codeoid`, PLUS `nhi:manage`, so the one short-lived token both drives the
+// daemon's session ops and registers the sandbox's per-agent identities.
+const audienceCodeoidRuntime = "codeoid-runtime"
+
 // audienceScopeProfiles maps a server-defined audience name to the fixed,
 // hard-coded scope set minted for that audience on the trusted external-principal
 // exchange. This is deliberately NOT caller-supplied: an audience name resolves
@@ -150,6 +159,20 @@ var audienceScopeProfiles = map[string][]string{
 		"session:read",
 		"session:dispatch",
 		"fs:read",
+	},
+	audienceCodeoidRuntime: {
+		"session:list",
+		"session:create",
+		"session:attach",
+		"session:watch",
+		"session:send",
+		"session:interrupt",
+		"session:approve",
+		"session:destroy",
+		"session:read",
+		"session:dispatch",
+		"fs:read",
+		"nhi:manage",
 	},
 }
 
