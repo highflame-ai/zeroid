@@ -26,10 +26,10 @@ var codeoidScopeProfile = []string{
 	"fs:read",
 }
 
-// codeoidRuntimeScopeProfile mirrors audienceScopeProfiles["codeoid-runtime"]:
-// the codeoid web-operator set PLUS nhi:manage, for the forge-brokered
-// per-sandbox identity mint (forge #25).
-var codeoidRuntimeScopeProfile = append(append([]string{}, codeoidScopeProfile...), "nhi:manage")
+// agentSandboxScopeProfile mirrors defaultAudienceScopeProfiles["agent-sandbox"]:
+// just nhi:manage — the one capability a broker's token needs to register a
+// per-sandbox identity on the user's behalf (forge #25).
+var agentSandboxScopeProfile = []string{"nhi:manage"}
 
 // audienceOf normalizes a decoded JWT `aud` claim (which JSON-encodes as either
 // a bare string or an array of strings) into []string so assertions don't
@@ -130,24 +130,24 @@ func TestExternalPrincipalExchange_AudienceProfile(t *testing.T) {
 		assert.NotContains(t, got, "fs:write", "caller scope must not leak into a profiled token")
 	})
 
-	t.Run("codeoid-runtime audience adds nhi:manage for the per-sandbox mint", func(t *testing.T) {
+	t.Run("agent-sandbox audience carries just nhi:manage for the per-sandbox mint", func(t *testing.T) {
 		b := baseExchange("codeoid-user-005")
-		b["audience"] = "codeoid-runtime"
+		b["audience"] = "agent-sandbox"
 
 		resp := post(t, "/oauth2/token", b, trusted)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
 		_ = resp.Body.Close()
 
-		assert.Equal(t, []string{"codeoid-runtime"}, audienceOf(t, claims),
-			"aud must be stamped to codeoid-runtime")
+		assert.Equal(t, []string{"agent-sandbox"}, audienceOf(t, claims),
+			"aud must be stamped to agent-sandbox")
 		assert.Equal(t, "codeoid-user-005", claims["sub"],
 			"sub must remain the external user — the forge-brokered token acts AS the user")
 		got := scopesOf(t, claims)
-		assert.ElementsMatch(t, codeoidRuntimeScopeProfile, got,
-			"codeoid-runtime must carry the web-operator set PLUS nhi:manage")
-		assert.Contains(t, got, "nhi:manage",
-			"nhi:manage is what lets the forge-brokered token register the sandbox identity")
+		assert.ElementsMatch(t, agentSandboxScopeProfile, got,
+			"agent-sandbox carries exactly nhi:manage — the one mint capability")
+		assert.NotContains(t, got, "session:create",
+			"the mint token must NOT carry codeoid's web-operator session scopes")
 	})
 
 	t.Run("no audience leaves issuance unchanged (default aud, no codeoid scopes)", func(t *testing.T) {

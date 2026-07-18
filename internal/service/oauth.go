@@ -41,6 +41,11 @@ type OAuthService struct {
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
 	hmacSecret      string // HS256 shared secret for auth code JWT verification
 	authCodeIssuer  string // expected issuer in auth code JWTs
+	// audienceScopeProfiles maps an external-principal-exchange audience name to
+	// its server-defined scope set (built-in defaults + deployer config, merged
+	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
+	// treated as the built-in defaults.
+	audienceScopeProfiles map[string][]string
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -126,27 +131,29 @@ var reservedClaims = map[string]bool{
 // Studio requests it on the user_session/external-principal exchange so a
 // short-lived, user-identity JWT can drive the codeoid daemon's web operator
 // surface. The name is the ONLY input a caller supplies — it maps to exactly
-// one fixed scope set (audienceScopeProfiles) that this server defines.
+// one server-defined scope profile (never caller-supplied scopes).
 const audienceCodeoid = "codeoid"
 
-// audienceCodeoidRuntime is the audience profile for the codeoid RUNTIME NHI
-// surface. A trusted broker (highflame-forge) requests it on the user_session
-// exchange to obtain a short-lived, user-identity JWT that registers the
-// per-sandbox agent identity (POST /agents/register) in the user's OWN tenant —
-// the workload-identity mint (forge #25). Same web-operator session scopes as
-// `codeoid`, PLUS `nhi:manage`, so the one short-lived token both drives the
-// daemon's session ops and registers the sandbox's per-agent identities.
-const audienceCodeoidRuntime = "codeoid-runtime"
+// audienceAgentSandbox is the audience profile for provisioning a per-sandbox
+// workload identity. A trusted broker (e.g. highflame-forge) requests it on the
+// user_session exchange to obtain a short-lived, user-identity token that
+// registers a per-sandbox agent identity (POST /agents/register) in the user's
+// OWN tenant — the workload-identity mint (forge #25). Deliberately harness-
+// AGNOSTIC (any agent workspace, not just codeoid) and scoped to just
+// `nhi:manage` — the ONE capability the register call needs; the registered
+// badge's own scopes are set separately in the register request.
+const audienceAgentSandbox = "agent-sandbox"
 
-// audienceScopeProfiles maps a server-defined audience name to the fixed,
-// hard-coded scope set minted for that audience on the trusted external-principal
-// exchange. This is deliberately NOT caller-supplied: an audience name resolves
-// to exactly one scope profile here, so a caller can never request arbitrary
-// scopes by naming an audience. Adding a new audience is a single-entry change.
-//
-// codeoid: the web-operator scope set the codeoid daemon re-verifies (via JWKS)
-// and reads from the token's `scopes` claim to authorize embedded-UI actions.
-var audienceScopeProfiles = map[string][]string{
+// defaultAudienceScopeProfiles is the BUILT-IN fallback map of audience name →
+// the fixed scope set minted for that audience on the trusted external-principal
+// exchange. Deployers ADD or OVERRIDE profiles via config
+// (Config.AudienceScopeProfiles → ResolveAudienceScopeProfiles), so a NEW
+// audience is a reviewed CONFIG change, not a code release. It stays
+// server-defined either way (never caller-supplied): a caller only names an
+// audience, which resolves to exactly one profile the deployer controls.
+var defaultAudienceScopeProfiles = map[string][]string{
+	// codeoid: the web-operator scope set the codeoid daemon re-verifies (via
+	// JWKS) and reads from the `scopes` claim to authorize embedded-UI actions.
 	audienceCodeoid: {
 		"session:list",
 		"session:create",
@@ -160,20 +167,57 @@ var audienceScopeProfiles = map[string][]string{
 		"session:dispatch",
 		"fs:read",
 	},
-	audienceCodeoidRuntime: {
-		"session:list",
-		"session:create",
-		"session:attach",
-		"session:watch",
-		"session:send",
-		"session:interrupt",
-		"session:approve",
-		"session:destroy",
-		"session:read",
-		"session:dispatch",
-		"fs:read",
+	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
+	// to register a per-sandbox identity on the user's behalf.
+	audienceAgentSandbox: {
 		"nhi:manage",
 	},
+}
+
+// allowedProfileScopes bounds what ANY audience profile (built-in default OR
+// deployer config) may grant, so a config entry can never invent authority the
+// server doesn't recognize. A profile scope outside this set fails startup
+// (ResolveAudienceScopeProfiles, fail closed).
+var allowedProfileScopes = map[string]bool{
+	"session:list":      true,
+	"session:create":    true,
+	"session:attach":    true,
+	"session:watch":     true,
+	"session:send":      true,
+	"session:interrupt": true,
+	"session:approve":   true,
+	"session:destroy":   true,
+	"session:read":      true,
+	"session:dispatch":  true,
+	"fs:read":           true,
+	"nhi:manage":        true,
+}
+
+// ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
+// the built-in defaults and validates that every granted scope is in
+// allowedProfileScopes. It returns an error (→ startup failure, fail closed) on
+// an empty audience name or an unrecognized scope, so a config typo/mistake can
+// never silently widen authority. Called once at server construction; the merged
+// result is stored on the OAuthService. A nil/empty config yields the defaults.
+func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]string, error) {
+	out := make(map[string][]string, len(defaultAudienceScopeProfiles)+len(configured))
+	for aud, scopes := range defaultAudienceScopeProfiles {
+		out[aud] = slices.Clone(scopes)
+	}
+	for aud, scopes := range configured {
+		if strings.TrimSpace(aud) == "" {
+			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		for _, sc := range scopes {
+			if !allowedProfileScopes[sc] {
+				return nil, fmt.Errorf(
+					"audience_scope_profiles[%q]: scope %q is not in the server's allowed profile-scope set",
+					aud, sc)
+			}
+		}
+		out[aud] = slices.Clone(scopes)
+	}
+	return out, nil
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
@@ -187,6 +231,10 @@ type OAuthServiceConfig struct {
 	WIMSEDomain    string
 	HMACSecret     string
 	AuthCodeIssuer string
+	// AudienceScopeProfiles is the merged+validated audience→scope map for the
+	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
+	// back to the built-in defaults.
+	AudienceScopeProfiles map[string][]string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -216,8 +264,19 @@ func NewOAuthService(
 		wimseDomain:             cfg.WIMSEDomain,
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
+		audienceScopeProfiles:   audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
+}
+
+// audienceProfilesOrDefault returns the configured profiles, or the built-in
+// defaults when nil — so direct NewOAuthService callers (e.g. tests) that don't
+// set them still resolve the standard audiences.
+func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
+	if configured == nil {
+		return defaultAudienceScopeProfiles
+	}
+	return configured
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
@@ -911,7 +970,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// it got the profile it requested (scope-confusion / privilege-escalation).
 	var audience []string
 	if req.Audience != "" {
-		profile, ok := audienceScopeProfiles[req.Audience]
+		profile, ok := s.audienceScopeProfiles[req.Audience]
 		if !ok {
 			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
 		}
