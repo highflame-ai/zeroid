@@ -46,6 +46,15 @@ type Config struct {
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
 
+	// AudienceScopeProfiles lets a deployer ADD or OVERRIDE audience→scope
+	// profiles for the trusted external-principal exchange WITHOUT a code release
+	// (the built-in defaults are the fallback). Each granted scope must be in the
+	// server's allowed profile-scope set (validated at startup, fail closed) —
+	// server-defined, never caller-supplied. Example (config.yaml):
+	//   audience_scope_profiles:
+	//     my-audience: ["nhi:manage"]
+	AudienceScopeProfiles map[string][]string `koanf:"audience_scope_profiles"`
+
 	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
 	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
 	// looks up the upstream iss in this list, fetches the issuer's JWKS, and
