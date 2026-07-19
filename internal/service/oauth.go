@@ -283,20 +283,21 @@ func NewOAuthService(
 	}
 }
 
-// audienceProfilesOrDefault returns the configured profiles, or the built-in
-// defaults when nil — so direct NewOAuthService callers (e.g. tests) that don't
-// set them still resolve the standard audiences.
+// audienceProfilesOrDefault returns a deep copy of the configured profiles, or of
+// the built-in defaults when nil — so direct NewOAuthService callers (e.g. tests)
+// that don't set them still resolve the standard audiences. It always clones, so
+// an OAuthService can never alias the package-global defaults (nil path) nor a map
+// the caller retains and later mutates (non-nil path).
 func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
-	if configured == nil {
-		// Deep-copy the shared defaults so a direct caller (e.g. a test) can never
-		// mutate the package global under another OAuthService in the same process.
-		out := make(map[string][]string, len(defaultAudienceScopeProfiles))
-		for aud, scopes := range defaultAudienceScopeProfiles {
-			out[aud] = slices.Clone(scopes)
-		}
-		return out
+	source := configured
+	if source == nil {
+		source = defaultAudienceScopeProfiles
 	}
-	return configured
+	out := make(map[string][]string, len(source))
+	for aud, scopes := range source {
+		out[aud] = slices.Clone(scopes)
+	}
+	return out
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.

@@ -74,14 +74,28 @@ func TestDefaultAudienceProfilesAreWithinAllowlist(t *testing.T) {
 	}
 }
 
-// TestAudienceProfilesOrDefaultClones proves the nil path returns a deep copy, so
-// a caller can never mutate the shared package-global defaults.
+// TestAudienceProfilesOrDefaultClones proves both the nil and non-nil paths return
+// a deep copy, so a caller can never mutate the shared package-global defaults nor
+// a config map it passed in and still holds a reference to.
 func TestAudienceProfilesOrDefaultClones(t *testing.T) {
-	got := audienceProfilesOrDefault(nil)
-	got[audienceCodeoid][0] = "MUTATED"
-	got["injected"] = []string{"x"}
-	assert.NotEqual(t, "MUTATED", defaultAudienceScopeProfiles[audienceCodeoid][0],
-		"mutating the returned map's slice must not corrupt the shared default")
-	assert.NotContains(t, defaultAudienceScopeProfiles, "injected",
-		"adding a key to the returned map must not corrupt the shared default")
+	t.Run("nil path clones defaults", func(t *testing.T) {
+		got := audienceProfilesOrDefault(nil)
+		got[audienceCodeoid][0] = "MUTATED"
+		got["injected"] = []string{"x"}
+		assert.NotEqual(t, "MUTATED", defaultAudienceScopeProfiles[audienceCodeoid][0],
+			"mutating the returned map's slice must not corrupt the shared default")
+		assert.NotContains(t, defaultAudienceScopeProfiles, "injected",
+			"adding a key to the returned map must not corrupt the shared default")
+	})
+
+	t.Run("non-nil path clones the configured map", func(t *testing.T) {
+		input := map[string][]string{"custom": {"session:read"}}
+		got := audienceProfilesOrDefault(input)
+		got["custom"][0] = "MUTATED"
+		got["injected"] = []string{"x"}
+		assert.Equal(t, "session:read", input["custom"][0],
+			"mutating the returned map's slice must not corrupt the input config")
+		assert.NotContains(t, input, "injected",
+			"adding a key to the returned map must not corrupt the input config")
+	})
 }
