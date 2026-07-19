@@ -196,7 +196,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		req.SubType = domain.SubTypeToolAgent
 	}
 	if !req.SubType.ValidForIdentityType(req.IdentityType) {
-		return nil, fmt.Errorf("invalid sub_type: %s", req.SubType)
+		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, req.SubType, req.IdentityType)
 	}
 	if req.AllowedScopes == nil {
 		req.AllowedScopes = []string{}
@@ -681,7 +681,7 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	}
 	if req.SubType != "" {
 		if !req.SubType.ValidForIdentityType(identity.IdentityType) {
-			return nil, fmt.Errorf("invalid sub_type: %s", req.SubType)
+			return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, req.SubType, identity.IdentityType)
 		}
 		identity.SubType = req.SubType
 	}

@@ -111,13 +111,17 @@ const (
 	SubTypeToolAgent    SubType = "tool_agent"
 	SubTypeHumanProxy   SubType = "human_proxy"
 	SubTypeEvaluator    SubType = "evaluator"
+	// SubTypeCodeAgent is a code-generation/analysis agent (e.g. a coding-agent
+	// workspace). It is valid for BOTH identity_type=agent (a delegated code
+	// agent, e.g. forge's per-sandbox mint) and identity_type=application (a
+	// code-gen product registered as an application) — see the two sets below.
+	SubTypeCodeAgent SubType = "code_agent"
 
 	// Application sub-types.
 	SubTypeChatbot    SubType = "chatbot"
 	SubTypeAssistant  SubType = "assistant"
 	SubTypeAPIService SubType = "api_service"
 	SubTypeCustom     SubType = "custom"
-	SubTypeCodeAgent  SubType = "code_agent"
 
 	// Service sub-types.
 	SubTypeLLMProvider SubType = "llm_provider"
@@ -130,9 +134,15 @@ var agentSubTypes = map[SubType]bool{
 	SubTypeToolAgent:    true,
 	SubTypeHumanProxy:   true,
 	SubTypeEvaluator:    true,
+	// A code agent IS an agent. Previously code_agent was only accepted for
+	// identity_type=application, so registering a code agent as an agent (the
+	// correct type) failed validation and 500'd.
+	SubTypeCodeAgent: true,
 }
 
 // applicationSubTypes is the set of sub-types valid for identity_type = "application".
+// code_agent is also accepted here (a code-gen product modeled as an application)
+// for backward compatibility; it is primarily an agent sub-type (see agentSubTypes).
 var applicationSubTypes = map[SubType]bool{
 	SubTypeChatbot:    true,
 	SubTypeAssistant:  true,
