@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
-          pip install --quiet highflame
+          pip install --quiet "highflame==0.3.17"
 
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
@@ -103,7 +103,7 @@ jobs:
         run: |-
           npm init -y
           npm install --save-dev vitest typescript @testcontainers/postgresql
-          npm install @highflame/sdk
+          npm install @highflame/sdk@0.3.17
 
       - name: Run TypeScript SDK smoke tests
         working-directory: tests/sdk
