@@ -49,4 +49,39 @@ func TestResolveAudienceScopeProfiles(t *testing.T) {
 		_, err := ResolveAudienceScopeProfiles(map[string][]string{"  ": {"nhi:manage"}})
 		require.Error(t, err)
 	})
+
+	t.Run("an empty scope LIST is rejected (would silently neuter a profile)", func(t *testing.T) {
+		// A config typo like `codeoid: []` must fail loud at boot, not ship an
+		// audience that mints scopeless tokens.
+		_, err := ResolveAudienceScopeProfiles(map[string][]string{"x": {}})
+		require.Error(t, err)
+		_, err = ResolveAudienceScopeProfiles(map[string][]string{audienceCodeoid: {}})
+		require.Error(t, err, "overriding a default down to zero scopes must also fail")
+	})
+}
+
+// TestDefaultAudienceProfilesAreWithinAllowlist pins the invariant that every
+// built-in default profile grants at least one scope and only scopes the server
+// recognizes — so a future default can't drift out of allowedProfileScopes (which
+// would let a default grant a scope a deployer config is then rejected for).
+func TestDefaultAudienceProfilesAreWithinAllowlist(t *testing.T) {
+	for aud, scopes := range defaultAudienceScopeProfiles {
+		assert.NotEmptyf(t, scopes, "default profile %q must grant at least one scope", aud)
+		for _, sc := range scopes {
+			assert.Truef(t, allowedProfileScopes[sc],
+				"default profile %q scope %q must be in allowedProfileScopes", aud, sc)
+		}
+	}
+}
+
+// TestAudienceProfilesOrDefaultClones proves the nil path returns a deep copy, so
+// a caller can never mutate the shared package-global defaults.
+func TestAudienceProfilesOrDefaultClones(t *testing.T) {
+	got := audienceProfilesOrDefault(nil)
+	got[audienceCodeoid][0] = "MUTATED"
+	got["injected"] = []string{"x"}
+	assert.NotEqual(t, "MUTATED", defaultAudienceScopeProfiles[audienceCodeoid][0],
+		"mutating the returned map's slice must not corrupt the shared default")
+	assert.NotContains(t, defaultAudienceScopeProfiles, "injected",
+		"adding a key to the returned map must not corrupt the shared default")
 }

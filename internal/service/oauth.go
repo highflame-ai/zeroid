@@ -205,8 +205,23 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 		out[aud] = slices.Clone(scopes)
 	}
 	for aud, scopes := range configured {
+		out[aud] = slices.Clone(scopes)
+	}
+	// Validate the MERGED set (built-in defaults AND deployer config) uniformly and
+	// fail closed. Validating the defaults too guards against a future default
+	// scope drifting out of allowedProfileScopes (a config trying to grant the same
+	// scope would then be rejected while the default silently grants it).
+	for aud, scopes := range out {
 		if strings.TrimSpace(aud) == "" {
 			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		if len(scopes) == 0 {
+			// A recognized-but-empty profile mints a token with the audience stamped
+			// and ZERO scopes — every scope-gated action then silently denies. Reject
+			// at boot (fail loud) rather than shipping a scopeless audience.
+			return nil, fmt.Errorf(
+				"audience_scope_profiles[%q]: empty scope list — a recognized audience must grant at least one scope",
+				aud)
 		}
 		for _, sc := range scopes {
 			if !allowedProfileScopes[sc] {
@@ -215,7 +230,6 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 					aud, sc)
 			}
 		}
-		out[aud] = slices.Clone(scopes)
 	}
 	return out, nil
 }
@@ -274,7 +288,13 @@ func NewOAuthService(
 // set them still resolve the standard audiences.
 func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
 	if configured == nil {
-		return defaultAudienceScopeProfiles
+		// Deep-copy the shared defaults so a direct caller (e.g. a test) can never
+		// mutate the package global under another OAuthService in the same process.
+		out := make(map[string][]string, len(defaultAudienceScopeProfiles))
+		for aud, scopes := range defaultAudienceScopeProfiles {
+			out[aud] = slices.Clone(scopes)
+		}
+		return out
 	}
 	return configured
 }
