@@ -205,8 +205,23 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 		out[aud] = slices.Clone(scopes)
 	}
 	for aud, scopes := range configured {
+		out[aud] = slices.Clone(scopes)
+	}
+	// Validate the MERGED set (built-in defaults AND deployer config) uniformly and
+	// fail closed. Validating the defaults too guards against a future default
+	// scope drifting out of allowedProfileScopes (a config trying to grant the same
+	// scope would then be rejected while the default silently grants it).
+	for aud, scopes := range out {
 		if strings.TrimSpace(aud) == "" {
 			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		if len(scopes) == 0 {
+			// A recognized-but-empty profile mints a token with the audience stamped
+			// and ZERO scopes — every scope-gated action then silently denies. Reject
+			// at boot (fail loud) rather than shipping a scopeless audience.
+			return nil, fmt.Errorf(
+				"audience_scope_profiles[%q]: empty scope list — a recognized audience must grant at least one scope",
+				aud)
 		}
 		for _, sc := range scopes {
 			if !allowedProfileScopes[sc] {
@@ -215,7 +230,6 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 					aud, sc)
 			}
 		}
-		out[aud] = slices.Clone(scopes)
 	}
 	return out, nil
 }
@@ -269,14 +283,21 @@ func NewOAuthService(
 	}
 }
 
-// audienceProfilesOrDefault returns the configured profiles, or the built-in
-// defaults when nil — so direct NewOAuthService callers (e.g. tests) that don't
-// set them still resolve the standard audiences.
+// audienceProfilesOrDefault returns a deep copy of the configured profiles, or of
+// the built-in defaults when nil — so direct NewOAuthService callers (e.g. tests)
+// that don't set them still resolve the standard audiences. It always clones, so
+// an OAuthService can never alias the package-global defaults (nil path) nor a map
+// the caller retains and later mutates (non-nil path).
 func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
-	if configured == nil {
-		return defaultAudienceScopeProfiles
+	source := configured
+	if source == nil {
+		source = defaultAudienceScopeProfiles
 	}
-	return configured
+	out := make(map[string][]string, len(source))
+	for aud, scopes := range source {
+		out[aud] = slices.Clone(scopes)
+	}
+	return out
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
