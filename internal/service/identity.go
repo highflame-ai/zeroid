@@ -196,7 +196,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		req.SubType = domain.SubTypeToolAgent
 	}
 	if !req.SubType.ValidForIdentityType(req.IdentityType) {
-		return nil, fmt.Errorf("invalid sub_type: %s", req.SubType)
+		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, req.SubType, req.IdentityType)
 	}
 	if req.AllowedScopes == nil {
 		req.AllowedScopes = []string{}
@@ -675,15 +675,21 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	}
 	if req.IdentityType != "" {
 		if !req.IdentityType.Valid() {
-			return nil, fmt.Errorf("invalid identity_type: %s", req.IdentityType)
+			return nil, fmt.Errorf("%w: invalid identity_type: %s", ErrInvalidIdentityField, req.IdentityType)
 		}
 		identity.IdentityType = req.IdentityType
 	}
 	if req.SubType != "" {
-		if !req.SubType.ValidForIdentityType(identity.IdentityType) {
-			return nil, fmt.Errorf("invalid sub_type: %s", req.SubType)
-		}
 		identity.SubType = req.SubType
+	}
+	// Whenever the identity_type OR the sub_type changed, the FINAL combination
+	// must be valid — otherwise retyping alone (sub_type unchanged) could strand a
+	// sub_type that isn't valid for the new identity_type. Only enforced when one
+	// of the two was actually touched, so an unrelated update (e.g. Name) never
+	// fails on pre-existing data.
+	if (req.IdentityType != "" || req.SubType != "") &&
+		!identity.SubType.ValidForIdentityType(identity.IdentityType) {
+		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, identity.SubType, identity.IdentityType)
 	}
 	if req.OwnerUserID != "" {
 		identity.OwnerUserID = req.OwnerUserID

@@ -135,3 +135,36 @@ func TestBuildWIMSEURI_LengthCap(t *testing.T) {
 		t.Fatalf("error not ErrSPIFFEIDTooLong: %v", err)
 	}
 }
+
+// TestSubTypeValidForIdentityType pins the sub_type ↔ identity_type matrix.
+// Regression: code_agent must be valid for identity_type=agent (a delegated
+// code agent, e.g. forge's per-sandbox mint) — it was previously accepted only
+// for application, so registering a code agent as an agent (the correct type)
+// failed validation and 500'd.
+func TestSubTypeValidForIdentityType(t *testing.T) {
+	cases := []struct {
+		sub  SubType
+		typ  IdentityType
+		want bool
+	}{
+		// code_agent is valid for BOTH agent and application.
+		{SubTypeCodeAgent, IdentityTypeAgent, true},
+		{SubTypeCodeAgent, IdentityTypeApplication, true},
+		// A code_agent is not a service/mcp_server sub-type.
+		{SubTypeCodeAgent, IdentityTypeService, false},
+		{SubTypeCodeAgent, IdentityTypeMCPServer, false},
+		// Core agent sub-types stay agent-only.
+		{SubTypeToolAgent, IdentityTypeAgent, true},
+		{SubTypeToolAgent, IdentityTypeApplication, false},
+		// Application sub-types stay application-only.
+		{SubTypeChatbot, IdentityTypeApplication, true},
+		{SubTypeChatbot, IdentityTypeAgent, false},
+		// Empty sub-type is always valid (no sub-classification).
+		{"", IdentityTypeAgent, true},
+	}
+	for _, c := range cases {
+		if got := c.sub.ValidForIdentityType(c.typ); got != c.want {
+			t.Errorf("SubType(%q).ValidForIdentityType(%q) = %v, want %v", c.sub, c.typ, got, c.want)
+		}
+	}
+}
