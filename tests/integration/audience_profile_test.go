@@ -111,6 +111,44 @@ func TestExternalPrincipalExchange_AudienceProfile(t *testing.T) {
 			"scopes must be exactly the server-defined codeoid web-operator set")
 	})
 
+	t.Run("user_name mirrors into the OIDC-standard name claim when the principal has none", func(t *testing.T) {
+		// The external-principal exchange mints an ephemeral service identity
+		// with no name of its own, so a spec-compliant client (e.g. the codeoid
+		// web UI) reading the standard `name` claim would otherwise fall back to
+		// the raw `sub`. The exchange mirrors the acting user's display name into
+		// `name` so it renders correctly; `user_name` still carries it verbatim.
+		b := baseExchange("codeoid-user-006")
+		b["audience"] = "codeoid"
+		b["user_name"] = "Yash Datta"
+
+		resp := post(t, "/oauth2/token", b, trusted)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+		_ = resp.Body.Close()
+
+		assert.Equal(t, "Yash Datta", claims["name"],
+			"name must fall back to user_name when the principal has no name of its own")
+		assert.Equal(t, "Yash Datta", claims["user_name"],
+			"user_name is still emitted verbatim alongside the standard name claim")
+		assert.Equal(t, "codeoid-user-006", claims["sub"],
+			"sub is unaffected — it remains the external user id")
+	})
+
+	t.Run("no user_name leaves the name claim unset (no regression)", func(t *testing.T) {
+		// Without a user display name and without a principal name, `name` must
+		// stay absent rather than being coerced to an empty string.
+		b := baseExchange("codeoid-user-007")
+		b["audience"] = "codeoid"
+
+		resp := post(t, "/oauth2/token", b, trusted)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+		_ = resp.Body.Close()
+
+		_, present := claims["name"]
+		assert.False(t, present, "name must not be emitted when there is nothing to name")
+	})
+
 	t.Run("codeoid audience ignores caller-supplied scopes (never widened)", func(t *testing.T) {
 		b := baseExchange("codeoid-user-002")
 		b["audience"] = "codeoid"
