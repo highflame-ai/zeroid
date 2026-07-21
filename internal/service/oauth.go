@@ -58,6 +58,11 @@ type OAuthService struct {
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// cimdSvc resolves Client ID Metadata Document (CIMD) client_id URLs into
+	// ephemeral public PKCE clients on the authorization_code flow. Nil (or a
+	// disabled instance) means CIMD is off and the auth-code paths use only the
+	// client registry. Wired after construction via SetCIMDService.
+	cimdSvc *CIMDService
 	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
 	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
 	// every other check passes) so a replayed ID-JAG is rejected with
@@ -312,6 +317,41 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+}
+
+// SetCIMDService wires the Client ID Metadata Document resolver after
+// construction. When set to an enabled instance, the authorization_code flow
+// resolves https:// client_id URLs by fetching + validating their published
+// metadata documents (see internal/service/cimd.go). A nil or disabled
+// instance leaves CIMD off — the auth-code paths use only the client registry.
+func (s *OAuthService) SetCIMDService(c *CIMDService) {
+	s.cimdSvc = c
+}
+
+// cimdOAuthError maps a CIMD resolution error sentinel to the RFC 6749 §5.2
+// OAuth error the /oauth2/authorize and /oauth2/token responses should carry.
+// It never surfaces the wrapped cause's message to the client (fetch details
+// can leak our DNS view / internal topology); the cause is preserved on the
+// OAuthError for server-side logs.
+func cimdOAuthError(err error) error {
+	switch {
+	case errors.Is(err, ErrCIMDInvalidClientID):
+		return oauthBadRequestCause(oautherror.InvalidRequest,
+			"client_id is not a valid metadata document URL", err)
+	case errors.Is(err, ErrCIMDInvalidDocument):
+		// RFC 7591 invalid_client_metadata — the document exists but is
+		// malformed or declares an unsupported shape.
+		return oauthBadRequestCause(oautherror.InvalidClientMetadata,
+			"client id metadata document is invalid", err)
+	case errors.Is(err, ErrCIMDDomainNotAllowed):
+		return oauthUnauthorized("client_id metadata domain is not allowed", err)
+	case errors.Is(err, ErrCIMDFetch):
+		return oauthUnauthorized("could not retrieve client id metadata document", err)
+	case errors.Is(err, ErrCIMDDisabled):
+		return oauthUnauthorized("client id metadata documents are not enabled", err)
+	default:
+		return oauthServerError("client id metadata resolution failed", err)
+	}
 }
 
 // SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
@@ -1380,12 +1420,26 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", oauthServerError("authorization_code issuance requires HMAC secret to be configured", nil)
 	}
 
-	// Client lookup. GetPublicClient verifies the client exists and is
-	// active; no secret is required because PKCE provides the proof of
-	// possession at exchange time.
+	// Client lookup — registry first, CIMD fallback. GetPublicClient verifies
+	// the client exists and is active; no secret is required because PKCE
+	// provides the proof of possession at exchange time. When the registry
+	// misses AND the client_id is shaped like a CIMD identifier (an https://
+	// URL with a path), resolve it by fetching + validating its published
+	// metadata document into an ephemeral public client. Registry-first keeps
+	// any pre-existing registry client whose client_id happens to be a URL
+	// working unchanged (CIMD is on by default), and gives deployers a pinning
+	// mechanism: registering a client under a CIMD URL overrides the document.
+	// CIMD clients are inherently public PKCE clients, so both paths converge
+	// on the same shape.
 	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
 	if err != nil {
-		return "", oauthUnauthorized("unknown or inactive client_id", err)
+		if !s.cimdSvc.Enabled() || !IsCIMDClientID(req.ClientID) {
+			return "", oauthUnauthorized("unknown or inactive client_id", err)
+		}
+		oauthClient, err = s.cimdSvc.ResolveClient(ctx, req.ClientID)
+		if err != nil {
+			return "", cimdOAuthError(err)
+		}
 	}
 
 	// Grant-type allow-list. Same check that authorizationCode runs at
@@ -1541,17 +1595,29 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
 	}
 
-	// Look up the client in the registry — this is the authoritative check.
-	// Resolve ANY client (public or confidential): an authorization_code client
-	// may be either. GetPublicClient filters to client_type='public', so a
-	// confidential code client would otherwise fail to resolve. Re-establish
-	// the active-client gate that GetPublicClient enforced.
+	// Look up the client — this is the authoritative check. Registry first:
+	// GetClientByClientID resolves ANY client (public or confidential — an
+	// authorization_code client may be either; GetPublicClient would filter to
+	// client_type='public' and miss a confidential code client), so the
+	// active-client gate GetPublicClient enforces is re-established here. When
+	// the registry misses AND the client_id is CIMD-shaped, re-resolve it from
+	// its metadata document (cached from the /oauth2/authorize call moments
+	// earlier); the synthesized client is a public PKCE client, always active.
+	// Registry-first mirrors IssueAuthCode so both halves of the flow resolve
+	// the same client for a given client_id.
 	oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
-	if err != nil {
+	switch {
+	case err == nil:
+		if !oauthClient.IsActive {
+			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+		}
+	case s.cimdSvc.Enabled() && IsCIMDClientID(req.ClientID):
+		oauthClient, err = s.cimdSvc.ResolveClient(ctx, req.ClientID)
+		if err != nil {
+			return nil, cimdOAuthError(err)
+		}
+	default:
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
-	}
-	if !oauthClient.IsActive {
-		return nil, oauthUnauthorized("unknown or inactive client_id", nil)
 	}
 
 	// RFC 6749 §2.3/§10.4: a confidential client MUST authenticate with its
@@ -1766,6 +1832,18 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
 			return nil, err
+		}
+	} else if errors.Is(err, ErrOAuthClientNotFound) && s.cimdSvc.Enabled() && IsCIMDClientID(req.ClientID) {
+		// CIMD client: re-resolve its metadata document (served from cache in
+		// steady state). CIMD clients are public PKCE clients — possession of
+		// the refresh-token string plus the peeked row's client_id binding
+		// below is the client authentication; there is no secret to verify.
+		// TTLs stay 0 → server defaults (synthesized clients carry none).
+		// Resolution failure fails closed WITHOUT consuming the token (we're
+		// before rotation), which also gives CIMD its lifecycle story: a
+		// client that unpublishes its document can no longer rotate.
+		if _, cimdErr := s.cimdSvc.ResolveClient(ctx, req.ClientID); cimdErr != nil {
+			return nil, cimdOAuthError(cimdErr)
 		}
 	} else {
 		// The named client_id (required by the entry guard above) can't be
@@ -2138,15 +2216,21 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	if clientID == "" {
 		return oauthUnauthorized("client_id is required when a client_secret is supplied", nil)
 	}
-	// client_id with no secret: valid only for a registered public client.
-	// RFC 7009 §2.1 / RFC 7662 §2.1 — public clients have no secret, and
-	// standard OAuth libraries attach client_id to revocation/introspection
-	// requests. A confidential client (or an unknown client_id) must present a
-	// secret, so this neither widens access nor lets a confidential client
-	// skip authentication.
+	// client_id with no secret: valid only for a registered public client or a
+	// resolvable CIMD client (also public — its metadata document is the
+	// registration). RFC 7009 §2.1 / RFC 7662 §2.1 — public clients have no
+	// secret, and standard OAuth libraries attach client_id to revocation/
+	// introspection requests. A confidential client (or an unknown client_id)
+	// must present a secret, so this neither widens access nor lets a
+	// confidential client skip authentication.
 	if clientSecret == "" {
 		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
 			if errors.Is(err, ErrOAuthClientNotFound) {
+				if s.cimdSvc.Enabled() && IsCIMDClientID(clientID) {
+					if _, cimdErr := s.cimdSvc.ResolveClient(ctx, clientID); cimdErr == nil {
+						return nil
+					}
+				}
 				return oauthUnauthorized("client authentication required", nil)
 			}
 			return oauthServerError("client verification failed", err)

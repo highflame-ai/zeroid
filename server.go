@@ -278,6 +278,28 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 
+	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
+	// the authorization_code flow by fetching + validating their published
+	// metadata documents. The document fetch reuses the same DNS-rebinding-safe
+	// SSRF-guarded HTTP client as the OIDC attestation verifier and CIBA
+	// dispatch, so a client_id URL can never make ZeroID reach a private /
+	// loopback / metadata address (unless the deployer opts into the test/dev
+	// relaxation). Enabled by default (cfg.CIMD.Enabled defaults true).
+	cimdSvc := service.NewCIMDService(service.CIMDConfig{
+		Enabled:          cfg.CIMD.Enabled,
+		AllowedDomains:   cfg.CIMD.AllowedDomains,
+		MaxDocumentBytes: cfg.CIMD.MaxDocumentBytes,
+		CacheTTL:         time.Duration(cfg.CIMD.CacheTTLSeconds) * time.Second,
+		HTTPClient:       attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints),
+	})
+	oauthSvc.SetCIMDService(cimdSvc)
+	if cfg.CIMD.Enabled {
+		log.Info().
+			Int("allowed_domains", len(cfg.CIMD.AllowedDomains)).
+			Bool("allow_private_endpoints", cfg.CIMD.AllowPrivateMetadataEndpoints).
+			Msg("CIMD (Client ID Metadata Documents) enabled")
+	}
+
 	// Build the external-issuer registry when the deployer has configured
 	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
@@ -345,6 +367,8 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		signingCredSvc, db,
 		cfg.Token.Issuer,
 	)
+	// Advertise CIMD support in the AS metadata document only when enabled.
+	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.

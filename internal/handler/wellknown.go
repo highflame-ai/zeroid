@@ -114,7 +114,7 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 }
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
-	return &OAuthMetadataOutput{Body: map[string]any{
+	body := map[string]any{
 		"issuer":                                a.issuer,
 		"token_endpoint":                        a.issuer + "/oauth2/token",
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
@@ -164,7 +164,18 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// backchannel endpoint. An empty array signals "no signing algs
 		// supported" per the spec's MAY clause.
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
-	}}, nil
+	}
+
+	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
+	// only when it's enabled on this deployment so CIMD-aware clients (e.g. MCP
+	// 2025-11-25) know they can present an https:// client_id URL and skip
+	// registration. Omitted entirely when disabled (the field's absence means
+	// "unsupported").
+	if a.cimdEnabled {
+		body["client_id_metadata_document_supported"] = true
+	}
+
+	return &OAuthMetadataOutput{Body: body}, nil
 }
 
 // protectedResourceMetadataOp serves RFC 9728 OAuth 2.0 Protected Resource
