@@ -416,6 +416,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// make identity-aware decisions without calling back to ZeroID.
 	if req.Identity.Name != "" {
 		_ = token.Set("name", req.Identity.Name)
+	} else if req.UserName != "" {
+		// No principal-specific name (e.g. the trusted external-principal
+		// exchange, where the minted principal is an ephemeral service
+		// identity acting on behalf of a human). Fall back to the acting
+		// user's display name so the OIDC-standard `name` claim (RFC 7519 /
+		// OpenID Connect) is populated for spec-compliant clients that read
+		// it. `user_name` below still carries the value verbatim; this only
+		// mirrors it into the reserved `name` claim when nothing else owns it.
+		_ = token.Set("name", req.UserName)
 	}
 	if req.Identity.Framework != "" {
 		_ = token.Set("framework", req.Identity.Framework)
