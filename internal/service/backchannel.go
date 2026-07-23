@@ -666,6 +666,10 @@ type RedeemInput struct {
 	// Non-empty when the polling /oauth2/token call carried a valid DPoP
 	// proof; the issued credential then carries cnf.jkt + token_type "DPoP".
 	DPoPKeyThumbprint string
+	// Audience carries the RFC 8707 pre-resolved audience from Token(). Nil
+	// means no resource indicator was supplied (IssueCredential uses the
+	// issuer-URL fallback).
+	Audience []string
 }
 
 // Redeem implements the polling response state machine per CIBA Core §11.
@@ -774,7 +778,7 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 
 	case domain.BackchannelStatusApproved:
-		return s.issueTokenForApprovedRow(ctx, row, in.DPoPKeyThumbprint)
+		return s.issueTokenForApprovedRow(ctx, row, in.DPoPKeyThumbprint, in.Audience)
 
 	default:
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("unexpected request status %q", row.Status))
@@ -789,7 +793,7 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 // Caller MUST hold the invariant that row.Status == approved. The MarkIssued
 // guard provides the actual at-most-once gate; on a lost race the second
 // caller gets affected=0 and an *OAuthError signalling the duplication.
-func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *domain.BackchannelAuthRequest, dpopKeyThumbprint string) (*domain.AccessToken, error) {
+func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *domain.BackchannelAuthRequest, dpopKeyThumbprint string, audience []string) (*domain.AccessToken, error) {
 	// Claim-first: flip approved → issued BEFORE minting the token so only
 	// one caller can ever reach IssueCredential. The conditional UPDATE in
 	// MarkIssued (status='approved' guard) is the at-most-once invariant;
@@ -854,6 +858,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		Identity:          identity,
 		Scopes:            parseScopeString(row.Scope),
 		GrantType:         domain.GrantTypeCIBA,
+		Audience:          audience,
 		TTL:               900, // 15 minutes — short-lived; matches ExternalPrincipalExchange
 		UseRS256:          true,
 		SubjectOverride:   row.ApprovedSubjectID,
@@ -1067,7 +1072,7 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	// so there is no DPoP proof — passes empty thumbprint to keep the token
 	// as Bearer. Resource-server-side DPoP for CIBA-push tokens is a future
 	// item if it's ever needed.
-	accessToken, err := s.issueTokenForApprovedRow(ctx, row, "")
+	accessToken, err := s.issueTokenForApprovedRow(ctx, row, "", nil)
 	if err != nil {
 		// Most likely an OAuthError("access_denied") from a lost race against
 		// a concurrent dispatch. Log and exit — the first dispatcher will
