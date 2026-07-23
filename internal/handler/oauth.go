@@ -65,6 +65,13 @@ type TokenInput struct {
 		// empty value leaves issuance unchanged; a non-empty value that names
 		// no known profile is rejected with `invalid_target` (RFC 8693).
 		Audience string `json:"audience,omitempty" doc:"Audience profile name (trusted external-principal exchange only)"`
+		// Resource is the RFC 8707 resource indicator URI — the target resource
+		// server this token will be presented to. When supplied, `aud` on the
+		// issued JWT is set to [resource] instead of the issuer URL. The value
+		// must be an absolute URI (scheme + host, no fragment). When
+		// AllowedResources is configured, the URI must match one of the listed
+		// values; otherwise any syntactically valid URI is accepted.
+		Resource string `json:"resource,omitempty" doc:"RFC 8707 resource indicator URI — the target resource server"`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -397,6 +404,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		Role:              input.Body.Role,
 		PrivilegeScope:    input.Body.PrivilegeScope,
 		Audience:          input.Body.Audience,
+		Resource:          input.Body.Resource,
 		Code:              input.Body.Code,
 		CodeVerifier:      input.Body.CodeVerifier,
 		RedirectURI:       input.Body.RedirectURI,

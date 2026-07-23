@@ -46,6 +46,12 @@ type OAuthService struct {
 	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
 	// treated as the built-in defaults.
 	audienceScopeProfiles map[string][]string
+	// allowedResources is the validated RFC 8707 resource allowlist. Nil or
+	// empty = open mode (any syntactically valid URI accepted).
+	allowedResources []string
+	// defaultAudience is used as aud when no resource parameter is supplied.
+	// Empty = fall back to the issuer URL (existing behavior in IssueCredential).
+	defaultAudience string
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -252,6 +258,23 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
 type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, err error)
 
+// ValidateAllowedResources validates the deployer-configured allowed_resources
+// list at startup. It rejects any blank entry (fail closed — an empty string
+// could otherwise accidentally match resource="" in allowlist mode). URI
+// syntactic validity is intentionally deferred to request time in
+// resolveResourceAudience. Returns a cloned list on success; nil input returns
+// an empty list and no error.
+func ValidateAllowedResources(configured []string) ([]string, error) {
+	out := make([]string, 0, len(configured))
+	for _, r := range configured {
+		if strings.TrimSpace(r) == "" {
+			return nil, fmt.Errorf("allowed_resources: entry %q is blank", r)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
 	Issuer         string
@@ -262,6 +285,12 @@ type OAuthServiceConfig struct {
 	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
 	// back to the built-in defaults.
 	AudienceScopeProfiles map[string][]string
+	// AllowedResources is the validated list of permitted resource URIs for RFC
+	// 8707 resource indicators. Empty = open mode (any valid URI accepted).
+	AllowedResources []string
+	// DefaultAudience is the aud value used when no resource parameter is
+	// supplied. Empty = fall back to the issuer URL (existing behavior).
+	DefaultAudience string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -292,6 +321,8 @@ func NewOAuthService(
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
 		audienceScopeProfiles:   audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
+		allowedResources:        cfg.AllowedResources,
+		defaultAudience:         cfg.DefaultAudience,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
 }
@@ -311,6 +342,31 @@ func audienceProfilesOrDefault(configured map[string][]string) map[string][]stri
 		out[aud] = slices.Clone(scopes)
 	}
 	return out
+}
+
+// resolveResourceAudience resolves the RFC 8707 resource indicator to the aud
+// value that will be stamped on the issued JWT.
+//
+//   - resource non-empty → validate URI + allowlist → return []string{resource}
+//   - resource empty + defaultAudience set → return []string{defaultAudience}
+//   - resource empty + no defaultAudience → return nil (IssueCredential uses issuer fallback)
+func (s *OAuthService) resolveResourceAudience(resource string) ([]string, error) {
+	if resource == "" {
+		if s.defaultAudience != "" {
+			return []string{s.defaultAudience}, nil
+		}
+		return nil, nil
+	}
+	// RFC 8707 §2: MUST be an absolute URI with no fragment.
+	u, err := url.Parse(resource)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Fragment != "" {
+		return nil, oauthBadRequest(oautherror.InvalidTarget, "resource URI is malformed (must be an absolute URI with no fragment)")
+	}
+	// Allowlist check (restricted mode).
+	if len(s.allowedResources) > 0 && !slices.Contains(s.allowedResources, resource) {
+		return nil, oauthBadRequest(oautherror.InvalidTarget, "resource is not in the server's allowed_resources list")
+	}
+	return []string{resource}, nil
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
@@ -400,6 +456,16 @@ type TokenRequest struct {
 	// Role/PrivilegeScope this is a dedicated field, never settable via
 	// AdditionalClaims (`aud`/`scopes` are reserved).
 	Audience string
+	// Resource is the RFC 8707 resource indicator URI supplied by the caller.
+	// Empty means no resource was requested. Token() resolves it to
+	// ResolvedAudience before dispatching to any grant handler.
+	Resource string
+	// ResolvedAudience is the aud value computed by Token() from Resource (and
+	// DefaultAudience / issuer fallback). It is set BEFORE the grant-type
+	// switch so all grant handlers read from one place. Callers that bypass
+	// Token() (e.g. tests that call grant handlers directly) may leave this nil;
+	// IssueCredential then falls back to the issuer URL as before.
+	ResolvedAudience []string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -419,6 +485,15 @@ type TokenRequest struct {
 
 // Token handles the /oauth2/token endpoint dispatch.
 func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	// Resolve RFC 8707 resource indicator to an audience once, before dispatch,
+	// so every grant handler reads from req.ResolvedAudience without needing its
+	// own validation logic.
+	resolvedAud, err := s.resolveResourceAudience(req.Resource)
+	if err != nil {
+		return nil, err
+	}
+	req.ResolvedAudience = resolvedAud
+
 	switch req.GrantType {
 	case "client_credentials":
 		return s.clientCredentials(ctx, req)
@@ -441,6 +516,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 			ClientID:          req.ClientID,
 			ClientSecret:      req.ClientSecret,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			Audience:          req.ResolvedAudience,
 		})
 	default:
 		// Check custom grant handlers registered via RegisterGrant.
@@ -513,6 +589,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
+		Audience:          req.ResolvedAudience,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
@@ -625,6 +702,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeJWTBearer,
+		Audience:          req.ResolvedAudience,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
@@ -840,6 +918,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		IdentityPolicyID:    actorPolicy.ID,
 		Scopes:              scopes,
 		GrantType:           domain.GrantTypeTokenExchange,
+		Audience:            req.ResolvedAudience,
 		DelegatedBy:         delegatedBy,
 		ParentJTI:           subjectJTI,
 		DelegationDepth:     parentDepth + 1,
@@ -1004,12 +1083,18 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// it got the profile it requested (scope-confusion / privilege-escalation).
 	var audience []string
 	if req.Audience != "" {
+		// Named audience profile wins (BR-7): audienceScopeProfiles resolves the
+		// aud and overrides any resource indicator that may have been supplied.
 		profile, ok := s.audienceScopeProfiles[req.Audience]
 		if !ok {
 			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
 		}
 		scopes = slices.Clone(profile)
 		audience = []string{req.Audience}
+	} else {
+		// No named audience profile — use the pre-resolved resource audience
+		// (nil when no resource + no default → IssueCredential falls back to issuer).
+		audience = req.ResolvedAudience
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
@@ -1251,6 +1336,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		CredentialPolicyID: sk.CredentialPolicyID,
 		Scopes:             scopes,
 		GrantType:          domain.GrantTypeAPIKey,
+		Audience:           req.ResolvedAudience,
 		UseRS256:           true,
 		// sub = WIMSE URI (the identity), not the creator.
 		// owner_user_id is set from Identity.OwnerUserID automatically.
@@ -1667,6 +1753,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
+		Audience:          req.ResolvedAudience,
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
 		ApplicationID:     authCode.ClientID,
@@ -1911,6 +1998,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeRefreshToken,
+		Audience:          req.ResolvedAudience,
 		UseRS256:          true,
 		SubjectOverride:   oldToken.UserID,
 		ApplicationID:     oldToken.ClientID,
