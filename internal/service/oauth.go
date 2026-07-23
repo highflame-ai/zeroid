@@ -159,6 +159,11 @@ const audienceAgentSandbox = "agent-sandbox"
 var defaultAudienceScopeProfiles = map[string][]string{
 	// codeoid: the web-operator scope set the codeoid daemon re-verifies (via
 	// JWKS) and reads from the `scopes` claim to authorize embedded-UI actions.
+	// The `pipeline:*` scopes drive the embedded /packs Pack Browser + /pipeline
+	// runner (pack.list needs pipeline:read); without them the embedded UI renders
+	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
+	// the api-key exchange flow (which widens its own request), the embed-handoff
+	// token is used verbatim, so this server-side profile is the only lever.
 	audienceCodeoid: {
 		"session:list",
 		"session:create",
@@ -171,6 +176,10 @@ var defaultAudienceScopeProfiles = map[string][]string{
 		"session:read",
 		"session:dispatch",
 		"fs:read",
+		"pipeline:read",
+		"pipeline:create",
+		"pipeline:answer",
+		"pipeline:manage",
 	},
 	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
 	// to register a per-sandbox identity on the user's behalf.
@@ -196,6 +205,10 @@ var allowedProfileScopes = map[string]bool{
 	"session:dispatch":  true,
 	"fs:read":           true,
 	"nhi:manage":        true,
+	"pipeline:read":     true,
+	"pipeline:create":   true,
+	"pipeline:answer":   true,
+	"pipeline:manage":   true,
 }
 
 // ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
