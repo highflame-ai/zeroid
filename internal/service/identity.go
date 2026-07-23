@@ -673,6 +673,7 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.TrustLevel != "" {
 		identity.TrustLevel = req.TrustLevel
 	}
+	priorType := identity.IdentityType
 	if req.IdentityType != "" {
 		if !req.IdentityType.Valid() {
 			return nil, fmt.Errorf("%w: invalid identity_type: %s", ErrInvalidIdentityField, req.IdentityType)
@@ -690,6 +691,22 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if (req.IdentityType != "" || req.SubType != "") &&
 		!identity.SubType.ValidForIdentityType(identity.IdentityType) {
 		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, identity.SubType, identity.IdentityType)
+	}
+	// When identity_type changes the WIMSE URI must be rebuilt in lockstep:
+	// the URI embeds identity_type as a path segment, so a stale URI breaks
+	// GetIdentityByWIMSEURI and leaves dangling JWT sub claims. Cascade-revoke
+	// active credentials so old tokens (which carry the prior URI as sub) stop
+	// resolving — same sweep as deactivation, with a distinct audit reason.
+	if identity.IdentityType != priorType {
+		newURI, err := domain.BuildWIMSEURI(
+			s.wimseDomain, identity.AccountID, identity.ProjectID,
+			identity.IdentityType, identity.ExternalID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		identity.WIMSEURI = newURI
+		s.runDeactivationCleanup(ctx, identity, "identity_retyped")
 	}
 	if req.OwnerUserID != "" {
 		identity.OwnerUserID = req.OwnerUserID

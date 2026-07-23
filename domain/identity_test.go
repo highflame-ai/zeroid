@@ -136,6 +136,42 @@ func TestBuildWIMSEURI_LengthCap(t *testing.T) {
 	}
 }
 
+// TestBuildWIMSEURI_TypeSegmentVaries pins that identity_type is embedded as a
+// path segment and differs for each type — the invariant that UpdateIdentity
+// must maintain when retyping: the same (domain, account, project, external_id)
+// produces different URIs for different identity types.
+func TestBuildWIMSEURI_TypeSegmentVaries(t *testing.T) {
+	const (
+		wimseDomain = "highflame.dev"
+		account     = "acct"
+		project     = "proj"
+		extID       = "my-identity"
+	)
+	cases := []struct {
+		typ     IdentityType
+		segment string
+	}{
+		{IdentityTypeAgent, "/agent/"},
+		{IdentityTypeApplication, "/application/"},
+		{IdentityTypeMCPServer, "/mcp_server/"},
+		{IdentityTypeService, "/service/"},
+	}
+	uris := make(map[string]bool)
+	for _, tc := range cases {
+		uri, err := BuildWIMSEURI(wimseDomain, account, project, tc.typ, extID)
+		if err != nil {
+			t.Fatalf("BuildWIMSEURI(%q) returned error: %v", tc.typ, err)
+		}
+		if !strings.Contains(uri, tc.segment) {
+			t.Errorf("URI for type %q = %q, want segment %q", tc.typ, uri, tc.segment)
+		}
+		if uris[uri] {
+			t.Errorf("duplicate URI across identity types: %q", uri)
+		}
+		uris[uri] = true
+	}
+}
+
 // TestSubTypeValidForIdentityType pins the sub_type ↔ identity_type matrix.
 // Regression: code_agent must be valid for identity_type=agent (a delegated
 // code agent, e.g. forge's per-sandbox mint) — it was previously accepted only
