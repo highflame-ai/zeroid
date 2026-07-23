@@ -81,6 +81,39 @@ func TestIssuedTokenPreservesExplicitAudience(t *testing.T) {
 		"explicit audience must be preserved, not overwritten by the issuer default")
 }
 
+// TestIssuedTokenResourceOverridesAud verifies the RFC 8707 happy path: when
+// the caller supplies resource=<URI> on client_credentials, the issued token's
+// aud claim is overridden from the issuer default to the supplied URI.
+func TestIssuedTokenResourceOverridesAud(t *testing.T) {
+	agentID := uid("aud-resource-override")
+	scopes := []string{"data:read"}
+
+	registerIdentity(t, agentID, scopes)
+	client := registerOAuthClient(t, agentID, scopes)
+
+	const rs = "https://rs.test.example.com"
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+		"resource":      rs,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	accessToken := decode(t, resp)["access_token"].(string)
+	require.NotEmpty(t, accessToken)
+
+	parsed, err := jwt.ParseInsecure([]byte(accessToken))
+	require.NoError(t, err)
+
+	aud, _ := parsed.Audience()
+	assert.Equal(t, []string{rs}, aud,
+		"resource parameter must override the default issuer aud on the issued token")
+}
+
 // TestAuthjwtAcceptsDefaultedAudience is the end-to-end proof that the fix
 // restores interop with spec-compliant verifiers: a token issued without an
 // explicit audience must pass validation under an authjwt.Verifier that is
