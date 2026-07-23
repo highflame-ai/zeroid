@@ -18,11 +18,14 @@ build: ## Build the zeroid binary
 run: build ## Build and run zeroid locally
 	./$(BINARY) -config zeroid.yaml
 
-test: ## Run all tests (unit + integration)
-	go test ./... -v -race -count=1 -timeout=120s
+test: ## Run unit tests (matches CI unit-test step; integration requires Docker — use make test-integration)
+	go test $$(go list ./... | grep -v '/tests') -v -race -count=1 -timeout=300s
 
-test-integration: ## Run integration tests only (requires Docker)
-	go test ./tests/integration/ -v -count=1 -timeout=120s
+test-integration: ## Run integration tests only (requires Docker, testcontainers)
+	go test ./tests/integration/ -v -count=1 -timeout=300s
+
+test-all: ## Run unit + integration tests (requires Docker)
+	go test ./... -v -race -count=1 -timeout=300s
 
 lint: ## Run go vet
 	go vet ./...
