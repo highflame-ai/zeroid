@@ -46,6 +46,12 @@ type OAuthService struct {
 	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
 	// treated as the built-in defaults.
 	audienceScopeProfiles map[string][]string
+	// allowedResources is the validated RFC 8707 resource allowlist. Nil or
+	// empty = open mode (any syntactically valid URI accepted).
+	allowedResources []string
+	// defaultAudience is used as aud when no resource parameter is supplied.
+	// Empty = fall back to the issuer URL (existing behavior in IssueCredential).
+	defaultAudience string
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -252,6 +258,23 @@ func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
 type trustedServiceValidatorFunc func(ctx context.Context) (serviceName string, err error)
 
+// ValidateAllowedResources validates the deployer-configured allowed_resources
+// list at startup. It rejects any blank entry (fail closed — an empty string
+// could otherwise accidentally match resource="" in allowlist mode). URI
+// syntactic validity is intentionally deferred to request time in
+// resolveResourceAudience. Returns a cloned list on success; nil input returns
+// an empty list and no error.
+func ValidateAllowedResources(configured []string) ([]string, error) {
+	out := make([]string, 0, len(configured))
+	for _, r := range configured {
+		if strings.TrimSpace(r) == "" {
+			return nil, fmt.Errorf("allowed_resources: entry %q is blank", r)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // OAuthServiceConfig holds configuration for the OAuthService.
 type OAuthServiceConfig struct {
 	Issuer         string
@@ -262,6 +285,12 @@ type OAuthServiceConfig struct {
 	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
 	// back to the built-in defaults.
 	AudienceScopeProfiles map[string][]string
+	// AllowedResources is the validated list of permitted resource URIs for RFC
+	// 8707 resource indicators. Empty = open mode (any valid URI accepted).
+	AllowedResources []string
+	// DefaultAudience is the aud value used when no resource parameter is
+	// supplied. Empty = fall back to the issuer URL (existing behavior).
+	DefaultAudience string
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -292,6 +321,8 @@ func NewOAuthService(
 		hmacSecret:              cfg.HMACSecret,
 		authCodeIssuer:          cfg.AuthCodeIssuer,
 		audienceScopeProfiles:   audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
+		allowedResources:        cfg.AllowedResources,
+		defaultAudience:         cfg.DefaultAudience,
 		trustedServiceValidator: cfg.TrustedServiceValidator,
 	}
 }

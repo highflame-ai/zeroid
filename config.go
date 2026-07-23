@@ -55,6 +55,21 @@ type Config struct {
 	//     my-audience: ["nhi:manage"]
 	AudienceScopeProfiles map[string][]string `koanf:"audience_scope_profiles"`
 
+	// AllowedResources is the deployer-configured allowlist of resource URIs
+	// accepted on POST /oauth2/token (RFC 8707 §2 resource indicator). When
+	// non-empty (restricted mode), a supplied `resource` parameter MUST match
+	// one entry exactly; mismatches are rejected with invalid_target. When
+	// empty (the default, open mode), any syntactically valid absolute URI is
+	// accepted. Blank entries fail closed at startup.
+	AllowedResources []string `koanf:"allowed_resources"`
+
+	// DefaultAudience is the `aud` value stamped on access tokens when no
+	// `resource` parameter is supplied. When empty (the default), `aud` falls
+	// back to the issuer URL (backward-compatible). Set this to the canonical
+	// URI of your resource server to make tokens immediately acceptable by
+	// strict resource servers without requiring every caller to pass `resource`.
+	DefaultAudience string `koanf:"default_audience"`
+
 	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
 	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
 	// looks up the upstream iss in this list, fetches the issuer's JWKS, and

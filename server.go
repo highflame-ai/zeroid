@@ -265,12 +265,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audience scope profiles: %w", err)
 	}
+	allowedResources, err := service.ValidateAllowedResources(cfg.AllowedResources)
+	if err != nil {
+		return nil, fmt.Errorf("allowed_resources: %w", err)
+	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, authCodeRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
 		Issuer:                cfg.Token.Issuer,
 		WIMSEDomain:           cfg.WIMSEDomain,
 		HMACSecret:            cfg.Token.HMACSecret,
 		AuthCodeIssuer:        authCodeIssuer,
 		AudienceScopeProfiles: audienceScopeProfiles,
+		AllowedResources:      allowedResources,
+		DefaultAudience:       cfg.DefaultAudience,
 	})
 	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
 	// require it whenever unauthenticated inspection is NOT allowed. Validate()

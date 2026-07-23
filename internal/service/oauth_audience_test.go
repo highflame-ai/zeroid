@@ -60,6 +60,46 @@ func TestResolveAudienceScopeProfiles(t *testing.T) {
 	})
 }
 
+// TestValidateAllowedResources covers the startup-time validation for the RFC
+// 8707 allowed_resources config list. URI syntactic validity is intentionally
+// NOT checked here — that is deferred to request time in resolveResourceAudience.
+// Startup only guards against blank entries that would never match anything.
+func TestValidateAllowedResources(t *testing.T) {
+	t.Run("nil input returns empty list no error", func(t *testing.T) {
+		out, err := ValidateAllowedResources(nil)
+		require.NoError(t, err)
+		assert.Empty(t, out)
+	})
+
+	t.Run("empty slice returns empty list no error", func(t *testing.T) {
+		out, err := ValidateAllowedResources([]string{})
+		require.NoError(t, err)
+		assert.Empty(t, out)
+	})
+
+	t.Run("valid list returned as clone", func(t *testing.T) {
+		input := []string{"https://a.example.com", "https://b.example.com"}
+		out, err := ValidateAllowedResources(input)
+		require.NoError(t, err)
+		assert.Equal(t, input, out)
+		// Mutations to the returned slice must not affect the caller's input.
+		out[0] = "MUTATED"
+		assert.Equal(t, "https://a.example.com", input[0])
+	})
+
+	t.Run("blank entry rejected", func(t *testing.T) {
+		_, err := ValidateAllowedResources([]string{"https://a.example.com", ""})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "blank")
+	})
+
+	t.Run("whitespace-only entry rejected", func(t *testing.T) {
+		_, err := ValidateAllowedResources([]string{"  "})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "blank")
+	})
+}
+
 // TestDefaultAudienceProfilesAreWithinAllowlist pins the invariant that every
 // built-in default profile grants at least one scope and only scopes the server
 // recognizes — so a future default can't drift out of allowedProfileScopes (which
