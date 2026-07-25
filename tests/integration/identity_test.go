@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -633,4 +634,56 @@ func TestUpdateIdentityRiskMetadata(t *testing.T) {
 	assert.Equal(t, "high", reclassified["capability_tier"])
 	assert.Equal(t, "high", reclassified["risk_tier"], "risk_tier should be unchanged by capability_tier update")
 	assert.Equal(t, "ial3", reclassified["ial"], "ial should be unchanged by capability_tier update")
+}
+
+// TestUpdateIdentity_TypeChange_WIMSEURIRebuild verifies that PATCH
+// /identities/{id} with a new identity_type rebuilds the WIMSE URI in
+// lockstep. The old URI must no longer resolve (404) and the new URI must
+// resolve (200) — otherwise GetIdentityByWIMSEURI and JWT sub-claim lookups
+// break silently after a retype.
+func TestUpdateIdentity_TypeChange_WIMSEURIRebuild(t *testing.T) {
+	externalID := uid("retype-agent")
+	identity := registerIdentity(t, externalID, nil)
+
+	oldURI := identity.WIMSEURI
+	require.Contains(t, oldURI, "/agent/", "initial URI must embed identity_type=agent")
+
+	// Retype agent → application (supply a compatible sub_type).
+	resp := doRequest(t, http.MethodPatch, adminPath("/identities/"+identity.ID), map[string]any{
+		"identity_type": "application",
+		"sub_type":      "api_service",
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	newURI, _ := body["wimse_uri"].(string)
+	assert.Contains(t, newURI, "/application/", "WIMSE URI must be rebuilt to reflect the new identity_type")
+	assert.NotContains(t, newURI, "/agent/", "old identity_type segment must not appear in the rebuilt URI")
+	assert.NotEqual(t, oldURI, newURI, "URI must change when identity_type changes")
+
+	// New URI resolves; stale URI does not.
+	newResp := get(t, adminPath("/identities/by-wimse")+"?uri="+url.QueryEscape(newURI), adminHeaders())
+	assert.Equal(t, http.StatusOK, newResp.StatusCode, "new wimse_uri must resolve after retype")
+	_ = newResp.Body.Close()
+
+	oldResp := get(t, adminPath("/identities/by-wimse")+"?uri="+url.QueryEscape(oldURI), adminHeaders())
+	assert.Equal(t, http.StatusNotFound, oldResp.StatusCode, "stale wimse_uri must no longer resolve after retype")
+	_ = oldResp.Body.Close()
+}
+
+// TestUpdateIdentity_TypeUnchanged_URIStable verifies that an update that
+// does not touch identity_type leaves the WIMSE URI unchanged — the rebuild
+// must be a no-op when the type is the same.
+func TestUpdateIdentity_TypeUnchanged_URIStable(t *testing.T) {
+	externalID := uid("stable-uri-agent")
+	identity := registerIdentity(t, externalID, nil)
+	originalURI := identity.WIMSEURI
+
+	resp := doRequest(t, http.MethodPatch, adminPath("/identities/"+identity.ID), map[string]any{
+		"name": "renamed-agent",
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	assert.Equal(t, originalURI, body["wimse_uri"], "URI must not change when identity_type is not updated")
 }

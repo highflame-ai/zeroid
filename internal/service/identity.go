@@ -673,6 +673,7 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.TrustLevel != "" {
 		identity.TrustLevel = req.TrustLevel
 	}
+	priorType := identity.IdentityType
 	if req.IdentityType != "" {
 		if !req.IdentityType.Valid() {
 			return nil, fmt.Errorf("%w: invalid identity_type: %s", ErrInvalidIdentityField, req.IdentityType)
@@ -690,6 +691,19 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if (req.IdentityType != "" || req.SubType != "") &&
 		!identity.SubType.ValidForIdentityType(identity.IdentityType) {
 		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, identity.SubType, identity.IdentityType)
+	}
+	// When identity_type changes the WIMSE URI must be rebuilt in lockstep:
+	// the URI embeds identity_type as a path segment, so a stale URI breaks
+	// GetIdentityByWIMSEURI and leaves dangling JWT sub claims.
+	if identity.IdentityType != priorType {
+		newURI, err := domain.BuildWIMSEURI(
+			s.wimseDomain, identity.AccountID, identity.ProjectID,
+			identity.IdentityType, identity.ExternalID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		identity.WIMSEURI = newURI
 	}
 	if req.OwnerUserID != "" {
 		identity.OwnerUserID = req.OwnerUserID
@@ -790,6 +804,16 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		return nil, err
 	}
 
+	// Post-persist cleanups — all run after repo.Update succeeds so a DB
+	// failure cannot leave credentials revoked while the identity row is
+	// unchanged (the authoritative outcome must land before the sweep).
+
+	// Retype: cascade-revoke active credentials so old tokens (which carry
+	// the prior URI as sub) stop resolving — same sweep as deactivation,
+	// with a distinct audit reason.
+	if identity.IdentityType != priorType {
+		s.runDeactivationCleanup(ctx, identity, "identity_retyped")
+	}
 	// Fresh transition into deactivated or expired: sweep linked API keys,
 	// cascade-revoke active credentials, and emit a retirement/expiry signal.
 	// Centralized here so every update path (PUT /identities/{id},
