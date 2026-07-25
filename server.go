@@ -266,11 +266,12 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		return nil, fmt.Errorf("audience scope profiles: %w", err)
 	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, authCodeRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
-		Issuer:                cfg.Token.Issuer,
-		WIMSEDomain:           cfg.WIMSEDomain,
-		HMACSecret:            cfg.Token.HMACSecret,
-		AuthCodeIssuer:        authCodeIssuer,
-		AudienceScopeProfiles: audienceScopeProfiles,
+		Issuer:                           cfg.Token.Issuer,
+		WIMSEDomain:                      cfg.WIMSEDomain,
+		HMACSecret:                       cfg.Token.HMACSecret,
+		AuthCodeIssuer:                   authCodeIssuer,
+		AudienceScopeProfiles:            audienceScopeProfiles,
+		ExternalPrincipalRefreshTokenTTL: cfg.Token.ExternalPrincipalRefreshTokenTTL,
 	})
 	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
 	// require it whenever unauthenticated inspection is NOT allowed. Validate()
@@ -600,18 +601,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 	s.oauthSvc.RegisterGrant(name, func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
 		return handler(ctx, GrantRequest{
-			GrantType:        req.GrantType,
-			AccountID:        req.AccountID,
-			ProjectID:        req.ProjectID,
-			UserID:           req.UserID,
-			UserEmail:        req.UserEmail,
-			UserName:         req.UserName,
-			ApplicationID:    req.ApplicationID,
-			Scope:            req.Scope,
-			AdditionalClaims: req.AdditionalClaims,
-			Role:             req.Role,
-			PrivilegeScope:   req.PrivilegeScope,
-			Audience:         req.Audience,
+			GrantType:         req.GrantType,
+			AccountID:         req.AccountID,
+			ProjectID:         req.ProjectID,
+			UserID:            req.UserID,
+			UserEmail:         req.UserEmail,
+			UserName:          req.UserName,
+			ApplicationID:     req.ApplicationID,
+			Scope:             req.Scope,
+			AdditionalClaims:  req.AdditionalClaims,
+			Role:              req.Role,
+			PrivilegeScope:    req.PrivilegeScope,
+			Audience:          req.Audience,
+			IssueRefreshToken: req.IssueRefreshToken,
 		})
 	})
 }
@@ -665,19 +667,20 @@ func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResol
 // This is the building block for custom grant types like "user_session".
 func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest) (*domain.AccessToken, error) {
 	return s.oauthSvc.ExternalPrincipalExchange(ctx, service.TokenRequest{
-		GrantType:        req.GrantType,
-		AccountID:        req.AccountID,
-		ProjectID:        req.ProjectID,
-		UserID:           req.UserID,
-		UserEmail:        req.UserEmail,
-		UserName:         req.UserName,
-		ApplicationID:    req.ApplicationID,
-		Scope:            req.Scope,
-		AdditionalClaims: req.AdditionalClaims,
-		Role:             req.Role,
-		PrivilegeScope:   req.PrivilegeScope,
-		Audience:         req.Audience,
-		TrustedService:   true,
+		GrantType:         req.GrantType,
+		AccountID:         req.AccountID,
+		ProjectID:         req.ProjectID,
+		UserID:            req.UserID,
+		UserEmail:         req.UserEmail,
+		UserName:          req.UserName,
+		ApplicationID:     req.ApplicationID,
+		Scope:             req.Scope,
+		AdditionalClaims:  req.AdditionalClaims,
+		Role:              req.Role,
+		PrivilegeScope:    req.PrivilegeScope,
+		Audience:          req.Audience,
+		IssueRefreshToken: req.IssueRefreshToken,
+		TrustedService:    true,
 	})
 }
 

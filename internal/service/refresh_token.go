@@ -57,6 +57,12 @@ type RefreshTokenParams struct {
 	// every rotation can re-emit it, keeping a refreshing session inside one
 	// mission. Empty ⇒ no mission to carry (refresh falls back to re-rooting).
 	MissionID string
+	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
+	// this refresh token was issued for by the external-principal exchange.
+	// Persisted on the family so every rotation re-stamps the same `aud` claim
+	// (and profile scopes) on the successor access token. Empty ⇒ a normal
+	// (non-audience) refresh token whose rotation carries no `aud`.
+	Audience string
 }
 
 // ErrDPoPBindingMismatch is returned when a refresh-token rotation presents a
@@ -96,6 +102,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		ExpiresAt:         expiresAt,
 		DPoPKeyThumbprint: params.DPoPKeyThumbprint,
 		MissionID:         params.MissionID,
+		Audience:          params.Audience,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -129,6 +136,21 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 // which distinguishes the grace window).
 func (s *RefreshTokenService) PeekRefreshToken(ctx context.Context, rawToken string) (*domain.RefreshToken, error) {
 	return s.repo.GetByTokenHash(ctx, hashRefreshToken(rawToken))
+}
+
+// PeekRefreshTokenIncludingRevoked returns the refresh-token row for the
+// presented raw token REGARDLESS of state (active, revoked, or expired),
+// without consuming it. It exists for reading STATE-INDEPENDENT binding
+// metadata — specifically the audience-profile name — so the refresh grant can
+// route an already-rotated audience-profile token down the same audience path
+// (where RotateRefreshToken's claim step then fires the correct reuse
+// detection) instead of misrouting it to the OAuth-client path, which has no
+// client for a client-less audience token and would 401 before reuse detection
+// ran. It MUST NOT be used for authorization decisions — an active-only
+// PeekRefreshToken / the rotation claim remains the security gate. Returns an
+// error only when no row matches (genuinely unknown token).
+func (s *RefreshTokenService) PeekRefreshTokenIncludingRevoked(ctx context.Context, rawToken string) (*domain.RefreshToken, error) {
+	return s.repo.GetByTokenHashIncludingRevoked(ctx, hashRefreshToken(rawToken))
 }
 
 // RotateRefreshToken validates the presented token, revokes it, and issues a new one.
@@ -195,6 +217,11 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			// issuance) but be lost on the second rotation, re-fragmenting the
 			// tree. Copied verbatim like the DPoP thumbprint above.
 			MissionID: c.MissionID,
+			// Carry the audience-profile forward so every rotation re-stamps the
+			// same `aud` claim on its access token. Without this the audience
+			// would survive the first refresh (seeded at issuance) but be lost on
+			// the second rotation, and the harness daemon would reject the token.
+			Audience: c.Audience,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})

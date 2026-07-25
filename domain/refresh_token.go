@@ -52,4 +52,13 @@ type RefreshToken struct {
 	// as SQL NULL (pre-migration families, or flows that carried no mission_id);
 	// the refresh path falls back to re-rooting for those. Opaque to consumers.
 	MissionID string `bun:"mission_id,nullzero" json:"mission_id,omitempty"`
+	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
+	// this refresh family was issued for by the external-principal exchange.
+	// Copied verbatim onto every successor row on rotation and read back when
+	// the refresh grant issues a new access token, so the refreshed token
+	// carries the SAME `aud` claim (and profile scopes) as the original —
+	// essential for a harness daemon that validates `aud` on every message.
+	// Empty (nullzero ⇒ SQL NULL) ⇒ a normal refresh token (authorization_code
+	// flow, or any pre-migration family): rotation is unchanged, no `aud`.
+	Audience string `bun:"audience,nullzero" json:"audience,omitempty"`
 }
