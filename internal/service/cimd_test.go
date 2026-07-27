@@ -374,6 +374,11 @@ func TestValidateCIMDRedirectURI(t *testing.T) {
 		{"http://app.example.com/callback", false}, // plaintext non-loopback
 		{"/relative/callback", false},
 		{"://bad", false},
+		{"https:/cb", false},                          // rootless — url.Parse accepts, no host
+		{"https://", false},                           // no host
+		{"https://app.example.com/cb#frag", false},    // fragment not allowed
+		{"https://user:pw@app.example.com/cb", false}, // userinfo not allowed
+		{"", false}, // empty
 	}
 	for _, tc := range cases {
 		err := validateCIMDRedirectURI(tc.uri)
@@ -396,5 +401,44 @@ func TestCIMDCacheTTLClamp(t *testing.T) {
 	}
 	if svc2.maxDocumentBytes != defaultCIMDMaxDocumentBytes {
 		t.Errorf("maxDocumentBytes = %d, want default %d", svc2.maxDocumentBytes, defaultCIMDMaxDocumentBytes)
+	}
+}
+
+// TestCIMDCacheReturnsIndependentCopies pins that a cache hit hands back a
+// client whose slice fields don't alias the cached entry — mutating a returned
+// client must not corrupt what the next resolution sees.
+func TestCIMDCacheReturnsIndependentCopies(t *testing.T) {
+	var docURL string
+	svc, base, hits := newCIMDTestServer(t, CIMDConfig{Enabled: true, CacheTTL: time.Hour}, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, docJSON(docURL, `,"scope":"read write"`))
+	})
+	docURL = base + "/oauth/client.json"
+
+	ctx := context.Background()
+	first, err := svc.ResolveClient(ctx, docURL)
+	if err != nil {
+		t.Fatalf("first ResolveClient: %v", err)
+	}
+	// Mutate every slice field on the returned copy.
+	first.RedirectURIs[0] = "https://evil.example.com/cb"
+	first.Scopes[0] = "admin"
+	first.GrantTypes[0] = "implicit"
+
+	second, err := svc.ResolveClient(ctx, docURL) // served from cache (hits stays 1)
+	if err != nil {
+		t.Fatalf("second ResolveClient: %v", err)
+	}
+	if atomic.LoadInt32(hits) != 1 {
+		t.Fatalf("expected cache hit (1 fetch), got %d", *hits)
+	}
+	if second.RedirectURIs[0] == "https://evil.example.com/cb" {
+		t.Error("RedirectURIs leaked a mutation from a prior returned copy")
+	}
+	if second.Scopes[0] == "admin" {
+		t.Error("Scopes leaked a mutation from a prior returned copy")
+	}
+	if second.GrantTypes[0] == "implicit" {
+		t.Error("GrantTypes leaked a mutation from a prior returned copy")
 	}
 }

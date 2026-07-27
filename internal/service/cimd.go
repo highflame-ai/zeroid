@@ -456,14 +456,27 @@ func validateCIMDRedirectURI(raw string) error {
 	if err != nil {
 		return fmt.Errorf("redirect_uri %q is not a valid URI", raw)
 	}
+	// A fragment is never valid on a redirect URI (RFC 6749 §3.1.2) — it would
+	// clobber the fragment the server appends. Reject regardless of scheme.
+	if u.Fragment != "" {
+		return fmt.Errorf("redirect_uri %q must not contain a fragment", raw)
+	}
 	switch u.Scheme {
-	case "https":
-		return nil
-	case "http":
-		if isLoopbackHost(u.Hostname()) {
-			return nil
+	case "https", "http":
+		// https:// and loopback http:// must be absolute (host present) and
+		// carry no userinfo. url.Parse accepts rootless forms like "https:/cb"
+		// (Host == "") — those are not usable redirect targets and must not
+		// pass validation just because the scheme matched.
+		if u.Host == "" {
+			return fmt.Errorf("redirect_uri %q must be an absolute URI with a host", raw)
 		}
-		return fmt.Errorf("redirect_uri %q: http is only permitted for loopback hosts", raw)
+		if u.User != nil {
+			return fmt.Errorf("redirect_uri %q must not contain userinfo", raw)
+		}
+		if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("redirect_uri %q: http is only permitted for loopback hosts", raw)
+		}
+		return nil
 	case "":
 		return fmt.Errorf("redirect_uri %q must be an absolute URI", raw)
 	default:
@@ -491,8 +504,20 @@ func (s *CIMDService) cachedResult(clientID string) (*domain.OAuthClient, error,
 	if e.err != nil {
 		return nil, e.err, true
 	}
-	cp := *e.client
-	return &cp, nil, true
+	return cloneCIMDClient(e.client), nil, true
+}
+
+// cloneCIMDClient copies c so the result shares no slice backing storage with
+// c. A plain `*c` struct copy leaves the slice fields (GrantTypes/RedirectURIs/
+// Scopes/Contacts) aliasing the original — a caller appending to or mutating
+// one of those slices would corrupt the cached entry (and race other callers).
+func cloneCIMDClient(c *domain.OAuthClient) *domain.OAuthClient {
+	cp := *c
+	cp.GrantTypes = slices.Clone(c.GrantTypes)
+	cp.RedirectURIs = slices.Clone(c.RedirectURIs)
+	cp.Scopes = slices.Clone(c.Scopes)
+	cp.Contacts = slices.Clone(c.Contacts)
+	return &cp
 }
 
 // storeResult caches entry under clientID for ttl, keeping the map bounded:
@@ -517,8 +542,7 @@ func (s *CIMDService) storeResult(clientID string, entry cimdCacheEntry, ttl tim
 		}
 	}
 	if entry.client != nil {
-		cp := *entry.client
-		entry.client = &cp
+		entry.client = cloneCIMDClient(entry.client)
 	}
 	entry.expiresAt = s.now().Add(ttl)
 	s.cache[clientID] = entry

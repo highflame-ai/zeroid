@@ -115,10 +115,15 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
 	body := map[string]any{
-		"issuer":                                a.issuer,
-		"token_endpoint":                        a.issuer + "/oauth2/token",
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+		"issuer":         a.issuer,
+		"token_endpoint": a.issuer + "/oauth2/token",
+		// "none" is advertised because public PKCE clients — including CIMD
+		// clients, whose metadata document is the registration — authenticate
+		// at the token endpoint with PKCE alone and carry no secret.
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
 		"grant_types_supported": []string{
+			"authorization_code",
+			"refresh_token",
 			"client_credentials",
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
 			"urn:ietf:params:oauth:grant-type:token-exchange",
@@ -140,9 +145,11 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// RFC 8414 — client auth methods accepted by the introspection and
 		// revocation endpoints (client_secret_basic via Authorization header,
 		// client_secret_post via body fields).
-		"introspection_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
-		"revocation_endpoint_auth_methods_supported":       []string{"client_secret_post", "client_secret_basic"},
-		"response_types_supported":                         []string{"token"},
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
+		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
+		// implicit "token" flow is not supported), so advertise "code".
+		"response_types_supported":                         []string{"code"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
