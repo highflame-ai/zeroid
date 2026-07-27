@@ -235,6 +235,9 @@ func TestInspectionBasicAuth_MetadataAdvertisesAuthMethods(t *testing.T) {
 	} {
 		methods, ok := body[key].([]any)
 		require.True(t, ok, "metadata must include %s", key)
-		assert.ElementsMatch(t, []any{"client_secret_post", "client_secret_basic"}, methods, key)
+		// "none" is advertised because VerifyPresentedClientAuth accepts a
+		// no-secret public/CIMD client_id on these endpoints (RFC 7009 §2.1 /
+		// RFC 7662 §2.1).
+		assert.ElementsMatch(t, []any{"client_secret_post", "client_secret_basic", "none"}, methods, key)
 	}
 }
