@@ -106,13 +106,31 @@ CIMD is **on by default**. Knobs (all optional):
 ```yaml
 cimd:
   enabled: true                          # ZEROID_CIMD_ENABLED — set false to disable
-  allowed_domains: []                    # YAML-only allowlist of client_id hosts; empty = any HTTPS host
+  allowed_domains: []                    # PRODUCTION HARDENING LEVER — allowlist of client_id hosts; empty = any HTTPS host (see below)
   allow_private_metadata_endpoints: false # ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS — test/dev only
   max_document_bytes: 5120               # ZEROID_CIMD_MAX_DOCUMENT_BYTES
   cache_ttl_seconds: 3600                # ZEROID_CIMD_CACHE_TTL_SECONDS (clamped to 24 h)
 ```
 
-To run CIMD as a **closed ecosystem**, set `allowed_domains` to the hosts you trust. To turn it off entirely, set `enabled: false` — `https://` `client_id` values then fall through to the registry (and miss, since CIMD clients are never persisted).
+### Production hardening — set `allowed_domains`
+
+> **`allowed_domains` is the primary production hardening lever for CIMD.** Set it to the exact hosts you trust.
+
+CIMD ships **on and open**: with an empty `allowed_domains`, any request-supplied `https://` `client_id` reaching the public `/oauth2/authorize` endpoint drives ZeroID to fetch that URL. The fetch is heavily guarded (SSRF blocklist, 5 KiB / 5 s caps, no redirects, negative caching — see [Security considerations](#security-considerations)), but an empty allowlist still means ZeroID will make outbound requests to arbitrary attacker-chosen public hosts.
+
+`allowed_domains` closes that: only `client_id` URLs whose host is in the list (exact, case-insensitive) are resolved — every other host is rejected **before any outbound fetch**. This turns CIMD from an open ecosystem into a closed one bounded to your known clients.
+
+```yaml
+cimd:
+  allowed_domains:
+    - client.example.com
+    - apps.acme.dev
+```
+
+Guidance:
+- **Enterprise / closed deployments:** set `allowed_domains` to your known client hosts. This is the recommended production posture.
+- **Open agent ecosystems (public MCP):** leaving it empty is a deliberate choice — additionally rate-limit `/oauth2/authorize` at the edge (see [Fetch abuse](#security-considerations)).
+- **Turning CIMD off entirely:** `enabled: false` — `https://` `client_id` values then fall through to the registry (and miss, since CIMD clients are never persisted).
 
 `allow_private_metadata_endpoints: true` disables the SSRF blocklist so documents can be served from `localhost` / a private network in single-tenant dev/test. **Production MUST keep it `false`.**
 
@@ -135,9 +153,9 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 - **Redirect-URI allow-list is the load-bearing control.** Copying a `client_id` is useless without control of a host in its `redirect_uris`. PKCE binds the code to the verifier on top of that.
 - **SSRF.** The document fetch cannot be turned into a probe of internal/metadata addresses — the guard is the same audited implementation used elsewhere in ZeroID, applied at dial time against the *resolved* IP (DNS-rebinding-safe).
 - **Localhost redirects.** Loopback `redirect_uris` are matched port-agnostically (RFC 8252) so native/CLI callbacks work, but any process on the user's machine can bind a loopback port. Treat localhost CIMD clients with the same caution as any native public client.
-- **DNS / TLS trust.** CIMD's integrity rests on the same DNS + TLS + certificate-transparency assumptions as any HTTPS-based trust model. Use `allowed_domains` where you want a hard boundary.
+- **DNS / TLS trust.** CIMD's integrity rests on the same DNS + TLS + certificate-transparency assumptions as any HTTPS-based trust model. **`allowed_domains` is the hard boundary** — see [Production hardening](#production-hardening--set-allowed_domains).
 - **No persistence, no secret.** CIMD clients are ephemeral and hold no symmetric secret at the broker — there is nothing to leak from ZeroID's side.
-- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so it is deliberately hard to abuse: bounded cache (1000 entries), 60 s negative caching of failures, 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist. Deployers running fully open CIMD should still rate-limit `/oauth2/authorize` at the edge like any public endpoint.
+- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — bounded cache (1000 entries), 60 s negative caching of failures, 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist — but the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch. Deployers running fully open CIMD (empty allowlist) should additionally rate-limit `/oauth2/authorize` at the edge like any public endpoint.
 
 ---
 

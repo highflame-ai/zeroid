@@ -94,11 +94,14 @@ type CIMDConfig struct {
 	// https:// client_id URLs fall back to the client registry (and miss).
 	Enabled bool `koanf:"enabled"`
 
-	// AllowedDomains optionally restricts CIMD to client_id URLs whose host is
-	// in this exact, case-insensitive list. Empty (default) accepts any public
-	// HTTPS host — the SSRF guard (see AllowPrivateMetadataEndpoints) still
-	// blocks private/loopback/metadata ranges. Set an allowlist to run CIMD as
-	// a closed ecosystem. YAML only (a list), e.g.:
+	// AllowedDomains is the primary PRODUCTION HARDENING LEVER for CIMD. It
+	// restricts CIMD to client_id URLs whose host is in this exact,
+	// case-insensitive list; a host not in the list is rejected BEFORE any
+	// outbound fetch. Empty (default) accepts any public HTTPS host — the SSRF
+	// guard (see AllowPrivateMetadataEndpoints) still blocks private/loopback/
+	// metadata ranges, but ZeroID will otherwise fetch arbitrary
+	// request-supplied URLs. Set an allowlist to run CIMD as a closed ecosystem
+	// (recommended for enterprise/closed deployments). YAML only (a list), e.g.:
 	//   cimd:
 	//     allowed_domains: ["client.example.com", "apps.acme.dev"]
 	AllowedDomains []string `koanf:"allowed_domains"`

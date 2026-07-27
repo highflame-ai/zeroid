@@ -123,9 +123,13 @@ cimd:
   # On by default so agents can onboard against this AS without registration.
   # Env: ZEROID_CIMD_ENABLED
   enabled: true
-  # Optional allowlist of client_id hosts (exact, case-insensitive). Empty =
-  # any public HTTPS host (SSRF guard still applies). Set this to run CIMD as a
-  # closed ecosystem. YAML only.
+  # PRODUCTION HARDENING LEVER. Allowlist of client_id hosts (exact,
+  # case-insensitive); a host not in the list is rejected BEFORE any outbound
+  # fetch. Empty (default) = any public HTTPS host, so ZeroID will fetch
+  # arbitrary attacker-supplied URLs (SSRF-guarded/capped, but still outbound).
+  # Set this to the hosts you trust to run CIMD as a closed ecosystem —
+  # recommended for enterprise/closed deployments. Leave empty only for open
+  # agent ecosystems, and rate-limit /oauth2/authorize at the edge. YAML only.
   # allowed_domains: ["client.example.com", "apps.acme.dev"]
   #
   # Relaxes the SSRF guard on the metadata-document fetch. Default false rejects
