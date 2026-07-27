@@ -1517,6 +1517,17 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		if !s.cimdSvc.Enabled() || !IsCIMDClientID(req.ClientID) {
 			return "", oauthUnauthorized("unknown or inactive client_id", err)
 		}
+		// Fall back to CIMD only when the registry has NO row at all.
+		// GetPublicClient collapses "no row" and "row exists but inactive/
+		// non-public" into the same ErrOAuthClientNotFound, so without this
+		// guard a deactivated client whose client_id is a CIMD-shaped URL would
+		// be resurrected from its metadata document — deactivation must stay a
+		// kill switch, and a registered row must keep its documented precedence
+		// over the document. GetClientByClientID returns any existing row
+		// (active or not) with err == nil.
+		if _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); rowErr == nil {
+			return "", oauthUnauthorized("unknown or inactive client_id", err)
+		}
 		oauthClient, err = s.cimdSvc.ResolveClient(ctx, req.ClientID)
 		if err != nil {
 			return "", cimdOAuthError(err)
@@ -2357,9 +2368,14 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	if clientSecret == "" {
 		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
 			if errors.Is(err, ErrOAuthClientNotFound) {
+				// Fall back to CIMD only when the registry has NO row at all — a
+				// deactivated (or non-public) registered client must not be
+				// resurrected here either. See IssueAuthCode for the full rationale.
 				if s.cimdSvc.Enabled() && IsCIMDClientID(clientID) {
-					if _, cimdErr := s.cimdSvc.ResolveClient(ctx, clientID); cimdErr == nil {
-						return nil
+					if _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, clientID); rowErr != nil {
+						if _, cimdErr := s.cimdSvc.ResolveClient(ctx, clientID); cimdErr == nil {
+							return nil
+						}
 					}
 				}
 				return oauthUnauthorized("client authentication required", nil)
