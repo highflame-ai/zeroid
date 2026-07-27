@@ -1524,9 +1524,15 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		// be resurrected from its metadata document — deactivation must stay a
 		// kill switch, and a registered row must keep its documented precedence
 		// over the document. GetClientByClientID returns any existing row
-		// (active or not) with err == nil.
-		if _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); rowErr == nil {
+		// (active or not) with err == nil, ErrOAuthClientNotFound when there is
+		// genuinely no row, and an operational error otherwise — fail closed on
+		// the last so a DB outage can't be misread as "unregistered" and used to
+		// resurrect a deactivated client.
+		switch _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); {
+		case rowErr == nil:
 			return "", oauthUnauthorized("unknown or inactive client_id", err)
+		case !errors.Is(rowErr, ErrOAuthClientNotFound):
+			return "", oauthServerError("failed to check client registry before CIMD fallback", rowErr)
 		}
 		oauthClient, err = s.cimdSvc.ResolveClient(ctx, req.ClientID)
 		if err != nil {
@@ -1703,13 +1709,17 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		if !oauthClient.IsActive {
 			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
 		}
-	case s.cimdSvc.Enabled() && IsCIMDClientID(req.ClientID):
+	case errors.Is(err, ErrOAuthClientNotFound) && s.cimdSvc.Enabled() && IsCIMDClientID(req.ClientID):
 		oauthClient, err = s.cimdSvc.ResolveClient(ctx, req.ClientID)
 		if err != nil {
 			return nil, cimdOAuthError(err)
 		}
-	default:
+	case errors.Is(err, ErrOAuthClientNotFound):
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	default:
+		// Operational error — fail closed rather than treat as "no row" (which
+		// would let CIMD resolution resurrect a client under a DB outage).
+		return nil, oauthServerError("failed to resolve client for authorization_code grant", err)
 	}
 
 	// RFC 6749 §2.3/§10.4: a confidential client MUST authenticate with its
@@ -2372,7 +2382,10 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 				// deactivated (or non-public) registered client must not be
 				// resurrected here either. See IssueAuthCode for the full rationale.
 				if s.cimdSvc.Enabled() && IsCIMDClientID(clientID) {
-					if _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, clientID); rowErr != nil {
+					// Only when the registry genuinely has no row — an operational
+					// error (rowErr not ErrOAuthClientNotFound) falls through to the
+					// reject below rather than resurrecting a client under a DB outage.
+					if _, rowErr := s.oauthClientSvc.GetClientByClientID(ctx, clientID); errors.Is(rowErr, ErrOAuthClientNotFound) {
 						if _, cimdErr := s.cimdSvc.ResolveClient(ctx, clientID); cimdErr == nil {
 							return nil
 						}

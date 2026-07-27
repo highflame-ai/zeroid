@@ -322,6 +322,13 @@ func (s *CIMDService) domainAllowed(host string) bool {
 
 // fetch performs the SSRF-guarded GET and JSON-decodes the (size-capped) body.
 func (s *CIMDService) fetch(ctx context.Context, docURL string) (*cimdMetadataDocument, error) {
+	// Bound the fetch at cimdFetchTimeout regardless of the injected client's
+	// own Timeout (the production SSRF-guarded client is wired at 10s), so the
+	// documented 5s ceiling holds and a slow origin can't stall the request
+	// path longer than that.
+	ctx, cancel := context.WithTimeout(ctx, cimdFetchTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, docURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCIMDFetch, err)

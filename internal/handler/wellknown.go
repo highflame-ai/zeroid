@@ -144,9 +144,11 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"revocation_endpoint":    a.issuer + "/oauth2/token/revoke",
 		// RFC 8414 — client auth methods accepted by the introspection and
 		// revocation endpoints (client_secret_basic via Authorization header,
-		// client_secret_post via body fields).
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
-		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
+		// client_secret_post via body fields). "none" is included because
+		// VerifyPresentedClientAuth accepts a no-secret public/CIMD client_id on
+		// these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
 		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
 		// implicit "token" flow is not supported), so advertise "code".
 		"response_types_supported":                         []string{"code"},
