@@ -7,9 +7,15 @@ import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // vi.hoisted ensures TEST_HOME is defined before vi.mock factories run.
-const TEST_HOME = vi.hoisted(
-  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zeroid-config-test-${process.pid}`,
-);
+// Normalise the tmp base (strip any trailing slash) and join with an explicit
+// separator: on macOS TMPDIR is e.g. `/var/folders/.../T/` (trailing slash, so
+// concatenation happened to work), but on Linux CI it's unset → `/tmp` with no
+// slash, which made the old concatenation produce `/tmpzeroid-config-test-<pid>`
+// at the filesystem root → EACCES on mkdir.
+const TEST_HOME = vi.hoisted(() => {
+  const base = (process.env.TMPDIR ?? process.env.TEMP ?? "/tmp").replace(/\/+$/, "");
+  return `${base}/zeroid-config-test-${process.pid}`;
+});
 
 // Must mock before importing config (it resolves HOME at module load time).
 // Use importOriginal to keep tmpdir and other exports from node:os intact.

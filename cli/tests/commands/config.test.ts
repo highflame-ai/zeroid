@@ -9,9 +9,13 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { runCLI } from "../helpers.js";
 
-const TEST_HOME = vi.hoisted(
-  () => `${process.env.TMPDIR ?? process.env.TEMP ?? "/tmp"}zeroid-config-cmd-test-${process.pid}`,
-);
+// Normalise the tmp base (strip trailing slash) and join with an explicit "/".
+// Plain concatenation crashed on Linux CI where TMPDIR is unset → "/tmp" with no
+// slash → "/tmpzeroid-config-cmd-test-<pid>" at the filesystem root → EACCES.
+const TEST_HOME = vi.hoisted(() => {
+  const base = (process.env.TMPDIR ?? process.env.TEMP ?? "/tmp").replace(/\/+$/, "");
+  return `${base}/zeroid-config-cmd-test-${process.pid}`;
+});
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
   return { ...actual, homedir: () => TEST_HOME };

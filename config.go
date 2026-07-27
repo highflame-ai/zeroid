@@ -283,6 +283,14 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the trusted caller
+	// requests one (GrantRequest.IssueRefreshToken). It bounds how long an
+	// external-principal session (e.g. an embedded codeoid workspace) can keep
+	// itself alive by self-rotating before the user must re-authenticate through
+	// the broker. 0 ⇒ the built-in default (12h).
+	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
+
 	// AuditRetentionDays is how long an issued_credentials row remains
 	// queryable AFTER the token expires. The two clocks are deliberately
 	// decoupled (same model as signing_credentials): expires_at bounds how

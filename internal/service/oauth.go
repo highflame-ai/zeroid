@@ -46,6 +46,12 @@ type OAuthService struct {
 	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
 	// treated as the built-in defaults.
 	audienceScopeProfiles map[string][]string
+	// externalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller requests
+	// one (IssueRefreshToken). It bounds how long a harness session can keep
+	// itself alive by self-rotating before the user must re-authenticate. 0 ⇒
+	// the built-in default (defaultExternalPrincipalRefreshTokenTTL).
+	externalPrincipalRefreshTokenTTL int
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -101,6 +107,21 @@ const (
 	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
 	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
 )
+
+// externalPrincipalAccessTokenTTL is the lifetime (seconds) of the SHORT-LIVED
+// access token issued by the external-principal exchange — 15 minutes, whether
+// or not a refresh token accompanies it. Kept short so a stolen access token
+// has a small window; continuity comes from the refresh token, not a long
+// access-token TTL. The refresh grant re-issues at this same TTL.
+const externalPrincipalAccessTokenTTL = 900
+
+// defaultExternalPrincipalRefreshTokenTTL bounds how long an external-principal
+// session (e.g. an embedded codeoid workspace) can keep itself alive by
+// self-rotating its refresh token before the user must re-authenticate through
+// the broker. 12 hours: comfortably longer than an interactive coding session,
+// short enough to cap a leaked refresh token's usefulness. Overridable per
+// deployment via OAuthServiceConfig.ExternalPrincipalRefreshTokenTTL.
+const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 
 // reservedClaims are standard JWT and ZeroID claims that additional_claims cannot override.
 var reservedClaims = map[string]bool{
@@ -267,6 +288,10 @@ type OAuthServiceConfig struct {
 	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
 	// back to the built-in defaults.
 	AudienceScopeProfiles map[string][]string
+	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller sets
+	// IssueRefreshToken. 0 ⇒ the built-in default (12h).
+	ExternalPrincipalRefreshTokenTTL int
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -285,19 +310,20 @@ func NewOAuthService(
 	cfg OAuthServiceConfig,
 ) *OAuthService {
 	return &OAuthService{
-		credentialSvc:           credentialSvc,
-		identitySvc:             identitySvc,
-		oauthClientSvc:          oauthClientSvc,
-		apiKeyRepo:              apiKeyRepo,
-		authCodeRepo:            authCodeRepo,
-		jwksSvc:                 jwksSvc,
-		refreshTokenSvc:         refreshTokenSvc,
-		issuer:                  cfg.Issuer,
-		wimseDomain:             cfg.WIMSEDomain,
-		hmacSecret:              cfg.HMACSecret,
-		authCodeIssuer:          cfg.AuthCodeIssuer,
-		audienceScopeProfiles:   audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
-		trustedServiceValidator: cfg.TrustedServiceValidator,
+		credentialSvc:                    credentialSvc,
+		identitySvc:                      identitySvc,
+		oauthClientSvc:                   oauthClientSvc,
+		apiKeyRepo:                       apiKeyRepo,
+		authCodeRepo:                     authCodeRepo,
+		jwksSvc:                          jwksSvc,
+		refreshTokenSvc:                  refreshTokenSvc,
+		issuer:                           cfg.Issuer,
+		wimseDomain:                      cfg.WIMSEDomain,
+		hmacSecret:                       cfg.HMACSecret,
+		authCodeIssuer:                   cfg.AuthCodeIssuer,
+		audienceScopeProfiles:            audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
+		externalPrincipalRefreshTokenTTL: cfg.ExternalPrincipalRefreshTokenTTL,
+		trustedServiceValidator:          cfg.TrustedServiceValidator,
 	}
 }
 
@@ -440,6 +466,14 @@ type TokenRequest struct {
 	// Role/PrivilegeScope this is a dedicated field, never settable via
 	// AdditionalClaims (`aud`/`scopes` are reserved).
 	Audience string
+	// IssueRefreshToken requests that the external-principal exchange ALSO mint a
+	// rotating refresh token alongside the short-lived access token, so the
+	// external principal (e.g. an embedded codeoid workspace) can keep its
+	// session alive by self-rotating at /oauth2/token instead of the broker
+	// re-minting on a timer. Honoured ONLY on the trusted external-principal
+	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
+	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
+	IssueRefreshToken bool
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -1063,7 +1097,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		UserEmail:         req.UserEmail,
 		UserName:          req.UserName,
 		ApplicationID:     req.ApplicationID,
-		TTL:               900, // 15 minutes — short-lived for external principals
+		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
@@ -1074,6 +1108,40 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	accessToken.AccountID = req.AccountID
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = req.UserID
+
+	// Step 6 (optional): mint a rotating refresh token so the external principal
+	// can keep its session alive on its own — self-rotating at /oauth2/token —
+	// rather than the broker re-minting on a timer. Gated to a PROFILED audience
+	// (audience != "" was validated above): the refresh grant re-stamps the same
+	// `aud`/scope profile on every rotation, which only exists for a profiled
+	// audience. The audience NAME is persisted as the refresh token's client_id
+	// binding (RFC 6749 §10.4) — the principal presents it as `client_id` on
+	// refresh; there is no confidential OAuth client, so possession of the
+	// rotating token plus family reuse-detection is the security boundary.
+	if req.IssueRefreshToken && len(audience) > 0 && s.refreshTokenSvc != nil {
+		refreshTTL := s.externalPrincipalRefreshTokenTTL
+		if refreshTTL <= 0 {
+			refreshTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
+			ClientID:          req.Audience, // audience name is the client_id binding
+			AccountID:         req.AccountID,
+			ProjectID:         req.ProjectID,
+			UserID:            req.UserID,
+			Scopes:            strings.Join(scopes, " "),
+			Audience:          req.Audience,
+			TTL:               refreshTTL,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		})
+		if rtErr != nil {
+			// Fail CLOSED: the caller explicitly asked for a refresh token (its
+			// session continuity depends on it). Surfacing the error is better
+			// than silently returning an access-token-only response the caller
+			// would treat as a working self-refreshing session.
+			return nil, oauthServerError("failed to issue refresh token for external principal", rtErr)
+		}
+		accessToken.RefreshToken = rtResult.RawToken
+	}
 
 	return accessToken, nil
 }
@@ -1827,12 +1895,45 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthServerError("refresh tokens not configured", nil)
 	}
 
-	// Look up client to get per-client TTL settings AND to enforce client
-	// authentication. A confidential client MUST present its client_secret on
-	// the refresh_token grant (RFC 6749 §6/§10.4); a public client proves
-	// possession with the refresh-token string alone and carries no secret.
+	// Audience-profile refresh tokens (issued by the external-principal exchange
+	// for a profiled audience like "codeoid") have NO registered OAuth client —
+	// the audience name is their client_id binding, and possession of the
+	// rotating token plus family reuse-detection is the security boundary. Detect
+	// them with a NON-CONSUMING peek that reads REGARDLESS OF STATE (including
+	// revoked): a replayed / already-rotated audience token MUST still route down
+	// the audience path so RotateRefreshToken's claim step fires the correct
+	// reuse detection. An active-only peek would miss the revoked row, fall
+	// through to the OAuth-client path, and 401 on the (non-existent) "codeoid"
+	// client BEFORE reuse detection ran. Reading the Audience/ClientID binding
+	// off a revoked row is safe: it is metadata for ROUTING only — the rotation
+	// claim below remains the authorization gate. A genuinely unknown token
+	// matches nothing here and falls through to the OAuth-client path.
+	var audienceRefreshToken *domain.RefreshToken
+	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, req.RefreshTokenStr); peekErr == nil && peeked.Audience != "" {
+		audienceRefreshToken = peeked
+	}
+
 	var accessTTL, refreshTokenTTL int
-	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
+	if audienceRefreshToken != nil {
+		// Client-less audience-profile token. The refreshed access token is
+		// re-issued short-lived (same 15-minute TTL as the original external
+		// principal exchange); the refresh token keeps its configured lifetime.
+		// client_id binding (RFC 6749 §10.4) is the audience name; verified on
+		// the peek here so a mismatch does not consume the token.
+		if audienceRefreshToken.ClientID != req.ClientID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+		accessTTL = externalPrincipalAccessTokenTTL
+		refreshTokenTTL = s.externalPrincipalRefreshTokenTTL
+		if refreshTokenTTL <= 0 {
+			refreshTokenTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+	} else if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
+		// Look up client to get per-client TTL settings AND to enforce client
+		// authentication. A confidential client MUST present its client_secret on
+		// the refresh_token grant (RFC 6749 §6/§10.4); a public client proves
+		// possession with the refresh-token string alone and carries no secret.
+		//
 		// GetClientByClientID does not filter is_active (unlike GetPublicClient /
 		// VerifyClientSecret), and verifyConfidentialClientAuth is a no-op for
 		// public clients — so without this guard a deactivated PUBLIC client
@@ -1981,6 +2082,22 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		}
 	}
 
+	// Re-stamp the audience profile on rotation. An audience-profile refresh
+	// token (external-principal exchange, e.g. codeoid) MUST re-issue with the
+	// SAME `aud` claim so the harness daemon — which validates `aud` on every
+	// message — accepts the refreshed token. The audience name is bound to the
+	// family (copied across every rotation); empty for a normal refresh token,
+	// leaving issuance unchanged. ApplicationID is cleared for audience tokens:
+	// they carry a synthetic principal (no application row), mirroring the
+	// original external-principal exchange rather than stamping the audience
+	// name (the client_id binding) as a bogus application claim.
+	var refreshAudience []string
+	applicationID := oldToken.ClientID
+	if oldToken.Audience != "" {
+		refreshAudience = []string{oldToken.Audience}
+		applicationID = ""
+	}
+
 	// Inherit scopes from the original refresh token. Without this the
 	// refreshed access token would be issued with no scopes (or default
 	// scopes), breaking the contract that refresh preserves the original
@@ -1991,7 +2108,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		GrantType:         domain.GrantTypeRefreshToken,
 		UseRS256:          true,
 		SubjectOverride:   oldToken.UserID,
-		ApplicationID:     oldToken.ClientID,
+		ApplicationID:     applicationID,
+		Audience:          refreshAudience,
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
