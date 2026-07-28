@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,6 +18,12 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
+
+// ErrInvalidAPIKeyReference is returned when a caller-supplied reference
+// field (e.g. identity_id, credential_policy_id) fails a database-level type
+// or foreign-key check that request validation didn't catch — malformed
+// input, not a server fault. Callers map this to 400.
+var ErrInvalidAPIKeyReference = errors.New("invalid reference on API key")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
@@ -127,6 +135,13 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	if req.IdentityID != "" {
 		identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
 		if err != nil {
+			// A caller-supplied identity_id that's malformed or doesn't
+			// resolve in this tenant is caller error, not a server fault —
+			// same class of bug as #149, just triggered by an explicit bad
+			// value instead of an omitted one.
+			if errors.Is(err, sql.ErrNoRows) || isInvalidUUIDError(err) {
+				return nil, fmt.Errorf("%w: identity_id %q: %v", ErrInvalidAPIKeyReference, req.IdentityID, err)
+			}
 			return nil, fmt.Errorf("failed to load identity %s for subset check: %w", req.IdentityID, err)
 		}
 		if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
@@ -193,6 +208,12 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	}
 
 	if err := s.repo.Create(ctx, sk); err != nil {
+		// A malformed UUID reference or a dangling FK is caller error, not a
+		// server fault — surface it as such instead of leaking a raw
+		// database error as an opaque 500 (issue #149).
+		if isInvalidUUIDError(err) || isForeignKeyViolation(err) {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidAPIKeyReference, err)
+		}
 		return nil, fmt.Errorf("failed to store API key: %w", err)
 	}
 
