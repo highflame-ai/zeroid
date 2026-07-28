@@ -6,12 +6,15 @@ import (
 	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -37,6 +41,17 @@ type OAuthService struct {
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
 	hmacSecret      string // HS256 shared secret for auth code JWT verification
 	authCodeIssuer  string // expected issuer in auth code JWTs
+	// audienceScopeProfiles maps an external-principal-exchange audience name to
+	// its server-defined scope set (built-in defaults + deployer config, merged
+	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
+	// treated as the built-in defaults.
+	audienceScopeProfiles map[string][]string
+	// externalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller requests
+	// one (IssueRefreshToken). It bounds how long a harness session can keep
+	// itself alive by self-rotating before the user must re-authenticate. 0 ⇒
+	// the built-in default (defaultExternalPrincipalRefreshTokenTTL).
+	externalPrincipalRefreshTokenTTL int
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -46,9 +61,30 @@ type OAuthService struct {
 	// governance binding is not configured for this deployment — every
 	// existing flow then behaves identically to pre-#59 ZeroID.
 	governanceSvc *GovernanceService
+	// externalIssuerRegistry resolves direct-federation token-exchange
+	// requests (subject_token_type=id_token) to a configured upstream IdP.
+	// Nil when no external_issuers are configured — direct federation is
+	// disabled in that case and only the broker path remains.
+	externalIssuerRegistry *ExternalIssuerRegistry
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
+	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
+	// every other check passes) so a replayed ID-JAG is rejected with
+	// invalid_grant. Wired after construction via SetIDJAGReplayStore. Nil when
+	// ID-JAG federation is not configured; idJAGBearer already fails closed in
+	// that case (no external issuers → no ID-JAG path), so a nil store can never
+	// silently skip replay protection while ID-JAG is actually in use — but the
+	// handler also guards against nil defensively (fail closed).
+	idJAGReplayStore IDJAGReplayStore
+	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
+	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
+	// MUST present client credentials. When false the endpoints accept-and-
+	// verify (anonymous allowed, presented credentials still verified). atomic
+	// so a test can flip it on a shared server without racing concurrent
+	// introspect/revoke reads under -race.
+	requireTokenInspectionAuth atomic.Bool
 }
 
 // SetGovernanceService attaches a GovernanceService so that token_exchange
@@ -61,11 +97,38 @@ func (s *OAuthService) SetGovernanceService(g *GovernanceService) {
 // CustomGrantHandler implements a custom OAuth2 grant type.
 type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
 
+// IDJAGReplayStore is the durable single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Insert records a previously-unredeemed jti and MUST
+// return a replay sentinel (postgres.ErrIDJAGReplay) when the jti is already
+// present. The check-and-insert must be atomic (a unique-constraint violation
+// is the replay signal) — a non-atomic read-then-write is a TOCTOU bug that
+// defeats the single-use guarantee. The concrete impl is
+// postgres.IDJAGReplayStore; an interface here keeps the service testable and
+// the dependency narrow.
+type IDJAGReplayStore interface {
+	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+}
+
 // Default token TTLs (used when per-client TTL is not configured).
 const (
 	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
 	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
 )
+
+// externalPrincipalAccessTokenTTL is the lifetime (seconds) of the SHORT-LIVED
+// access token issued by the external-principal exchange — 15 minutes, whether
+// or not a refresh token accompanies it. Kept short so a stolen access token
+// has a small window; continuity comes from the refresh token, not a long
+// access-token TTL. The refresh grant re-issues at this same TTL.
+const externalPrincipalAccessTokenTTL = 900
+
+// defaultExternalPrincipalRefreshTokenTTL bounds how long an external-principal
+// session (e.g. an embedded codeoid workspace) can keep itself alive by
+// self-rotating its refresh token before the user must re-authenticate through
+// the broker. 12 hours: comfortably longer than an interactive coding session,
+// short enough to cap a leaked refresh token's usefulness. Overridable per
+// deployment via OAuthServiceConfig.ExternalPrincipalRefreshTokenTTL.
+const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 
 // reservedClaims are standard JWT and ZeroID claims that additional_claims cannot override.
 var reservedClaims = map[string]bool{
@@ -78,12 +141,148 @@ var reservedClaims = map[string]bool{
 	"capabilities": true, "scopes": true, "grant_type": true, "delegation_depth": true,
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
-	"act": true, "token_exchange": true, "trusted_by": true,
+	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
 	// Governance binding (issue #59) — set by tokenExchange /
 	// authorizationCode from the active DRM and Constraint Catalog.
 	// Deployer claim enrichers cannot spoof these.
 	"drm_version": true, "drm_hash": true,
 	"constraint_catalog_version": true, "constraint_catalog_hash": true,
+	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
+	// callers from injecting it via additional_claims, which would otherwise
+	// let a trusted-service caller mint a token that appears DPoP-bound to
+	// an attacker-chosen key thumbprint.
+	"cnf": true,
+	// Authorization claims. `role` and
+	// `privilege_scope` carry authorization weight downstream, so they must
+	// never be settable via the ungated additional_claims map on ANY grant —
+	// that would be a privilege-escalation vector for any caller that can
+	// reach the token endpoint. They are honoured ONLY on the trusted-service
+	// external-principal exchange path, set from dedicated request fields
+	// after the TrustedServiceValidator has authorised the caller (see
+	// ExternalPrincipalExchange). Reserving them here makes the additional_claims
+	// route fail closed regardless of which grant is in play.
+	"role":            true,
+	"privilege_scope": true,
+}
+
+// audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
+// Studio requests it on the user_session/external-principal exchange so a
+// short-lived, user-identity JWT can drive the codeoid daemon's web operator
+// surface. The name is the ONLY input a caller supplies — it maps to exactly
+// one server-defined scope profile (never caller-supplied scopes).
+const audienceCodeoid = "codeoid"
+
+// audienceAgentSandbox is the audience profile for provisioning a per-sandbox
+// workload identity. A trusted broker (e.g. highflame-forge) requests it on the
+// user_session exchange to obtain a short-lived, user-identity token that
+// registers a per-sandbox agent identity (POST /agents/register) in the user's
+// OWN tenant — the workload-identity mint (forge #25). Deliberately harness-
+// AGNOSTIC (any agent workspace, not just codeoid) and scoped to just
+// `nhi:manage` — the ONE capability the register call needs; the registered
+// badge's own scopes are set separately in the register request.
+const audienceAgentSandbox = "agent-sandbox"
+
+// defaultAudienceScopeProfiles is the BUILT-IN fallback map of audience name →
+// the fixed scope set minted for that audience on the trusted external-principal
+// exchange. Deployers ADD or OVERRIDE profiles via config
+// (Config.AudienceScopeProfiles → ResolveAudienceScopeProfiles), so a NEW
+// audience is a reviewed CONFIG change, not a code release. It stays
+// server-defined either way (never caller-supplied): a caller only names an
+// audience, which resolves to exactly one profile the deployer controls.
+var defaultAudienceScopeProfiles = map[string][]string{
+	// codeoid: the web-operator scope set the codeoid daemon re-verifies (via
+	// JWKS) and reads from the `scopes` claim to authorize embedded-UI actions.
+	// The `pipeline:*` scopes drive the embedded /packs Pack Browser + /pipeline
+	// runner (pack.list needs pipeline:read); without them the embedded UI renders
+	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
+	// the api-key exchange flow (which widens its own request), the embed-handoff
+	// token is used verbatim, so this server-side profile is the only lever.
+	audienceCodeoid: {
+		"session:list",
+		"session:create",
+		"session:attach",
+		"session:watch",
+		"session:send",
+		"session:interrupt",
+		"session:approve",
+		"session:destroy",
+		"session:read",
+		"session:dispatch",
+		"fs:read",
+		"pipeline:read",
+		"pipeline:create",
+		"pipeline:answer",
+		"pipeline:manage",
+	},
+	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
+	// to register a per-sandbox identity on the user's behalf.
+	audienceAgentSandbox: {
+		"nhi:manage",
+	},
+}
+
+// allowedProfileScopes bounds what ANY audience profile (built-in default OR
+// deployer config) may grant, so a config entry can never invent authority the
+// server doesn't recognize. A profile scope outside this set fails startup
+// (ResolveAudienceScopeProfiles, fail closed).
+var allowedProfileScopes = map[string]bool{
+	"session:list":      true,
+	"session:create":    true,
+	"session:attach":    true,
+	"session:watch":     true,
+	"session:send":      true,
+	"session:interrupt": true,
+	"session:approve":   true,
+	"session:destroy":   true,
+	"session:read":      true,
+	"session:dispatch":  true,
+	"fs:read":           true,
+	"nhi:manage":        true,
+	"pipeline:read":     true,
+	"pipeline:create":   true,
+	"pipeline:answer":   true,
+	"pipeline:manage":   true,
+}
+
+// ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
+// the built-in defaults and validates that every granted scope is in
+// allowedProfileScopes. It returns an error (→ startup failure, fail closed) on
+// an empty audience name or an unrecognized scope, so a config typo/mistake can
+// never silently widen authority. Called once at server construction; the merged
+// result is stored on the OAuthService. A nil/empty config yields the defaults.
+func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]string, error) {
+	out := make(map[string][]string, len(defaultAudienceScopeProfiles)+len(configured))
+	for aud, scopes := range defaultAudienceScopeProfiles {
+		out[aud] = slices.Clone(scopes)
+	}
+	for aud, scopes := range configured {
+		out[aud] = slices.Clone(scopes)
+	}
+	// Validate the MERGED set (built-in defaults AND deployer config) uniformly and
+	// fail closed. Validating the defaults too guards against a future default
+	// scope drifting out of allowedProfileScopes (a config trying to grant the same
+	// scope would then be rejected while the default silently grants it).
+	for aud, scopes := range out {
+		if strings.TrimSpace(aud) == "" {
+			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		if len(scopes) == 0 {
+			// A recognized-but-empty profile mints a token with the audience stamped
+			// and ZERO scopes — every scope-gated action then silently denies. Reject
+			// at boot (fail loud) rather than shipping a scopeless audience.
+			return nil, fmt.Errorf(
+				"audience_scope_profiles[%q]: empty scope list — a recognized audience must grant at least one scope",
+				aud)
+		}
+		for _, sc := range scopes {
+			if !allowedProfileScopes[sc] {
+				return nil, fmt.Errorf(
+					"audience_scope_profiles[%q]: scope %q is not in the server's allowed profile-scope set",
+					aud, sc)
+			}
+		}
+	}
+	return out, nil
 }
 
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
@@ -97,6 +296,14 @@ type OAuthServiceConfig struct {
 	WIMSEDomain    string
 	HMACSecret     string
 	AuthCodeIssuer string
+	// AudienceScopeProfiles is the merged+validated audience→scope map for the
+	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
+	// back to the built-in defaults.
+	AudienceScopeProfiles map[string][]string
+	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller sets
+	// IssueRefreshToken. 0 ⇒ the built-in default (12h).
+	ExternalPrincipalRefreshTokenTTL int
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -115,19 +322,38 @@ func NewOAuthService(
 	cfg OAuthServiceConfig,
 ) *OAuthService {
 	return &OAuthService{
-		credentialSvc:           credentialSvc,
-		identitySvc:             identitySvc,
-		oauthClientSvc:          oauthClientSvc,
-		apiKeyRepo:              apiKeyRepo,
-		authCodeRepo:            authCodeRepo,
-		jwksSvc:                 jwksSvc,
-		refreshTokenSvc:         refreshTokenSvc,
-		issuer:                  cfg.Issuer,
-		wimseDomain:             cfg.WIMSEDomain,
-		hmacSecret:              cfg.HMACSecret,
-		authCodeIssuer:          cfg.AuthCodeIssuer,
-		trustedServiceValidator: cfg.TrustedServiceValidator,
+		credentialSvc:                    credentialSvc,
+		identitySvc:                      identitySvc,
+		oauthClientSvc:                   oauthClientSvc,
+		apiKeyRepo:                       apiKeyRepo,
+		authCodeRepo:                     authCodeRepo,
+		jwksSvc:                          jwksSvc,
+		refreshTokenSvc:                  refreshTokenSvc,
+		issuer:                           cfg.Issuer,
+		wimseDomain:                      cfg.WIMSEDomain,
+		hmacSecret:                       cfg.HMACSecret,
+		authCodeIssuer:                   cfg.AuthCodeIssuer,
+		audienceScopeProfiles:            audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
+		externalPrincipalRefreshTokenTTL: cfg.ExternalPrincipalRefreshTokenTTL,
+		trustedServiceValidator:          cfg.TrustedServiceValidator,
 	}
+}
+
+// audienceProfilesOrDefault returns a deep copy of the configured profiles, or of
+// the built-in defaults when nil — so direct NewOAuthService callers (e.g. tests)
+// that don't set them still resolve the standard audiences. It always clones, so
+// an OAuthService can never alias the package-global defaults (nil path) nor a map
+// the caller retains and later mutates (non-nil path).
+func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
+	source := configured
+	if source == nil {
+		source = defaultAudienceScopeProfiles
+	}
+	out := make(map[string][]string, len(source))
+	for aud, scopes := range source {
+		out[aud] = slices.Clone(scopes)
+	}
+	return out
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
@@ -142,6 +368,24 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+}
+
+// SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
+// values (ADR 0010 D2a). Required whenever ID-JAG federation is enabled — the
+// idJAGBearer path consumes jti against this store as its final gate. Wired in
+// server.go alongside the external-issuer registry.
+func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
+	s.idJAGReplayStore = store
+}
+
+// SetRequireTokenInspectionAuth toggles strict client authentication on the
+// introspection (RFC 7662) and revocation (RFC 7009) endpoints. When true,
+// anonymous callers are rejected; when false, the accept-and-verify posture
+// is used (anonymous allowed, presented credentials still verified). Wired
+// from config at startup (server.go) and flippable at runtime so a test can
+// exercise both modes on a shared server without standing up a second one.
+func (s *OAuthService) SetRequireTokenInspectionAuth(require bool) {
+	s.requireTokenInspectionAuth.Store(require)
 }
 
 // RegisterGrant registers a custom grant type handler on the OAuth service.
@@ -176,6 +420,37 @@ type TokenRequest struct {
 	UserName         string         // user display name
 	ApplicationID    string         // optional application scope
 	AdditionalClaims map[string]any // arbitrary claims to inject into the issued JWT
+	// Role and PrivilegeScope are authorization claims
+	// that the trusted service (already authenticated via TrustedServiceValidator)
+	// may set on the issued token. They are minted into the `role` (string) and
+	// `privilege_scope` (array of strings) JWT claims ONLY on the trusted-service
+	// external-principal exchange path. They CANNOT be set via AdditionalClaims —
+	// both names are in reservedClaims — so an untrusted caller can never inject
+	// them. On any non-trusted path these fields are ignored (never reach the
+	// token), because only ExternalPrincipalExchange reads them and that function
+	// rejects untrusted callers before issuance.
+	Role           string   // authorization role claim (`role`)
+	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
+	// Audience is an OPTIONAL, server-recognized audience profile name (e.g.
+	// "codeoid"). Honoured ONLY on the trusted external-principal exchange:
+	// when it matches a known profile in audienceScopeProfiles, the issued
+	// token carries `aud` = the audience name plus that profile's fixed scope
+	// set in the `scopes` claim. Arbitrary caller scopes are never honoured for
+	// a profiled audience — the audience name is the whole input. An empty
+	// value leaves issuance unchanged (default `aud` = issuer, scopes from
+	// Scope); a non-empty value that names no known profile is rejected with
+	// `invalid_target` (RFC 8693) rather than silently downgraded. Like
+	// Role/PrivilegeScope this is a dedicated field, never settable via
+	// AdditionalClaims (`aud`/`scopes` are reserved).
+	Audience string
+	// IssueRefreshToken requests that the external-principal exchange ALSO mint a
+	// rotating refresh token alongside the short-lived access token, so the
+	// external principal (e.g. an embedded codeoid workspace) can keep its
+	// session alive by self-rotating at /oauth2/token instead of the broker
+	// re-minting on a timer. Honoured ONLY on the trusted external-principal
+	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
+	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
+	IssueRefreshToken bool
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -187,6 +462,10 @@ type TokenRequest struct {
 	TrustedService bool
 	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
+	// DPoPKeyThumbprint is the base64url JWK thumbprint of the client's DPoP key.
+	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
+	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
+	DPoPKeyThumbprint string
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -206,24 +485,26 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.refreshToken(ctx, req)
 	case string(domain.GrantTypeCIBA):
 		if s.backchannelSvc == nil {
-			return nil, oauthBadRequest("unsupported_grant_type", "CIBA is not enabled on this deployment")
+			return nil, oauthBadRequest(oautherror.UnsupportedGrantType, "CIBA is not enabled on this deployment")
 		}
 		return s.backchannelSvc.Redeem(ctx, RedeemInput{
-			AuthReqID: req.AuthReqID,
-			ClientID:  req.ClientID,
+			AuthReqID:         req.AuthReqID,
+			ClientID:          req.ClientID,
+			ClientSecret:      req.ClientSecret,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
 		// Check custom grant handlers registered via RegisterGrant.
 		if handler, ok := s.customGrants[req.GrantType]; ok {
 			return handler(ctx, req)
 		}
-		return nil, oauthBadRequest("unsupported_grant_type", req.GrantType)
+		return nil, oauthBadRequest(oautherror.UnsupportedGrantType, req.GrantType)
 	}
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for client_credentials grant")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
 	}
 
 	// Validate client credentials against the oauth_clients table.
@@ -238,7 +519,19 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// Ensure client_credentials grant is permitted.
 	allowed := slices.Contains(client.GrantTypes, "client_credentials")
 	if !allowed {
-		return nil, oauthBadRequest("unauthorized_client", "client not authorized for client_credentials grant")
+		return nil, oauthBadRequest(oautherror.UnauthorizedClient, "client not authorized for client_credentials grant")
+	}
+
+	// A client_credentials client registered with zero scopes can mint
+	// NOTHING — there is no human or delegation chain to fall back to here,
+	// so the client's registered scope set IS the entire authority ceiling.
+	// intersectScopes treats an empty allow-list as "no restriction" (RFC 6749
+	// §3.3 default) which is correct for the chained api_key/jwt_bearer/
+	// token_exchange paths (they have a separate identity/policy ceiling), but
+	// for client_credentials it would let a scope-less client echo arbitrary
+	// requested scopes. Deny outright instead of calling the shared helper.
+	if len(client.Scopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
 	// Parse and intersect requested scopes with the client's allowed scopes.
@@ -251,10 +544,10 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 	}
 	if !identity.Status.IsUsable() {
-		return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
 	}
 	if identity.IsExpired() {
-		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
 
 	// Resolve the identity policy — the authority ceiling. Without this
@@ -267,10 +560,11 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: policy.ID,
-		Scopes:           scopes,
-		GrantType:        domain.GrantTypeClientCredentials,
+		Identity:          identity,
+		IdentityPolicyID:  policy.ID,
+		Scopes:            scopes,
+		GrantType:         domain.GrantTypeClientCredentials,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -284,49 +578,61 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 // iss must equal the agent's WIMSE URI; aud must equal the issuer URL.
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Subject == "" {
-		return nil, oauthBadRequest("invalid_request", "subject (assertion JWT) is required for jwt_bearer grant")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
+	}
+
+	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
+	// whose JWS typ header is oauth-id-jag+jwt is an Identity Assertion
+	// Authorization Grant signed by a corporate IdP — it MUST be validated
+	// against that IdP's JWKS (the #88 external-issuer substrate), NOT this
+	// path's registered-per-identity public key. Branch before any NHI-specific
+	// work so the two validation modes stay cleanly separate (D2: the branch
+	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
+	// NHI self-signed behavior below.
+	if isIDJAGAssertion(req.Subject) {
+		return s.idJAGBearer(ctx, req)
 	}
 
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
 	if err := jwtalg.Validate(req.Subject); err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT uses an unsupported algorithm", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
 	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT is malformed", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT is malformed", err)
 	}
 
 	wimseURI, _ := peeked.Issuer()
 	if wimseURI == "" {
-		return nil, oauthBadRequest("invalid_grant", "assertion JWT missing iss claim")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "assertion JWT missing iss claim")
 	}
 
 	// Parse tenant from the WIMSE URI itself — no caller-supplied tenant headers needed.
 	accountID, projectID, err := s.parseWIMSEURI(wimseURI)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "invalid WIMSE URI in assertion", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid WIMSE URI in assertion", err)
 	}
 
 	// Resolve the identity by WIMSE URI, scoped to the tenant extracted above.
 	identity, err := s.identitySvc.repo.GetByWIMSEURI(ctx, wimseURI, accountID, projectID)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown issuer %s", wimseURI), err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("unknown issuer %s", wimseURI), err)
 	}
 	if !identity.Status.IsUsable() {
-		return nil, oauthBadRequest("invalid_grant", "agent identity is suspended or deactivated")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "agent identity is suspended or deactivated")
 	}
 	if identity.IsExpired() {
-		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
 	if identity.PublicKeyPEM == "" {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("no public key registered for identity %s — register a key before using jwt_bearer", identity.ID))
 	}
 
 	agentPubKey, err := parseECPublicKeyPEM(identity.PublicKeyPEM)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "registered public key is invalid", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "registered public key is invalid", err)
 	}
 
 	// Fully validate the assertion JWT against the agent's registered public key.
@@ -336,12 +642,23 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "assertion JWT validation failed", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT validation failed", err)
+	}
+
+	// RFC 7523 §3 mandatory claims. jwx's WithValidate(true) honors them
+	// when present but does not require them — supplement here.
+	//   §3 (2): "The JWT MUST contain a 'sub' (subject) claim ..."
+	//   §3 (4): "The JWT MUST contain an 'exp' (expiration) claim ..."
+	if _, ok := assertionToken.Subject(); !ok {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "assertion JWT missing required sub claim")
+	}
+	if _, ok := assertionToken.Expiration(); !ok {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "assertion JWT missing required exp claim")
 	}
 
 	// iss must match the identity's WIMSE URI.
 	if iss, _ := assertionToken.Issuer(); iss != identity.WIMSEURI {
-		return nil, oauthBadRequest("invalid_grant", "iss claim does not match identity WIMSE URI")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "iss claim does not match identity WIMSE URI")
 	}
 
 	// Resolve the identity policy — the authority ceiling for scopes, TTL,
@@ -355,10 +672,11 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: policy.ID,
-		Scopes:           scopes,
-		GrantType:        domain.GrantTypeJWTBearer,
+		Identity:          identity,
+		IdentityPolicyID:  policy.ID,
+		Scopes:            scopes,
+		GrantType:         domain.GrantTypeJWTBearer,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -382,13 +700,24 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 // public key (same requirement as jwt_bearer).
 func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.SubjectToken == "" {
-		return nil, oauthBadRequest("invalid_request", "subject_token is required for token_exchange grant")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject_token is required for token_exchange grant")
 	}
 
-	// RFC 8693 defines two exchange modes:
-	//   1. NHI delegation: subject_token (orchestrator) + actor_token (sub-agent) → delegated token
-	//   2. External principal exchange: subject_token (external JWT) from a trusted service → zeroid token
-	// Mode is determined by the presence of actor_token.
+	// RFC 8693 defines several exchange modes:
+	//   1. Direct OIDC federation (issue #88): subject_token_type=id_token →
+	//      ZeroID itself verifies the upstream IdP's signature against a
+	//      configured JWKS. The TrustedServiceValidator hook is *not* used —
+	//      this path is the trust anchor. Dispatch happens before the
+	//      actor_token check because direct federation never carries one.
+	//   2. NHI delegation: subject_token (orchestrator) + actor_token
+	//      (sub-agent) → delegated token.
+	//   3. External principal exchange (broker): subject_token from a
+	//      trusted upstream service → zeroid token. ZeroID gates on the
+	//      caller via TrustedServiceValidator and trusts the relay to
+	//      have done the IdP-side verification.
+	if req.SubjectTokenType == SubjectTokenTypeIDToken {
+		return s.externalIDTokenExchange(ctx, req)
+	}
 	if req.ActorToken == "" {
 		return s.ExternalPrincipalExchange(ctx, req)
 	}
@@ -397,65 +726,65 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// Accept both ES256 and RS256 tokens — the library matches kid + alg from the JWKS.
 	subjectParsed, err := s.parseToken(req.SubjectToken, true)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "subject_token validation failed", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "subject_token validation failed", err)
 	}
 
 	subjectJTI, _ := subjectParsed.JwtID()
 	if subjectJTI == "" {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing jti claim")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token missing jti claim")
 	}
 
 	// Check that the credential has not been revoked.
 	subjectCred, active, err := s.credentialSvc.IntrospectToken(ctx, subjectJTI)
 	if err != nil || subjectCred == nil || !active {
-		return nil, oauthBadRequest("invalid_grant", "subject_token is inactive or has been revoked")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token is inactive or has been revoked")
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
 	if err := jwtalg.Validate(req.ActorToken); err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "actor_token uses an unsupported algorithm", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "actor_token uses an unsupported algorithm", err)
 	}
 	actorPeeked, err := jwt.ParseInsecure([]byte(req.ActorToken))
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "actor_token is malformed", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "actor_token is malformed", err)
 	}
 
 	actorWIMSEURI, _ := actorPeeked.Issuer()
 	if actorWIMSEURI == "" {
-		return nil, oauthBadRequest("invalid_grant", "actor_token missing iss claim")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token missing iss claim")
 	}
 
 	// Derive the tenant from the actor's WIMSE URI.
 	accountID, projectID, err := s.parseWIMSEURI(actorWIMSEURI)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "actor_token iss is not a valid WIMSE URI", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "actor_token iss is not a valid WIMSE URI", err)
 	}
 
 	// Subject and actor must belong to the same tenant.
 	if accountID != subjectCred.AccountID || projectID != subjectCred.ProjectID {
-		return nil, oauthBadRequest("invalid_grant", "subject_token and actor_token must belong to the same tenant")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token and actor_token must belong to the same tenant")
 	}
 
 	// Look up the actor (sub-agent) identity.
 	actorIdentity, err := s.identitySvc.repo.GetByWIMSEURI(ctx, actorWIMSEURI, accountID, projectID)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("unknown actor identity %s", actorWIMSEURI), err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("unknown actor identity %s", actorWIMSEURI), err)
 	}
 	if !actorIdentity.Status.IsUsable() {
-		return nil, oauthBadRequest("invalid_grant", "actor identity is suspended or deactivated")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor identity is suspended or deactivated")
 	}
 	if actorIdentity.IsExpired() {
-		return nil, oauthBadRequest("invalid_grant", "identity_expired")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
 	if actorIdentity.PublicKeyPEM == "" {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("no public key registered for actor identity %s — register a key before using token_exchange", actorIdentity.ID))
 	}
 
 	// Fully validate the actor_token against the sub-agent's registered public key.
 	actorPubKey, err := parseECPublicKeyPEM(actorIdentity.PublicKeyPEM)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "actor's registered public key is invalid", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "actor's registered public key is invalid", err)
 	}
 
 	validatedActorToken, err := jwt.Parse([]byte(req.ActorToken),
@@ -464,10 +793,21 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		jwt.WithAudience(s.issuer),
 	)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "actor_token validation failed", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "actor_token validation failed", err)
+	}
+	// RFC 7523 §3 mandatory claims apply to the actor_token too (RFC 8693
+	// §1.2 inherits the JWT-bearer assertion contract). jwx's validator
+	// honors them when present but does not require them — supplement here.
+	//   §3 (2): sub REQUIRED
+	//   §3 (4): exp REQUIRED
+	if _, ok := validatedActorToken.Subject(); !ok {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token missing required sub claim")
+	}
+	if _, ok := validatedActorToken.Expiration(); !ok {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token missing required exp claim")
 	}
 	if iss, _ := validatedActorToken.Issuer(); iss != actorIdentity.WIMSEURI {
-		return nil, oauthBadRequest("invalid_grant", "actor_token iss does not match actor identity WIMSE URI")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token iss does not match actor identity WIMSE URI")
 	}
 
 	// Step 3: Resolve the actor's identity policy — the authority ceiling
@@ -512,7 +852,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	if len(scopes) == 0 {
-		return nil, oauthBadRequest("invalid_scope", "requested scopes are not available for delegation")
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not available for delegation")
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
@@ -549,6 +889,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// policy constraint set (delegation depth ceiling, required trust
 	// level, allowed grant types, max TTL) is enforced inside
 	// IssueCredential against actor.IdentityPolicyID.
+	//
+	// CredentialExpiresAt clamps the child's exp to the subject_token's:
+	// a delegated credential must never outlive its parent. Without this
+	// bound, an exchange near the end of the parent's lifetime mints a
+	// child that survives the parent's expiry — and once the parent row
+	// expires, the cascade-revocation walk can no longer reach the child
+	// (the traversal anchors on live ancestry).
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:              actorIdentity,
 		IdentityPolicyID:      actorPolicy.ID,
@@ -562,6 +909,8 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		DRMHash:               govReq.DRMHash,
 		ConstraintCatalogVer:  govReq.CatalogVersion,
 		ConstraintCatalogHash: govReq.CatalogHash,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		CredentialExpiresAt:   &subjectCred.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
@@ -633,20 +982,20 @@ func (s *OAuthService) resolveGovernance(ctx context.Context, accountID, project
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	// Step 1: Verify the caller is a trusted internal service.
 	if s.trustedServiceValidator == nil {
-		return nil, oauthBadRequest("invalid_grant", "external principal exchange is not configured")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "external principal exchange is not configured")
 	}
 	serviceName, err := s.trustedServiceValidator(ctx)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "caller is not a trusted service", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "caller is not a trusted service", err)
 	}
 
 	// Step 2: Validate required fields. The trusted service is responsible for
 	// authenticating the external principal and resolving tenant context.
 	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external principal exchange")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for external principal exchange")
 	}
 	if req.UserID == "" {
-		return nil, oauthBadRequest("invalid_request", "user_id is required for external principal exchange")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id is required for external principal exchange")
 	}
 
 	// Step 3: Resolve the identity for the token.
@@ -658,13 +1007,36 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	if req.ApplicationID != "" {
 		resolved, err := s.identitySvc.GetIdentity(ctx, req.ApplicationID, req.AccountID, req.ProjectID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid_request: application_id %s not found or access denied", req.ApplicationID)
+			// Distinguish "row not found / wrong tenant" (client error,
+			// 400 invalid_request) from transient infrastructure failures
+			// (server error, 500 — retriable by the client). The bun
+			// repository wraps sql.ErrNoRows for "no row matches id +
+			// account_id + project_id" — that covers both genuine-missing
+			// and IDOR-protected cross-tenant lookups. Anything else is
+			// an infra problem (DB unreachable, query timeout, etc.) the
+			// client can't act on; 500 with the cause preserved for logs
+			// lets the client retry instead of getting a misleading 400.
+			//
+			// Previously this branch used plain fmt.Errorf, which
+			// extractOAuthError didn't match as *OAuthError — every
+			// failure ended up as a 500 server_error regardless of cause.
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, oauthBadRequestCause(
+					oautherror.InvalidRequest,
+					fmt.Sprintf("application_id %s not found or access denied", req.ApplicationID),
+					err,
+				)
+			}
+			return nil, oauthServerError(
+				fmt.Sprintf("failed to look up application_id %s", req.ApplicationID),
+				err,
+			)
 		}
 		if !resolved.Status.IsUsable() {
-			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
 		}
 		if resolved.IsExpired() {
-			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 		}
 		identity = resolved
 	} else {
@@ -695,7 +1067,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		"trusted_by":     serviceName,
 	}
 	// Merge caller-provided additional claims (deployment-specific fields like gateway_id).
-	// Blocklist prevents overriding standard JWT/ZeroID claims.
+	// Blocklist prevents overriding standard JWT/ZeroID claims — including the
+	// reserved authorization claims `role` and `privilege_scope`, which can only
+	// be set via the dedicated request fields below, never through additional_claims.
 	for k, v := range req.AdditionalClaims {
 		if reservedClaims[k] {
 			continue
@@ -703,21 +1077,62 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		customClaims[k] = v
 	}
 
+	// Authorization claims. We are PAST the
+	// TrustedServiceValidator gate at the top of this function, so the caller
+	// is an authorised trusted service — only here may `role` / `privilege_scope`
+	// be minted. Set them from the dedicated request fields (not additional_claims,
+	// which is reserved-blocked) so an untrusted caller has no path to inject an
+	// authorization role. Empty values are omitted so legacy callers that don't
+	// supply them produce identical tokens to before (backward-compatible).
+	if req.Role != "" {
+		customClaims["role"] = req.Role
+	}
+	if len(req.PrivilegeScope) > 0 {
+		customClaims["privilege_scope"] = req.PrivilegeScope
+	}
+
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
+
+	// Audience profile (e.g. "codeoid"): the audience NAME maps to a fixed,
+	// server-defined scope set + `aud` claim (audienceScopeProfiles). This is
+	// the ONLY place these scopes come from — arbitrary caller-supplied scopes
+	// are never honoured for a profiled audience, so a profiled token cannot be
+	// widened past the hard-coded set. slices.Clone hands the token a private
+	// copy so the shared profile can never be mutated through an issued token.
+	//
+	// Empty audience is backward-compatible: issuance is unchanged (`scopes`
+	// from req.Scope, `aud` defaults to the issuer) — legacy callers that pass
+	// no audience get exactly the token they got before. A non-empty audience
+	// that names no known profile is rejected with `invalid_target` (RFC 8693
+	// §2.1/§2.2.2) rather than silently downgraded: a caller that asked for a
+	// scoped audience must not be handed an unscoped/misscoped token believing
+	// it got the profile it requested (scope-confusion / privilege-escalation).
+	var audience []string
+	if req.Audience != "" {
+		profile, ok := s.audienceScopeProfiles[req.Audience]
+		if !ok {
+			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
+		}
+		scopes = slices.Clone(profile)
+		audience = []string{req.Audience}
+	}
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		GrantType:        domain.GrantTypeTokenExchange,
-		Scopes:           scopes,
-		UseRS256:         true,
-		SubjectOverride:  req.UserID,
-		UserEmail:        req.UserEmail,
-		UserName:         req.UserName,
-		ApplicationID:    req.ApplicationID,
-		TTL:              900, // 15 minutes — short-lived for external principals
-		CustomClaims:     customClaims,
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeTokenExchange,
+		Scopes:            scopes,
+		Audience:          audience,
+		UseRS256:          true,
+		SubjectOverride:   req.UserID,
+		UserEmail:         req.UserEmail,
+		UserName:          req.UserName,
+		ApplicationID:     req.ApplicationID,
+		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
+		CustomClaims:      customClaims,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
@@ -727,22 +1142,134 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = req.UserID
 
+	// Step 6 (optional): mint a rotating refresh token so the external principal
+	// can keep its session alive on its own — self-rotating at /oauth2/token —
+	// rather than the broker re-minting on a timer. Gated to a PROFILED audience
+	// (audience != "" was validated above): the refresh grant re-stamps the same
+	// `aud`/scope profile on every rotation, which only exists for a profiled
+	// audience. The audience NAME is persisted as the refresh token's client_id
+	// binding (RFC 6749 §10.4) — the principal presents it as `client_id` on
+	// refresh; there is no confidential OAuth client, so possession of the
+	// rotating token plus family reuse-detection is the security boundary.
+	if req.IssueRefreshToken && len(audience) > 0 && s.refreshTokenSvc != nil {
+		refreshTTL := s.externalPrincipalRefreshTokenTTL
+		if refreshTTL <= 0 {
+			refreshTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
+			ClientID:          req.Audience, // audience name is the client_id binding
+			AccountID:         req.AccountID,
+			ProjectID:         req.ProjectID,
+			UserID:            req.UserID,
+			Scopes:            strings.Join(scopes, " "),
+			Audience:          req.Audience,
+			TTL:               refreshTTL,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		})
+		if rtErr != nil {
+			// Fail CLOSED: the caller explicitly asked for a refresh token (its
+			// session continuity depends on it). Surfacing the error is better
+			// than silently returning an access-token-only response the caller
+			// would treat as a working self-refreshing session.
+			return nil, oauthServerError("failed to issue refresh token for external principal", rtErr)
+		}
+		accessToken.RefreshToken = rtResult.RawToken
+	}
+
 	return accessToken, nil
 }
 
-// apiKeyGrant validates a zid_sk_* API key and issues an RS256 JWT.
-// Tenant is derived from the API key record — no caller-supplied headers needed.
-func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.APIKey == "" {
-		return nil, oauthBadRequest("invalid_request", "api_key is required for api_key grant")
-	}
+// APIKeyResolution is the public result of OAuthService.ResolveAPIKey —
+// a narrow, stable type that does not leak zeroid internals (Identity,
+// APIKey row, policy records). Consumers project this onto whatever
+// shape their layer needs (e.g. mapping to zeroid.Principal for the
+// /oauth2/authorize PrincipalResolver hook).
+//
+// The Scopes field is the api key's intrinsic scope set BEFORE policy
+// intersection — credential-policy and identity-policy narrowing happen
+// at issuance time and may produce a smaller effective set on the
+// minted token. Callers that just need "what tenant + user does this
+// key belong to" should ignore Scopes; callers that need to mirror
+// zeroid's pre-token-mint authority surface should treat this as the
+// starting point.
+type APIKeyResolution struct {
+	AccountID string
+	ProjectID string
+	// UserID is the human who created the API key (sk.CreatedBy) — i.e.
+	// the developer whose CLI is being used right now. Empty for keys
+	// minted programmatically without a creator.
+	UserID string
+	// Scopes is the api key's intrinsic scope set. Always non-nil
+	// (possibly len 0). Empty means "no per-key restriction";
+	// downstream policy may still narrow. Non-nil contract is to
+	// keep consumer code (range/len) safe without nil-checking and
+	// to JSON-marshal as `[]` rather than `null`.
+	Scopes []string
+	// KeyID is the API key's row UUID. Useful for audit/log
+	// attribution — never returned to end users.
+	KeyID string
+}
 
-	if !s.jwksSvc.HasRSAKeys() {
-		return nil, oauthServerError("api_key grant requires RSA keys to be configured", nil)
+// apiKeyContext is the rich internal result of resolveAPIKeyContext —
+// everything apiKeyGrant needs to continue past resolution into policy
+// + scope intersection + token mint. Not exported because Identity is
+// an internal-shaped type and consumers should use the public
+// APIKeyResolution projection instead.
+type apiKeyContext struct {
+	// Resolution is the narrow public projection — what ResolveAPIKey
+	// returns to deployers.
+	Resolution *APIKeyResolution
+	// APIKey is the resolved row, in case the caller needs metadata
+	// (expires_at, credential_policy_id) beyond the projection.
+	APIKey *domain.APIKey
+	// Identity is the linked identity record OR a synthetic minimal
+	// identity built from the api key's tenant scalars when the key
+	// has no linked identity. Never nil after a successful resolution.
+	Identity *domain.Identity
+}
+
+// ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
+// tenant context + user binding. This is the public surface used by
+// deployer-supplied PrincipalResolvers for the /oauth2/authorize
+// endpoint, and any other consumer that needs to authenticate an api
+// key out-of-band from the token endpoint.
+//
+// Returns:
+//   - (*APIKeyResolution, nil) on a valid, active, non-expired key.
+//   - (nil, *OAuthError) with code invalid_grant and HTTP 400 when the
+//     key is unknown, deactivated, or linked to a suspended/expired
+//     identity. Error is shaped for direct return from the
+//     /oauth2/authorize handler.
+//
+// Identity-state checks (IsUsable / IsExpired) match what apiKeyGrant
+// already enforces at token-mint time — a key whose identity is
+// suspended must not even authenticate at /authorize, let alone mint
+// a token. Same gate, same error shape.
+func (s *OAuthService) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResolution, error) {
+	rc, err := s.resolveAPIKeyContext(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	return rc.Resolution, nil
+}
+
+// resolveAPIKeyContext is the shared resolution core used by both
+// apiKeyGrant (which needs the rich Identity for policy intersection)
+// and ResolveAPIKey (which projects to the narrow public type). Kept
+// unexported because *domain.Identity is not part of zeroid's public
+// surface.
+//
+// The function never returns a nil Identity on success — it builds a
+// synthetic identity from the key's tenant scalars when the key has no
+// linked identity row, matching the established api_key behaviour. This
+// lets downstream callers always assume Identity is populated.
+func (s *OAuthService) resolveAPIKeyContext(ctx context.Context, apiKey string) (*apiKeyContext, error) {
+	if apiKey == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "api_key is required")
 	}
 
 	// Hash the API key with SHA-256 to look up in the database.
-	hash := sha256.Sum256([]byte(req.APIKey))
+	hash := sha256.Sum256([]byte(apiKey))
 	keyHash := hex.EncodeToString(hash[:])
 
 	sk, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
@@ -750,7 +1277,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// GetByKeyHash already filters on state=active and rejects keys past
 		// their expires_at — both surface as a not-found from the caller's
 		// perspective. No service-layer expiry check needed.
-		return nil, oauthBadRequestCause("invalid_grant", "invalid api key", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid api key", err)
 	}
 
 	// Build a synthetic identity for the API key holder.
@@ -763,9 +1290,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			log.Warn().Str("identity_id", sk.IdentityID).Str("key_id", sk.ID).Msg("API key linked to unknown identity_id, issuing without identity")
 			identity = nil
 		} else if !identity.Status.IsUsable() {
-			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
 		} else if identity.IsExpired() {
-			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 		}
 	}
 
@@ -778,6 +1305,42 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 			Status:    domain.IdentityStatusActive,
 		}
 	}
+
+	return &apiKeyContext{
+		Resolution: &APIKeyResolution{
+			AccountID: sk.AccountID,
+			ProjectID: sk.ProjectID,
+			UserID:    sk.CreatedBy,
+			// Always non-nil (possibly len 0) so consumers can range /
+			// len safely without nil-checking. JSON-marshals to `[]`
+			// instead of `null` — better API hygiene for downstream
+			// serializers. Defensive copy so caller mutation can't
+			// leak back into the api_key row's slice.
+			Scopes: append(make([]string, 0, len(sk.Scopes)), sk.Scopes...),
+			KeyID:  sk.ID,
+		},
+		APIKey:   sk,
+		Identity: identity,
+	}, nil
+}
+
+// apiKeyGrant validates a zid_sk_* API key and issues an RS256 JWT.
+// Tenant is derived from the API key record — no caller-supplied headers needed.
+func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	if req.APIKey == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "api_key is required for api_key grant")
+	}
+
+	if !s.jwksSvc.HasRSAKeys() {
+		return nil, oauthServerError("api_key grant requires RSA keys to be configured", nil)
+	}
+
+	rc, err := s.resolveAPIKeyContext(ctx, req.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	sk := rc.APIKey
+	identity := rc.Identity
 
 	// Resolve the identity policy (authority ceiling) whenever the key is
 	// linked to a real identity. api_key tokens then pass through both
@@ -837,6 +1400,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
+		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -858,6 +1422,250 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	return accessToken, nil
 }
 
+// IssueAuthCodeRequest is the input shape for OAuthService.IssueAuthCode —
+// the upstream half of the authorization_code grant. Callers (the /oauth2/
+// authorize handler in this repo, plus deployer code that wants to issue
+// codes programmatically) populate every field; zeroid enforces every
+// invariant the authorizationCode decoder later validates.
+//
+// All fields are required except OrgID and Scopes (both optional).
+type IssueAuthCodeRequest struct {
+	// ClientID identifies the OAuth client requesting the code. Must
+	// be registered, active, and have "authorization_code" in its
+	// GrantTypes — IssueAuthCode rejects clients that don't.
+	ClientID string
+
+	// RedirectURI is the callback URI the issued code's holder will
+	// receive at after token exchange. IssueAuthCode validates that it
+	// matches one of the client's pre-registered RedirectURIs
+	// (normalizeLoopback applied per RFC 8252). Mismatched URIs are
+	// rejected with invalid_request so an attacker cannot redirect the
+	// code to their own callback.
+	RedirectURI string
+
+	// CodeChallenge is the PKCE S256 challenge (RFC 7636 §4.2). Will
+	// be encoded into the auth code as the "cc" claim and verified at
+	// /oauth2/token against the caller-supplied code_verifier.
+	CodeChallenge string
+
+	// CodeChallengeMethod is the PKCE method. ONLY "S256" is accepted —
+	// "plain" (RFC 7636 §4.2) confers no protection and OAuth 2.1
+	// removes it entirely. Misconfigured CLI clients cannot downgrade
+	// themselves silently; "plain" returns invalid_request.
+	CodeChallengeMethod string
+
+	// AccountID and ProjectID are the tenant scalars baked into the
+	// auth code's "aid"/"pid" claims. AccountID is required; ProjectID
+	// is optional but strongly recommended (zeroid won't reject an
+	// empty pid, but downstream tenant-isolation gates may).
+	AccountID string
+	ProjectID string
+
+	// UserID is the human (or workload) the issued token will be bound
+	// to. Baked into the "uid" claim. May be empty for tenant-only
+	// tokens.
+	UserID string
+
+	// OrgID is an optional org-level scope above AccountID. Baked into
+	// the "oid" claim only when non-empty; omitted otherwise.
+	OrgID string
+
+	// Scopes is the pre-narrowed scope set this code authorizes the
+	// token exchange to mint. IssueAuthCode intersects this with the
+	// OAuth client's registered Scopes — a code can never authorize a
+	// scope the client itself isn't allowed. Empty means "no
+	// resolver-side narrowing"; the client's full registered scope
+	// surface is encoded.
+	Scopes []string
+}
+
+// IssueAuthCode is the upstream half of the OAuth 2.0 + PKCE
+// authorization_code grant — the symmetric counterpart to the
+// authorizationCode method below (which consumes codes at /oauth2/token).
+// It validates the OAuth context, intersects the requested scopes against
+// the client's registered allow-list, and mints a stateless HS256 JWT in
+// the AuthCodeClaims shape that decodeAuthCodeJWT reads. No row is
+// inserted at issuance — the authCodeRepo is touched only at consumption
+// time (ON CONFLICT (jti) DO NOTHING), so issuance is a pure signing
+// operation with no DB write and no race.
+//
+// Validation gates (in order):
+//
+//  1. Required fields: client_id, redirect_uri, code_challenge,
+//     code_challenge_method, account_id.
+//  2. code_challenge_method must be "S256" (plain rejected, OAuth 2.1).
+//  3. Client must exist + be active (GetPublicClient).
+//  4. Client must have "authorization_code" in its registered grant
+//     types.
+//  5. Redirect URI must match one of the client's registered URIs
+//     (loopback-normalized).
+//  6. HMAC secret must be configured on the service (deployer wired
+//     cfg.Token.HMACSecret).
+//
+// Returns a signed JWT on success, or an *OAuthError shaped for direct
+// surfacing from the /oauth2/authorize handler.
+func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
+	// Required-field gate.
+	if req.ClientID == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "client_id is required")
+	}
+	if req.RedirectURI == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "redirect_uri is required")
+	}
+	if req.CodeChallenge == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "code_challenge is required")
+	}
+	if req.CodeChallengeMethod == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "code_challenge_method is required")
+	}
+	if req.AccountID == "" {
+		return "", oauthBadRequest(oautherror.InvalidRequest, "account_id is required")
+	}
+
+	// S256-only. plain is deprecated (RFC 7636 §4.2) and removed in
+	// OAuth 2.1 — reject explicitly so misconfigured CLI clients
+	// cannot downgrade themselves silently.
+	if req.CodeChallengeMethod != "S256" {
+		return "", oauthBadRequest(oautherror.InvalidRequest,
+			"code_challenge_method must be S256 (plain is not supported)")
+	}
+
+	if s.hmacSecret == "" {
+		return "", oauthServerError("authorization_code issuance requires HMAC secret to be configured", nil)
+	}
+
+	// Client lookup. GetPublicClient verifies the client exists and is
+	// active; no secret is required because PKCE provides the proof of
+	// possession at exchange time.
+	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
+	if err != nil {
+		return "", oauthUnauthorized("unknown or inactive client_id", err)
+	}
+
+	// Grant-type allow-list. Same check that authorizationCode runs at
+	// exchange — applied here too so a client without the grant cannot
+	// even obtain a code, not just fail at exchange.
+	if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
+		return "", oauthBadRequest(oautherror.UnauthorizedClient,
+			"client is not authorized for authorization_code grant")
+	}
+
+	// Redirect-URI allow-list. The redirect_uri the caller supplies
+	// must be one the client pre-registered, otherwise an attacker
+	// who steals a code could redirect it to their own callback.
+	// normalizeLoopback handles the 127.0.0.1 ↔ localhost equivalence
+	// (RFC 8252 §7.3) so native-app CLI clients aren't tripped up by
+	// the form their loopback URI takes.
+	if !redirectURIAllowed(req.RedirectURI, oauthClient.RedirectURIs) {
+		return "", oauthBadRequest(oautherror.InvalidRequest,
+			"redirect_uri is not in the client's registered list")
+	}
+
+	// Scope intersection: the issued code can never authorize a scope
+	// the client itself isn't allowed. Empty req.Scopes means
+	// "no resolver-side narrowing" — pass through the client's full
+	// registered surface.
+	scopes := req.Scopes
+	if len(scopes) == 0 {
+		scopes = oauthClient.Scopes
+	} else {
+		scopes = intersectScopes(scopes, oauthClient.Scopes)
+	}
+
+	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
+	// as the issuance instant — mintAuthCodeJWT derives jti + exp from
+	// it. Centralising the timestamp here (rather than inside the pure
+	// mint helper) keeps the mint helper deterministic and testable
+	// with an injectable time.
+	now := time.Now()
+	claims := &AuthCodeClaims{
+		ExpiresAt:     now.Add(AuthCodeTTL),
+		ClientID:      req.ClientID,
+		CodeChallenge: req.CodeChallenge,
+		RedirectURI:   req.RedirectURI,
+		Scopes:        scopes,
+		UserID:        req.UserID,
+		OrgID:         req.OrgID,
+		AccountID:     req.AccountID,
+		ProjectID:     req.ProjectID,
+	}
+
+	signed, err := mintAuthCodeJWT(claims, s.hmacSecret, s.authCodeIssuer, now)
+	if err != nil {
+		// Reach here only when mintAuthCodeJWT's defensive checks
+		// trip — should not happen given the gates above. Surface as
+		// 500 (server-side misconfiguration) rather than 400.
+		return "", oauthServerError("failed to mint authorization code", err)
+	}
+
+	return signed, nil
+}
+
+// redirectURIAllowed reports whether candidate matches one of the client's
+// registered redirect URIs. Used by IssueAuthCode at /oauth2/authorize time.
+//
+// Non-loopback URIs must match exactly (after normalizeLoopback's 127.0.0.1 ↔
+// localhost equivalence). LOOPBACK URIs are matched with the PORT IGNORED:
+// RFC 8252 §7.3 requires the authorization server to "allow any port to be
+// specified at the time of the request for loopback IP redirect URIs", because
+// a native / CLI app binds an ephemeral, OS-assigned port for its callback
+// listener and cannot reserve a fixed one in advance. So for a loopback
+// candidate we accept it when some registered loopback URI shares the same
+// scheme, host (treating 127.0.0.1, localhost and ::1 as equivalent), path and
+// query — only the port floats; userinfo and fragments are rejected.
+//
+// This is safe: the loopback interface is reachable only from the same host, so
+// no remote attacker can stand up a listener to intercept the redirect, and
+// PKCE binds the code to the verifier regardless. Without it, the embedded
+// Overwatch/ramparts Guardian (which listens on an ephemeral loopback port)
+// is rejected here even though its redirect is a legitimate loopback callback.
+func redirectURIAllowed(candidate string, registered []string) bool {
+	normCand := normalizeLoopback(candidate)
+
+	cu, cerr := url.Parse(candidate)
+	candLoopback := cerr == nil && isLoopbackHost(cu.Hostname())
+
+	for _, r := range registered {
+		if normalizeLoopback(r) == normCand {
+			return true
+		}
+
+		if !candLoopback {
+			continue
+		}
+
+		ru, rerr := url.Parse(r)
+		if rerr != nil || !isLoopbackHost(ru.Hostname()) {
+			continue
+		}
+
+		// Loopback: match everything but the port. Reject userinfo /
+		// fragments — registered redirect URIs carry neither, and the old
+		// Studio-side regex anchored them out too.
+		if cu.User == nil && cu.Fragment == "" &&
+			cu.Scheme == ru.Scheme && cu.Path == ru.Path && cu.RawQuery == ru.RawQuery {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isLoopbackHost reports whether host is one of the canonical loopback forms a
+// native/CLI redirect URI uses, for RFC 8252 §7.3 port-agnostic matching. We
+// treat 127.0.0.1, localhost and ::1 as equivalent (the seed config registers
+// the 127.0.0.1 and localhost variants). Anything else — including a
+// look-alike like "127.0.0.1.evil.com" — is not loopback and falls through to
+// exact matching.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1":
+		return true
+	default:
+		return false
+	}
+}
+
 // authorizationCode handles the PKCE authorization code grant (RFC 6749 section 4.1).
 // Auth codes are HS256 JWTs containing all tenant context.
 // Token behaviour is derived from the client's registered grant_types:
@@ -869,7 +1677,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // all tokens issued from the original exchange are revoked.
 func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.Code == "" || req.CodeVerifier == "" || req.ClientID == "" || req.RedirectURI == "" {
-		return nil, oauthBadRequest("invalid_request", "code, code_verifier, client_id, and redirect_uri are required")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "code, code_verifier, client_id, and redirect_uri are required")
 	}
 
 	if s.hmacSecret == "" {
@@ -880,33 +1688,46 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// inside the signed JWT, not in caller-supplied headers.
 	authCode, err := decodeAuthCodeJWT(req.Code, s.hmacSecret, s.authCodeIssuer)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "invalid authorization code", err)
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid authorization code", err)
 	}
 
 	if authCode.ClientID != req.ClientID {
-		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
 	}
 
 	// Look up the client in the registry — this is the authoritative check.
-	// GetPublicClient verifies the client is active and registered; no secret
-	// is required because PKCE provides the proof of possession.
-	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
+	// Resolve ANY client (public or confidential): an authorization_code client
+	// may be either. GetPublicClient filters to client_type='public', so a
+	// confidential code client would otherwise fail to resolve. Re-establish
+	// the active-client gate that GetPublicClient enforced.
+	oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
 	if err != nil {
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	}
+	if !oauthClient.IsActive {
+		return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+	}
+
+	// RFC 6749 §2.3/§10.4: a confidential client MUST authenticate with its
+	// client_secret even on the PKCE authorization_code path — PKCE proves
+	// possession of the code, the secret proves the client's identity (defense
+	// in depth). Public PKCE clients carry no secret and pass through unchanged.
+	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+		return nil, err
 	}
 
 	// Verify the client is authorised to use the authorization_code grant.
 	grantAllowed := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode))
 	if !grantAllowed {
-		return nil, oauthBadRequest("unauthorized_client", "client is not authorized for authorization_code grant")
+		return nil, oauthBadRequest(oautherror.UnauthorizedClient, "client is not authorized for authorization_code grant")
 	}
 
 	if normalizeLoopback(authCode.RedirectURI) != normalizeLoopback(req.RedirectURI) {
-		return nil, oauthBadRequest("invalid_grant", "redirect_uri mismatch")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "redirect_uri mismatch")
 	}
 
 	if !verifyCodeChallenge(req.CodeVerifier, authCode.CodeChallenge) {
-		return nil, oauthBadRequest("invalid_grant", "PKCE verification failed")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "PKCE verification failed")
 	}
 
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
@@ -932,7 +1753,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 	if !consumed {
 		s.revokeAuthCodeTokens(ctx, authCode.JTI)
-		return nil, oauthBadRequest("invalid_grant", "authorization code has already been used")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "authorization code has already been used")
 	}
 
 	// Determine access token TTL.
@@ -967,13 +1788,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	if oauthClient.IdentityID != nil && *oauthClient.IdentityID != "" {
 		linked, err := s.identitySvc.repo.GetByID(ctx, *oauthClient.IdentityID, authCode.AccountID, authCode.ProjectID)
 		if err != nil {
-			return nil, oauthBadRequestCause("invalid_grant", "oauth client linked to unknown identity", err)
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "oauth client linked to unknown identity", err)
 		}
 		if !linked.Status.IsUsable() {
-			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
 		}
 		if linked.IsExpired() {
-			return nil, oauthBadRequest("invalid_grant", "identity_expired")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 		}
 		identity = linked
 		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
@@ -1001,7 +1822,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		}
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:              identity,
 		IdentityPolicyID:      identityPolicyID,
 		GrantType:             domain.GrantTypeAuthorizationCode,
@@ -1014,6 +1835,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		DRMHash:               govBind.DRMHash,
 		ConstraintCatalogVer:  govBind.CatalogVersion,
 		ConstraintCatalogHash: govBind.CatalogHash,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -1028,13 +1850,18 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if hasRefreshGrant && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
-			ClientID:   req.ClientID,
-			AccountID:  authCode.AccountID,
-			ProjectID:  authCode.ProjectID,
-			UserID:     authCode.UserID,
-			IdentityID: oauthClient.IdentityID,
-			Scopes:     strings.Join(authCode.Scopes, " "),
-			TTL:        oauthClient.RefreshTokenTTL,
+			ClientID:          req.ClientID,
+			AccountID:         authCode.AccountID,
+			ProjectID:         authCode.ProjectID,
+			UserID:            authCode.UserID,
+			IdentityID:        oauthClient.IdentityID,
+			Scopes:            strings.Join(authCode.Scopes, " "),
+			TTL:               oauthClient.RefreshTokenTTL,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			// Seed the family with the access token's mission so every later
+			// rotation (and the access token each one mints) stays inside the
+			// same delegation tree (issue #81).
+			MissionID: cred.MissionID,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -1077,7 +1904,7 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 	}
 
 	if record.RefreshFamilyID != nil && *record.RefreshFamilyID != "" && s.refreshTokenSvc != nil {
-		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID)
+		count, revokeErr := s.refreshTokenSvc.RevokeFamily(ctx, *record.RefreshFamilyID, "auth_code_replay")
 		if revokeErr != nil {
 			log.Error().Err(revokeErr).Str("family_id", *record.RefreshFamilyID).Msg("Auth code replay: failed to revoke refresh token family")
 		} else if count > 0 {
@@ -1090,64 +1917,202 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 // Implements single-use rotation with family-based reuse detection.
 func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if req.RefreshTokenStr == "" || req.ClientID == "" {
-		return nil, oauthBadRequest("invalid_request", "refresh_token and client_id are required")
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "refresh_token and client_id are required")
 	}
 
 	if s.refreshTokenSvc == nil {
 		return nil, oauthServerError("refresh tokens not configured", nil)
 	}
 
-	// Look up client to get per-client TTL settings.
+	// Audience-profile refresh tokens (issued by the external-principal exchange
+	// for a profiled audience like "codeoid") have NO registered OAuth client —
+	// the audience name is their client_id binding, and possession of the
+	// rotating token plus family reuse-detection is the security boundary. Detect
+	// them with a NON-CONSUMING peek that reads REGARDLESS OF STATE (including
+	// revoked): a replayed / already-rotated audience token MUST still route down
+	// the audience path so RotateRefreshToken's claim step fires the correct
+	// reuse detection. An active-only peek would miss the revoked row, fall
+	// through to the OAuth-client path, and 401 on the (non-existent) "codeoid"
+	// client BEFORE reuse detection ran. Reading the Audience/ClientID binding
+	// off a revoked row is safe: it is metadata for ROUTING only — the rotation
+	// claim below remains the authorization gate. A genuinely unknown token
+	// matches nothing here and falls through to the OAuth-client path.
+	var audienceRefreshToken *domain.RefreshToken
+	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, req.RefreshTokenStr); peekErr == nil && peeked.Audience != "" {
+		audienceRefreshToken = peeked
+	}
+
 	var accessTTL, refreshTokenTTL int
-	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
+	if audienceRefreshToken != nil {
+		// Client-less audience-profile token. The refreshed access token is
+		// re-issued short-lived (same 15-minute TTL as the original external
+		// principal exchange); the refresh token keeps its configured lifetime.
+		// client_id binding (RFC 6749 §10.4) is the audience name; verified on
+		// the peek here so a mismatch does not consume the token.
+		if audienceRefreshToken.ClientID != req.ClientID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+		accessTTL = externalPrincipalAccessTokenTTL
+		refreshTokenTTL = s.externalPrincipalRefreshTokenTTL
+		if refreshTokenTTL <= 0 {
+			refreshTokenTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+	} else if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
+		// Look up client to get per-client TTL settings AND to enforce client
+		// authentication. A confidential client MUST present its client_secret on
+		// the refresh_token grant (RFC 6749 §6/§10.4); a public client proves
+		// possession with the refresh-token string alone and carries no secret.
+		//
+		// GetClientByClientID does not filter is_active (unlike GetPublicClient /
+		// VerifyClientSecret), and verifyConfidentialClientAuth is a no-op for
+		// public clients — so without this guard a deactivated PUBLIC client
+		// could keep rotating refresh tokens indefinitely. Same gate as the
+		// authorization_code path.
+		if !oauthClient.IsActive {
+			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+		}
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
+		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+			return nil, err
+		}
 	} else {
-		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("failed to get oauth client for TTL override, using defaults")
+		// The named client_id (required by the entry guard above) can't be
+		// resolved. Fail closed: proceeding here would skip
+		// verifyConfidentialClientAuth entirely, letting a confidential client
+		// refresh with no secret after its registration is gone. A genuine
+		// "unknown client" is invalid_client (401, matching the
+		// authorization_code path); an operational lookup error is a server
+		// fault, not the client's.
+		if errors.Is(err, ErrOAuthClientNotFound) {
+			return nil, oauthUnauthorized("client_id does not resolve to a registered client", nil)
+		}
+		return nil, oauthServerError("failed to resolve client for refresh grant", err)
 	}
 
 	if accessTTL <= 0 {
 		accessTTL = defaultAccessTokenTTLWithRefresh
 	}
 
-	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL)
+	// Pre-rotation validation (HIGH — session-bricking fix). The gates that can
+	// reject a request for an OTHERWISE-VALID token (client_id binding, identity
+	// status/expiry, policy resolution) now run AGAINST A NON-CONSUMING PEEK of
+	// the token, BEFORE RotateRefreshToken commits the claim. If a gate fails
+	// the token stays active, so the client can retry once the transient
+	// condition clears — a wrong client_id, a temporarily suspended identity, or
+	// a DB blip during policy resolution no longer revokes the family
+	// permanently (RFC 6749 §10.4). Previously these ran AFTER rotation: the
+	// successor was discarded on error, the client retried with the now-revoked
+	// old token, and reuse detection nuked the whole session.
+	//
+	// A failed peek means the token is NOT active (expired, revoked, or
+	// unknown). We deliberately DO NOT reject here — instead we fall through to
+	// RotateRefreshToken, whose claim path distinguishes the reuse grace window
+	// from a genuine RFC 6749 §10.4 replay (and revokes the family on the
+	// latter). Short-circuiting on the peek would silence reuse detection.
+	var (
+		identity         *domain.Identity
+		identityPolicyID string
+	)
+	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshToken(ctx, req.RefreshTokenStr); peekErr == nil {
+		// client_id binding check (RFC 6749 §10.4) — done on the peek so a
+		// mismatch does not consume the token.
+		if peeked.ClientID != req.ClientID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+
+		// Identity gate. The link came from the OAuth client at
+		// authorization_code time and was persisted on the refresh_token row.
+		// When present, the linked identity's status + expires_at gate
+		// refresh-grant issuance the same way they gate every other grant.
+		// Resolved here (before rotation) so a suspended/expired identity
+		// rejects the request without burning the token.
+		if peeked.IdentityID != nil && *peeked.IdentityID != "" {
+			linked, err := s.identitySvc.repo.GetByID(ctx, *peeked.IdentityID, peeked.AccountID, peeked.ProjectID)
+			if err != nil {
+				return nil, oauthBadRequestCause(oautherror.InvalidGrant, "refresh token references unknown identity", err)
+			}
+			if !linked.Status.IsUsable() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+			}
+			if linked.IsExpired() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+			}
+			identity = linked
+			policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+			if err != nil {
+				return nil, oauthServerError("failed to resolve identity credential policy", err)
+			}
+			identityPolicyID = policy.ID
+		}
+	}
+
+	// Pre-rotation gates passed (or the token was already inactive — in which
+	// case rotation's claim path returns the right error / fires reuse
+	// detection). NOW consume the token and mint the successor. The remaining
+	// failure surface (IssueCredential) is the only post-claim step; if it fails
+	// the successor was already inserted in the rotation transaction, so the
+	// client's retry trips the grace window rather than reuse detection.
+	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL, req.DPoPKeyThumbprint)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "invalid or expired refresh token", err)
+		// A DPoP binding mismatch is a proof failure, not an invalid refresh
+		// token. The token row is untouched (the rotation transaction rolled
+		// back) so the legitimate caller's next request still works. RFC 9449
+		// §5 carriage: the AS rejects the request without revoking the token.
+		if errors.Is(err, ErrDPoPBindingMismatch) {
+			return nil, oauthBadRequest(oautherror.InvalidDPoPProof, "refresh token is DPoP-bound; the presented proof does not match the original key")
+		}
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid or expired refresh token", err)
 	}
 
-	if oldToken.ClientID != req.ClientID {
-		return nil, oauthBadRequest("invalid_grant", "client_id mismatch")
+	// The peek-time identity resolution is the authoritative one. If the peek
+	// missed (rare: a benign race where the row activated between peek and
+	// claim) re-run the identity gate against the freshly claimed row so the
+	// gate is never skipped — the post-claim failure window here is acceptable
+	// because it only triggers on that race, and a gate failure now lands the
+	// caller in the grace window (successor already minted) rather than a
+	// permanent family revocation. A human session (no IdentityID) falls
+	// through to a synthetic carrier with no policy to resolve.
+	if identity == nil {
+		identity = &domain.Identity{
+			AccountID: oldToken.AccountID,
+			ProjectID: oldToken.ProjectID,
+			Status:    domain.IdentityStatusActive,
+		}
+		if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
+			linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
+			if err != nil {
+				return nil, oauthBadRequestCause(oautherror.InvalidGrant, "refresh token references unknown identity", err)
+			}
+			if !linked.Status.IsUsable() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+			}
+			if linked.IsExpired() {
+				return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+			}
+			identity = linked
+			policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
+			if err != nil {
+				return nil, oauthServerError("failed to resolve identity credential policy", err)
+			}
+			identityPolicyID = policy.ID
+		}
 	}
 
-	// Identity gate. The link came from the OAuth client at authorization_code
-	// time and was persisted on the refresh_token row. When present, the
-	// linked identity's status + expires_at gate refresh-grant issuance the
-	// same way they gate every other grant. When absent, this is a human
-	// session with no identity row to check and we fall through to the
-	// synthetic carrier.
-	identity := &domain.Identity{
-		AccountID: oldToken.AccountID,
-		ProjectID: oldToken.ProjectID,
-		Status:    domain.IdentityStatusActive,
-	}
-	var identityPolicyID string
-	if oldToken.IdentityID != nil && *oldToken.IdentityID != "" {
-		linked, err := s.identitySvc.repo.GetByID(ctx, *oldToken.IdentityID, oldToken.AccountID, oldToken.ProjectID)
-		if err != nil {
-			return nil, oauthBadRequestCause("invalid_grant", "refresh token references unknown identity", err)
-		}
-		if !linked.Status.IsUsable() {
-			return nil, oauthBadRequest("invalid_grant", "identity is suspended or deactivated")
-		}
-		if linked.IsExpired() {
-			return nil, oauthBadRequest("invalid_grant", "identity_expired")
-		}
-		identity = linked
-		policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, linked)
-		if err != nil {
-			return nil, oauthServerError("failed to resolve identity credential policy", err)
-		}
-		identityPolicyID = policy.ID
+	// Re-stamp the audience profile on rotation. An audience-profile refresh
+	// token (external-principal exchange, e.g. codeoid) MUST re-issue with the
+	// SAME `aud` claim so the harness daemon — which validates `aud` on every
+	// message — accepts the refreshed token. The audience name is bound to the
+	// family (copied across every rotation); empty for a normal refresh token,
+	// leaving issuance unchanged. ApplicationID is cleared for audience tokens:
+	// they carry a synthetic principal (no application row), mirroring the
+	// original external-principal exchange rather than stamping the audience
+	// name (the client_id binding) as a bogus application claim.
+	var refreshAudience []string
+	applicationID := oldToken.ClientID
+	if oldToken.Audience != "" {
+		refreshAudience = []string{oldToken.Audience}
+		applicationID = ""
 	}
 
 	// Inherit scopes from the original refresh token. Without this the
@@ -1155,14 +2120,22 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// scopes), breaking the contract that refresh preserves the original
 	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		GrantType:        domain.GrantTypeRefreshToken,
-		UseRS256:         true,
-		SubjectOverride:  oldToken.UserID,
-		ApplicationID:    oldToken.ClientID,
-		TTL:              accessTTL,
-		Scopes:           parseScopeString(oldToken.Scopes),
+		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
+		GrantType:         domain.GrantTypeRefreshToken,
+		UseRS256:          true,
+		SubjectOverride:   oldToken.UserID,
+		ApplicationID:     applicationID,
+		Audience:          refreshAudience,
+		TTL:               accessTTL,
+		Scopes:            parseScopeString(oldToken.Scopes),
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// Inherit the mission from the refresh family rather than re-rooting
+		// it (issue #81). A refresh is continuity of an existing grant, not a
+		// new delegation tree. Empty when the family predates this column —
+		// IssueCredential then falls back to defaulting mission_id to the new
+		// credential's own JTI (the pre-fix behavior).
+		MissionID: oldToken.MissionID,
 	})
 	if err != nil {
 		return nil, err
@@ -1242,8 +2215,12 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	}
 
 	// Custom claims via the v4 generic accessor. jwt.Get[any] survives both
-	// string and structured shapes (e.g. act is a nested object).
-	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act"} {
+	// string and structured shapes (e.g. act and cnf are nested objects).
+	// cnf is surfaced so resource servers see the RFC 9449 jkt binding and
+	// can validate the caller's DPoP proof against the expected thumbprint.
+	// authorization_details is surfaced per RFC 9396 §7 so resource servers
+	// can read the typed RAR grant via introspection without parsing the JWT.
+	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details"} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v
 		}
@@ -1318,6 +2295,106 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 		return "", "", fmt.Errorf("malformed WIMSE URI: expected spiffe://%s/{account}/{project}/{identity_type}/{id}", s.wimseDomain)
 	}
 	return parts[0], parts[1], nil
+}
+
+// verifyConfidentialClientAuth enforces RFC 6749 §2.3 / §10.4 client
+// authentication for an already-resolved OAuth client. When the client is
+// CONFIDENTIAL it MUST present and prove its client_secret before any grant
+// proceeds; a missing or wrong secret is rejected with invalid_client (HTTP
+// 401). PUBLIC clients carry no secret and pass through unchanged — they prove
+// possession by other means (PKCE on authorization_code, the refresh-token
+// string itself on refresh_token).
+//
+// VerifyClientSecret re-fetches the client by client_id and bcrypt-compares the
+// secret; the caller passes the already-resolved client purely to read its
+// ClientType. The re-fetch is intentional — VerifyClientSecret owns the
+// constant-time comparison and the active-client gate.
+func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
+	if client == nil {
+		return nil
+	}
+	// A client is confidential if it declares so OR carries a stored secret
+	// hash. The second clause is belt-and-suspenders against an inconsistent
+	// row (secret set but client_type != "confidential"), which would
+	// otherwise skip secret verification and allow an unintended bypass. Same
+	// test the CIBA bc-authorize/redeem paths use.
+	if client.ClientType != "confidential" && client.ClientSecret == "" {
+		return nil
+	}
+	if clientSecret == "" {
+		return oauthUnauthorized("client_secret is required for confidential clients", nil)
+	}
+	if _, err := s.oauthClientSvc.VerifyClientSecret(ctx, clientID, clientSecret); err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return oauthUnauthorized("invalid client credentials", err)
+		}
+		// An unexpected (operational) error is a server fault, not a client
+		// authentication failure — don't mislead the client with a 401.
+		return oauthServerError("client verification failed", err)
+	}
+	return nil
+}
+
+// VerifyPresentedClientAuth implements the "accept-and-verify" client-auth
+// posture for the introspection (RFC 7662) and revocation (RFC 7009)
+// endpoints, which sit on the unauthenticated public group in this standalone
+// server. When a caller presents client credentials (client_id +
+// client_secret) they are VERIFIED and a bad secret is rejected with
+// invalid_client (HTTP 401). When NO client credentials are presented the call
+// is left to the existing internal/network-isolated path (tenant-header access,
+// service-to-service) — ZeroID does not hard-reject unauthenticated callers
+// here because that would break the standalone deployment model and the
+// established tenant-header access pattern.
+//
+// Returns nil when no credentials were presented, when a registered PUBLIC
+// client presents just its client_id, or when a confidential client's
+// client_id + client_secret verify. Returns an *OAuthError (invalid_client /
+// 401) when a presented secret does not verify, when only a client_secret is
+// supplied without a client_id, or when a client_id without a secret does not
+// resolve to a public client. Operational failures surface as 500.
+func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
+	// Anonymous call — neither half presented.
+	if clientID == "" && clientSecret == "" {
+		// Strict mode (RFC 7662 §2.1 / RFC 7009 §2.1): the endpoint MUST
+		// require some form of authorization — reject the anonymous caller.
+		// Enabled by default in production (config gate). When disabled, the
+		// existing internal/network-isolated path is preserved (anonymous
+		// allowed); ZeroID clients are global (not tenant-scoped), so a
+		// tenant cross-check against the caller is not expressible via client
+		// auth alone — gating access is the surface this closes.
+		if s.requireTokenInspectionAuth.Load() {
+			return oauthUnauthorized("client authentication is required for this endpoint", nil)
+		}
+		return nil
+	}
+	// A client_secret with no client_id is a malformed attempt — there is no
+	// client to authenticate. Reject rather than treat it as anonymous.
+	if clientID == "" {
+		return oauthUnauthorized("client_id is required when a client_secret is supplied", nil)
+	}
+	// client_id with no secret: valid only for a registered public client.
+	// RFC 7009 §2.1 / RFC 7662 §2.1 — public clients have no secret, and
+	// standard OAuth libraries attach client_id to revocation/introspection
+	// requests. A confidential client (or an unknown client_id) must present a
+	// secret, so this neither widens access nor lets a confidential client
+	// skip authentication.
+	if clientSecret == "" {
+		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
+			if errors.Is(err, ErrOAuthClientNotFound) {
+				return oauthUnauthorized("client authentication required", nil)
+			}
+			return oauthServerError("client verification failed", err)
+		}
+		return nil
+	}
+	if _, err := s.oauthClientSvc.VerifyClientSecret(ctx, clientID, clientSecret); err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return oauthUnauthorized("invalid client credentials", err)
+		}
+		// Operational failure — server fault, not a client auth failure.
+		return oauthServerError("client verification failed", err)
+	}
+	return nil
 }
 
 // parseScopeString splits a space-delimited scope string into a slice.

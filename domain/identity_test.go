@@ -6,6 +6,97 @@ import (
 	"testing"
 )
 
+// TestValidateWIMSEURI pins the shape contract used by /identities/by-wimse:
+// only well-formed spiffe:// URIs with a trust domain and a workload path
+// pass. Anything else returns a wrapped ErrInvalidWIMSEURI so handlers can
+// errors.Is and map to 400.
+func TestValidateWIMSEURI(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		if err := ValidateWIMSEURI("spiffe://highflame.dev/acct/proj/agent/my-agent"); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+	})
+
+	t.Run("rejection cases", func(t *testing.T) {
+		cases := []struct {
+			name string
+			uri  string
+		}{
+			{"empty", ""},
+			{"missing scheme", "highflame.dev/acct/proj/agent/x"},
+			{"wrong scheme", "https://highflame.dev/acct/proj/agent/x"},
+			{"missing host", "spiffe:///acct/proj/agent/x"},
+			{"bare trust domain", "spiffe://highflame.dev"},
+			{"trust domain with empty path", "spiffe://highflame.dev/"},
+			{"with query", "spiffe://highflame.dev/acct/proj/agent/x?foo=bar"},
+			{"with trailing question mark", "spiffe://highflame.dev/acct/proj/agent/x?"},
+			{"with fragment", "spiffe://highflame.dev/acct/proj/agent/x#frag"},
+			{"with user-info", "spiffe://user:pass@highflame.dev/acct/proj/agent/x"},
+			{"trust domain with port", "spiffe://highflame.dev:443/acct/proj/agent/x"},
+			{"path with trailing slash", "spiffe://highflame.dev/acct/proj/agent/x/"},
+			{"path with empty segment", "spiffe://highflame.dev/acct//agent/x"},
+			{"path segment with space", "spiffe://highflame.dev/acct/proj/agent/my agent"},
+			{"path segment with special char", "spiffe://highflame.dev/acct/proj/agent/my$agent"},
+			{"too long", "spiffe://highflame.dev/" + strings.Repeat("a", MaxSPIFFEIDBytes)},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				err := ValidateWIMSEURI(tc.uri)
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tc.uri)
+				}
+				if !errors.Is(err, ErrInvalidWIMSEURI) {
+					t.Fatalf("error not wrapped with ErrInvalidWIMSEURI: %v", err)
+				}
+			})
+		}
+	})
+}
+
+// TestIdentityStatusExpired_Valid confirms expired is a valid status.
+func TestIdentityStatusExpired_Valid(t *testing.T) {
+	if !IdentityStatusExpired.Valid() {
+		t.Fatal("IdentityStatusExpired.Valid() = false, want true")
+	}
+}
+
+// TestIdentityStatusExpired_IsUsable confirms expired identities cannot authenticate.
+func TestIdentityStatusExpired_IsUsable(t *testing.T) {
+	if IdentityStatusExpired.IsUsable() {
+		t.Fatal("IdentityStatusExpired.IsUsable() = true, want false")
+	}
+}
+
+// TestCanTransitionTo_Expired pins the expired state machine transitions.
+func TestCanTransitionTo_Expired(t *testing.T) {
+	tests := []struct {
+		from   IdentityStatus
+		to     IdentityStatus
+		expect bool
+	}{
+		// Into expired
+		{IdentityStatusActive, IdentityStatusExpired, true},
+		{IdentityStatusSuspended, IdentityStatusExpired, true},
+		{IdentityStatusPending, IdentityStatusExpired, false},
+		{IdentityStatusDeactivated, IdentityStatusExpired, false},
+		// Out of expired
+		{IdentityStatusExpired, IdentityStatusDeactivated, true},
+		{IdentityStatusExpired, IdentityStatusActive, false},
+		{IdentityStatusExpired, IdentityStatusSuspended, false},
+		{IdentityStatusExpired, IdentityStatusPending, false},
+		{IdentityStatusExpired, IdentityStatusExpired, false},
+	}
+	for _, tc := range tests {
+		name := string(tc.from) + " → " + string(tc.to)
+		t.Run(name, func(t *testing.T) {
+			got := tc.from.CanTransitionTo(tc.to)
+			if got != tc.expect {
+				t.Fatalf("CanTransitionTo = %v, want %v", got, tc.expect)
+			}
+		})
+	}
+}
+
 // TestBuildWIMSEURI_LengthCap pins the SPIFFE §2.4 invariant: any URI that
 // would exceed MaxSPIFFEIDBytes is rejected at construction time, returning
 // ErrSPIFFEIDTooLong so callers can errors.Is. Three cases — happy path, the
@@ -42,5 +133,38 @@ func TestBuildWIMSEURI_LengthCap(t *testing.T) {
 	}
 	if !errors.Is(err, ErrSPIFFEIDTooLong) {
 		t.Fatalf("error not ErrSPIFFEIDTooLong: %v", err)
+	}
+}
+
+// TestSubTypeValidForIdentityType pins the sub_type ↔ identity_type matrix.
+// Regression: code_agent must be valid for identity_type=agent (a delegated
+// code agent, e.g. forge's per-sandbox mint) — it was previously accepted only
+// for application, so registering a code agent as an agent (the correct type)
+// failed validation and 500'd.
+func TestSubTypeValidForIdentityType(t *testing.T) {
+	cases := []struct {
+		sub  SubType
+		typ  IdentityType
+		want bool
+	}{
+		// code_agent is valid for BOTH agent and application.
+		{SubTypeCodeAgent, IdentityTypeAgent, true},
+		{SubTypeCodeAgent, IdentityTypeApplication, true},
+		// A code_agent is not a service/mcp_server sub-type.
+		{SubTypeCodeAgent, IdentityTypeService, false},
+		{SubTypeCodeAgent, IdentityTypeMCPServer, false},
+		// Core agent sub-types stay agent-only.
+		{SubTypeToolAgent, IdentityTypeAgent, true},
+		{SubTypeToolAgent, IdentityTypeApplication, false},
+		// Application sub-types stay application-only.
+		{SubTypeChatbot, IdentityTypeApplication, true},
+		{SubTypeChatbot, IdentityTypeAgent, false},
+		// Empty sub-type is always valid (no sub-classification).
+		{"", IdentityTypeAgent, true},
+	}
+	for _, c := range cases {
+		if got := c.sub.ValidForIdentityType(c.typ); got != c.want {
+			t.Errorf("SubType(%q).ValidForIdentityType(%q) = %v, want %v", c.sub, c.typ, got, c.want)
+		}
 	}
 }

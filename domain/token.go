@@ -61,6 +61,14 @@ type AccessToken struct {
 	ExternalID   string `json:"external_id,omitempty"`
 	UserID       string `json:"user_id,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	// AuthorizationDetails is the granted RFC 9396 authorization_details
+	// JSON array, included on the token response per §5.2 when the request
+	// carried (and the AS granted) RAR. Empty / unset for non-CIBA flows
+	// and for CIBA requests that did not supply authorization_details.
+	// The raw bytes are the same array embedded in the access-token JWT
+	// claim (§6.1) — kept verbatim so resource servers see the exact
+	// payload the approver authorized.
+	AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty"`
 }
 
 // OAuthClient represents a registered OAuth2 client (RFC 7591).
@@ -124,6 +132,17 @@ type OAuthClient struct {
 	// status + expires_at — same fail-closed semantics jwt_bearer and
 	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
+
+	// Dynamic Client Registration (RFC 7591/7592)
+	// RegistrationSource is "internal" for clients created via the admin/internal
+	// API path, "dynamic" for clients created via POST /oauth2/register.
+	RegistrationSource string `bun:"registration_source" json:"registration_source,omitempty"`
+	// RegistrationAccessToken is a bcrypt hash of the management bearer token
+	// returned at RFC 7591 registration. NULL for internal clients (the column
+	// is NULL-able in the schema; `nullzero` ensures bun INSERTs NULL when the
+	// field is the Go zero value instead of persisting an empty string that
+	// would defeat `IS NULL` queries). Never JSON-serialized.
+	RegistrationAccessToken string `bun:"registration_access_token,nullzero" json:"-"`
 
 	// Lifecycle
 	IsActive  bool      `bun:"is_active"   json:"is_active"`

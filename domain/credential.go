@@ -6,6 +6,25 @@ import (
 	"github.com/uptrace/bun"
 )
 
+// Audit-retention window bounds for issued_credentials. One source of truth
+// for the "evidence clock" default and ceiling, referenced by the koanf
+// default, Config.Validate, and CredentialService's clamp so the three can't
+// silently diverge.
+const (
+	// DefaultAuditRetentionDays is the retention applied when
+	// token.audit_retention_days is absent or 0. ~400 days mirrors the
+	// signing-credentials retention default. NOTE: migration 037's backfill
+	// hardcodes 400 (a migration can't read config); a deployment running a
+	// non-default window must re-stamp historical rows out-of-band.
+	DefaultAuditRetentionDays = 400
+	// MaxAuditRetentionDays caps the window. Past ~106751 days the
+	// days→time.Duration conversion overflows int64 into a negative
+	// duration, which would stamp retention BEFORE expiry and erase the
+	// evidence window the knob exists to protect. 36500 (~100y) is a
+	// generous practical ceiling well below the overflow point.
+	MaxAuditRetentionDays = 36500
+)
+
 // GrantType represents the OAuth2 grant type used to issue a credential.
 type GrantType string
 
@@ -97,4 +116,16 @@ type IssuedCredential struct {
 	// every credential in the tree so workflow-scoped audit queries are
 	// O(1) instead of walking the parent_jti chain. Issue #81.
 	MissionID string `bun:"mission_id,type:varchar(255),nullzero" json:"mission_id,omitempty"`
+	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
+	// the DPoP key bound to this credential (RFC 9449 §6.1). Empty for plain
+	// Bearer tokens. When non-empty, the access token carries a cnf.jkt claim
+	// and must be presented with a valid DPoP proof at the protected resource.
+	DPoPKeyThumbprint string `bun:"dpop_key_thumbprint,type:text" json:"dpop_key_thumbprint,omitempty"`
+	// AuditRetentionUntil is the evidence clock, decoupled from ExpiresAt
+	// (the operational clock): how long the row remains queryable so the
+	// delegation graph (parent_jti walks, mission_id aggregates) survives
+	// token expiry. The cleanup worker prunes on this, not ExpiresAt. Nil on
+	// rows written before migration 037; those fall back to the legacy
+	// expires_at prune rule.
+	AuditRetentionUntil *time.Time `bun:"audit_retention_until" json:"audit_retention_until,omitempty"`
 }

@@ -88,7 +88,10 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 
 - **Agent Identity Registry** — Register agents, MCP servers, services, and applications as first-class entities. Classify by role (`orchestrator`, `autonomous`, `tool_agent`), enrich with metadata (`framework`, `version`, `publisher`, `capabilities`), assign trust levels, and manage the full lifecycle: register → activate → deactivate → de-provision.
 - **OAuth 2.1 Token Issuance** — Full OAuth 2.1 support: `client_credentials`, `jwt_bearer` (RFC 7523), `token_exchange` (RFC 8693) for delegation, `api_key`, `authorization_code` (PKCE), `refresh_token`, `urn:openid:params:grant-type:ciba` (OpenID CIBA Core 1.0).
-- **CIBA Backchannel Approval** — OpenID Client-Initiated Backchannel Authentication (CIBA Core 1.0). Agent posts to `/oauth2/bc-authorize` with a `binding_message`; the deployer's `BackchannelNotifier` prompts the end user out-of-band (email, Slack, mobile push); user approves or denies; agent receives the resulting token via poll, ping callback, or push delivery. SSRF-guarded outbound callbacks, per-tenant audit, single-use `auth_req_id`s.
+- **DPoP Sender-Constrained Tokens** — RFC 9449. Clients may attach a `DPoP` proof JWT to any `/oauth2/token` call; the issued token then carries `cnf.jkt` and `token_type: "DPoP"`. Proof replay is blocked by an atomic `dpop_jti` upsert (DB primary key — no pre-check race). Resource servers retrieve `cnf` via introspection and validate the per-request proof themselves. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
+- **Dynamic Client Registration** — RFC 7591 (`POST /oauth2/register`) gated by an initial access token with the `client:register` scope, plus RFC 7592 management (`GET`/`PUT`/`DELETE /oauth2/register/{client_id}`) authenticated by a one-shot `registration_access_token` (bcrypt-hashed at rest, constant-time lookup). Internal admin-registered clients remain isolated from DCR — the delete path refuses to touch `registration_source = 'internal'`. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
+- **CIBA Backchannel Approval** — OpenID Client-Initiated Backchannel Authentication (CIBA Core 1.0). Agent posts to `/oauth2/bc-authorize` with a `binding_message`; the deployer's `BackchannelNotifier` prompts the end user out-of-band (email, Slack, mobile push); user approves or denies; agent receives the resulting token via poll, ping callback, or push delivery. SSRF-guarded outbound callbacks, per-tenant audit, single-use `auth_req_id`s. Per-user targeting via standard `login_hint` (CIBA Core §7.1); role / group / queue targeting via the `group_hint` extension — an opaque deployer-namespaced string (e.g. `"highflame:role:finance_lead"`, `"pd:schedule:P12345"`) that the deployer's `BackchannelNotifier` resolves at fan-out time; first-approver wins via zeroid's existing atomic single-use CAS.
+- **Rich Authorization Requests (RAR)** — RFC 9396. Agents can attach a typed `authorization_details` JSON array to a CIBA `/oauth2/bc-authorize` call describing exactly what is being authorized at finer granularity than `scope` — e.g. `{"type": "tool_call", "tool": "transfer_funds", "amount": 50000}`. The `BackchannelNotifier` receives the parsed typed slice so the approver UX can render a per-action prompt instead of "approve this scope." Per-type schema validation is opt-in via `Server.RegisterAuthorizationDetailValidator(typ, fn)`. JSON and form-encoded bodies both supported. Rejections map to the RFC 9396 `invalid_authorization_details` OAuth error code. Full reference: [`docs/rar.md`](docs/rar.md).
 - **On-Behalf-Of (OBO) Delegation** — RFC 8693 token exchange with automatic scope attenuation at each hop, delegation depth tracking, and cascade revocation when any upstream credential is revoked. The `act` claim carries the full chain per RFC 8693, closing the auditability gap that plagues shared service accounts.
 - **WIMSE/SPIFFE URIs** — Stable, globally unique identity URIs: `spiffe://{domain}/{account}/{project}/{type}/{id}` for every agent. Tokens carry the WIMSE URI as `sub`, so every downstream system receives a meaningful, verifiable identity—not just a client ID.
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
@@ -706,15 +709,114 @@ curl -s -X POST https://auth.highflame.ai/oauth2/token \
 
 ---
 
+### Pattern 7: Sender-constrained tokens for high-risk agents (DPoP)
+
+**Scenario:** A finance-team agent issues high-value payment instructions. The bearer access token it carries is, by default, a portable credential — anyone who steals it gets full impersonation until expiry or revocation. For a 1-hour TTL on a budget-transferring NHI, that's an unacceptable blast radius.
+
+**The problem without ZeroID:** Mitigations like network-bound MTLS, IP allowlists, or short token TTLs are coarse and operationally painful. They either constrain where the agent can run (defeating workload portability) or add a refresh storm that hits the token endpoint every few minutes.
+
+**With ZeroID:** RFC 9449 DPoP — Demonstrating Proof of Possession. The agent generates an asymmetric key in its own process memory, signs a fresh DPoP proof for each request to `/oauth2/token`, and ZeroID binds the issued token to that key by embedding `cnf.jkt` (the JWK thumbprint) inside the JWT. The same proof mechanism is replayed at every resource-server call: a stolen access token is useless without the private key that signed the proof.
+
+```bash
+# 1. Agent (or its SDK) generates an ephemeral ES256 keypair and signs a DPoP proof
+#    over { typ=dpop+jwt, htm=POST, htu=https://auth.example/oauth2/token, iat, jti }.
+# 2. Request a token with the proof in the DPoP header.
+curl -s -X POST https://auth.example/oauth2/token \
+  -H "DPoP: <proof-jwt>" \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=finance-bot' \
+  -d 'client_secret=...' \
+  -d 'account_id=acme' -d 'project_id=prod' \
+  -d 'scope=payments:write'
+# →
+# {
+#   "access_token": "...",                 ← carries cnf.jkt = thumbprint of agent's key
+#   "token_type": "DPoP",                  ← signals to the agent that proofs are required downstream
+#   "expires_in": 3600
+# }
+
+# 3. Calling a resource server: include the access token + a *new* DPoP proof
+#    whose ath claim hashes the access token and whose htu/htm match this call.
+curl -s -X POST https://payments.example/transfer \
+  -H "Authorization: DPoP <access_token>" \
+  -H "DPoP: <new-proof-jwt-with-ath>" \
+  -d '...'
+
+# 4. The resource server validates the per-request proof against the cnf.jkt
+#    it pulls from ZeroID's introspection response. Stolen token without the
+#    key → invalid_dpop_proof, instantly.
+```
+
+**Why this matters:** Every grant type ZeroID issues — `client_credentials`, `jwt_bearer`, `token_exchange`, `api_key`, `authorization_code`, `refresh_token`, even CIBA — produces a DPoP-bound token when the caller attaches a proof. The agent's key never leaves its process; ZeroID never stores it; rotation is a no-op (next request, new key, new cnf). For agents whose tokens cross orchestrator → sub-agent → tool-agent hops, the binding survives the entire `token_exchange` chain because the new proof's key gets bound at each step.
+
+Replay defence is atomic: each proof's `jti` is INSERT-or-fail on a primary-key column. No pre-check race window — the second request collapses to `invalid_dpop_proof` at the database level. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
+
+---
+
+### Pattern 8: Self-service agent registration (Dynamic Client Registration)
+
+**Scenario:** An MCP server, an SDK, or a per-deployment AI agent needs an OAuth client to talk to ZeroID — but you can't ship the platform's admin API surface to every tenant who installs your tool. Hand-rolling a sign-up flow adds an operator burden and a security hole the moment the form is exposed.
+
+**The problem without ZeroID:** Most OAuth servers force you to provision every client through their admin console, which makes any "install this tool and it works" experience impossible. The teams that try to automate it usually expose their internal admin API to the public internet behind a thin shim, then patch CVEs in that shim for the next decade.
+
+**With ZeroID:** RFC 7591 dynamic client registration with RFC 7592 management — gated by an initial access token (an ordinary ZeroID-issued JWT with the reserved `client:register` scope). The platform mints initial access tokens to authorised registrants (your installer, your CLI's first-run bootstrap, your MCP server's onboarding flow); each one is single-issuer / single-audience / scope-restricted, so the surface is the same shape as any other OAuth call.
+
+```bash
+# 1. Platform mints an initial access token (ordinary client_credentials grant
+#    against a confidential client whose allowed_scopes includes client:register).
+IAT=$(curl -s -X POST https://auth.example/oauth2/token \
+  -d 'grant_type=client_credentials' \
+  -d "client_id=$BOOTSTRAP_CLIENT" -d "client_secret=$BOOTSTRAP_SECRET" \
+  -d 'account_id=acme' -d 'project_id=prod' \
+  -d 'scope=client:register' | jq -r .access_token)
+
+# 2. Tool registers itself.
+curl -s -X POST https://auth.example/oauth2/register \
+  -H "Authorization: Bearer $IAT" \
+  -d '{
+        "client_name": "Acme Notebook MCP",
+        "grant_types": ["client_credentials"],
+        "scope": "notebook:read notebook:write",
+        "software_id": "com.acme.notebook",
+        "software_version": "2.4.0"
+      }'
+# →
+# {
+#   "client_id":                 "9f...",
+#   "client_secret":             "<shown once>",
+#   "registration_access_token": "<shown once — for RFC 7592 management>",
+#   "registration_client_uri":   "https://auth.example/oauth2/register/9f..."
+# }
+
+# 3. The tool stores its own client_id + client_secret locally and uses them
+#    for every subsequent /oauth2/token call. The registration_access_token
+#    only ever leaves the tool's hands when it's calling its own
+#    /oauth2/register/{client_id} endpoint to update/rotate/delete itself.
+curl -X PUT https://auth.example/oauth2/register/9f... \
+  -H "Authorization: Bearer <registration_access_token>" \
+  -d '{"client_name":"Acme Notebook MCP","grant_types":["client_credentials"],"scope":"notebook:read"}'
+
+curl -X DELETE https://auth.example/oauth2/register/9f... \
+  -H "Authorization: Bearer <registration_access_token>"
+```
+
+**Why this matters:** DCR-registered clients carry `registration_source = 'dynamic'`; admin-provisioned clients carry `registration_source = 'internal'`. The two pools are isolated at the repo layer — a stolen `registration_access_token` can never reach an internal client, regardless of how the service code is called. DCR clients are deliberately blocked from `token_exchange` and `authorization_code` (no `IdentityID` binding, no interactive flow) so a self-registered tool cannot escalate into a delegation actor or run a PKCE consent flow. `client:register` is in ZeroID's reserved-claims set, so it cannot be smuggled in via `additional_claims` on `token_exchange`.
+
+Operationally: deployers who never mint a `client:register`-scoped token have DCR effectively disabled (the endpoint exists but every request 401s). Adoption is gradual and explicit. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
+
+---
+
 ## Architecture
 
 ```mermaid
 graph TD
     subgraph ZEROID ["ZeroID"]
         direction TB
-        IR[Identity Registry] --> CS[Credential Service<br/><i>ES256 signing · Policy enforcement · Audit</i>]
+        IR[Identity Registry] --> CS[Credential Service<br/><i>ES256/RS256 signing · Policy enforcement · Audit</i>]
         OG[OAuth2 Grants<br/><i>client_credentials · jwt_bearer · api_key<br/>authorization_code · refresh_token · ciba</i>] --> CS
         DL[Delegation Engine<br/><i>RFC 8693 token_exchange</i>] --> CS
+        DPOP[DPoP Validator<br/><i>RFC 9449 · jti replay store · cnf.jkt binding</i>] --> OG
+        DCR[Dynamic Registration<br/><i>RFC 7591 / 7592 · IAT-gated</i>] --> IR
 
         CS --> AT[Attestation]
         CS --> CAE[CAE Signals<br/><i>Real-time revocation</i>]
@@ -724,12 +826,14 @@ graph TD
         CAE --> DB
         WPT --> DB
         CS --> DB
+        DPOP --> DB
     end
 
-    Agent([AI Agent]) -- "api_key / jwt_bearer" --> OG
+    Agent([AI Agent]) -- "api_key / jwt_bearer<br/>(+ optional DPoP)" --> OG
     Orchestrator([Orchestrator]) -- "token_exchange" --> DL
     SDK([SDK / CLI]) -- "authorization_code" --> OG
-    Downstream([MCP Server / Tool]) -- "introspect / verify" --> WPT
+    Installer([Installer / Bootstrap]) -- "client:register IAT" --> DCR
+    Downstream([MCP Server / Tool]) -- "introspect / verify<br/>(+ DPoP for bound tokens)" --> WPT
 
     style ZEROID fill:#1a1a2e,stroke:#e94560,stroke-width:3px,color:#fff
     style CS fill:#2d6a4f,color:#fff
@@ -750,6 +854,8 @@ graph TD
 | CLI (`authorization_code`) | RS256 | 90 days | User ID | — |
 | MCP (`authorization_code` + refresh) | RS256 | 1 hour | User ID | — |
 | CIBA (`urn:openid:params:grant-type:ciba`) | RS256 | 15 min | Approving user ID | `email`, `name`, `backchannel_client_id`, `token_exchange="ciba"` |
+| **DPoP-bound** (any grant + `DPoP` header) | — (modifier) | — (inherits grant) | — (inherits grant) | adds `cnf.jkt` claim; response `token_type: "DPoP"` |
+| **DCR client_credentials** | ES256 | 1 hour | DCR client's WIMSE URI (when bound) | identical claims to internal `client_credentials`; client's `registration_source` distinguishes provenance for audit |
 
 ---
 
@@ -762,11 +868,15 @@ graph TD
 | GET | `/health` | Health check |
 | GET | `/ready` | Readiness check |
 | GET | `/.well-known/jwks.json` | JWKS public keys |
-| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata |
+| GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata (RFC 8414) |
+| GET | `/.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) — discovery entry point clients hit before AS metadata |
+| GET | `/.well-known/spiffe-trust-bundle.json` | SPIFFE JWT-SVID trust bundle |
 | POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
 | POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
 | POST | `/oauth2/bc-authorize` | CIBA backchannel authorization request (OpenID CIBA Core §7) |
+| POST | `/oauth2/register` | Dynamic client registration (RFC 7591). Requires initial access token with `client:register` scope. |
+| GET / PUT / DELETE | `/oauth2/register/{client_id}` | Client management (RFC 7592). Authenticated by `registration_access_token`. |
 | GET | `/oauth2/token/verify` | Forward-auth endpoint for reverse proxies (nginx `auth_request`, Caddy `forward_auth`) |
 
 ### Admin (protect at network layer)
@@ -801,6 +911,9 @@ Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit
 | GET | `/api/v1/signals/stream` | SSE signal stream |
 | POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
 | POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
+| GET | `/api/v1/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
+| GET | `/api/v1/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
+| GET | `/api/v1/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
@@ -823,10 +936,17 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 | PKCE | RFC 7636 | Authorization code flow |
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
+| OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |
 | CIBA | OpenID CIBA Core 1.0 | Out-of-band user approval for agent-initiated actions (poll / ping / push) |
+| Rich Authorization Requests | RFC 9396 | Typed `authorization_details` on CIBA bc-authorize for per-action approval prompts (vs scope-string) |
+| DPoP | RFC 9449 | Sender-constrained access tokens — proof-of-possession at `/oauth2/token` and at the resource server |
+| JWK Thumbprint | RFC 7638 | DPoP `cnf.jkt` key binding |
+| Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating |
+| Client Configuration Endpoint | RFC 7592 | Read/update/delete of dynamically registered clients via `registration_access_token` |
 
 ---
 
@@ -840,6 +960,8 @@ References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Id
 - Coding agent task claims — `session_id`, `task_id`, `task_type`, `allowed_tools`, `workspace`, `environment` as typed fields on `ZeroIDIdentity`; `has_tool()` helper alongside `has_scope()`
 - Ecosystem integrations (LangGraph, CrewAI, Strands)
 - **CIBA (Client-Initiated Backchannel Authentication)** — full OpenID CIBA Core 1.0 server-side flow with poll, ping, and push delivery modes; deployer-pluggable `BackchannelNotifier` for out-of-band user prompts (email, Slack, push); SSRF-guarded outbound callbacks
+- **Rich Authorization Requests (RFC 9396)** — typed `authorization_details` JSON array on CIBA `/oauth2/bc-authorize`; outer-shape + per-type validator hooks; raw payload threaded verbatim through to the `BackchannelNotifier` for typed approver UX; both JSON and form-encoded bodies; RFC 9396 §5 error-code mapping (`invalid_authorization_details`). On approval the granted payload is embedded in the access-token JWT (§6.1), surfaced on the token response body (§5.2), and exposed in introspection (§7) — resource servers can read the typed grant from either the JWT or `/oauth2/token/introspect`.
+- **Delegation Explorer** — three read-only endpoints that expose the delegation graph stored in `issued_credentials`: `/delegations/graph` (depth-bounded subgraph centered on any identity, with per-edge scope attenuation), `/delegations/by-jti/{jti}` (forensic lineage walk root → leaf), and `/delegations/chains` (mission summary list with time-window filtering). All three are tenant-scoped and driven by `parent_jti` recursive CTEs — no dependency on `mission_id` for correctness.
 
 **Planned**
 - Human-in-the-loop approval workflow (`/api/v1/approvals`)

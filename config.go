@@ -5,6 +5,7 @@ package zeroid
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -42,6 +45,22 @@ type Config struct {
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
 	WIMSEDomain string `koanf:"wimse_domain"`
+
+	// AudienceScopeProfiles lets a deployer ADD or OVERRIDE audience→scope
+	// profiles for the trusted external-principal exchange WITHOUT a code release
+	// (the built-in defaults are the fallback). Each granted scope must be in the
+	// server's allowed profile-scope set (validated at startup, fail closed) —
+	// server-defined, never caller-supplied. Example (config.yaml):
+	//   audience_scope_profiles:
+	//     my-audience: ["nhi:manage"]
+	AudienceScopeProfiles map[string][]string `koanf:"audience_scope_profiles"`
+
+	// ExternalIssuers configures direct OIDC IdP federation (issue #88).
+	// When grant_type=token-exchange and subject_token_type=id_token, ZeroID
+	// looks up the upstream iss in this list, fetches the issuer's JWKS, and
+	// verifies the ID token before minting a ZeroID token. Empty list (default)
+	// disables direct federation — only the broker path remains available.
+	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -79,6 +98,24 @@ type AttestationConfig struct {
 	// should set ZEROID_ALLOW_UNSAFE_DEV_STUB=false. The OIDC verifier
 	// (the only real verifier shipped) is unaffected by this flag.
 	AllowUnsafeDevStub bool `koanf:"allow_unsafe_dev_stub"`
+
+	// AllowPrivateIssuerEndpoints relaxes the SSRF guard the OIDC
+	// attestation verifier applies to a proof's issuer endpoint (the URL
+	// it fetches OIDC discovery + JWKS from). Default false
+	// (production-safe).
+	//
+	// When false, the verifier rejects issuer endpoints that resolve to
+	// private, loopback, link-local, multicast, CGN, or unspecified IP
+	// ranges so an attacker-controlled proof can't make the server fetch
+	// internal URLs (SSRF).
+	//
+	// When true, that guard is disabled. Use ONLY in single-tenant
+	// test/dev deployments whose attestation issuer is itself on
+	// localhost / a private network. Production MUST keep this false.
+	//
+	// Wired at startup into both the OIDC verifier (fetch-time guard) and
+	// the attestation policy service (write-time URL validation).
+	AllowPrivateIssuerEndpoints bool `koanf:"allow_private_issuer_endpoints"`
 }
 
 // SigningCredsConfig governs workload-attested ephemeral signing
@@ -132,6 +169,14 @@ type ServerConfig struct {
 	//
 	// Set to empty string ("") to register admin routes at the router root.
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
+
+	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
+	// X-Forwarded-Host when reconstructing the effective request URL for
+	// DPoP htu validation (RFC 9449 §4.3). Production deployers behind a
+	// trusted edge proxy (nginx, AWS ALB, GCP LB) flip this on; deployers
+	// that terminate TLS at the service itself leave it false so spoofed
+	// proxy headers cannot move the htu goalposts.
+	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
 // GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"
@@ -175,10 +220,52 @@ type KeysConfig struct {
 
 // TokenConfig holds JWT issuance settings.
 type TokenConfig struct {
+	// Issuer is the canonical URL of this ZeroID instance. It serves three
+	// roles, all REQUIRED to be the same URL by RFC 8414 §3:
+	//
+	//  1. The JWT `iss` claim on every issued token.
+	//  2. The discovery anchor — RFC 8414 §3 says clients construct
+	//     `{Issuer}/.well-known/oauth-authorization-server` (with the
+	//     well-known segment inserted between host and path) to find AS
+	//     metadata. Issuer MUST be reachable at that URL.
+	//  3. The URL prefix for every endpoint advertised in the AS metadata,
+	//     PRM document, and RFC 7592 `registration_client_uri` — i.e. the
+	//     URL clients actually hit.
+	//
+	// MUST be the publicly-routable URL of this AS, scheme://host[:port][/path],
+	// no fragment. Reverse-proxied deployments: use the public form, not the
+	// backend's listener URL. Path-mounted deployments (rare; antipattern for
+	// new deployments): include the path in Issuer so RFC 8414's insertion
+	// rule lands on a route the AS actually serves.
+	//
+	// DPoP `htu` validation does NOT depend on Issuer — it compares against
+	// the request's effective URL (via RequestURLMiddleware), so reverse-proxy
+	// header trust governs DPoP independently.
 	Issuer     string `koanf:"issuer"`
-	BaseURL    string `koanf:"base_url"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
+
+	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the trusted caller
+	// requests one (GrantRequest.IssueRefreshToken). It bounds how long an
+	// external-principal session (e.g. an embedded codeoid workspace) can keep
+	// itself alive by self-rotating before the user must re-authenticate through
+	// the broker. 0 ⇒ the built-in default (12h).
+	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
+
+	// AuditRetentionDays is how long an issued_credentials row remains
+	// queryable AFTER the token expires. The two clocks are deliberately
+	// decoupled (same model as signing_credentials): expires_at bounds how
+	// long the token authenticates; expires_at + AuditRetentionDays bounds
+	// how long the delegation graph can still answer historical questions
+	// about it. The cleanup worker prunes on the audit clock, never on
+	// expiry alone. See domain.IssuedCredential.AuditRetentionUntil.
+	//
+	// Floor: the cleanup worker ANDs this evidence clock with the
+	// cascade-walk clock (Token.MaxTTL). A value below MaxTTL (~90d) has no
+	// effect on deletion timing — MaxTTL is the effective floor. 0 selects
+	// domain.DefaultAuditRetentionDays; see Validate for the accepted range.
+	AuditRetentionDays int `koanf:"audit_retention_days"`
 
 	// authorization_code grant configuration.
 	// HMACSecret is the shared secret used to sign and verify auth code JWTs (HS256).
@@ -186,6 +273,26 @@ type TokenConfig struct {
 	// AuthCodeIssuer is the expected issuer claim in auth code JWTs.
 	// Defaults to Token.Issuer when empty.
 	AuthCodeIssuer string `koanf:"auth_code_issuer"`
+
+	// AllowUnauthenticatedTokenInspection controls whether the introspection
+	// (RFC 7662) and revocation (RFC 7009) endpoints accept anonymous callers.
+	//
+	// RFC 7662 §2.1 says the introspection endpoint MUST require some form of
+	// authorization (token-scanning defense); RFC 7009 §2.1 requires client
+	// authentication on revocation. When this is false, ZeroID enforces that:
+	// a caller MUST present client credentials, and an anonymous call is
+	// rejected with invalid_client.
+	//
+	// Default true preserves the accept-and-verify posture (anonymous allowed,
+	// presented credentials still verified) for the standalone, network-
+	// isolated deployment model and local development. Validate() REJECTS true
+	// when server.env is production, so production deployments are strict
+	// (spec-compliant) by default and must consciously keep this false — the
+	// same production-gate pattern as AllowUnsafeDevStub and the default
+	// issuer. A production deployment that genuinely relies on network
+	// isolation should authenticate these endpoints at its own edge
+	// (Server.Use) rather than serving them unauthenticated from ZeroID.
+	AllowUnauthenticatedTokenInspection bool `koanf:"allow_unauthenticated_token_inspection"`
 }
 
 // TelemetryConfig holds OpenTelemetry settings.
@@ -217,6 +324,13 @@ func LoadConfig(configPath string) (Config, error) {
 
 	if err := loadEnvVars(k); err != nil {
 		return Config{}, fmt.Errorf("loading env vars: %w", err)
+	}
+
+	// Detect removed/renamed config keys so deployers see a loud failure on
+	// upgrade instead of silently losing settings. Koanf's Unmarshal would
+	// otherwise drop keys that no longer map to struct fields.
+	if err := rejectRemovedKeys(k); err != nil {
+		return Config{}, err
 	}
 
 	var cfg Config
@@ -260,6 +374,153 @@ func (c *Config) Validate() error {
 	}
 	if err := validateWIMSEDomain(c.WIMSEDomain); err != nil {
 		return fmt.Errorf("wimse_domain: %w", err)
+	}
+	if err := validateIssuer(c.Token.Issuer); err != nil {
+		return err
+	}
+
+	// Production-gated hardening. server.env had ZERO readers before this —
+	// it now governs the footgun defaults that are safe in dev but dangerous
+	// in production. The dev defaults stay intact so local/test workflows are
+	// unaffected; these checks only fire when the deployer declares production.
+	if isProductionEnv(c.Server.Env) {
+		// The dev stub accepts ANY submitted proof for image_hash/tpm. Its
+		// default is true (so dev demos work); leaving it on in production
+		// means accept-any attestation. Force an explicit opt-out.
+		if c.Attestation.AllowUnsafeDevStub {
+			return fmt.Errorf("attestation.allow_unsafe_dev_stub must be false in production (server.env=%q): the stub accepts ANY submitted proof for image_hash/tpm — set ZEROID_ALLOW_UNSAFE_DEV_STUB=false", c.Server.Env)
+		}
+		// token.issuer and wimse_domain are validated by validateIssuer()
+		// and validateWIMSEDomain() above (empty/malformed → reject).
+		// No default-value comparison here — the built-in default may
+		// legitimately be the deployer's intended production value.
+		// Introspection (RFC 7662 §2.1) and revocation (RFC 7009 §2.1) MUST
+		// require caller authorization. The default leaves them accept-and-
+		// verify (anonymous allowed) for the standalone/dev model; production
+		// must not serve an unauthenticated token-scanning / force-revoke
+		// surface. Force the explicit opt-out.
+		if c.Token.AllowUnauthenticatedTokenInspection {
+			return fmt.Errorf("token.allow_unauthenticated_token_inspection must be false in production (server.env=%q): RFC 7662 §2.1 / RFC 7009 §2.1 require caller authentication on introspection/revocation — set ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION=false (authenticate these endpoints at your edge if you rely on network isolation)", c.Server.Env)
+		}
+	}
+
+	// token.hmac_secret signs/verifies stateless authorization_code JWTs
+	// (HS256). The authorization_code grant is optional, so the secret is not
+	// globally required — but a weak secret is forgeable, so when one IS set
+	// we enforce a floor. 32 bytes matches the HS256 output size.
+	if c.Token.HMACSecret != "" && len(c.Token.HMACSecret) < 32 {
+		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
+	}
+
+	// token.audit_retention_days is a day count converted to time.Duration
+	// (days × 24h in nanoseconds); past ~106751 days the multiplication
+	// overflows int64 into a NEGATIVE duration, which would stamp
+	// AuditRetentionUntil before expiry and silently erase the evidence
+	// window the knob exists to guarantee. Bounds shared with the service
+	// clamp via domain. 0 means "use domain.DefaultAuditRetentionDays".
+	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > domain.MaxAuditRetentionDays {
+		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
+	}
+
+	seen := make(map[string]struct{}, len(c.ExternalIssuers))
+	for i := range c.ExternalIssuers {
+		c.ExternalIssuers[i].Defaults()
+		if err := c.ExternalIssuers[i].Validate(); err != nil {
+			return fmt.Errorf("external_issuers[%d]: %w", i, err)
+		}
+		iss := c.ExternalIssuers[i].Issuer
+		if _, dup := seen[iss]; dup {
+			return fmt.Errorf("external_issuers[%d]: duplicate issuer %q", i, iss)
+		}
+		seen[iss] = struct{}{}
+	}
+	return nil
+}
+
+// isProductionEnv reports whether server.env names a production deployment.
+// Accepts the common spellings ("production", "prod") case-insensitively so a
+// deployer can't accidentally dodge the production gate with "Production".
+func isProductionEnv(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "production", "prod":
+		return true
+	default:
+		return false
+	}
+}
+
+// validateIssuer enforces RFC 8414 §2's shape constraints on Token.Issuer.
+// The issuer URL is load-bearing — it is the JWT iss claim, the RFC 8414 §3
+// discovery anchor, and the URL prefix for every endpoint advertised in AS
+// metadata, PRM, and RFC 7592 registration_client_uri. A malformed issuer
+// causes silent client failures everywhere, so we reject anything that won't
+// parse as a clean absolute URL up front.
+func validateIssuer(s string) error {
+	if s == "" {
+		return fmt.Errorf("token.issuer is required: it is the JWT iss claim, the RFC 8414 §3 discovery anchor, and the URL prefix for every endpoint the server advertises; see TokenConfig.Issuer")
+	}
+	if strings.HasSuffix(s, "/") {
+		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", s)
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("token.issuer must be a valid URL (got %q): %w", s, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("token.issuer must use http or https scheme (got %q in %q)", u.Scheme, s)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("token.issuer must have a host (got %q)", s)
+	}
+	if u.User != nil {
+		// Issuer URLs with embedded user-info (https://user:pass@host) are
+		// not a real OAuth deployment shape — they would leak credentials
+		// into JWT `iss` claims, metadata documents, and every URI the
+		// server publishes. RFC 8414 §2's "URL using the https scheme"
+		// language excludes user-info by reference to RFC 3986's URI
+		// composition rules for OAuth identifiers. Error message kept
+		// short so it fits one terminal line; rationale lives in this
+		// comment for code readers.
+		return fmt.Errorf("token.issuer must not contain user-info (got %q)", s)
+	}
+	if u.RawQuery != "" {
+		return fmt.Errorf("token.issuer must not contain query parameters (got %q): RFC 8414 §2 requires the issuer URL to have no query component", s)
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("token.issuer must not contain a fragment (got %q): RFC 8414 §2 requires the issuer URL to have no fragment component", s)
+	}
+	return nil
+}
+
+// rejectRemovedKeys fails fast if a deployer's config (YAML or env) still sets
+// keys that this version of ZeroID has removed. Silent drop on upgrade is
+// indistinguishable from "the setting works but does nothing"; loud rejection
+// forces migration.
+//
+// Add an entry here whenever a config key is removed. Keep entries until you
+// believe no live deployment carries the old key.
+func rejectRemovedKeys(k *koanf.Koanf) error {
+	// Removed in the Token.BaseURL elimination (see CHANGELOG). Issuer now
+	// serves the role BaseURL used to. Migration: set token.issuer (or
+	// ZEROID_ISSUER) to whatever you previously had in token.base_url
+	// (or ZEROID_BASE_URL).
+	if k.Exists("token.base_url") {
+		return fmt.Errorf("token.base_url has been removed: set token.issuer to the full URL ZeroID is reached at (RFC 8414 §3 anchors discovery on the issuer URL). See CHANGELOG for migration notes")
+	}
+	if os.Getenv("ZEROID_BASE_URL") != "" {
+		return fmt.Errorf("ZEROID_BASE_URL has been removed: set ZEROID_ISSUER to the full URL ZeroID is reached at (RFC 8414 §3 anchors discovery on the issuer URL). See CHANGELOG for migration notes")
+	}
+	// telemetry.endpoint / telemetry.insecure were removed when exporter
+	// configuration moved to the standard OTel SDK env vars
+	// (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE). They are no
+	// longer fields on TelemetryConfig, so koanf would silently drop them —
+	// reject loudly so a stale YAML doesn't quietly point telemetry at the
+	// wrong collector.
+	if k.Exists("telemetry.endpoint") {
+		return fmt.Errorf("telemetry.endpoint has been removed: exporter config moved to the OTel SDK env var OTEL_EXPORTER_OTLP_ENDPOINT. Remove it from config and set the env var instead")
+	}
+	if k.Exists("telemetry.insecure") {
+		return fmt.Errorf("telemetry.insecure has been removed: exporter config moved to the OTel SDK env var OTEL_EXPORTER_OTLP_INSECURE. Remove it from config and set the env var instead")
 	}
 	return nil
 }
@@ -328,14 +589,19 @@ func loadDefaults(k *koanf.Koanf) error {
 		"keys.rsa_public_key_path":  "",
 		"keys.rsa_key_id":           "v1",
 
-		// Token
-		"token.issuer":      "https://highflame.ai",
-		"token.base_url":    "https://highflame.ai",
+		// Token — no default for token.issuer or wimse_domain; every
+		// deployment must set them explicitly via ZEROID_ISSUER /
+		// ZEROID_WIMSE_DOMAIN or YAML. validateIssuer() and
+		// validateWIMSEDomain() reject empty values at startup.
 		"token.default_ttl": 3600,
 		"token.max_ttl":     7776000, // 90 days
-
-		// WIMSE
-		"wimse_domain": "highflame.ai",
+		// Delegation-graph evidence clock: issued_credentials rows stay
+		// queryable this long past token expiry. Single source of truth in
+		// domain so the default can't drift from the service clamp / Validate.
+		"token.audit_retention_days": domain.DefaultAuditRetentionDays,
+		// Accept-and-verify on introspect/revoke by default (dev/standalone).
+		// Validate() forces this false in production (RFC 7662/7009).
+		"token.allow_unauthenticated_token_inspection": true,
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -350,6 +616,10 @@ func loadDefaults(k *koanf.Koanf) error {
 		// ZEROID_ALLOW_UNSAFE_DEV_STUB=false for deployments that don't
 		// submit those proof types (or once real verifiers land).
 		"attestation.allow_unsafe_dev_stub": true,
+		// SSRF guard on the OIDC verifier's issuer-endpoint fetch. Default
+		// false (production-safe); dev/test deployments whose attestation
+		// issuer is on localhost/a private network opt in.
+		"attestation.allow_private_issuer_endpoints": false,
 
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
@@ -377,9 +647,10 @@ func loadDefaults(k *koanf.Koanf) error {
 func loadEnvVars(k *koanf.Koanf) error {
 	envMapping := map[string]string{
 		// Server
-		"ZEROID_PORT":              "server.port",
-		"ZEROID_ENV":               "server.env",
-		"ZEROID_ADMIN_PATH_PREFIX": "server.admin_path_prefix",
+		"ZEROID_PORT":                    "server.port",
+		"ZEROID_ENV":                     "server.env",
+		"ZEROID_ADMIN_PATH_PREFIX":       "server.admin_path_prefix",
+		"ZEROID_TRUST_FORWARDED_HEADERS": "server.trust_forwarded_headers",
 
 		// Database
 		"ZEROID_DATABASE_URL": "database.url",
@@ -406,15 +677,27 @@ func loadEnvVars(k *koanf.Koanf) error {
 
 		// Token
 		"ZEROID_ISSUER":                "token.issuer",
-		"ZEROID_BASE_URL":              "token.base_url",
 		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+		// Evidence clock for issued_credentials (delegation-graph retention).
+		"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
+		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
+		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
+		"ZEROID_HMAC_SECRET": "token.hmac_secret",
+		// Strict client auth on introspection/revocation (RFC 7662/7009).
+		// Default true (accept-and-verify); Validate() forces false in production.
+		"ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION": "token.allow_unauthenticated_token_inspection",
 
 		// WIMSE
 		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
 
 		// Attestation
-		"ZEROID_ALLOW_UNSAFE_DEV_STUB": "attestation.allow_unsafe_dev_stub",
+		"ZEROID_ALLOW_UNSAFE_DEV_STUB":                      "attestation.allow_unsafe_dev_stub",
+		"ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS": "attestation.allow_private_issuer_endpoints",
+
+		// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
+		// test/dev deployments only. Production MUST leave this false.
+		"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
 
 		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
 		// directly by the OTel SDK (spec-compliant).
@@ -431,26 +714,49 @@ func loadEnvVars(k *koanf.Koanf) error {
 			continue
 		}
 
+		// Parse errors are returned, not swallowed: a typo'd typed env var
+		// (e.g. ZEROID_ALLOW_UNSAFE_DEV_STUB=flase) must NOT silently retain
+		// the default — for a security flag that means the accept-any
+		// attestation stub stays on. Fail loud at startup instead.
 		switch {
 		case strings.HasSuffix(configPath, ".enabled") ||
-			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub"):
-			if boolVal, err := strconv.ParseBool(value); err == nil {
-				_ = k.Set(configPath, boolVal)
+			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub") ||
+			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
+			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
+			boolVal, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)
+			}
+			if err := k.Set(configPath, boolVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		case strings.HasSuffix(configPath, ".max_open_conns") ||
 			strings.HasSuffix(configPath, ".max_idle_conns") ||
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
+			strings.HasSuffix(configPath, ".audit_retention_days") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
-			if intVal, err := strconv.Atoi(value); err == nil {
-				_ = k.Set(configPath, intVal)
+			intVal, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid integer", envVar, value)
+			}
+			if err := k.Set(configPath, intVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		case strings.HasSuffix(configPath, ".sampling_rate"):
-			if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
-				_ = k.Set(configPath, floatVal)
+			floatVal, err := strconv.ParseFloat(value, 64)
+			if err != nil {
+				return fmt.Errorf("%s=%q: not a valid float", envVar, value)
+			}
+			if err := k.Set(configPath, floatVal); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
 			}
 		default:
-			_ = k.Set(configPath, value)
+			if err := k.Set(configPath, value); err != nil {
+				return fmt.Errorf("setting %s from %s: %w", configPath, envVar, err)
+			}
 		}
 	}
 

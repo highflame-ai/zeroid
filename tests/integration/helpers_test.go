@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +80,66 @@ var testServerPrivKey *ecdsa.PrivateKey
 // directly, bypassing the HTTP surface.
 var testDB *bun.DB
 
+// testTrustedServiceHeader gates the test TrustedServiceValidator: requests
+// carrying this header (any non-empty value) are treated as a trusted internal
+// service for external-principal exchange. The value is echoed back as the
+// service name (the `trusted_by` claim).
+const testTrustedServiceHeader = "X-Test-Trusted-Service"
+
+// trustedServiceCtxKey is the context key the test global middleware uses to
+// pass the trusted-service name through to the validator.
+type trustedServiceCtxKey struct{}
+
+// revocationEventCapture is a thread-safe sink for RevocationEvents emitted by
+// the server's RevocationNotifier. Tests filter by JTI / account so the shared
+// server doesn't leak events across tests.
+type revocationEventCapture struct {
+	mu     sync.Mutex
+	events []zeroid.RevocationEvent
+}
+
+func (c *revocationEventCapture) add(e zeroid.RevocationEvent) {
+	c.mu.Lock()
+	c.events = append(c.events, e)
+	c.mu.Unlock()
+}
+
+// forJTI returns every captured event whose JTI matches.
+func (c *revocationEventCapture) forJTI(jti string) []zeroid.RevocationEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []zeroid.RevocationEvent
+	for _, e := range c.events {
+		if e.JTI == jti {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// forReason returns every captured event whose Reason matches.
+func (c *revocationEventCapture) forReason(reason string) []zeroid.RevocationEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []zeroid.RevocationEvent
+	for _, e := range c.events {
+		if e.Reason == reason {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// count returns the total number of captured events.
+func (c *revocationEventCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.events)
+}
+
+// revocationCapture is the shared sink, wired into the server in TestMain.
+var revocationCapture = &revocationEventCapture{}
+
 func TestMain(m *testing.M) {
 	os.Exit(runTests(m))
 }
@@ -109,6 +170,7 @@ func runTests(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "get connection string: %v\n", err)
 		return 1
 	}
+	sharedDBURL = dbURL // used by federation-test helpers (external_idp_test.go).
 
 	// Generate the server's ECDSA P-256 key pair and write to temp files.
 	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -160,11 +222,17 @@ func runTests(m *testing.M) int {
 		},
 		Token: zeroid.TokenConfig{
 			Issuer:         testIssuer,
-			BaseURL:        testIssuer,
 			DefaultTTL:     3600,
 			MaxTTL:         90 * 24 * 3600, // 90 days — needed for authorization_code CLI tokens
 			HMACSecret:     testHMACSecret,
 			AuthCodeIssuer: testIssuer,
+			// Accept-and-verify posture for the suite (this is the LoadConfig
+			// default, but a struct literal doesn't get koanf defaults — so set
+			// it explicitly, else the suite would run strict and every
+			// anonymous introspect()/revoke() helper call would 401). The
+			// strict-mode path is exercised by toggling
+			// SetRequireTokenInspectionAuth in its dedicated test.
+			AllowUnauthenticatedTokenInspection: true,
 		},
 		Telemetry: zeroid.TelemetryConfig{
 			Enabled: false,
@@ -179,6 +247,14 @@ func runTests(m *testing.M) int {
 		// false — see GHSA-599q-j34m-33vc.
 		Backchannel: zeroid.BackchannelConfig{
 			AllowPrivateNotificationEndpoints: true,
+		},
+		// The attestation OIDC verifier fixtures run a discovery + JWKS
+		// httptest server on 127.0.0.1, which the new SSRF guard blocks by
+		// default. Relax it for this test deployment, exactly as the
+		// Backchannel flag above does for loopback notification endpoints.
+		// Production deployments keep this false.
+		Attestation: zeroid.AttestationConfig{
+			AllowPrivateIssuerEndpoints: true,
 		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a
@@ -201,6 +277,61 @@ func runTests(m *testing.M) int {
 	}
 
 	testZeroIDServer = srv
+
+	// Install a capturing RevocationNotifier so revocation tests can
+	// assert that exactly one event fires per revoked JTI on every path. Force
+	// synchronous dispatch so assertions are deterministic without sleeps racing
+	// the detached goroutine.
+	srv.SetRevocationNotifier(func(_ context.Context, e zeroid.RevocationEvent) error {
+		revocationCapture.add(e)
+		return nil
+	})
+	srv.SetRevocationNotifyDispatchSync(true)
+
+	// Wire a TrustedServiceValidator gated on a test header so the
+	// external-principal exchange (role / privilege_scope) tests can exercise
+	// both the trusted and untrusted caller paths against the same server.
+	srv.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get(testTrustedServiceHeader) != "" {
+				r = r.WithContext(context.WithValue(r.Context(), trustedServiceCtxKey{}, r.Header.Get(testTrustedServiceHeader)))
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	srv.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
+		if name, ok := ctx.Value(trustedServiceCtxKey{}).(string); ok && name != "" {
+			return name, nil
+		}
+		return "", fmt.Errorf("caller is not a trusted service")
+	})
+
+	// Stub PrincipalResolver for /oauth2/authorize tests. Reads its
+	// behaviour from magic form fields so a single resolver covers
+	// every test shape (happy path, not-applicable, rejected). Tests
+	// that don't hit /oauth2/authorize never trigger it.
+	//
+	// Form-field protocol:
+	//   test_principal_account → AccountID (required to "apply")
+	//   test_principal_project → ProjectID
+	//   test_principal_user    → UserID
+	//   test_principal_reject  → "true" returns a non-sentinel error
+	//   (anything else)        → ErrPrincipalNotApplicable
+	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		if req.Form("test_principal_reject") == "true" {
+			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")
+		}
+		acct := req.Form("test_principal_account")
+		if acct == "" {
+			return nil, zeroid.ErrPrincipalNotApplicable
+		}
+		return &zeroid.Principal{
+			AccountID: acct,
+			ProjectID: req.Form("test_principal_project"),
+			UserID:    req.Form("test_principal_user"),
+		}, nil
+	})
+
 	testServer = httptest.NewServer(srv.Router())
 	defer testServer.Close()
 
@@ -384,12 +515,15 @@ func ecPublicKeyPEM(t *testing.T, key *ecdsa.PrivateKey) string {
 }
 
 // buildAssertion creates a self-signed ES256 JWT assertion for jwt_bearer and token_exchange flows.
-// issuerWIMSE is the agent's WIMSE URI used as the iss claim.
+// issuerWIMSE is the agent's WIMSE URI used as both the iss and sub claims —
+// for self-asserting agents, RFC 7523 §3 (2) requires sub to identify the
+// principal, which is the same agent the assertion is for.
 func buildAssertion(t *testing.T, privKey *ecdsa.PrivateKey, issuerWIMSE string) string {
 	t.Helper()
 	now := time.Now()
 	tok, err := jwt.NewBuilder().
 		Issuer(issuerWIMSE).
+		Subject(issuerWIMSE).
 		Audience([]string{testIssuer}).
 		IssuedAt(now).
 		Expiration(now.Add(5 * time.Minute)).

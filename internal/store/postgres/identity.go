@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -49,6 +50,31 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 	return identity, nil
 }
 
+// GetByIDs returns identities with the given UUIDs, scoped to a tenant.
+// Used for batch node enrichment in graph endpoints (issue #153) so a
+// single query loads every identity referenced by a delegation chain
+// instead of issuing one GetByID per node.
+//
+// Returns the rows that matched; missing IDs are silently dropped (the
+// caller may filter ids belonging to other tenants, or pass IDs that
+// have since been deleted — both are non-errors for graph rendering).
+func (r *IdentityRepository) GetByIDs(ctx context.Context, ids []string, accountID, projectID string) ([]*domain.Identity, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(&identities).
+		Where("id IN (?)", bun.List(ids)).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identities by ids: %w", err)
+	}
+	return identities, nil
+}
+
 // GetByExternalID retrieves an identity by external ID within a tenant.
 func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
@@ -79,10 +105,21 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 	return identity, nil
 }
 
-// List returns identities for a tenant, optionally filtered by identity_type(s) and label.
-// The label parameter accepts "key:value" format (e.g. "product:guardrails", "team:platform")
-// and filters using JSONB containment: labels @> {"key": "value"}.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label, trustLevel, isActive, search string, limit, offset int) ([]*domain.Identity, int, error) {
+// List returns identities for a tenant, optionally filtered by identity_type(s),
+// label, and metadata.
+//
+// The label parameter accepts "key:value" format (e.g. "product:guardrails") and
+// filters using JSONB containment: labels @> {"key": "value"}.
+//
+// The metadata parameter accepts either "key" — key presence (jsonb_exists) — or
+// "key:value" — containment (metadata @> {"key": "value"}). Key-presence is used
+// e.g. to list identities that have a redteam_target object configured, whose
+// value is not a scalar and so can't be matched by containment.
+// The origin filter accepts an exact ecosystem (e.g. "okta") or the sentinel
+// "external" — any non-native (discovered) provenance. The status filter is an
+// exact lifecycle match (e.g. "discovered") — the discovery adoption inbox is
+// status="discovered". Both are independent of the legacy is_active boolean.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -103,8 +140,55 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		labelJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
 		q = q.Where("labels @> ?::jsonb", string(labelJSON))
 	}
-	if trustLevel != "" {
-		q = q.Where("trust_level = ?", trustLevel)
+	if metadata != "" {
+		parts := strings.SplitN(metadata, ":", 2)
+		if parts[0] == "" {
+			return nil, 0, fmt.Errorf("invalid metadata filter: expected key or key:value, got %q", metadata)
+		}
+		if len(parts) == 2 {
+			metaJSON, _ := json.Marshal(map[string]string{parts[0]: parts[1]})
+			q = q.Where("metadata @> ?::jsonb", string(metaJSON))
+		} else {
+			// key-presence: identities whose metadata has this top-level key.
+			q = q.Where("jsonb_exists(metadata, ?)", parts[0])
+		}
+	}
+	switch identityClass {
+	case "custom":
+		q = q.Where("NOT jsonb_exists(metadata, 'created_via')")
+	case "code_agent":
+		q = q.Where("jsonb_exists(metadata, 'created_via')")
+	}
+	if len(trustLevels) == 1 {
+		q = q.Where("trust_level = ?", trustLevels[0])
+	} else if len(trustLevels) > 1 {
+		q = q.Where("trust_level IN (?)", bun.List(trustLevels))
+	}
+	if origin != "" {
+		if origin == "external" {
+			q = q.Where("origin <> ?", string(domain.OriginNative))
+		} else {
+			q = q.Where("origin = ?", origin)
+		}
+	}
+	if len(statuses) == 1 {
+		q = q.Where("status = ?", statuses[0])
+	} else if len(statuses) > 1 {
+		q = q.Where("status IN (?)", bun.List(statuses))
+	} else {
+		// Default exclusion: 'discovered' is a pre-governance state — no
+		// credential, no owner required. These live in the Adoption Inbox
+		// (which sends status=discovered explicitly). All other callers see
+		// only governed identities by default.
+		q = q.Where("status <> ?", string(domain.IdentityStatusDiscovered))
+	}
+	if ownerUserID != "" {
+		q = q.Where("owner_user_id = ?", ownerUserID)
+	}
+	if ownerless != "" {
+		if isOwnerless, err := strconv.ParseBool(ownerless); err == nil && isOwnerless {
+			q = q.Where("(owner_user_id IS NULL OR owner_user_id = '')")
+		}
 	}
 	if isActive != "" {
 		if active, err := strconv.ParseBool(isActive); err == nil {
@@ -116,8 +200,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		}
 	}
 	if search != "" {
-		searchPattern := "%" + search + "%"
-		q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		if _, err := uuid.Parse(search); err == nil {
+			q = q.Where("(id = ? OR external_id = ?)", search, search)
+		} else {
+			searchPattern := "%" + search + "%"
+			q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		}
 	}
 
 	total, err := q.Count(ctx)
@@ -136,6 +224,163 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		return nil, 0, fmt.Errorf("failed to list identities: %w", err)
 	}
 	return identities, total, nil
+}
+
+// FacetValue is a single value+count pair in a faceted aggregation.
+type FacetValue struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
+// IdentityFacets holds grouped counts for identity filter dimensions.
+type IdentityFacets struct {
+	IdentityTypes   []FacetValue `json:"identity_types"`
+	TrustLevels     []FacetValue `json:"trust_levels"`
+	Statuses        []FacetValue `json:"statuses"`
+	IdentityClasses []FacetValue `json:"identity_classes"`
+	CreatedBy       []FacetValue `json:"created_by"`
+	// Origins is the provenance breakdown (native vs each discovery ecosystem).
+	Origins []FacetValue `json:"origins"`
+	// Ownerless is the count of identities with no human owner — the headline
+	// discovery posture signal (an orphaned/never-adopted identity). Derived
+	// from owner_user_id being empty (identity-lifecycle.md "ownerless").
+	Ownerless int `json:"ownerless"`
+	// Discovered is the count of discovered (pre-governance) identities —
+	// shown in the identity page banner linking to the adoption inbox.
+	Discovered int `json:"discovered"`
+}
+
+// GetFacets returns grouped counts for each filterable dimension, scoped to a tenant.
+// Discovered agents are excluded — they are pre-governance and surfaced separately
+// in the adoption inbox. Facet counts reflect the registered inventory only.
+func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID string) (*IdentityFacets, error) {
+	db := dbOrTx(ctx, r.db)
+	facets := &IdentityFacets{}
+	excludeDiscovered := string(domain.IdentityStatusDiscovered)
+
+	// identity_type
+	var typeFacets []FacetValue
+	err := db.NewSelect().TableExpr("identities").
+		ColumnExpr("identity_type AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		GroupExpr("identity_type").
+		OrderExpr("count DESC").
+		Scan(ctx, &typeFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity_type facets: %w", err)
+	}
+	facets.IdentityTypes = typeFacets
+
+	// trust_level
+	var trustFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("trust_level AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		GroupExpr("trust_level").
+		OrderExpr("count DESC").
+		Scan(ctx, &trustFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get trust_level facets: %w", err)
+	}
+	facets.TrustLevels = trustFacets
+
+	// status (excludes discovered — those are counted separately for the banner)
+	var statusFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("status AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		GroupExpr("status").
+		OrderExpr("count DESC").
+		Scan(ctx, &statusFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get status facets: %w", err)
+	}
+	facets.Statuses = statusFacets
+
+	// identity class (custom vs code_agent, based on metadata.created_via)
+	var classFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		GroupExpr("CASE WHEN jsonb_exists(metadata, 'created_via') THEN 'code_agent' ELSE 'custom' END").
+		OrderExpr("count DESC").
+		Scan(ctx, &classFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity_class facets: %w", err)
+	}
+	facets.IdentityClasses = classFacets
+
+	// created_by (owner_user_id)
+	var createdByFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("COALESCE(NULLIF(owner_user_id, ''), created_by) AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		Where("COALESCE(NULLIF(owner_user_id, ''), created_by) != ''").
+		GroupExpr("COALESCE(NULLIF(owner_user_id, ''), created_by)").
+		OrderExpr("count DESC").
+		Scan(ctx, &createdByFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get created_by facets: %w", err)
+	}
+	facets.CreatedBy = createdByFacets
+
+	// origin (provenance: native vs each discovery ecosystem)
+	var originFacets []FacetValue
+	err = db.NewSelect().TableExpr("identities").
+		ColumnExpr("origin AS value").
+		ColumnExpr("COUNT(*) AS count").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status <> ?", excludeDiscovered).
+		GroupExpr("origin").
+		OrderExpr("count DESC").
+		Scan(ctx, &originFacets)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get origin facets: %w", err)
+	}
+	facets.Origins = originFacets
+
+	// ownerless count — scoped to governed (non-discovered) live identities.
+	ownerless, err := db.NewSelect().TableExpr("identities").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("COALESCE(owner_user_id, '') = ''").
+		Where("status <> ?", excludeDiscovered).
+		Where("status != ?", string(domain.IdentityStatusDeactivated)).
+		Where("status != ?", string(domain.IdentityStatusExpired)).
+		Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ownerless count: %w", err)
+	}
+	facets.Ownerless = ownerless
+
+	// discovered count — separate from the registered facets above.
+	discovered, err := db.NewSelect().TableExpr("identities").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("status = ?", excludeDiscovered).
+		Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get discovered count: %w", err)
+	}
+	facets.Discovered = discovered
+
+	return facets, nil
 }
 
 // Update saves changes to an existing identity. Participates in a caller-
@@ -230,6 +475,40 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 		return false, nil, nil
 	}
 	return true, identity, nil
+}
+
+// DeactivateStaleDiscovered flips to 'deactivated' every still-`discovered`
+// identity from the given (origin, source_id) whose updated_at predates
+// notSeenSince — the rows a connector sync no longer reported. It is a bulk
+// status flip (discovered rows hold no credential, so nothing to cascade); the
+// caller_name on the context stamps modified_by so the audit trigger records who
+// pruned. Scoped by source_id so one connector's sweep never touches another's
+// agents of the same origin. Returns the number of rows deactivated.
+func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where("updated_at < ?", notSeenSince).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("deactivate stale discovered rows: %w", err)
+	}
+	return int(n), nil
 }
 
 // ListExpiredActive returns identities whose expires_at has passed while

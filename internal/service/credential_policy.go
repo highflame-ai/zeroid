@@ -23,6 +23,11 @@ var ErrPolicyViolation = errors.New("credential policy violation")
 // ErrPolicyNameConflict is returned when a policy with the same name already exists in the tenant.
 var ErrPolicyNameConflict = errors.New("credential policy with this name already exists")
 
+// ErrPolicyInUse is returned by DeletePolicy when the policy is still
+// referenced by one or more service keys. Maps to 409 Conflict at the HTTP
+// boundary — the delete is refused, the policy is left intact.
+var ErrPolicyInUse = errors.New("credential policy is still in use")
+
 // ErrInvalidPolicyField marks caller-fixable input errors emitted by
 // UpdatePolicy when the tri-state expires_at PATCH string fails to parse
 // (malformed RFC3339) or is backdated. Maps to 400 at the HTTP boundary.
@@ -106,6 +111,11 @@ type CreatePolicyRequest struct {
 	RequiredTrustLevel  string
 	RequiredAttestation string
 	MaxDelegationDepth  int
+	// Source + SourceKey mark an auto-derived policy (e.g. Source="discovery").
+	// When SourceKey is set, CreatePolicy is idempotent: a conflicting create
+	// returns the existing policy with that (source, source_key) instead of erroring.
+	Source    string
+	SourceKey string
 	// ExpiresAt time-bounds the policy. Nil means "no expiry".
 	ExpiresAt *time.Time
 }
@@ -147,13 +157,34 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		RequiredTrustLevel:  req.RequiredTrustLevel,
 		RequiredAttestation: req.RequiredAttestation,
 		MaxDelegationDepth:  req.MaxDelegationDepth,
+		Source:              req.Source,
+		SourceKey:           req.SourceKey,
 		IsActive:            true,
 		ExpiresAt:           req.ExpiresAt,
 		CreatedAt:           time.Now(),
 		UpdatedAt:           time.Now(),
 	}
 
-	if err := s.repo.Create(ctx, policy); err != nil {
+	if req.SourceKey != "" {
+		// Derived policies are idempotent by (source, source_key). ON CONFLICT DO
+		// NOTHING means a concurrent/prior adoption of the same posture doesn't
+		// error (which would poison an enclosing transaction); if we didn't insert,
+		// return the existing row.
+		inserted, err := s.repo.CreateDerived(ctx, policy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create credential policy: %w", err)
+		}
+		if !inserted {
+			existing, gerr := s.repo.GetBySourceKey(ctx, req.AccountID, req.ProjectID, req.Source, req.SourceKey)
+			if gerr != nil {
+				return nil, fmt.Errorf("failed to fetch existing derived credential policy: %w", gerr)
+			}
+			if existing == nil {
+				return nil, ErrPolicyNameConflict // no insert and no existing row — treat as a conflict
+			}
+			return existing, nil
+		}
+	} else if err := s.repo.Create(ctx, policy); err != nil {
 		if isDuplicateKeyError(err) {
 			return nil, ErrPolicyNameConflict
 		}
@@ -276,9 +307,23 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	return policy, nil
 }
 
-// DeletePolicy deletes a credential policy if no identities reference it.
+// DeletePolicy deletes a credential policy if no service keys reference it.
+// It translates the store-layer sentinels into the service-layer sentinels the
+// handler maps to HTTP status codes:
+//   - ErrPolicyInUse     → still referenced by at least one service key (409)
+//   - ErrPolicyNotFound  → no policy with this id in the tenant (404)
 func (s *CredentialPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
-	return s.repo.Delete(ctx, id, accountID, projectID)
+	err := s.repo.Delete(ctx, id, accountID, projectID)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, postgres.ErrCredentialPolicyInUse):
+		return fmt.Errorf("%w: %w", ErrPolicyInUse, err)
+	case errors.Is(err, postgres.ErrCredentialPolicyNotFound):
+		return ErrPolicyNotFound
+	default:
+		return err
+	}
 }
 
 // EnforcePolicy checks all six credential policy constraints against an issuance request.

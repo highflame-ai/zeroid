@@ -144,7 +144,14 @@ func (a *API) listSignalsOp(ctx context.Context, input *SignalListInput) (*Signa
 func (a *API) streamSignalsHandler(w http.ResponseWriter, r *http.Request) {
 	tenant, err := internalMiddleware.GetTenant(r.Context())
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, domain.ErrCodeUnauthorized, "missing tenant context")
+		// Missing X-Account-ID / X-Project-ID is a request-formedness
+		// failure — the caller (typically the operator's edge service
+		// after its own auth check) did not include the required routing
+		// headers. This is 400 Bad Request, not 401: there are no
+		// credentials in play at this layer (ZeroID admin endpoints have
+		// no built-in auth; the deployer wraps them via AdminAuthMiddleware
+		// or the network), so RFC 6750 §3 / RFC 9728 §5.1 don't apply.
+		respondWithError(w, http.StatusBadRequest, domain.ErrCodeBadRequest, "missing X-Account-ID or X-Project-ID header")
 		return
 	}
 

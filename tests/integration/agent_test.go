@@ -164,3 +164,99 @@ func TestRegisterAgent_CrossTenantCredentialPolicyRejected(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"cross-tenant credential_policy_id must be rejected at register-agent with 400")
 }
+
+// TestDeleteAgent_WithServiceKey_SoftDeletes is the regression for authn#109:
+// DELETE /agents/registry/{id} on an agent that has a service key must SOFT
+// delete (deactivate) it, not hard-delete. Previously the hard delete returned
+// 500 on the non-cascading service_keys FK (every registered agent gets a
+// bootstrap key, so all agent deletes failed). The fix deactivates instead:
+// the request succeeds, the identity row is retained as deactivated (audit
+// trail preserved + matches the "soft delete" contract), and the agent's
+// credentials are revoked on the way out.
+func TestDeleteAgent_WithServiceKey_SoftDeletes(t *testing.T) {
+	ext := uid("delete-agent-softdelete")
+	reg := registerAgent(t, ext) // registration auto-creates a service key
+
+	// Mint a live token from the bootstrap key so we can prove revocation.
+	issueResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    reg.APIKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, issueResp.StatusCode)
+	token := decode(t, issueResp)["access_token"].(string)
+	require.True(t, introspect(t, token)["active"].(bool), "token should be active before delete")
+
+	// DELETE must succeed — not 500 on the service_keys FK.
+	delResp, err := doRaw(t, http.MethodDelete, adminPath("/agents/registry/"+reg.AgentID), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, delResp.StatusCode,
+		"DELETE of an agent with a service key must succeed, not 500 on the service_keys FK")
+	_ = delResp.Body.Close()
+
+	// Soft delete: the identity row is RETAINED and flipped to deactivated.
+	getResp := get(t, adminPath("/identities/"+reg.AgentID), adminHeaders())
+	require.Equal(t, http.StatusOK, getResp.StatusCode, "identity must still exist after a soft delete")
+	assert.Equal(t, "deactivated", decode(t, getResp)["status"],
+		"DELETE must deactivate the agent, not hard-delete it")
+
+	// Credentials revoked on the way out (the "revoke its keys" half of the contract).
+	assert.False(t, introspect(t, token)["active"].(bool),
+		"DELETE must revoke the agent's credentials")
+
+	// Idempotent: deleting an already-deactivated agent still succeeds.
+	delAgain, err := doRaw(t, http.MethodDelete, adminPath("/agents/registry/"+reg.AgentID), nil, adminHeaders())
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, delAgain.StatusCode, "repeat DELETE must be idempotent")
+	_ = delAgain.Body.Close()
+}
+
+// TestRegisterAgent_ReusingDeactivatedExternalID_Returns409WithExistingID
+// covers the re-registration UX after a soft delete: because DELETE is now a
+// soft delete, the deactivated row keeps the external_id, so re-registering it
+// collides. The 409 must be actionable — it names the deactivated identity's
+// id (hidden from the active registry view) so the caller can reactivate it
+// instead of hitting an opaque "already exists".
+func TestRegisterAgent_ReusingDeactivatedExternalID_Returns409WithExistingID(t *testing.T) {
+	ext := uid("reregister-deactivated")
+	reg := registerAgent(t, ext)
+
+	delResp, err := doRaw(t, http.MethodDelete, adminPath("/agents/registry/"+reg.AgentID), nil, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, delResp.StatusCode)
+	_ = delResp.Body.Close()
+
+	// Re-registering the same external_id collides with the soft-deleted row.
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":        ext,
+		"external_id": ext,
+		"sub_type":    "orchestrator",
+		"trust_level": "first_party",
+		"created_by":  "test-user",
+	}, adminHeaders())
+	require.Equal(t, http.StatusConflict, resp.StatusCode,
+		"re-registering a soft-deleted external_id must 409 (actionable), not 500 or an opaque conflict")
+
+	body := decode(t, resp)
+
+	detail, _ := body["detail"].(string)
+	assert.Contains(t, detail, "deactivated",
+		"the 409 detail must explain the existing identity is deactivated; got %q", detail)
+	assert.Contains(t, detail, reg.AgentID,
+		"the 409 detail must include the existing identity id for reactivation; got %q", detail)
+
+	// Machine-readable detail: errors[0].value carries the existing id so a UI
+	// can offer a one-click reactivate.
+	errs, _ := body["errors"].([]any)
+	require.NotEmpty(t, errs, "expected a structured error detail carrying the existing id")
+	first, _ := errs[0].(map[string]any)
+	assert.Equal(t, reg.AgentID, first["value"],
+		"errors[0].value must be the deactivated identity id")
+
+	// Sanity: a genuinely fresh external_id still registers fine.
+	fresh := post(t, adminPath("/agents/register"), map[string]any{
+		"name": uid("fresh"), "external_id": uid("fresh-ext"),
+		"sub_type": "orchestrator", "trust_level": "first_party", "created_by": "test-user",
+	}, adminHeaders())
+	assert.Equal(t, http.StatusCreated, fresh.StatusCode)
+	_ = fresh.Body.Close()
+}

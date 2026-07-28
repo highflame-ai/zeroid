@@ -3,11 +3,20 @@
 
 server:
   port: "8899"
+  # env gates production-only safety checks in Validate(): when set to
+  # "production" (or "prod"), ZeroID refuses to start with the unsafe dev
+  # attestation stub on or with the built-in default issuer / wimse_domain
+  # left unchanged. Leave as "development" for local/test.
   env: development
   read_timeout: "15s"
   write_timeout: "15s"
   idle_timeout: "60s"
   shutdown_timeout_seconds: 30
+  # Trust X-Forwarded-Proto / X-Forwarded-Host when reconstructing the
+  # request URL for DPoP htu validation (RFC 9449 §4.3). Set true ONLY
+  # behind a trusted edge proxy that strips client-supplied values;
+  # leave false when ZeroID terminates TLS itself. Env: ZEROID_TRUST_FORWARDED_HEADERS
+  trust_forwarded_headers: false
 
 database:
   url: "postgres://zeroid:zeroid@localhost:5432/zeroid?sslmode=disable"
@@ -25,10 +34,38 @@ keys:
   rsa_key_id: "v1"
 
 token:
-  issuer: "https://highflame.ai"
-  base_url: "http://localhost:8899"
+  # Issuer is the canonical URL of this AS — the JWT iss claim, the
+  # RFC 8414 §3 discovery anchor, AND the URL prefix for every endpoint
+  # advertised in AS metadata / PRM / RFC 7592 registration_client_uri.
+  #
+  # This file is the local-dev sample; localhost:8899 matches where
+  # `make run` actually serves. Production deployments override via
+  # ZEROID_ISSUER (Helm/Terraform) to their public URL — e.g.
+  # https://auth.highflame.ai for the hosted Highflame instance.
+  #
+  # The code default in loadDefaults() is https://auth.highflame.ai;
+  # YAML overrides it for `make run`, env vars override both.
+  issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
+  # hmac_secret signs/verifies stateless authorization_code JWTs (HS256).
+  # Only needed if the authorization_code grant is enabled. When set it
+  # MUST be at least 32 bytes (Validate() rejects shorter secrets — a short
+  # secret is forgeable, and a leak forges auth codes). Prefer the env var
+  # ZEROID_HMAC_SECRET over committing a secret to YAML.
+  # hmac_secret: ""
+
+  # allow_unauthenticated_token_inspection controls whether the introspection
+  # (RFC 7662) and revocation (RFC 7009) endpoints accept anonymous callers.
+  # true  → accept-and-verify: anonymous allowed, presented client credentials
+  #         still verified. Suitable for a standalone, network-isolated
+  #         deployment or local development.
+  # false → strict: a caller MUST present client credentials; anonymous calls
+  #         are rejected with invalid_client (RFC 7662 §2.1 / RFC 7009 §2.1).
+  # Default true, BUT Validate() rejects true when server.env=production, so
+  # production is spec-compliant (strict) by default. Env override:
+  # ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION.
+  allow_unauthenticated_token_inspection: true
 
 wimse_domain: "highflame.ai"
 
@@ -38,10 +75,12 @@ wimse_domain: "highflame.ai"
 
 telemetry:
   enabled: false
-  endpoint: "localhost:4317"
-  insecure: true
   service_name: "zeroid"
   sampling_rate: 1.0
+  # NOTE: exporter endpoint / TLS are NOT configured here. They are read
+  # by the OTel SDK from the standard env vars OTEL_EXPORTER_OTLP_ENDPOINT
+  # and OTEL_EXPORTER_OTLP_INSECURE. The old telemetry.endpoint /
+  # telemetry.insecure keys were removed — setting them now fails startup.
 
 logging:
   level: "debug"
@@ -55,3 +94,39 @@ logging:
 # ZEROID_ALLOW_UNSAFE_DEV_STUB=false).
 attestation:
   allow_unsafe_dev_stub: true
+  # Relaxes the SSRF guard the OIDC verifier applies to a proof's issuer
+  # endpoint (the URL it fetches OIDC discovery + JWKS from). Default false
+  # rejects issuers resolving to private/loopback/link-local IPs. Set true
+  # ONLY in single-tenant dev/test where the attestation issuer is itself
+  # on localhost / a private network. Production MUST keep this false.
+  # Env: ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS
+  allow_private_issuer_endpoints: false
+
+# CIBA (OpenID Client-Initiated Backchannel Authentication) settings.
+backchannel:
+  # Relaxes the SSRF guard on CIBA outbound client_notification_endpoint
+  # destinations. Default false rejects endpoints resolving to
+  # private/loopback/link-local IPs (re-checked at request time as a
+  # DNS-rebinding defense). Set true ONLY in single-tenant dev/test that
+  # registers endpoints like https://localhost:9000/. Production MUST keep
+  # this false (see GHSA-599q-j34m-33vc).
+  # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
+  allow_private_notification_endpoints: false
+
+# Direct OIDC IdP federation (issue #88).
+# Each entry registers a trusted upstream issuer for RFC 8693 token exchange
+# with subject_token_type=urn:ietf:params:oauth:token-type:id_token.
+# When empty (default), only the broker path remains available.
+# external_issuers:
+#   - issuer:           "https://auth.example.okta.com"
+#     jwks_uri:         "https://auth.example.okta.com/.well-known/jwks.json"
+#     audience:         "https://zeroid.example.com"
+#     algorithms:       ["RS256", "ES256"]
+#     max_token_age:    10m
+#     jwks_cache_ttl:   5m
+#     claim_mapping:
+#       user_id:        sub
+#       email:          email
+#     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
+#     propagate_claims: ["auth_time", "acr", "amr"]
+#     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch

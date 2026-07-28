@@ -15,6 +15,18 @@ import (
 // ErrBackchannelRequestNotFound is returned when GetByAuthReqID finds no row.
 var ErrBackchannelRequestNotFound = errors.New("backchannel auth request not found")
 
+// ApprovedRedemptionGrace bounds how long an APPROVED-but-not-yet-issued CIBA
+// request stays redeemable past its own expires_at. Without an upper bound an
+// approved auth_req_id was redeemable forever AND never reaped, so a leaked
+// months-old handle still minted a token (the expiry guard only covered
+// PENDING rows). The window is generous relative to the slow-poll rationale —
+// expires_at already gives the client the full DefaultExpiry/MaxExpiry to act,
+// and this grace adds a fixed cushion on top of approval so an honest client
+// whose approval landed right at expiry can still complete one final poll —
+// while keeping approvals bounded rather than immortal. MarkIssued enforces
+// it at issuance; DeleteExpired reaps past it.
+const ApprovedRedemptionGrace = 10 * time.Minute
+
 // BackchannelRequestRepository persists CIBA authentication requests.
 type BackchannelRequestRepository struct {
 	db *bun.DB
@@ -91,12 +103,35 @@ func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID
 
 // MarkIssued transitions an approved row to issued so a second redemption of
 // the same auth_req_id returns access_denied instead of minting a second token.
-func (r *BackchannelRequestRepository) MarkIssued(ctx context.Context, authReqID string) (int64, error) {
+//
+// The cutoff guard mirrors the expires_at guard MarkApproved already carries:
+// an approved-but-leaked auth_req_id polled long after the user acted must NOT
+// mint a token. Issuance is bounded to the later of the row's own expires_at
+// and (approved_at + ApprovedRedemptionGrace), so an honest slow poll that
+// approved just before expiry still completes, while a months-old leaked
+// handle is rejected at the DB layer even if a future caller skips the
+// service-side guard (defence-in-depth, same posture as the SSRF
+// re-validation in CreateAuthRequest). `cutoff` is the latest instant at
+// which issuance is still permitted (the service passes time.Now()).
+func (r *BackchannelRequestRepository) MarkIssued(ctx context.Context, authReqID string, cutoff time.Time) (int64, error) {
+	// Derive the grace floor in Go rather than doing timestamp + interval
+	// arithmetic in SQL: a Go time.Duration is int64 nanoseconds and would
+	// NOT add correctly to a Postgres timestamptz. The row is redeemable
+	// while approved_at is newer than (cutoff - grace), which is the
+	// algebraic rearrangement of "approved_at + grace > cutoff".
+	graceFloor := cutoff.Add(-ApprovedRedemptionGrace)
 	res, err := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
 		Set("status = ?", domain.BackchannelStatusIssued).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusApproved).
+		// Bound issuance: the row must still be within either its own
+		// expires_at OR the post-approval grace window (approved_at + grace).
+		// COALESCE(approved_at, created_at) guards a NULL approved_at — an
+		// approved row always has it stamped, but COALESCE keeps the SQL
+		// well-defined if that invariant ever slips.
+		Where("(expires_at > ? OR COALESCE(approved_at, created_at) > ?)",
+			cutoff, graceFloor).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to mark backchannel request issued: %w", err)
@@ -150,18 +185,46 @@ func (r *BackchannelRequestRepository) SweepExpired(ctx context.Context, now tim
 	return res.RowsAffected()
 }
 
-// DeleteExpired reaps resolved rows (expired/denied/issued) whose expires_at
-// is past. Approved-but-not-yet-issued rows are retained so a slow poll can
-// still complete the issuance.
+// DeleteExpired reaps rows that can no longer mint a token:
+//
+//   - terminal rows (expired/denied/issued) whose expires_at is past, and
+//   - APPROVED-but-not-yet-issued rows whose post-approval grace window has
+//     also lapsed (approved_at + grace < now).
+//
+// Previously approved rows were retained indefinitely so "a slow poll can
+// still complete the issuance" — but with no upper bound, a leaked
+// approved auth_req_id stayed redeemable forever AND was never reaped. We
+// now bound it: an approved row is kept only until the later of its
+// expires_at and (approved_at + ApprovedRedemptionGrace); past both it is
+// reaped. The grace matches the redemption window MarkIssued enforces, so the
+// sweep never deletes a row that is still legitimately redeemable.
 func (r *BackchannelRequestRepository) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
+	graceFloor := now.Add(-ApprovedRedemptionGrace)
 	res, err := r.db.NewDelete().
 		Model((*domain.BackchannelAuthRequest)(nil)).
-		Where("expires_at < ?", now).
-		Where("status IN (?, ?, ?)",
-			domain.BackchannelStatusExpired,
-			domain.BackchannelStatusDenied,
-			domain.BackchannelStatusIssued,
-		).
+		WhereGroup(" AND ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
+			return q.
+				WhereGroup(" OR ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
+					// Terminal rows past their own expiry.
+					return q.
+						Where("status IN (?, ?, ?) AND expires_at < ?",
+							domain.BackchannelStatusExpired,
+							domain.BackchannelStatusDenied,
+							domain.BackchannelStatusIssued,
+							now,
+						)
+				}).
+				WhereGroup(" OR ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
+					// Approved rows that can no longer be redeemed: past
+					// both expires_at and the post-approval grace window.
+					return q.
+						Where("status = ? AND expires_at < ? AND COALESCE(approved_at, created_at) < ?",
+							domain.BackchannelStatusApproved,
+							now,
+							graceFloor,
+						)
+				})
+		}).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to delete expired backchannel requests: %w", err)

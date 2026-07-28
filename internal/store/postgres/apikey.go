@@ -77,7 +77,7 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id, accountID, projectID
 // optionally filtered by application ID, product, or identity label.
 // The label parameter accepts "key:value" format (e.g. "env:production")
 // and filters by joining on the identities table using JSONB containment.
-func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID, applicationID, product, label string, limit, offset int) ([]*domain.APIKey, int, error) {
+func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID, applicationID, product, state, label string, limit, offset int) ([]*domain.APIKey, int, error) {
 	var keys []*domain.APIKey
 
 	q := r.db.NewSelect().
@@ -95,6 +95,9 @@ func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, 
 	}
 	if product != "" {
 		q = q.Where("sk.product = ?", product)
+	}
+	if state != "" {
+		q = q.Where("sk.state = ?", state)
 	}
 	if label != "" {
 		parts := strings.SplitN(label, ":", 2)

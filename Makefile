@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version
+.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-dpop
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -60,11 +60,36 @@ cli-test: cli-install ## Run CLI tests
 
 next-version: ## Print svu-computed next semver from commits since last v* tag
 	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
-	@echo "current : $$(svu current)"
-	@echo "next    : $$(svu next)"
+	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
+		echo "current : $$($${SVU} current)"; \
+		echo "next    : $$($${SVU} next)"
 	@echo
-	@echo "Use 'gh release create \$$(svu next) --generate-notes' to cut the release."
-	@echo "(Workflow guardrail in release.yml will fail any tag below this value.)"
+	@echo "Cut a zeroid release: draft a new release in the GitHub UI with tag = svu's recommendation"
+	@echo "(or higher). See RELEASING.md."
+	@echo
+	@echo "If you changed pkg/dpop/ source: run 'make release-dpop VERSION=vX.Y.Z' FIRST to cut"
+	@echo "a new pkg/dpop release + bump zeroid's reference. Otherwise the zeroid release will"
+	@echo "fail the drift guard."
+
+release-dpop: ## Cut a new pkg/dpop release (tag + open PR bumping zeroid's reference). Requires VERSION=vX.Y.Z.
+	@command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI is required (https://cli.github.com/)"; exit 1; }
+	@if [ -z "$(VERSION)" ]; then \
+		echo "::error::VERSION is required, e.g. make release-dpop VERSION=v1.6.1"; \
+		exit 1; \
+	fi
+	@if ! printf '%s' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
+		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
+		exit 1; \
+	fi
+	@echo "Triggering release-dpop.yml with version=$(VERSION)..."
+	gh workflow run release-dpop.yml \
+		--repo highflame-ai/zeroid \
+		--field version=$(VERSION)
+	@echo
+	@echo "Watch progress:"
+	@echo "  gh run watch --repo highflame-ai/zeroid"
+	@echo "Then review + merge the auto-opened PR. After merge, your next zeroid release"
+	@echo "(cut normally via GitHub UI) will ship with pkg/dpop $(VERSION)."
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)

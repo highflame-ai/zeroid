@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -136,11 +137,12 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 	}
 
 	accessToken, cred, err := a.credSvc.IssueCredential(ctx, service.IssueRequest{
-		Identity:  identity,
-		Scopes:    input.Body.Scopes,
-		TTL:       input.Body.TTL,
-		GrantType: grantType,
-		Audience:  input.Body.Audience,
+		Identity:              identity,
+		Scopes:                input.Body.Scopes,
+		TTL:                   input.Body.TTL,
+		GrantType:             grantType,
+		Audience:              input.Body.Audience,
+		ResolveIdentityPolicy: true,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to issue credential")
@@ -208,6 +210,13 @@ func (a *API) revokeCredentialOp(ctx context.Context, input *RevokeCredentialInp
 	}
 
 	if err := a.credSvc.RevokeCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, input.Body.Reason); err != nil {
+		if errors.Is(err, service.ErrCredentialNotFound) {
+			// Zero rows matched. Could be: wrong id, tenant-scope mismatch,
+			// already revoked, or already expired. All four are "this revoke
+			// did not mutate state" — surface as 404 so the caller knows,
+			// instead of the previous silent 200-OK.
+			return nil, huma.Error404NotFound("credential not found, already revoked, or expired")
+		}
 		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to revoke credential")
 		return nil, huma.Error500InternalServerError("failed to revoke credential")
 	}
@@ -239,6 +248,13 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 
 	accessToken, newCred, err := a.credSvc.RotateCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, identity)
 	if err != nil {
+		// Terminal-state rejections are client mistakes, not server faults:
+		// map them to 409 so they neither fire 5xx alerting nor tell the
+		// caller to retry something that can never succeed. A dead
+		// credential can't be rotated — the caller must issue a new one.
+		if errors.Is(err, domain.ErrCredentialExpired) || errors.Is(err, domain.ErrCredentialAlreadyRevoked) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
 		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to rotate credential")
 		return nil, huma.Error500InternalServerError("failed to rotate credential")
 	}

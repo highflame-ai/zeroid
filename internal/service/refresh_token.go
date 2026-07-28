@@ -26,6 +26,11 @@ type RefreshTokenService struct {
 	// failed successor insert rolls back the claim, avoiding spurious reuse
 	// detection on a client retry after a transient DB error.
 	db *bun.DB
+	// revocationDispatcher fans out a RevocationEvent per revoked refresh token
+	// when reuse detection (or auth-code replay) nukes a family. Shared with
+	// CredentialService so one Server.SetRevocationNotifier wires every path.
+	// Nil-safe: unset ⇒ no events.
+	revocationDispatcher *RevocationDispatcher
 }
 
 // NewRefreshTokenService creates a new refresh token service.
@@ -42,7 +47,29 @@ type RefreshTokenParams struct {
 	IdentityID *string
 	Scopes     string
 	TTL        int // seconds, 0 = use default (90 days)
+	// DPoPKeyThumbprint binds the refresh token to a DPoP key (RFC 9449 §5).
+	// Set non-empty when the issuing /oauth2/token call carried a valid DPoP
+	// proof; every later rotation must present a proof signed by the same
+	// key. Empty ⇒ unbound (Bearer).
+	DPoPKeyThumbprint string
+	// MissionID is the delegation-tree identifier (issue #81) of the access
+	// token issued alongside this refresh token. Persisted on the family so
+	// every rotation can re-emit it, keeping a refreshing session inside one
+	// mission. Empty ⇒ no mission to carry (refresh falls back to re-rooting).
+	MissionID string
+	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
+	// this refresh token was issued for by the external-principal exchange.
+	// Persisted on the family so every rotation re-stamps the same `aud` claim
+	// (and profile scopes) on the successor access token. Empty ⇒ a normal
+	// (non-audience) refresh token whose rotation carries no `aud`.
+	Audience string
 }
+
+// ErrDPoPBindingMismatch is returned when a refresh-token rotation presents a
+// DPoP proof whose key thumbprint differs from the one persisted with the
+// token. Callers MUST map this to invalid_dpop_proof / 4xx — it is the proof
+// that failed, not the refresh token. The token itself is NOT consumed.
+var ErrDPoPBindingMismatch = errors.New("refresh token's DPoP binding does not match the presented proof")
 
 // RefreshTokenResult contains both the raw token (returned to client) and stored metadata.
 type RefreshTokenResult struct {
@@ -63,16 +90,19 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 	expiresAt := time.Now().Add(refreshTokenTTL(params.TTL))
 
 	record := &domain.RefreshToken{
-		TokenHash:  tokenHash,
-		ClientID:   params.ClientID,
-		AccountID:  params.AccountID,
-		ProjectID:  params.ProjectID,
-		UserID:     params.UserID,
-		IdentityID: params.IdentityID,
-		Scopes:     params.Scopes,
-		FamilyID:   familyID,
-		State:      domain.RefreshTokenStateActive,
-		ExpiresAt:  expiresAt,
+		TokenHash:         tokenHash,
+		ClientID:          params.ClientID,
+		AccountID:         params.AccountID,
+		ProjectID:         params.ProjectID,
+		UserID:            params.UserID,
+		IdentityID:        params.IdentityID,
+		Scopes:            params.Scopes,
+		FamilyID:          familyID,
+		State:             domain.RefreshTokenStateActive,
+		ExpiresAt:         expiresAt,
+		DPoPKeyThumbprint: params.DPoPKeyThumbprint,
+		MissionID:         params.MissionID,
+		Audience:          params.Audience,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -84,6 +114,43 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		FamilyID:  familyID,
 		ExpiresAt: expiresAt,
 	}, nil
+}
+
+// PeekRefreshToken returns the active, non-expired refresh-token row for the
+// presented raw token WITHOUT consuming (revoking) it. It is the non-mutating
+// counterpart to RotateRefreshToken's claim step: the caller can read binding
+// metadata (ClientID, IdentityID, tenant scalars) and run pre-rotation gates
+// (client_id binding, identity status/expiry) before committing the rotation.
+//
+// Crucially, a gate that fails AFTER a Peek leaves the token UNTOUCHED — the
+// client can retry with the same token once the transient condition clears.
+// This avoids the session-bricking failure mode where the rotation committed
+// (old token revoked, successor inserted) before a post-claim gate ran, then
+// discarded the successor on error: the client would then retry with a
+// now-revoked token and trip reuse detection, nuking the whole family over a
+// transient mistake (RFC 6749 §10.4).
+//
+// Returns an error if no active, non-expired token matches (expired, revoked,
+// or unknown). The caller maps this to invalid_grant; it does NOT trigger
+// reuse detection (that only fires inside RotateRefreshToken's claim path,
+// which distinguishes the grace window).
+func (s *RefreshTokenService) PeekRefreshToken(ctx context.Context, rawToken string) (*domain.RefreshToken, error) {
+	return s.repo.GetByTokenHash(ctx, hashRefreshToken(rawToken))
+}
+
+// PeekRefreshTokenIncludingRevoked returns the refresh-token row for the
+// presented raw token REGARDLESS of state (active, revoked, or expired),
+// without consuming it. It exists for reading STATE-INDEPENDENT binding
+// metadata — specifically the audience-profile name — so the refresh grant can
+// route an already-rotated audience-profile token down the same audience path
+// (where RotateRefreshToken's claim step then fires the correct reuse
+// detection) instead of misrouting it to the OAuth-client path, which has no
+// client for a client-less audience token and would 401 before reuse detection
+// ran. It MUST NOT be used for authorization decisions — an active-only
+// PeekRefreshToken / the rotation claim remains the security gate. Returns an
+// error only when no row matches (genuinely unknown token).
+func (s *RefreshTokenService) PeekRefreshTokenIncludingRevoked(ctx context.Context, rawToken string) (*domain.RefreshToken, error) {
+	return s.repo.GetByTokenHashIncludingRevoked(ctx, hashRefreshToken(rawToken))
 }
 
 // RotateRefreshToken validates the presented token, revokes it, and issues a new one.
@@ -100,7 +167,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 //     leave the original token revoked with no successor, and the client's
 //     retry would trip reuse detection and nuke the whole family — turning a
 //     transient glitch into a forced re-auth across all sessions.
-func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int) (*domain.RefreshToken, *RefreshTokenResult, error) {
+func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken string, ttl int, presentedDPoPThumbprint string) (*domain.RefreshToken, *RefreshTokenResult, error) {
 	tokenHash := hashRefreshToken(rawToken)
 
 	newRawToken, err := generateRefreshToken()
@@ -116,6 +183,14 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 		if err != nil {
 			return err
 		}
+		// DPoP binding check (RFC 9449 §5). A refresh token issued under
+		// DPoP must rotate only when the presented proof carries the same
+		// public key. Mismatch rolls back the transaction — the original
+		// row stays active, so a failed-proof attempt does NOT consume
+		// the token (no DoS via spamming bad proofs).
+		if c.DPoPKeyThumbprint != "" && c.DPoPKeyThumbprint != presentedDPoPThumbprint {
+			return ErrDPoPBindingMismatch
+		}
 		claimed = c
 
 		successor := &domain.RefreshToken{
@@ -129,10 +204,31 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			FamilyID:   c.FamilyID, // Same family — rotation chain.
 			State:      domain.RefreshTokenStateActive,
 			ExpiresAt:  expiresAt,
+			// Bound tokens stay bound; UNBOUND tokens stay unbound, even if
+			// the new rotation request carried a DPoP proof. Retroactive
+			// binding-on-first-proof is a deliberate non-decision today —
+			// the consequence is that a stolen unbound refresh can be
+			// rotated with any DPoP key, but binding requires explicit
+			// opt-in at original issuance. See docs/dpop-and-dcr.md
+			// "Refresh-token binding" for the full rationale.
+			DPoPKeyThumbprint: c.DPoPKeyThumbprint,
+			// Carry the delegation tree forward (issue #81). Without this the
+			// mission would survive the first refresh (seeded on the family at
+			// issuance) but be lost on the second rotation, re-fragmenting the
+			// tree. Copied verbatim like the DPoP thumbprint above.
+			MissionID: c.MissionID,
+			// Carry the audience-profile forward so every rotation re-stamps the
+			// same `aud` claim on its access token. Without this the audience
+			// would survive the first refresh (seeded at issuance) but be lost on
+			// the second rotation, and the harness daemon would reject the token.
+			Audience: c.Audience,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})
 	if txErr != nil {
+		if errors.Is(txErr, ErrDPoPBindingMismatch) {
+			return nil, nil, ErrDPoPBindingMismatch
+		}
 		if errors.Is(txErr, sql.ErrNoRows) {
 			return nil, nil, s.handleFailedClaim(ctx, tokenHash)
 		}
@@ -181,14 +277,17 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 			return fmt.Errorf("refresh token already rotated")
 		}
 
-		count, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
+		revoked, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
 		log.Warn().
 			Str("family_id", existing.FamilyID).
 			Str("user_id", existing.UserID).
 			Str("client_id", existing.ClientID).
-			Int64("revoked_count", count).
+			Int("revoked_count", len(revoked)).
 			Err(revokeErr).
 			Msg("Refresh token reuse detected — entire family revoked")
+		// Fan out one revocation event per revoked token after the family
+		// revocation commits (detached; never blocks reuse-detection's response).
+		s.dispatchRefreshRevocations(ctx, revoked, "refresh_token_reuse")
 		return fmt.Errorf("refresh token reuse detected — family revoked")
 	}
 
@@ -207,10 +306,59 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 	return fmt.Errorf("refresh token in unexpected state")
 }
 
-// RevokeFamily revokes all active tokens in a refresh token family.
-// Used during auth code replay detection per RFC 6749 §4.1.2.
-func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID string) (int64, error) {
-	return s.repo.RevokeFamily(ctx, familyID)
+// SetRevocationDispatcher attaches the shared revocation-event dispatcher.
+// Wired once at server construction; shares the dispatcher with
+// CredentialService. Nil-safe.
+func (s *RefreshTokenService) SetRevocationDispatcher(d *RevocationDispatcher) {
+	s.revocationDispatcher = d
+}
+
+// RevokeFamily revokes all active tokens in a refresh token family and fires a
+// RevocationNotifier event per revoked token. Used during refresh-token reuse
+// detection (RFC 6749 §10.4) and auth-code replay detection (§4.1.2) — the
+// caller passes the reason so each path is labelled correctly on the emitted
+// events (e.g. "refresh_token_reuse" vs "auth_code_replay").
+//
+// Returns the number of tokens revoked. The revocation commits before the
+// events are dispatched (on the shared dispatcher's detached goroutine), so a
+// slow subscriber never blocks reuse-detection's response.
+func (s *RefreshTokenService) RevokeFamily(ctx context.Context, familyID, reason string) (int64, error) {
+	revoked, err := s.repo.RevokeFamily(ctx, familyID)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRefreshRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
+// dispatchRefreshRevocations maps revoked refresh-token rows into
+// RevocationEvents and hands them to the shared dispatcher. The refresh token's
+// UUID is used as the JTI surrogate (refresh tokens are opaque and carry no JWT
+// id), and ExpiresAt is the token's own expiry so subscribers can size their
+// deny-set TTL. No-op when no dispatcher/notifier is attached.
+func (s *RefreshTokenService) dispatchRefreshRevocations(ctx context.Context, revoked []*domain.RefreshToken, reason string) {
+	// hasNotifier short-circuit keeps the default no-listener path allocation-free:
+	// skip building the events slice + mapping loop when nobody is subscribed.
+	if s.revocationDispatcher == nil || !s.revocationDispatcher.hasNotifier() || len(revoked) == 0 {
+		return
+	}
+	events := make([]RevocationEvent, 0, len(revoked))
+	for _, rt := range revoked {
+		identityID := ""
+		if rt.IdentityID != nil {
+			identityID = *rt.IdentityID
+		}
+		events = append(events, RevocationEvent{
+			JTI:        rt.ID, // refresh tokens have no jti; the row UUID is the stable handle
+			IdentityID: identityID,
+			AccountID:  rt.AccountID,
+			ProjectID:  rt.ProjectID,
+			ExpiresAt:  rt.ExpiresAt,
+			Reason:     reason,
+			RevokedAt:  time.Now(),
+		})
+	}
+	s.revocationDispatcher.Dispatch(ctx, events)
 }
 
 // refreshTokenTTL resolves the effective token lifetime: a positive

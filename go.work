@@ -1,0 +1,28 @@
+// Go workspace for in-repo development across zeroid's three published
+// modules. When you run `go build` or `go test` from anywhere inside the
+// repo, Go reads this file and treats the three modules as one workspace
+// — local code in ./pkg/authjwt and ./pkg/dpop is used directly,
+// regardless of what versions zeroid/go.mod's require directives
+// declare. This lets zeroid/go.mod reference real published subpackage
+// versions (required for downstream `go get` resolution) without
+// breaking the in-repo dev loop.
+//
+// pkg/authjwt is also covered by a `replace ./pkg/authjwt` directive in
+// zeroid/go.mod. That replace is redundant with this workspace for the
+// common dev path, but keeps `GOWORK=off` builds working (some CI
+// matrix variants disable workspace mode). pkg/dpop has no such
+// replace — its version reference in zeroid/go.mod is a real
+// published version (decoupled release cadence via release-dpop.yml).
+//
+// Releases: see RELEASING.md. Normal zeroid release is just "click
+// Publish in UI" — no version-bumping ceremony required because
+// zeroid/go.mod pins pkg/dpop to a specific released version that
+// stays static across most zeroid releases.
+
+go 1.26.0
+
+use (
+	.
+	./pkg/authjwt
+	./pkg/dpop
+)

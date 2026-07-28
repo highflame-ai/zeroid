@@ -19,23 +19,28 @@ type SignalSubscriber chan *domain.CAESignal
 
 // SignalService handles CAE signal ingestion and fan-out to subscribers.
 type SignalService struct {
-	repo         *postgres.SignalRepository
-	credRepo     *postgres.CredentialRepository
-	identityRepo *postgres.IdentityRepository
-	mu           sync.RWMutex
-	subscribers  map[string]SignalSubscriber
+	repo          *postgres.SignalRepository
+	credentialSvc *CredentialService
+	identityRepo  *postgres.IdentityRepository
+	mu            sync.RWMutex
+	subscribers   map[string]SignalSubscriber
 }
 
 // NewSignalService creates a new SignalService. identityRepo is required so
 // IngestSignal can verify that a caller-supplied identity_id actually belongs
 // to the caller's tenant before cascading a high/critical-severity revoke
 // to its credentials.
-func NewSignalService(repo *postgres.SignalRepository, credRepo *postgres.CredentialRepository, identityRepo *postgres.IdentityRepository) *SignalService {
+//
+// The auto-revoke cascade routes through credentialSvc (not the credential repo
+// directly) so the RevocationNotifier hook fires one event per revoked JTI —
+// the CAE high/critical signal cascade is one of the documented revocation
+// fire-points.
+func NewSignalService(repo *postgres.SignalRepository, credentialSvc *CredentialService, identityRepo *postgres.IdentityRepository) *SignalService {
 	return &SignalService{
-		repo:         repo,
-		credRepo:     credRepo,
-		identityRepo: identityRepo,
-		subscribers:  make(map[string]SignalSubscriber),
+		repo:          repo,
+		credentialSvc: credentialSvc,
+		identityRepo:  identityRepo,
+		subscribers:   make(map[string]SignalSubscriber),
 	}
 }
 
@@ -83,7 +88,7 @@ func (s *SignalService) IngestSignal(ctx context.Context, accountID, projectID, 
 				Msg("signal references identity outside caller tenant; skipping auto-revoke")
 		} else {
 			reason := fmt.Sprintf("auto-revoked by CAE signal %s (severity: %s)", signal.ID, severity)
-			n, err := s.credRepo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+			n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identityID, reason)
 			if err != nil {
 				log.Error().Err(err).Str("identity_id", identityID).Msg("Failed to auto-revoke credentials on high/critical signal")
 			} else if n > 0 {

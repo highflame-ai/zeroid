@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+httpx
+PyJWT[cryptography]
+prometheus-client
+PyYAML
+highflame

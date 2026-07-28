@@ -111,20 +111,27 @@ func (s *ProofService) VerifyProofToken(ctx context.Context, tokenStr, expectedA
 		return nil, fmt.Errorf("proof token validation failed: %w", err)
 	}
 
+	// A WPT without a jti cannot participate in single-use enforcement —
+	// reject it as malformed rather than letting the empty string fall
+	// through to MarkUsed, where the inevitable zero-row claim would
+	// surface as a misleading ErrNonceReplayed.
 	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return nil, fmt.Errorf("proof token validation failed: missing jti claim")
+	}
 
-	// Check if already used (single-use enforcement).
-	pt, err := s.proofRepo.GetByJTI(ctx, jti)
+	// Single-use enforcement: claim the token via the conditional UPDATE in
+	// MarkUsed. Zero rows claimed means another verification got there first
+	// (or the JTI was never issued) — both are replays from this caller's
+	// perspective. A read-then-check here would race: two concurrent
+	// verifications of the same WPT could both observe is_used = FALSE and
+	// both succeed.
+	affected, err := s.proofRepo.MarkUsed(ctx, jti)
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup proof token: %w", err)
-	}
-	if pt.IsUsed {
-		return nil, ErrNonceReplayed
-	}
-
-	// Mark as used atomically.
-	if err := s.proofRepo.MarkUsed(ctx, jti); err != nil {
 		return nil, fmt.Errorf("failed to mark proof token as used: %w", err)
+	}
+	if affected == 0 {
+		return nil, ErrNonceReplayed
 	}
 
 	return parsed, nil

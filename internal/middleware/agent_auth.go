@@ -35,6 +35,13 @@ type AgentAuthConfig struct {
 	PublicKey *ecdsa.PublicKey
 	// Issuer is the expected iss claim value.
 	Issuer string
+	// ResourceMetadataURL is the absolute URL of this server's RFC 9728
+	// Protected Resource Metadata document. Emitted in the WWW-Authenticate
+	// header on every 401 so cold-start clients can chain resource → PRM →
+	// AS metadata per RFC 9728 §5.1. Empty disables the breadcrumb (e.g.
+	// for legacy deployments that haven't migrated to issuer-anchored
+	// discovery).
+	ResourceMetadataURL string
 }
 
 // AgentAuthMiddleware validates ES256 Bearer tokens issued by ZeroID and injects agent claims into context.
@@ -43,16 +50,45 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				// RFC 6750 §3: "If the request lacks any authentication
+				// information, the resource server SHOULD NOT include an
+				// error code or other error information." Emit a bare
+				// Bearer challenge — the RFC 9728 §5.1 resource_metadata
+				// breadcrumb still gets attached (the SHOULD-NOT clause
+				// scopes to error info, not discovery hints), so a
+				// cold-start client can still find PRM.
+				//
+				// The JSON body still carries a human-readable message
+				// (`bodyMessage`) so a developer reading the response gets
+				// actionable signal — the SHOULD-NOT-include-error-info
+				// guidance is about the WWW-Authenticate header, not the
+				// response body which is a ZeroID-internal convention.
+				writeAgentAuthError(w, "", "", "Authorization header is required", cfg.ResourceMetadataURL)
+				return
+			}
 			if !strings.HasPrefix(authHeader, "Bearer ") {
-				writeAgentAuthError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
+				// Credentials WERE sent, just not in a recognized scheme —
+				// RFC 6750 §3.1 error_code applies here.
+				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer scheme", "Authorization header must use the Bearer scheme", cfg.ResourceMetadataURL)
 				return
 			}
 			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
+			// `Bearer ` with no token after the prefix is a malformed
+			// request, not a token-validation failure — there is no token
+			// to validate. RFC 6750 §3.1 invalid_request applies; short-
+			// circuiting before jwtalg.Validate also avoids an unnecessary
+			// JWS parse on input that can never succeed.
+			if tokenStr == "" {
+				writeAgentAuthError(w, "invalid_request", "Authorization header carries an empty Bearer token", "Authorization header carries an empty Bearer token", cfg.ResourceMetadataURL)
+				return
+			}
+
 			// Reject alg=none / HS* before any further work — JWT-SVID §3.
 			if err := jwtalg.Validate(tokenStr); err != nil {
 				log.Warn().Err(err).Str("path", r.URL.Path).Msg("Agent JWT rejected: bad alg")
-				writeAgentAuthError(w, http.StatusUnauthorized, "invalid or expired token")
+				writeAgentAuthError(w, "invalid_token", "invalid or expired token", "invalid or expired token", cfg.ResourceMetadataURL)
 				return
 			}
 
@@ -63,14 +99,14 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 			)
 			if err != nil {
 				log.Warn().Err(err).Str("path", r.URL.Path).Msg("Agent JWT validation failed")
-				writeAgentAuthError(w, http.StatusUnauthorized, "invalid or expired token")
+				writeAgentAuthError(w, "invalid_token", "invalid or expired token", "invalid or expired token", cfg.ResourceMetadataURL)
 				return
 			}
 
 			claims := extractAgentClaims(parsed)
 
 			if claims.AccountID == "" || claims.ProjectID == "" {
-				writeAgentAuthError(w, http.StatusUnauthorized, "token missing required tenant claims")
+				writeAgentAuthError(w, "invalid_token", "token missing required tenant claims", "token missing required tenant claims", cfg.ResourceMetadataURL)
 				return
 			}
 
@@ -132,13 +168,30 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	return claims
 }
 
-func writeAgentAuthError(w http.ResponseWriter, status int, message string) {
+// writeAgentAuthError emits a 401 response with an RFC 6750 §3 challenge in
+// the WWW-Authenticate header.
+//
+//   - errorCode      — RFC 6750 §3.1 value ("invalid_request", "invalid_token",
+//     "insufficient_scope"). Empty when the request lacks any auth info, per
+//     RFC 6750 §3 SHOULD-NOT-emit-error-info.
+//   - headerMessage  — error_description value in the header. Same RFC 6750 §3
+//     constraint as errorCode: empty when the request lacked auth info.
+//   - bodyMessage    — human-readable message for the JSON response body.
+//     This is ZeroID's internal convention, NOT subject to the RFC 6750 §3
+//     SHOULD-NOT clause (which scopes to the header). Always populate this so
+//     a developer reading the response gets actionable signal even when the
+//     header is intentionally bare.
+//
+// When resourceMetadataURL is non-empty, RFC 9728 §5.1's resource_metadata
+// parameter is appended so cold-start clients can discover the PRM document.
+func writeAgentAuthError(w http.ResponseWriter, errorCode, headerMessage, bodyMessage, resourceMetadataURL string) {
+	w.Header().Set("WWW-Authenticate", WWWAuthenticate(errorCode, headerMessage, resourceMetadataURL))
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusUnauthorized)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{
-			"code":    status,
-			"message": message,
+			"code":    http.StatusUnauthorized,
+			"message": bodyMessage,
 		},
 	})
 }

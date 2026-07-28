@@ -9,11 +9,12 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
 	github.com/highflame-ai/zeroid/pkg/authjwt v0.0.0
+	github.com/highflame-ai/zeroid/pkg/dpop v1.6.0
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
-	github.com/lestrrat-go/jwx/v4 v4.0.1
-	github.com/rs/zerolog v1.34.0
+	github.com/lestrrat-go/jwx/v4 v4.0.2
+	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
@@ -27,8 +28,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.43.0
 	go.opentelemetry.io/otel/sdk/metric v1.43.0
 	go.opentelemetry.io/otel/trace v1.43.0
-	golang.org/x/crypto v0.49.0
-	google.golang.org/grpc v1.80.0
+	golang.org/x/crypto v0.52.0
 )
 
 require (
@@ -95,14 +95,26 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
-	golang.org/x/net v0.52.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/text v0.35.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/grpc v1.82.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
 
+// pkg/authjwt is import-only-from-tests. Go does not follow test
+// imports across module boundaries, so the v0.0.0 placeholder in the
+// require directive above is invisible to downstream consumers — they
+// never try to resolve it. The local replace keeps `GOWORK=off` builds
+// inside this repo working (e.g. some CI matrix variants); the
+// go.work file at the repo root provides the same override for
+// default workspace-mode builds.
+//
+// pkg/dpop intentionally does NOT have a local replace — it's
+// referenced at a real published version in the require block above
+// (decoupled release cadence via release-dpop.yml). See RELEASING.md.
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt

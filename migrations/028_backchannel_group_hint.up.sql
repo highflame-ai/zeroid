@@ -1,0 +1,31 @@
+-- 028_backchannel_group_hint.up.sql
+-- CIBA extension: group_hint targeting parameter.
+--
+-- CIBA Core 1.0 §7.1 specifies login_hint / login_hint_token / id_token_hint
+-- as the canonical targeting parameters — all of which name a single
+-- end-user. For policy-driven approval flows (e.g. AARM STEP_UP with
+-- `@step_up_required("finance_lead")`) where a *role* satisfying many
+-- users is the natural target, pinning to one user is fragile (out of
+-- office, ambiguous pick, single point of failure). The group_hint
+-- extension lets clients pass an opaque deployer-namespaced string
+-- (e.g. "highflame:role:finance_lead", "pd:schedule:P12345") and the
+-- deployer's BackchannelNotifier resolves it at delivery time.
+--
+-- Storage shape:
+--   * VARCHAR(255) — small enough to live alongside the row's other
+--     varchar columns, large enough to hold any reasonable namespace
+--     scheme. The cap matches binding_message's defensive bound.
+--   * Default empty string so existing rows surface as "no group_hint"
+--     without a NULL check in consumer code.
+--
+-- Validation:
+--   * zeroid treats the column value as opaque; no namespace validation
+--     beyond the length cap. The deployer's notifier hook owns
+--     interpretation.
+--   * At least one of {login_hint, login_hint_token, id_token_hint,
+--     group_hint} MUST be present on bc-authorize per CIBA Core §7.1's
+--     intent. zeroid enforces this at the service layer (handler reads
+--     the field, service validates; column itself accepts empty).
+
+ALTER TABLE backchannel_auth_requests
+    ADD COLUMN IF NOT EXISTS group_hint VARCHAR(255) NOT NULL DEFAULT '';

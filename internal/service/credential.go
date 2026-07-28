@@ -26,6 +26,17 @@ type CredentialService struct {
 	issuer          string
 	defaultTTL      int
 	maxTTL          int
+	// auditRetention is how long past expiry an issued_credentials row
+	// stays queryable (the evidence clock the cleanup worker prunes on),
+	// so the delegation graph survives token expiry. From
+	// token.audit_retention_days.
+	auditRetention time.Duration
+	// revocationDispatcher fans out a RevocationEvent per revoked JTI to the
+	// deployer-supplied RevocationNotifier after each revocation commits.
+	// Shared with RefreshTokenService so one Server.SetRevocationNotifier call
+	// wires every revocation path. Nil-safe: when no dispatcher is attached, or
+	// no notifier is set on it, revocation behaviour is unchanged.
+	revocationDispatcher *RevocationDispatcher
 }
 
 // NewCredentialService creates a new CredentialService.
@@ -35,8 +46,20 @@ func NewCredentialService(
 	policySvc *CredentialPolicyService,
 	attestationRepo *postgres.AttestationRepository,
 	issuer string,
-	defaultTTL, maxTTL int,
+	defaultTTL, maxTTL, auditRetentionDays int,
 ) *CredentialService {
+	// Clamp defensively: this constructor is also reached from tests and
+	// external tools that bypass Config.Validate. A non-positive value would
+	// stamp AuditRetentionUntil at or before expiry (degrading the graph back
+	// to delete-at-expiry); an enormous value would overflow the
+	// days→Duration multiplication into a negative duration (same effect,
+	// worse). Both collapse to safe bounds — misconfiguration must never
+	// erase evidence. Bounds shared with Config.Validate via domain.
+	if auditRetentionDays <= 0 {
+		auditRetentionDays = domain.DefaultAuditRetentionDays
+	} else if auditRetentionDays > domain.MaxAuditRetentionDays {
+		auditRetentionDays = domain.MaxAuditRetentionDays
+	}
 	return &CredentialService{
 		repo:            repo,
 		jwksSvc:         jwksSvc,
@@ -45,6 +68,7 @@ func NewCredentialService(
 		issuer:          issuer,
 		defaultTTL:      defaultTTL,
 		maxTTL:          maxTTL,
+		auditRetention:  time.Duration(auditRetentionDays) * 24 * time.Hour,
 	}
 }
 
@@ -115,6 +139,22 @@ type IssueRequest struct {
 	// mission). Non-empty on token_exchange — the caller has resolved the
 	// subject_token's mission and is propagating it down the chain.
 	MissionID string
+	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
+	// the client's DPoP public key. When non-empty, the issued JWT carries a
+	// cnf.jkt claim binding the token to that key, and token_type is returned
+	// as "DPoP" instead of "Bearer" (RFC 9449 §6.1).
+	DPoPKeyThumbprint string
+	// ResolveIdentityPolicy asks IssueCredential to resolve and enforce the
+	// identity's policy when IdentityPolicyID is empty. The OAuth grant paths
+	// resolve the policy themselves (and only for grants gated at the identity
+	// layer — authorization_code/refresh_token/CIBA tokens minted for a client
+	// with no linked identity are deliberately governed by the client, not an
+	// identity policy). The three issuance paths that historically bypassed the
+	// ceiling — RotateCredential, the admin issue handler, and post-attestation
+	// verification — set this so the chokepoint resolves the identity's policy
+	// (own CredentialPolicyID, else tenant default) and enforces it. Leaving it
+	// false preserves the prior behavior for every other caller.
+	ResolveIdentityPolicy bool
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -268,16 +308,43 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 
 		// Identity policy — governance ceiling.
-		if req.IdentityPolicyID != "" {
-			policy, err := s.policySvc.GetPolicy(ctx, req.IdentityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+		//
+		// Callers on the OAuth grant paths resolve the identity's policy
+		// themselves (via IdentityService.ResolveCredentialPolicy) and pass
+		// its ID in IdentityPolicyID — and only do so for grants gated at the
+		// identity layer. Three other issuance paths — RotateCredential, the
+		// admin issue handler, and post-attestation verification — historically
+		// left IdentityPolicyID empty, which turned this "authoritative
+		// chokepoint" into a no-op for them and let a since-tightened ceiling be
+		// bypassed. They now set ResolveIdentityPolicy so the chokepoint
+		// resolves the governing policy when none was supplied, mirroring
+		// ResolveCredentialPolicy: prefer the identity's own CredentialPolicyID,
+		// else the tenant default (EnsureDefaultPolicy, which always yields a
+		// policy so a tenant that never configured one is governed by the
+		// default rather than rejected). Callers that pass IdentityPolicyID keep
+		// using exactly that policy; we never re-resolve or override it. Callers
+		// that neither pass an ID nor opt in are unaffected — preserving the
+		// client-gated behavior of authorization_code/refresh_token/CIBA tokens
+		// minted for clients with no linked identity.
+		identityPolicyID := req.IdentityPolicyID
+		if identityPolicyID == "" && req.ResolveIdentityPolicy {
+			resolved, err := s.resolveIdentityPolicyID(ctx, req.Identity)
 			if err != nil {
-				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", req.IdentityPolicyID, err)
+				return nil, nil, fmt.Errorf("failed to resolve identity credential policy: %w", err)
+			}
+			identityPolicyID = resolved
+		}
+
+		if identityPolicyID != "" {
+			policy, err := s.policySvc.GetPolicy(ctx, identityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+			if err != nil {
+				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", identityPolicyID, err)
 			}
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
 					Str("identity_id", req.Identity.ID).
-					Str("policy_id", req.IdentityPolicyID).
+					Str("policy_id", identityPolicyID).
 					Str("policy_layer", "identity").
 					Msg("Identity policy enforcement denied issuance")
 				return nil, nil, err
@@ -286,8 +353,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 
 		// API key policy — per-credential restriction. Checked only when a
 		// distinct policy is supplied; if the API key inherits the identity
-		// policy we skip the redundant enforcement.
-		if req.CredentialPolicyID != "" && req.CredentialPolicyID != req.IdentityPolicyID {
+		// policy we skip the redundant enforcement. Compared against the
+		// resolved identity policy (not the raw request field) so the skip
+		// still fires when the identity policy was resolved at this layer.
+		if req.CredentialPolicyID != "" && req.CredentialPolicyID != identityPolicyID {
 			policy, err := s.policySvc.GetPolicy(ctx, req.CredentialPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
 			if err != nil {
 				return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
@@ -356,6 +425,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// make identity-aware decisions without calling back to ZeroID.
 	if req.Identity.Name != "" {
 		_ = token.Set("name", req.Identity.Name)
+	} else if req.UserName != "" {
+		// No principal-specific name (e.g. the trusted external-principal
+		// exchange, where the minted principal is an ephemeral service
+		// identity acting on behalf of a human). Fall back to the acting
+		// user's display name so the OIDC-standard `name` claim (RFC 7519 /
+		// OpenID Connect) is populated for spec-compliant clients that read
+		// it. `user_name` below still carries the value verbatim; this only
+		// mirrors it into the reserved `name` claim when nothing else owns it.
+		_ = token.Set("name", req.UserName)
 	}
 	if req.Identity.Framework != "" {
 		_ = token.Set("framework", req.Identity.Framework)
@@ -419,6 +497,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
 	}
 
+	// DPoP binding: embed cnf.jkt so resource servers can match the proof key (RFC 9449 §6.1).
+	if req.DPoPKeyThumbprint != "" {
+		_ = token.Set("cnf", map[string]string{"jkt": req.DPoPKeyThumbprint})
+	}
+
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
 	// kid lets verifiers pick the right key from the JWKS; typ=JWT is per
 	// JWT-SVID §3 (jwx doesn't default it).
@@ -439,7 +522,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		return nil, nil, fmt.Errorf("failed to sign JWT: %w", signErr)
 	}
 
-	// Persist credential record
+	// Persist credential record. AuditRetentionUntil (evidence clock) is
+	// stamped at issuance so the row outlives the token: the delegation
+	// graph reads expired rows within the retention window (see the
+	// cleanup worker's two-clock prune).
+	auditRetentionUntil := expiresAt.Add(s.auditRetention)
 	cred := &domain.IssuedCredential{
 		ID:                    uuid.New().String(),
 		IdentityID:            stringPtrOrNil(req.Identity.ID),
@@ -458,6 +545,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		DRMHash:               req.DRMHash,
 		ConstraintCatalogHash: req.ConstraintCatalogHash,
 		MissionID:             missionID,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		AuditRetentionUntil:   &auditRetentionUntil,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
@@ -471,9 +560,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Int("ttl_seconds", ttl).
 		Msg("Credential issued")
 
+	tokenType := "Bearer"
+	if req.DPoPKeyThumbprint != "" {
+		tokenType = "DPoP"
+	}
 	accessToken := &domain.AccessToken{
 		AccessToken: string(signed),
-		TokenType:   "Bearer",
+		TokenType:   tokenType,
 		ExpiresIn:   ttl,
 		Scope:       strings.Join(req.Scopes, " "),
 		JTI:         jti,
@@ -501,23 +594,123 @@ func (s *CredentialService) ListCredentialsByMission(ctx context.Context, missio
 	return s.repo.ListByMissionID(ctx, missionID, accountID, projectID)
 }
 
-// RevokeCredential revokes a credential by ID.
+// SetRevocationDispatcher attaches the shared revocation-event dispatcher.
+// Wired once at server construction; the same dispatcher is shared with
+// RefreshTokenService so a single Server.SetRevocationNotifier configures every
+// revocation path. Nil-safe — when unset, revocation emits no events.
+func (s *CredentialService) SetRevocationDispatcher(d *RevocationDispatcher) {
+	s.revocationDispatcher = d
+}
+
+// RevokeCredential revokes a credential by ID and cascades to any delegated
+// descendants. Fires one RevocationNotifier event per affected JTI after the
+// revocation commits (on a detached goroutine — never on the request's
+// critical path).
+//
+// Returns ErrCredentialNotFound when the underlying cascade matches zero
+// rows. The SQL function filters on id + account_id + project_id, and skips
+// rows that are already revoked or past expires_at — so a zero-row outcome
+// means one of: wrong id, tenant-scope mismatch, already revoked, or
+// already expired. Mapping all four to a typed error turns what used to be
+// a silent 200-OK no-op (the handler always set revoked:true) into an
+// explicit failure the caller can react to. Real DB errors still surface
+// as the underlying error.
 func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID, projectID, reason string) error {
 	if reason == "" {
 		reason = "manual_revocation"
 	}
-	return s.repo.Revoke(ctx, id, accountID, projectID, reason)
+	revoked, err := s.repo.Revoke(ctx, id, accountID, projectID, reason)
+	if err != nil {
+		return err
+	}
+	if len(revoked) == 0 {
+		return ErrCredentialNotFound
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return nil
 }
 
 // RevokeAllActiveForIdentity revokes every active credential issued to the given
 // identity and cascades to any delegated descendants via the parent_jti chain.
 // Returns the total number of credentials revoked. Used during agent deactivation
-// so existing tokens stop working immediately rather than surviving until TTL.
+// (and CAE high/critical signal ingest) so existing tokens stop working
+// immediately rather than surviving until TTL.
+//
+// Fires one RevocationNotifier event per affected JTI after the revocation
+// commits — if the cascade revokes N tokens, N events are emitted, each on the
+// shared dispatcher's detached goroutine so the caller's path is never blocked.
 func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, identityID, reason string) (int64, error) {
 	if reason == "" {
 		reason = "identity_deactivated"
 	}
-	return s.repo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+	revoked, err := s.repo.RevokeAllActiveForIdentity(ctx, identityID, reason)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
+// dispatchRevocations maps the repository's affected-row projection into
+// RevocationEvents and hands them to the shared dispatcher. The dispatcher
+// itself owns the async/sync decision, the notifier-installed check, and the
+// detached-goroutine lifecycle (mirroring the backchannel notifier). No-op when
+// no dispatcher is attached or no notifier is installed — the no-listener path
+// stays exactly as cheap as before this hook existed.
+func (s *CredentialService) dispatchRevocations(ctx context.Context, revoked []postgres.RevokedCredential, reason string) {
+	// hasNotifier short-circuit keeps the default no-listener path allocation-free:
+	// skip building the events slice + mapping loop when nobody is subscribed.
+	if s.revocationDispatcher == nil || !s.revocationDispatcher.hasNotifier() || len(revoked) == 0 {
+		return
+	}
+	events := make([]RevocationEvent, 0, len(revoked))
+	for _, rc := range revoked {
+		identityID := ""
+		if rc.IdentityID != nil {
+			identityID = *rc.IdentityID
+		}
+		events = append(events, RevocationEvent{
+			JTI:        rc.JTI,
+			IdentityID: identityID,
+			AccountID:  rc.AccountID,
+			ProjectID:  rc.ProjectID,
+			ExpiresAt:  rc.ExpiresAt,
+			Reason:     reason,
+			RevokedAt:  rc.RevokedAt,
+		})
+	}
+	s.revocationDispatcher.Dispatch(ctx, events)
+}
+
+// resolveIdentityPolicyID returns the ID of the credential policy that
+// governs this identity, to be used as the authority ceiling at the issuance
+// chokepoint when the caller didn't supply one explicitly.
+//
+// It mirrors IdentityService.ResolveCredentialPolicy: prefer the identity's
+// own CredentialPolicyID, otherwise fall back to the tenant default
+// (EnsureDefaultPolicy, which creates one on first use). The chokepoint owns
+// this resolution so every issuance path is governed even when its caller
+// forgot to resolve and pass IdentityPolicyID. CredentialService already holds
+// policySvc, so this introduces no new dependency and no import cycle (the
+// OAuth-side resolver lives on IdentityService, which depends on
+// CredentialService — reaching the other way would cycle).
+//
+// EnsureDefaultPolicy always returns a policy, so this never produces an
+// "unrestricted, no policy" outcome for a tenant that simply never configured
+// one — that tenant is governed by the permissive default policy, matching the
+// OAuth grant paths exactly.
+func (s *CredentialService) resolveIdentityPolicyID(ctx context.Context, identity *domain.Identity) (string, error) {
+	if s.policySvc == nil || identity == nil {
+		return "", nil
+	}
+	if identity.CredentialPolicyID != "" {
+		return identity.CredentialPolicyID, nil
+	}
+	policy, err := s.policySvc.EnsureDefaultPolicy(ctx, identity.AccountID, identity.ProjectID)
+	if err != nil {
+		return "", err
+	}
+	return policy.ID, nil
 }
 
 // RotateCredential revokes an existing credential and immediately issues a new one for the same identity.
@@ -527,21 +720,35 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 	if err != nil {
 		return nil, nil, fmt.Errorf("credential not found: %w", err)
 	}
+	// Both terminal-state rejections wrap a sentinel so the handler maps
+	// them to 409, not 500: with rows now outliving their tokens by the
+	// audit-retention window, rotating a long-dead credential is a routine
+	// client mistake, not a server fault, and must not fire 5xx alerting.
 	if old.IsRevoked {
-		return nil, nil, fmt.Errorf("credential is already revoked")
+		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialAlreadyRevoked)
+	}
+	// An expired credential cannot be rotated: the revoke half would be a
+	// silent no-op (the cascade anchor requires expires_at > revoked_at) and
+	// "rotate" would degrade to minting a fresh token off a dead row.
+	if time.Now().After(old.ExpiresAt) {
+		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialExpired)
 	}
 
-	// Revoke the old credential.
-	if err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated"); err != nil {
+	// Revoke the old credential (cascades to descendants and fires the
+	// RevocationNotifier per affected JTI, same as any other revoke path).
+	revoked, err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated")
+	if err != nil {
 		return nil, nil, fmt.Errorf("failed to revoke old credential during rotation: %w", err)
 	}
+	s.dispatchRevocations(ctx, revoked, "rotated")
 
 	// Issue a new one with the same parameters.
 	return s.IssueCredential(ctx, IssueRequest{
-		Identity:  identity,
-		Scopes:    old.Scopes,
-		TTL:       old.TTLSeconds,
-		GrantType: old.GrantType,
+		Identity:              identity,
+		Scopes:                old.Scopes,
+		TTL:                   old.TTLSeconds,
+		GrantType:             old.GrantType,
+		ResolveIdentityPolicy: true,
 	})
 }
 

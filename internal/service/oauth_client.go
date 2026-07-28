@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -204,6 +205,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		IdentityID:                   identityID,
 		ClientNotificationEndpoint:   req.ClientNotificationEndpoint,
 		BackchannelTokenDeliveryMode: deliveryMode,
+		RegistrationSource:           "internal",
 		IsActive:                     true,
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
@@ -310,6 +312,273 @@ func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OA
 // DeleteClient removes an OAuth2 client.
 func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error {
 	return s.repo.Delete(ctx, id)
+}
+
+// ── RFC 7591 / RFC 7592 Dynamic Client Registration ──────────────────────────
+
+// dcrBcryptCost is the work factor used for hashing the registration_access_token.
+// Stricter than the default to reflect the higher trust placed in a long-lived
+// management bearer that survives a single registration call.
+const dcrBcryptCost = 12
+
+// dcrAllowedAuthMethods are the only token_endpoint_auth_method values
+// dynamically-registered clients may declare. Enforced at the service layer
+// as defense-in-depth so a direct call to DynamicRegisterClient or
+// UpdateDynamicClient (bypassing the handler) cannot smuggle in "none" or
+// an unsupported value.
+var dcrAllowedAuthMethods = map[string]bool{
+	"client_secret_post":  true,
+	"client_secret_basic": true,
+}
+
+// dcrAllowedGrantTypes mirrors the handler-layer allow-list. Service-layer
+// enforcement guards against direct service-method callers.
+var dcrAllowedGrantTypes = map[string]bool{
+	"client_credentials":                          true,
+	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
+}
+
+// validateDCRSubmittedFields runs the service-layer defense for grant_types
+// and token_endpoint_auth_method. Returns the normalised auth method (with
+// the default applied for empty input) or an error.
+func validateDCRSubmittedFields(grantTypes []string, authMethod string) (string, error) {
+	for _, gt := range grantTypes {
+		if !dcrAllowedGrantTypes[gt] {
+			return "", fmt.Errorf("grant_type %q is not permitted for dynamically-registered clients", gt)
+		}
+	}
+	if authMethod == "" {
+		// RFC 7591 §2 default. Older drafts and some examples used
+		// client_secret_post; we conform to the published spec for
+		// interoperability with standards-compliant clients that omit
+		// the field expecting the spec default.
+		return "client_secret_basic", nil
+	}
+	if !dcrAllowedAuthMethods[authMethod] {
+		return "", fmt.Errorf("token_endpoint_auth_method %q is not permitted for dynamically-registered clients", authMethod)
+	}
+	return authMethod, nil
+}
+
+// DynamicRegisterClientRequest is the input shape for RFC 7591 dynamic registration.
+// Mirrors RegisterClientRequest's confidential-client subset — DCR-issued clients
+// are always confidential (they get a client_secret and an opaque registration token).
+type DynamicRegisterClientRequest struct {
+	Name                    string
+	GrantTypes              []string
+	Scopes                  []string
+	RedirectURIs            []string
+	TokenEndpointAuthMethod string
+	SoftwareID              string
+	SoftwareVersion         string
+	Contacts                []string
+	Metadata                json.RawMessage
+}
+
+// DynamicRegisterClient creates an OAuth2 client via RFC 7591 dynamic registration.
+// Returns the created client, the plain-text client_secret, and the plain-text
+// registration_access_token. Both are shown once and never stored in plain form;
+// callers MUST return them to the registrant on the registration response and
+// then drop the values from memory.
+func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req DynamicRegisterClientRequest) (*domain.OAuthClient, string, string, error) {
+	if req.Name == "" {
+		return nil, "", "", fmt.Errorf("name is required")
+	}
+
+	clientID, err := generateSecureToken(16)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
+	}
+
+	plainSecret, err := generateSecureToken(32)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
+	}
+	hashedSecret, err := bcrypt.GenerateFromPassword([]byte(plainSecret), dcrBcryptCost)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to hash client secret: %w", err)
+	}
+
+	plainRegToken, err := generateSecureToken(32)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to generate registration_access_token: %w", err)
+	}
+	hashedRegToken, err := bcrypt.GenerateFromPassword([]byte(plainRegToken), dcrBcryptCost)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("failed to hash registration token: %w", err)
+	}
+
+	grantTypes := req.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"client_credentials"}
+	}
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	if err != nil {
+		return nil, "", "", err
+	}
+	scopes := req.Scopes
+	if scopes == nil {
+		scopes = []string{}
+	}
+	redirectURIs := req.RedirectURIs
+	if redirectURIs == nil {
+		redirectURIs = []string{}
+	}
+	contacts := req.Contacts
+	if contacts == nil {
+		contacts = []string{}
+	}
+
+	now := time.Now()
+	client := &domain.OAuthClient{
+		ID:                      uuid.New().String(),
+		ClientID:                clientID,
+		ClientSecret:            string(hashedSecret),
+		Name:                    req.Name,
+		ClientType:              "confidential",
+		TokenEndpointAuthMethod: authMethod,
+		GrantTypes:              grantTypes,
+		RedirectURIs:            redirectURIs,
+		Scopes:                  scopes,
+		SoftwareID:              req.SoftwareID,
+		SoftwareVersion:         req.SoftwareVersion,
+		Contacts:                contacts,
+		Metadata:                req.Metadata,
+		// backchannel_token_delivery_mode has a NOT NULL DEFAULT 'poll' + a CHECK
+		// constraint (migration 021). Bun inserts the Go zero value rather than
+		// letting the DB default fire, so DCR clients must set this explicitly or
+		// the INSERT fails the CHECK with SQLSTATE 23514 (a 500 at the handler).
+		// DCR clients don't use CIBA, so 'poll' is the safe baseline.
+		BackchannelTokenDeliveryMode: string(domain.BackchannelNotificationPoll),
+		RegistrationSource:           "dynamic",
+		RegistrationAccessToken:      string(hashedRegToken),
+		IsActive:                     true,
+		CreatedAt:                    now,
+		UpdatedAt:                    now,
+	}
+
+	if err := s.repo.Create(ctx, client); err != nil {
+		if isDuplicateKeyError(err) {
+			return nil, "", "", ErrOAuthClientAlreadyExists
+		}
+		return nil, "", "", fmt.Errorf("failed to register oauth client: %w", err)
+	}
+
+	log.Info().
+		Str("client_id", clientID).
+		Msg("OAuth2 client registered via RFC 7591 dynamic registration")
+
+	return client, plainSecret, plainRegToken, nil
+}
+
+// dummyRegistrationTokenHash is a pre-computed bcrypt hash used for constant-time
+// comparison when a client_id is not found, preventing timing-based client_id enumeration.
+// The plaintext is irrelevant — no real token will ever match this.
+var dummyRegistrationTokenHash []byte
+
+func init() {
+	h, err := bcrypt.GenerateFromPassword([]byte("dummy-timing-equaliser"), dcrBcryptCost)
+	if err != nil {
+		panic("failed to generate dummy bcrypt hash for timing equalisation: " + err.Error())
+	}
+	dummyRegistrationTokenHash = h
+}
+
+// VerifyRegistrationToken looks up a dynamically registered client by client_id
+// and verifies the provided registration_access_token against the stored bcrypt hash.
+// Used to authenticate RFC 7592 management requests (GET/PUT/DELETE /oauth2/register/{client_id}).
+//
+// Always runs a bcrypt comparison regardless of whether the client_id exists, so that
+// response time does not leak client_id existence to an attacker.
+//
+// Errors are distinguished:
+//   - ErrOAuthClientNotFound: row absent or row is not a dynamic client or hash mismatch.
+//     Callers map this to 401 invalid_token.
+//   - any other error: a DB or infrastructure failure. Callers must map this to 5xx,
+//     not 401, so an outage is not masquerading as an auth failure.
+func (s *OAuthClientService) VerifyRegistrationToken(ctx context.Context, clientID, regToken string) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetByClientID(ctx, clientID)
+	if err != nil {
+		// sql.ErrNoRows is the genuine not-found; equalise timing and return 401.
+		// Anything else is a DB/infra failure that the handler must propagate as 500.
+		if errors.Is(err, sql.ErrNoRows) {
+			_ = bcrypt.CompareHashAndPassword(dummyRegistrationTokenHash, []byte(regToken))
+			return nil, ErrOAuthClientNotFound
+		}
+		return nil, fmt.Errorf("verify registration token: %w", err)
+	}
+	if client.RegistrationSource != "dynamic" {
+		_ = bcrypt.CompareHashAndPassword(dummyRegistrationTokenHash, []byte(regToken))
+		return nil, ErrOAuthClientNotFound
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(client.RegistrationAccessToken), []byte(regToken)); err != nil {
+		return nil, ErrOAuthClientNotFound
+	}
+	return client, nil
+}
+
+// UpdateDynamicClient replaces the mutable metadata of a dynamically registered client
+// per RFC 7592 §3 (full replacement, not partial update).
+// The client_id and secrets are immutable after registration.
+func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID string, req DynamicRegisterClientRequest) (*domain.OAuthClient, error) {
+	client, err := s.repo.GetByClientID(ctx, clientID)
+	if err != nil {
+		// Distinguish genuine not-found from infra failure so the handler
+		// can return 401 vs 5xx appropriately. Same pattern as
+		// VerifyRegistrationToken — a DB outage must not look like "no
+		// such client".
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOAuthClientNotFound
+		}
+		return nil, fmt.Errorf("update dynamic client: lookup failed: %w", err)
+	}
+	if client.RegistrationSource != "dynamic" {
+		return nil, ErrOAuthClientNotFound
+	}
+	// RFC 7592 §3: PUT is a full replacement. The handler applies RFC 7591 defaults
+	// for any omitted fields before calling here, so all fields are unconditionally replaced.
+	grantTypes := req.GrantTypes
+	if grantTypes == nil {
+		grantTypes = []string{"client_credentials"}
+	}
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	if err != nil {
+		return nil, err
+	}
+	scopes := req.Scopes
+	if scopes == nil {
+		scopes = []string{}
+	}
+	redirectURIs := req.RedirectURIs
+	if redirectURIs == nil {
+		redirectURIs = []string{}
+	}
+	contacts := req.Contacts
+	if contacts == nil {
+		contacts = []string{}
+	}
+
+	client.Name = req.Name
+	client.GrantTypes = grantTypes
+	client.Scopes = scopes
+	client.RedirectURIs = redirectURIs
+	client.TokenEndpointAuthMethod = authMethod
+	client.SoftwareID = req.SoftwareID
+	client.SoftwareVersion = req.SoftwareVersion
+	client.Contacts = contacts
+	client.Metadata = req.Metadata
+	client.UpdatedAt = time.Now()
+	if err := s.repo.Update(ctx, client); err != nil {
+		return nil, fmt.Errorf("failed to update dynamic client: %w", err)
+	}
+	return client, nil
+}
+
+// DeleteDynamicClient removes a dynamically registered client by its client_id.
+// The registration_source = 'dynamic' guard is enforced at the repo layer too,
+// so this method cannot accidentally remove an internal client.
+func (s *OAuthClientService) DeleteDynamicClient(ctx context.Context, clientID string) error {
+	return s.repo.DeleteByClientID(ctx, clientID)
 }
 
 // generateSecureToken creates a cryptographically random hex-encoded token.

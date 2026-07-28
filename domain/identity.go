@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/uptrace/bun"
@@ -27,6 +29,12 @@ var ErrIdentityNotUsable = errors.New("identity is not usable")
 // handler-mapping pattern as the identity sentinels above — wrap with %w
 // at the service layer so handlers can errors.Is and map to 4xx.
 var ErrCredentialExpired = errors.New("credential_expired")
+
+// ErrCredentialAlreadyRevoked is returned when an operation (e.g. rotation)
+// is attempted on a credential that is already revoked. Terminal state, not
+// a server fault — handlers map it to 409, same pattern as the sentinels
+// above.
+var ErrCredentialAlreadyRevoked = errors.New("credential_already_revoked")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Trust Level
@@ -103,13 +111,17 @@ const (
 	SubTypeToolAgent    SubType = "tool_agent"
 	SubTypeHumanProxy   SubType = "human_proxy"
 	SubTypeEvaluator    SubType = "evaluator"
+	// SubTypeCodeAgent is a code-generation/analysis agent (e.g. a coding-agent
+	// workspace). It is valid for BOTH identity_type=agent (a delegated code
+	// agent, e.g. forge's per-sandbox mint) and identity_type=application (a
+	// code-gen product registered as an application) — see the two sets below.
+	SubTypeCodeAgent SubType = "code_agent"
 
 	// Application sub-types.
 	SubTypeChatbot    SubType = "chatbot"
 	SubTypeAssistant  SubType = "assistant"
 	SubTypeAPIService SubType = "api_service"
 	SubTypeCustom     SubType = "custom"
-	SubTypeCodeAgent  SubType = "code_agent"
 
 	// Service sub-types.
 	SubTypeLLMProvider SubType = "llm_provider"
@@ -122,9 +134,15 @@ var agentSubTypes = map[SubType]bool{
 	SubTypeToolAgent:    true,
 	SubTypeHumanProxy:   true,
 	SubTypeEvaluator:    true,
+	// A code agent IS an agent. Previously code_agent was only accepted for
+	// identity_type=application, so registering a code agent as an agent (the
+	// correct type) failed validation and 500'd.
+	SubTypeCodeAgent: true,
 }
 
 // applicationSubTypes is the set of sub-types valid for identity_type = "application".
+// code_agent is also accepted here (a code-gen product modeled as an application)
+// for backward compatibility; it is primarily an agent sub-type (see agentSubTypes).
 var applicationSubTypes = map[SubType]bool{
 	SubTypeChatbot:    true,
 	SubTypeAssistant:  true,
@@ -158,29 +176,79 @@ func (s SubType) ValidForIdentityType(t IdentityType) bool {
 	}
 }
 
+// CanRetypeDiscovered reports whether a connector re-sync may re-classify a
+// still-`discovered` identity to (newType, newSub).
+//
+// While a row sits in the discovered inbox it is a credential-less posture
+// signal (never an auth principal), so the connector remains the source of truth
+// for its classification. This lets an improved or late classification (e.g.
+// application → mcp_server once the connector recognises it, CAP-DSC-003) reach
+// identities ingested before the classifier could type them — the reconcile path
+// otherwise leaves identity_type untouched. Once a row is adopted (status !=
+// discovered) its type may be human-curated, so it is never re-typed.
+//
+// newSub is the connector's incoming sub_type for the new classification. The
+// re-type adopts (newType, newSub) as a pair — the same (type, sub_type)
+// validation the create path applies — and the caller sets sub_type = newSub
+// alongside identity_type so the pair stays consistent. This is why the check is
+// on newSub, not the stored sub_type: a row ingested as agent gets a defaulted
+// tool_agent sub_type, which is invalid for mcp_server; validating (and
+// overwriting) with the connector's incoming sub_type (empty for the sync path)
+// lets that row re-type and clears the now-invalid sub_type, instead of being
+// silently pinned to agent forever. A no-op (newType == curType), an unknown
+// newType, or an (newType, newSub) pair the schema rejects all return false.
+func CanRetypeDiscovered(status IdentityStatus, curType, newType IdentityType, newSub SubType) bool {
+	return status == IdentityStatusDiscovered &&
+		newType.Valid() &&
+		newType != curType &&
+		newSub.ValidForIdentityType(newType)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Identity Status — lifecycle state machine
 // ──────────────────────────────────────────────────────────────────────────────
 
 // IdentityStatus represents the lifecycle state of an identity.
 //
+// The enum is an ISO/IEC 24760-1 §7.2-shaped identity lifecycle. `discovered`
+// sits *below* "Established" — there is no SDO state for a pre-authoritative
+// identity, so it is genuine prior art from ITIL/CMDB + CSPM/CIEM discovery.
+// See docs/identity-lifecycle.md for the full standards mapping and the
+// rationale for one registry (native ∪ discovered) keyed on `origin`+`status`.
+//
 // State machine:
 //
-//	pending → active → suspended → active (reactivation)
-//	                 → deactivated (terminal)
-//	pending → deactivated (registration rejected)
+//	discovered → pending  (adopt — a human owner is assigned)
+//	           → active    (direct activation — first EMA/ID-JAG mint adopts+grants)
+//	           → deactivated (dismiss — operator marks out-of-scope, audit-retained)
+//	pending    → active → suspended → active (reactivation)
+//	                    → deactivated (terminal-ish — reactivatable)
+//	                    → expired (time-bound authority lapsed)
+//	pending    → deactivated (registration rejected)
+//	pending    → discovered (dismiss reverts adoption — agent returns to adoption inbox)
+//
+// `discovered` is the normal entry state but can also be re-entered from `pending`
+// when an adoption is reverted (dismiss). ISO mapping (24760 → ours):
+// Established=pending, Active=active, Suspended=suspended, Archived=deactivated/expired.
 type IdentityStatus string
 
 const (
+	// IdentityStatusDiscovered is the pre-authoritative state for an identity
+	// observed in an external IdP via a discovery connector (origin != native).
+	// It is owner-OPTIONAL, credential-less, and NOT usable (IsUsable is false):
+	// a discovered row is a posture signal, never an auth principal, until it is
+	// adopted (→pending) or directly activated (→active). identity-lifecycle.md.
+	IdentityStatusDiscovered  IdentityStatus = "discovered"
 	IdentityStatusPending     IdentityStatus = "pending"
 	IdentityStatusActive      IdentityStatus = "active"
 	IdentityStatusSuspended   IdentityStatus = "suspended"
 	IdentityStatusDeactivated IdentityStatus = "deactivated"
+	IdentityStatusExpired     IdentityStatus = "expired"
 )
 
 func (s IdentityStatus) Valid() bool {
 	switch s {
-	case IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated:
+	case IdentityStatusDiscovered, IdentityStatusPending, IdentityStatusActive, IdentityStatusSuspended, IdentityStatusDeactivated, IdentityStatusExpired:
 		return true
 	}
 	return false
@@ -189,14 +257,22 @@ func (s IdentityStatus) Valid() bool {
 // CanTransitionTo reports whether the identity can move from its current status to the target.
 func (s IdentityStatus) CanTransitionTo(target IdentityStatus) bool {
 	switch s {
+	case IdentityStatusDiscovered:
+		// adopt (→pending), direct activation (→active), dismiss (→deactivated).
+		// Adoption/activation additionally require an owner — enforced at the
+		// service layer, not here (this method is pure status topology).
+		return target == IdentityStatusPending || target == IdentityStatusActive || target == IdentityStatusDeactivated
 	case IdentityStatusPending:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		// activate (→active), dismiss (→discovered, reverts adoption), deactivate (→deactivated).
+		return target == IdentityStatusActive || target == IdentityStatusDiscovered || target == IdentityStatusDeactivated
 	case IdentityStatusActive:
-		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated
+		return target == IdentityStatusSuspended || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusSuspended:
-		return target == IdentityStatusActive || target == IdentityStatusDeactivated
+		return target == IdentityStatusActive || target == IdentityStatusDeactivated || target == IdentityStatusExpired
 	case IdentityStatusDeactivated:
 		return target == IdentityStatusActive
+	case IdentityStatusExpired:
+		return target == IdentityStatusDeactivated
 	default:
 		return false
 	}
@@ -250,9 +326,71 @@ func ValidIAL(v string) bool {
 	return false
 }
 
-// IsUsable reports whether an identity in this status can authenticate and receive tokens.
+// IsUsable reports whether an identity in this status can authenticate and
+// receive tokens. Only `active` is usable — `discovered` and `pending` are
+// explicitly NOT usable, which is the platform's safety gate: a discovered
+// (untrusted, externally-observed) row can never mint a credential regardless
+// of how it was written, so table separation isn't needed to keep external
+// data away from credentialed identities (identity-lifecycle.md "Safety is
+// already enforced by status").
 func (s IdentityStatus) IsUsable() bool {
 	return s == IdentityStatusActive
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Origin — provenance discriminator (native vs discovered)
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Origin records where an identity came from (see
+// docs/identity-lifecycle.md): `native` — ZeroID issued it — versus an external
+// ecosystem we observed it in via a discovery connector. It is orthogonal to
+// status: `origin` is provenance, `status` is lifecycle. A discovered agent and
+// a native agent are rows in the *same* registry, distinguished by this field
+// plus status — there is no separate discovered store.
+//
+// The external-ecosystem set is OPEN: each new IdP connector in the discovery
+// service contributes a value, so validation (ValidOrigin) checks shape, not
+// membership. The closed-enum columns (status, trust_level, identity_type) are
+// platform-owned and change rarely; coupling a ZeroID release to every new
+// connector via a hard origin enum would be the wrong trade.
+type Origin string
+
+const (
+	// OriginNative is the default — an identity ZeroID registered itself.
+	OriginNative Origin = "native"
+	// The launch discovery connectors. More are added by the discovery service
+	// without a ZeroID change (ValidOrigin accepts any clean identifier).
+	OriginOkta            Origin = "okta"
+	OriginEntra           Origin = "entra"
+	OriginGoogleWorkspace Origin = "google_workspace"
+)
+
+// IsExternal reports whether the identity was discovered in an external IdP
+// (origin is set and not `native`). External-origin identities enter the
+// lifecycle in `discovered` and may be owner-less until adopted.
+func (o Origin) IsExternal() bool {
+	return o != "" && o != OriginNative
+}
+
+// ValidOrigin reports whether v is a syntactically valid origin: a non-empty
+// lowercase identifier (a–z, 0–9, underscore). Membership is intentionally not
+// checked — the external-ecosystem set is open (see Origin). Empty is invalid
+// at the storage boundary; the service layer defaults an unset origin to
+// `native` before validation.
+func ValidOrigin(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -279,6 +417,20 @@ type Identity struct {
 	SubType      SubType        `bun:"sub_type,type:varchar(50)"      json:"sub_type,omitempty"`
 	TrustLevel   TrustLevel     `bun:"trust_level,type:varchar(50)"   json:"trust_level"`
 	Status       IdentityStatus `bun:"status,type:varchar(50)"        json:"status"`
+
+	// Origin is the provenance discriminator (see
+	// docs/identity-lifecycle.md): `native` (ZeroID issued it) vs an external
+	// ecosystem an identity was discovered in (`okta`, `entra`,
+	// `google_workspace`, …). External-origin identities enter the lifecycle in
+	// `discovered` and may be owner-less until adopted. Defaults to `native`.
+	Origin Origin `bun:"origin,type:varchar(50),notnull,default:'native'" json:"origin"`
+
+	// SourceID identifies the discovery source instance (e.g. a specific
+	// connector) that ingested this identity, so a sync can prune only the rows
+	// it owns when a tenant runs several connectors of the same origin. Opaque to
+	// ZeroID — the discovery service assigns it. Empty/NULL for native
+	// identities and for discovered rows ingested without a source.
+	SourceID string `bun:"source_id,type:varchar(255),nullzero" json:"source_id,omitempty"`
 
 	// Ownership and governance.
 	//
@@ -382,6 +534,10 @@ type IdentitySchema struct {
 	IdentityTypes []IdentityTypeSchema `json:"identity_types"`
 	TrustLevels   []SchemaOption       `json:"trust_levels"`
 	Statuses      []SchemaOption       `json:"statuses"`
+	// Origins lists the known provenance values. The external set is open
+	// (grows with discovery connectors), so this is the launch set, not a
+	// closed enum — clients should render unknown origins gracefully.
+	Origins []SchemaOption `json:"origins"`
 }
 
 // GetIdentitySchema returns the canonical identity schema.
@@ -433,10 +589,18 @@ func GetIdentitySchema() *IdentitySchema {
 			{Value: string(TrustLevelUnverified), Label: "Unverified", Description: "Unknown identities — restricted access"},
 		},
 		Statuses: []SchemaOption{
-			{Value: string(IdentityStatusPending), Label: "Pending", Description: "Awaiting activation"},
+			{Value: string(IdentityStatusDiscovered), Label: "Discovered", Description: "Observed in an external IdP — owner-optional, credential-less, not usable until adopted"},
+			{Value: string(IdentityStatusPending), Label: "Pending", Description: "Adopted (owned & governable) — awaiting activation"},
 			{Value: string(IdentityStatusActive), Label: "Active", Description: "Fully operational"},
 			{Value: string(IdentityStatusSuspended), Label: "Suspended", Description: "Temporarily disabled"},
-			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Permanently disabled"},
+			{Value: string(IdentityStatusDeactivated), Label: "Deactivated", Description: "Soft-deleted (audit-retained, reactivatable)"},
+			{Value: string(IdentityStatusExpired), Label: "Expired", Description: "Time-bound authority lapsed"},
+		},
+		Origins: []SchemaOption{
+			{Value: string(OriginNative), Label: "Native", Description: "Registered directly in ZeroID"},
+			{Value: string(OriginOkta), Label: "Okta", Description: "Discovered via the Okta connector"},
+			{Value: string(OriginEntra), Label: "Microsoft Entra", Description: "Discovered via the Microsoft Entra connector"},
+			{Value: string(OriginGoogleWorkspace), Label: "Google Workspace", Description: "Discovered via the Google Workspace connector"},
 		},
 	}
 }
@@ -481,6 +645,89 @@ func ValidateSPIFFEPathSegment(field, value string) error {
 		case r == '.' || r == '-' || r == '_':
 		default:
 			return fmt.Errorf("%s contains character %q not allowed in a SPIFFE path segment (allowed: a-z A-Z 0-9 . - _)", field, r)
+		}
+	}
+	return nil
+}
+
+// ErrInvalidWIMSEURI is returned by ValidateWIMSEURI when the caller-supplied
+// URI cannot be a SPIFFE ID. Callers branch on this with errors.Is to map to
+// a 400 at the HTTP boundary.
+var ErrInvalidWIMSEURI = errors.New("invalid wimse uri")
+
+// ValidateWIMSEURI checks the shape of a caller-supplied WIMSE/SPIFFE URI
+// without binding it to a specific trust domain. Used by lookup endpoints
+// (e.g. GET /identities/by-wimse) that need to reject obviously malformed
+// input before hitting the store, but cannot reject by trust-domain because
+// the caller's tenant determines which trust domain is in play.
+//
+// Rules (SPIFFE §2):
+//   - scheme is "spiffe"
+//   - non-empty host (the trust domain)
+//   - host must not include a port
+//   - non-empty workload path (a bare trust-domain URI is the trust-domain ID,
+//     not a workload ID — reject)
+//   - path must not have a trailing slash or empty segments
+//   - path segments must conform to SPIFFE §2.3 character set (delegated to
+//     ValidateSPIFFEPathSegment so the read-side validator agrees with
+//     BuildWIMSEURI on what's a legal segment)
+//   - no query (including a trailing "?" with empty value), no fragment, no
+//     user-info
+//   - total length within MaxSPIFFEIDBytes
+//
+// Returns a wrapped ErrInvalidWIMSEURI on failure.
+func ValidateWIMSEURI(uri string) error {
+	if uri == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidWIMSEURI)
+	}
+	if len(uri) > MaxSPIFFEIDBytes {
+		return fmt.Errorf("%w: exceeds %d bytes", ErrInvalidWIMSEURI, MaxSPIFFEIDBytes)
+	}
+	// Reject obvious scheme mismatches before url.Parse so the error reason
+	// is more useful than "missing scheme".
+	if !strings.HasPrefix(uri, "spiffe://") {
+		return fmt.Errorf("%w: scheme must be spiffe://", ErrInvalidWIMSEURI)
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidWIMSEURI, err)
+	}
+	if u.Scheme != "spiffe" {
+		return fmt.Errorf("%w: scheme must be spiffe (got %q)", ErrInvalidWIMSEURI, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%w: missing trust domain (host)", ErrInvalidWIMSEURI)
+	}
+	// SPIFFE §2.2: the trust domain is a DNS name without a port.
+	// url.Host carries the host[:port] form; reject any colon to forbid ports.
+	if strings.Contains(u.Host, ":") {
+		return fmt.Errorf("%w: trust domain must not contain a port", ErrInvalidWIMSEURI)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%w: user-info not allowed", ErrInvalidWIMSEURI)
+	}
+	// ForceQuery catches a trailing "?" even when RawQuery is empty.
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("%w: query/fragment not allowed", ErrInvalidWIMSEURI)
+	}
+	// SPIFFE IDs always have a workload path. A bare trust-domain URI like
+	// "spiffe://example.org" is a trust domain identifier, not a workload ID.
+	if u.Path == "" || u.Path == "/" {
+		return fmt.Errorf("%w: missing workload path", ErrInvalidWIMSEURI)
+	}
+	if strings.HasSuffix(u.Path, "/") {
+		return fmt.Errorf("%w: path must not end with a slash", ErrInvalidWIMSEURI)
+	}
+	if strings.Contains(u.Path, "//") {
+		return fmt.Errorf("%w: path must not contain empty segments", ErrInvalidWIMSEURI)
+	}
+	// Validate each path segment against the same character set BuildWIMSEURI
+	// enforces. The read-side validator must agree with the write-side
+	// constructor on what's legal — otherwise a stored URI could fail
+	// validation on lookup.
+	for _, seg := range strings.Split(strings.TrimPrefix(u.Path, "/"), "/") {
+		if err := ValidateSPIFFEPathSegment("path segment", seg); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidWIMSEURI, err)
 		}
 	}
 	return nil

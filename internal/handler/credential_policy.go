@@ -26,6 +26,8 @@ type CreatePolicyInput struct {
 		RequiredTrustLevel  string     `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
 		RequiredAttestation string     `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
 		MaxDelegationDepth  int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth"`
+		Source              string     `json:"source,omitempty" doc:"Provenance of an auto-derived policy (e.g. 'discovery'); omit for user-authored policies"`
+		SourceKey           string     `json:"source_key,omitempty" doc:"Stable dedup identity within the source; when set, create is idempotent by (source, source_key)"`
 		ExpiresAt           *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
 	}
 }
@@ -126,6 +128,8 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 		RequiredTrustLevel:  input.Body.RequiredTrustLevel,
 		RequiredAttestation: input.Body.RequiredAttestation,
 		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
+		Source:              input.Body.Source,
+		SourceKey:           input.Body.SourceKey,
 		ExpiresAt:           input.Body.ExpiresAt,
 	})
 	if err != nil {
@@ -213,6 +217,15 @@ func (a *API) deletePolicyOp(ctx context.Context, input *PolicyIDInput) (*struct
 	}
 
 	if err := a.credentialPolicySvc.DeletePolicy(ctx, input.ID, tenant.AccountID, tenant.ProjectID); err != nil {
+		if errors.Is(err, service.ErrPolicyInUse) {
+			// Safe to surface: the delete dialog already tells the operator
+			// the policy is still attached to keys. Tenant-scoped query means
+			// no cross-tenant information leaks.
+			return nil, huma.Error409Conflict("credential policy is still in use by one or more service keys")
+		}
+		if errors.Is(err, service.ErrPolicyNotFound) {
+			return nil, huma.Error404NotFound("credential policy not found")
+		}
 		log.Error().Err(err).Str("policy_id", input.ID).Msg("failed to delete credential policy")
 		return nil, huma.Error500InternalServerError("failed to delete credential policy")
 	}
