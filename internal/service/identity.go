@@ -613,6 +613,13 @@ func (s *IdentityService) ListIdentities(ctx context.Context, accountID, project
 	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
 }
 
+// ListByExternalIDs fetches identities by external_id within a tenant, used to
+// hydrate the parent agents of sub-agents so a paginated caller can nest them
+// regardless of pagination/filtering.
+func (s *IdentityService) ListByExternalIDs(ctx context.Context, accountID, projectID string, externalIDs []string) ([]*domain.Identity, error) {
+	return s.repo.ListByExternalIDs(ctx, accountID, projectID, externalIDs)
+}
+
 // GetFacets returns grouped counts for each filterable identity dimension.
 func (s *IdentityService) GetFacets(ctx context.Context, accountID, projectID string) (*postgres.IdentityFacets, error) {
 	return s.repo.GetFacets(ctx, accountID, projectID)
