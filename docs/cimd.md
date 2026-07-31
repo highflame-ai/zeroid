@@ -83,7 +83,7 @@ Implemented in [`internal/service/cimd.go`](../internal/service/cimd.go); wired 
    - `token_endpoint_auth_method` must be `none` (omitted defaults to `none`). **Confidential CIMD clients (`private_key_jwt`) are not supported in v1.**
    - `grant_types` defaults to `["authorization_code"]`, must include `authorization_code`, and may only contain `authorization_code` / `refresh_token`.
    - `response_types`, if present, must include `code`.
-6. **Synthesize + cache.** The document becomes an ephemeral `domain.OAuthClient` (`client_type: public`, `token_endpoint_auth_method: none`, `registration_source: cimd`) that is **never written to the database**. Outcomes are memoized in a bounded in-memory cache (1000 entries): successes for the configured TTL (1 h default, 24 h hard cap) so the `/oauth2/authorize` → `/oauth2/token` round-trip doesn't fetch twice; failures for 60 s (negative caching) so replaying a dead URL can't force a fresh timeout-bounded outbound fetch per request.
+6. **Synthesize + cache.** The document becomes an ephemeral `domain.OAuthClient` (`client_type: public`, `token_endpoint_auth_method: none`, `registration_source: cimd`) that is **never written to the database**. Outcomes are memoized in a bounded in-memory cache (1000 entries): successes for the configured TTL (1 h default, 24 h hard cap), shortened when the document's `Cache-Control` `max-age` asks for less (floored at 60 s so a document can't force a fetch per request) — so the `/oauth2/authorize` → `/oauth2/token` round-trip doesn't fetch twice, and a client rotating its `redirect_uris` can shrink the staleness window; failures are negative-cached (10 s for transient fetch errors, 60 s for deterministic validation failures) so replaying a dead URL can't force a fresh timeout-bounded outbound fetch per request.
 
 ### Error mapping
 
@@ -155,14 +155,13 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 - **Localhost redirects.** Loopback `redirect_uris` are matched port-agnostically (RFC 8252) so native/CLI callbacks work, but any process on the user's machine can bind a loopback port. Treat localhost CIMD clients with the same caution as any native public client.
 - **DNS / TLS trust.** CIMD's integrity rests on the same DNS + TLS + certificate-transparency assumptions as any HTTPS-based trust model. **`allowed_domains` is the hard boundary** — see [Production hardening](#production-hardening--set-allowed_domains).
 - **No persistence, no secret.** CIMD clients are ephemeral and hold no symmetric secret at the broker — there is nothing to leak from ZeroID's side.
-- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — bounded cache (1000 entries), 60 s negative caching of failures, 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist — but the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch. Deployers running fully open CIMD (empty allowlist) should additionally rate-limit `/oauth2/authorize` at the edge like any public endpoint.
+- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — bounded cache (1000 entries), negative caching of failures (10 s fetch / 60 s validation), 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist — but the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch. Deployers running fully open CIMD (empty allowlist) should additionally rate-limit `/oauth2/authorize` at the edge like any public endpoint.
 
 ---
 
 ## Limitations / future work
 
 - **Confidential CIMD clients** (`token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`) are not supported — ZeroID does not yet accept `private_key_jwt` token-endpoint auth for any client. v1 is public-PKCE-only.
-- **`Cache-Control` honouring** — the resolved-client cache uses a fixed TTL (config-driven, 24 h cap) rather than reading the document's `Cache-Control` / `max-age`. Adding max-age honouring (still capped) is a small extension.
 - **`software_statement`** (signed metadata) — not consumed; CIMD trust is domain-ownership based.
 
 ---

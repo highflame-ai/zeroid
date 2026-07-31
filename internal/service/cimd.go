@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -65,11 +66,24 @@ const (
 	maxCIMDCacheTTL                   = 24 * time.Hour
 	cimdFetchTimeout                  = 5 * time.Second
 
-	// cimdNegativeCacheTTL is how long a FAILED resolution (fetch error,
-	// invalid document) is remembered. Short — a client fixing its document
-	// shouldn't wait long — but enough that a hostile caller replaying the
-	// same dead URL cannot force a fresh 5s-timeout outbound fetch per request.
+	// cimdNegativeCacheTTL is how long a FAILED validation (invalid document,
+	// self-reference mismatch) is remembered. Short — a client fixing its
+	// document shouldn't wait long — but enough that a hostile caller replaying
+	// the same dead URL cannot force revalidation work per request. Validation
+	// failures are deterministic, so a longer TTL costs a healthy client nothing.
 	cimdNegativeCacheTTL = time.Minute
+
+	// cimdTransientNegativeCacheTTL is the negative-cache TTL for FETCH
+	// failures (network error, timeout, non-200). These are transient: a
+	// single origin blip during a refresh_token call must not lock a healthy
+	// client out for a full minute after the origin recovers. 10s still caps
+	// hostile replays of a dead URL at one 5s-timeout outbound fetch per 10s.
+	cimdTransientNegativeCacheTTL = 10 * time.Second
+
+	// cimdPositiveCacheFloor is the minimum positive-cache TTL even when the
+	// document's Cache-Control asks for less (max-age=0, no-store): honoring
+	// zero would let a document force a fresh outbound fetch on every request.
+	cimdPositiveCacheFloor = time.Minute
 
 	// maxCIMDCacheEntries bounds the resolution cache. Entries are evicted
 	// lazily on same-key access and swept at insert time when the cap is hit,
@@ -288,11 +302,17 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 		return client, cachedErr
 	}
 
-	doc, err := s.fetch(ctx, clientID)
+	doc, docTTL, err := s.fetch(ctx, clientID)
 	if err != nil {
-		// Negative-cache the failure (short TTL) so replaying a dead URL can't
-		// force a fresh timeout-bounded outbound fetch per request.
-		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
+		// Negative-cache the failure so replaying a dead URL can't force a
+		// fresh timeout-bounded outbound fetch per request. Fetch errors are
+		// transient (origin blip) and get the short TTL; validation errors are
+		// deterministic and keep the longer one.
+		ttl := cimdNegativeCacheTTL
+		if errors.Is(err, ErrCIMDFetch) {
+			ttl = cimdTransientNegativeCacheTTL
+		}
+		s.storeResult(clientID, cimdCacheEntry{err: err}, ttl)
 		return nil, err
 	}
 	client, err := synthesizeCIMDClient(clientID, doc, s.now())
@@ -301,7 +321,7 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 		return nil, err
 	}
 
-	s.storeResult(clientID, cimdCacheEntry{client: client}, s.cacheTTL)
+	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
 	log.Info().
 		Str("client_id", clientID).
 		Str("client_name", client.Name).
@@ -321,7 +341,12 @@ func (s *CIMDService) domainAllowed(host string) bool {
 }
 
 // fetch performs the SSRF-guarded GET and JSON-decodes the (size-capped) body.
-func (s *CIMDService) fetch(ctx context.Context, docURL string) (*cimdMetadataDocument, error) {
+// The returned duration is the positive-cache TTL for the document: the
+// response's Cache-Control max-age when it asks for LESS than the configured
+// TTL (clamped to cimdPositiveCacheFloor), the configured TTL otherwise. A
+// client that rotates its redirect_uris can thus shorten how long a stale
+// document is honored; it can never extend past the configured/24h cap.
+func (s *CIMDService) fetch(ctx context.Context, docURL string) (*cimdMetadataDocument, time.Duration, error) {
 	// Bound the fetch at cimdFetchTimeout regardless of the injected client's
 	// own Timeout (the production SSRF-guarded client is wired at 10s), so the
 	// documented 5s ceiling holds and a slow origin can't stall the request
@@ -331,7 +356,7 @@ func (s *CIMDService) fetch(ctx context.Context, docURL string) (*cimdMetadataDo
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, docURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
+		return nil, 0, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
 	}
 	req.Header.Set("Accept", "application/json")
 
@@ -340,29 +365,55 @@ func (s *CIMDService) fetch(ctx context.Context, docURL string) (*cimdMetadataDo
 		// Network error, timeout, or SSRF-guard dial rejection. Don't echo the
 		// underlying message to the client (it can reveal our DNS view / internal
 		// topology); the wrapped cause is preserved for server-side logs.
-		return nil, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
+		return nil, 0, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: unexpected HTTP status %d", ErrCIMDFetch, resp.StatusCode)
+		return nil, 0, fmt.Errorf("%w: unexpected HTTP status %d", ErrCIMDFetch, resp.StatusCode)
 	}
 
 	// Read one byte past the cap so an over-limit document is detected rather
 	// than silently truncated into malformed JSON.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, s.maxDocumentBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
+		return nil, 0, fmt.Errorf("%w: %v", ErrCIMDFetch, err)
 	}
 	if int64(len(body)) > s.maxDocumentBytes {
-		return nil, fmt.Errorf("%w: document exceeds %d-byte limit", ErrCIMDInvalidDocument, s.maxDocumentBytes)
+		return nil, 0, fmt.Errorf("%w: document exceeds %d-byte limit", ErrCIMDInvalidDocument, s.maxDocumentBytes)
 	}
 
 	var doc cimdMetadataDocument
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, fmt.Errorf("%w: response is not valid JSON: %v", ErrCIMDInvalidDocument, err)
+		return nil, 0, fmt.Errorf("%w: response is not valid JSON: %v", ErrCIMDInvalidDocument, err)
 	}
-	return &doc, nil
+	return &doc, s.positiveCacheTTL(resp.Header.Get("Cache-Control")), nil
+}
+
+// positiveCacheTTL derives the positive-cache TTL from a response's
+// Cache-Control header. A max-age (or no-store/no-cache) SHORTER than the
+// configured TTL is honored, clamped to cimdPositiveCacheFloor; anything
+// else — absent header, unparseable value, or a max-age longer than the
+// configured TTL — yields the configured TTL. Directives only ever shorten
+// the window (draft: the AS caps cache lifetime regardless of Cache-Control).
+func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
+	ttl := s.cacheTTL
+	for _, directive := range strings.Split(cacheControl, ",") {
+		directive = strings.ToLower(strings.TrimSpace(directive))
+		if directive == "no-store" || directive == "no-cache" {
+			return cimdPositiveCacheFloor
+		}
+		if v, ok := strings.CutPrefix(directive, "max-age="); ok {
+			secs, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil || secs < 0 {
+				continue
+			}
+			if maxAge := time.Duration(secs) * time.Second; maxAge < ttl {
+				ttl = max(maxAge, cimdPositiveCacheFloor)
+			}
+		}
+	}
+	return ttl
 }
 
 // synthesizeCIMDClient validates the document against the fetch URL and turns it
@@ -433,10 +484,8 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// An empty scope means "no client-side scope ceiling": the principal
 	// resolver's narrowing governs (intersectScopes treats an empty allowed set
 	// as unrestricted). Same as a registry public client with no scopes.
+	// strings.Fields never returns nil, so no empty-slice normalization needed.
 	scopes := strings.Fields(doc.Scope)
-	if scopes == nil {
-		scopes = []string{}
-	}
 
 	return &domain.OAuthClient{
 		ClientID:                clientID,

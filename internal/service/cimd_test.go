@@ -442,3 +442,27 @@ func TestCIMDCacheReturnsIndependentCopies(t *testing.T) {
 		t.Error("GrantTypes leaked a mutation from a prior returned copy")
 	}
 }
+
+func TestCIMDPositiveCacheTTL(t *testing.T) {
+	s := NewCIMDService(CIMDConfig{Enabled: true, CacheTTL: time.Hour})
+	cases := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", time.Hour},                              // no header → configured TTL
+		{"max-age=600", 10 * time.Minute},            // shorter max-age honored
+		{"max-age=86400", time.Hour},                 // longer max-age never extends
+		{"max-age=5", cimdPositiveCacheFloor},        // tiny max-age clamped to floor
+		{"max-age=0", cimdPositiveCacheFloor},        // zero clamped to floor
+		{"no-store", cimdPositiveCacheFloor},         // no-store → floor, not zero
+		{"public, no-cache", cimdPositiveCacheFloor}, // no-cache among other directives
+		{"MAX-AGE=600", 10 * time.Minute},            // case-insensitive
+		{"max-age=bogus", time.Hour},                 // unparseable → configured TTL
+		{"max-age=-5", time.Hour},                    // negative → configured TTL
+	}
+	for _, tc := range cases {
+		if got := s.positiveCacheTTL(tc.header); got != tc.want {
+			t.Errorf("positiveCacheTTL(%q) = %v, want %v", tc.header, got, tc.want)
+		}
+	}
+}

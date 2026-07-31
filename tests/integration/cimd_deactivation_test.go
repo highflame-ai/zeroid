@@ -119,14 +119,17 @@ func TestCIMD_DeactivatedRegistryClientNotResurrected(t *testing.T) {
 			"deactivation must be a kill switch — no CIMD document fetch may occur")
 	})
 
-	// 3. Positive control: an unregistered CIMD URL still resolves via the
-	//    fallback (the fix narrows resurrection, it must not disable CIMD).
-	t.Run("VerifyPresentedClientAuth still resolves unregistered CIMD client", func(t *testing.T) {
+	// 3. Introspection/revocation accepts REGISTERED public clients only: an
+	//    unregistered CIMD URL must be rejected without a document fetch. A
+	//    CIMD "registration" is a self-published document, so honoring it here
+	//    would let anyone on the internet pass the strict token-inspection
+	//    gate (token oracle) — see VerifyPresentedClientAuth.
+	t.Run("VerifyPresentedClientAuth rejects unregistered CIMD client, no fetch", func(t *testing.T) {
 		before := atomic.LoadInt32(hits)
 		err := oauthSvc.VerifyPresentedClientAuth(ctx, unregisteredID, "")
-		require.NoError(t, err)
-		assert.Equal(t, int32(1), atomic.LoadInt32(hits)-before,
-			"an unregistered CIMD client_id must resolve by fetching its document")
+		require.Error(t, err)
+		assert.Equal(t, int32(0), atomic.LoadInt32(hits)-before,
+			"an unregistered CIMD client_id must not trigger a document fetch on the inspection gate")
 	})
 }
 
