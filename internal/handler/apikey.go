@@ -45,7 +45,7 @@ type APIKeyOutput struct {
 type APIKeyListInput struct {
 	Product       string `query:"product" doc:"Filter by product namespace"`
 	ApplicationID string `query:"application_id" doc:"Filter by application identity ID"`
-	State         string `query:"state" doc:"Filter by key state (active, revoked, expired)"`
+	State         string `query:"state" enum:"active,revoked,expired" doc:"Filter by key state (active, revoked, expired)"`
 	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
 	Page          int    `query:"page" default:"1" doc:"Page number"`
 	Limit         int    `query:"limit" default:"20" doc:"Items per page (max 100)"`

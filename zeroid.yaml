@@ -113,6 +113,38 @@ backchannel:
   # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
   allow_private_notification_endpoints: false
 
+# CIMD — Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document).
+# Lets an OAuth client onboard with ZERO pre-registration by using a stable
+# https:// URL as its client_id. On the authorization_code flow, ZeroID fetches
+# and validates the JSON metadata document published at that URL and treats it as
+# an ephemeral public PKCE client. This is the MCP Authorization 2025-11-25
+# preferred default for open agent ecosystems. See docs/cimd.md.
+cimd:
+  # On by default so agents can onboard against this AS without registration.
+  # Env: ZEROID_CIMD_ENABLED
+  enabled: true
+  # PRODUCTION HARDENING LEVER. Allowlist of client_id hosts (exact,
+  # case-insensitive); a host not in the list is rejected BEFORE any outbound
+  # fetch. Empty (default) = any public HTTPS host, so ZeroID will fetch
+  # arbitrary attacker-supplied URLs (SSRF-guarded/capped, but still outbound).
+  # Set this to the hosts you trust to run CIMD as a closed ecosystem —
+  # recommended for enterprise/closed deployments. Leave empty only for open
+  # agent ecosystems, and rate-limit /oauth2/authorize at the edge. YAML only.
+  # allowed_domains: ["client.example.com", "apps.acme.dev"]
+  #
+  # Relaxes the SSRF guard on the metadata-document fetch. Default false rejects
+  # client_id URLs resolving to private/loopback/link-local/metadata ranges
+  # (DNS-rebinding-safe dialer). Set true ONLY in single-tenant dev/test that
+  # publishes documents on localhost / a private network. Production MUST keep
+  # this false.
+  # Env: ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS
+  allow_private_metadata_endpoints: false
+  # Fetch size cap (bytes) and resolved-client cache lifetime (seconds).
+  # Defaults: 5120 bytes, 3600 s (cache clamped to a 24 h hard cap).
+  # Env: ZEROID_CIMD_MAX_DOCUMENT_BYTES / ZEROID_CIMD_CACHE_TTL_SECONDS
+  # max_document_bytes: 5120
+  # cache_ttl_seconds: 3600
+
 # Direct OIDC IdP federation (issue #88).
 # Each entry registers a trusted upstream issuer for RFC 8693 token exchange
 # with subject_token_type=urn:ietf:params:oauth:token-type:id_token.

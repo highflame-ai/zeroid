@@ -297,10 +297,10 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		}
 	}
 
+	prefixes := s.keyPrefixesFor(ctx, identities)
 	agents := make([]AgentResponse, len(identities))
 	for i, id := range identities {
-		keyPrefix := s.getKeyPrefix(ctx, id.ID)
-		agents[i] = identityToAgentResponse(id, keyPrefix)
+		agents[i] = identityToAgentResponse(id, prefixes[id.ID])
 		agents[i].DelegationDepth = depthMap[id.ID]
 	}
 
@@ -629,9 +629,10 @@ func (s *AgentService) hydrateParents(ctx context.Context, accountID, projectID 
 		if len(fetched) == 0 {
 			break
 		}
+		prefixes := s.keyPrefixesFor(ctx, fetched)
 		for _, id := range fetched {
 			present[id.ExternalID] = true
-			hydrated = append(hydrated, identityToAgentResponse(id, s.getKeyPrefix(ctx, id.ID)))
+			hydrated = append(hydrated, identityToAgentResponse(id, prefixes[id.ID]))
 		}
 		missing = missingParentExternalIDs(fetched, present)
 	}
@@ -668,6 +669,27 @@ func missingParentExternalIDs(ids []*domain.Identity, present map[string]bool) [
 	}
 
 	return out
+}
+
+// keyPrefixesFor returns identity ID → active API-key prefix for a batch of
+// identities in one query — the batched form of getKeyPrefix. Identities
+// without an active key (or the whole batch, on a lookup error) are absent
+// from the map, yielding the same "" a getKeyPrefix miss produces.
+func (s *AgentService) keyPrefixesFor(ctx context.Context, identities []*domain.Identity) map[string]string {
+	ids := make([]string, len(identities))
+	for i, id := range identities {
+		ids[i] = id.ID
+	}
+	keys, err := s.apiKeyRepo.ListActiveByIdentityIDs(ctx, ids)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to batch-fetch API key prefixes, continuing without")
+		return nil
+	}
+	prefixes := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prefixes[k.IdentityID] = k.KeyPrefix
+	}
+	return prefixes
 }
 
 func (s *AgentService) getKeyPrefix(ctx context.Context, identityID string) string {
