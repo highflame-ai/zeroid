@@ -340,6 +340,27 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = userID
 
+	// Record the MCP servers this exchange authorized (zeroid#259). We just
+	// audience-restricted a token to them, which makes this the authoritative
+	// answer to "which MCP servers do our agents actually reach" — the one
+	// inventory that sees an enterprise's PRIVATE servers, which no public
+	// registry knows and no reachability probe can necessarily resolve.
+	//
+	// Deliberately AFTER issuance and deliberately non-fatal. The token exists;
+	// withholding it because a bookkeeping row failed would turn an inventory
+	// feature into an availability risk on the critical auth path. Placement is
+	// the security control too: reaching here means every gate above passed, so
+	// a rejected exchange can never plant an entry in a tenant's inventory.
+	if s.observedIDJAGResources != nil {
+		if err := s.observedIDJAGResources.Record(ctx, req.AccountID, req.ProjectID, upstreamIss, resources); err != nil {
+			log.Warn().Err(err).
+				Str("account_id", req.AccountID).
+				Str("project_id", req.ProjectID).
+				Strs("resources", resources).
+				Msg("failed to record observed ID-JAG resources (token was still issued)")
+		}
+	}
+
 	log.Info().
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).

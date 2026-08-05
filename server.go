@@ -324,6 +324,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// skip replay protection. Backed by the id_jag_jti table (migration 034),
 	// swept by the cleanup worker.
 	oauthSvc.SetIDJAGReplayStore(postgres.NewIDJAGReplayStore(db))
+	// Observed-MCP-server inventory (zeroid#259). Backed by
+	// observed_idjag_resources (migration 040). Best-effort and off the critical
+	// path: a failure here is logged and the token is still issued.
+	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
