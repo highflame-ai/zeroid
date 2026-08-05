@@ -261,7 +261,7 @@ func extractClaims(token jwt.Token) *Claims {
 	// Known ZeroID claims — mapped to typed fields.
 	knownKeys := map[string]struct{}{
 		"iss": {}, "sub": {}, "aud": {}, "iat": {}, "exp": {}, "nbf": {}, "jti": {},
-		"resource": {},
+		"resource":   {},
 		"account_id": {}, "project_id": {},
 		"user_id": {}, "owner_user_id": {},
 		"external_id": {}, "identity_type": {}, "sub_type": {}, "trust_level": {},
@@ -273,9 +273,17 @@ func extractClaims(token jwt.Token) *Claims {
 	}
 
 	// RFC 8707 resource binding. Per RFC 8707 the value is a single URI string
-	// OR an array of them; ZeroID mints the array shape, but accept both so an
-	// unexpected shape degrades to "bound" rather than silently to "unbound" —
-	// the failure direction matters, since empty means enforce nothing.
+	// OR an array of them. ZeroID mints the array shape; the string branch
+	// exists so that form is not silently read as "unbound", which is the
+	// direction that matters — empty means a PEP enforces nothing.
+	//
+	// Be precise about the limit of that guarantee: a value which is NEITHER
+	// shape (a number, an object) still yields empty, i.e. unbound, i.e. fail
+	// OPEN. That is tolerable only because ZeroID is the sole issuer behind
+	// this verifier and always writes []string, and the value is signature-
+	// verified before it gets here — it is not a general fail-closed property.
+	// An issuer that could emit other shapes would need this to return an error
+	// rather than a zero value.
 	c.Resource = getStringSlice("resource")
 	if len(c.Resource) == 0 {
 		if single := getString("resource"); single != "" {
