@@ -214,6 +214,20 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		}
 	}
 
+	// RFC 8707 resource binding (D4), stamped as its own claim so downstream
+	// PEPs have an EXPLICIT signal that this token was resource-bound at the
+	// mint. `aud` carries the same value for RFC 8707 §2 conformance, but it
+	// cannot serve as the signal: ZeroID stamps `aud` on every token it issues,
+	// defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
+	// says nothing about whether a binding exists. Shield treating it as if it
+	// did denied every MCP-targeted request in prod (shield#366). Presence of
+	// THIS claim is the discriminator; its absence means "not resource-bound".
+	//
+	// Set after the PropagateClaims loop so a deployer that lists "resource" in
+	// propagate_claims cannot clobber the value we validated above, and
+	// reserved in reservedClaims so additional_claims cannot inject or widen it.
+	customClaims["resource"] = resources
+
 	// Resolve the identity's credential policy when we have a real identity row
 	// so issuance enforces the same policy ceiling (allowed scopes, max TTL,
 	// trust level, policy expiry) as every other grant.

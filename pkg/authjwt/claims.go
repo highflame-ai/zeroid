@@ -26,6 +26,18 @@ type Claims struct {
 	ExpiresAt time.Time `json:"exp"`
 	JWTID     string    `json:"jti"`
 
+	// Resource is the RFC 8707 `resource` claim — the resource(s) this token
+	// was bound to AT THE MINT. Non-empty ONLY when ZeroID recorded an explicit
+	// binding (today: the ID-JAG grant, ADR 0010 D4). ZeroID reserves the claim,
+	// so a caller cannot inject or widen it via additional_claims.
+	//
+	// This — not Audience — is what a PEP must gate resource enforcement on.
+	// ZeroID stamps `aud` on every token it issues, defaulting to the issuer URL
+	// when nothing was requested (JWT-SVID §3), so a non-empty Audience carries
+	// no information about whether the token is resource-restricted. Empty here
+	// means "not resource-bound"; enforce nothing.
+	Resource []string `json:"resource,omitempty"`
+
 	// Tenant scoping
 	AccountID string `json:"account_id"`
 	ProjectID string `json:"project_id,omitempty"`
@@ -249,6 +261,7 @@ func extractClaims(token jwt.Token) *Claims {
 	// Known ZeroID claims — mapped to typed fields.
 	knownKeys := map[string]struct{}{
 		"iss": {}, "sub": {}, "aud": {}, "iat": {}, "exp": {}, "nbf": {}, "jti": {},
+		"resource": {},
 		"account_id": {}, "project_id": {},
 		"user_id": {}, "owner_user_id": {},
 		"external_id": {}, "identity_type": {}, "sub_type": {}, "trust_level": {},
@@ -257,6 +270,17 @@ func extractClaims(token jwt.Token) *Claims {
 		"grant_type":   {}, "scopes": {}, "delegation_depth": {},
 		"act":        {},
 		"mission_id": {},
+	}
+
+	// RFC 8707 resource binding. Per RFC 8707 the value is a single URI string
+	// OR an array of them; ZeroID mints the array shape, but accept both so an
+	// unexpected shape degrades to "bound" rather than silently to "unbound" —
+	// the failure direction matters, since empty means enforce nothing.
+	c.Resource = getStringSlice("resource")
+	if len(c.Resource) == 0 {
+		if single := getString("resource"); single != "" {
+			c.Resource = []string{single}
+		}
 	}
 
 	// Tenant
