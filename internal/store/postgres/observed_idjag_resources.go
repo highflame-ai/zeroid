@@ -154,10 +154,33 @@ func (s *ObservedIDJAGResourceStore) Record(
 	return err
 }
 
-// List returns every resource observed for a tenant, most recently seen first.
+// ObservedResourceStaleAfter is how long a resource may go unseen before it
+// drops out of the inventory.
+//
+// The table has no reaper, and it must not accumulate indefinitely: an IdP that
+// mints per-object resource URIs would grow the row count without bound. More
+// importantly, this inventory feeds MCP typing downstream — without a cutoff, a
+// decommissioned server stays listed forever and discovery keeps typing that app
+// as an MCP server off a year-old observation.
+//
+// 90 days is deliberately generous. This is an inventory of infrastructure, not
+// a session log; a server used quarterly is still a real server, and dropping it
+// too eagerly would make the inventory flap.
+const ObservedResourceStaleAfter = 90 * 24 * time.Hour
+
+// maxObservedResourcesReturned caps one response. Resources are a small,
+// slow-moving set, so a tenant at this limit means something is generating
+// resource URIs per-object rather than per-server — a bounded, wrong answer that
+// still renders beats an unbounded one that times out.
+const maxObservedResourcesReturned = 500
+
+// List returns the resources observed for a tenant, most recently seen first,
+// excluding any not seen within ObservedResourceStaleAfter.
+//
 // Scoped to (accountID, projectID) with no cross-tenant escape: this is an
 // inventory of a customer's internal infrastructure, so a leak here is worse
-// than the deployer-configured issuer list.
+// than the deployer-configured issuer list. The ordering and cutoff are both
+// served by idx_observed_idjag_resources_tenant_last_seen.
 func (s *ObservedIDJAGResourceStore) List(
 	ctx context.Context,
 	accountID, projectID string,
@@ -167,7 +190,9 @@ func (s *ObservedIDJAGResourceStore) List(
 		Model(&rows).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
+		Where("last_seen_at >= ?", time.Now().UTC().Add(-ObservedResourceStaleAfter)).
 		Order("last_seen_at DESC").
+		Limit(maxObservedResourcesReturned).
 		Scan(ctx)
 	if err != nil {
 		return nil, err
