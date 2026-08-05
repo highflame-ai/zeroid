@@ -127,6 +127,13 @@ const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
+	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
+	// it — so the claim only means that if ZeroID is the only party who can set
+	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// must never be able to make a token look resource-bound when it isn't, or
+	// to widen a real binding by overriding it through additional_claims.
+	"resource": true,
 	// ZeroID identity claims
 	"account_id": true, "project_id": true, "user_id": true, "owner_user_id": true,
 	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
