@@ -17,8 +17,9 @@ env:
   # regex. tag_name is the load-bearing identifier for every gate in
   # this workflow.
   RELEASE_TAG: ${{ github.event.release.tag_name }}
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  DEVOPS_REPO: "highflame-cloud"
+  DEVOPS_BRANCH: "main"
+  CICD_WORKFLOW: "trigger-release-zeroid.yml"
 
 jobs:
   highflame-validate:
@@ -265,50 +266,33 @@ jobs:
           version: "~> v2"
           args: release --clean
 
-  highflame-docker:
-    needs:
-      - highflame-validate
-      - highflame-sast
+  highflame-trigger:
     permissions:
-      contents: read
-      packages: write
+      contents: 'read'
+      id-token: 'write'
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v6
         with:
           persist-credentials: false
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Install GitHub CLI
+        run: sudo apt install gh -y
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: token
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.DEVOPS_PKG_TOKEN }}
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          pull: true
-          push: true
-          context: .
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Trigger private repo workflow
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          gh workflow run ${{ env.CICD_WORKFLOW }} \
+            --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
+            --ref ${{ env.DEVOPS_BRANCH }}
+            -f RELEASE_VER=${{ env.RELEASE_TAG }}
