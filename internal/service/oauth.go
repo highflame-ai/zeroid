@@ -78,6 +78,12 @@ type OAuthService struct {
 	// silently skip replay protection while ID-JAG is actually in use — but the
 	// handler also guards against nil defensively (fail closed).
 	idJAGReplayStore IDJAGReplayStore
+	// observedIDJAGResources records which MCP servers this tenant's agents have
+	// actually reached, learned from the `resource` claim of successful ID-JAG
+	// redemptions (zeroid#259). Wired after construction via
+	// SetObservedIDJAGResourceStore. Nil is valid and simply means the inventory
+	// is not being collected — it must NEVER affect whether a token is minted.
+	observedIDJAGResources ObservedIDJAGResourceStore
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -100,6 +106,18 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 // the dependency narrow.
 type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+}
+
+// ObservedIDJAGResourceStore records the MCP servers named by the `resource`
+// claim of successfully-redeemed ID-JAGs (zeroid#259), giving a tenant an
+// inventory of the servers its agents actually reach.
+//
+// Record is called on the SUCCESS path only and is strictly best-effort: the
+// token is already minted by that point, so a bookkeeping failure must never
+// withhold it. The concrete impl is postgres.ObservedIDJAGResourceStore; an
+// interface here keeps the service testable and the dependency narrow.
+type ObservedIDJAGResourceStore interface {
+	Record(ctx context.Context, accountID, projectID, authorizingISS string, resources []string) error
 }
 
 // Default token TTLs (used when per-client TTL is not configured).
@@ -406,6 +424,13 @@ func cimdOAuthError(err error) error {
 // server.go alongside the external-issuer registry.
 func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
 	s.idJAGReplayStore = store
+}
+
+// SetObservedIDJAGResourceStore wires the observed-MCP-server inventory
+// (zeroid#259). Optional: when unset, ID-JAG exchanges behave exactly as before
+// and nothing is recorded. Wired in server.go alongside the replay store.
+func (s *OAuthService) SetObservedIDJAGResourceStore(store ObservedIDJAGResourceStore) {
+	s.observedIDJAGResources = store
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the

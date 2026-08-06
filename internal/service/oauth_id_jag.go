@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
@@ -340,6 +341,19 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = userID
 
+	// Record the MCP servers this exchange authorized (zeroid#259). We just
+	// audience-restricted a token to them, which makes this the authoritative
+	// answer to "which MCP servers do our agents actually reach" — the one
+	// inventory that sees an enterprise's PRIVATE servers, which no public
+	// registry knows and no reachability probe can necessarily resolve.
+	//
+	// Deliberately AFTER issuance. Placement is the security control: reaching
+	// here means every gate above passed, so a rejected exchange can never plant
+	// an entry in a tenant's inventory.
+	if s.observedIDJAGResources != nil {
+		s.recordObservedResources(ctx, req.AccountID, req.ProjectID, upstreamIss, resources)
+	}
+
 	log.Info().
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).
@@ -349,4 +363,43 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		Msg("ID-JAG jwt-bearer exchange succeeded")
 
 	return accessToken, nil
+}
+
+// observedResourceRecordTimeout bounds the inventory write. It is generous
+// relative to a healthy upsert and tight relative to anything a client would
+// notice: the token is already minted, so this is the maximum extra latency a
+// degraded database can add to a request that has already succeeded.
+const observedResourceRecordTimeout = 2 * time.Second
+
+// recordObservedResources writes the observed-MCP-server inventory for a
+// successful exchange (zeroid#259), off the critical path.
+//
+// Three properties, each load-bearing:
+//
+//   - context.WithoutCancel. The caller's context is cancelled the moment the
+//     HTTP response is written. Inheriting it would race the response and drop
+//     observations non-deterministically — and on a fast client, drop most of
+//     them, which looks like an inventory that mysteriously under-reports.
+//   - A bounded timeout. Every exchange for a given MCP server UPDATEs the same
+//     row by design (one row per resource), so concurrent redemptions for a
+//     popular server serialize on that row lock. Without a deadline, lock waits
+//     or pool exhaustion would add unbounded latency to a token that is already
+//     issued — exactly the availability risk this is supposed to avoid.
+//   - Errors are logged, never returned. The token exists; withholding it over a
+//     bookkeeping row would turn an inventory feature into an auth-path outage.
+func (s *OAuthService) recordObservedResources(
+	ctx context.Context,
+	accountID, projectID, upstreamIss string,
+	resources []string,
+) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), observedResourceRecordTimeout)
+	defer cancel()
+
+	if err := s.observedIDJAGResources.Record(recordCtx, accountID, projectID, upstreamIss, resources); err != nil {
+		log.Warn().Err(err).
+			Str("account_id", accountID).
+			Str("project_id", projectID).
+			Strs("resources", resources).
+			Msg("failed to record observed ID-JAG resources (token was still issued)")
+	}
 }
