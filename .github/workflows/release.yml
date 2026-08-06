@@ -267,6 +267,9 @@ jobs:
           args: release --clean
 
   highflame-trigger:
+    needs:
+      - highflame-validate
+      - highflame-sast
     permissions:
       contents: 'read'
       id-token: 'write'
@@ -291,8 +294,9 @@ jobs:
       - name: Trigger private repo workflow
         env:
           GITHUB_TOKEN: ${{ steps.token.outputs.token }}
-        run: |
+        shell: bash
+        run: |-
           gh workflow run ${{ env.CICD_WORKFLOW }} \
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
-            --ref ${{ env.DEVOPS_BRANCH }}
+            --ref ${{ env.DEVOPS_BRANCH }} \
             -f RELEASE_VER=${{ env.RELEASE_TAG }}
