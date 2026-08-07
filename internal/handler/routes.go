@@ -36,6 +36,7 @@ type API struct {
 	agentSvc             *service.AgentService
 	auditSvc             *service.AuditService
 	backchannelSvc       *service.BackchannelService
+	governanceSvc        *service.GovernanceService
 	dpopVerifier         *dpop.Verifier
 	delegationSvc        *service.DelegationService
 	jwksSvc              *signing.JWKSService
@@ -84,6 +85,7 @@ func NewAPI(
 	agentSvc *service.AgentService,
 	auditSvc *service.AuditService,
 	backchannelSvc *service.BackchannelService,
+	governanceSvc *service.GovernanceService,
 	dpopVerifier *dpop.Verifier,
 	delegationSvc *service.DelegationService,
 	jwksSvc *signing.JWKSService,
@@ -105,6 +107,7 @@ func NewAPI(
 		agentSvc:             agentSvc,
 		auditSvc:             auditSvc,
 		backchannelSvc:       backchannelSvc,
+		governanceSvc:        governanceSvc,
 		dpopVerifier:         dpopVerifier,
 		delegationSvc:        delegationSvc,
 		jwksSvc:              jwksSvc,
@@ -249,6 +252,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerAuditRoutes(api)
 	a.registerBackchannelAdminRoutes(api)
 	a.registerExpiringSoonRoute(api)
+	a.registerGovernanceRoutes(api)
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
 	a.registerObservedResourceRoutes(api)

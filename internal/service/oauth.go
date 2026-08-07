@@ -56,6 +56,11 @@ type OAuthService struct {
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
 	customGrants map[string]CustomGrantHandler
+	// governanceSvc wires the DRM authorization check + Constraint
+	// Catalog hash lookup into delegation grants (issue #59). Nil when
+	// governance binding is not configured for this deployment — every
+	// existing flow then behaves identically to pre-#59 ZeroID.
+	governanceSvc *GovernanceService
 	// externalIssuerRegistry resolves direct-federation token-exchange
 	// requests (subject_token_type=id_token) to a configured upstream IdP.
 	// Nil when no external_issuers are configured — direct federation is
@@ -91,6 +96,13 @@ type OAuthService struct {
 	// so a test can flip it on a shared server without racing concurrent
 	// introspect/revoke reads under -race.
 	requireTokenInspectionAuth atomic.Bool
+}
+
+// SetGovernanceService attaches a GovernanceService so that token_exchange
+// and authorization_code grants run the DRM authorization check and embed
+// the active DRM / Constraint Catalog hash claims (issue #59).
+func (s *OAuthService) SetGovernanceService(g *GovernanceService) {
+	s.governanceSvc = g
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -160,6 +172,11 @@ var reservedClaims = map[string]bool{
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
+	// Governance binding (issue #59) — set by tokenExchange /
+	// authorizationCode from the active DRM and Constraint Catalog.
+	// Deployer claim enrichers cannot spoof these.
+	"drm_version": true, "drm_hash": true,
+	"constraint_catalog_version": true, "constraint_catalog_hash": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to
@@ -930,7 +947,17 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		missionID = subjectJTI
 	}
 
-	// Step 6: Issue a delegated credential for the sub-agent. The full
+	// Step 6: Governance binding (issue #59). If a DRM is configured for
+	// the tenant, refuse the exchange unless the orchestrator→sub-agent
+	// pair is permitted by the active DRM. Bind drm_hash + catalog_hash
+	// into the issued credential so post-hoc audit can identify which
+	// governance version authorized the delegation.
+	govReq, err := s.resolveGovernance(ctx, accountID, projectID, delegatedBy, actorIdentity.WIMSEURI)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 7: Issue a delegated credential for the sub-agent. The full
 	// policy constraint set (delegation depth ceiling, required trust
 	// level, allowed grant types, max TTL) is enforced inside
 	// IssueCredential against actor.IdentityPolicyID.
@@ -942,22 +969,68 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// expires, the cascade-revocation walk can no longer reach the child
 	// (the traversal anchors on live ancestry).
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:            actorIdentity,
-		IdentityPolicyID:    actorPolicy.ID,
-		Scopes:              scopes,
-		GrantType:           domain.GrantTypeTokenExchange,
-		DelegatedBy:         delegatedBy,
-		ParentJTI:           subjectJTI,
-		DelegationDepth:     parentDepth + 1,
-		MissionID:           missionID,
-		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
-		CredentialExpiresAt: &subjectCred.ExpiresAt,
+		Identity:              actorIdentity,
+		IdentityPolicyID:      actorPolicy.ID,
+		Scopes:                scopes,
+		GrantType:             domain.GrantTypeTokenExchange,
+		DelegatedBy:           delegatedBy,
+		ParentJTI:             subjectJTI,
+		DelegationDepth:       parentDepth + 1,
+		MissionID:             missionID,
+		DRMVersion:            govReq.DRMVersion,
+		DRMHash:               govReq.DRMHash,
+		ConstraintCatalogVer:  govReq.CatalogVersion,
+		ConstraintCatalogHash: govReq.CatalogHash,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		CredentialExpiresAt:   &subjectCred.ExpiresAt,
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	return accessToken, nil
+}
+
+// governanceBinding carries the resolved DRM + Constraint Catalog values
+// for one issuance call. All four fields are empty when no governance is
+// configured for the tenant — IssueCredential then skips the claim
+// embedding entirely.
+type governanceBinding struct {
+	DRMVersion     string
+	DRMHash        string
+	CatalogVersion string
+	CatalogHash    string
+}
+
+// resolveGovernance performs the DRM authorization check (when a DRM
+// exists) and looks up the active Constraint Catalog hash. Returns an
+// oauth error wrapping ErrDRMUnauthorized when the delegation pair is
+// rejected; returns empty values when no governance is configured.
+func (s *OAuthService) resolveGovernance(ctx context.Context, accountID, projectID, fromURI, toURI string) (governanceBinding, error) {
+	var out governanceBinding
+	if s.governanceSvc == nil {
+		return out, nil
+	}
+	drm, err := s.governanceSvc.AuthorizeDelegation(ctx, accountID, projectID, fromURI, toURI)
+	if err != nil {
+		if errors.Is(err, domain.ErrDRMUnauthorized) {
+			return out, oauthBadRequest("invalid_grant", err.Error())
+		}
+		return out, oauthServerError("governance: drm authorization failed", err)
+	}
+	if drm != nil {
+		out.DRMVersion = drm.Version
+		out.DRMHash = drm.Hash
+	}
+	catalog, err := s.governanceSvc.GetActiveCatalog(ctx, accountID, projectID)
+	if err != nil {
+		return out, oauthServerError("governance: catalog lookup failed", err)
+	}
+	if catalog != nil {
+		out.CatalogVersion = catalog.Version
+		out.CatalogHash = catalog.Hash
+	}
+	return out, nil
 }
 
 // externalPrincipalExchange handles RFC 8693 token exchange for externally-authenticated
@@ -1857,16 +1930,38 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
+	// Governance binding (issue #59). authorization_code represents
+	// human consent, not agent-to-agent delegation, so we do not run
+	// the DRM authorization gate here — but we DO bind the active DRM
+	// and Constraint Catalog hashes onto the issued token so post-hoc
+	// audit can recover which governance version was in effect when
+	// the user consented.
+	govBind := governanceBinding{}
+	if s.governanceSvc != nil {
+		if drm, err := s.governanceSvc.GetActiveDRM(ctx, authCode.AccountID, authCode.ProjectID); err == nil && drm != nil {
+			govBind.DRMVersion = drm.Version
+			govBind.DRMHash = drm.Hash
+		}
+		if cat, err := s.governanceSvc.GetActiveCatalog(ctx, authCode.AccountID, authCode.ProjectID); err == nil && cat != nil {
+			govBind.CatalogVersion = cat.Version
+			govBind.CatalogHash = cat.Hash
+		}
+	}
+
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeAuthorizationCode,
-		UseRS256:          true,
-		SubjectOverride:   authCode.UserID,
-		ApplicationID:     authCode.ClientID,
-		TTL:               ttl,
-		Scopes:            authCode.Scopes,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		Identity:              identity,
+		IdentityPolicyID:      identityPolicyID,
+		GrantType:             domain.GrantTypeAuthorizationCode,
+		UseRS256:              true,
+		SubjectOverride:       authCode.UserID,
+		ApplicationID:         authCode.ClientID,
+		TTL:                   ttl,
+		Scopes:                authCode.Scopes,
+		DRMVersion:            govBind.DRMVersion,
+		DRMHash:               govBind.DRMHash,
+		ConstraintCatalogVer:  govBind.CatalogVersion,
+		ConstraintCatalogHash: govBind.CatalogHash,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -2270,6 +2365,14 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	// can read the typed RAR grant via introspection without parsing the JWT.
 	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details"} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
+			result[claim] = v
+		}
+	}
+	// Governance binding claims (issue #59). Pass through only when
+	// present — every existing introspection response keeps its shape
+	// for tokens that pre-date governance binding.
+	for _, claim := range []string{"drm_version", "drm_hash", "constraint_catalog_version", "constraint_catalog_hash"} {
+		if v, err := jwt.Get[string](parsed, claim); err == nil && v != "" {
 			result[claim] = v
 		}
 	}
