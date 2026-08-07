@@ -122,6 +122,54 @@ func TestCreateAPIKey_CustomCredentialPolicy_Propagates(t *testing.T) {
 		"custom credential_policy_id supplied at creation must be stored on the key")
 }
 
+// TestCreateAPIKey_NoProductNoIdentity_Succeeds is the regression repro for
+// #149: POST /api-keys with only the documented-required `name` field (no
+// product, no identity_id) previously 500'd — CreateKey left IdentityID as
+// "" and the store inserted that empty string into the identity_id uuid
+// column, which Postgres rejects (SQLSTATE 22P02). The column is nullable
+// (ON DELETE CASCADE / SET NULL FKs across the schema), so the fix persists
+// SQL NULL instead of "" when no identity is linked. The key must create
+// successfully with an empty identity_id.
+func TestCreateAPIKey_NoProductNoIdentity_Succeeds(t *testing.T) {
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name": "no-identity-no-product-key",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode,
+		"POST /api-keys with only name must succeed, not 500 on the identity_id uuid column")
+	created := decode(t, resp)
+	keyID := created["id"].(string)
+	require.NotEmpty(t, keyID)
+
+	fetched := get(t, adminPath("/api-keys/"+keyID), adminHeaders())
+	require.Equal(t, http.StatusOK, fetched.StatusCode)
+	got := decode(t, fetched)
+	assert.Equal(t, "", got["identity_id"], "unlinked key must report an empty identity_id, not error")
+}
+
+// TestCreateAPIKey_NonexistentIdentityIDRejected verifies that supplying an
+// identity_id that doesn't resolve in the caller's tenant is rejected with
+// 400, not the same class of opaque 500 #149 reported for the omitted case.
+func TestCreateAPIKey_NonexistentIdentityIDRejected(t *testing.T) {
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":        "nonexistent-identity-key",
+		"identity_id": "00000000-0000-0000-0000-000000000000",
+	}, adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a well-formed but nonexistent identity_id must be rejected with 400, not 500")
+}
+
+// TestCreateAPIKey_MalformedIdentityIDRejected verifies that a syntactically
+// invalid identity_id (not a UUID at all) is rejected with 400 rather than
+// leaking the underlying Postgres invalid-input-syntax error as a 500.
+func TestCreateAPIKey_MalformedIdentityIDRejected(t *testing.T) {
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":        "malformed-identity-key",
+		"identity_id": "not-a-uuid",
+	}, adminHeaders())
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a malformed (non-UUID) identity_id must be rejected with 400, not 500")
+}
+
 // TestCreateAPIKey_CrossTenantCredentialPolicyRejected verifies the IDOR guard:
 // a caller in tenant B cannot associate a new API key with a credential policy
 // that belongs to tenant A. GetPolicy is tenant-scoped and returns

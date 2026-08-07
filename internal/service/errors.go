@@ -14,6 +14,23 @@ func isDuplicateKeyError(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Field('C') == "23505"
 }
 
+// isInvalidUUIDError returns true if err is a PostgreSQL invalid-text-
+// representation error (SQLSTATE 22P02) — e.g. an empty or malformed string
+// written to a uuid column. Uses errors.As to handle wrapped errors from
+// bun/pgdriver.
+func isInvalidUUIDError(err error) bool {
+	var pgErr pgdriver.Error
+	return errors.As(err, &pgErr) && pgErr.Field('C') == "22P02"
+}
+
+// isForeignKeyViolation returns true if err is a PostgreSQL foreign key
+// violation (SQLSTATE 23503) — e.g. a caller-supplied reference ID that
+// doesn't exist. Uses errors.As to handle wrapped errors from bun/pgdriver.
+func isForeignKeyViolation(err error) bool {
+	var pgErr pgdriver.Error
+	return errors.As(err, &pgErr) && pgErr.Field('C') == "23503"
+}
+
 // IdentityDeactivatedConflictError is returned by RegisterIdentity when the
 // external_id collides with an existing identity that is DEACTIVATED (soft
 // deleted). Because deletes are soft, the deactivated row keeps the

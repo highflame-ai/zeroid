@@ -145,6 +145,11 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		if errors.Is(err, service.ErrPolicySubsetViolation) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
+		// Malformed or dangling reference field (e.g. a nonexistent
+		// identity_id) is caller error, not a server fault — see #149.
+		if errors.Is(err, service.ErrInvalidAPIKeyReference) {
+			return nil, huma.Error400BadRequest("invalid identity_id or credential_policy_id")
+		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create API key")
 		return nil, huma.Error500InternalServerError("failed to create API key")
 	}

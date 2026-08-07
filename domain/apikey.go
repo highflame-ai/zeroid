@@ -33,7 +33,7 @@ type APIKey struct {
 	KeyVersion         int             `bun:"key_version"              json:"key_version"`
 	AccountID          string          `bun:"account_id"               json:"account_id"`
 	ProjectID          string          `bun:"project_id"               json:"project_id"`
-	IdentityID         string          `bun:"identity_id,type:uuid"    json:"identity_id"`
+	IdentityID         string          `bun:"identity_id,type:uuid,nullzero" json:"identity_id"`
 	CreatedBy          string          `bun:"created_by"               json:"created_by"`
 	Scopes             []string        `bun:"scopes,array"             json:"scopes"`
 	Product            string          `bun:"product"                  json:"product"`
