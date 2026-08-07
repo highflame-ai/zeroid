@@ -98,6 +98,8 @@ var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 // Deployers don't typically observe this sentinel directly — it's
 // emitted by zeroid's chain walker and consumed by the handler. The
 // re-export exists so deployer tests can match on it via errors.Is.
+// No longer returned at runtime — see the service-package doc. Retained
+// for API compatibility.
 var ErrNoResolversRegistered = service.ErrNoResolversRegistered
 
 // APIKeyResolution is the public projection returned by

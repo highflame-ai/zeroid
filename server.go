@@ -762,10 +762,10 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 // used by the /oauth2/authorize handler for log attribution.
 //
 // Errors:
-//   - No resolvers registered → returns
-//     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
-//     so the deployer sees a clear "you forgot to wire this up"
-//     signal, distinct from the 401 "credential didn't match" case.
+//   - No longer returns ErrNoResolversRegistered. Since #263 a built-in
+//     api_key resolver is appended after the registered chain, so the
+//     chain is never empty and a deployment that registers nothing still
+//     serves the authorization_code flow its AS metadata advertises.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
 //     returns (nil, "", nil). Handler maps to 401 invalid_client.
 //   - Any resolver returning a non-sentinel error → returns
@@ -777,9 +777,15 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	copy(resolvers, s.principalResolvers)
 	s.mu.RUnlock()
 
-	if len(resolvers) == 0 {
-		return nil, "", ErrNoResolversRegistered
-	}
+	// The built-in api_key resolver runs LAST, after every registered
+	// resolver has declined. Ordering matters both ways: an embedder's
+	// resolver always wins on a request it recognises, and a deployment
+	// that registers nothing still has a working authorization_code flow
+	// instead of a 503 (#263).
+	resolvers = append(resolvers, namedPrincipalResolver{
+		name: builtinAPIKeyResolverName,
+		fn:   s.builtinAPIKeyResolver,
+	})
 
 	for _, r := range resolvers {
 		p, err := r.fn(ctx, req)
@@ -798,6 +804,60 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	}
 
 	return nil, "", nil
+}
+
+// builtinAPIKeyResolverName identifies the fallback resolver in
+// /oauth2/authorize logs, so operators can tell "the deployer's resolver
+// matched" from "we fell through to the built-in".
+const builtinAPIKeyResolverName = "builtin-api-key"
+
+// builtinAPIKeyResolver authenticates the principal from a ZeroID api_key.
+//
+// Why this exists: before #263, RegisterPrincipalResolver was the ONLY way to
+// populate the chain, and nothing in cmd/zeroid called it — so a shipped
+// ZeroID answered every /oauth2/authorize request with 503 while its own AS
+// metadata advertised `authorization_code` and
+// `client_id_metadata_document_supported: true`. Advertising a flow no
+// deployment can serve is the bug; this closes it.
+//
+// It grants no new authority: the same api_key already mints tokens directly
+// via the api_key grant at /oauth2/token, and ResolveAPIKey applies the same
+// deactivation/suspension gates on both paths.
+//
+// Credential sources, in order — deliberately NOT the query string. The
+// handler binds req.Form to the POST body only, so on a GET this reads
+// headers alone and a credential never lands in a URL, an access log, or a
+// Referer header (the reason GET was withheld in v1).
+func (s *Server) builtinAPIKeyResolver(ctx context.Context, req *AuthorizeRequest) (*Principal, error) {
+	key := req.Form("api_key")
+	if key == "" {
+		key = req.Header("X-API-Key")
+	}
+	if key == "" {
+		if bearer, ok := strings.CutPrefix(req.Header("Authorization"), "Bearer "); ok {
+			// Only claim a Bearer that looks like an api_key. A bearer
+			// access token is somebody else's credential shape, and
+			// swallowing it here would turn "wrong credential type" into
+			// a confusing invalid_client instead of falling through.
+			if strings.HasPrefix(bearer, domain.APIKeyPrefix) {
+				key = bearer
+			}
+		}
+	}
+	if key == "" {
+		return nil, ErrPrincipalNotApplicable
+	}
+
+	res, err := s.ResolveAPIKey(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &Principal{
+		AccountID: res.AccountID,
+		ProjectID: res.ProjectID,
+		UserID:    res.UserID,
+		Scopes:    res.Scopes,
+	}, nil
 }
 
 // AdminAuth sets an optional authentication middleware for admin routes.

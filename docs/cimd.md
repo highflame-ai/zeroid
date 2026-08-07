@@ -43,7 +43,21 @@ At a stable HTTPS URL it controls, e.g. `https://app.example.com/oauth/client.js
 
 ### 2. The client starts the flow with its URL as `client_id`
 
-`POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value):
+`GET` or `POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value).
+
+A browser-based client uses the RFC 6749 §4.1.1 redirect:
+
+```http
+GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+    &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+    &response_type=code
+    &code_challenge=<S256 challenge>
+    &code_challenge_method=S256
+    &state=<opaque> HTTP/1.1
+X-API-Key: zid_sk_...
+```
+
+A CLI client can post the same parameters as a form instead:
 
 ```http
 POST /oauth2/authorize HTTP/1.1
@@ -55,7 +69,13 @@ client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
 &code_challenge=<S256 challenge>
 &code_challenge_method=S256
 &state=<opaque>
+&api_key=zid_sk_...
 ```
+
+**Credentials never travel in the query string.** On `GET`, the principal must
+arrive in a header (`X-API-Key`, or `Authorization: Bearer zid_sk_…`) or a
+cookie — a URL ends up in access logs, browser history, and `Referer`. The
+protocol parameters above are fine there; the credential is not.
 
 ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…`.
 

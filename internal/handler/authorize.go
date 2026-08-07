@@ -30,12 +30,24 @@ import (
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
-// registerAuthorizeRoute mounts POST /oauth2/authorize on the public
-// chi router. GET is intentionally not supported in v1: RFC 6749
-// §4.1.1 permits GET for browser redirects, but the v1 use case (CLI
-// clients posting api_key + code_challenge) is POST-only. GET would
-// surface principal credentials in URL query strings + access logs.
+// registerAuthorizeRoute mounts GET and POST /oauth2/authorize on the
+// public chi router.
+//
+// GET is required, not optional: RFC 6749 §4.1.1 says the authorization
+// endpoint MUST support GET, and the browser redirect it enables is the
+// only shape an off-the-shelf OAuth client — an MCP client doing CIMD,
+// say — knows how to drive. v1 withheld it because the CLI use case was
+// POST-only and "GET would surface principal credentials in URL query
+// strings + access logs" (#263).
+//
+// That concern was right and is preserved rather than traded away:
+// buildAuthorizeRequest binds the resolver-facing Form accessor to the
+// POST body ONLY. On a GET the protocol parameters come from the query
+// string — where RFC 6749 puts them — while credentials must arrive in a
+// header or cookie. A credential therefore still never lands in a URL, an
+// access log, or a Referer header.
 func (a *API) registerAuthorizeRoute(router chi.Router) {
+	router.Get("/oauth2/authorize", a.authorizeHandler)
 	router.Post("/oauth2/authorize", a.authorizeHandler)
 }
 
@@ -78,16 +90,33 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// Form/Header/Cookie are typed accessors over the underlying
 	// request — resolvers read through them without ever holding a
 	// reference to *http.Request. PostForm.Get is naturally read-only.
+	//
+	// Protocol parameters come from the query string on GET (RFC 6749
+	// §4.1.1) and the body on POST. Read exactly one source per method
+	// rather than r.Form, which merges both: a merged view lets a caller
+	// put client_id in the query and another in the body, and whichever
+	// one the handler happens to read is a parameter-smuggling seam.
+	//
+	// The resolver-facing Form accessor stays bound to PostForm on BOTH
+	// methods. That is what keeps credentials out of URLs on the GET
+	// path: on a GET, req.Form is empty by construction, so a resolver
+	// reading req.Form("api_key") sees nothing and must fall through to
+	// a header or cookie. See registerAuthorizeRoute.
+	params := r.PostForm.Get
+	if r.Method == http.MethodGet {
+		query := r.URL.Query()
+		params = query.Get
+	}
 	postForm := r.PostForm
 	header := r.Header
 	req := &service.AuthorizeRequest{
-		ClientID:            postForm.Get("client_id"),
-		RedirectURI:         postForm.Get("redirect_uri"),
-		ResponseType:        postForm.Get("response_type"),
-		CodeChallenge:       postForm.Get("code_challenge"),
-		CodeChallengeMethod: postForm.Get("code_challenge_method"),
-		State:               postForm.Get("state"),
-		Scope:               postForm.Get("scope"),
+		ClientID:            params("client_id"),
+		RedirectURI:         params("redirect_uri"),
+		ResponseType:        params("response_type"),
+		CodeChallenge:       params("code_challenge"),
+		CodeChallengeMethod: params("code_challenge_method"),
+		State:               params("state"),
+		Scope:               params("scope"),
 		Form:                postForm.Get,
 		Header: func(name string) string {
 			return header.Get(name)

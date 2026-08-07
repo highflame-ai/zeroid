@@ -160,3 +160,36 @@ func TestADR0010_IDJAGGrantProfileAdvertised(t *testing.T) {
 	require.True(t, found,
 		"authorization_grant_profiles_supported MUST advertise the ID-JAG grant profile")
 }
+
+// TestASMetadata_AuthorizationEndpointAdvertised — RFC 8414 §2 makes
+// `authorization_endpoint` REQUIRED when the AS supports the
+// authorization_code grant, and we advertise that grant.
+//
+// The omission was not merely untidy (#263). `authorization_endpoint` is a
+// required field on the MCP Python SDK's OAuthMetadata model, so the entire
+// document failed to parse; the client concluded the AS had no metadata,
+// skipped CIMD — which is gated on client_id_metadata_document_supported
+// being readable — and silently fell back to dynamic client registration.
+// A discovery document that cannot be parsed is worse than one that is
+// absent, because the client proceeds on wrong assumptions.
+func TestASMetadata_AuthorizationEndpointAdvertised(t *testing.T) {
+	meta := fetchASMetadata(t)
+
+	grants, _ := meta["grant_types_supported"].([]any)
+	require.Contains(t, grants, "authorization_code",
+		"precondition: this test only applies while we advertise authorization_code")
+
+	authzEndpoint, _ := meta["authorization_endpoint"].(string)
+	require.NotEmpty(t, authzEndpoint,
+		"RFC 8414 §2: authorization_endpoint is REQUIRED when authorization_code "+
+			"is supported — without it a client cannot start the flow, and strict "+
+			"metadata parsers reject the whole document")
+	require.True(t, strings.HasSuffix(authzEndpoint, "/oauth2/authorize"),
+		"authorization_endpoint must point at the real endpoint, got %q", authzEndpoint)
+
+	// PKCE is mandatory on this endpoint (S256 only, no `plain`), so the
+	// method list has to say so rather than leaving clients to guess.
+	methods, _ := meta["code_challenge_methods_supported"].([]any)
+	require.Equal(t, []any{"S256"}, methods,
+		"code_challenge_methods_supported must advertise exactly S256")
+}
