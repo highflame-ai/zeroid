@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -199,8 +200,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		}
 	}
 	if search != "" {
-		searchPattern := "%" + search + "%"
-		q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		if _, err := uuid.Parse(search); err == nil {
+			q = q.Where("(id = ? OR external_id = ?)", search, search)
+		} else {
+			searchPattern := "%" + search + "%"
+			q = q.Where("(name ILIKE ? OR external_id ILIKE ?)", searchPattern, searchPattern)
+		}
 	}
 
 	total, err := q.Count(ctx)
@@ -219,6 +224,28 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		return nil, 0, fmt.Errorf("failed to list identities: %w", err)
 	}
 	return identities, total, nil
+}
+
+// ListByExternalIDs fetches identities by external_id within a tenant. external_id
+// is UNIQUE per (account, project) and indexed, so this is an indexed lookup. Used
+// to hydrate the parent agents of sub-agents that landed on a list page without
+// their parent, so a paginated caller can still nest them. It deliberately applies
+// no status/class filter: a sub-agent's parent must resolve even when the parent
+// would otherwise be filtered out (e.g. deactivated).
+func (r *IdentityRepository) ListByExternalIDs(ctx context.Context, accountID, projectID string, externalIDs []string) ([]*domain.Identity, error) {
+	if len(externalIDs) == 0 {
+		return nil, nil
+	}
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("external_id IN (?)", bun.List(externalIDs)).
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("failed to list identities by external_ids: %w", err)
+	}
+	return identities, nil
 }
 
 // FacetValue is a single value+count pair in a faceted aggregation.

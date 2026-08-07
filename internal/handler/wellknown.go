@@ -114,11 +114,16 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 }
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
-	return &OAuthMetadataOutput{Body: map[string]any{
-		"issuer":                                a.issuer,
-		"token_endpoint":                        a.issuer + "/oauth2/token",
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+	body := map[string]any{
+		"issuer":         a.issuer,
+		"token_endpoint": a.issuer + "/oauth2/token",
+		// "none" is advertised because public PKCE clients — including CIMD
+		// clients, whose metadata document is the registration — authenticate
+		// at the token endpoint with PKCE alone and carry no secret.
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
 		"grant_types_supported": []string{
+			"authorization_code",
+			"refresh_token",
 			"client_credentials",
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
 			"urn:ietf:params:oauth:grant-type:token-exchange",
@@ -139,10 +144,15 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"revocation_endpoint":    a.issuer + "/oauth2/token/revoke",
 		// RFC 8414 — client auth methods accepted by the introspection and
 		// revocation endpoints (client_secret_basic via Authorization header,
-		// client_secret_post via body fields).
-		"introspection_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic"},
-		"revocation_endpoint_auth_methods_supported":       []string{"client_secret_post", "client_secret_basic"},
-		"response_types_supported":                         []string{"token"},
+		// client_secret_post via body fields). "none" is included because
+		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
+		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
+		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
+		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
+		// implicit "token" flow is not supported), so advertise "code".
+		"response_types_supported":                         []string{"code"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
@@ -164,7 +174,18 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// backchannel endpoint. An empty array signals "no signing algs
 		// supported" per the spec's MAY clause.
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
-	}}, nil
+	}
+
+	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
+	// only when it's enabled on this deployment so CIMD-aware clients (e.g. MCP
+	// 2025-11-25) know they can present an https:// client_id URL and skip
+	// registration. Omitted entirely when disabled (the field's absence means
+	// "unsupported").
+	if a.cimdEnabled {
+		body["client_id_metadata_document_supported"] = true
+	}
+
+	return &OAuthMetadataOutput{Body: body}, nil
 }
 
 // protectedResourceMetadataOp serves RFC 9728 OAuth 2.0 Protected Resource

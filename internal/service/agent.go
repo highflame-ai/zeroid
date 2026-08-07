@@ -124,6 +124,10 @@ type AgentListResponse struct {
 	Total  int             `json:"total"`
 	Limit  int             `json:"limit"`
 	Offset int             `json:"offset"`
+	// Parents holds parent agents hydrated for sub-agents on this page whose parent
+	// is not itself on the page, so a paginated caller can nest them. Context only
+	// — NOT counted in Total/Limit/Offset.
+	Parents []AgentResponse `json:"parents,omitempty"`
 }
 
 // UpdateAgentRequest holds PATCH fields for updating an agent.
@@ -261,7 +265,7 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 
 // ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
 // label, and metadata (key presence or key:value).
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) (*AgentListResponse, error) {
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int, includeParents bool) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -270,8 +274,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 	}
 
 	// origin/status surface the unified native∪discovered inventory through the
-	// agent registry list (the endpoint admin/Studio proxy) — same filters the
-	// identities list exposes.
+	// agent registry list endpoint — the same filters the identities list exposes.
 	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
 	if err != nil {
 		return nil, err
@@ -294,18 +297,24 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		}
 	}
 
+	prefixes := s.keyPrefixesFor(ctx, identities)
 	agents := make([]AgentResponse, len(identities))
 	for i, id := range identities {
-		keyPrefix := s.getKeyPrefix(ctx, id.ID)
-		agents[i] = identityToAgentResponse(id, keyPrefix)
+		agents[i] = identityToAgentResponse(id, prefixes[id.ID])
 		agents[i].DelegationDepth = depthMap[id.ID]
 	}
 
+	var parents []AgentResponse
+	if includeParents {
+		parents = s.hydrateParents(ctx, accountID, projectID, identities)
+	}
+
 	return &AgentListResponse{
-		Agents: agents,
-		Total:  total,
-		Limit:  limit,
-		Offset: offset,
+		Agents:  agents,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+		Parents: parents,
 	}, nil
 }
 
@@ -583,6 +592,104 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 		CreatedBy:          identity.CreatedBy,
 		UpdatedAt:          identity.UpdatedAt,
 	}
+}
+
+// agentMeta is the subset of an agent's opaque metadata this service reads to
+// resolve agent → sub-agent hierarchy: a sub-agent points at its parent agent via
+// the parent_external_id key.
+type agentMeta struct {
+	ParentExternalID string `json:"parent_external_id"`
+}
+
+// hydrateParents returns the parent agents of any sub-agents in page whose parent
+// is not itself on the page — an agent is treated as a sub-agent when its metadata
+// carries a parent_external_id. It walks the ancestor chain so nested sub-agents
+// also resolve. Parents are fetched by external_id regardless of status/filter, so
+// a sub-agent whose parent is on another page — or filtered out (e.g. deactivated)
+// — can still be nested under it by a paginated caller.
+func (s *AgentService) hydrateParents(ctx context.Context, accountID, projectID string, page []*domain.Identity) []AgentResponse {
+	present := make(map[string]bool, len(page))
+	for _, id := range page {
+		present[id.ExternalID] = true
+	}
+
+	missing := missingParentExternalIDs(page, present)
+	var hydrated []AgentResponse
+
+	// Ancestor chains are shallow; cap rounds so a pathological/cyclic
+	// parent_external_id can never loop forever.
+	const maxRounds = 8
+	for round := 0; round < maxRounds && len(missing) > 0; round++ {
+		fetched, err := s.identitySvc.ListByExternalIDs(ctx, accountID, projectID, missing)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to hydrate parent agents, continuing without")
+
+			break
+		}
+		if len(fetched) == 0 {
+			break
+		}
+		prefixes := s.keyPrefixesFor(ctx, fetched)
+		for _, id := range fetched {
+			present[id.ExternalID] = true
+			hydrated = append(hydrated, identityToAgentResponse(id, prefixes[id.ID]))
+		}
+		missing = missingParentExternalIDs(fetched, present)
+	}
+
+	return hydrated
+}
+
+// missingParentExternalIDs collects the distinct parent_external_id of every
+// sub-agent in ids (an agent whose metadata sets parent_external_id) whose parent
+// is not already in present.
+func missingParentExternalIDs(ids []*domain.Identity, present map[string]bool) []string {
+	seen := make(map[string]bool)
+
+	var out []string
+
+	for _, id := range ids {
+		if len(id.Metadata) == 0 {
+			continue
+		}
+
+		var meta agentMeta
+		if err := json.Unmarshal(id.Metadata, &meta); err != nil {
+			continue
+		}
+		if meta.ParentExternalID == "" {
+			continue
+		}
+		if present[meta.ParentExternalID] || seen[meta.ParentExternalID] {
+			continue
+		}
+
+		seen[meta.ParentExternalID] = true
+		out = append(out, meta.ParentExternalID)
+	}
+
+	return out
+}
+
+// keyPrefixesFor returns identity ID → active API-key prefix for a batch of
+// identities in one query — the batched form of getKeyPrefix. Identities
+// without an active key (or the whole batch, on a lookup error) are absent
+// from the map, yielding the same "" a getKeyPrefix miss produces.
+func (s *AgentService) keyPrefixesFor(ctx context.Context, identities []*domain.Identity) map[string]string {
+	ids := make([]string, len(identities))
+	for i, id := range identities {
+		ids[i] = id.ID
+	}
+	keys, err := s.apiKeyRepo.ListActiveByIdentityIDs(ctx, ids)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to batch-fetch API key prefixes, continuing without")
+		return nil
+	}
+	prefixes := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prefixes[k.IdentityID] = k.KeyPrefix
+	}
+	return prefixes
 }
 
 func (s *AgentService) getKeyPrefix(ctx context.Context, identityID string) string {

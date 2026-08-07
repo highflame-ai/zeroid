@@ -38,6 +38,24 @@ type GrantRequest struct {
 	// and can never be injected via AdditionalClaims (both names are reserved).
 	Role           string
 	PrivilegeScope []string
+	// Audience is an OPTIONAL, server-recognized audience-profile name (e.g.
+	// "codeoid"). On the trusted external-principal exchange
+	// (Server.ExternalPrincipalExchange) a recognized value stamps the issued
+	// token's `aud` claim and adds that profile's fixed, server-defined scope
+	// set to the `scopes` claim. Callers never supply scopes through this
+	// field — the name maps to a hard-coded profile inside zeroid. An empty
+	// value leaves issuance unchanged; a non-empty value that names no known
+	// profile is rejected with `invalid_target` (RFC 8693) rather than
+	// silently downgraded to a default token.
+	Audience string
+	// IssueRefreshToken requests that the external-principal exchange ALSO mint a
+	// rotating refresh token (returned as `refresh_token` in the token response)
+	// so the external principal can keep its session alive by self-rotating at
+	// /oauth2/token — no broker re-mint on a timer. Honoured ONLY on
+	// Server.ExternalPrincipalExchange AND ONLY for a profiled Audience; ignored
+	// otherwise. The principal presents the Audience name as `client_id` when
+	// rotating; every rotation re-stamps the same `aud`/scope profile.
+	IssueRefreshToken bool
 }
 
 // Principal is the resolved caller at /oauth2/authorize — the tenant +

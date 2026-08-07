@@ -45,6 +45,7 @@ type APIKeyOutput struct {
 type APIKeyListInput struct {
 	Product       string `query:"product" doc:"Filter by product namespace"`
 	ApplicationID string `query:"application_id" doc:"Filter by application identity ID"`
+	State         string `query:"state" enum:"active,revoked,expired" doc:"Filter by key state (active, revoked, expired)"`
 	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
 	Page          int    `query:"page" default:"1" doc:"Page number"`
 	Limit         int    `query:"limit" default:"20" doc:"Items per page (max 100)"`
@@ -171,7 +172,7 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, input.ApplicationID, input.Product, input.Label, input.Page, input.Limit)
+	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, input.ApplicationID, input.Product, input.State, input.Label, input.Page, input.Limit)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")

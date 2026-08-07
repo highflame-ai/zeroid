@@ -239,10 +239,20 @@ func (s *OAuthClientService) GetPublicClient(ctx context.Context, clientID strin
 }
 
 // GetClientByClientID retrieves any client (public or confidential) by client_id.
+//
+// Returns ErrOAuthClientNotFound only when there is genuinely no matching row;
+// an operational failure (e.g. DB outage) is returned as-is. Callers that gate
+// security decisions on "no row exists" — notably the CIMD registry-first
+// fallback — MUST distinguish the two with errors.Is(err, ErrOAuthClientNotFound)
+// and fail closed on an operational error, so a transient store failure can't be
+// misread as "unregistered" and used to resurrect a deactivated client.
 func (s *OAuthClientService) GetClientByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client, err := s.repo.GetByClientID(ctx, clientID)
 	if err != nil {
-		return nil, ErrOAuthClientNotFound
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOAuthClientNotFound
+		}
+		return nil, err
 	}
 
 	return client, nil

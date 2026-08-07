@@ -44,6 +44,12 @@ type API struct {
 	issuer               string
 	startTime            time.Time
 
+	// cimdEnabled advertises CIMD support in the OAuth 2.0 Authorization Server
+	// Metadata document (client_id_metadata_document_supported). Set via
+	// SetCIMDEnabled after construction; defaults false so a build that doesn't
+	// wire CIMD doesn't advertise it.
+	cimdEnabled bool
+
 	// resolvePrincipal walks the PrincipalResolver chain registered on
 	// the top-level Server. Wired by Server.NewServer via
 	// SetPrincipalResolverFunc; nil when no resolvers are registered
@@ -218,6 +224,14 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 	a.resolvePrincipal = fn
 }
 
+// SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution
+// is active on this deployment, so the OAuth 2.0 Authorization Server Metadata
+// document advertises client_id_metadata_document_supported accordingly. Called
+// by Server.NewServer from cfg.CIMD.Enabled.
+func (a *API) SetCIMDEnabled(enabled bool) {
+	a.cimdEnabled = enabled
+}
+
 // RegisterAdmin registers admin/management endpoints:
 // identities, credentials, policies, attestation, signals, oauth clients, proof verify.
 // These run on the admin port which is protected at the network layer.
@@ -237,6 +251,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerExpiringSoonRoute(api)
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
+	a.registerObservedResourceRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

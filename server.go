@@ -259,17 +259,47 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	if authCodeIssuer == "" {
 		authCodeIssuer = cfg.Token.Issuer
 	}
+	// Merge deployer-configured audience→scope profiles over the built-in defaults
+	// and validate every scope against the allowlist (fail closed at startup).
+	audienceScopeProfiles, err := service.ResolveAudienceScopeProfiles(cfg.AudienceScopeProfiles)
+	if err != nil {
+		return nil, fmt.Errorf("audience scope profiles: %w", err)
+	}
 	oauthSvc := service.NewOAuthService(credentialSvc, identitySvc, oauthClientSvc, apiKeyRepo, authCodeRepo, jwksSvc, refreshTokenSvc, service.OAuthServiceConfig{
-		Issuer:         cfg.Token.Issuer,
-		WIMSEDomain:    cfg.WIMSEDomain,
-		HMACSecret:     cfg.Token.HMACSecret,
-		AuthCodeIssuer: authCodeIssuer,
+		Issuer:                           cfg.Token.Issuer,
+		WIMSEDomain:                      cfg.WIMSEDomain,
+		HMACSecret:                       cfg.Token.HMACSecret,
+		AuthCodeIssuer:                   authCodeIssuer,
+		AudienceScopeProfiles:            audienceScopeProfiles,
+		ExternalPrincipalRefreshTokenTTL: cfg.Token.ExternalPrincipalRefreshTokenTTL,
 	})
 	// Strict client auth on introspection (RFC 7662) / revocation (RFC 7009):
 	// require it whenever unauthenticated inspection is NOT allowed. Validate()
 	// forces allow_unauthenticated_token_inspection=false in production, so
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
+
+	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
+	// the authorization_code flow by fetching + validating their published
+	// metadata documents. The document fetch reuses the same DNS-rebinding-safe
+	// SSRF-guarded HTTP client as the OIDC attestation verifier and CIBA
+	// dispatch, so a client_id URL can never make ZeroID reach a private /
+	// loopback / metadata address (unless the deployer opts into the test/dev
+	// relaxation). Enabled by default (cfg.CIMD.Enabled defaults true).
+	cimdSvc := service.NewCIMDService(service.CIMDConfig{
+		Enabled:          cfg.CIMD.Enabled,
+		AllowedDomains:   cfg.CIMD.AllowedDomains,
+		MaxDocumentBytes: cfg.CIMD.MaxDocumentBytes,
+		CacheTTL:         time.Duration(cfg.CIMD.CacheTTLSeconds) * time.Second,
+		HTTPClient:       attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints),
+	})
+	oauthSvc.SetCIMDService(cimdSvc)
+	if cfg.CIMD.Enabled {
+		log.Info().
+			Int("allowed_domains", len(cfg.CIMD.AllowedDomains)).
+			Bool("allow_private_endpoints", cfg.CIMD.AllowPrivateMetadataEndpoints).
+			Msg("CIMD (Client ID Metadata Documents) enabled")
+	}
 
 	// Build the external-issuer registry when the deployer has configured
 	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
@@ -294,6 +324,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// skip replay protection. Backed by the id_jag_jti table (migration 034),
 	// swept by the cleanup worker.
 	oauthSvc.SetIDJAGReplayStore(postgres.NewIDJAGReplayStore(db))
+	// Observed-MCP-server inventory (zeroid#259). Backed by
+	// observed_idjag_resources (migration 040). Best-effort and off the critical
+	// path: a failure here is logged and the token is still issued.
+	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
@@ -338,6 +372,8 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		signingCredSvc, db,
 		cfg.Token.Issuer,
 	)
+	// Advertise CIMD support in the AS metadata document only when enabled.
+	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
@@ -593,17 +629,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 	s.oauthSvc.RegisterGrant(name, func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
 		return handler(ctx, GrantRequest{
-			GrantType:        req.GrantType,
-			AccountID:        req.AccountID,
-			ProjectID:        req.ProjectID,
-			UserID:           req.UserID,
-			UserEmail:        req.UserEmail,
-			UserName:         req.UserName,
-			ApplicationID:    req.ApplicationID,
-			Scope:            req.Scope,
-			AdditionalClaims: req.AdditionalClaims,
-			Role:             req.Role,
-			PrivilegeScope:   req.PrivilegeScope,
+			GrantType:         req.GrantType,
+			AccountID:         req.AccountID,
+			ProjectID:         req.ProjectID,
+			UserID:            req.UserID,
+			UserEmail:         req.UserEmail,
+			UserName:          req.UserName,
+			ApplicationID:     req.ApplicationID,
+			Scope:             req.Scope,
+			AdditionalClaims:  req.AdditionalClaims,
+			Role:              req.Role,
+			PrivilegeScope:    req.PrivilegeScope,
+			Audience:          req.Audience,
+			IssueRefreshToken: req.IssueRefreshToken,
 		})
 	})
 }
@@ -657,18 +695,20 @@ func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResol
 // This is the building block for custom grant types like "user_session".
 func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest) (*domain.AccessToken, error) {
 	return s.oauthSvc.ExternalPrincipalExchange(ctx, service.TokenRequest{
-		GrantType:        req.GrantType,
-		AccountID:        req.AccountID,
-		ProjectID:        req.ProjectID,
-		UserID:           req.UserID,
-		UserEmail:        req.UserEmail,
-		UserName:         req.UserName,
-		ApplicationID:    req.ApplicationID,
-		Scope:            req.Scope,
-		AdditionalClaims: req.AdditionalClaims,
-		Role:             req.Role,
-		PrivilegeScope:   req.PrivilegeScope,
-		TrustedService:   true,
+		GrantType:         req.GrantType,
+		AccountID:         req.AccountID,
+		ProjectID:         req.ProjectID,
+		UserID:            req.UserID,
+		UserEmail:         req.UserEmail,
+		UserName:          req.UserName,
+		ApplicationID:     req.ApplicationID,
+		Scope:             req.Scope,
+		AdditionalClaims:  req.AdditionalClaims,
+		Role:              req.Role,
+		PrivilegeScope:    req.PrivilegeScope,
+		Audience:          req.Audience,
+		IssueRefreshToken: req.IssueRefreshToken,
+		TrustedService:    true,
 	})
 }
 

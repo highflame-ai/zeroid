@@ -191,7 +191,7 @@ jobs:
         shell: bash
         run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
-          pip install --quiet highflame
+          pip install --quiet "highflame==0.3.17"
 
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
@@ -202,13 +202,80 @@ jobs:
         run: |-
           npm init -y
           npm install --save-dev vitest typescript @testcontainers/postgresql
-          npm install @highflame/sdk
+          npm install @highflame/sdk@0.3.17
 
       - name: Run TypeScript SDK smoke tests
         working-directory: tests/sdk
         shell: bash
         run: |-
          npx vitest run sdk-smoke.test.ts --reporter=verbose
+
+  # CLI unit tests (cli/) — an offline, msw-mocked vitest suite that already
+  # exists (`make cli-test`) but was never wired into CI. highflame-sdk#93.
+  highflame-cli-check:
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VER }}
+
+      - name: Run CLI unit tests (offline, msw-mocked)
+        shell: bash
+        run: make cli-test
+
+  # Executes the zeroid quickstart example notebook end-to-end against a live
+  # server, so a change that breaks the documented getting-started flow fails the
+  # PR. Mirrors the notebook's own prerequisites (`make setup-keys` + docker
+  # compose on :8899, which the notebook hardcodes). The notebook's own `assert`s
+  # (revocation, CAE auto-revoke) are the pass/fail signal. highflame-sdk#93.
+  highflame-notebook-check:
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+
+      - name: Generate signing keys
+        shell: bash
+        run: make setup-keys
+
+      - name: Start zeroid + postgres (docker compose, wait for health)
+        shell: bash
+        run: docker compose up --build -d --wait
+
+      - name: Install notebook execution deps
+        shell: bash
+        run: pip install --quiet pytest nbmake ipykernel "highflame==0.3.17" cryptography "PyJWT>=2.8"
+
+      - name: Execute the quickstart notebook against the live server
+        shell: bash
+        run: pytest --nbmake --nbmake-timeout=300 examples/zeroid_quickstart.ipynb -v
+
+      - name: Dump zeroid logs on failure
+        if: failure()
+        shell: bash
+        run: docker compose logs zeroid | tail -200
+
+      - name: Teardown
+        if: always()
+        shell: bash
+        run: docker compose down -v
 
   highflame-trivy-check:
     permissions:

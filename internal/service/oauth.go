@@ -41,6 +41,17 @@ type OAuthService struct {
 	wimseDomain     string // configurable WIMSE URI domain (e.g. "zeroid.dev")
 	hmacSecret      string // HS256 shared secret for auth code JWT verification
 	authCodeIssuer  string // expected issuer in auth code JWTs
+	// audienceScopeProfiles maps an external-principal-exchange audience name to
+	// its server-defined scope set (built-in defaults + deployer config, merged
+	// and validated at construction — see ResolveAudienceScopeProfiles). Nil is
+	// treated as the built-in defaults.
+	audienceScopeProfiles map[string][]string
+	// externalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller requests
+	// one (IssueRefreshToken). It bounds how long a harness session can keep
+	// itself alive by self-rotating before the user must re-authenticate. 0 ⇒
+	// the built-in default (defaultExternalPrincipalRefreshTokenTTL).
+	externalPrincipalRefreshTokenTTL int
 	// trustedServiceValidator checks if the caller is a trusted service for external principal exchange.
 	trustedServiceValidator trustedServiceValidatorFunc
 	// customGrants holds registered custom grant type handlers.
@@ -53,6 +64,11 @@ type OAuthService struct {
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
+	// cimdSvc resolves Client ID Metadata Document (CIMD) client_id URLs into
+	// ephemeral public PKCE clients on the authorization_code flow. Nil (or a
+	// disabled instance) means CIMD is off and the auth-code paths use only the
+	// client registry. Wired after construction via SetCIMDService.
+	cimdSvc *CIMDService
 	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
 	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
 	// every other check passes) so a replayed ID-JAG is rejected with
@@ -62,6 +78,12 @@ type OAuthService struct {
 	// silently skip replay protection while ID-JAG is actually in use — but the
 	// handler also guards against nil defensively (fail closed).
 	idJAGReplayStore IDJAGReplayStore
+	// observedIDJAGResources records which MCP servers this tenant's agents have
+	// actually reached, learned from the `resource` claim of successful ID-JAG
+	// redemptions (zeroid#259). Wired after construction via
+	// SetObservedIDJAGResourceStore. Nil is valid and simply means the inventory
+	// is not being collected — it must NEVER affect whether a token is minted.
+	observedIDJAGResources ObservedIDJAGResourceStore
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -86,16 +108,50 @@ type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
 }
 
+// ObservedIDJAGResourceStore records the MCP servers named by the `resource`
+// claim of successfully-redeemed ID-JAGs (zeroid#259), giving a tenant an
+// inventory of the servers its agents actually reach.
+//
+// Record is called on the SUCCESS path only and is strictly best-effort: the
+// token is already minted by that point, so a bookkeeping failure must never
+// withhold it. The concrete impl is postgres.ObservedIDJAGResourceStore; an
+// interface here keeps the service testable and the dependency narrow.
+type ObservedIDJAGResourceStore interface {
+	Record(ctx context.Context, accountID, projectID, authorizingISS string, resources []string) error
+}
+
 // Default token TTLs (used when per-client TTL is not configured).
 const (
 	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
 	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
 )
 
+// externalPrincipalAccessTokenTTL is the lifetime (seconds) of the SHORT-LIVED
+// access token issued by the external-principal exchange — 15 minutes, whether
+// or not a refresh token accompanies it. Kept short so a stolen access token
+// has a small window; continuity comes from the refresh token, not a long
+// access-token TTL. The refresh grant re-issues at this same TTL.
+const externalPrincipalAccessTokenTTL = 900
+
+// defaultExternalPrincipalRefreshTokenTTL bounds how long an external-principal
+// session (e.g. an embedded codeoid workspace) can keep itself alive by
+// self-rotating its refresh token before the user must re-authenticate through
+// the broker. 12 hours: comfortably longer than an interactive coding session,
+// short enough to cap a leaked refresh token's usefulness. Overridable per
+// deployment via OAuthServiceConfig.ExternalPrincipalRefreshTokenTTL.
+const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
+
 // reservedClaims are standard JWT and ZeroID claims that additional_claims cannot override.
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
+	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
+	// it — so the claim only means that if ZeroID is the only party who can set
+	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// must never be able to make a token look resource-bound when it isn't, or
+	// to widen a real binding by overriding it through additional_claims.
+	"resource": true,
 	// ZeroID identity claims
 	"account_id": true, "project_id": true, "user_id": true, "owner_user_id": true,
 	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
@@ -122,6 +178,126 @@ var reservedClaims = map[string]bool{
 	"privilege_scope": true,
 }
 
+// audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
+// Studio requests it on the user_session/external-principal exchange so a
+// short-lived, user-identity JWT can drive the codeoid daemon's web operator
+// surface. The name is the ONLY input a caller supplies — it maps to exactly
+// one server-defined scope profile (never caller-supplied scopes).
+const audienceCodeoid = "codeoid"
+
+// audienceAgentSandbox is the audience profile for provisioning a per-sandbox
+// workload identity. A trusted broker (e.g. highflame-forge) requests it on the
+// user_session exchange to obtain a short-lived, user-identity token that
+// registers a per-sandbox agent identity (POST /agents/register) in the user's
+// OWN tenant — the workload-identity mint (forge #25). Deliberately harness-
+// AGNOSTIC (any agent workspace, not just codeoid) and scoped to just
+// `nhi:manage` — the ONE capability the register call needs; the registered
+// badge's own scopes are set separately in the register request.
+const audienceAgentSandbox = "agent-sandbox"
+
+// defaultAudienceScopeProfiles is the BUILT-IN fallback map of audience name →
+// the fixed scope set minted for that audience on the trusted external-principal
+// exchange. Deployers ADD or OVERRIDE profiles via config
+// (Config.AudienceScopeProfiles → ResolveAudienceScopeProfiles), so a NEW
+// audience is a reviewed CONFIG change, not a code release. It stays
+// server-defined either way (never caller-supplied): a caller only names an
+// audience, which resolves to exactly one profile the deployer controls.
+var defaultAudienceScopeProfiles = map[string][]string{
+	// codeoid: the web-operator scope set the codeoid daemon re-verifies (via
+	// JWKS) and reads from the `scopes` claim to authorize embedded-UI actions.
+	// The `pipeline:*` scopes drive the embedded /packs Pack Browser + /pipeline
+	// runner (pack.list needs pipeline:read); without them the embedded UI renders
+	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
+	// the api-key exchange flow (which widens its own request), the embed-handoff
+	// token is used verbatim, so this server-side profile is the only lever.
+	audienceCodeoid: {
+		"session:list",
+		"session:create",
+		"session:attach",
+		"session:watch",
+		"session:send",
+		"session:interrupt",
+		"session:approve",
+		"session:destroy",
+		"session:read",
+		"session:dispatch",
+		"fs:read",
+		"pipeline:read",
+		"pipeline:create",
+		"pipeline:answer",
+		"pipeline:manage",
+	},
+	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
+	// to register a per-sandbox identity on the user's behalf.
+	audienceAgentSandbox: {
+		"nhi:manage",
+	},
+}
+
+// allowedProfileScopes bounds what ANY audience profile (built-in default OR
+// deployer config) may grant, so a config entry can never invent authority the
+// server doesn't recognize. A profile scope outside this set fails startup
+// (ResolveAudienceScopeProfiles, fail closed).
+var allowedProfileScopes = map[string]bool{
+	"session:list":      true,
+	"session:create":    true,
+	"session:attach":    true,
+	"session:watch":     true,
+	"session:send":      true,
+	"session:interrupt": true,
+	"session:approve":   true,
+	"session:destroy":   true,
+	"session:read":      true,
+	"session:dispatch":  true,
+	"fs:read":           true,
+	"nhi:manage":        true,
+	"pipeline:read":     true,
+	"pipeline:create":   true,
+	"pipeline:answer":   true,
+	"pipeline:manage":   true,
+}
+
+// ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
+// the built-in defaults and validates that every granted scope is in
+// allowedProfileScopes. It returns an error (→ startup failure, fail closed) on
+// an empty audience name or an unrecognized scope, so a config typo/mistake can
+// never silently widen authority. Called once at server construction; the merged
+// result is stored on the OAuthService. A nil/empty config yields the defaults.
+func ResolveAudienceScopeProfiles(configured map[string][]string) (map[string][]string, error) {
+	out := make(map[string][]string, len(defaultAudienceScopeProfiles)+len(configured))
+	for aud, scopes := range defaultAudienceScopeProfiles {
+		out[aud] = slices.Clone(scopes)
+	}
+	for aud, scopes := range configured {
+		out[aud] = slices.Clone(scopes)
+	}
+	// Validate the MERGED set (built-in defaults AND deployer config) uniformly and
+	// fail closed. Validating the defaults too guards against a future default
+	// scope drifting out of allowedProfileScopes (a config trying to grant the same
+	// scope would then be rejected while the default silently grants it).
+	for aud, scopes := range out {
+		if strings.TrimSpace(aud) == "" {
+			return nil, fmt.Errorf("audience_scope_profiles: empty audience name")
+		}
+		if len(scopes) == 0 {
+			// A recognized-but-empty profile mints a token with the audience stamped
+			// and ZERO scopes — every scope-gated action then silently denies. Reject
+			// at boot (fail loud) rather than shipping a scopeless audience.
+			return nil, fmt.Errorf(
+				"audience_scope_profiles[%q]: empty scope list — a recognized audience must grant at least one scope",
+				aud)
+		}
+		for _, sc := range scopes {
+			if !allowedProfileScopes[sc] {
+				return nil, fmt.Errorf(
+					"audience_scope_profiles[%q]: scope %q is not in the server's allowed profile-scope set",
+					aud, sc)
+			}
+		}
+	}
+	return out, nil
+}
+
 // trustedServiceValidatorFunc checks whether the current request comes from a trusted
 // internal service that is allowed to perform external principal exchange.
 // The public type is zeroid.TrustedServiceValidator (hooks.go).
@@ -133,6 +309,14 @@ type OAuthServiceConfig struct {
 	WIMSEDomain    string
 	HMACSecret     string
 	AuthCodeIssuer string
+	// AudienceScopeProfiles is the merged+validated audience→scope map for the
+	// external-principal exchange (from ResolveAudienceScopeProfiles). Nil falls
+	// back to the built-in defaults.
+	AudienceScopeProfiles map[string][]string
+	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
+	// token minted by the external-principal exchange when the caller sets
+	// IssueRefreshToken. 0 ⇒ the built-in default (12h).
+	ExternalPrincipalRefreshTokenTTL int
 	// TrustedServiceValidator is called during external principal token exchange
 	// to verify the caller is a trusted internal service. If nil, external
 	// principal exchange is disabled.
@@ -151,19 +335,38 @@ func NewOAuthService(
 	cfg OAuthServiceConfig,
 ) *OAuthService {
 	return &OAuthService{
-		credentialSvc:           credentialSvc,
-		identitySvc:             identitySvc,
-		oauthClientSvc:          oauthClientSvc,
-		apiKeyRepo:              apiKeyRepo,
-		authCodeRepo:            authCodeRepo,
-		jwksSvc:                 jwksSvc,
-		refreshTokenSvc:         refreshTokenSvc,
-		issuer:                  cfg.Issuer,
-		wimseDomain:             cfg.WIMSEDomain,
-		hmacSecret:              cfg.HMACSecret,
-		authCodeIssuer:          cfg.AuthCodeIssuer,
-		trustedServiceValidator: cfg.TrustedServiceValidator,
+		credentialSvc:                    credentialSvc,
+		identitySvc:                      identitySvc,
+		oauthClientSvc:                   oauthClientSvc,
+		apiKeyRepo:                       apiKeyRepo,
+		authCodeRepo:                     authCodeRepo,
+		jwksSvc:                          jwksSvc,
+		refreshTokenSvc:                  refreshTokenSvc,
+		issuer:                           cfg.Issuer,
+		wimseDomain:                      cfg.WIMSEDomain,
+		hmacSecret:                       cfg.HMACSecret,
+		authCodeIssuer:                   cfg.AuthCodeIssuer,
+		audienceScopeProfiles:            audienceProfilesOrDefault(cfg.AudienceScopeProfiles),
+		externalPrincipalRefreshTokenTTL: cfg.ExternalPrincipalRefreshTokenTTL,
+		trustedServiceValidator:          cfg.TrustedServiceValidator,
 	}
+}
+
+// audienceProfilesOrDefault returns a deep copy of the configured profiles, or of
+// the built-in defaults when nil — so direct NewOAuthService callers (e.g. tests)
+// that don't set them still resolve the standard audiences. It always clones, so
+// an OAuthService can never alias the package-global defaults (nil path) nor a map
+// the caller retains and later mutates (non-nil path).
+func audienceProfilesOrDefault(configured map[string][]string) map[string][]string {
+	source := configured
+	if source == nil {
+		source = defaultAudienceScopeProfiles
+	}
+	out := make(map[string][]string, len(source))
+	for aud, scopes := range source {
+		out[aud] = slices.Clone(scopes)
+	}
+	return out
 }
 
 // SetTrustedServiceValidator sets the validator for external principal token exchange.
@@ -180,12 +383,54 @@ func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
 }
 
+// SetCIMDService wires the Client ID Metadata Document resolver after
+// construction. When set to an enabled instance, the authorization_code flow
+// resolves https:// client_id URLs by fetching + validating their published
+// metadata documents (see internal/service/cimd.go). A nil or disabled
+// instance leaves CIMD off — the auth-code paths use only the client registry.
+func (s *OAuthService) SetCIMDService(c *CIMDService) {
+	s.cimdSvc = c
+}
+
+// cimdOAuthError maps a CIMD resolution error sentinel to the RFC 6749 §5.2
+// OAuth error the /oauth2/authorize and /oauth2/token responses should carry.
+// It never surfaces the wrapped cause's message to the client (fetch details
+// can leak our DNS view / internal topology); the cause is preserved on the
+// OAuthError for server-side logs.
+func cimdOAuthError(err error) error {
+	switch {
+	case errors.Is(err, ErrCIMDInvalidClientID):
+		return oauthBadRequestCause(oautherror.InvalidRequest,
+			"client_id is not a valid metadata document URL", err)
+	case errors.Is(err, ErrCIMDInvalidDocument):
+		// RFC 7591 invalid_client_metadata — the document exists but is
+		// malformed or declares an unsupported shape.
+		return oauthBadRequestCause(oautherror.InvalidClientMetadata,
+			"client id metadata document is invalid", err)
+	case errors.Is(err, ErrCIMDDomainNotAllowed):
+		return oauthUnauthorized("client_id metadata domain is not allowed", err)
+	case errors.Is(err, ErrCIMDFetch):
+		return oauthUnauthorized("could not retrieve client id metadata document", err)
+	case errors.Is(err, ErrCIMDDisabled):
+		return oauthUnauthorized("client id metadata documents are not enabled", err)
+	default:
+		return oauthServerError("client id metadata resolution failed", err)
+	}
+}
+
 // SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
 // values (ADR 0010 D2a). Required whenever ID-JAG federation is enabled — the
 // idJAGBearer path consumes jti against this store as its final gate. Wired in
 // server.go alongside the external-issuer registry.
 func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
 	s.idJAGReplayStore = store
+}
+
+// SetObservedIDJAGResourceStore wires the observed-MCP-server inventory
+// (zeroid#259). Optional: when unset, ID-JAG exchanges behave exactly as before
+// and nothing is recorded. Wired in server.go alongside the replay store.
+func (s *OAuthService) SetObservedIDJAGResourceStore(store ObservedIDJAGResourceStore) {
+	s.observedIDJAGResources = store
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
@@ -241,6 +486,26 @@ type TokenRequest struct {
 	// rejects untrusted callers before issuance.
 	Role           string   // authorization role claim (`role`)
 	PrivilegeScope []string // authorization privilege scope claim (`privilege_scope`)
+	// Audience is an OPTIONAL, server-recognized audience profile name (e.g.
+	// "codeoid"). Honoured ONLY on the trusted external-principal exchange:
+	// when it matches a known profile in audienceScopeProfiles, the issued
+	// token carries `aud` = the audience name plus that profile's fixed scope
+	// set in the `scopes` claim. Arbitrary caller scopes are never honoured for
+	// a profiled audience — the audience name is the whole input. An empty
+	// value leaves issuance unchanged (default `aud` = issuer, scopes from
+	// Scope); a non-empty value that names no known profile is rejected with
+	// `invalid_target` (RFC 8693) rather than silently downgraded. Like
+	// Role/PrivilegeScope this is a dedicated field, never settable via
+	// AdditionalClaims (`aud`/`scopes` are reserved).
+	Audience string
+	// IssueRefreshToken requests that the external-principal exchange ALSO mint a
+	// rotating refresh token alongside the short-lived access token, so the
+	// external principal (e.g. an embedded codeoid workspace) can keep its
+	// session alive by self-rotating at /oauth2/token instead of the broker
+	// re-minting on a timer. Honoured ONLY on the trusted external-principal
+	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
+	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
+	IssueRefreshToken bool
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -828,17 +1093,43 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// Step 5: Issue an RS256 token. RS256 is used for human/SDK tokens to distinguish
 	// them from ES256 NHI tokens in downstream verification.
 	scopes := parseScopeString(req.Scope)
+
+	// Audience profile (e.g. "codeoid"): the audience NAME maps to a fixed,
+	// server-defined scope set + `aud` claim (audienceScopeProfiles). This is
+	// the ONLY place these scopes come from — arbitrary caller-supplied scopes
+	// are never honoured for a profiled audience, so a profiled token cannot be
+	// widened past the hard-coded set. slices.Clone hands the token a private
+	// copy so the shared profile can never be mutated through an issued token.
+	//
+	// Empty audience is backward-compatible: issuance is unchanged (`scopes`
+	// from req.Scope, `aud` defaults to the issuer) — legacy callers that pass
+	// no audience get exactly the token they got before. A non-empty audience
+	// that names no known profile is rejected with `invalid_target` (RFC 8693
+	// §2.1/§2.2.2) rather than silently downgraded: a caller that asked for a
+	// scoped audience must not be handed an unscoped/misscoped token believing
+	// it got the profile it requested (scope-confusion / privilege-escalation).
+	var audience []string
+	if req.Audience != "" {
+		profile, ok := s.audienceScopeProfiles[req.Audience]
+		if !ok {
+			return nil, oauthBadRequest(oautherror.InvalidTarget, "unrecognized audience profile")
+		}
+		scopes = slices.Clone(profile)
+		audience = []string{req.Audience}
+	}
+
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
 		Scopes:            scopes,
+		Audience:          audience,
 		UseRS256:          true,
 		SubjectOverride:   req.UserID,
 		UserEmail:         req.UserEmail,
 		UserName:          req.UserName,
 		ApplicationID:     req.ApplicationID,
-		TTL:               900, // 15 minutes — short-lived for external principals
+		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	})
@@ -849,6 +1140,40 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	accessToken.AccountID = req.AccountID
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = req.UserID
+
+	// Step 6 (optional): mint a rotating refresh token so the external principal
+	// can keep its session alive on its own — self-rotating at /oauth2/token —
+	// rather than the broker re-minting on a timer. Gated to a PROFILED audience
+	// (audience != "" was validated above): the refresh grant re-stamps the same
+	// `aud`/scope profile on every rotation, which only exists for a profiled
+	// audience. The audience NAME is persisted as the refresh token's client_id
+	// binding (RFC 6749 §10.4) — the principal presents it as `client_id` on
+	// refresh; there is no confidential OAuth client, so possession of the
+	// rotating token plus family reuse-detection is the security boundary.
+	if req.IssueRefreshToken && len(audience) > 0 && s.refreshTokenSvc != nil {
+		refreshTTL := s.externalPrincipalRefreshTokenTTL
+		if refreshTTL <= 0 {
+			refreshTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
+			ClientID:          req.Audience, // audience name is the client_id binding
+			AccountID:         req.AccountID,
+			ProjectID:         req.ProjectID,
+			UserID:            req.UserID,
+			Scopes:            strings.Join(scopes, " "),
+			Audience:          req.Audience,
+			TTL:               refreshTTL,
+			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		})
+		if rtErr != nil {
+			// Fail CLOSED: the caller explicitly asked for a refresh token (its
+			// session continuity depends on it). Surfacing the error is better
+			// than silently returning an access-token-only response the caller
+			// would treat as a working self-refreshing session.
+			return nil, oauthServerError("failed to issue refresh token for external principal", rtErr)
+		}
+		accessToken.RefreshToken = rtResult.RawToken
+	}
 
 	return accessToken, nil
 }
@@ -1176,6 +1501,37 @@ type IssueAuthCodeRequest struct {
 //  6. HMAC secret must be configured on the service (deployer wired
 //     cfg.Token.HMACSecret).
 //
+// resolveClientRegistryOrCIMD is the ONE place that encodes the registry-first
+// + CIMD-fallback client resolution policy shared by the authorization_code
+// and refresh_token flows:
+//
+//   - A registry row ALWAYS wins, active or not, any client_type — CIMD must
+//     never resurrect a deactivated client (deactivation is a kill switch) or
+//     shadow a registered row (registering a client under a CIMD URL is the
+//     documented pinning mechanism). Callers apply their own IsActive /
+//     client_type gates to the returned row.
+//   - CIMD resolution runs only when the registry genuinely has NO row, CIMD
+//     is enabled, and the client_id is CIMD-shaped (https:// URL with a path).
+//     The synthesized client is always an active public PKCE client.
+//   - An operational registry error is returned as-is — fail closed; a DB
+//     outage must not be misread as "unregistered".
+//
+// viaCIMD reports that the CIMD path decided the outcome: with err == nil the
+// client is synthesized (not a registry row); with err != nil the error is a
+// CIMD sentinel the caller maps via cimdOAuthError. When viaCIMD is false a
+// non-nil error is either ErrOAuthClientNotFound or operational.
+func (s *OAuthService) resolveClientRegistryOrCIMD(ctx context.Context, clientID string) (client *domain.OAuthClient, viaCIMD bool, err error) {
+	client, err = s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+	if err == nil || !errors.Is(err, ErrOAuthClientNotFound) {
+		return client, false, err
+	}
+	if !s.cimdSvc.Enabled() || !IsCIMDClientID(clientID) {
+		return nil, false, ErrOAuthClientNotFound
+	}
+	client, err = s.cimdSvc.ResolveClient(ctx, clientID)
+	return client, true, err
+}
+
 // Returns a signed JWT on success, or an *OAuthError shaped for direct
 // surfacing from the /oauth2/authorize handler.
 func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
@@ -1208,12 +1564,24 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", oauthServerError("authorization_code issuance requires HMAC secret to be configured", nil)
 	}
 
-	// Client lookup. GetPublicClient verifies the client exists and is
-	// active; no secret is required because PKCE provides the proof of
-	// possession at exchange time.
-	oauthClient, err := s.oauthClientSvc.GetPublicClient(ctx, req.ClientID)
-	if err != nil {
+	// Client lookup — registry first, CIMD fallback (one shared policy, see
+	// resolveClientRegistryOrCIMD). No secret is required because PKCE provides
+	// the proof of possession at exchange time. Issuance is restricted to
+	// ACTIVE PUBLIC clients (the pre-CIMD GetPublicClient contract): a
+	// confidential client cannot obtain a code here, and a deactivated or
+	// non-public registry row is rejected rather than falling through to CIMD.
+	oauthClient, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
+	switch {
+	case err == nil:
+		if !viaCIMD && (!oauthClient.IsActive || oauthClient.ClientType != "public") {
+			return "", oauthUnauthorized("unknown or inactive client_id", nil)
+		}
+	case viaCIMD:
+		return "", cimdOAuthError(err)
+	case errors.Is(err, ErrOAuthClientNotFound):
 		return "", oauthUnauthorized("unknown or inactive client_id", err)
+	default:
+		return "", oauthServerError("failed to resolve client for authorization_code issuance", err)
 	}
 
 	// Grant-type allow-list. Same check that authorizationCode runs at
@@ -1369,17 +1737,28 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
 	}
 
-	// Look up the client in the registry — this is the authoritative check.
-	// Resolve ANY client (public or confidential): an authorization_code client
-	// may be either. GetPublicClient filters to client_type='public', so a
-	// confidential code client would otherwise fail to resolve. Re-establish
-	// the active-client gate that GetPublicClient enforced.
-	oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
-	if err != nil {
+	// Look up the client — this is the authoritative check. Registry first
+	// with CIMD fallback (one shared policy, see resolveClientRegistryOrCIMD).
+	// A registry row may be public OR confidential (an authorization_code
+	// client may be either), so the only gate here is IsActive; a CIMD client
+	// re-resolves from its metadata document (cached from the
+	// /oauth2/authorize call moments earlier) and is always active + public.
+	// Registry-first mirrors IssueAuthCode so both halves of the flow resolve
+	// the same client for a given client_id.
+	oauthClient, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
+	switch {
+	case err == nil:
+		if !viaCIMD && !oauthClient.IsActive {
+			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+		}
+	case viaCIMD:
+		return nil, cimdOAuthError(err)
+	case errors.Is(err, ErrOAuthClientNotFound):
 		return nil, oauthUnauthorized("unknown or inactive client_id", err)
-	}
-	if !oauthClient.IsActive {
-		return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+	default:
+		// Operational error — fail closed rather than treat as "no row" (which
+		// would let CIMD resolution resurrect a client under a DB outage).
+		return nil, oauthServerError("failed to resolve client for authorization_code grant", err)
 	}
 
 	// RFC 6749 §2.3/§10.4: a confidential client MUST authenticate with its
@@ -1576,17 +1955,49 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		return nil, oauthServerError("refresh tokens not configured", nil)
 	}
 
-	// Look up client to get per-client TTL settings AND to enforce client
-	// authentication. A confidential client MUST present its client_secret on
-	// the refresh_token grant (RFC 6749 §6/§10.4); a public client proves
-	// possession with the refresh-token string alone and carries no secret.
+	// Audience-profile refresh tokens (issued by the external-principal exchange
+	// for a profiled audience like "codeoid") have NO registered OAuth client —
+	// the audience name is their client_id binding, and possession of the
+	// rotating token plus family reuse-detection is the security boundary. Detect
+	// them with a NON-CONSUMING peek that reads REGARDLESS OF STATE (including
+	// revoked): a replayed / already-rotated audience token MUST still route down
+	// the audience path so RotateRefreshToken's claim step fires the correct
+	// reuse detection. An active-only peek would miss the revoked row, fall
+	// through to the OAuth-client path, and 401 on the (non-existent) "codeoid"
+	// client BEFORE reuse detection ran. Reading the Audience/ClientID binding
+	// off a revoked row is safe: it is metadata for ROUTING only — the rotation
+	// claim below remains the authorization gate. A genuinely unknown token
+	// matches nothing here and falls through to the OAuth-client path.
+	var audienceRefreshToken *domain.RefreshToken
+	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, req.RefreshTokenStr); peekErr == nil && peeked.Audience != "" {
+		audienceRefreshToken = peeked
+	}
+
 	var accessTTL, refreshTokenTTL int
-	if oauthClient, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID); err == nil {
-		// GetClientByClientID does not filter is_active (unlike GetPublicClient /
-		// VerifyClientSecret), and verifyConfidentialClientAuth is a no-op for
-		// public clients — so without this guard a deactivated PUBLIC client
-		// could keep rotating refresh tokens indefinitely. Same gate as the
-		// authorization_code path.
+	if audienceRefreshToken != nil {
+		// Client-less audience-profile token. The refreshed access token is
+		// re-issued short-lived (same 15-minute TTL as the original external
+		// principal exchange); the refresh token keeps its configured lifetime.
+		// client_id binding (RFC 6749 §10.4) is the audience name; verified on
+		// the peek here so a mismatch does not consume the token.
+		if audienceRefreshToken.ClientID != req.ClientID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+		accessTTL = externalPrincipalAccessTokenTTL
+		refreshTokenTTL = s.externalPrincipalRefreshTokenTTL
+		if refreshTokenTTL <= 0 {
+			refreshTokenTTL = defaultExternalPrincipalRefreshTokenTTL
+		}
+	} else if oauthClient, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, req.ClientID); err == nil && !viaCIMD {
+		// Registry client: per-client TTL settings AND client authentication. A
+		// confidential client MUST present its client_secret on the
+		// refresh_token grant (RFC 6749 §6/§10.4); a public client proves
+		// possession with the refresh-token string alone and carries no secret.
+		//
+		// The registry row is returned active or not, and
+		// verifyConfidentialClientAuth is a no-op for public clients — so
+		// without this guard a deactivated PUBLIC client could keep rotating
+		// refresh tokens indefinitely. Same gate as the authorization_code path.
 		if !oauthClient.IsActive {
 			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
 		}
@@ -1595,6 +2006,24 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
 			return nil, err
 		}
+	} else if err == nil {
+		// CIMD client, re-resolved from its metadata document (served from
+		// cache in steady state). CIMD clients are public PKCE clients —
+		// possession of the refresh-token string plus the peeked row's
+		// client_id binding below is the client authentication; there is no
+		// secret to verify. TTLs stay 0 → server defaults (synthesized clients
+		// carry none). The CURRENT document's grant_types govern: a client that
+		// republishes without refresh_token (or unpublishes entirely — the
+		// resolution-failure branch below) can no longer rotate; that document
+		// edit is CIMD's revocation lever.
+		if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken)) {
+			return nil, oauthBadRequest(oautherror.UnauthorizedClient,
+				"client metadata document no longer permits the refresh_token grant")
+		}
+	} else if viaCIMD {
+		// Resolution failure fails closed WITHOUT consuming the token (we're
+		// before rotation).
+		return nil, cimdOAuthError(err)
 	} else {
 		// The named client_id (required by the entry guard above) can't be
 		// resolved. Fail closed: proceeding here would skip
@@ -1718,6 +2147,22 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		}
 	}
 
+	// Re-stamp the audience profile on rotation. An audience-profile refresh
+	// token (external-principal exchange, e.g. codeoid) MUST re-issue with the
+	// SAME `aud` claim so the harness daemon — which validates `aud` on every
+	// message — accepts the refreshed token. The audience name is bound to the
+	// family (copied across every rotation); empty for a normal refresh token,
+	// leaving issuance unchanged. ApplicationID is cleared for audience tokens:
+	// they carry a synthetic principal (no application row), mirroring the
+	// original external-principal exchange rather than stamping the audience
+	// name (the client_id binding) as a bogus application claim.
+	var refreshAudience []string
+	applicationID := oldToken.ClientID
+	if oldToken.Audience != "" {
+		refreshAudience = []string{oldToken.Audience}
+		applicationID = ""
+	}
+
 	// Inherit scopes from the original refresh token. Without this the
 	// refreshed access token would be issued with no scopes (or default
 	// scopes), breaking the contract that refresh preserves the original
@@ -1728,7 +2173,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		GrantType:         domain.GrantTypeRefreshToken,
 		UseRS256:          true,
 		SubjectOverride:   oldToken.UserID,
-		ApplicationID:     oldToken.ClientID,
+		ApplicationID:     applicationID,
+		Audience:          refreshAudience,
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
@@ -1966,12 +2412,20 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	if clientID == "" {
 		return oauthUnauthorized("client_id is required when a client_secret is supplied", nil)
 	}
-	// client_id with no secret: valid only for a registered public client.
+	// client_id with no secret: valid only for a REGISTERED public client.
 	// RFC 7009 §2.1 / RFC 7662 §2.1 — public clients have no secret, and
 	// standard OAuth libraries attach client_id to revocation/introspection
 	// requests. A confidential client (or an unknown client_id) must present a
 	// secret, so this neither widens access nor lets a confidential client
 	// skip authentication.
+	//
+	// CIMD client_ids are deliberately NOT accepted here, unlike the token
+	// flows: a CIMD "registration" is a self-published HTTPS document, so
+	// honoring it would let any party on the internet satisfy this gate and
+	// use introspection as a token oracle (and trigger outbound document
+	// fetches) with zero registration. Token issuance to a CIMD client is
+	// safe because redirect_uri binding protects the flow; token INSPECTION
+	// has no equivalent binding, so it stays registry-only.
 	if clientSecret == "" {
 		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
 			if errors.Is(err, ErrOAuthClientNotFound) {
