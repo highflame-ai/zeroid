@@ -254,3 +254,13 @@ func TestAuthorizeGET_RejectsNonCodeResponseType(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	require.Contains(t, strings.ToLower(body["error_description"]), "response_type")
 }
+
+// The authorize.unsafe_dev_principal escape hatch (#271) is covered by
+// config-level tests in config_test.go, not here: the resolver applies to EVERY
+// request, so enabling it on this suite's shared server would make
+// TestAuthorizeGET_NoCredentialIs401 and
+// TestAuthorizeGET_APIKeyInQueryStringIsIgnored pass for the wrong reason — and
+// those two are the security assertions in this file. Standing up a second
+// server just to exercise a hatch that gets deleted when #271 lands is not
+// worth the fixture. What matters is that it cannot reach production, and
+// TestValidate_UnsafeDevPrincipalRefusedInProduction pins that.

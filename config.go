@@ -41,6 +41,7 @@ type Config struct {
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
 	CIMD        CIMDConfig        `koanf:"cimd"`
+	Authorize   AuthorizeConfig   `koanf:"authorize"`
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
@@ -80,6 +81,52 @@ type BackchannelConfig struct {
 	// register endpoints like https://localhost:9000/. Production deployments
 	// MUST keep this false (see GHSA-599q-j34m-33vc).
 	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+}
+
+// AuthorizeConfig governs /oauth2/authorize.
+type AuthorizeConfig struct {
+	// UnsafeDevPrincipal makes /oauth2/authorize accept an UNAUTHENTICATED
+	// request and treat it as this principal. There is no login, no consent,
+	// and no user interaction of any kind — every authorization request
+	// succeeds as whoever is named here.
+	//
+	// It exists to unblock browser-redirect testing before an interactive
+	// authentication surface lands (#271). A browser presents no api_key, so
+	// without it the CIMD flow cannot be driven end-to-end by a real OAuth
+	// client at all.
+	//
+	// THIS IS A RUBBER STAMP. Enabled, ZeroID will hand an authorization code
+	// for this principal to any client that asks, including one whose CIMD
+	// document an attacker published. Validate() refuses it when
+	// server.env is production, and Server logs a warning at startup and on
+	// every use. Same posture as attestation.allow_unsafe_dev_stub, except
+	// this one defaults OFF — an accept-any authorization endpoint is worse
+	// than an accept-any attestation proof.
+	//
+	// Set all three fields to enable; any empty field disables it.
+	//
+	//	authorize:
+	//	  unsafe_dev_principal:
+	//	    account_id: "acct-test"
+	//	    project_id: "proj-test"
+	//	    user_id:    "dev@example.test"
+	UnsafeDevPrincipal UnsafeDevPrincipalConfig `koanf:"unsafe_dev_principal"`
+}
+
+// UnsafeDevPrincipalConfig is the fixed principal AuthorizeConfig hands out.
+type UnsafeDevPrincipalConfig struct {
+	AccountID string   `koanf:"account_id"`
+	ProjectID string   `koanf:"project_id"`
+	UserID    string   `koanf:"user_id"`
+	Scopes    []string `koanf:"scopes"`
+}
+
+// Enabled reports whether the dev principal is fully configured. All three
+// tenant fields are required: a partially-filled block is a misconfiguration,
+// and defaulting the missing pieces would silently authorize into the wrong
+// tenant.
+func (c UnsafeDevPrincipalConfig) Enabled() bool {
+	return c.AccountID != "" && c.ProjectID != "" && c.UserID != ""
 }
 
 // CIMDConfig governs Client ID Metadata Documents
@@ -430,6 +477,12 @@ func (c *Config) Validate() error {
 		// means accept-any attestation. Force an explicit opt-out.
 		if c.Attestation.AllowUnsafeDevStub {
 			return fmt.Errorf("attestation.allow_unsafe_dev_stub must be false in production (server.env=%q): the stub accepts ANY submitted proof for image_hash/tpm — set ZEROID_ALLOW_UNSAFE_DEV_STUB=false", c.Server.Env)
+		}
+		// An unauthenticated authorization endpoint that mints codes for a
+		// fixed principal is a rubber stamp — never in production.
+		if c.Authorize.UnsafeDevPrincipal.Enabled() {
+			return fmt.Errorf("authorize.unsafe_dev_principal must be unset in production (server.env=%q): it makes /oauth2/authorize issue codes for %q with no authentication and no consent",
+				c.Server.Env, c.Authorize.UnsafeDevPrincipal.UserID)
 		}
 		// token.issuer and wimse_domain are validated by validateIssuer()
 		// and validateWIMSEDomain() above (empty/malformed → reject).
