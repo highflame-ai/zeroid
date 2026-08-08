@@ -135,6 +135,33 @@ func (r *CredentialRepository) RevokeAllActiveForIdentity(ctx context.Context, i
 	return rows, nil
 }
 
+// RevokeAllActiveForOwner revokes every non-expired, non-revoked credential
+// belonging to an identity owned by ownerUserID within accountID, and cascades
+// to every downstream delegated credential in the parent_jti chain. This is the
+// primitive for human offboarding: deactivating a person revokes every agent
+// that person owns (and their sub-agents) at once. Implemented via the
+// revoke_credentials_by_owner DB function (migration 041), which mirrors the
+// identity cascade's atomic single-statement update and returned-row semantics.
+//
+// Scoped by (ownerUserID, accountID) for tenant safety. Returns the affected
+// credentials, one entry per revoked JTI, each stamped with the revoked_at
+// timestamp; len(result) is the total number revoked.
+func (r *CredentialRepository) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) ([]RevokedCredential, error) {
+	now := time.Now()
+	var rows []RevokedCredential
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewRaw(
+		"SELECT jti, identity_id, account_id, project_id, expires_at FROM revoke_credentials_by_owner(?, ?, ?, ?)",
+		ownerUserID, accountID, now, reason,
+	).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("failed to cascade-revoke credentials for owner %s in account %s: %w", ownerUserID, accountID, err)
+	}
+	for i := range rows {
+		rows[i].RevokedAt = now
+	}
+	return rows, nil
+}
+
 // Revoke marks a credential as revoked and cascades the revocation to every
 // downstream delegated credential in the parent_jti chain (RFC 8693 descendants).
 // account_id and project_id are enforced on the anchor as tenant-safety guards.
