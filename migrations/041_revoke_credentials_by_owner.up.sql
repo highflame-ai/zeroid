@@ -20,6 +20,14 @@
 -- that were live and are now revoked — so the RevocationNotifier fan-out stays
 -- accurate and already-dead rows emit no events. Cycle guard + depth cap 50
 -- match the identity/credential cascades.
+--
+-- Multi-anchor note (intentional): unlike the single-identity 031 seed, this
+-- seed can contain both a parent agent and a child the same human owns, so a
+-- credential may be reached both as a seed row and as a descendant and its
+-- subtree walked once per owned ancestor. This is correctness-safe — the final
+-- UPDATE is set-membership on ic.id, so each physical row flips once and each
+-- flipped row is RETURNed once (no double-revoke, no duplicate notifier event)
+-- — and bounded: the depth cap 50 caps the re-visits at a small constant factor.
 
 CREATE OR REPLACE FUNCTION revoke_credentials_by_owner(
     p_owner_user_id TEXT,
