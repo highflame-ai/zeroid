@@ -59,10 +59,14 @@ type API struct {
 	authorizationCodeAvailable func() bool
 
 	// resolvePrincipal walks the PrincipalResolver chain registered on
-	// the top-level Server. Wired by Server.NewServer via
-	// SetPrincipalResolverFunc; nil when no resolvers are registered
-	// (the /oauth2/authorize handler then returns 503 so deployers
-	// see a clear "not configured" signal).
+	// the top-level Server. Wired unconditionally by Server.NewServer via
+	// SetPrincipalResolverFunc, which passes a BOUND METHOD — so this is
+	// never nil, even with an empty registry. An empty chain surfaces as
+	// ErrNoResolversRegistered from the call, which the /oauth2/authorize
+	// handler maps to 503.
+	//
+	// It therefore cannot be used to test whether the deployment has any
+	// resolvers; that is what authorizationCodeAvailable is for.
 	resolvePrincipal PrincipalResolverFunc
 }
 
