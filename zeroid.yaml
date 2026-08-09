@@ -162,25 +162,3 @@ cimd:
 #     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch
-
-# authorize governs /oauth2/authorize.
-#
-# unsafe_dev_principal makes the endpoint accept an UNAUTHENTICATED request and
-# treat it as the named principal — no login, no consent, every request
-# succeeds. It exists so the browser-redirect half of the authorization_code
-# flow can be exercised before an interactive authentication surface lands
-# (zeroid#271): a browser presents no api_key, so without it a real OAuth client
-# cannot drive the flow end-to-end at all.
-#
-# THIS IS A RUBBER STAMP. Enabled, ZeroID hands an authorization code for this
-# principal to any client that asks, including one whose CIMD document an
-# attacker published. Validate() REFUSES to start with it set when
-# server.env is production; a warning is logged at startup and on every use.
-# Default off. Set all three tenant fields to enable.
-#
-# authorize:
-#   unsafe_dev_principal:
-#     account_id: "acct-dev"
-#     project_id: "proj-dev"
-#     user_id:    "dev@example.test"
-#     scopes:     ["tools:read"]

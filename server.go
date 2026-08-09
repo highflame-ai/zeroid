@@ -155,19 +155,6 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		log.Warn().Err(err).Msg("Failed to initialize telemetry — continuing without observability")
 	}
 
-	// Say it once, loudly, at startup. Config.Validate() has already refused
-	// this combination in production, so reaching here means a dev/test
-	// deployment opted in — but "somebody left it on" is the failure mode worth
-	// making impossible to miss in a log.
-	if cfg.Authorize.UnsafeDevPrincipal.Enabled() {
-		log.Warn().
-			Str("user_id", cfg.Authorize.UnsafeDevPrincipal.UserID).
-			Str("account_id", cfg.Authorize.UnsafeDevPrincipal.AccountID).
-			Msg("UNSAFE: authorize.unsafe_dev_principal is SET — /oauth2/authorize will " +
-				"issue authorization codes to ANY client with NO authentication and NO " +
-				"consent. Test deployments only; see zeroid#271")
-	}
-
 	// Initialize database.
 	db, err := initDatabase(cfg.Database.URL, cfg.Database.MaxOpenConns, cfg.Database.MaxIdleConns)
 	if err != nil {
@@ -800,17 +787,6 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 		fn:   s.builtinAPIKeyResolver,
 	})
 
-	// Dead last, and only when explicitly configured: the unsafe dev principal.
-	// It applies to EVERY request, so anything ahead of it must get first
-	// refusal — otherwise enabling it would stop real credentials from being
-	// resolved as themselves.
-	if s.cfg.Authorize.UnsafeDevPrincipal.Enabled() {
-		resolvers = append(resolvers, namedPrincipalResolver{
-			name: unsafeDevPrincipalResolverName,
-			fn:   s.unsafeDevPrincipalResolver,
-		})
-	}
-
 	for _, r := range resolvers {
 		p, err := r.fn(ctx, req)
 		if err != nil {
@@ -828,37 +804,6 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	}
 
 	return nil, "", nil
-}
-
-// unsafeDevPrincipalResolverName identifies the rubber-stamp resolver in
-// /oauth2/authorize logs. Distinct from every other name so an audit can grep
-// for authorizations that were never actually authenticated.
-const unsafeDevPrincipalResolverName = "unsafe-dev-principal"
-
-// unsafeDevPrincipalResolver returns a fixed principal for ANY request.
-//
-// No authentication, no consent. It exists so the browser-redirect half of the
-// authorization_code flow can be exercised before an interactive
-// authentication surface lands (#271) — a browser presents no api_key, so
-// without this a real OAuth client cannot drive the flow end-to-end at all.
-//
-// Config-gated, default off, and Validate() refuses it when server.env is
-// production. Every use is logged at WARN with the client_id that benefited,
-// because "who did we hand codes to while this was on" is the question someone
-// will eventually need to answer.
-func (s *Server) unsafeDevPrincipalResolver(_ context.Context, req *AuthorizeRequest) (*Principal, error) {
-	p := s.cfg.Authorize.UnsafeDevPrincipal
-	log.Warn().
-		Str("client_id", req.ClientID).
-		Str("user_id", p.UserID).
-		Msg("UNSAFE: /oauth2/authorize authorized a request with no authentication " +
-			"and no consent (authorize.unsafe_dev_principal is set) — see zeroid#271")
-	return &Principal{
-		AccountID: p.AccountID,
-		ProjectID: p.ProjectID,
-		UserID:    p.UserID,
-		Scopes:    p.Scopes,
-	}, nil
 }
 
 // builtinAPIKeyResolverName identifies the fallback resolver in
