@@ -197,7 +197,7 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 	// actually serve it — i.e. a PrincipalResolver is registered. Prepended
 	// so the list keeps its conventional order. See
 	// API.SetAuthorizationCodeAvailable for why this is gated at all.
-	if a.canServeAuthorizationCode() {
+	if servesAuthorizationCode {
 		grants, _ := body["grant_types_supported"].([]string)
 		body["grant_types_supported"] = append([]string{"authorization_code"}, grants...)
 
