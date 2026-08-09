@@ -168,6 +168,19 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "code_challenge_method is required")
 		return
 	}
+	// RFC 6749 §4.1.1 makes response_type REQUIRED. Enforce it on GET: the
+	// browser leg is new surface with no back-compat obligation, and every
+	// real OAuth client sends it. POST stays lenient because CLI callers have
+	// been permitted to omit it since v1 and "code" is the only value this
+	// endpoint has ever supported, so tightening it there would break them for
+	// no security gain.
+	if r.Method == http.MethodGet && req.ResponseType == "" {
+		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
+			"response_type is required (RFC 6749 §4.1.1) and must be 'code'")
+
+		return
+	}
+
 	if req.ResponseType != "" && req.ResponseType != "code" {
 		// response_type is optional in our shape (we only support
 		// "code" anyway), but if the caller passes something else

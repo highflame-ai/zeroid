@@ -114,6 +114,12 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 }
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
+	// Evaluate the gate ONCE per request. The predicate is deliberately
+	// dynamic — a deployer may register resolvers after NewServer — so calling
+	// it twice could emit a document advertising CIMD without the
+	// authorization_code grant CIMD applies to, or the reverse.
+	servesAuthorizationCode := a.canServeAuthorizationCode()
+
 	body := map[string]any{
 		"issuer": a.issuer,
 		// REQUIRED by RFC 8414 §2 whenever the AS supports the
@@ -156,8 +162,14 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
 		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
-		"introspection_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
-		"revocation_endpoint_auth_methods_supported":       []string{"client_secret_post", "client_secret_basic", "none"},
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
+		// REQUIRED by RFC 8414 §2 unconditionally — unlike the grant list, this
+		// member must be present even when the flow is unavailable, or the
+		// document is invalid and strict parsers reject the whole thing (the
+		// #263 failure). The VALUE is gated below: an empty array is the
+		// accurate way to say "no response type is supported".
+		"response_types_supported":                         []string{},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
@@ -210,7 +222,7 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 	// Gated on the authorization_code grant too: CIMD only applies to that
 	// flow, so advertising it while the flow is unavailable is the same
 	// broken promise.
-	if a.cimdEnabled && a.canServeAuthorizationCode() {
+	if a.cimdEnabled && servesAuthorizationCode {
 		body["client_id_metadata_document_supported"] = true
 	}
 

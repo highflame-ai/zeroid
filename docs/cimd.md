@@ -85,9 +85,15 @@ Three things a deployer must handle:
   user interaction — a consent screen with a CSRF token — before issuing a code.
   This is the same reason a real AS never mints on the bare redirect.
 * **Consent content.** CIMD's premise is that the AS shows the user something
-  about a client it has never seen. `client_name`, `client_uri` and `logo_uri`
-  are parsed and available for exactly that; mark an unregistered client
-  unverified.
+  about a client it has never seen, and marks it unverified. ZeroID does not
+  hand you that metadata today: `client_name` / `client_uri` / `logo_uri` are
+  parsed into the internal document type but dropped when it is synthesized
+  into a client (`domain.OAuthClient` has no such fields), and the document
+  type is unexported. Your consent surface must fetch and validate the CIMD
+  document itself — applying the same rules ZeroID does, in particular the
+  draft §4 self-reference check that the document's own `client_id` equals the
+  URL it was fetched from, without which the screen can be made to display
+  someone else's branding.
 
 A CLI client can post the same parameters as a form instead:
 

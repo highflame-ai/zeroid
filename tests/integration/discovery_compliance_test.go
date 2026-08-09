@@ -232,44 +232,66 @@ func TestASMetadata_AuthorizationCodeAdvertisedOnlyWhenServable(t *testing.T) {
 	}
 }
 
-// TestASMetadata_AuthorizationCodeFieldsRideOneGate — every field that only
-// describes the authorization_code flow must appear together or not at all.
+// TestASMetadata_AuthorizationCodeFieldsRideOneGate — every VALUE that only
+// describes the authorization_code flow appears together or not at all, while
+// the RFC 8414 §2 REQUIRED members stay present either way.
 //
-// Gating `grant_types_supported` alone would leave
-// `response_types_supported: ["code"]` asserting a flow the AS cannot serve, and
-// a client that keys off response_types rather than grant_types would start it
-// anyway. `authorization_endpoint` is deliberately NOT gated: the endpoint
-// exists, and omitting it makes the document unparseable to strict clients —
-// the original #263 failure.
+// Both branches are exercised: the suite's server has resolvers registered, so
+// the servable side is the default, and SetAuthorizationCodeAvailable flips the
+// other. Without that flip the unavailable branch — the entire point of the
+// gate — would never execute, since every integration test shares one server.
 func TestASMetadata_AuthorizationCodeFieldsRideOneGate(t *testing.T) {
+	// Servable: the suite registers PrincipalResolvers.
 	meta := fetchASMetadata(t)
+	requireAuthorizationCodeAdvertised(t, meta, true)
+
+	// Unavailable: flip the deployer predicate, then restore. Safe to mutate
+	// shared state because no integration test calls t.Parallel().
+	testZeroIDServer.SetAuthorizationCodeAvailable(func() bool { return false })
+	defer testZeroIDServer.SetAuthorizationCodeAvailable(nil)
+
+	requireAuthorizationCodeAdvertised(t, fetchASMetadata(t), false)
+
+	// Restoring the built-in guess must bring the values back — the predicate
+	// is dynamic by design.
+	testZeroIDServer.SetAuthorizationCodeAvailable(nil)
+	requireAuthorizationCodeAdvertised(t, fetchASMetadata(t), true)
+}
+
+// requireAuthorizationCodeAdvertised asserts the whole gated group is coherent
+// for the expected servability, and that the always-required members survive.
+func requireAuthorizationCodeAdvertised(t *testing.T, meta map[string]any, want bool) {
+	t.Helper()
 
 	grants, _ := meta["grant_types_supported"].([]any)
-	servable := false
-	for _, g := range grants {
-		if g == "authorization_code" {
-			servable = true
-		}
-	}
+	require.Contains(t, meta, "response_types_supported",
+		"RFC 8414 §2: response_types_supported is REQUIRED unconditionally — "+
+			"omitting it makes the document invalid, which is the failure this "+
+			"PR exists to fix")
+	require.NotEmpty(t, meta["authorization_endpoint"],
+		"authorization_endpoint is never gated: omitting it breaks strict parsers")
 
-	_, hasResponseTypes := meta["response_types_supported"]
+	responseTypes, _ := meta["response_types_supported"].([]any)
 	_, hasPKCEMethods := meta["code_challenge_methods_supported"]
 	cimd, _ := meta["client_id_metadata_document_supported"].(bool)
 
-	if servable {
-		require.True(t, hasResponseTypes,
-			"response_types_supported must be present when authorization_code is")
+	if want {
+		require.Contains(t, grants, "authorization_code")
+		require.Equal(t, []any{"code"}, responseTypes)
 		require.True(t, hasPKCEMethods,
-			"code_challenge_methods_supported must be present when authorization_code is")
-	} else {
-		require.False(t, hasResponseTypes,
-			"response_types_supported describes a flow that is not advertised")
-		require.False(t, hasPKCEMethods,
-			"code_challenge_methods_supported describes a flow that is not advertised")
-		require.False(t, cimd,
-			"CIMD applies only to authorization_code, which is not advertised")
+			"code_challenge_methods_supported must accompany the advertised grant")
+
+		return
 	}
 
-	require.NotEmpty(t, meta["authorization_endpoint"],
-		"authorization_endpoint is never gated — omitting it breaks strict parsers")
+	require.NotContains(t, grants, "authorization_code")
+	require.Empty(t, responseTypes,
+		"the member stays present (RFC 8414 requires it) but must be empty — "+
+			"advertising \"code\" on an AS that cannot serve it is the same lie "+
+			"as advertising the grant")
+	require.False(t, hasPKCEMethods,
+		"code_challenge_methods_supported is OPTIONAL, so it is omitted rather "+
+			"than emptied when the flow is unavailable")
+	require.False(t, cimd,
+		"CIMD applies only to authorization_code, which is not advertised")
 }

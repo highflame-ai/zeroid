@@ -901,14 +901,21 @@ func (s *Server) SetAuthorizationCodeAvailable(fn func() bool) {
 // canServeAuthorizationCode answers the deployer's override when one is set,
 // otherwise falls back to the built-in guess (any resolver registered).
 func (s *Server) canServeAuthorizationCode() bool {
+	// Snapshot under the lock, then release it BEFORE calling the deployer's
+	// predicate. Go's RWMutex is not reentrant, so invoking an arbitrary
+	// callback while holding s.mu deadlocks the moment that callback touches
+	// any Server method that locks — RegisterPrincipalResolver, for one. Same
+	// pattern resolvePrincipal uses for the resolver chain.
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	fn := s.authzCodeAvailable
+	resolverCount := len(s.principalResolvers)
+	s.mu.RUnlock()
 
-	if s.authzCodeAvailable != nil {
-		return s.authzCodeAvailable()
+	if fn != nil {
+		return fn()
 	}
 
-	return len(s.principalResolvers) > 0
+	return resolverCount > 0
 }
 
 // SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA
