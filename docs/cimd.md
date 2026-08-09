@@ -79,6 +79,13 @@ Three things a deployer must handle:
   resume a consent screen. Do it in `Server.Use` middleware, which sees the raw
   request and can 302 to a consent page before the handler runs; the resolver
   then only recognises the session that flow established.
+
+  **`Server.Use` replaces rather than chains.** A second call silently discards
+  the first, despite the name. If you already use it for anything else — and
+  most deployers do — compose both into one function at the call site. Adding
+  the consent gate as a second `Use` call drops one of the two with no error,
+  and if the loser is the consent gate, the protection below simply is not
+  running. Tracked in zeroid#276.
 * **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
   from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
   attacker-published `client_id` + its own `redirect_uri`. Require an explicit

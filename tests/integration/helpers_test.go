@@ -306,6 +306,19 @@ func runTests(m *testing.M) int {
 		return "", fmt.Errorf("caller is not a trusted service")
 	})
 
+	srv.RegisterPrincipalResolver("test-header-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		acct := req.Header("X-Test-Principal-Account")
+		if acct == "" {
+			return nil, zeroid.ErrPrincipalNotApplicable
+		}
+
+		return &zeroid.Principal{
+			AccountID: acct,
+			ProjectID: req.Header("X-Test-Principal-Project"),
+			UserID:    req.Header("X-Test-Principal-User"),
+		}, nil
+	})
+
 	// Stub PrincipalResolver for /oauth2/authorize tests. Reads its
 	// behaviour from magic form fields so a single resolver covers
 	// every test shape (happy path, not-applicable, rejected). Tests
@@ -326,19 +339,6 @@ func runTests(m *testing.M) int {
 	// Registered FIRST so it wins when both are present; it declines (returns
 	// ErrPrincipalNotApplicable) whenever its header is absent, so the
 	// form-field stub still serves every POST test unchanged.
-	srv.RegisterPrincipalResolver("test-header-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
-		acct := req.Header("X-Test-Principal-Account")
-		if acct == "" {
-			return nil, zeroid.ErrPrincipalNotApplicable
-		}
-
-		return &zeroid.Principal{
-			AccountID: acct,
-			ProjectID: req.Header("X-Test-Principal-Project"),
-			UserID:    req.Header("X-Test-Principal-User"),
-		}, nil
-	})
-
 	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		if req.Form("test_principal_reject") == "true" {
 			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")

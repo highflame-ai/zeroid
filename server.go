@@ -680,7 +680,9 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 // let alone mint a token. The shared core (resolveAPIKeyContext) is
 // the single source of truth.
 //
-// Typical usage from a PrincipalResolver:
+// Typical usage from a PrincipalResolver. As with the example on
+// RegisterPrincipalResolver, req.Form is POST-only — read a header or
+// cookie instead if the resolver must serve the browser GET leg.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -737,7 +739,13 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // the first to return a non-nil Principal wins. name is used for
 // log/metric attribution and must be non-empty.
 //
-// Typical usage from a deployer that owns api_key resolution:
+// Typical usage from a deployer that owns api_key resolution. NOTE this
+// shape serves POST ONLY: req.Form is bound to the POST body, so it
+// returns ErrPrincipalNotApplicable on every browser GET. A GET-capable
+// resolver must read req.Header(...) or req.Cookie(...) instead — and if
+// ALL your resolvers are form-based, call
+// Server.SetAuthorizationCodeAvailable(func() bool { return false }) so
+// AS metadata stops advertising a flow that will 401.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
