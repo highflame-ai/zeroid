@@ -639,7 +639,30 @@ func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, iden
 // Fires one RevocationNotifier event per affected JTI after the revocation
 // commits, exactly like RevokeAllActiveForIdentity, so Shield's deny-set picks
 // them up within seconds.
+//
+// Both ownerUserID and accountID are REQUIRED and rejected when empty. This is
+// a hard guard, not defensive tidiness: identities.owner_user_id is NOT NULL
+// (001_init_schema), so an ownerless identity — the documented posture for
+// `discovered` ones (identity-lifecycle.md "Ownership: relaxed for discovered
+// only") — stores the empty string. An empty ownerUserID would therefore match
+// EVERY ownerless identity in the account and cascade-revoke each one's whole
+// delegation subtree. The realistic trigger is the intended caller: an IdP
+// offboarding webhook whose user-id field arrives blank, turning "revoke one
+// departing human's agents" into a tenant-wide outage of exactly the workloads
+// nobody watches. Revocation is not reversible, so this fails closed.
+//
+// The identity-scoped sibling is protected only incidentally — its uuid cast
+// rejects "" with a 22P02 — so the guard lives here explicitly rather than
+// relying on that accident holding for a TEXT column. Mirrored in SQL by
+// migration 042 so it survives a caller that bypasses this service.
 func (s *CredentialService) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) (int64, error) {
+	if ownerUserID == "" || accountID == "" {
+		return 0, fmt.Errorf(
+			"RevokeAllActiveForOwner requires a non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account",
+			ownerUserID, accountID)
+	}
+
 	if reason == "" {
 		reason = "owner_deactivated"
 	}
