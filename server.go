@@ -760,6 +760,25 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // supported — register the most-specific first (e.g. session cookie
 // before api_key fallback) because order determines precedence on
 // overlapping requests.
+//
+// # Writing a cookie-based resolver
+//
+// /oauth2/authorize serves GET (RFC 6749 §4.1.1), so a resolver that
+// authenticates from a cookie is reachable by top-level navigation from
+// any site — SameSite=Lax still sends the cookie on a cross-site GET.
+// Combined with CIMD, which accepts any attacker-published client_id and
+// its own redirect_uri, a bare redirect would hand the attacker a code
+// for the victim's principal.
+//
+// A cookie resolver therefore MUST NOT be sufficient on its own. Gate
+// code issuance behind an explicit user interaction — a consent screen
+// carrying a CSRF token — the way a real authorization server does. That
+// surface is the deployer's to build; see docs/cimd.md and #271.
+//
+// Header-based resolvers (api_key, mTLS, a signed assertion) do not have
+// this exposure: a browser cannot set a custom header on a top-level
+// navigation, which is also why the handler binds AuthorizeRequest.Form
+// to the POST body only.
 func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 	if name == "" || r == nil {
 		return
