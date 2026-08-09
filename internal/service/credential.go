@@ -628,6 +628,29 @@ func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, iden
 	return int64(len(revoked)), nil
 }
 
+// RevokeAllActiveForOwner revokes every active credential belonging to an
+// identity owned by ownerUserID within accountID, cascading to any delegated
+// descendants via the parent_jti chain. Returns the total number revoked. This
+// is the offboarding primitive: when a human is deactivated in the IdP, an
+// offboarding handler calls this so every agent that person owns — and every
+// sub-agent those agents delegated to — stops working immediately rather than
+// surviving until TTL.
+//
+// Fires one RevocationNotifier event per affected JTI after the revocation
+// commits, exactly like RevokeAllActiveForIdentity, so Shield's deny-set picks
+// them up within seconds.
+func (s *CredentialService) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) (int64, error) {
+	if reason == "" {
+		reason = "owner_deactivated"
+	}
+	revoked, err := s.repo.RevokeAllActiveForOwner(ctx, ownerUserID, accountID, reason)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
 // dispatchRevocations maps the repository's affected-row projection into
 // RevocationEvents and hands them to the shared dispatcher. The dispatcher
 // itself owns the async/sync decision, the notifier-installed check, and the
