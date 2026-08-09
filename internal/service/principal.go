@@ -135,10 +135,9 @@ var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not appli
 // hence 503 (server is missing required configuration) rather than
 // 500 (something went wrong). Surfacing it as its own sentinel lets
 // the handler distinguish from the "all resolvers returned
-// ErrPrincipalNotApplicable" case, which is a legitimate 401.//
-// DEPRECATED as a runtime outcome since #263: resolvePrincipal now appends a
-// built-in api_key resolver after the registered chain, so the chain is never
-// empty and this is no longer returned. Kept as exported API (and as a
-// defensive branch in the handler) rather than removed, because callers may
-// still reference it.
+// ErrPrincipalNotApplicable" case, which is a legitimate 401.
+//
+// AS metadata omits the authorization_code grant while the chain is
+// empty (see handler.API.SetAuthorizationCodeAvailable), so a client
+// never discovers a flow that would land here.
 var ErrNoResolversRegistered = errors.New("zeroid: no principal resolvers registered")

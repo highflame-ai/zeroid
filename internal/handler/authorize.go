@@ -81,8 +81,17 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// ── Step 1: parse form body ──────────────────────────────────────
 	if err := r.ParseForm(); err != nil {
+		// Name the source the caller actually used: a GET has no body, so
+		// "could not parse ... body" points at the wrong parameter for the
+		// request that most often trips this (a malformed %-escape in the
+		// query string).
+		source := "application/x-www-form-urlencoded body"
+		if r.Method == http.MethodGet {
+			source = "query string"
+		}
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
-			"could not parse application/x-www-form-urlencoded body")
+			"could not parse "+source)
+
 		return
 	}
 

@@ -193,3 +193,41 @@ func TestASMetadata_AuthorizationEndpointAdvertised(t *testing.T) {
 	require.Equal(t, []any{"S256"}, methods,
 		"code_challenge_methods_supported must advertise exactly S256")
 }
+
+// TestASMetadata_AuthorizationCodeAdvertisedOnlyWhenServable — discovery is a
+// promise, and #263 showed what breaks when it is not kept.
+//
+// ZeroID advertised `authorization_code` and
+// `client_id_metadata_document_supported` unconditionally, while
+// /oauth2/authorize answered 503 on every deployment that registered no
+// PrincipalResolver. An MCP client that believed the metadata skipped CIMD and
+// silently fell back to dynamic client registration.
+//
+// This suite registers resolvers, so the grant MUST be advertised here. The
+// negative case (empty chain omits it) is a unit-level property of
+// API.SetAuthorizationCodeAvailable; this test pins the positive half and
+// guards against the gate accidentally suppressing the grant on a deployment
+// that can serve it.
+func TestASMetadata_AuthorizationCodeAdvertisedOnlyWhenServable(t *testing.T) {
+	meta := fetchASMetadata(t)
+
+	grants, _ := meta["grant_types_supported"].([]any)
+	require.Contains(t, grants, "authorization_code",
+		"this suite registers PrincipalResolvers, so /oauth2/authorize can serve "+
+			"the flow and metadata must advertise it")
+
+	// The endpoint is advertised unconditionally: it exists and answers, and
+	// omitting it makes the whole document unparseable to strict clients (the
+	// MCP Python SDK requires the field).
+	require.NotEmpty(t, meta["authorization_endpoint"],
+		"authorization_endpoint must always be present (RFC 8414 §2)")
+
+	// CIMD only applies to the authorization_code flow, so it rides the same
+	// gate. Advertising it while the flow is unavailable is the same broken
+	// promise.
+	if cimd, ok := meta["client_id_metadata_document_supported"].(bool); ok && cimd {
+		require.Contains(t, grants, "authorization_code",
+			"client_id_metadata_document_supported must never be advertised "+
+				"without the authorization_code grant it applies to")
+	}
+}

@@ -54,8 +54,27 @@ GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.j
     &code_challenge=<S256 challenge>
     &code_challenge_method=S256
     &state=<opaque> HTTP/1.1
-X-API-Key: zid_sk_...
+Cookie: <your session cookie>
 ```
+
+**The browser leg needs a session-cookie `PrincipalResolver`, which ZeroID does
+not ship.** A browser cannot set a custom header on a top-level navigation, so
+the deployer must register a resolver that reads a session cookie
+(`RegisterPrincipalResolver` → `req.Cookie(...)`) and own the login and consent
+screens behind it. Without one, an unauthenticated redirect gets
+`401 invalid_client`, and ZeroID omits `authorization_code` from its AS metadata
+so no client discovers a flow it cannot finish.
+
+Two things a deployer must handle when writing that resolver:
+
+* **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
+  from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
+  attacker-published `client_id` + its own `redirect_uri`. Require an explicit
+  user interaction — a consent screen with a CSRF token — before issuing a code.
+  This is the same reason a real AS never mints on the bare redirect.
+* **Consent.** CIMD's premise is that the AS shows the user something about a
+  client it has never seen. `client_name`, `client_uri` and `logo_uri` are
+  parsed and available for exactly that.
 
 A CLI client can post the same parameters as a form instead:
 

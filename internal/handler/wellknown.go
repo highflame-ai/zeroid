@@ -131,7 +131,6 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// at the token endpoint with PKCE alone and carry no secret.
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
 		"grant_types_supported": []string{
-			"authorization_code",
 			"refresh_token",
 			"client_credentials",
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -189,12 +188,24 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
 	}
 
+	// authorization_code is advertised only when /oauth2/authorize can
+	// actually serve it — i.e. a PrincipalResolver is registered. Prepended
+	// so the list keeps its conventional order. See
+	// API.SetAuthorizationCodeAvailable for why this is gated at all.
+	if a.canServeAuthorizationCode() {
+		grants, _ := body["grant_types_supported"].([]string)
+		body["grant_types_supported"] = append([]string{"authorization_code"}, grants...)
+	}
+
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
 	// only when it's enabled on this deployment so CIMD-aware clients (e.g. MCP
 	// 2025-11-25) know they can present an https:// client_id URL and skip
 	// registration. Omitted entirely when disabled (the field's absence means
 	// "unsupported").
-	if a.cimdEnabled {
+	// Gated on the authorization_code grant too: CIMD only applies to that
+	// flow, so advertising it while the flow is unavailable is the same
+	// broken promise.
+	if a.cimdEnabled && a.canServeAuthorizationCode() {
 		body["client_id_metadata_document_supported"] = true
 	}
 
