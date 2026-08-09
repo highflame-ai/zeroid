@@ -231,3 +231,45 @@ func TestASMetadata_AuthorizationCodeAdvertisedOnlyWhenServable(t *testing.T) {
 				"without the authorization_code grant it applies to")
 	}
 }
+
+// TestASMetadata_AuthorizationCodeFieldsRideOneGate — every field that only
+// describes the authorization_code flow must appear together or not at all.
+//
+// Gating `grant_types_supported` alone would leave
+// `response_types_supported: ["code"]` asserting a flow the AS cannot serve, and
+// a client that keys off response_types rather than grant_types would start it
+// anyway. `authorization_endpoint` is deliberately NOT gated: the endpoint
+// exists, and omitting it makes the document unparseable to strict clients —
+// the original #263 failure.
+func TestASMetadata_AuthorizationCodeFieldsRideOneGate(t *testing.T) {
+	meta := fetchASMetadata(t)
+
+	grants, _ := meta["grant_types_supported"].([]any)
+	servable := false
+	for _, g := range grants {
+		if g == "authorization_code" {
+			servable = true
+		}
+	}
+
+	_, hasResponseTypes := meta["response_types_supported"]
+	_, hasPKCEMethods := meta["code_challenge_methods_supported"]
+	cimd, _ := meta["client_id_metadata_document_supported"].(bool)
+
+	if servable {
+		require.True(t, hasResponseTypes,
+			"response_types_supported must be present when authorization_code is")
+		require.True(t, hasPKCEMethods,
+			"code_challenge_methods_supported must be present when authorization_code is")
+	} else {
+		require.False(t, hasResponseTypes,
+			"response_types_supported describes a flow that is not advertised")
+		require.False(t, hasPKCEMethods,
+			"code_challenge_methods_supported describes a flow that is not advertised")
+		require.False(t, cimd,
+			"CIMD applies only to authorization_code, which is not advertised")
+	}
+
+	require.NotEmpty(t, meta["authorization_endpoint"],
+		"authorization_endpoint is never gated — omitting it breaks strict parsers")
+}

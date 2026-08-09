@@ -97,6 +97,11 @@ type Server struct {
 	mu                 sync.RWMutex
 	claimsEnrichers    []ClaimsEnricher
 	principalResolvers []namedPrincipalResolver
+
+	// authzCodeAvailable is the deployer's override for whether
+	// /oauth2/authorize can complete an authorization_code flow. nil means
+	// "use the built-in guess". See SetAuthorizationCodeAvailable.
+	authzCodeAvailable func() bool
 	adminAuthState     *middlewareHolder
 	globalMWState      *middlewareHolder
 }
@@ -535,12 +540,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// metadata document. Evaluated per request, because
 	// RegisterPrincipalResolver is documented as safe to call after NewServer
 	// and before Start (#263).
-	apiHandler.SetAuthorizationCodeAvailable(func() bool {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-
-		return len(srv.principalResolvers) > 0
-	})
+	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
 
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
@@ -770,11 +770,19 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // its own redirect_uri, a bare redirect would hand the attacker a code
 // for the victim's principal.
 //
-// A cookie resolver therefore MUST NOT be sufficient on its own. Gate
-// code issuance behind an explicit user interaction — a consent screen
-// carrying a CSRF token — the way a real authorization server does. That
-// surface is the deployer's to build; see docs/cimd.md and
-// highflame-authn#157.
+// A cookie resolver therefore MUST NOT be sufficient on its own. Code
+// issuance has to sit behind an explicit user interaction — a consent
+// screen carrying a CSRF token — the way a real authorization server does.
+//
+// A PrincipalResolver CANNOT implement that: its signature returns
+// (*Principal, error), so it has no ResponseWriter, cannot redirect, and
+// cannot render or resume a consent screen. Its only lever is failing the
+// request. Do the interaction in Server.Use middleware, which sees the
+// raw request and response and can 302 to a consent page before the
+// handler runs; the resolver then only has to recognise the session the
+// consent flow established. See docs/cimd.md, highflame-authn#157 for a
+// worked example, and #276 for why this is more awkward than it should
+// be.
 //
 // Header-based resolvers (api_key, mTLS, a signed assertion) do not have
 // this exposure: a browser cannot set a custom header on a top-level
@@ -858,6 +866,49 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fn = middleware
+}
+
+// SetAuthorizationCodeAvailable overrides ZeroID's guess about whether
+// /oauth2/authorize can actually complete an authorization_code flow on this
+// deployment. When the answer is false, AS metadata omits the
+// authorization_code grant, response_types_supported, the PKCE method list,
+// and client_id_metadata_document_supported, so no client discovers a flow it
+// cannot finish (#263).
+//
+// # Why an override exists
+//
+// ZeroID's built-in guess is "at least one PrincipalResolver is registered".
+// That is NECESSARY but NOT SUFFICIENT, and only the deployer knows the
+// difference: a resolver that reads its credential from req.Form cannot serve
+// a browser GET at all, because Form is bound to the POST body (see
+// RegisterPrincipalResolver). A deployment whose resolvers are all form-based
+// serves POST fine and 401s every browser redirect — while the default guess
+// happily advertises the grant.
+//
+// So: if your resolvers are form-only, call this with a func returning false
+// until you add a header- or cookie-based one. ZeroID cannot introspect what a
+// resolver reads, which is why it cannot work this out itself.
+//
+// A predicate rather than a bool so the answer can change as resolvers are
+// registered. Passing nil restores the built-in guess. Safe to call after
+// NewServer.
+func (s *Server) SetAuthorizationCodeAvailable(fn func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authzCodeAvailable = fn
+}
+
+// canServeAuthorizationCode answers the deployer's override when one is set,
+// otherwise falls back to the built-in guess (any resolver registered).
+func (s *Server) canServeAuthorizationCode() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.authzCodeAvailable != nil {
+		return s.authzCodeAvailable()
+	}
+
+	return len(s.principalResolvers) > 0
 }
 
 // SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA

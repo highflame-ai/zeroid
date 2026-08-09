@@ -41,7 +41,7 @@ import (
 // strings + access logs" (#263).
 //
 // That concern was right and is preserved rather than traded away:
-// buildAuthorizeRequest binds the resolver-facing Form accessor to the
+// authorizeHandler binds the resolver-facing Form accessor to the
 // POST body ONLY. On a GET the protocol parameters come from the query
 // string — where RFC 6749 puts them — while credentials must arrive in a
 // header or cookie. A credential therefore still never lands in a URL, an
@@ -51,7 +51,7 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 	router.Post("/oauth2/authorize", a.authorizeHandler)
 }
 
-// authorizeHandler is the chi handler for POST /oauth2/authorize.
+// authorizeHandler is the chi handler for GET and POST /oauth2/authorize.
 //
 // Pipeline:
 //
@@ -74,12 +74,19 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // resolvers rejected) return RFC 6749 §5.2 JSON error bodies — we
 // cannot redirect to a URL we haven't validated. Errors AFTER
 // successful client lookup could in principle be redirected back per
-// RFC 6749 §4.1.2.1, but v1 keeps them as JSON too; CLI clients
-// (today's only consumer) parse JSON errors fine, and redirect-with-
-// error needs careful URL validation we'd rather not introduce
-// piecemeal.
+// RFC 6749 §4.1.2.1, but are still JSON today. That was defensible when
+// this endpoint was POST-only and CLI clients parsed the body; mounting
+// GET invalidates the reasoning. A browser now shows the user a raw JSON
+// blob while the client waits on a callback that never arrives, with no
+// error to surface.
+//
+// Fixing it is gated on an ordering problem, not effort: an error raised
+// BEFORE redirect_uri is validated must stay JSON, or the redirect is an
+// open redirect — and redirect_uri validation currently lives inside
+// IssueAuthCode, so the handler holds no validated URI at most failure
+// points. Splitting that check out is the work. Tracked in #263.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
-	// ── Step 1: parse form body ──────────────────────────────────────
+	// ── Step 1: parse the query string (GET) or form body (POST) ─────
 	if err := r.ParseForm(); err != nil {
 		// Name the source the caller actually used: a GET has no body, so
 		// "could not parse ... body" points at the wrong parameter for the

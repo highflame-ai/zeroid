@@ -57,24 +57,37 @@ GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.j
 Cookie: <your session cookie>
 ```
 
-**The browser leg needs a session-cookie `PrincipalResolver`, which ZeroID does
-not ship.** A browser cannot set a custom header on a top-level navigation, so
-the deployer must register a resolver that reads a session cookie
-(`RegisterPrincipalResolver` → `req.Cookie(...)`) and own the login and consent
-screens behind it. Without one, an unauthenticated redirect gets
-`401 invalid_client`, and ZeroID omits `authorization_code` from its AS metadata
-so no client discovers a flow it cannot finish.
+**The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
+ship.** A browser cannot set a custom header on a top-level navigation, and the
+resolver-facing `Form` accessor is bound to the POST body, so a resolver that
+reads `req.Form(...)` sees nothing on a GET. The deployer must register one that
+reads a session cookie (`req.Cookie(...)`) and own the login and consent screens
+behind it.
 
-Two things a deployer must handle when writing that resolver:
+**ZeroID cannot detect this for you.** Its AS metadata omits the
+`authorization_code` grant when *no* resolver is registered, but it cannot
+introspect what a registered resolver reads — so a deployment whose resolvers are
+all form-based advertises the grant and then 401s every browser redirect. If that
+is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })`
+until a GET-capable resolver exists; otherwise the metadata promises a flow the
+endpoint cannot finish, which is exactly the failure this is meant to prevent.
 
+Three things a deployer must handle:
+
+* **The interaction cannot live in the resolver.** `PrincipalResolver` returns
+  `(*Principal, error)` — no `ResponseWriter`, no redirect, no way to render or
+  resume a consent screen. Do it in `Server.Use` middleware, which sees the raw
+  request and can 302 to a consent page before the handler runs; the resolver
+  then only recognises the session that flow established.
 * **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
   from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
   attacker-published `client_id` + its own `redirect_uri`. Require an explicit
   user interaction — a consent screen with a CSRF token — before issuing a code.
   This is the same reason a real AS never mints on the bare redirect.
-* **Consent.** CIMD's premise is that the AS shows the user something about a
-  client it has never seen. `client_name`, `client_uri` and `logo_uri` are
-  parsed and available for exactly that.
+* **Consent content.** CIMD's premise is that the AS shows the user something
+  about a client it has never seen. `client_name`, `client_uri` and `logo_uri`
+  are parsed and available for exactly that; mark an unregistered client
+  unverified.
 
 A CLI client can post the same parameters as a form instead:
 

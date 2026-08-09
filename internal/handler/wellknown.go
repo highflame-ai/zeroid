@@ -156,15 +156,8 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
 		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
-		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
-		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
-		// implicit "token" flow is not supported), so advertise "code".
-		"response_types_supported": []string{"code"},
-		// OAuth 2.1 / RFC 7636 §4.3: IssueAuthCode rejects anything but S256
-		// (`plain` is not accepted), so say so. A PKCE-aware client reads this
-		// to pick a challenge method rather than guessing.
-		"code_challenge_methods_supported":                 []string{"S256"},
+		"introspection_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
+		"revocation_endpoint_auth_methods_supported":       []string{"client_secret_post", "client_secret_basic", "none"},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
@@ -195,6 +188,18 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 	if a.canServeAuthorizationCode() {
 		grants, _ := body["grant_types_supported"].([]string)
 		body["grant_types_supported"] = append([]string{"authorization_code"}, grants...)
+
+		// Everything else that only describes the authorization_code flow rides
+		// the same gate. Advertising response_types_supported: ["code"] on an AS
+		// that cannot serve `code` is the same broken promise as advertising the
+		// grant — and a client that keys off response_types rather than
+		// grant_types would start the flow anyway.
+		//
+		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — no implicit
+		// flow), and IssueAuthCode rejects any PKCE method but S256, so these are
+		// the accurate values when the flow IS servable.
+		body["response_types_supported"] = []string{"code"}
+		body["code_challenge_methods_supported"] = []string{"S256"}
 	}
 
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
