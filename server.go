@@ -773,7 +773,8 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // A cookie resolver therefore MUST NOT be sufficient on its own. Gate
 // code issuance behind an explicit user interaction — a consent screen
 // carrying a CSRF token — the way a real authorization server does. That
-// surface is the deployer's to build; see docs/cimd.md and #271.
+// surface is the deployer's to build; see docs/cimd.md and
+// highflame-authn#157.
 //
 // Header-based resolvers (api_key, mTLS, a signed assertion) do not have
 // this exposure: a browser cannot set a custom header on a top-level
