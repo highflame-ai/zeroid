@@ -194,8 +194,22 @@ func TestCIMDResolveClient_InvalidClientID(t *testing.T) {
 	for _, id := range []string{
 		"http://app.example.com/client.json",       // not https
 		"https://app.example.com",                  // no path
-		"https://app.example.com/client.json?a=b",  // query
-		"https://app.example.com/client.json#frag", // fragment
+		"https://app.example.com/client.json?a=b",  // query (draft-02 §3 SHOULD NOT; we reject)
+		"https://app.example.com/client.json#frag", // fragment (§3 MUST NOT)
+
+		// Userinfo (§3 MUST NOT). Reads as legit.example.com wherever the
+		// client_id is displayed — consent screen, audit log — while resolving
+		// to evil.example. Not an allow-list bypass (domainAllowed sees the
+		// real host); a spoof of the string a human is asked to trust.
+		"https://legit.example.com@evil.example/client.json",
+		"https://user:pw@app.example.com/client.json",
+
+		// Dot segments (§3 MUST NOT). Otherwise one document has many
+		// spellings, splitting the cache and giving one client several
+		// identities the §4 self-reference check cannot tell apart.
+		"https://app.example.com/a/../client.json",
+		"https://app.example.com/./client.json",
+		"https://app.example.com/%2e%2e/client.json", // percent-encoded, decoded by url.Parse
 	} {
 		if _, err := svc.ResolveClient(context.Background(), id); !errors.Is(err, ErrCIMDInvalidClientID) {
 			t.Errorf("ResolveClient(%q): expected ErrCIMDInvalidClientID, got %v", id, err)
@@ -256,6 +270,61 @@ func TestCIMDResolveClient_DomainAllowlist(t *testing.T) {
 	docURL = base2 + "/client.json"
 	if _, err := svcAllow.ResolveClient(context.Background(), docURL); err != nil {
 		t.Errorf("allowlisted host should resolve, got %v", err)
+	}
+}
+
+// TestCIMDAllowedDomainCount_ReportsEffectivePolicy — the constructor lower-cases
+// and drops blank/whitespace-only entries, so the raw config slice and the policy
+// actually in force disagree. They disagree in the worst direction: a config of
+// allowed_domains: [""] has length 1 but admits every host, so anything reading
+// the raw slice reports a locked-down deployment at the exact moment it is wide
+// open. That is what the startup warning in NewServer keys on.
+func TestCIMDAllowedDomainCount_ReportsEffectivePolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		domains []string
+		want    int
+	}{
+		{"nil is open mode", nil, 0},
+		{"empty is open mode", []string{}, 0},
+		{"single blank entry is STILL open mode", []string{""}, 0},
+		{"whitespace-only entries are still open mode", []string{"  ", "\t", "\n"}, 0},
+		{"one real domain", []string{"client.example.com"}, 1},
+		{"blanks alongside a real domain do not inflate the count", []string{"", "client.example.com", "   "}, 1},
+		{"case-insensitive duplicates collapse", []string{"Client.Example.com", "client.example.com"}, 1},
+		{"two distinct domains", []string{"a.example.com", "b.example.com"}, 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewCIMDService(CIMDConfig{Enabled: true, AllowedDomains: tc.domains})
+			if got := svc.AllowedDomainCount(); got != tc.want {
+				t.Errorf("AllowedDomainCount() = %d, want %d (raw slice length %d)",
+					got, tc.want, len(tc.domains))
+			}
+		})
+	}
+
+	// Nil-safe, matching Enabled().
+	var nilSvc *CIMDService
+	if got := nilSvc.AllowedDomainCount(); got != 0 {
+		t.Errorf("nil *CIMDService AllowedDomainCount() = %d, want 0", got)
+	}
+}
+
+// TestCIMDBlankAllowedDomainIsOpenMode is the behavioural half of the above: a
+// blank-only allow-list must not merely count as zero, it must actually admit a
+// host that no entry names.
+func TestCIMDBlankAllowedDomainIsOpenMode(t *testing.T) {
+	var docURL string
+	handler := func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, docJSON(docURL, "")) }
+
+	svc, base, _ := newCIMDTestServer(t,
+		CIMDConfig{Enabled: true, AllowedDomains: []string{"", "   "}}, handler)
+	docURL = base + "/client.json"
+
+	if _, err := svc.ResolveClient(context.Background(), docURL); err != nil {
+		t.Errorf("a blank-only allowlist is open mode and must admit any host, got %v", err)
 	}
 }
 

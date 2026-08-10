@@ -33,19 +33,34 @@ import (
 // registerAuthorizeRoute mounts GET and POST /oauth2/authorize on the
 // public chi router.
 //
-// GET is required, not optional: RFC 6749 §4.1.1 says the authorization
-// endpoint MUST support GET, and the browser redirect it enables is the
-// only shape an off-the-shelf OAuth client — an MCP client doing CIMD,
-// say — knows how to drive. v1 withheld it because the CLI use case was
+// Both methods are mounted, and RFC 6749 §3.1 is the sentence that governs
+// both: "The authorization server MUST support the use of the HTTP GET
+// method for the authorization endpoint and MAY support the use of the
+// POST method as well." OAuth 2.1 §3.1 carries the same text forward, and
+// OpenID Connect requires both. So GET is an obligation and POST is a
+// permitted extra — not, as is sometimes assumed, disallowed.
+//
+// GET is what matters here: the browser redirect it enables is the only
+// shape an off-the-shelf OAuth client — an MCP client doing CIMD, say —
+// knows how to drive. v1 withheld it because the CLI use case was
 // POST-only and "GET would surface principal credentials in URL query
-// strings + access logs" (#263).
+// strings + access logs" (#263). POST stays because it is the only method
+// v1 had, so CLI callers depend on it.
 //
 // That concern was right and is preserved rather than traded away:
 // authorizeHandler binds the resolver-facing Form accessor to the
 // POST body ONLY. On a GET the protocol parameters come from the query
 // string — where RFC 6749 puts them — while credentials must arrive in a
-// header or cookie. A credential therefore still never lands in a URL, an
-// access log, or a Referer header.
+// header or cookie. ZeroID therefore never AUTHENTICATES from a URL.
+//
+// That is a narrower claim than "a credential never lands in a URL", which
+// an earlier version of this comment made and could not keep: ZeroID does
+// not control what a caller puts in the query string. A client author who
+// mirrors the documented POST form into a GET gets a correct 401 — and
+// would, before this was fixed, have had the secret written to ZeroID's own
+// access log on the way there. The request loggers now record r.URL.Path
+// rather than r.RequestURI for that reason; see logSafePath in server.go.
+// Referer and browser history remain the caller's to manage.
 func (a *API) registerAuthorizeRoute(router chi.Router) {
 	router.Get("/oauth2/authorize", a.authorizeHandler)
 	router.Post("/oauth2/authorize", a.authorizeHandler)
@@ -69,23 +84,51 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //     redirect_uri allow-list, S256 enforcement, and JWT minting.
 //  7. Build the redirect URL with code + state and emit 302.
 //
-// Errors fall into two camps. Syntactic errors (missing fields, bad
-// response_type) and credential failures (no resolver matched, all
-// resolvers rejected) return RFC 6749 §5.2 JSON error bodies — we
-// cannot redirect to a URL we haven't validated. Errors AFTER
-// successful client lookup could in principle be redirected back per
-// RFC 6749 §4.1.2.1, but are still JSON today. That was defensible when
-// this endpoint was POST-only and CLI clients parsed the body; mounting
-// GET invalidates the reasoning. A browser now shows the user a raw JSON
-// blob while the client waits on a callback that never arrives, with no
-// error to surface.
+// EVERY failure here returns an RFC 6749 §5.2 JSON body. RFC 6749
+// §4.1.2.1 wants most of them redirected back to the client as error +
+// state instead, and only exempts the two cases where redirecting would
+// itself be the vulnerability: a missing/invalid redirect_uri and an
+// invalid client_id. JSON was defensible while this endpoint was
+// POST-only and the caller was a CLI parsing the body; mounting GET
+// invalidated that. A browser now renders a raw JSON blob while the
+// client blocks on a callback that never fires, with no error and no
+// state to correlate.
 //
-// Fixing it is gated on an ordering problem, not effort: an error raised
-// BEFORE redirect_uri is validated must stay JSON, or the redirect is an
-// open redirect — and redirect_uri validation currently lives inside
-// IssueAuthCode, so the handler holds no validated URI at most failure
-// points. Splitting that check out is the work. Tracked in #263.
+// The blocker is ordering, and it is upstream of this handler's own
+// steps: principal resolution (step 4) runs BEFORE any client lookup,
+// which happens inside IssueAuthCode at step 6. So access_denied — the
+// failure a browser user actually hits, when they are not signed in or
+// decline — fires while no validated redirect_uri exists to redirect to.
+// Redirecting to an unvalidated URI would be an open redirect, so it
+// stays JSON until the lookup moves.
+//
+// Note that redirect_uri validation is not merely "inside IssueAuthCode":
+// it runs there AFTER the grant-type allow-list, so the only failure
+// genuinely downstream of it is the mint 500. Fixing this means hoisting
+// client resolution + redirect_uri validation ahead of step 4, not
+// reordering within IssueAuthCode. Tracked in #279.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
+	// ── Step 0: is this deployment serving the flow at all? ──────────
+	// SetAuthorizationCodeAvailable(false) used to suppress only the
+	// discovery metadata, leaving the endpoint itself live. That made it
+	// an advertisement switch, not an off switch — and mounting GET gave
+	// deployers a reason to want a real one: a cookie-based resolver is
+	// safe under POST alone (SameSite=Lax withholds the cookie on a
+	// cross-site POST) and CSRF-reachable once a top-level navigation can
+	// drive it. A deployer who reaches for the documented hatch gets what
+	// the name promises: the flow is off, on both methods.
+	//
+	// Nothing changes by default. The built-in guess is "any resolver
+	// registered", and a deployment with none already answered 503 here
+	// via ErrNoResolversRegistered — this just reaches the same answer
+	// before touching the request.
+	if !a.canServeAuthorizationCode() {
+		writeAuthorizeError(w, http.StatusServiceUnavailable, oautherror.ServerError,
+			"/oauth2/authorize is not available on this deployment")
+
+		return
+	}
+
 	// ── Step 1: parse the query string (GET) or form body (POST) ─────
 	if err := r.ParseForm(); err != nil {
 		// Name the source the caller actually used: a GET has no body, so
