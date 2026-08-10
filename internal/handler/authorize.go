@@ -26,6 +26,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/internal/service"
 )
@@ -275,7 +276,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		// JSON blob in the browser despite having a perfectly good registered
 		// redirect_uri, which is the dead end this PR exists to remove.
 		if oauthClient != nil {
-			a.failAuthorize(w, r, req, status, code, code, description)
+			a.failAuthorize(w, r, req, oauthClient, status, code, code, description)
 
 			return
 		}
@@ -308,7 +309,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 			// deployer told us where; otherwise fall through to access_denied,
 			// because a resolver cannot conjure a login surface a deployment
 			// does not have.
-			if a.redirectToInteractiveLogin(w, r, req, resolverName) {
+			if a.redirectToInteractiveLogin(w, r, req, oauthClient, resolverName) {
 				return
 			}
 
@@ -317,7 +318,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 				Str("client_id", req.ClientID).
 				Msg("resolver requested interactive authentication but no interactive login URL is configured " +
 					"(Server.SetInteractiveLoginURL); refusing as access_denied")
-			a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+			a.failAuthorize(w, r, req, oauthClient, http.StatusUnauthorized, oautherror.InvalidClient,
 				oautherror.AccessDenied, "interactive authentication required but unavailable")
 
 			return
@@ -336,7 +337,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		// it at step 3.5 — it is the RESOURCE OWNER whose credential failed,
 		// which is exactly what RFC 6749 §4.1.2.1 defines access_denied for.
 		// The old invalid_client blamed the wrong party.
-		a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+		a.failAuthorize(w, r, req, oauthClient, http.StatusUnauthorized, oautherror.InvalidClient,
 			oautherror.AccessDenied, "credential rejected")
 
 		return
@@ -347,7 +348,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		// browser GET this is the ordinary "you are not signed in" case, so it
 		// redirects as access_denied; on POST the JSON hint naming the
 		// deployer-chosen credential fields is more useful to a CLI author.
-		a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+		a.failAuthorize(w, r, req, oauthClient, http.StatusUnauthorized, oautherror.InvalidClient,
 			oautherror.AccessDenied,
 			"no applicable credential: request did not match any registered principal resolver")
 
@@ -392,7 +393,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 			Str("account_id", principal.AccountID).
 			Msg("IssueAuthCode rejected request")
 		errCode, desc, status := extractOAuthError(err)
-		a.failAuthorize(w, r, req, status, errCode, errCode, desc)
+		a.failAuthorize(w, r, req, oauthClient, status, errCode, errCode, desc)
 
 		return
 	}
@@ -434,13 +435,19 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 // redirectToInteractiveLogin sends the user agent to the deployer's login
 // surface, returning true when it handled the response.
 //
-// Returns false — leaving the caller to refuse — in the two cases where a
+// Returns false — leaving the caller to refuse — in the three cases where a
 // redirect is not the right answer:
 //
 //   - Not a GET. There is no user agent in a POST exchange to send anywhere; the
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
+//   - A self-asserted (CIMD) client. Sending a user through the deployment's real
+//     login page on behalf of a client nobody vetted is the more damaging half of
+//     the same problem failAuthorize declines: the victim authenticates for real,
+//     and the flow resumes toward an attacker-published redirect_uri. Refusing
+//     here means an unvetted client cannot borrow the login surface's credibility.
+//     Set cimd.allowed_domains to vet the publishing hosts and this applies again.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -455,9 +462,11 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 // target from request data reintroduces exactly that risk, which is why the
 // godoc on the public setter says not to.
 func (a *API) redirectToInteractiveLogin(
-	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest, resolverName string,
+	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
+	client *domain.OAuthClient, resolverName string,
 ) bool {
-	if r.Method != http.MethodGet || a.interactiveLoginURL == nil {
+	if r.Method != http.MethodGet || a.interactiveLoginURL == nil ||
+		client == nil || client.SelfAsserted() {
 		return false
 	}
 
@@ -521,6 +530,29 @@ func (a *API) redirectToInteractiveLogin(
 // v1. Redirecting those would break them for no benefit, and there is no user
 // agent in that exchange to redirect anyway.
 //
+// It also keeps the JSON body for a SELF-ASSERTED client, and that one is a
+// deliberate deviation from §4.1.2.1 rather than a gap.
+//
+// §4.1.2.1's redirect rule rests on "registered" meaning a party somebody vetted.
+// CIMD removes registration by design: the redirect_uris come from a document the
+// requester published, CIMD is on by default, and allowed_domains ships empty, so
+// the destination is attacker-CHOSEN rather than merely attacker-supplied. Under
+// those conditions honouring the rule turns this endpoint into an unauthenticated
+// redirector — reachable with no credential, since the failure being reported IS
+// "you have no credential" — with the authorization server's own origin as the
+// first hop. Three independent reviews flagged it; the deviation is the
+// deliberate answer.
+//
+// What it costs: a CIMD client driving a browser cannot learn its error from the
+// callback and must read the JSON body instead, which is exactly the ergonomic
+// problem #279 set out to fix, kept for the one client class whose redirect
+// target nobody vetted. Registered and dynamically-registered clients — where
+// somebody did — are unaffected and get the conformant redirect.
+//
+// Deployers who want CIMD clients to receive redirects can restore them by
+// setting cimd.allowed_domains, which re-establishes the vetting the rule assumes;
+// see docs/cimd.md. The gate is provenance, not the CIMD feature itself.
+//
 // jsonCode vs redirectCode: the wire code sometimes has to differ between the
 // two shapes. A failed resolver is invalid_client to a programmatic POST caller
 // (that is the vocabulary §5.2 gives it) but access_denied on the browser leg,
@@ -534,9 +566,9 @@ func (a *API) redirectToInteractiveLogin(
 // failure to the request that caused it.
 func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
-	status int, jsonCode, redirectCode, description string,
+	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet || client == nil || client.SelfAsserted() {
 		writeAuthorizeError(w, status, jsonCode, description)
 
 		return

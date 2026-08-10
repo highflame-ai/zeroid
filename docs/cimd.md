@@ -85,6 +85,23 @@ cookie resolver is safe while POST is the only route, because `SameSite=Lax`
 withholds the cookie on a cross-site POST, and becomes reachable by cross-site
 top-level navigation once GET is mounted.
 
+**Errors are not redirected to a CIMD client.** RFC 6749 §4.1.2.1 says report most
+`/oauth2/authorize` failures by redirecting to the client's registered
+`redirect_uri`, and ZeroID does — for clients somebody registered. A CIMD client's
+`redirect_uris` come from a document it published itself, so with `allowed_domains`
+empty the destination is attacker-*chosen*, and honouring the rule would make the
+endpoint an unauthenticated redirector: the failure being reported is "you have no
+credential", so no credential is needed to trigger it, and the first hop carries
+your origin. CIMD clients therefore get the §5.2 JSON body instead, and the
+interactive-login redirect is refused for them too — an unvetted client does not
+get to borrow your login surface's credibility.
+
+The cost is real and worth naming: a browser-driven CIMD client cannot learn its
+error from the callback and has to read the JSON body. **Setting
+`cimd.allowed_domains` restores the redirect**, because vetting which hosts may
+publish restores the assumption §4.1.2.1 is built on. The gate is provenance, not
+CIMD.
+
 Three things a deployer must handle:
 
 * **The resolver starts the interaction; it does not render it.**
@@ -102,7 +119,8 @@ Three things a deployer must handle:
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
-  conjure a surface the deployment does not have.
+  conjure a surface the deployment does not have — and it is refused outright for a
+  CIMD client, per the provenance rule above.
 
   Use `Server.Use` middleware instead if you want to own the whole interaction
   including the 302.

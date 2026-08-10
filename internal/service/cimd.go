@@ -101,7 +101,7 @@ const (
 	// downstream code can distinguish them from "internal" (admin) and
 	// "dynamic" (RFC 7591) clients. Kept out of the DB — CIMD clients are
 	// never persisted.
-	cimdRegistrationSource = "cimd"
+	cimdRegistrationSource = domain.RegistrationSourceCIMD
 )
 
 // CIMD error sentinels. Callers wrap these into RFC 6749 §5.2 OAuth errors via
