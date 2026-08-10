@@ -43,7 +43,66 @@ At a stable HTTPS URL it controls, e.g. `https://app.example.com/oauth/client.js
 
 ### 2. The client starts the flow with its URL as `client_id`
 
-`POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value):
+`GET` or `POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value).
+
+A browser-based client uses the RFC 6749 §4.1.1 redirect:
+
+```http
+GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+    &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+    &response_type=code
+    &code_challenge=<S256 challenge>
+    &code_challenge_method=S256
+    &state=<opaque> HTTP/1.1
+Cookie: <your session cookie>
+```
+
+**The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
+ship.** A browser cannot set a custom header on a top-level navigation, and the
+resolver-facing `Form` accessor is bound to the POST body, so a resolver that
+reads `req.Form(...)` sees nothing on a GET. The deployer must register one that
+reads a session cookie (`req.Cookie(...)`) and own the login and consent screens
+behind it.
+
+**ZeroID cannot detect this for you.** Its AS metadata omits the
+`authorization_code` grant when *no* resolver is registered, but it cannot
+introspect what a registered resolver reads — so a deployment whose resolvers are
+all form-based advertises the grant and then 401s every browser redirect. If that
+is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })`
+until a GET-capable resolver exists; otherwise the metadata promises a flow the
+endpoint cannot finish, which is exactly the failure this is meant to prevent.
+
+Three things a deployer must handle:
+
+* **The interaction cannot live in the resolver.** `PrincipalResolver` returns
+  `(*Principal, error)` — no `ResponseWriter`, no redirect, no way to render or
+  resume a consent screen. Do it in `Server.Use` middleware, which sees the raw
+  request and can 302 to a consent page before the handler runs; the resolver
+  then only recognises the session that flow established.
+
+  **`Server.Use` replaces rather than chains.** A second call silently discards
+  the first, despite the name. If you already use it for anything else — and
+  most deployers do — compose both into one function at the call site. Adding
+  the consent gate as a second `Use` call drops one of the two with no error,
+  and if the loser is the consent gate, the protection below simply is not
+  running. Tracked in zeroid#276.
+* **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
+  from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
+  attacker-published `client_id` + its own `redirect_uri`. Require an explicit
+  user interaction — a consent screen with a CSRF token — before issuing a code.
+  This is the same reason a real AS never mints on the bare redirect.
+* **Consent content.** CIMD's premise is that the AS shows the user something
+  about a client it has never seen, and marks it unverified. ZeroID does not
+  hand you that metadata today: `client_name` / `client_uri` / `logo_uri` are
+  parsed into the internal document type but dropped when it is synthesized
+  into a client (`domain.OAuthClient` has no such fields), and the document
+  type is unexported. Your consent surface must fetch and validate the CIMD
+  document itself — applying the same rules ZeroID does, in particular the
+  draft §4 self-reference check that the document's own `client_id` equals the
+  URL it was fetched from, without which the screen can be made to display
+  someone else's branding.
+
+A CLI client can post the same parameters as a form instead:
 
 ```http
 POST /oauth2/authorize HTTP/1.1
@@ -55,7 +114,13 @@ client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
 &code_challenge=<S256 challenge>
 &code_challenge_method=S256
 &state=<opaque>
+&api_key=zid_sk_...
 ```
+
+**Credentials never travel in the query string.** On `GET`, the principal must
+arrive in a header (`X-API-Key`, or `Authorization: Bearer zid_sk_…`) or a
+cookie — a URL ends up in access logs, browser history, and `Referer`. The
+protocol parameters above are fine there; the credential is not.
 
 ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…`.
 

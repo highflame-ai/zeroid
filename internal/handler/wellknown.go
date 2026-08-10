@@ -114,15 +114,29 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 }
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
+	// Evaluate the gate ONCE per request. The predicate is deliberately
+	// dynamic — a deployer may register resolvers after NewServer — so calling
+	// it twice could emit a document advertising CIMD without the
+	// authorization_code grant CIMD applies to, or the reverse.
+	servesAuthorizationCode := a.canServeAuthorizationCode()
+
 	body := map[string]any{
-		"issuer":         a.issuer,
-		"token_endpoint": a.issuer + "/oauth2/token",
+		"issuer": a.issuer,
+		// REQUIRED by RFC 8414 §2 whenever the AS supports the
+		// authorization_code grant — which we advertise below. Omitting it
+		// broke more than discovery ergonomics: OAuthMetadata is a required
+		// field in the MCP Python SDK's model, so the whole document failed
+		// to parse, the client treated the AS as having no metadata, and it
+		// silently fell back to dynamic client registration instead of using
+		// CIMD (#263). A client cannot start the flow it is being told to use
+		// if it cannot find the endpoint.
+		"authorization_endpoint": a.issuer + "/oauth2/authorize",
+		"token_endpoint":         a.issuer + "/oauth2/token",
 		// "none" is advertised because public PKCE clients — including CIMD
 		// clients, whose metadata document is the registration — authenticate
 		// at the token endpoint with PKCE alone and carry no secret.
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
 		"grant_types_supported": []string{
-			"authorization_code",
 			"refresh_token",
 			"client_credentials",
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -150,9 +164,12 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
-		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
-		// implicit "token" flow is not supported), so advertise "code".
-		"response_types_supported":                         []string{"code"},
+		// REQUIRED by RFC 8414 §2 unconditionally — unlike the grant list, this
+		// member must be present even when the flow is unavailable, or the
+		// document is invalid and strict parsers reject the whole thing (the
+		// #263 failure). The VALUE is gated below: an empty array is the
+		// accurate way to say "no response type is supported".
+		"response_types_supported":                         []string{},
 		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
 
 		// RFC 7591 dynamic client registration.
@@ -176,12 +193,36 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
 	}
 
+	// authorization_code is advertised only when /oauth2/authorize can
+	// actually serve it — i.e. a PrincipalResolver is registered. Prepended
+	// so the list keeps its conventional order. See
+	// API.SetAuthorizationCodeAvailable for why this is gated at all.
+	if servesAuthorizationCode {
+		grants, _ := body["grant_types_supported"].([]string)
+		body["grant_types_supported"] = append([]string{"authorization_code"}, grants...)
+
+		// Everything else that only describes the authorization_code flow rides
+		// the same gate. Advertising response_types_supported: ["code"] on an AS
+		// that cannot serve `code` is the same broken promise as advertising the
+		// grant — and a client that keys off response_types rather than
+		// grant_types would start the flow anyway.
+		//
+		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — no implicit
+		// flow), and IssueAuthCode rejects any PKCE method but S256, so these are
+		// the accurate values when the flow IS servable.
+		body["response_types_supported"] = []string{"code"}
+		body["code_challenge_methods_supported"] = []string{"S256"}
+	}
+
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
 	// only when it's enabled on this deployment so CIMD-aware clients (e.g. MCP
 	// 2025-11-25) know they can present an https:// client_id URL and skip
 	// registration. Omitted entirely when disabled (the field's absence means
 	// "unsupported").
-	if a.cimdEnabled {
+	// Gated on the authorization_code grant too: CIMD only applies to that
+	// flow, so advertising it while the flow is unavailable is the same
+	// broken promise.
+	if a.cimdEnabled && servesAuthorizationCode {
 		body["client_id_metadata_document_supported"] = true
 	}
 
