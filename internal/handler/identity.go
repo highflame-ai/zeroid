@@ -54,6 +54,23 @@ type IdentityIDInput struct {
 	ID string `path:"id" doc:"Identity UUID"`
 }
 
+// OffboardByOwnerInput is the request for POST /identities/offboard-by-owner.
+// account_id comes from tenant context, never the body — the payload cannot
+// steer tenancy (INV-IDN-002 applied to the admin surface).
+type OffboardByOwnerInput struct {
+	Body struct {
+		OwnerUserID string `json:"owner_user_id" required:"true" minLength:"1" doc:"Stable user ID of the offboarded human (identities.owner_user_id)"`
+		Reason      string `json:"reason,omitempty" maxLength:"256" doc:"Audit reason recorded on the revocations (defaults to owner_deactivated)"`
+	}
+}
+
+type OffboardByOwnerOutput struct {
+	Body struct {
+		IdentitiesDeactivated int   `json:"identities_deactivated" doc:"Identities deactivated this call — the field to key offboarding evidence and zero-alerts on"`
+		CredentialsRevoked    int64 `json:"credentials_revoked" doc:"Stragglers caught by the final owner-scoped sweep only; ~0 on a healthy run because each identity's deactivation already cascade-revoked its credentials and descendants"`
+	}
+}
+
 // GetIdentityByWIMSEInput is the query for GET /identities/by-wimse.
 // The URI is supplied as a query param (rather than a path segment) because
 // SPIFFE URIs contain slashes that would conflict with route segmentation
@@ -151,6 +168,21 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Lookup endpoint used by downstream gateways to verify a JWT's sub claim still resolves to an active identity row in the caller's tenant before forwarding the request.",
 		Tags:        []string{"Identities"},
 	}, a.getIdentityByWIMSEOp)
+
+	// Literal segment, registered before /identities/{id} like by-wimse above.
+	huma.Register(api, huma.Operation{
+		OperationID: "offboard-identities-by-owner",
+		Method:      http.MethodPost,
+		Path:        "/identities/offboard-by-owner",
+		Summary:     "Offboard a human: deactivate every identity they own and cascade-revoke credentials",
+		Description: "Human-offboarding composition (INV-IDN-010 / ADR 0028): deactivates every " +
+			"identity owned by the given user in the caller's account — across ALL projects; the " +
+			"X-Project-ID header is required by the admin surface but not used to scope this sweep — " +
+			"sweeping each identity's API keys and credentials and emitting retirement CAE signals, " +
+			"then runs the owner-scoped credential cascade to catch delegated descendants. Idempotent: " +
+			"safe to retry until 200. Intended caller: admin's SCIM deactivation outbox worker.",
+		Tags: []string{"Identities"},
+	}, a.offboardByOwnerOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "get-identity",
@@ -527,6 +559,41 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	}
 
 	return &IdentityOutput{Body: identity}, nil
+}
+
+// offboardByOwnerOp drives IdentityService.OffboardOwner. Failure mapping is
+// retry-oriented for the SCIM outbox worker: a partial application (some
+// identities failed to deactivate, or the credential cascade errored after
+// some deactivations) returns 502 so the worker retries the idempotent
+// operation; only a fully-applied offboarding returns 200.
+func (a *API) offboardByOwnerOp(ctx context.Context, input *OffboardByOwnerInput) (*OffboardByOwnerOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	result, err := a.identitySvc.OffboardOwner(ctx, input.Body.OwnerUserID, tenant.AccountID, input.Body.Reason)
+	if err != nil {
+		log.Error().Err(err).
+			Str("owner_user_id", input.Body.OwnerUserID).
+			Str("account_id", tenant.AccountID).
+			Msg("owner offboarding failed or partially applied")
+		if result == nil {
+			// Nothing applied: argument guard or list failure.
+			return nil, mapErr(err)
+		}
+		// Partially applied — the worker must retry until it gets a 200.
+		// Fixed message: the wrapped chain can carry DB driver text, and this
+		// surface's convention (mapErr) is generic client messages with
+		// details logged server-side.
+		return nil, huma.Error502BadGateway("offboarding partially applied; retry (the operation is idempotent)")
+	}
+
+	out := &OffboardByOwnerOutput{}
+	out.Body.IdentitiesDeactivated = result.IdentitiesDeactivated
+	out.Body.CredentialsRevoked = result.CredentialsRevoked
+
+	return out, nil
 }
 
 func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*IdentityOutput, error) {
