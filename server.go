@@ -51,6 +51,37 @@ import (
 type middlewareHolder struct {
 	mu  sync.RWMutex
 	fns []func(http.Handler) http.Handler
+	// composed is fns wrapped into a single middleware, rebuilt whenever fns
+	// changes. Cached rather than composed per call because chain() runs on EVERY
+	// request through EVERY route: composing there cost a slice copy plus a
+	// closure allocation per request, which the previous single-slot read did not.
+	// nil when fns is empty, so the router closure can skip the wrap entirely.
+	composed func(http.Handler) http.Handler
+}
+
+// rebuildLocked recomputes composed. Caller must hold the write lock.
+//
+// Wraps in reverse so fns[0] ends up OUTERMOST, matching chi and net/http:
+// middleware runs in registration order, and one that annotates context has to
+// run before one that reads it.
+func (h *middlewareHolder) rebuildLocked() {
+	if len(h.fns) == 0 {
+		h.composed = nil
+
+		return
+	}
+
+	fns := make([]func(http.Handler) http.Handler, len(h.fns))
+	copy(fns, h.fns)
+
+	h.composed = func(next http.Handler) http.Handler {
+		wrapped := next
+		for i := len(fns) - 1; i >= 0; i-- {
+			wrapped = fns[i](wrapped)
+		}
+
+		return wrapped
+	}
 }
 
 // fn returns the single registered middleware, or nil. For holders that only
@@ -69,27 +100,14 @@ func (h *middlewareHolder) fn() func(http.Handler) http.Handler {
 // chain returns the registered middleware composed so the FIRST registered is
 // outermost, matching chi and net/http convention. Nil when none are set.
 //
-// Composed per call rather than cached because Use is documented as callable
-// after NewServer, and the router closure reads this on every request.
+// Read-only and allocation-free: it hands back the cached composition. Use is
+// documented as callable after NewServer, so the cache is rebuilt on mutation
+// rather than assumed immutable.
 func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
 	h.mu.RLock()
-	fns := make([]func(http.Handler) http.Handler, len(h.fns))
-	copy(fns, h.fns)
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
 
-	if len(fns) == 0 {
-		return nil
-	}
-
-	return func(next http.Handler) http.Handler {
-		// Wrap in reverse so fns[0] ends up outermost.
-		h := next
-		for i := len(fns) - 1; i >= 0; i-- {
-			h = fns[i](h)
-		}
-
-		return h
-	}
+	return h.composed
 }
 
 // Server is the main ZeroID server.
@@ -929,11 +947,13 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 
 	if middleware == nil {
 		s.adminAuthState.fns = nil
+		s.adminAuthState.rebuildLocked()
 
 		return
 	}
 
 	s.adminAuthState.fns = []func(http.Handler) http.Handler{middleware}
+	s.adminAuthState.rebuildLocked()
 }
 
 // Use adds a global middleware that runs on ALL routes (public + admin).
@@ -966,6 +986,7 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fns = append(s.globalMWState.fns, middleware)
+	s.globalMWState.rebuildLocked()
 }
 
 // SetInteractiveLoginURL supplies the login surface a user agent is sent to when

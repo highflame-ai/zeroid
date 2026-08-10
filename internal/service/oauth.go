@@ -1486,10 +1486,15 @@ type IssueAuthCodeRequest struct {
 	Scopes []string
 
 	// Client is an already-resolved OAuth client, as returned by
-	// ResolveAuthorizeClient. Optional. When non-nil, IssueAuthCode skips
-	// its own registry/CIMD lookup, its client-state gate and the
-	// redirect_uri allow-list, because ResolveAuthorizeClient has already
-	// applied all three to this exact (ClientID, RedirectURI) pair.
+	// ResolveAuthorizeClient. Optional. When non-nil, IssueAuthCode skips the
+	// registry/CIMD LOOKUP and the client-state gate, because
+	// ResolveAuthorizeClient already applied them.
+	//
+	// It does NOT skip the redirect_uri allow-list. That check is pure string
+	// work, and it guards a value baked into the issued code as the "ruri" claim
+	// and honoured at exchange — so it is re-run here against this Client rather
+	// than assumed, and a caller passing a redirect_uri the client never
+	// registered is refused however it was resolved.
 	//
 	// This exists so the /oauth2/authorize handler can validate the client
 	// and redirect_uri BEFORE resolving the principal, which is what lets it
@@ -1666,12 +1671,26 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		if oauthClient, err = s.ResolveAuthorizeClient(ctx, req.ClientID, req.RedirectURI); err != nil {
 			return "", err
 		}
-	} else if oauthClient.ClientID != req.ClientID {
-		// A pre-resolved client must be the one these parameters were validated
-		// against. Without this, a caller could resolve a permissive client and
-		// then issue against a different client_id, and the redirect_uri
-		// allow-list it satisfied would be the wrong client's.
-		return "", oauthServerError("pre-resolved client does not match request client_id", nil)
+	} else {
+		// A pre-resolved client only lets the caller skip the LOOKUP — the
+		// expensive part, a DB read or a CIMD fetch. The two cheap invariants are
+		// re-established here rather than trusted, because Client is an exported
+		// field on an exported request type and nothing stops a caller resolving
+		// one pair and issuing against another.
+		//
+		// That matters most for redirect_uri: it is baked into the code as the
+		// "ruri" claim and honoured at exchange, so accepting one the client never
+		// registered would defeat the allow-list end to end, not just here.
+		// redirectURIAllowed is pure string work (with RFC 8252 loopback
+		// equivalence), so re-running it costs nothing worth saving.
+		if oauthClient.ClientID != req.ClientID {
+			return "", oauthServerError("pre-resolved client does not match request client_id", nil)
+		}
+
+		if !redirectURIAllowed(req.RedirectURI, oauthClient.RedirectURIs) {
+			return "", oauthBadRequest(oautherror.InvalidRequest,
+				"redirect_uri is not in the client's registered list")
+		}
 	}
 
 	// Scope intersection: the issued code can never authorize a scope
