@@ -32,6 +32,13 @@ func TestRevokeAllActiveForOwner_RejectsEmptyOwner(t *testing.T) {
 		{"empty owner", "", "acct-123"},
 		{"empty account", "user-42", ""},
 		{"both empty", "", ""},
+		// Whitespace variants: pass == "" but match no stored row (ownerless
+		// identities store exactly ""), so the cascade would "succeed" with
+		// zero revocations — a broken offboarding that looks healthy. Guard
+		// is trim-aware; migration 043 mirrors it in SQL.
+		{"whitespace-only owner", " ", "acct-123"},
+		{"padded owner", " user-42 ", "acct-123"},
+		{"padded account", "user-42", " acct-123"},
 	}
 
 	for _, tc := range tests {

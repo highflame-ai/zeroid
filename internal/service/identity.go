@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -971,6 +972,130 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	}
 
 	return updated, nil
+}
+
+// OffboardResult reports what an owner offboarding actually did, so the caller
+// (admin's SCIM outbox worker) can log evidence and decide whether to retry.
+type OffboardResult struct {
+	// IdentitiesDeactivated counts identities the loop successfully drove to
+	// deactivated. The list excludes already-deactivated rows, so this is the
+	// fresh count in practice; a row deactivated concurrently between list and
+	// loop is still counted (DeactivateIdentity no-ops idempotently). This is
+	// the field the SCIM worker should key evidence and zero-alerts on.
+	IdentitiesDeactivated int
+	// FailedIdentityIDs lists identities whose deactivation errored. Non-empty
+	// means the offboarding is INCOMPLETE and the caller must retry (the whole
+	// operation is idempotent).
+	FailedIdentityIDs []string
+	// CredentialsRevoked is the count from the FINAL owner-scoped cascade
+	// (revoke_credentials_by_owner) only. Expect it to be ~0 on a healthy run:
+	// each identity's deactivation cleanup already cascade-revokes that
+	// identity's credentials AND their delegated descendants
+	// (revoke_credentials_cascade, migration 031), so the final sweep usually
+	// finds nothing left. A non-zero value here means the sweep caught
+	// stragglers — descendants of identities that failed to deactivate, or
+	// credentials issued mid-loop. Do NOT alert on this being zero.
+	CredentialsRevoked int64
+}
+
+// OffboardOwner is the human-offboarding composition (INV-IDN-010 / ADR 0028
+// D5): when the org IdP deactivates a person, every agent identity they own in
+// the account — across all projects — is deactivated, and the owner-scoped
+// credential cascade sweeps anything delegation reached beyond them.
+//
+// Order matters and both halves are required:
+//
+//  1. Deactivate each owned identity via the shared DeactivateIdentity path
+//     (sweeps linked API keys, cascade-revokes that identity's credentials,
+//     emits the retirement CAE signal). Credential revocation alone would be
+//     cosmetic — a surviving zid_sk_* service key just re-exchanges for a
+//     fresh token via the api_key grant.
+//  2. RevokeAllActiveForOwner — the single-statement atomic sweep that also
+//     catches delegated descendants owned by other humans (parent_jti chain)
+//     and any credential issued while step 1 was looping.
+//
+// Failure semantics are retry-oriented, not fail-fast: a per-identity
+// deactivation error is recorded and the loop continues, and the credential
+// cascade runs regardless, so one bad row cannot shield the rest of the fleet.
+// A non-nil error alongside a non-nil result means "partially applied, retry
+// me" — every step is idempotent (already-deactivated identities no-op,
+// already-revoked credentials emit no duplicate revocation events).
+//
+// Re-activation is deliberately NOT offered here: a SCIM active:true after an
+// offboarding restores org membership only (ADR 0028 D6); agents are never
+// silently resurrected.
+func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accountID, reason string) (*OffboardResult, error) {
+	// Trim-aware, not just non-empty: " " passes a == "" check, matches NO row
+	// (ownerless identities store "", and Postgres VARCHAR equality is exact),
+	// and would turn the offboarding into a silent 200 no-op — the SCIM worker
+	// records success while the departing human's fleet keeps running. A
+	// padded owner (e.g. "alice ") likewise matches nothing stored as "alice".
+	// Both are malformed events that must fail loudly (ErrInvalidOwnerArgument
+	// → 400), not read as healthy.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return nil, fmt.Errorf(
+			"%w: OffboardOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
+	}
+
+	if reason == "" {
+		reason = "owner_deactivated"
+	}
+
+	identities, err := s.repo.ListByOwnerForOffboard(ctx, ownerUserID, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &OffboardResult{}
+	for _, identity := range identities {
+		// A canceled caller must not burn one error log + one failure append
+		// per remaining identity on a large fleet; stop and report partial so
+		// the worker retries.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+
+			return result, fmt.Errorf("offboard interrupted after %d deactivations: %w", result.IdentitiesDeactivated, ctxErr)
+		}
+
+		if _, err := s.DeactivateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID); err != nil {
+			log.Error().Err(err).
+				Str("identity_id", identity.ID).
+				Str("owner_user_id", ownerUserID).
+				Str("account_id", accountID).
+				Msg("offboard: failed to deactivate owned identity")
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+			continue
+		}
+		result.IdentitiesDeactivated++
+	}
+
+	// The owner-scoped cascade runs even when some deactivations failed — it
+	// does not depend on identity status and every credential it can reach
+	// must die on this call, not on the retry.
+	revoked, err := s.credentialSvc.RevokeAllActiveForOwner(ctx, ownerUserID, accountID, reason)
+	if err != nil {
+		return result, fmt.Errorf("offboard: owner-scoped credential cascade failed (deactivated %d identities first): %w",
+			result.IdentitiesDeactivated, err)
+	}
+	result.CredentialsRevoked = revoked
+
+	if len(result.FailedIdentityIDs) > 0 {
+		return result, fmt.Errorf("offboard incomplete: %d of %d identities failed to deactivate — retry (idempotent)",
+			len(result.FailedIdentityIDs), len(identities))
+	}
+
+	log.Info().
+		Str("owner_user_id", ownerUserID).
+		Str("account_id", accountID).
+		Str("reason", reason).
+		Int("identities_deactivated", result.IdentitiesDeactivated).
+		Int64("credentials_revoked", result.CredentialsRevoked).
+		Msg("offboard: owner offboarding complete")
+
+	return result, nil
 }
 
 // ExpireIdentity transitions an active identity to expired. It runs the same

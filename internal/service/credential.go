@@ -656,11 +656,17 @@ func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, iden
 // relying on that accident holding for a TEXT column. Mirrored in SQL by
 // migration 042 so it survives a caller that bypasses this service.
 func (s *CredentialService) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) (int64, error) {
-	if ownerUserID == "" || accountID == "" {
+	// Trim-aware (not just non-empty): a whitespace-only or padded owner
+	// passes == "" but matches NO stored row (ownerless identities store "";
+	// VARCHAR equality is exact), so the cascade would "succeed" with zero
+	// revocations and a broken offboarding integration would look healthy
+	// indefinitely. Malformed input fails loudly instead.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
 		return 0, fmt.Errorf(
-			"RevokeAllActiveForOwner requires a non-empty owner_user_id and account_id (got owner=%q account=%q): "+
-				"an empty owner matches every ownerless identity in the account",
-			ownerUserID, accountID)
+			"%w: RevokeAllActiveForOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
 	}
 
 	if reason == "" {

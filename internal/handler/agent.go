@@ -28,6 +28,12 @@ func mapErr(err error) error {
 	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
 		return huma.Error400BadRequest(err.Error())
 	}
+	// Malformed owner/account on the owner-scoped destructive paths: a 400
+	// tells the SCIM outbox worker the event is a data bug to surface, not a
+	// transient fault to retry forever.
+	if errors.Is(err, service.ErrInvalidOwnerArgument) {
+		return huma.Error400BadRequest(err.Error())
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no rows in result set"), strings.Contains(msg, "not found"):
