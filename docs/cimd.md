@@ -66,9 +66,29 @@ the user to.
 **The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
 ship.** A browser cannot set a custom header on a top-level navigation, and the
 resolver-facing `Form` accessor is bound to the POST body, so a resolver that
-reads `req.Form(...)` sees nothing on a GET. The deployer must register one that
-reads a session cookie (`req.Cookie(...)`) and own the login and consent screens
-behind it.
+reads `req.Form(...)` sees nothing on a GET.
+
+There are two ways to supply it, and the second is usually the better one:
+
+1. **Register a cookie-reading resolver** (`req.Cookie(...)`) and own the login
+   and consent screens behind it. This makes `/oauth2/authorize` itself the
+   browser-facing endpoint, which brings the CSRF obligations described below —
+   `SameSite=Lax` still sends the cookie on a cross-site top-level navigation,
+   and CIMD accepts an attacker-published `client_id` with its own
+   `redirect_uri`.
+2. **Front the browser leg above ZeroID and hand off over POST.** Your own
+   surface owns the redirect, authenticates the human however you already do,
+   and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
+   reads — an RFC 7523 assertion signed by that surface, say, verified against
+   its published JWKS. The browser never reaches this endpoint, so no GET-capable
+   resolver is needed and the CSRF exposure does not arise: the caller is your
+   own server, not a navigation.
+
+Highflame's own deployment takes route 2 — Studio authenticates the user, mints
+an assertion, and POSTs; AuthN's assertion resolver verifies it and ZeroID mints
+the code. Route 1 exists for deployers with no such surface. Either way ZeroID
+stays the engine: it validates the CIMD document, enforces the `redirect_uri`
+allow-list, and issues the code.
 
 **ZeroID cannot detect this for you.** Its AS metadata omits the
 `authorization_code` grant when *no* resolver is registered, but it cannot
