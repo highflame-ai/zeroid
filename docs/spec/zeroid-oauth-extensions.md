@@ -16,14 +16,16 @@ out-of-band approval, ZeroID layers a small set of extensions on top of the
 baseline IETF and OpenID specifications it implements. This document specifies
 those extensions — and *only* those extensions — at the wire level: the
 additional JWT claims, request parameters, URI scheme, gating rules,
-event types, workload identity federation, and discovery metadata. It is the
+event types, workload identity federation, client-identifier-URL rules, and
+discovery metadata. It is the
 normative reference an
 independent implementer or a resource server would use to interoperate with
 ZeroID without reading its source.
 
 Baseline conformance (the parts of OAuth 2.1, RFC 8693, RFC 9449, OpenID CIBA
-Core 1.0, RFC 9396, RFC 7591/7592, RFC 7662/7009, RFC 8414, and RFC 9728 that
-ZeroID implements *as written*) is **out of scope** here. This document covers
+Core 1.0, RFC 9396, RFC 7591/7592, RFC 7662/7009, RFC 8414, RFC 9728, and
+draft-ietf-oauth-client-id-metadata-document that ZeroID implements *as
+written*) is **out of scope** here. This document covers
 the deltas only.
 
 ## Status of This Document
@@ -31,7 +33,7 @@ the deltas only.
 This is an implementation specification, not an IETF/OpenID standards-track
 document. The `urn`/draft naming is a convenience for citation. None of the
 extensions defined here are registered with IANA; the registry in
-[Section 13](#13-claim--parameter-registry-iana-style) is informative and scoped
+[Section 14](#14-claim--parameter-registry-iana-style) is informative and scoped
 to ZeroID deployments.
 
 ---
@@ -49,9 +51,10 @@ to ZeroID deployments.
 9. [CAE / SSF Signals](#9-cae--ssf-signals)
 10. [Workload Identity Federation](#10-workload-identity-federation)
 11. [Discovery Metadata Extensions](#11-discovery-metadata-extensions)
-12. [Security Considerations](#12-security-considerations)
-13. [Claim / Parameter Registry (IANA-style)](#13-claim--parameter-registry-iana-style)
-14. [References](#14-references)
+12. [Client ID Metadata Documents (CIMD)](#12-client-id-metadata-documents-cimd)
+13. [Security Considerations](#13-security-considerations)
+14. [Claim / Parameter Registry (IANA-style)](#14-claim--parameter-registry-iana-style)
+15. [References](#15-references)
 
 ---
 
@@ -396,6 +399,26 @@ ZeroID validates the assertion signature against the actor identity's registered
 ES256 public key before issuing. The issued token's `act.sub` is set to the
 orchestrator's WIMSE URI (Section 4.4 case 1).
 
+The `actor_token` is **NOT** replay-tracked. A `jti` is honoured if present but
+not consumed, so the same assertion can be exchanged repeatedly until it expires
+and `exp` is the only bound on the replay window. Clients choose their own `exp`;
+ZeroID does not cap it.
+
+This is worth stating explicitly because it cuts against two reasonable
+expectations. RFC 7523 assertions are conventionally single-use, and Section 7
+establishes that ZeroID *does* run an atomic `jti` replay store — for DPoP
+proofs, not for actor assertions. An implementer who reads §5.3 and §7 together
+would be entitled to assume otherwise.
+
+The consequence is that the assertion is bearer material rather than a proof of
+possession held only by its signer: anything that observes one in flight — a
+log, an error report, a proxy, a compromised orchestrator — can mint further
+delegated credentials for that sub-agent until it expires, without ever holding
+the sub-agent's private key. It is not an escalation on its own (the assertion
+still only attests the sub-agent's identity, and Section 5.1 still bounds the
+granted scope), but it weakens the non-shareable-credential property the rest of
+this section is built on. Tracked in zeroid#282.
+
 The registered key itself is enrolled and rotated self-service via
 `POST /agents/self/public-key` (caller authenticated by its access token; an
 identity can only manage its own key). First enrollment is trust-on-first-use:
@@ -489,7 +512,7 @@ upstream ID token. The mode:
 - Fetches JWKS through an SSRF-guarded HTTP client: an issuer/`jwks_uri` host
   resolving to a private/loopback/link-local/metadata address is rejected unless
   the issuer sets `allow_private_endpoints` (for a deliberately internal IdP).
-  See Section 12.
+  See Section 13.
 
 Out of scope: the interactive OIDC redirect/authentication flow is the
 deployer's responsibility — ZeroID is a token-exchange endpoint, not a
@@ -707,7 +730,7 @@ federation (Section 5.6), where an upstream *user* ID token is exchanged for a
 ZeroID principal token via `token_exchange`; that path mints a token for the
 authenticated user rather than attesting a workload. Both verify an upstream
 issuer's signature against a configured JWKS and apply the same SSRF guard on
-the issuer/`jwks_uri` fetch (Section 12).
+the issuer/`jwks_uri` fetch (Section 13).
 
 ### 10.1 Inbound — proof types
 
@@ -832,6 +855,7 @@ baseline:
 | `backchannel_token_delivery_modes_supported` | `["poll","ping","push"]` | CIBA Core |
 | `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
 | `backchannel_authentication_request_signing_alg_values_supported` | `[]` (signed bc-authorize requests unsupported) | CIBA Core |
+| `client_id_metadata_document_supported` | `true` (gated — see Section 12.7) | CIMD draft-02 |
 
 ### 11.2 Protected Resource Metadata (RFC 9728)
 
@@ -852,7 +876,161 @@ JWT-SVID trust bundle: each key's `use` is `JWT-SVID`, and the document carries
 `spiffe_sequence` and `spiffe_refresh_hint` per the SPIFFE bundle format. This
 lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
 
-## 12. Security Considerations
+## 12. Client ID Metadata Documents (CIMD)
+
+ZeroID implements
+[`draft-ietf-oauth-client-id-metadata-document`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/)
+(revision **-02**, July 2026), the client-onboarding model the MCP Authorization
+specification names as its preferred default. A client presents an `https://`
+URL as its `client_id`; ZeroID fetches and validates the metadata document
+published there and synthesises an **ephemeral** public PKCE client from it. No
+row is written to the client registry.
+
+This section specifies ZeroID's deviations from the draft and the deployment
+controls around it. `docs/cimd.md` carries the worked examples.
+
+### 12.1 Client identifier URL
+
+Per draft-02 §3, a Client Identifier URL **MUST** use the `https` scheme, **MUST**
+carry a path, and **MUST NOT** carry userinfo, a fragment, or single-/double-dot
+path segments. ZeroID enforces all of these, and adds two constraints of its own:
+
+| Constraint | Draft-02 §3 | ZeroID |
+|---|---|---|
+| `https` scheme, host present, path present | MUST | enforced |
+| No fragment | MUST NOT | rejected |
+| No userinfo | MUST NOT | rejected |
+| No `.` / `..` path segments | MUST NOT | rejected (checked on the decoded path, so `%2e%2e` is caught) |
+| No query string | SHOULD NOT | **rejected** — stricter than the draft |
+| Length | — | **≤ 255 characters** |
+
+The query-string rejection is deliberate. The `client_id` a client presents must
+remain byte-identical to the URL the document was fetched from, because that is
+exactly what the §12.4 self-reference check compares; permitting a query would
+admit two spellings of one identity. The length cap is a deployment constraint —
+the `client_id` is persisted into `VARCHAR(255)` columns downstream, so an
+oversize URL is refused at the door rather than failing later at code
+consumption.
+
+Two of the draft's MUST NOTs carry weight beyond conformance. Userinfo is the
+phishing shape: `https://legit.example.com@evil.example/client.json` resolves to
+`evil.example` while *reading* as `legit.example.com` wherever the `client_id` is
+displayed — a consent screen, an audit log — which are the two places a human is
+asked to trust the string. Dot segments would give one document many spellings,
+splitting the resolution cache and handing one client several identities the
+self-reference check cannot distinguish.
+
+### 12.2 Registry-first precedence
+
+The client registry is **always** consulted first. CIMD resolution runs only when
+the registry holds **no row at all** for that `client_id`.
+
+That is stronger than "the registry lookup failed", and the distinction is
+load-bearing: a row that exists but is inactive or non-public was deliberately
+registered, so deactivation **MUST** remain a kill switch. Falling back to CIMD
+on a deactivated row would let a client whose `client_id` happens to be an
+`https://` URL resurrect itself by republishing its document.
+
+Registering a client under a CIMD URL therefore pins it: the registry row
+overrides the document.
+
+### 12.3 Document fetch
+
+- `GET` through the same DNS-rebinding-safe SSRF-guarded client used for OIDC
+  attestation and CIBA dispatch. The host is resolved once, every answer checked
+  against the private/loopback/link-local/multicast/CGN/reserved blocklist, and
+  the connection pinned to the validated IP; TLS still verifies the original
+  hostname. Draft-02 §8.6 requires this, permitting a loopback exception only
+  for development deployments whose authorization server is itself on loopback.
+- **Size-capped at 5 KiB**, matching the draft's §8.7 recommendation.
+- **Timeout-bounded at 5 s**, applied by wrapping the caller's context so the
+  bound holds regardless of the injected HTTP client's own timeout.
+- **HTTP redirects are not followed.** The `client_id` is a canonical document
+  location; a 3xx is a resolution failure.
+
+### 12.4 Document validation
+
+- **Self-reference** (draft-02 §4): the document's `client_id` **MUST** equal the
+  URL it was fetched from. This is what stops a document claiming another
+  client's identity.
+- `redirect_uris` is **REQUIRED and non-empty** — CIMD's primary
+  anti-impersonation control. Each entry must satisfy OAuth 2.1 scheme rules:
+  `https`, loopback `http`, or a private-use scheme (RFC 8252 §7.1 native-app
+  callbacks). Plaintext non-loopback `http` is rejected, as are userinfo and
+  fragments.
+- `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
+  `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
+  establish itself as confidential via `token_endpoint_auth_method` and
+  `jwks_uri`; ZeroID accepts no `private_key_jwt` anywhere yet, so every CIMD
+  client is public and PKCE is the sole proof of possession. Tracked in
+  zeroid#264.
+- `grant_types` defaults to `["authorization_code"]`, **MUST** include
+  `authorization_code`, and may contain only `authorization_code` and
+  `refresh_token`.
+- `response_types`, when present, **MUST** include `code`.
+- Outer-shape validation only, by default. Per-type schema validation is opt-in
+  through the `RegisterAuthorizationDetailValidator`-style hook pattern.
+
+A CIMD `client_id` is **not** accepted as an authenticated client at the
+introspection or revocation endpoints; the `none` advertised in those metadata
+arrays (Section 11.1) applies to *registered* public clients only.
+
+### 12.5 Caching
+
+Outcomes are memoised in a bounded in-memory cache (1000 entries, evicted on
+pressure). Nothing is persisted.
+
+| Outcome | TTL |
+|---|---|
+| Success | configured TTL, **1 h** default, **24 h** hard cap |
+| Success, document sets `Cache-Control: max-age` | shortened to that value, floored at **60 s** |
+| Transient fetch failure | negative-cached **10 s** |
+| Deterministic validation failure | negative-cached **60 s** |
+
+Draft-02 §5.2 permits an authorization server to impose its own bounds over the
+document's cache headers, which is what the 24 h cap and the 60 s floor are: the
+cap stops a document pinning a stale client indefinitely, and the floor stops one
+forcing a fetch per request. Negative caching means replaying a dead URL cannot
+force a fresh timeout-bounded outbound fetch on every request.
+
+The positive TTL is also why the `/oauth2/authorize` → `/oauth2/token`
+round-trip does not fetch twice.
+
+### 12.6 Deployment policy and what it cannot do
+
+`cimd.allowed_domains` restricts CIMD to `client_id` URLs whose host appears in
+an exact, case-insensitive allow-list, checked **before** any outbound fetch. It
+is the primary production hardening lever. **Empty is the default** and accepts
+any public HTTPS host; ZeroID warns at startup when CIMD is enabled without an
+allow-list.
+
+Deployers **SHOULD** understand its limits, because they are properties of the
+CIMD model rather than of this implementation:
+
+- **Domain granularity, not client authentication.** The allow-list constrains
+  *which hosts may publish*. Anyone able to serve a path under an allowed
+  domain can mint a client — inside an organisation, a low bar.
+- **No proof of possession.** A document URL is public, so any party may present
+  any published `client_id`. What bounds the impersonator is that the requested
+  `redirect_uri` must appear in that document — which, for a native client whose
+  document lists a loopback `redirect_uri`, is satisfied by the impersonator's
+  own listener. PKCE does not help, because the impersonator chooses its own
+  verifier.
+- **One document per application, not per installation.** Every installation of
+  a native client shares one document, so a future `jwks_uri` could only carry a
+  key shared across the whole population — a constraint on what "confidential
+  CIMD client" can mean (zeroid#264).
+
+### 12.7 Discovery
+
+`client_id_metadata_document_supported: true` is advertised in Authorization
+Server Metadata (Section 11.1) when CIMD is enabled **and** the deployment can
+actually serve the `authorization_code` flow. It is omitted otherwise: a
+discovery document that names a flow the endpoint cannot complete is worse than
+one that stays silent, since a CIMD-aware client gates its whole onboarding path
+on reading this field.
+
+## 13. Security Considerations
 
 - **No authority amplification on delegation.** Scope attenuation (5.1) and
   depth capping (5.2) are enforced server-side; a delegated token is always a
@@ -905,13 +1083,13 @@ lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
   rely on short token TTLs; deployers SHOULD scope the `aud`/`sub`/claim
   constraints a relying party accepts as tightly as the provider allows.
 
-## 13. Claim / Parameter Registry (IANA-style)
+## 14. Claim / Parameter Registry (IANA-style)
 
 Informative registry of every identifier this document defines, for ZeroID
 deployments. "Std" marks an identifier defined by a baseline spec but
 *populated* with ZeroID semantics.
 
-### 13.1 JWT claims
+### 14.1 JWT claims
 
 | Claim | Kind | Defined in |
 |---|---|---|
@@ -943,7 +1121,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `binding_message` | string | §4.7 |
 | `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |
 
-### 13.2 Request parameters
+### 14.2 Request parameters
 
 | Parameter | Endpoint | Defined in |
 |---|---|---|
@@ -953,21 +1131,22 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `additional_claims` | `/oauth2/token` (ext-principal exchange) | §4.8, §8 |
 | `subject_token_type` = `urn:ietf:params:oauth:token-type:id_token` | `/oauth2/token` (direct OIDC federation) | §5.6 (Std: RFC 8693) |
 
-### 13.3 DPoP proof claim
+### 14.3 DPoP proof claim
 
 | Claim | Defined in |
 |---|---|
 | `bh` | §7.1 (ZeroID extension — not in RFC 9449, no adopted IETF draft) |
 
-### 13.4 Signal types & severities
+### 14.4 Signal types & severities
 
 See §9.1 / §9.2.
 
-### 13.5 Discovery fields
+### 14.5 Discovery fields
 
-See §11.1 / §11.2 / §11.3.
+See §11.1 / §11.2 / §11.3. `client_id_metadata_document_supported` is specified
+in §12.7.
 
-### 13.6 Workload Identity Federation
+### 14.6 Workload Identity Federation
 
 Inbound: proof types (`oidc_token`, `image_hash`, `tpm`) and the
 `OIDCPolicyConfig` / `OIDCIssuerConfig` policy fields (`issuers`, `url`,
@@ -976,9 +1155,9 @@ ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
 `oauth-authorization-server` `issuer`/`jwks_uri`, and the SPIFFE trust bundle
 (§10.4).
 
-## 14. References
+## 15. References
 
-### 14.1 Normative (baseline specs extended)
+### 15.1 Normative (baseline specs extended)
 
 | Specification | Used for |
 |---|---|
@@ -993,11 +1172,12 @@ ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
 | RFC 9396 | Rich Authorization Requests (`authorization_details`) |
 | RFC 9449 | DPoP |
 | RFC 9728 | Protected Resource Metadata |
+| draft-ietf-oauth-client-id-metadata-document-02 | Client ID Metadata Documents (URL as `client_id`) |
 | OpenID CIBA Core 1.0 | Backchannel Authentication |
 | OpenID Shared Signals Framework / CAEP | CAE signals |
 | SPIFFE / WIMSE | Identity URI scheme and trust bundle |
 
-### 14.2 Informative
+### 15.2 Informative
 
 - The `bh` body-hash proof claim (Section 7.1) is a ZeroID extension with no RFC
   or IETF draft of its own. For the standards-track approach to request-body
