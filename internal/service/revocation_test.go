@@ -189,3 +189,16 @@ func TestReservedClaims_BlockAuthorizationClaims(t *testing.T) {
 		}
 	}
 }
+
+// TestReservedClaims_BlockResourceBinding enforces the security invariant the
+// RFC 8707 `resource` claim depends on. Shield gates INV-IDN-006 on presence of
+// the claim as proof that ZeroID recorded a resource restriction at the mint, so
+// the claim only carries that meaning while ZeroID is the sole party able to set
+// it. Left unreserved, a caller could forge a binding on a token that has none,
+// or widen a real one by overriding it through additional_claims.
+func TestReservedClaims_BlockResourceBinding(t *testing.T) {
+	if !reservedClaims["resource"] {
+		t.Error("claim \"resource\" MUST be reserved — additional_claims must never " +
+			"be able to forge or widen an RFC 8707 resource binding (shield#366)")
+	}
+}

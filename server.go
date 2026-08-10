@@ -97,6 +97,11 @@ type Server struct {
 	mu                 sync.RWMutex
 	claimsEnrichers    []ClaimsEnricher
 	principalResolvers []namedPrincipalResolver
+
+	// authzCodeAvailable is the deployer's override for whether
+	// /oauth2/authorize can complete an authorization_code flow. nil means
+	// "use the built-in guess". See SetAuthorizationCodeAvailable.
+	authzCodeAvailable func() bool
 	adminAuthState     *middlewareHolder
 	globalMWState      *middlewareHolder
 }
@@ -324,6 +329,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// skip replay protection. Backed by the id_jag_jti table (migration 034),
 	// swept by the cleanup worker.
 	oauthSvc.SetIDJAGReplayStore(postgres.NewIDJAGReplayStore(db))
+	// Observed-MCP-server inventory (zeroid#259). Backed by
+	// observed_idjag_resources (migration 040). Best-effort and off the critical
+	// path: a failure here is logged and the token is still issued.
+	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
@@ -525,6 +534,14 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
 
+	// Discovery must not promise a flow /oauth2/authorize cannot serve: with no
+	// PrincipalResolver registered the endpoint 503s, so the authorization_code
+	// grant (and CIMD, which only applies to that flow) stays out of the
+	// metadata document. Evaluated per request, because
+	// RegisterPrincipalResolver is documented as safe to call after NewServer
+	// and before Start (#263).
+	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
+
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
 	// the resolvers registered via Server.RegisterPrincipalResolver.
@@ -663,7 +680,9 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 // let alone mint a token. The shared core (resolveAPIKeyContext) is
 // the single source of truth.
 //
-// Typical usage from a PrincipalResolver:
+// Typical usage from a PrincipalResolver. As with the example on
+// RegisterPrincipalResolver, req.Form is POST-only — read a header or
+// cookie instead if the resolver must serve the browser GET leg.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -720,7 +739,13 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // the first to return a non-nil Principal wins. name is used for
 // log/metric attribution and must be non-empty.
 //
-// Typical usage from a deployer that owns api_key resolution:
+// Typical usage from a deployer that owns api_key resolution. NOTE this
+// shape serves POST ONLY: req.Form is bound to the POST body, so it
+// returns ErrPrincipalNotApplicable on every browser GET. A GET-capable
+// resolver must read req.Header(...) or req.Cookie(...) instead — and if
+// ALL your resolvers are form-based, call
+// Server.SetAuthorizationCodeAvailable(func() bool { return false }) so
+// AS metadata stops advertising a flow that will 401.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -743,6 +768,34 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // supported — register the most-specific first (e.g. session cookie
 // before api_key fallback) because order determines precedence on
 // overlapping requests.
+//
+// # Writing a cookie-based resolver
+//
+// /oauth2/authorize serves GET (RFC 6749 §4.1.1), so a resolver that
+// authenticates from a cookie is reachable by top-level navigation from
+// any site — SameSite=Lax still sends the cookie on a cross-site GET.
+// Combined with CIMD, which accepts any attacker-published client_id and
+// its own redirect_uri, a bare redirect would hand the attacker a code
+// for the victim's principal.
+//
+// A cookie resolver therefore MUST NOT be sufficient on its own. Code
+// issuance has to sit behind an explicit user interaction — a consent
+// screen carrying a CSRF token — the way a real authorization server does.
+//
+// A PrincipalResolver CANNOT implement that: its signature returns
+// (*Principal, error), so it has no ResponseWriter, cannot redirect, and
+// cannot render or resume a consent screen. Its only lever is failing the
+// request. Do the interaction in Server.Use middleware, which sees the
+// raw request and response and can 302 to a consent page before the
+// handler runs; the resolver then only has to recognise the session the
+// consent flow established. See docs/cimd.md, highflame-authn#157 for a
+// worked example, and #276 for why this is more awkward than it should
+// be.
+//
+// Header-based resolvers (api_key, mTLS, a signed assertion) do not have
+// this exposure: a browser cannot set a custom header on a top-level
+// navigation, which is also why the handler binds AuthorizeRequest.Form
+// to the POST body only.
 func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 	if name == "" || r == nil {
 		return
@@ -762,6 +815,8 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
 //     so the deployer sees a clear "you forgot to wire this up"
 //     signal, distinct from the 401 "credential didn't match" case.
+//     AS metadata omits the authorization_code grant in that state, so
+//     discovery never promises a flow the endpoint cannot serve.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
 //     returns (nil, "", nil). Handler maps to 401 invalid_client.
 //   - Any resolver returning a non-sentinel error → returns
@@ -819,6 +874,56 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
 	s.globalMWState.fn = middleware
+}
+
+// SetAuthorizationCodeAvailable overrides ZeroID's guess about whether
+// /oauth2/authorize can actually complete an authorization_code flow on this
+// deployment. When the answer is false, AS metadata omits the
+// authorization_code grant, response_types_supported, the PKCE method list,
+// and client_id_metadata_document_supported, so no client discovers a flow it
+// cannot finish (#263).
+//
+// # Why an override exists
+//
+// ZeroID's built-in guess is "at least one PrincipalResolver is registered".
+// That is NECESSARY but NOT SUFFICIENT, and only the deployer knows the
+// difference: a resolver that reads its credential from req.Form cannot serve
+// a browser GET at all, because Form is bound to the POST body (see
+// RegisterPrincipalResolver). A deployment whose resolvers are all form-based
+// serves POST fine and 401s every browser redirect — while the default guess
+// happily advertises the grant.
+//
+// So: if your resolvers are form-only, call this with a func returning false
+// until you add a header- or cookie-based one. ZeroID cannot introspect what a
+// resolver reads, which is why it cannot work this out itself.
+//
+// A predicate rather than a bool so the answer can change as resolvers are
+// registered. Passing nil restores the built-in guess. Safe to call after
+// NewServer.
+func (s *Server) SetAuthorizationCodeAvailable(fn func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authzCodeAvailable = fn
+}
+
+// canServeAuthorizationCode answers the deployer's override when one is set,
+// otherwise falls back to the built-in guess (any resolver registered).
+func (s *Server) canServeAuthorizationCode() bool {
+	// Snapshot under the lock, then release it BEFORE calling the deployer's
+	// predicate. Go's RWMutex is not reentrant, so invoking an arbitrary
+	// callback while holding s.mu deadlocks the moment that callback touches
+	// any Server method that locks — RegisterPrincipalResolver, for one. Same
+	// pattern resolvePrincipal uses for the resolver chain.
+	s.mu.RLock()
+	fn := s.authzCodeAvailable
+	resolverCount := len(s.principalResolvers)
+	s.mu.RUnlock()
+
+	if fn != nil {
+		return fn()
+	}
+
+	return resolverCount > 0
 }
 
 // SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA

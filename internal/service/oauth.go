@@ -78,6 +78,12 @@ type OAuthService struct {
 	// silently skip replay protection while ID-JAG is actually in use — but the
 	// handler also guards against nil defensively (fail closed).
 	idJAGReplayStore IDJAGReplayStore
+	// observedIDJAGResources records which MCP servers this tenant's agents have
+	// actually reached, learned from the `resource` claim of successful ID-JAG
+	// redemptions (zeroid#259). Wired after construction via
+	// SetObservedIDJAGResourceStore. Nil is valid and simply means the inventory
+	// is not being collected — it must NEVER affect whether a token is minted.
+	observedIDJAGResources ObservedIDJAGResourceStore
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -100,6 +106,18 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 // the dependency narrow.
 type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+}
+
+// ObservedIDJAGResourceStore records the MCP servers named by the `resource`
+// claim of successfully-redeemed ID-JAGs (zeroid#259), giving a tenant an
+// inventory of the servers its agents actually reach.
+//
+// Record is called on the SUCCESS path only and is strictly best-effort: the
+// token is already minted by that point, so a bookkeeping failure must never
+// withhold it. The concrete impl is postgres.ObservedIDJAGResourceStore; an
+// interface here keeps the service testable and the dependency narrow.
+type ObservedIDJAGResourceStore interface {
+	Record(ctx context.Context, accountID, projectID, authorizingISS string, resources []string) error
 }
 
 // Default token TTLs (used when per-client TTL is not configured).
@@ -127,6 +145,13 @@ const defaultExternalPrincipalRefreshTokenTTL = 12 * 3600
 var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
+	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
+	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
+	// it — so the claim only means that if ZeroID is the only party who can set
+	// it. Reserving it keeps the presence of the claim load-bearing: a caller
+	// must never be able to make a token look resource-bound when it isn't, or
+	// to widen a real binding by overriding it through additional_claims.
+	"resource": true,
 	// ZeroID identity claims
 	"account_id": true, "project_id": true, "user_id": true, "owner_user_id": true,
 	"external_id": true, "identity_type": true, "sub_type": true, "trust_level": true,
@@ -399,6 +424,13 @@ func cimdOAuthError(err error) error {
 // server.go alongside the external-issuer registry.
 func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
 	s.idJAGReplayStore = store
+}
+
+// SetObservedIDJAGResourceStore wires the observed-MCP-server inventory
+// (zeroid#259). Optional: when unset, ID-JAG exchanges behave exactly as before
+// and nothing is recorded. Wired in server.go alongside the replay store.
+func (s *OAuthService) SetObservedIDJAGResourceStore(store ObservedIDJAGResourceStore) {
+	s.observedIDJAGResources = store
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
