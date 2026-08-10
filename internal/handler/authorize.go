@@ -73,40 +73,43 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //  1. Parse application/x-www-form-urlencoded body
 //  2. Build a typed AuthorizeRequest snapshot from the parsed form +
 //     headers + cookies (read-only — resolvers never see *http.Request)
-//  3. Required-field gate + response_type=code check (cheap, before
-//     any DB hits)
+//  3. Required-field gate + response_type=code + S256 check (cheap,
+//     before any DB hits)
+//     3.5. Resolve the client and validate redirect_uri
+//     (OAuthService.ResolveAuthorizeClient) — BEFORE the resolver chain,
+//     so later failures have somewhere safe to be reported.
 //  4. Walk the registered PrincipalResolver chain. First non-nil
-//     Principal wins. No matches → 401 invalid_client.
+//     Principal wins. No matches → access_denied.
 //  5. Intersect (caller-requested scope ∩ resolver-narrowed scope) —
 //     the service layer intersects again with the client's registered
 //     scope, so the issued code carries the narrowest authority.
-//  6. Hand off to OAuthService.IssueAuthCode for client validation,
-//     redirect_uri allow-list, S256 enforcement, and JWT minting.
+//  6. Hand off to OAuthService.IssueAuthCode with the resolved client
+//     for scope intersection and JWT minting.
 //  7. Build the redirect URL with code + state and emit 302.
 //
-// EVERY failure here returns an RFC 6749 §5.2 JSON body. RFC 6749
-// §4.1.2.1 wants most of them redirected back to the client as error +
-// state instead, and only exempts the two cases where redirecting would
-// itself be the vulnerability: a missing/invalid redirect_uri and an
-// invalid client_id. JSON was defensible while this endpoint was
-// POST-only and the caller was a CLI parsing the body; mounting GET
-// invalidated that. A browser now renders a raw JSON blob while the
-// client blocks on a callback that never fires, with no error and no
-// state to correlate.
+// Failures split by WHERE they happen, which is what step 3.5 exists to
+// make possible. RFC 6749 §4.1.2.1 wants most failures redirected back to
+// the client as error + state, and exempts exactly the two where
+// redirecting would itself be the vulnerability: an invalid client_id and
+// a missing or unregistered redirect_uri.
 //
-// The blocker is ordering, and it is upstream of this handler's own
-// steps: principal resolution (step 4) runs BEFORE any client lookup,
-// which happens inside IssueAuthCode at step 6. So access_denied — the
-// failure a browser user actually hits, when they are not signed in or
-// decline — fires while no validated redirect_uri exists to redirect to.
-// Redirecting to an unvalidated URI would be an open redirect, so it
-// stays JSON until the lookup moves.
+// So everything decided BEFORE step 3.5 — the availability gate, the
+// parse error, the required-field gate, and client validation itself —
+// answers with an RFC 6749 §5.2 JSON body via writeAuthorizeError,
+// because there is no validated redirect_uri to trust yet. Everything
+// after it goes through failAuthorize, which redirects on GET and keeps
+// JSON on POST (see that function for why the method matters).
 //
-// Note that redirect_uri validation is not merely "inside IssueAuthCode":
-// it runs there AFTER the grant-type allow-list, so the only failure
-// genuinely downstream of it is the mint 500. Fixing this means hoisting
-// client resolution + redirect_uri validation ahead of step 4, not
-// reordering within IssueAuthCode. Tracked in #279.
+// Ordering was the whole difficulty, and it was upstream of this
+// handler's own steps: principal resolution used to run before any client
+// lookup, which lived inside IssueAuthCode. access_denied — the failure a
+// browser user actually hits by not being signed in — therefore fired
+// while no validated redirect_uri existed to send it to, and redirecting
+// to an unvalidated URI would have been an open redirect. Hoisting the
+// lookup into step 3.5 is what fixed it (#279); note the fix had to be a
+// hoist rather than a reorder within IssueAuthCode, where redirect_uri
+// validation ran after the grant-type gate and only the mint 500 sat
+// downstream of it.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// ── Step 0: is this deployment serving the flow at all? ──────────
 	// SetAuthorizationCodeAvailable(false) used to suppress only the
@@ -234,6 +237,21 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// S256 is checked HERE, not only at IssueAuthCode, because it is the one
+	// remaining step-6 gate that a request can fail on values it supplied itself.
+	// Leaving it downstream means a request carrying code_challenge_method=plain
+	// now survives long enough to send the user through the deployer's login
+	// surface (step 4's interaction hook) and only fails after they authenticate.
+	// Making somebody sign in to be told their own parameter was wrong is a poor
+	// trade for a check that costs a string comparison. IssueAuthCode still
+	// enforces it for programmatic callers that bypass this handler.
+	if req.CodeChallengeMethod != "S256" {
+		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
+			"code_challenge_method must be S256 (plain is not supported)")
+
+		return
+	}
+
 	// ── Step 3.5: resolve the client, validate redirect_uri ──────────
 	// Deliberately BEFORE principal resolution, which is the whole point.
 	// RFC 6749 §4.1.2.1 exempts exactly two failures from being redirected —
@@ -318,7 +336,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		// deployer-chosen credential fields is more useful to a CLI author.
 		a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
 			oautherror.AccessDenied,
-			"no applicable credential — request did not match any registered principal resolver")
+			"no applicable credential: request did not match any registered principal resolver")
 
 		return
 	}
@@ -526,7 +544,7 @@ func (a *API) failAuthorize(
 
 	q := u.Query()
 	q.Set("error", redirectCode)
-	q.Set("error_description", description)
+	q.Set("error_description", nqchar(description))
 
 	if req.State != "" {
 		q.Set("state", req.State)
@@ -537,6 +555,33 @@ func (a *API) failAuthorize(
 	w.Header().Set("Location", u.String())
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusFound)
+}
+
+// nqchar coerces a description to RFC 6749 §4.1.2.1's NQCHAR set —
+// %x20-21 / %x23-5B / %x5D-7E, i.e. printable ASCII minus the double quote and
+// backslash. Anything outside it becomes a space.
+//
+// Percent-encoding already makes any byte transport-safe, so this is about the
+// charset the spec allows in the value rather than about injection: a client
+// validating error_description strictly is entitled to reject an em dash. Applied
+// at this one boundary rather than by auditing every literal, because the
+// descriptions that reach here include service-layer strings from
+// extractOAuthError, and "remember to keep this ASCII" does not survive the next
+// person writing an error message.
+//
+// The JSON body needs no such treatment — §5.2 puts no charset limit on it, and
+// UTF-8 reads better there.
+func nqchar(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '"' || r == '\\':
+			return ' '
+		case r >= 0x20 && r <= 0x7e:
+			return r
+		default:
+			return ' '
+		}
+	}, s)
 }
 
 // writeAuthorizeError emits an RFC 6749 §5.2 JSON error body. Used for every

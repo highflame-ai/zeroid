@@ -902,10 +902,20 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     AS metadata omits the authorization_code grant in that state, so
 //     discovery never promises a flow the endpoint cannot serve.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
-//     returns (nil, "", nil). Handler maps to 401 invalid_client.
-//   - Any resolver returning a non-sentinel error → returns
-//     (nil, resolverName, err). The chain stops at the first such
-//     error; handler surfaces it as 401 invalid_client.
+//     returns (nil, "", nil). The handler reports access_denied: on a GET
+//     that is a 302 back to the client's redirect_uri per RFC 6749
+//     §4.1.2.1, on a POST a 401 invalid_client JSON body.
+//   - A resolver returning ErrPrincipalInteractionRequired → returns
+//     (nil, resolverName, err) and STOPS the chain, like any other
+//     non-sentinel error. On a GET the handler redirects the user agent
+//     to Server.SetInteractiveLoginURL's target instead of refusing; with
+//     no target set, or on a POST, it degrades to access_denied. A
+//     resolver that wants the chain to continue must return
+//     ErrPrincipalNotApplicable instead.
+//   - Any other resolver error → returns (nil, resolverName, err). The
+//     chain stops at the first such error; the handler reports it the
+//     same way as the no-match case (access_denied / 401), without
+//     revealing which resolver matched.
 func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
 	s.mu.RLock()
 	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
@@ -1012,6 +1022,15 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 //     to access_denied, because a resolver cannot conjure a surface the
 //     deployment does not have.
 //   - Honoured on GET only. A POST caller has no user agent to redirect.
+//   - return_to is ZeroID's parameter name and is SET on whatever you return, so
+//     a target already carrying one loses it. Put your own state elsewhere.
+//
+// **Your surface must not bounce back to return_to unconditionally.** ZeroID has
+// no loop guard here: if the user is returned without a session established —
+// they cancelled, cookies are blocked, a third-party-cookie policy intervened —
+// your resolver reports the sentinel again and the redirect repeats. Send them
+// back only once you can satisfy the resolver, and show them a terminal error
+// otherwise.
 //
 // **Derive the target from configuration, not from the request.** fn receives the
 // AuthorizeRequest so the target can vary by tenant, client or locale — but

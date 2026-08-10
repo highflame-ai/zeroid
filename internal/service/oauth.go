@@ -1490,11 +1490,11 @@ type IssueAuthCodeRequest struct {
 	// registry/CIMD LOOKUP and the client-state gate, because
 	// ResolveAuthorizeClient already applied them.
 	//
-	// It does NOT skip the redirect_uri allow-list. That check is pure string
-	// work, and it guards a value baked into the issued code as the "ruri" claim
-	// and honoured at exchange — so it is re-run here against this Client rather
-	// than assumed, and a caller passing a redirect_uri the client never
-	// registered is refused however it was resolved.
+	// It does NOT skip checkAuthorizeClientPolicy — the grant-type allow-list and
+	// the redirect_uri allow-list. Both are I/O-free and both are re-run against
+	// this Client rather than assumed, so a caller passing a redirect_uri the
+	// client never registered, or a client without the authorization_code grant,
+	// is refused however the client was resolved.
 	//
 	// This exists so the /oauth2/authorize handler can validate the client
 	// and redirect_uri BEFORE resolving the principal, which is what lets it
@@ -1559,21 +1559,46 @@ func (s *OAuthService) ResolveAuthorizeClient(
 		return nil, oauthServerError("failed to resolve client for authorization_code issuance", err)
 	}
 
-	// Same check authorizationCode runs at exchange — applied here too so a
-	// client without the grant cannot even obtain a code.
-	if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
-		return nil, oauthBadRequest(oautherror.UnauthorizedClient,
-			"client is not authorized for authorization_code grant")
-	}
-
-	// The redirect_uri must be one the client pre-registered, otherwise an
-	// attacker who steals a code could redirect it to their own callback.
-	if !redirectURIAllowed(redirectURI, oauthClient.RedirectURIs) {
-		return nil, oauthBadRequest(oautherror.InvalidRequest,
-			"redirect_uri is not in the client's registered list")
+	if err := checkAuthorizeClientPolicy(oauthClient, redirectURI); err != nil {
+		return nil, err
 	}
 
 	return oauthClient, nil
+}
+
+// checkAuthorizeClientPolicy applies the two authorization-request gates that
+// depend only on an already-resolved client plus the requested redirect_uri —
+// no I/O, just a slice scan and a string comparison.
+//
+// It is a named function called on EVERY path into IssueAuthCode, including the
+// one that supplies a pre-resolved client, rather than a pair of inline checks
+// inside the resolution branch. That is deliberate. When these lived inline they
+// were skipped whenever a caller passed IssueAuthCodeRequest.Client, and the
+// skip was silent: the redirect_uri allow-list was missed first, and after that
+// was fixed by re-checking it in the other branch, the grant-type gate was still
+// missed, because "re-add the check to both branches" does not scale to the next
+// gate anyone adds. One function both paths must call removes the class.
+//
+// Neither gate is safe to skip on the strength of "the caller already resolved
+// it". redirect_uri is baked into the issued code as the "ruri" claim and
+// honoured at exchange, so accepting one the client never registered defeats the
+// allow-list end to end. The grant-type gate is the same check authorizationCode
+// runs at exchange, applied here so a client without the grant cannot obtain a
+// code in the first place.
+func checkAuthorizeClientPolicy(client *domain.OAuthClient, redirectURI string) error {
+	if !slices.Contains(client.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
+		return oauthBadRequest(oautherror.UnauthorizedClient,
+			"client is not authorized for authorization_code grant")
+	}
+
+	// Otherwise an attacker who steals a code could redirect it to their own
+	// callback.
+	if !redirectURIAllowed(redirectURI, client.RedirectURIs) {
+		return oauthBadRequest(oautherror.InvalidRequest,
+			"redirect_uri is not in the client's registered list")
+	}
+
+	return nil
 }
 
 // IssueAuthCode is the upstream half of the OAuth 2.0 + PKCE
@@ -1671,26 +1696,19 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		if oauthClient, err = s.ResolveAuthorizeClient(ctx, req.ClientID, req.RedirectURI); err != nil {
 			return "", err
 		}
-	} else {
-		// A pre-resolved client only lets the caller skip the LOOKUP — the
-		// expensive part, a DB read or a CIMD fetch. The two cheap invariants are
-		// re-established here rather than trusted, because Client is an exported
-		// field on an exported request type and nothing stops a caller resolving
-		// one pair and issuing against another.
-		//
-		// That matters most for redirect_uri: it is baked into the code as the
-		// "ruri" claim and honoured at exchange, so accepting one the client never
-		// registered would defeat the allow-list end to end, not just here.
-		// redirectURIAllowed is pure string work (with RFC 8252 loopback
-		// equivalence), so re-running it costs nothing worth saving.
-		if oauthClient.ClientID != req.ClientID {
-			return "", oauthServerError("pre-resolved client does not match request client_id", nil)
-		}
+	} else if oauthClient.ClientID != req.ClientID {
+		// A pre-resolved client must be the one these parameters were validated
+		// against. Everything else it lets the caller skip is just the LOOKUP —
+		// the expensive part, a DB read or a CIMD fetch.
+		return "", oauthServerError("pre-resolved client does not match request client_id", nil)
+	}
 
-		if !redirectURIAllowed(req.RedirectURI, oauthClient.RedirectURIs) {
-			return "", oauthBadRequest(oautherror.InvalidRequest,
-				"redirect_uri is not in the client's registered list")
-		}
+	// Re-established on BOTH paths, never assumed from the fact that a caller
+	// handed us a resolved client. Idempotent and I/O-free, so running it again
+	// after ResolveAuthorizeClient costs nothing worth saving — and it is the only
+	// arrangement in which a caller supplying Client cannot skip a gate.
+	if err := checkAuthorizeClientPolicy(oauthClient, req.RedirectURI); err != nil {
+		return "", err
 	}
 
 	// Scope intersection: the issued code can never authorize a scope

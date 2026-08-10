@@ -330,3 +330,64 @@ func TestAuthorizePOST_QueryParamsAreNotRead(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	require.Contains(t, body["error_description"], "client_id")
 }
+
+// TestAuthorizeGET_ErrorDescriptionIsInCharset pins RFC 6749 §4.1.2.1's NQCHAR
+// limit on error_description: %x20-21 / %x23-5B / %x5D-7E, i.e. printable ASCII
+// without the double quote or backslash.
+//
+// It did not matter while every failure was a JSON body — §5.2 puts no charset
+// limit there, and UTF-8 reads better. It matters now that the same strings ride
+// in a Location query, where a client validating strictly is entitled to reject a
+// non-ASCII byte. Percent-encoding makes any byte transport-safe, so this is about
+// conformance rather than injection.
+//
+// Enforced by coercion at the redirect boundary rather than by keeping every
+// literal ASCII, since descriptions reaching here include service-layer strings.
+func TestAuthorizeGET_ErrorDescriptionIsInCharset(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+
+	resp := getAuthorize(t, query, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+
+	desc := loc.Query().Get("error_description")
+	require.NotEmpty(t, desc)
+
+	for i, r := range desc {
+		require.True(t, r >= 0x20 && r <= 0x7e && r != '"' && r != '\\',
+			"error_description[%d] = %q (U+%04X) is outside RFC 6749 §4.1.2.1 NQCHAR; full value %q",
+			i, r, r, desc)
+	}
+}
+
+// TestAuthorizeGET_NonS256IsRejectedBeforeAnyLookup keeps a request that cannot
+// possibly succeed from costing anything.
+//
+// code_challenge_method=plain used to be caught only inside IssueAuthCode, at the
+// very end. With the interactive-login hook in place that meant an unauthenticated
+// caller could be sent through the deployer's login surface, authenticate, and
+// only then be told their own parameter was wrong. The check costs a string
+// comparison, so it belongs in the cheap gate.
+func TestAuthorizeGET_NonS256IsRejectedBeforeAnyLookup(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+	query.Set("code_challenge_method", "plain")
+
+	// No credential: if the S256 check did not run first, this request would reach
+	// principal resolution and be reported as access_denied (or a login redirect)
+	// rather than as the invalid_request it is.
+	resp := getAuthorize(t, query, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Empty(t, resp.Header.Get("Location"),
+		"a request that cannot succeed must not be redirected anywhere, least of all to a login surface")
+
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "invalid_request", body["error"])
+	require.Contains(t, body["error_description"], "S256")
+}

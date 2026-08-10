@@ -378,6 +378,27 @@ func TestIssueAuthCode_PreResolvedClientStillChecksRedirectURI(t *testing.T) {
 		}
 	})
 
+	// The gate that was still missed after the redirect_uri fix: "re-add the check
+	// to the other branch" does not scale, so both now run through one function.
+	t.Run("a client without the authorization_code grant is refused", func(t *testing.T) {
+		noGrant := *client
+		noGrant.GrantTypes = []string{"refresh_token"}
+
+		req := base
+		req.Client = &noGrant
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		_, err := svc.IssueAuthCode(context.Background(), req)
+		if err == nil {
+			t.Fatal("a pre-resolved client must NOT skip the grant-type allow-list")
+		}
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) || oauthErr.Code != oautherror.UnauthorizedClient {
+			t.Fatalf("want unauthorized_client, got %v", err)
+		}
+	})
+
 	t.Run("a mismatched client_id is refused", func(t *testing.T) {
 		req := base
 		req.ClientID = "some-other-client"
