@@ -226,6 +226,40 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	return identities, total, nil
 }
 
+// ListByOwnerForOffboard returns every not-yet-deactivated identity owned by
+// ownerUserID within accountID — deliberately ACROSS ALL PROJECTS, unlike List:
+// offboarding a human (INV-IDN-010 / ADR 0028 D5) must sweep every project the
+// account has, mirroring the (owner_user_id, account_id) scoping of the
+// revoke_credentials_by_owner cascade (migration 041). No status default is
+// applied beyond excluding already-deactivated rows: discovered/pending/
+// suspended/expired identities all transition legally to deactivated
+// (domain.CanTransitionTo), and an offboarding must not leave a suspended or
+// discovered row able to return to service later.
+//
+// Both arguments are required: identities.owner_user_id is NOT NULL, so
+// ownerless identities store the empty string and a blank owner would match
+// every one of them (the same footgun the service-layer and SQL guards on the
+// credential cascade close — see RevokeAllActiveForOwner).
+func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUserID, accountID string) ([]*domain.Identity, error) {
+	if ownerUserID == "" || accountID == "" {
+		return nil, fmt.Errorf(
+			"ListByOwnerForOffboard requires a non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account", ownerUserID, accountID)
+	}
+
+	var identities []*domain.Identity
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("owner_user_id = ?", ownerUserID).
+		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		OrderExpr("created_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list identities for owner %s in account %s: %w", ownerUserID, accountID, err)
+	}
+	return identities, nil
+}
+
 // ListByExternalIDs fetches identities by external_id within a tenant. external_id
 // is UNIQUE per (account, project) and indexed, so this is an indexed lookup. Used
 // to hydrate the parent agents of sub-agents that landed on a list page without
