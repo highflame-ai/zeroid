@@ -977,16 +977,24 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 // OffboardResult reports what an owner offboarding actually did, so the caller
 // (admin's SCIM outbox worker) can log evidence and decide whether to retry.
 type OffboardResult struct {
-	// IdentitiesDeactivated counts identities freshly deactivated this call.
-	// Already-deactivated identities are idempotent no-ops and not counted.
+	// IdentitiesDeactivated counts identities the loop successfully drove to
+	// deactivated. The list excludes already-deactivated rows, so this is the
+	// fresh count in practice; a row deactivated concurrently between list and
+	// loop is still counted (DeactivateIdentity no-ops idempotently). This is
+	// the field the SCIM worker should key evidence and zero-alerts on.
 	IdentitiesDeactivated int
 	// FailedIdentityIDs lists identities whose deactivation errored. Non-empty
 	// means the offboarding is INCOMPLETE and the caller must retry (the whole
 	// operation is idempotent).
 	FailedIdentityIDs []string
-	// CredentialsRevoked is the count from the owner-scoped credential cascade
-	// (revoke_credentials_by_owner), which also covers delegated descendants
-	// whose identities this owner does not own.
+	// CredentialsRevoked is the count from the FINAL owner-scoped cascade
+	// (revoke_credentials_by_owner) only. Expect it to be ~0 on a healthy run:
+	// each identity's deactivation cleanup already cascade-revokes that
+	// identity's credentials AND their delegated descendants
+	// (revoke_credentials_cascade, migration 031), so the final sweep usually
+	// finds nothing left. A non-zero value here means the sweep caught
+	// stragglers — descendants of identities that failed to deactivate, or
+	// credentials issued mid-loop. Do NOT alert on this being zero.
 	CredentialsRevoked int64
 }
 

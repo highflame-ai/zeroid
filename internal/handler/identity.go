@@ -66,8 +66,8 @@ type OffboardByOwnerInput struct {
 
 type OffboardByOwnerOutput struct {
 	Body struct {
-		IdentitiesDeactivated int   `json:"identities_deactivated" doc:"Identities freshly deactivated this call (idempotent no-ops not counted)"`
-		CredentialsRevoked    int64 `json:"credentials_revoked" doc:"Credentials revoked by the owner-scoped cascade, including delegated descendants"`
+		IdentitiesDeactivated int   `json:"identities_deactivated" doc:"Identities deactivated this call — the field to key offboarding evidence and zero-alerts on"`
+		CredentialsRevoked    int64 `json:"credentials_revoked" doc:"Stragglers caught by the final owner-scoped sweep only; ~0 on a healthy run because each identity's deactivation already cascade-revoked its credentials and descendants"`
 	}
 }
 
