@@ -57,6 +57,12 @@ GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.j
 Cookie: <your session cookie>
 ```
 
+`state` is **optional** here. PKCE is mandatory on this endpoint and carries the
+CSRF binding that `state` was originally needed for, so OAuth 2.1 leaves `state`
+to carry application state only. ZeroID round-trips it verbatim when present and
+does not require it. It is shown because most clients have somewhere to return
+the user to.
+
 **The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
 ship.** A browser cannot set a custom header on a top-level navigation, and the
 resolver-facing `Form` accessor is bound to the POST body, so a resolver that
@@ -71,6 +77,13 @@ all form-based advertises the grant and then 401s every browser redirect. If tha
 is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })`
 until a GET-capable resolver exists; otherwise the metadata promises a flow the
 endpoint cannot finish, which is exactly the failure this is meant to prevent.
+
+A `false` answer turns the flow **off**, not merely unadvertised:
+`/oauth2/authorize` answers 503 on both GET and POST. Reach for it if you run a
+cookie-based resolver and are not yet ready for the CSRF obligations below — a
+cookie resolver is safe while POST is the only route, because `SameSite=Lax`
+withholds the cookie on a cross-site POST, and becomes reachable by cross-site
+top-level navigation once GET is mounted.
 
 Three things a deployer must handle:
 
@@ -139,8 +152,12 @@ When the document's `grant_types` includes `refresh_token`, the exchange also re
 Implemented in [`internal/service/cimd.go`](../internal/service/cimd.go); wired into the auth-code flow at `OAuthService.IssueAuthCode` (`/oauth2/authorize`) and `OAuthService.authorizationCode` (`/oauth2/token`).
 
 1. **Detect — registry first.** The client registry is always consulted first; CIMD resolution only runs when the registry misses **and** the `client_id` is an absolute `https://` URL with a host and a non-root path (`IsCIMDClientID`). Registry-first keeps any pre-existing registry client whose `client_id` happens to be a URL working unchanged, and gives deployers a pinning mechanism: registering a client under a CIMD URL overrides the document. Anything not CIMD-shaped behaves exactly as before — CIMD is purely additive.
-2. **Validate the URL.** `https` scheme, non-empty host, path present, **no query string, no fragment** (the draft requires a canonical document location), and ≤ 255 characters (the `client_id` is persisted into `VARCHAR(255)` columns downstream).
-3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host.
+2. **Validate the URL** against draft-02 §3: `https` scheme, non-empty host, path present, **no fragment** (MUST NOT), **no userinfo** (MUST NOT), **no `.` or `..` path segments** (MUST NOT), and ≤ 255 characters (the `client_id` is persisted into `VARCHAR(255)` columns downstream).
+
+   Two of these carry their own weight beyond conformance. Userinfo is the phishing shape — `https://legit.example.com@evil.example/client.json` resolves to `evil.example` while *reading* as `legit.example.com` on a consent screen or in an audit log. Dot segments would give one document many spellings, splitting the resolution cache and handing one client several identities the §4 self-reference check cannot distinguish.
+
+   ZeroID also rejects a **query string**, where the draft says only SHOULD NOT. That is deliberate and stricter than required: the `client_id` a client presents must stay byte-identical to the URL the document was fetched from, which is exactly what the self-reference check compares.
+3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
 4. **Fetch (SSRF-guarded, no redirects).** `GET` via the same DNS-rebinding-safe client the OIDC attestation verifier and CIBA dispatch use ([`attestation.NewSSRFGuardedHTTPClient`](../internal/attestation/oidc.go)): the host is resolved once, every answer is checked against the private/loopback/link-local/multicast/CGN/reserved blocklist, and the connection is pinned to the validated IP. TLS still verifies against the original hostname. Response is size-capped (5 KiB default) and timeout-bounded (5 s). **HTTP redirects are not followed** — the `client_id` is a canonical location; a 3xx is a resolution failure.
 5. **Validate the document.**
    - **Self-reference** (draft §4): the document's `client_id` field MUST equal the URL it was fetched from. This is what stops a document from claiming someone else's identity.

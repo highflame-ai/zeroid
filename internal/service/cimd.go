@@ -248,6 +248,23 @@ func (s *CIMDService) Enabled() bool {
 	return s != nil && s.enabled
 }
 
+// AllowedDomainCount reports how many domains are in the EFFECTIVE allow-list,
+// after the constructor has lower-cased and dropped blank/whitespace-only
+// entries. Zero means open mode: domainAllowed admits any host.
+//
+// Callers reporting or gating on allow-list policy must use this rather than
+// len(cfg.CIMD.AllowedDomains). The two disagree exactly where it matters:
+// allowed_domains: [""] has length 1 and an effective count of 0, so a caller
+// reading the raw slice concludes the deployment is locked down at the one
+// moment it is wide open.
+func (s *CIMDService) AllowedDomainCount() int {
+	if s == nil {
+		return 0
+	}
+
+	return len(s.allowedDomains)
+}
+
 // IsCIMDClientID reports whether clientID is shaped like a CIMD identifier: an
 // absolute https:// URL with a host and a non-root path component. The path
 // requirement is what distinguishes a CIMD identifier from a bare issuer URL,
@@ -288,11 +305,33 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 	if err != nil || u.Scheme != "https" || u.Host == "" || len(u.Path) <= 1 {
 		return nil, fmt.Errorf("%w: must be an absolute https:// URL with a path", ErrCIMDInvalidClientID)
 	}
-	// The draft forbids query strings and fragments in a CIMD client_id: the URL
-	// must be a stable, canonical document location. Reject rather than strip so
-	// the client_id the client presents everywhere is exactly the document URL.
+	// draft-02 §3: a fragment is MUST NOT, a query is SHOULD NOT. We reject
+	// both. Being stricter than the draft on the query is deliberate — the
+	// client_id must be a stable, canonical document location, and rejecting
+	// rather than stripping keeps the identifier the client presents everywhere
+	// byte-identical to the URL the document was fetched from, which is what
+	// the §4 self-reference check compares.
 	if u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("%w: must not contain a query string or fragment", ErrCIMDInvalidClientID)
+	}
+	// draft-02 §3: userinfo is MUST NOT. Beyond conformance this is the
+	// phishing shape — https://legit.example.com@evil.example/client.json
+	// resolves to evil.example (domainAllowed sees the right host, so this is
+	// not an allow-list bypass) while READING as legit.example.com everywhere
+	// the client_id is displayed: consent screens and audit logs, which are
+	// exactly where a human is asked to trust the string.
+	if u.User != nil {
+		return nil, fmt.Errorf("%w: must not contain userinfo", ErrCIMDInvalidClientID)
+	}
+	// draft-02 §3: no single- or double-dot path segments. Without this one
+	// document has many spellings — /a/../client.json and /client.json name the
+	// same resource — which splits the resolution cache and lets one client
+	// hold several identities that the self-reference check cannot tell apart.
+	// u.Path is decoded, so %2e%2e is caught here too.
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return nil, fmt.Errorf("%w: must not contain %q path segments", ErrCIMDInvalidClientID, seg)
+		}
 	}
 	if !s.domainAllowed(u.Hostname()) {
 		return nil, ErrCIMDDomainNotAllowed

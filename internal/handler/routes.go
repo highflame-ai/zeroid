@@ -255,6 +255,10 @@ func (a *API) SetCIMDEnabled(enabled bool) {
 // registration (#263). Discovery must not name a flow the endpoint cannot
 // complete.
 //
+// The predicate gates the endpoint as well as the document: authorizeHandler
+// answers 503 when it reports false, on both GET and POST. Editing only the
+// metadata would leave a deployer who turned the flow off still serving it.
+//
 // A predicate rather than a bool because RegisterPrincipalResolver is
 // documented as safe to call after NewServer.
 func (a *API) SetAuthorizationCodeAvailable(fn func() bool) {
