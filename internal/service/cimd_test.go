@@ -273,6 +273,61 @@ func TestCIMDResolveClient_DomainAllowlist(t *testing.T) {
 	}
 }
 
+// TestCIMDAllowedDomainCount_ReportsEffectivePolicy — the constructor lower-cases
+// and drops blank/whitespace-only entries, so the raw config slice and the policy
+// actually in force disagree. They disagree in the worst direction: a config of
+// allowed_domains: [""] has length 1 but admits every host, so anything reading
+// the raw slice reports a locked-down deployment at the exact moment it is wide
+// open. That is what the startup warning in NewServer keys on.
+func TestCIMDAllowedDomainCount_ReportsEffectivePolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		domains []string
+		want    int
+	}{
+		{"nil is open mode", nil, 0},
+		{"empty is open mode", []string{}, 0},
+		{"single blank entry is STILL open mode", []string{""}, 0},
+		{"whitespace-only entries are still open mode", []string{"  ", "\t", "\n"}, 0},
+		{"one real domain", []string{"client.example.com"}, 1},
+		{"blanks alongside a real domain do not inflate the count", []string{"", "client.example.com", "   "}, 1},
+		{"case-insensitive duplicates collapse", []string{"Client.Example.com", "client.example.com"}, 1},
+		{"two distinct domains", []string{"a.example.com", "b.example.com"}, 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := NewCIMDService(CIMDConfig{Enabled: true, AllowedDomains: tc.domains})
+			if got := svc.AllowedDomainCount(); got != tc.want {
+				t.Errorf("AllowedDomainCount() = %d, want %d (raw slice length %d)",
+					got, tc.want, len(tc.domains))
+			}
+		})
+	}
+
+	// Nil-safe, matching Enabled().
+	var nilSvc *CIMDService
+	if got := nilSvc.AllowedDomainCount(); got != 0 {
+		t.Errorf("nil *CIMDService AllowedDomainCount() = %d, want 0", got)
+	}
+}
+
+// TestCIMDBlankAllowedDomainIsOpenMode is the behavioural half of the above: a
+// blank-only allow-list must not merely count as zero, it must actually admit a
+// host that no entry names.
+func TestCIMDBlankAllowedDomainIsOpenMode(t *testing.T) {
+	var docURL string
+	handler := func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, docJSON(docURL, "")) }
+
+	svc, base, _ := newCIMDTestServer(t,
+		CIMDConfig{Enabled: true, AllowedDomains: []string{"", "   "}}, handler)
+	docURL = base + "/client.json"
+
+	if _, err := svc.ResolveClient(context.Background(), docURL); err != nil {
+		t.Errorf("a blank-only allowlist is open mode and must admit any host, got %v", err)
+	}
+}
+
 func TestCIMDResolveClient_Cache(t *testing.T) {
 	var docURL string
 	svc, base, hits := newCIMDTestServer(t, CIMDConfig{Enabled: true, CacheTTL: time.Hour}, func(w http.ResponseWriter, _ *http.Request) {

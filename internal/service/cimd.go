@@ -248,6 +248,23 @@ func (s *CIMDService) Enabled() bool {
 	return s != nil && s.enabled
 }
 
+// AllowedDomainCount reports how many domains are in the EFFECTIVE allow-list,
+// after the constructor has lower-cased and dropped blank/whitespace-only
+// entries. Zero means open mode: domainAllowed admits any host.
+//
+// Callers reporting or gating on allow-list policy must use this rather than
+// len(cfg.CIMD.AllowedDomains). The two disagree exactly where it matters:
+// allowed_domains: [""] has length 1 and an effective count of 0, so a caller
+// reading the raw slice concludes the deployment is locked down at the one
+// moment it is wide open.
+func (s *CIMDService) AllowedDomainCount() int {
+	if s == nil {
+		return 0
+	}
+
+	return len(s.allowedDomains)
+}
+
 // IsCIMDClientID reports whether clientID is shaped like a CIMD identifier: an
 // absolute https:// URL with a host and a non-root path component. The path
 // requirement is what distinguishes a CIMD identifier from a bare issuer URL,
