@@ -44,8 +44,16 @@ import (
 // authorizeHandler binds the resolver-facing Form accessor to the
 // POST body ONLY. On a GET the protocol parameters come from the query
 // string — where RFC 6749 puts them — while credentials must arrive in a
-// header or cookie. A credential therefore still never lands in a URL, an
-// access log, or a Referer header.
+// header or cookie. ZeroID therefore never AUTHENTICATES from a URL.
+//
+// That is a narrower claim than "a credential never lands in a URL", which
+// an earlier version of this comment made and could not keep: ZeroID does
+// not control what a caller puts in the query string. A client author who
+// mirrors the documented POST form into a GET gets a correct 401 — and
+// would, before this was fixed, have had the secret written to ZeroID's own
+// access log on the way there. The request loggers now record r.URL.Path
+// rather than r.RequestURI for that reason; see logSafePath in server.go.
+// Referer and browser history remain the caller's to manage.
 func (a *API) registerAuthorizeRoute(router chi.Router) {
 	router.Get("/oauth2/authorize", a.authorizeHandler)
 	router.Post("/oauth2/authorize", a.authorizeHandler)
@@ -86,6 +94,27 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // IssueAuthCode, so the handler holds no validated URI at most failure
 // points. Splitting that check out is the work. Tracked in #263.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
+	// ── Step 0: is this deployment serving the flow at all? ──────────
+	// SetAuthorizationCodeAvailable(false) used to suppress only the
+	// discovery metadata, leaving the endpoint itself live. That made it
+	// an advertisement switch, not an off switch — and mounting GET gave
+	// deployers a reason to want a real one: a cookie-based resolver is
+	// safe under POST alone (SameSite=Lax withholds the cookie on a
+	// cross-site POST) and CSRF-reachable once a top-level navigation can
+	// drive it. A deployer who reaches for the documented hatch gets what
+	// the name promises: the flow is off, on both methods.
+	//
+	// Nothing changes by default. The built-in guess is "any resolver
+	// registered", and a deployment with none already answered 503 here
+	// via ErrNoResolversRegistered — this just reaches the same answer
+	// before touching the request.
+	if !a.canServeAuthorizationCode() {
+		writeAuthorizeError(w, http.StatusServiceUnavailable, oautherror.ServerError,
+			"/oauth2/authorize is not available on this deployment")
+
+		return
+	}
+
 	// ── Step 1: parse the query string (GET) or form body (POST) ─────
 	if err := r.ParseForm(); err != nil {
 		// Name the source the caller actually used: a GET has no body, so

@@ -72,6 +72,13 @@ is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })
 until a GET-capable resolver exists; otherwise the metadata promises a flow the
 endpoint cannot finish, which is exactly the failure this is meant to prevent.
 
+A `false` answer turns the flow **off**, not merely unadvertised:
+`/oauth2/authorize` answers 503 on both GET and POST. Reach for it if you run a
+cookie-based resolver and are not yet ready for the CSRF obligations below — a
+cookie resolver is safe while POST is the only route, because `SameSite=Lax`
+withholds the cookie on a cross-site POST, and becomes reachable by cross-site
+top-level navigation once GET is mounted.
+
 Three things a deployer must handle:
 
 * **The interaction cannot live in the resolver.** `PrincipalResolver` returns

@@ -897,6 +897,13 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 // until you add a header- or cookie-based one. ZeroID cannot introspect what a
 // resolver reads, which is why it cannot work this out itself.
 //
+// A false answer turns the flow OFF, it does not merely stop advertising it:
+// /oauth2/authorize answers 503 on both GET and POST. That distinction matters
+// to a deployer running a cookie-based resolver, which is safe while POST is
+// the only route (SameSite=Lax withholds the cookie on a cross-site POST) and
+// CSRF-reachable once a top-level navigation can drive the endpoint. A hatch
+// that only edited the discovery document would have left that endpoint live.
+//
 // A predicate rather than a bool so the answer can change as resolvers are
 // registered. Passing nil restores the built-in guess. Safe to call after
 // NewServer.
@@ -1277,6 +1284,23 @@ func parseDurationOrDefault(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// logSafePath is what request loggers record instead of r.RequestURI.
+//
+// RequestURI carries the query string, and ZeroID does not control what a
+// caller puts there. /oauth2/authorize takes its protocol parameters from
+// the query on a GET, so a client author who mirrors a documented POST form
+// into a GET puts their api_key in the URL. The resolver correctly ignores
+// it — Form is bound to the POST body — but a logger reading RequestURI has
+// already written the secret to disk and shipped it to whatever log sink the
+// deployer runs, twice per request.
+//
+// The path alone cannot hide a credential, and no ZeroID endpoint takes a
+// query parameter worth logging. A deployer who wants query detail can add
+// their own middleware and decide their own redaction.
+func logSafePath(r *http.Request) string {
+	return r.URL.Path
+}
+
 // errorRecoveryMiddleware recovers from panics and returns a 500 JSON error response.
 func errorRecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1285,7 +1309,7 @@ func errorRecoveryMiddleware(next http.Handler) http.Handler {
 				log.Error().
 					Interface("panic", err).
 					Str("method", r.Method).
-					Str("path", r.RequestURI).
+					Str("path", logSafePath(r)).
 					Msg("Panic recovered in request handler")
 
 				w.Header().Set("Content-Type", "application/json")
@@ -1494,7 +1518,7 @@ func writeValidationError(w http.ResponseWriter, r *http.Request, msg string) {
 	log.Info().
 		Str("request_id", reqID).
 		Str("method", r.Method).
-		Str("path", r.RequestURI).
+		Str("path", logSafePath(r)).
 		Str("content_type", r.Header.Get("Content-Type")).
 		Str("reason", msg).
 		Msg("request validation rejected")
@@ -1525,7 +1549,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		log.Info().
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Str("remote_addr", r.RemoteAddr).
 			Msg("request.start")
 
@@ -1544,7 +1568,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		logLevel.
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Int("status", ww.Status()).
 			Dur("duration", duration).
 			Msg("request.complete")
