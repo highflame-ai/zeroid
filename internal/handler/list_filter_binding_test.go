@@ -130,13 +130,20 @@ func TestListAgentsInput_ScalarFiltersUnaffected(t *testing.T) {
 }
 
 func TestListIdentitiesInput_RepeatedFiltersBindEveryValue(t *testing.T) {
+	// Covers all three multi-value filters on this surface. Every tag this PR
+	// touches needs a case that fails without it — otherwise the suite passes
+	// while the regression it exists to prevent is back.
 	in := bindListIdentitiesInput(t,
-		"status=discovered&status=pending&identity_type=agent&identity_type=mcp_server")
+		"status=discovered&status=pending"+
+			"&identity_type=agent&identity_type=mcp_server"+
+			"&trust_level=unverified&trust_level=first_party")
 	assert.Equal(t, []string{"discovered", "pending"}, splitCSV(in.Status))
 	assert.Equal(t, []string{"agent", "mcp_server"}, splitCSV(in.IdentityType))
+	assert.Equal(t, []string{"unverified", "first_party"}, splitCSV(in.TrustLevel))
 }
 
 func TestListIdentitiesInput_CommaSeparatedStillBinds(t *testing.T) {
-	in := bindListIdentitiesInput(t, "status=discovered,pending")
+	in := bindListIdentitiesInput(t, "status=discovered,pending&trust_level=unverified,first_party")
 	assert.Equal(t, []string{"discovered", "pending"}, splitCSV(in.Status))
+	assert.Equal(t, []string{"unverified", "first_party"}, splitCSV(in.TrustLevel))
 }
