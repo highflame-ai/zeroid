@@ -194,8 +194,22 @@ func TestCIMDResolveClient_InvalidClientID(t *testing.T) {
 	for _, id := range []string{
 		"http://app.example.com/client.json",       // not https
 		"https://app.example.com",                  // no path
-		"https://app.example.com/client.json?a=b",  // query
-		"https://app.example.com/client.json#frag", // fragment
+		"https://app.example.com/client.json?a=b",  // query (draft-02 §3 SHOULD NOT; we reject)
+		"https://app.example.com/client.json#frag", // fragment (§3 MUST NOT)
+
+		// Userinfo (§3 MUST NOT). Reads as legit.example.com wherever the
+		// client_id is displayed — consent screen, audit log — while resolving
+		// to evil.example. Not an allow-list bypass (domainAllowed sees the
+		// real host); a spoof of the string a human is asked to trust.
+		"https://legit.example.com@evil.example/client.json",
+		"https://user:pw@app.example.com/client.json",
+
+		// Dot segments (§3 MUST NOT). Otherwise one document has many
+		// spellings, splitting the cache and giving one client several
+		// identities the §4 self-reference check cannot tell apart.
+		"https://app.example.com/a/../client.json",
+		"https://app.example.com/./client.json",
+		"https://app.example.com/%2e%2e/client.json", // percent-encoded, decoded by url.Parse
 	} {
 		if _, err := svc.ResolveClient(context.Background(), id); !errors.Is(err, ErrCIMDInvalidClientID) {
 			t.Errorf("ResolveClient(%q): expected ErrCIMDInvalidClientID, got %v", id, err)

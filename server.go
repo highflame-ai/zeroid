@@ -304,6 +304,16 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 			Int("allowed_domains", len(cfg.CIMD.AllowedDomains)).
 			Bool("allow_private_endpoints", cfg.CIMD.AllowPrivateMetadataEndpoints).
 			Msg("CIMD (Client ID Metadata Documents) enabled")
+		// cimd.allowed_domains is documented as the primary production
+		// hardening lever, and it ships off. Empty means any public HTTPS host
+		// can publish a document that mints a client here — anyone who can
+		// serve a path on any reachable domain, which inside an org is a low
+		// bar. That is a legitimate posture for an open ecosystem and a poor
+		// one for a closed deployment, and the difference is invisible unless
+		// somebody says so at boot.
+		if len(cfg.CIMD.AllowedDomains) == 0 {
+			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. Set an allowlist to run CIMD as a closed ecosystem.")
+		}
 	}
 
 	// Build the external-issuer registry when the deployer has configured
