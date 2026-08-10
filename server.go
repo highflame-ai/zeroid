@@ -988,6 +988,11 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 // route, and prefer to keep it to context annotation.
 //
 // Can be called after NewServer and before Start.
+//
+// Passing nil is IGNORED, not a way to unregister — there is no removal for an
+// appending registry, and silently dropping every previously registered
+// middleware would be a worse answer than doing nothing. This differs from
+// AdminAuth(nil), which does clear, because that one is a single slot.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 	if middleware == nil {
 		return

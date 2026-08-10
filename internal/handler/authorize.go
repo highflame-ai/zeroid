@@ -267,6 +267,19 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		code, description, status := extractOAuthError(err)
 		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("/oauth2/authorize client validation failed")
+
+		// A non-nil client alongside the error means redirect_uri was validated
+		// before the failure — so this is a §4.1.2.1 redirectable error
+		// (unauthorized_client) rather than one of the two exemptions. Without
+		// this branch a client whose grant types omit authorization_code got a
+		// JSON blob in the browser despite having a perfectly good registered
+		// redirect_uri, which is the dead end this PR exists to remove.
+		if oauthClient != nil {
+			a.failAuthorize(w, r, req, status, code, code, description)
+
+			return
+		}
+
 		writeAuthorizeError(w, status, code, description)
 
 		return

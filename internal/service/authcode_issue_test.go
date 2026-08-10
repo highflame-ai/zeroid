@@ -399,6 +399,55 @@ func TestIssueAuthCode_PreResolvedClientStillChecksRedirectURI(t *testing.T) {
 		}
 	})
 
+	// Third gate of the same class the shared policy function exists to protect:
+	// deactivation has to stay a kill switch even when the caller hands us a client
+	// it resolved earlier, and a confidential client must not obtain a code here.
+	t.Run("a deactivated pre-resolved client is refused", func(t *testing.T) {
+		inactive := *client
+		inactive.IsActive = false
+
+		req := base
+		req.Client = &inactive
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err == nil {
+			t.Fatal("a pre-resolved client must NOT skip the active/public gate — " +
+				"deactivation is the kill switch")
+		}
+	})
+
+	t.Run("a confidential pre-resolved client is refused", func(t *testing.T) {
+		confidential := *client
+		confidential.ClientType = "confidential"
+
+		req := base
+		req.Client = &confidential
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err == nil {
+			t.Fatal("a confidential client must not obtain an authorization code here")
+		}
+	})
+
+	// Ordering matters, not just presence: redirect_uri has to be settled before
+	// any redirectable failure, so the handler can tell whether §4.1.2.1 permits a
+	// redirect. A client that fails BOTH gates must report the redirect_uri one.
+	t.Run("an unregistered redirect_uri outranks a grant-type refusal", func(t *testing.T) {
+		noGrant := *client
+		noGrant.GrantTypes = []string{"refresh_token"}
+
+		req := base
+		req.Client = &noGrant
+		req.RedirectURI = "https://evil.example/steal"
+
+		_, err := svc.IssueAuthCode(context.Background(), req)
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) || oauthErr.Code != oautherror.InvalidRequest {
+			t.Fatalf("want the redirect_uri refusal (invalid_request) to win, got %v", err)
+		}
+	})
+
 	t.Run("a mismatched client_id is refused", func(t *testing.T) {
 		req := base
 		req.ClientID = "some-other-client"
