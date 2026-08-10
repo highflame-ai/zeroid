@@ -77,22 +77,29 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //     redirect_uri allow-list, S256 enforcement, and JWT minting.
 //  7. Build the redirect URL with code + state and emit 302.
 //
-// Errors fall into two camps. Syntactic errors (missing fields, bad
-// response_type) and credential failures (no resolver matched, all
-// resolvers rejected) return RFC 6749 §5.2 JSON error bodies — we
-// cannot redirect to a URL we haven't validated. Errors AFTER
-// successful client lookup could in principle be redirected back per
-// RFC 6749 §4.1.2.1, but are still JSON today. That was defensible when
-// this endpoint was POST-only and CLI clients parsed the body; mounting
-// GET invalidates the reasoning. A browser now shows the user a raw JSON
-// blob while the client waits on a callback that never arrives, with no
-// error to surface.
+// EVERY failure here returns an RFC 6749 §5.2 JSON body. RFC 6749
+// §4.1.2.1 wants most of them redirected back to the client as error +
+// state instead, and only exempts the two cases where redirecting would
+// itself be the vulnerability: a missing/invalid redirect_uri and an
+// invalid client_id. JSON was defensible while this endpoint was
+// POST-only and the caller was a CLI parsing the body; mounting GET
+// invalidated that. A browser now renders a raw JSON blob while the
+// client blocks on a callback that never fires, with no error and no
+// state to correlate.
 //
-// Fixing it is gated on an ordering problem, not effort: an error raised
-// BEFORE redirect_uri is validated must stay JSON, or the redirect is an
-// open redirect — and redirect_uri validation currently lives inside
-// IssueAuthCode, so the handler holds no validated URI at most failure
-// points. Splitting that check out is the work. Tracked in #263.
+// The blocker is ordering, and it is upstream of this handler's own
+// steps: principal resolution (step 4) runs BEFORE any client lookup,
+// which happens inside IssueAuthCode at step 6. So access_denied — the
+// failure a browser user actually hits, when they are not signed in or
+// decline — fires while no validated redirect_uri exists to redirect to.
+// Redirecting to an unvalidated URI would be an open redirect, so it
+// stays JSON until the lookup moves.
+//
+// Note that redirect_uri validation is not merely "inside IssueAuthCode":
+// it runs there AFTER the grant-type allow-list, so the only failure
+// genuinely downstream of it is the mint 500. Fixing this means hoisting
+// client resolution + redirect_uri validation ahead of step 4, not
+// reordering within IssueAuthCode. Tracked in #279.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// ── Step 0: is this deployment serving the flow at all? ──────────
 	// SetAuthorizationCodeAvailable(false) used to suppress only the
