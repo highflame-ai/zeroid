@@ -57,6 +57,12 @@ GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.j
 Cookie: <your session cookie>
 ```
 
+`state` is **optional** here. PKCE is mandatory on this endpoint and carries the
+CSRF binding that `state` was originally needed for, so OAuth 2.1 leaves `state`
+to carry application state only. ZeroID round-trips it verbatim when present and
+does not require it. It is shown because most clients have somewhere to return
+the user to.
+
 **The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
 ship.** A browser cannot set a custom header on a top-level navigation, and the
 resolver-facing `Form` accessor is bound to the POST body, so a resolver that
