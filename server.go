@@ -781,7 +781,7 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 //
 // # Writing a cookie-based resolver
 //
-// /oauth2/authorize serves GET (RFC 6749 §4.1.1), so a resolver that
+// /oauth2/authorize serves GET (RFC 6749 §3.1), so a resolver that
 // authenticates from a cookie is reachable by top-level navigation from
 // any site — SameSite=Lax still sends the cookie on a cross-site GET.
 // Combined with CIMD, which accepts any attacker-published client_id and

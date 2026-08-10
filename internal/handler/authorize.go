@@ -33,12 +33,19 @@ import (
 // registerAuthorizeRoute mounts GET and POST /oauth2/authorize on the
 // public chi router.
 //
-// GET is required, not optional: RFC 6749 §4.1.1 says the authorization
-// endpoint MUST support GET, and the browser redirect it enables is the
-// only shape an off-the-shelf OAuth client — an MCP client doing CIMD,
-// say — knows how to drive. v1 withheld it because the CLI use case was
+// Both methods are mounted, and RFC 6749 §3.1 is the sentence that governs
+// both: "The authorization server MUST support the use of the HTTP GET
+// method for the authorization endpoint and MAY support the use of the
+// POST method as well." OAuth 2.1 §3.1 carries the same text forward, and
+// OpenID Connect requires both. So GET is an obligation and POST is a
+// permitted extra — not, as is sometimes assumed, disallowed.
+//
+// GET is what matters here: the browser redirect it enables is the only
+// shape an off-the-shelf OAuth client — an MCP client doing CIMD, say —
+// knows how to drive. v1 withheld it because the CLI use case was
 // POST-only and "GET would surface principal credentials in URL query
-// strings + access logs" (#263).
+// strings + access logs" (#263). POST stays because it is the only method
+// v1 had, so CLI callers depend on it.
 //
 // That concern was right and is preserved rather than traded away:
 // authorizeHandler binds the resolver-facing Form accessor to the

@@ -1,9 +1,10 @@
 // /oauth2/authorize — the browser GET leg (#263).
 //
-// RFC 6749 §4.1.1 makes GET mandatory on the authorization endpoint, and a
-// browser redirect is the only shape an off-the-shelf OAuth client knows how to
-// drive. v1 mounted POST only, which is why an MCP client doing CIMD could not
-// start the flow at all.
+// RFC 6749 §3.1 makes GET mandatory on the authorization endpoint and POST
+// permitted ("MAY support"), so mounting both is conformant. A browser redirect
+// is the only shape an off-the-shelf OAuth client knows how to drive, and v1
+// mounted POST only — which is why an MCP client doing CIMD could not start the
+// flow at all.
 //
 // The v1 rationale for withholding GET — "GET would surface principal
 // credentials in URL query strings + access logs" — is preserved rather than
@@ -87,7 +88,7 @@ func TestAuthorizeGET_IsRouted(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	require.NotEqual(t, http.StatusMethodNotAllowed, resp.StatusCode,
-		"GET /oauth2/authorize must be routed (RFC 6749 §4.1.1)")
+		"GET /oauth2/authorize must be routed (RFC 6749 §3.1)")
 }
 
 // TestAuthorizeGET_HappyPath walks the browser leg end to end: query-string
