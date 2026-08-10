@@ -136,4 +136,8 @@ var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not appli
 // 500 (something went wrong). Surfacing it as its own sentinel lets
 // the handler distinguish from the "all resolvers returned
 // ErrPrincipalNotApplicable" case, which is a legitimate 401.
+//
+// AS metadata omits the authorization_code grant while the chain is
+// empty (see handler.API.SetAuthorizationCodeAvailable), so a client
+// never discovers a flow that would land here.
 var ErrNoResolversRegistered = errors.New("zeroid: no principal resolvers registered")

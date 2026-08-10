@@ -30,16 +30,28 @@ import (
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
-// registerAuthorizeRoute mounts POST /oauth2/authorize on the public
-// chi router. GET is intentionally not supported in v1: RFC 6749
-// §4.1.1 permits GET for browser redirects, but the v1 use case (CLI
-// clients posting api_key + code_challenge) is POST-only. GET would
-// surface principal credentials in URL query strings + access logs.
+// registerAuthorizeRoute mounts GET and POST /oauth2/authorize on the
+// public chi router.
+//
+// GET is required, not optional: RFC 6749 §4.1.1 says the authorization
+// endpoint MUST support GET, and the browser redirect it enables is the
+// only shape an off-the-shelf OAuth client — an MCP client doing CIMD,
+// say — knows how to drive. v1 withheld it because the CLI use case was
+// POST-only and "GET would surface principal credentials in URL query
+// strings + access logs" (#263).
+//
+// That concern was right and is preserved rather than traded away:
+// authorizeHandler binds the resolver-facing Form accessor to the
+// POST body ONLY. On a GET the protocol parameters come from the query
+// string — where RFC 6749 puts them — while credentials must arrive in a
+// header or cookie. A credential therefore still never lands in a URL, an
+// access log, or a Referer header.
 func (a *API) registerAuthorizeRoute(router chi.Router) {
+	router.Get("/oauth2/authorize", a.authorizeHandler)
 	router.Post("/oauth2/authorize", a.authorizeHandler)
 }
 
-// authorizeHandler is the chi handler for POST /oauth2/authorize.
+// authorizeHandler is the chi handler for GET and POST /oauth2/authorize.
 //
 // Pipeline:
 //
@@ -62,15 +74,31 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // resolvers rejected) return RFC 6749 §5.2 JSON error bodies — we
 // cannot redirect to a URL we haven't validated. Errors AFTER
 // successful client lookup could in principle be redirected back per
-// RFC 6749 §4.1.2.1, but v1 keeps them as JSON too; CLI clients
-// (today's only consumer) parse JSON errors fine, and redirect-with-
-// error needs careful URL validation we'd rather not introduce
-// piecemeal.
+// RFC 6749 §4.1.2.1, but are still JSON today. That was defensible when
+// this endpoint was POST-only and CLI clients parsed the body; mounting
+// GET invalidates the reasoning. A browser now shows the user a raw JSON
+// blob while the client waits on a callback that never arrives, with no
+// error to surface.
+//
+// Fixing it is gated on an ordering problem, not effort: an error raised
+// BEFORE redirect_uri is validated must stay JSON, or the redirect is an
+// open redirect — and redirect_uri validation currently lives inside
+// IssueAuthCode, so the handler holds no validated URI at most failure
+// points. Splitting that check out is the work. Tracked in #263.
 func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
-	// ── Step 1: parse form body ──────────────────────────────────────
+	// ── Step 1: parse the query string (GET) or form body (POST) ─────
 	if err := r.ParseForm(); err != nil {
+		// Name the source the caller actually used: a GET has no body, so
+		// "could not parse ... body" points at the wrong parameter for the
+		// request that most often trips this (a malformed %-escape in the
+		// query string).
+		source := "application/x-www-form-urlencoded body"
+		if r.Method == http.MethodGet {
+			source = "query string"
+		}
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
-			"could not parse application/x-www-form-urlencoded body")
+			"could not parse "+source)
+
 		return
 	}
 
@@ -78,16 +106,33 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// Form/Header/Cookie are typed accessors over the underlying
 	// request — resolvers read through them without ever holding a
 	// reference to *http.Request. PostForm.Get is naturally read-only.
+	//
+	// Protocol parameters come from the query string on GET (RFC 6749
+	// §4.1.1) and the body on POST. Read exactly one source per method
+	// rather than r.Form, which merges both: a merged view lets a caller
+	// put client_id in the query and another in the body, and whichever
+	// one the handler happens to read is a parameter-smuggling seam.
+	//
+	// The resolver-facing Form accessor stays bound to PostForm on BOTH
+	// methods. That is what keeps credentials out of URLs on the GET
+	// path: on a GET, req.Form is empty by construction, so a resolver
+	// reading req.Form("api_key") sees nothing and must fall through to
+	// a header or cookie. See registerAuthorizeRoute.
+	params := r.PostForm.Get
+	if r.Method == http.MethodGet {
+		query := r.URL.Query()
+		params = query.Get
+	}
 	postForm := r.PostForm
 	header := r.Header
 	req := &service.AuthorizeRequest{
-		ClientID:            postForm.Get("client_id"),
-		RedirectURI:         postForm.Get("redirect_uri"),
-		ResponseType:        postForm.Get("response_type"),
-		CodeChallenge:       postForm.Get("code_challenge"),
-		CodeChallengeMethod: postForm.Get("code_challenge_method"),
-		State:               postForm.Get("state"),
-		Scope:               postForm.Get("scope"),
+		ClientID:            params("client_id"),
+		RedirectURI:         params("redirect_uri"),
+		ResponseType:        params("response_type"),
+		CodeChallenge:       params("code_challenge"),
+		CodeChallengeMethod: params("code_challenge_method"),
+		State:               params("state"),
+		Scope:               params("scope"),
 		Form:                postForm.Get,
 		Header: func(name string) string {
 			return header.Get(name)
@@ -123,6 +168,19 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "code_challenge_method is required")
 		return
 	}
+	// RFC 6749 §4.1.1 makes response_type REQUIRED. Enforce it on GET: the
+	// browser leg is new surface with no back-compat obligation, and every
+	// real OAuth client sends it. POST stays lenient because CLI callers have
+	// been permitted to omit it since v1 and "code" is the only value this
+	// endpoint has ever supported, so tightening it there would break them for
+	// no security gain.
+	if r.Method == http.MethodGet && req.ResponseType == "" {
+		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
+			"response_type is required (RFC 6749 §4.1.1) and must be 'code'")
+
+		return
+	}
+
 	if req.ResponseType != "" && req.ResponseType != "code" {
 		// response_type is optional in our shape (we only support
 		// "code" anyway), but if the caller passes something else

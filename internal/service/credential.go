@@ -628,6 +628,58 @@ func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, iden
 	return int64(len(revoked)), nil
 }
 
+// RevokeAllActiveForOwner revokes every active credential belonging to an
+// identity owned by ownerUserID within accountID, cascading to any delegated
+// descendants via the parent_jti chain. Returns the total number revoked. This
+// is the offboarding primitive: when a human is deactivated in the IdP, an
+// offboarding handler calls this so every agent that person owns — and every
+// sub-agent those agents delegated to — stops working immediately rather than
+// surviving until TTL.
+//
+// Fires one RevocationNotifier event per affected JTI after the revocation
+// commits, exactly like RevokeAllActiveForIdentity, so Shield's deny-set picks
+// them up within seconds.
+//
+// Both ownerUserID and accountID are REQUIRED and rejected when empty. This is
+// a hard guard, not defensive tidiness: identities.owner_user_id is NOT NULL
+// (001_init_schema), so an ownerless identity — the documented posture for
+// `discovered` ones (identity-lifecycle.md "Ownership: relaxed for discovered
+// only") — stores the empty string. An empty ownerUserID would therefore match
+// EVERY ownerless identity in the account and cascade-revoke each one's whole
+// delegation subtree. The realistic trigger is the intended caller: an IdP
+// offboarding webhook whose user-id field arrives blank, turning "revoke one
+// departing human's agents" into a tenant-wide outage of exactly the workloads
+// nobody watches. Revocation is not reversible, so this fails closed.
+//
+// The identity-scoped sibling is protected only incidentally — its uuid cast
+// rejects "" with a 22P02 — so the guard lives here explicitly rather than
+// relying on that accident holding for a TEXT column. Mirrored in SQL by
+// migration 042 so it survives a caller that bypasses this service.
+func (s *CredentialService) RevokeAllActiveForOwner(ctx context.Context, ownerUserID, accountID, reason string) (int64, error) {
+	// Trim-aware (not just non-empty): a whitespace-only or padded owner
+	// passes == "" but matches NO stored row (ownerless identities store "";
+	// VARCHAR equality is exact), so the cascade would "succeed" with zero
+	// revocations and a broken offboarding integration would look healthy
+	// indefinitely. Malformed input fails loudly instead.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return 0, fmt.Errorf(
+			"%w: RevokeAllActiveForOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
+	}
+
+	if reason == "" {
+		reason = "owner_deactivated"
+	}
+	revoked, err := s.repo.RevokeAllActiveForOwner(ctx, ownerUserID, accountID, reason)
+	if err != nil {
+		return 0, err
+	}
+	s.dispatchRevocations(ctx, revoked, reason)
+	return int64(len(revoked)), nil
+}
+
 // dispatchRevocations maps the repository's affected-row projection into
 // RevocationEvents and hands them to the shared dispatcher. The dispatcher
 // itself owns the async/sync decision, the notifier-installed check, and the
