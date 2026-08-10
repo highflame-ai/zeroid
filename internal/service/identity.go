@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -1016,10 +1017,19 @@ type OffboardResult struct {
 // offboarding restores org membership only (ADR 0028 D6); agents are never
 // silently resurrected.
 func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accountID, reason string) (*OffboardResult, error) {
-	if ownerUserID == "" || accountID == "" {
+	// Trim-aware, not just non-empty: " " passes a == "" check, matches NO row
+	// (ownerless identities store "", and Postgres VARCHAR equality is exact),
+	// and would turn the offboarding into a silent 200 no-op — the SCIM worker
+	// records success while the departing human's fleet keeps running. A
+	// padded owner (e.g. "alice ") likewise matches nothing stored as "alice".
+	// Both are malformed events that must fail loudly (ErrInvalidOwnerArgument
+	// → 400), not read as healthy.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
 		return nil, fmt.Errorf(
-			"OffboardOwner requires a non-empty owner_user_id and account_id (got owner=%q account=%q): "+
-				"an empty owner matches every ownerless identity in the account", ownerUserID, accountID)
+			"%w: OffboardOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
 	}
 
 	if reason == "" {
@@ -1033,6 +1043,15 @@ func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accoun
 
 	result := &OffboardResult{}
 	for _, identity := range identities {
+		// A canceled caller must not burn one error log + one failure append
+		// per remaining identity on a large fleet; stop and report partial so
+		// the worker retries.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+
+			return result, fmt.Errorf("offboard interrupted after %d deactivations: %w", result.IdentitiesDeactivated, ctxErr)
+		}
+
 		if _, err := s.DeactivateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID); err != nil {
 			log.Error().Err(err).
 				Str("identity_id", identity.ID).

@@ -60,7 +60,7 @@ type IdentityIDInput struct {
 type OffboardByOwnerInput struct {
 	Body struct {
 		OwnerUserID string `json:"owner_user_id" required:"true" minLength:"1" doc:"Stable user ID of the offboarded human (identities.owner_user_id)"`
-		Reason      string `json:"reason,omitempty" doc:"Audit reason recorded on the revocations (defaults to owner_deactivated)"`
+		Reason      string `json:"reason,omitempty" maxLength:"256" doc:"Audit reason recorded on the revocations (defaults to owner_deactivated)"`
 	}
 }
 
@@ -583,7 +583,10 @@ func (a *API) offboardByOwnerOp(ctx context.Context, input *OffboardByOwnerInput
 			return nil, mapErr(err)
 		}
 		// Partially applied — the worker must retry until it gets a 200.
-		return nil, huma.Error502BadGateway(err.Error())
+		// Fixed message: the wrapped chain can carry DB driver text, and this
+		// surface's convention (mapErr) is generic client messages with
+		// details logged server-side.
+		return nil, huma.Error502BadGateway("offboarding partially applied; retry (the operation is idempotent)")
 	}
 
 	out := &OffboardByOwnerOutput{}

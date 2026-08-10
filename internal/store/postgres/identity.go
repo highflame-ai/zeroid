@@ -241,10 +241,12 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 // every one of them (the same footgun the service-layer and SQL guards on the
 // credential cascade close — see RevokeAllActiveForOwner).
 func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUserID, accountID string) ([]*domain.Identity, error) {
-	if ownerUserID == "" || accountID == "" {
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
 		return nil, fmt.Errorf(
-			"ListByOwnerForOffboard requires a non-empty owner_user_id and account_id (got owner=%q account=%q): "+
-				"an empty owner matches every ownerless identity in the account", ownerUserID, accountID)
+			"ListByOwnerForOffboard requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ownerUserID, accountID)
 	}
 
 	var identities []*domain.Identity

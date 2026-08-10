@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,14 @@ func TestOffboardOwner_RejectsEmptyOwnerAndAccount(t *testing.T) {
 		{"empty owner", "", "acct-123"},
 		{"empty account", "user-42", ""},
 		{"both empty", "", ""},
+		// Whitespace variants pass a bare == "" check but match NO stored row
+		// (ownerless identities store ""; VARCHAR equality is exact), which
+		// would turn the offboarding into a silent 200 no-op — the worst
+		// outcome for an irreversible revocation. They must be rejected too.
+		{"whitespace-only owner", " ", "acct-123"},
+		{"tab owner", "\t", "acct-123"},
+		{"padded owner", " user-42 ", "acct-123"},
+		{"padded account", "user-42", " acct-123"},
 	}
 
 	for _, tc := range tests {
@@ -63,6 +72,21 @@ func TestOffboardOwner_GuardPrecedesReasonDefault(t *testing.T) {
 	svc := &IdentityService{} // nil deps: reaching them would panic
 	if _, err := svc.OffboardOwner(context.Background(), "", "", ""); err == nil {
 		t.Fatal("expected an error when owner, account and reason are all empty")
+	}
+}
+
+// TestOffboardOwner_GuardErrorIsTyped pins that guard rejections carry
+// ErrInvalidOwnerArgument, so mapErr returns 400 (caller-fixable data bug the
+// SCIM worker must surface) rather than 500 (transient, retry forever).
+func TestOffboardOwner_GuardErrorIsTyped(t *testing.T) {
+	t.Parallel()
+
+	svc := &IdentityService{}
+	for _, owner := range []string{"", " ", " alice "} {
+		_, err := svc.OffboardOwner(context.Background(), owner, "acct-123", "owner_deactivated")
+		if !errors.Is(err, ErrInvalidOwnerArgument) {
+			t.Errorf("owner=%q: error must wrap ErrInvalidOwnerArgument; got: %v", owner, err)
+		}
 	}
 }
 
