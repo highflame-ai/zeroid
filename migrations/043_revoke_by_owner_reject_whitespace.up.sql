@@ -13,6 +13,14 @@
 -- straight to the function. Same rationale as 042: defense in depth is cheap
 -- and the failure mode is not recoverable.
 --
+-- btrim carries an explicit character set: one-argument btrim(text) strips
+-- SPACES ONLY, so 'alice\n' or a tab-padded owner would pass it — and
+-- trailing-newline artifacts from shell/file input are the classic case for
+-- exactly the direct-to-SQL callers this backstop exists for. The set below
+-- covers ASCII whitespace (space, tab, LF, CR, FF, VT); the Go guards use
+-- strings.TrimSpace, which additionally covers Unicode whitespace — the SQL
+-- backstop is deliberately the ASCII subset, not claimed as full parity.
+--
 -- Everything else — the recursive walk, CYCLE guard, depth cap 50, liveness
 -- filters on the final UPDATE only, and the RETURNING projection — is carried
 -- over from 042 verbatim. CREATE OR REPLACE keeps the signature stable, so no
@@ -31,13 +39,17 @@ CREATE OR REPLACE FUNCTION revoke_credentials_by_owner(
     expires_at  TIMESTAMPTZ
 ) AS $$
 BEGIN
-    IF p_owner_user_id IS NULL OR btrim(p_owner_user_id) = '' OR p_owner_user_id <> btrim(p_owner_user_id) THEN
+    IF p_owner_user_id IS NULL
+       OR btrim(p_owner_user_id, E' \t\n\r\f\v') = ''
+       OR p_owner_user_id <> btrim(p_owner_user_id, E' \t\n\r\f\v') THEN
         RAISE EXCEPTION
             'revoke_credentials_by_owner: p_owner_user_id must be trimmed and non-empty (an empty owner matches every ownerless identity in the account; a padded one silently matches nothing)'
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
-    IF p_account_id IS NULL OR btrim(p_account_id) = '' OR p_account_id <> btrim(p_account_id) THEN
+    IF p_account_id IS NULL
+       OR btrim(p_account_id, E' \t\n\r\f\v') = ''
+       OR p_account_id <> btrim(p_account_id, E' \t\n\r\f\v') THEN
         RAISE EXCEPTION
             'revoke_credentials_by_owner: p_account_id must be trimmed and non-empty (tenant scope is required)'
             USING ERRCODE = 'invalid_parameter_value';
