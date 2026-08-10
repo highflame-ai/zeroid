@@ -515,13 +515,12 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 
 	// client_name is REQUIRED here, though the draft only RECOMMENDS it.
 	//
-	// It is the string a human is asked to trust. Consent screens identify the
-	// application by client_name — Auth0 does exactly this, and likewise requires
-	// it non-empty for CIMD clients — so an absent one degrades the prompt to a
-	// raw URL, which is both less legible and, for a URL an attacker chose,
-	// actively misleading. The document's publisher is anonymous by construction:
-	// there is no registration and no secret, so this label is most of what
-	// consent has to go on.
+	// It is the string a human is asked to trust: a consent screen identifies the
+	// application by client_name, so an absent one degrades the prompt to a raw
+	// URL — both less legible and, for a URL an attacker chose, actively
+	// misleading. The document's publisher is anonymous by construction: there is
+	// no registration and no secret, so this label is most of what consent has to
+	// go on.
 	//
 	// We used to fall back to the client_id. That made the weakest case — a
 	// document that declined to name itself — silently indistinguishable from a

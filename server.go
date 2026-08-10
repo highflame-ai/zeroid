@@ -954,9 +954,8 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 //
 // A note on what belongs here. Middleware on this path sees /oauth2/authorize,
 // including requests from CIMD clients, which are unregistered and inherently
-// third-party. Auth0 goes as far as failing CIMD logins outright when tenant
-// extensibility is active. Treat anything registered here as
-// security-relevant on that route, and prefer to keep it to context annotation.
+// third-party. Treat anything registered here as security-relevant on that
+// route, and prefer to keep it to context annotation.
 //
 // Can be called after NewServer and before Start.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {

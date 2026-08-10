@@ -77,7 +77,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 	// secret — so this label is most of what consent has to go on. It used to
 	// fall back to the client_id, which made a document that declined to name
 	// itself indistinguishable from a well-formed one and let whoever chose the
-	// URL choose what the user reads. Auth0 requires it non-empty too.
+	// URL choose what the user reads.
 	t.Run("missing client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}}
 		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {

@@ -963,8 +963,7 @@ overrides the document.
   and a CIMD publisher is anonymous by construction, so this label is most of what
   consent has to go on. ZeroID previously fell back to the `client_id`, which made
   a document that declined to name itself indistinguishable from a well-formed one
-  and let whoever chose the URL choose what the user reads. Auth0 requires it
-  non-empty for the same reason.
+  and let whoever chose the URL choose what the user reads.
 - `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
   `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
   establish itself as confidential via `token_endpoint_auth_method` and
