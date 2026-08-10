@@ -958,6 +958,13 @@ overrides the document.
   `https`, loopback `http`, or a private-use scheme (RFC 8252 §7.1 native-app
   callbacks). Plaintext non-loopback `http` is rejected, as are userinfo and
   fragments.
+- `client_name` is **REQUIRED and non-empty** (trimmed). **This is a deviation** —
+  the draft only RECOMMENDS it. It is the string a consent screen shows the user,
+  and a CIMD publisher is anonymous by construction, so this label is most of what
+  consent has to go on. ZeroID previously fell back to the `client_id`, which made
+  a document that declined to name itself indistinguishable from a well-formed one
+  and let whoever chose the URL choose what the user reads. Auth0 requires it
+  non-empty for the same reason.
 - `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
   `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
   establish itself as confidential via `token_endpoint_auth_method` and

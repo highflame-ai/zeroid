@@ -271,6 +271,26 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 				"/oauth2/authorize is not configured on this deployment: no PrincipalResolver registered")
 			return
 		}
+		if errors.Is(err, service.ErrPrincipalInteractionRequired) {
+			// The resolver recognised this as a request a human could satisfy
+			// but found nobody signed in. Send them somewhere they can, if the
+			// deployer told us where; otherwise fall through to access_denied,
+			// because a resolver cannot conjure a login surface a deployment
+			// does not have.
+			if a.redirectToInteractiveLogin(w, r, req, resolverName) {
+				return
+			}
+
+			log.Warn().
+				Str("resolver", resolverName).
+				Str("client_id", req.ClientID).
+				Msg("resolver requested interactive authentication but no interactive login URL is configured " +
+					"(Server.SetInteractiveLoginURL); refusing as access_denied")
+			a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+				oautherror.AccessDenied, "interactive authentication required but unavailable")
+
+			return
+		}
 		// A specific resolver found its credential in the request but
 		// rejected it (wrong api_key, expired cookie, etc.). Log the
 		// resolver name + error for operators; return a generic
@@ -378,6 +398,81 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", u.String())
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusFound)
+}
+
+// redirectToInteractiveLogin sends the user agent to the deployer's login
+// surface, returning true when it handled the response.
+//
+// Returns false — leaving the caller to refuse — in the two cases where a
+// redirect is not the right answer:
+//
+//   - Not a GET. There is no user agent in a POST exchange to send anywhere; the
+//     caller is a CLI or a server posting an assertion.
+//   - No target configured. The deployment has no login surface, so there is
+//     nowhere to go.
+//
+// The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
+// copied from the inbound URL. That is deliberate: the inbound query is
+// caller-controlled and may carry anything, including a credential someone put
+// in the wrong channel, and forwarding it verbatim would hand that to the login
+// surface (and into its logs) as a side effect of a failed sign-in. Rebuilding
+// also means what comes back is exactly the request zeroid already validated.
+//
+// The target itself comes from deployer configuration, so it is not validated as
+// an open-redirect risk the way a client-supplied URI would be. It is worth
+// noting that the func receives the request, though — a deployer deriving the
+// target from request data reintroduces exactly that risk, which is why the
+// godoc on the public setter says not to.
+func (a *API) redirectToInteractiveLogin(
+	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest, resolverName string,
+) bool {
+	if r.Method != http.MethodGet || a.interactiveLoginURL == nil {
+		return false
+	}
+
+	target := a.interactiveLoginURL(req)
+	if target == "" {
+		return false
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		log.Error().Err(err).Str("target", target).
+			Msg("interactive login URL is not parseable; refusing rather than emitting a broken Location")
+
+		return false
+	}
+
+	// Rebuild the authorize request from validated fields only.
+	returnTo := url.Values{
+		"client_id":             {req.ClientID},
+		"redirect_uri":          {req.RedirectURI},
+		"response_type":         {"code"},
+		"code_challenge":        {req.CodeChallenge},
+		"code_challenge_method": {req.CodeChallengeMethod},
+	}
+	if req.State != "" {
+		returnTo.Set("state", req.State)
+	}
+
+	if req.Scope != "" {
+		returnTo.Set("scope", req.Scope)
+	}
+
+	q := u.Query()
+	q.Set("return_to", a.issuer+"/oauth2/authorize?"+returnTo.Encode())
+	u.RawQuery = q.Encode()
+
+	log.Info().
+		Str("resolver", resolverName).
+		Str("client_id", req.ClientID).
+		Msg("redirecting to interactive login")
+
+	w.Header().Set("Location", u.String())
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusFound)
+
+	return true
 }
 
 // failAuthorize reports a failure that occurred AFTER the client and

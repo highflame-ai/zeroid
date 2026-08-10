@@ -1,10 +1,13 @@
 package zeroid
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // Tests for Server.Use's chaining contract (#276).
@@ -143,5 +146,31 @@ func TestAdminAuth_StillReplaces(t *testing.T) {
 
 	if s.adminAuthState.fn() != nil {
 		t.Fatal("AdminAuth(nil) must clear the middleware")
+	}
+}
+
+// TestSetTrustedServiceValidator_NilDisables — the godoc has always said "when
+// nil (default), external principal exchange is disabled", but the setter wrapped
+// its argument unconditionally, so a nil validator became a NON-nil closure the
+// service would happily call. "Disabled" turned into a nil-deref panic on the
+// first external-principal exchange: a crash on a request path, at whatever hour
+// someone first used the feature, rather than a clear no-op.
+//
+// Asserted through Server rather than the service so the wrapper itself is what is
+// under test.
+func TestSetTrustedServiceValidator_NilDisables(t *testing.T) {
+	s := &Server{oauthSvc: &service.OAuthService{}}
+
+	s.SetTrustedServiceValidator(nil)
+
+	if s.oauthSvc.HasTrustedServiceValidator() {
+		t.Fatal("SetTrustedServiceValidator(nil) must leave NO validator — a non-nil wrapper " +
+			"around a nil func panics at request time instead of disabling the feature")
+	}
+
+	s.SetTrustedServiceValidator(func(context.Context) (string, error) { return "svc", nil })
+
+	if !s.oauthSvc.HasTrustedServiceValidator() {
+		t.Fatal("a real validator must be installed")
 	}
 }

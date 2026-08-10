@@ -375,6 +375,14 @@ func (s *OAuthService) SetTrustedServiceValidator(v trustedServiceValidatorFunc)
 	s.trustedServiceValidator = v
 }
 
+// HasTrustedServiceValidator reports whether a validator is installed, i.e.
+// whether external principal exchange is enabled. Exists so the Server-level
+// setter can be tested for the property its godoc promises — that passing nil
+// DISABLES the feature rather than installing a wrapper that panics when called.
+func (s *OAuthService) HasTrustedServiceValidator() bool {
+	return s.trustedServiceValidator != nil
+}
+
 // SetBackchannelService wires the CIBA service after construction. Two-phase
 // wiring avoids a circular dependency: BackchannelService needs CredentialService
 // (which OAuthService already has) but OAuthService also needs to dispatch into

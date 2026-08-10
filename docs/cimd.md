@@ -87,11 +87,25 @@ top-level navigation once GET is mounted.
 
 Three things a deployer must handle:
 
-* **The interaction cannot live in the resolver.** `PrincipalResolver` returns
-  `(*Principal, error)` — no `ResponseWriter`, no redirect, no way to render or
-  resume a consent screen. Do it in `Server.Use` middleware, which sees the raw
-  request and can 302 to a consent page before the handler runs; the resolver
-  then only recognises the session that flow established.
+* **The resolver starts the interaction; it does not render it.**
+  `PrincipalResolver` returns `(*Principal, error)` and has no `ResponseWriter`,
+  so it cannot render a consent screen — but it can ask for one. Return
+  `ErrPrincipalInteractionRequired` and ZeroID redirects the user agent to the
+  surface you registered with `Server.SetInteractiveLoginURL`, appending
+  `return_to` so the flow resumes at `/oauth2/authorize` once you have
+  authenticated them. Your resolver then only has to recognise the session that
+  established.
+
+  `return_to` is rebuilt from the parameters ZeroID validated, never copied from
+  the inbound URL, so nothing extraneous a caller appended — including a
+  credential in the wrong channel — is forwarded to your login surface.
+
+  Only GET is redirected: a POST caller has no user agent. With no target
+  configured the sentinel degrades to `access_denied`, because a resolver cannot
+  conjure a surface the deployment does not have.
+
+  Use `Server.Use` middleware instead if you want to own the whole interaction
+  including the 302.
 
   `Server.Use` chains, so registering the consent gate alongside whatever else
   you already use it for is safe: middleware runs in registration order, first
