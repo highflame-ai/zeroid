@@ -131,40 +131,128 @@ func TestAuthorizeGET_HappyPath(t *testing.T) {
 //
 // The handler binds the resolver-facing Form accessor to the POST body only, so
 // on a GET req.Form is empty by construction. A caller who puts the credential
-// in the URL gets 401, not a code — otherwise credentials would land in access
-// logs, browser history, and Referer headers.
+// in the URL does not get a code.
+//
+// Since #279 the shape of the refusal changed — an access_denied redirect rather
+// than a 401 JSON body — but the property did not, and the assertions here are
+// about the property: no `code` is issued, and (newly relevant now that there IS
+// a Location) the credential must not appear anywhere in it. The redirect is
+// built from the client's REGISTERED redirect_uri, never from the inbound URL,
+// so an echoed query string would be a leak straight back out to the client.
 func TestAuthorizeGET_CredentialInQueryStringIsIgnored(t *testing.T) {
+	const leakedSecret = "zid_sk_querystringleak"
+
 	query, _ := authorizeGETQuery(t)
 	// The header stub's credential in the wrong channel, plus the form stub's
 	// field names, so neither resolver can pick them up from the URL.
 	query.Set("X-Test-Principal-Account", testAccountID)
 	query.Set("test_principal_account", testAccountID)
 	query.Set("test_principal_project", testProjectID)
+	query.Set("api_key", leakedSecret)
 
 	resp := getAuthorize(t, query, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode,
+		"expected the access_denied redirect; got %d", resp.StatusCode)
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+
+	require.Empty(t, loc.Query().Get("code"),
+		"a credential in the query string must NOT authenticate the principal — no code may be issued")
+	require.Equal(t, "access_denied", loc.Query().Get("error"))
+	require.NotContains(t, resp.Header.Get("Location"), leakedSecret,
+		"the error redirect must not echo the inbound query string — that would hand the "+
+			"credential back out in a Location header")
+}
+
+// TestAuthorizeGET_NoCredentialRedirectsAccessDenied pins the distinction between
+// "you did not present a credential" and "this server is not configured".
+//
+// The first is the resource owner's failure and belongs back at the client as
+// access_denied per RFC 6749 §4.1.2.1 — the browser case a user hits by not being
+// signed in. The second is a deployer misconfiguration (empty resolver chain),
+// which stays a 503 JSON body because it is not the client's problem and there is
+// nothing useful for it to do with a redirect. The suite registers resolvers, so
+// the empty-chain sentinel must not fire here.
+func TestAuthorizeGET_NoCredentialRedirectsAccessDenied(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+	query.Set("state", "no-credential-state")
+
+	resp := getAuthorize(t, query, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	require.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.Equal(t, "access_denied", loc.Query().Get("error"))
+	require.NotEmpty(t, loc.Query().Get("error_description"))
+	require.Equal(t, "no-credential-state", loc.Query().Get("state"),
+		"state must round-trip on the error path — it is the client's correlation handle")
+	require.Empty(t, loc.Query().Get("code"))
+}
+
+// TestAuthorizePOST_NoCredentialStaysJSON is the other half of the #279 gate. The
+// POST caller is not a browser: it is a CLI, or a surface like Studio that
+// authenticated the user itself and posts an RFC 7523 assertion. It has parsed
+// JSON errors since v1 and there is no user agent in the exchange to redirect, so
+// redirecting would break it for no benefit.
+func TestAuthorizePOST_NoCredentialStaysJSON(t *testing.T) {
+	form, _ := authorizeBaseForm(t)
+	form.Del("test_principal_account") // no credential any resolver recognises
+
+	resp := postAuthorize(t, form)
 	defer func() { _ = resp.Body.Close() }()
 
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
-		"a credential in the query string must NOT authenticate the principal; "+
-			"got %d — credentials would be leaking into URLs", resp.StatusCode)
-	require.Empty(t, resp.Header.Get("Location"),
-		"no authorization code may be issued for a query-string credential")
-}
-
-// TestAuthorizeGET_NoCredentialIs401 pins the distinction between "you did not
-// present a credential" (401) and "this server is not configured" (503). The
-// suite registers resolvers, so the empty-chain sentinel must not fire here.
-func TestAuthorizeGET_NoCredentialIs401(t *testing.T) {
-	query, _ := authorizeGETQuery(t)
-
-	resp := getAuthorize(t, query, nil)
-	defer func() { _ = resp.Body.Close() }()
-
-	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		"POST must keep the JSON error body; redirecting it would break CLI and "+
+			"assertion-posting callers")
+	require.Empty(t, resp.Header.Get("Location"))
 
 	var body map[string]string
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	require.Equal(t, "invalid_client", body["error"])
+}
+
+// TestAuthorizeGET_UnknownClientStaysJSON pins the §4.1.2.1 exemption. An invalid
+// client_id must NOT redirect: we have no validated redirect_uri, so any target
+// would be attacker-supplied and the "fix" would be an open redirect.
+func TestAuthorizeGET_UnknownClientStaysJSON(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+	query.Set("client_id", "no-such-client-9f43b1c2")
+
+	resp := getAuthorize(t, query, principalHeaders())
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Empty(t, resp.Header.Get("Location"),
+		"an unknown client_id must never produce a redirect — the redirect_uri is unvalidated")
+
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Equal(t, "invalid_client", body["error"])
+}
+
+// TestAuthorizeGET_UnregisteredRedirectURIStaysJSON is the second §4.1.2.1
+// exemption, and the more dangerous one: redirecting to a redirect_uri the client
+// never registered is precisely the attack the allow-list exists to stop.
+func TestAuthorizeGET_UnregisteredRedirectURIStaysJSON(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+	query.Set("redirect_uri", "https://evil.example/steal")
+
+	resp := getAuthorize(t, query, principalHeaders())
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Empty(t, resp.Header.Get("Location"),
+		"an unregistered redirect_uri must never be redirected to")
+
+	var body map[string]string
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.Contains(t, body["error_description"], "redirect_uri")
 }
 
 // TestAuthorizeGET_MissingRequiredParam keeps the field gate working when the

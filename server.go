@@ -41,12 +41,55 @@ import (
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
-// middlewareHolder stores an optional middleware in a thread-safe way.
-// The middleware closure is registered at router-build time; the actual function
-// is set later (before Start) via a setter method.
+// middlewareHolder stores optional middleware in a thread-safe way.
+// The middleware closure is registered at router-build time; the actual
+// functions are set later (before Start) via a setter method.
+//
+// fns is a slice, not a single slot, so Server.Use can APPEND. A single slot
+// meant a second Use call silently discarded the first — see Server.Use.
+// adminAuthState still only ever holds one entry, set through fn().
 type middlewareHolder struct {
-	mu sync.RWMutex
-	fn func(http.Handler) http.Handler
+	mu  sync.RWMutex
+	fns []func(http.Handler) http.Handler
+}
+
+// fn returns the single registered middleware, or nil. For holders that only
+// ever carry one (adminAuthState), which is set by replacing the slice.
+func (h *middlewareHolder) fn() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.fns) == 0 {
+		return nil
+	}
+
+	return h.fns[0]
+}
+
+// chain returns the registered middleware composed so the FIRST registered is
+// outermost, matching chi and net/http convention. Nil when none are set.
+//
+// Composed per call rather than cached because Use is documented as callable
+// after NewServer, and the router closure reads this on every request.
+func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	fns := make([]func(http.Handler) http.Handler, len(h.fns))
+	copy(fns, h.fns)
+	h.mu.RUnlock()
+
+	if len(fns) == 0 {
+		return nil
+	}
+
+	return func(next http.Handler) http.Handler {
+		// Wrap in reverse so fns[0] ends up outermost.
+		h := next
+		for i := len(fns) - 1; i >= 0; i-- {
+			h = fns[i](h)
+		}
+
+		return h
+	}
 }
 
 // Server is the main ZeroID server.
@@ -423,11 +466,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// without blocking unauthenticated callers.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			globalMW.mu.RLock()
-			mw := globalMW.fn
-			globalMW.mu.RUnlock()
-			if mw != nil {
+			if mw := globalMW.chain(); mw != nil {
 				mw(next).ServeHTTP(w, req)
+
 				return
 			}
 			next.ServeHTTP(w, req)
@@ -474,11 +515,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				authState.mu.RLock()
-				auth := authState.fn
-				authState.mu.RUnlock()
-				if auth != nil {
+				if auth := authState.fn(); auth != nil {
 					auth(next).ServeHTTP(w, req)
+
 					return
 				}
 				next.ServeHTTP(w, req)
@@ -872,10 +911,19 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
+// Calling it again REPLACES the previous middleware — admin auth is one
+// decision, not a stack. Passing nil removes it.
 func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 	s.adminAuthState.mu.Lock()
 	defer s.adminAuthState.mu.Unlock()
-	s.adminAuthState.fn = middleware
+
+	if middleware == nil {
+		s.adminAuthState.fns = nil
+
+		return
+	}
+
+	s.adminAuthState.fns = []func(http.Handler) http.Handler{middleware}
 }
 
 // Use adds a global middleware that runs on ALL routes (public + admin).
@@ -886,11 +934,29 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 // trusted service identity from headers so that TrustedServiceValidator can read it
 // during external principal token exchange.
 //
+// Calling it more than once APPENDS. Middleware runs in registration order, so
+// the first registered is outermost — the same convention as chi and net/http.
+// It used to replace instead, which silently discarded everything but the last
+// registration: a deployer who added a second concern lost the first with no
+// error, and since the slot is typically already occupied (annotating trusted
+// service identity, say) the loss landed on whatever was registered first
+// (#276).
+//
+// A note on what belongs here. Middleware on this path sees /oauth2/authorize,
+// including requests from CIMD clients, which are unregistered and inherently
+// third-party. Auth0 goes as far as failing CIMD logins outright when tenant
+// extensibility is active. Treat anything registered here as
+// security-relevant on that route, and prefer to keep it to context annotation.
+//
 // Can be called after NewServer and before Start.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {
+	if middleware == nil {
+		return
+	}
+
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
-	s.globalMWState.fn = middleware
+	s.globalMWState.fns = append(s.globalMWState.fns, middleware)
 }
 
 // SetAuthorizationCodeAvailable overrides ZeroID's guess about whether

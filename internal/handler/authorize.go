@@ -234,6 +234,26 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── Step 3.5: resolve the client, validate redirect_uri ──────────
+	// Deliberately BEFORE principal resolution, which is the whole point.
+	// RFC 6749 §4.1.2.1 exempts exactly two failures from being redirected —
+	// an invalid client_id and a missing/unregistered redirect_uri — because
+	// redirecting either would be the vulnerability rather than the fix. Both
+	// are decided here, and both stay JSON.
+	//
+	// Everything after this point has a redirect_uri the client registered, so
+	// it can be reported the way the spec wants: a 302 carrying error + state.
+	// Running this after the resolver, as v1 did, is what made access_denied
+	// unreportable — see the header comment.
+	oauthClient, err := a.oauthSvc.ResolveAuthorizeClient(r.Context(), req.ClientID, req.RedirectURI)
+	if err != nil {
+		code, description, status := extractOAuthError(err)
+		log.Warn().Err(err).Str("client_id", req.ClientID).Msg("/oauth2/authorize client validation failed")
+		writeAuthorizeError(w, status, code, description)
+
+		return
+	}
+
 	// ── Step 4: principal resolution ─────────────────────────────────
 	// The resolvePrincipal callback is wired unconditionally by
 	// Server.NewServer (it's a method bound to the server's resolver
@@ -261,17 +281,25 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 			Str("resolver", resolverName).
 			Str("client_id", req.ClientID).
 			Msg("principal resolver rejected request")
-		writeAuthorizeError(w, http.StatusUnauthorized, oautherror.InvalidClient,
-			"credential rejected")
+		// access_denied, not invalid_client: the client is fine — we resolved
+		// it at step 3.5 — it is the RESOURCE OWNER whose credential failed,
+		// which is exactly what RFC 6749 §4.1.2.1 defines access_denied for.
+		// The old invalid_client blamed the wrong party.
+		a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+			oautherror.AccessDenied, "credential rejected")
+
 		return
 	}
 	if principal == nil {
-		// Every registered resolver returned ErrPrincipalNotApplicable —
-		// the caller didn't supply a credential any resolver
-		// recognized. 401 with a hint that points at the deployer-
-		// chosen credential names is the most useful response.
-		writeAuthorizeError(w, http.StatusUnauthorized, oautherror.InvalidClient,
+		// Every registered resolver returned ErrPrincipalNotApplicable — the
+		// caller didn't supply a credential any resolver recognized. On a
+		// browser GET this is the ordinary "you are not signed in" case, so it
+		// redirects as access_denied; on POST the JSON hint naming the
+		// deployer-chosen credential fields is more useful to a CLI author.
+		a.failAuthorize(w, r, req, http.StatusUnauthorized, oautherror.InvalidClient,
+			oautherror.AccessDenied,
 			"no applicable credential — request did not match any registered principal resolver")
+
 		return
 	}
 
@@ -290,6 +318,9 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── Step 6: mint via service ─────────────────────────────────────
+	// Client is the one resolved at step 3.5, so IssueAuthCode skips the
+	// lookup and the redirect_uri allow-list rather than repeating them —
+	// one resolution per request, and one place that decides the policy.
 	code, err := a.oauthSvc.IssueAuthCode(r.Context(), service.IssueAuthCodeRequest{
 		ClientID:            req.ClientID,
 		RedirectURI:         req.RedirectURI,
@@ -300,6 +331,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
 		Scopes:              scopes,
+		Client:              oauthClient,
 	})
 	if err != nil {
 		log.Warn().
@@ -309,7 +341,8 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 			Str("account_id", principal.AccountID).
 			Msg("IssueAuthCode rejected request")
 		errCode, desc, status := extractOAuthError(err)
-		writeAuthorizeError(w, status, errCode, desc)
+		a.failAuthorize(w, r, req, status, errCode, errCode, desc)
+
 		return
 	}
 
@@ -347,8 +380,76 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
-// writeAuthorizeError emits an RFC 6749 §5.2 JSON error body. Used for
-// all error paths at /oauth2/authorize in v1 (no redirect-with-error).
+// failAuthorize reports a failure that occurred AFTER the client and
+// redirect_uri were validated at step 3.5 — so, unlike the earlier gates, it has
+// somewhere safe to send the caller.
+//
+// On GET it redirects per RFC 6749 §4.1.2.1: 302 to the registered redirect_uri
+// with error, error_description and the caller's state. That is the only shape a
+// browser-driven client can act on; a JSON body leaves the user staring at a raw
+// error while the client waits on a callback that never arrives.
+//
+// On POST it keeps the JSON body. The POST caller is not a browser — it is a CLI
+// or a server-side surface that authenticated the user itself and posts a
+// credential (an RFC 7523 assertion, say), and it has parsed JSON errors since
+// v1. Redirecting those would break them for no benefit, and there is no user
+// agent in that exchange to redirect anyway.
+//
+// jsonCode vs redirectCode: the wire code sometimes has to differ between the
+// two shapes. A failed resolver is invalid_client to a programmatic POST caller
+// (that is the vocabulary §5.2 gives it) but access_denied on the browser leg,
+// where the client is fine and it is the resource owner who could not be
+// authenticated. Passing both keeps each channel accurate instead of forcing one
+// vocabulary onto the other.
+//
+// state is echoed only when the caller sent one. §4.1.2.1 requires it back
+// exactly if it was sent, and it is the client's CSRF and correlation handle —
+// dropping it on the error path is how a client ends up unable to match the
+// failure to the request that caused it.
+func (a *API) failAuthorize(
+	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
+	status int, jsonCode, redirectCode, description string,
+) {
+	if r.Method != http.MethodGet {
+		writeAuthorizeError(w, status, jsonCode, description)
+
+		return
+	}
+
+	u, err := url.Parse(req.RedirectURI)
+	if err != nil {
+		// Unreachable in practice: ResolveAuthorizeClient matched this against
+		// the client's registered list, which means it parsed. If it somehow
+		// does not now, fall back to JSON rather than emit a broken Location —
+		// never guess at a redirect target.
+		log.Error().Err(err).Str("redirect_uri", req.RedirectURI).
+			Msg("validated redirect_uri failed url.Parse on the error path")
+		writeAuthorizeError(w, status, jsonCode, description)
+
+		return
+	}
+
+	q := u.Query()
+	q.Set("error", redirectCode)
+	q.Set("error_description", description)
+
+	if req.State != "" {
+		q.Set("state", req.State)
+	}
+
+	u.RawQuery = q.Encode()
+
+	w.Header().Set("Location", u.String())
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusFound)
+}
+
+// writeAuthorizeError emits an RFC 6749 §5.2 JSON error body. Used for every
+// failure decided BEFORE the client and redirect_uri are validated — the
+// availability gate, the parse error, the required-field gate, and client
+// validation itself — because §4.1.2.1 exempts exactly those from being
+// redirected: with no validated redirect_uri, a redirect would be an open
+// redirect. Failures after that point go through failAuthorize.
 // Cache-Control: no-store per RFC 6749 §5.1 to prevent intermediary
 // caches from holding error responses tied to credential state.
 func writeAuthorizeError(w http.ResponseWriter, status int, code, description string) {

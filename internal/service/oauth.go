@@ -1476,6 +1476,91 @@ type IssueAuthCodeRequest struct {
 	// resolver-side narrowing"; the client's full registered scope
 	// surface is encoded.
 	Scopes []string
+
+	// Client is an already-resolved OAuth client, as returned by
+	// ResolveAuthorizeClient. Optional. When non-nil, IssueAuthCode skips
+	// its own registry/CIMD lookup, its client-state gate and the
+	// redirect_uri allow-list, because ResolveAuthorizeClient has already
+	// applied all three to this exact (ClientID, RedirectURI) pair.
+	//
+	// This exists so the /oauth2/authorize handler can validate the client
+	// and redirect_uri BEFORE resolving the principal, which is what lets it
+	// redirect later failures back to the client per RFC 6749 §4.1.2.1
+	// instead of answering JSON (#279). Leaving it nil preserves the
+	// original behaviour exactly, for programmatic callers that have no
+	// reason to split the two steps.
+	//
+	// A caller that sets this MUST pass the same ClientID and RedirectURI it
+	// resolved with; IssueAuthCode re-checks that they match and refuses
+	// otherwise, so a mismatch cannot smuggle an unvalidated redirect_uri
+	// past the allow-list.
+	Client *domain.OAuthClient
+}
+
+// ResolveAuthorizeClient resolves an authorization request's client and checks
+// its redirect_uri against that client's registered list. It is the first half
+// of IssueAuthCode's validation, split out so a caller can run it EARLY.
+//
+// Why split it. RFC 6749 §4.1.2.1 wants most /oauth2/authorize failures
+// redirected back to the client as error + state, and exempts exactly the two
+// cases where redirecting would itself be the vulnerability: an invalid
+// client_id, and a missing or unregistered redirect_uri. A handler therefore
+// cannot redirect anything until it has established both — and inside
+// IssueAuthCode that happens after principal resolution has already run and
+// failed. Calling this first gives the caller a validated redirect_uri to send
+// later errors to. See #279.
+//
+// The checks, in order, and each one's error:
+//
+//  1. Client lookup — registry first, CIMD fallback (resolveClientRegistryOrCIMD,
+//     one shared policy). A registry row wins whether active or not, so
+//     deactivation stays a kill switch and cannot fall through to CIMD.
+//  2. Client state — issuance is restricted to ACTIVE PUBLIC clients (the
+//     pre-CIMD GetPublicClient contract): 401 invalid_client. A confidential
+//     client cannot obtain a code here.
+//  3. Grant-type allow-list — 400 unauthorized_client.
+//  4. Redirect-URI allow-list — 400 invalid_request. normalizeLoopback handles
+//     the 127.0.0.1 ↔ localhost equivalence (RFC 8252 §7.3) so native-app CLI
+//     clients are not tripped up by the form their loopback URI takes.
+//
+// Every failure returns an *OAuthError carrying the same status and code
+// IssueAuthCode has always returned for it, so a caller that only reorders when
+// these run does not change any response.
+//
+// Callers that do not need the split should leave IssueAuthCodeRequest.Client
+// nil and let IssueAuthCode call this itself.
+func (s *OAuthService) ResolveAuthorizeClient(
+	ctx context.Context, clientID, redirectURI string,
+) (*domain.OAuthClient, error) {
+	oauthClient, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, clientID)
+	switch {
+	case err == nil:
+		if !viaCIMD && (!oauthClient.IsActive || oauthClient.ClientType != "public") {
+			return nil, oauthUnauthorized("unknown or inactive client_id", nil)
+		}
+	case viaCIMD:
+		return nil, cimdOAuthError(err)
+	case errors.Is(err, ErrOAuthClientNotFound):
+		return nil, oauthUnauthorized("unknown or inactive client_id", err)
+	default:
+		return nil, oauthServerError("failed to resolve client for authorization_code issuance", err)
+	}
+
+	// Same check authorizationCode runs at exchange — applied here too so a
+	// client without the grant cannot even obtain a code.
+	if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
+		return nil, oauthBadRequest(oautherror.UnauthorizedClient,
+			"client is not authorized for authorization_code grant")
+	}
+
+	// The redirect_uri must be one the client pre-registered, otherwise an
+	// attacker who steals a code could redirect it to their own callback.
+	if !redirectURIAllowed(redirectURI, oauthClient.RedirectURIs) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"redirect_uri is not in the client's registered list")
+	}
+
+	return oauthClient, nil
 }
 
 // IssueAuthCode is the upstream half of the OAuth 2.0 + PKCE
@@ -1564,43 +1649,21 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", oauthServerError("authorization_code issuance requires HMAC secret to be configured", nil)
 	}
 
-	// Client lookup — registry first, CIMD fallback (one shared policy, see
-	// resolveClientRegistryOrCIMD). No secret is required because PKCE provides
-	// the proof of possession at exchange time. Issuance is restricted to
-	// ACTIVE PUBLIC clients (the pre-CIMD GetPublicClient contract): a
-	// confidential client cannot obtain a code here, and a deactivated or
-	// non-public registry row is rejected rather than falling through to CIMD.
-	oauthClient, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
-	switch {
-	case err == nil:
-		if !viaCIMD && (!oauthClient.IsActive || oauthClient.ClientType != "public") {
-			return "", oauthUnauthorized("unknown or inactive client_id", nil)
+	// Client + redirect_uri validation. Either the caller already did it via
+	// ResolveAuthorizeClient and handed us the result, or we do it here — the
+	// checks are identical because both paths run the same function.
+	oauthClient := req.Client
+	if oauthClient == nil {
+		var err error
+		if oauthClient, err = s.ResolveAuthorizeClient(ctx, req.ClientID, req.RedirectURI); err != nil {
+			return "", err
 		}
-	case viaCIMD:
-		return "", cimdOAuthError(err)
-	case errors.Is(err, ErrOAuthClientNotFound):
-		return "", oauthUnauthorized("unknown or inactive client_id", err)
-	default:
-		return "", oauthServerError("failed to resolve client for authorization_code issuance", err)
-	}
-
-	// Grant-type allow-list. Same check that authorizationCode runs at
-	// exchange — applied here too so a client without the grant cannot
-	// even obtain a code, not just fail at exchange.
-	if !slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeAuthorizationCode)) {
-		return "", oauthBadRequest(oautherror.UnauthorizedClient,
-			"client is not authorized for authorization_code grant")
-	}
-
-	// Redirect-URI allow-list. The redirect_uri the caller supplies
-	// must be one the client pre-registered, otherwise an attacker
-	// who steals a code could redirect it to their own callback.
-	// normalizeLoopback handles the 127.0.0.1 ↔ localhost equivalence
-	// (RFC 8252 §7.3) so native-app CLI clients aren't tripped up by
-	// the form their loopback URI takes.
-	if !redirectURIAllowed(req.RedirectURI, oauthClient.RedirectURIs) {
-		return "", oauthBadRequest(oautherror.InvalidRequest,
-			"redirect_uri is not in the client's registered list")
+	} else if oauthClient.ClientID != req.ClientID {
+		// A pre-resolved client must be the one these parameters were validated
+		// against. Without this, a caller could resolve a permissive client and
+		// then issue against a different client_id, and the redirect_uri
+		// allow-list it satisfied would be the wrong client's.
+		return "", oauthServerError("pre-resolved client does not match request client_id", nil)
 	}
 
 	// Scope intersection: the issued code can never authorize a scope
