@@ -306,6 +306,15 @@ func runTests(m *testing.M) int {
 		return "", fmt.Errorf("caller is not a trusted service")
 	})
 
+	// Header-based stub for the GET leg. The form-field stub below cannot
+	// serve GET at all: the handler binds AuthorizeRequest.Form to the POST
+	// body only, so on a GET req.Form is empty by construction — that IS the
+	// property keeping credentials out of URLs. A GET-capable resolver must
+	// therefore read headers, which is exactly what deployers are told to do.
+	//
+	// Registered FIRST so it wins when both are present; it declines (returns
+	// ErrPrincipalNotApplicable) whenever its header is absent, so the
+	// form-field stub still serves every POST test unchanged.
 	srv.RegisterPrincipalResolver("test-header-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		acct := req.Header("X-Test-Principal-Account")
 		if acct == "" {
@@ -330,15 +339,9 @@ func runTests(m *testing.M) int {
 	//   test_principal_user    → UserID
 	//   test_principal_reject  → "true" returns a non-sentinel error
 	//   (anything else)        → ErrPrincipalNotApplicable
-	// Header-based stub for the GET leg. The form-field stub below cannot
-	// serve GET at all: the handler binds AuthorizeRequest.Form to the POST
-	// body only, so on a GET req.Form is empty by construction — that IS the
-	// property keeping credentials out of URLs. A GET-capable resolver must
-	// therefore read headers, which is exactly what deployers are told to do.
 	//
-	// Registered FIRST so it wins when both are present; it declines (returns
-	// ErrPrincipalNotApplicable) whenever its header is absent, so the
-	// form-field stub still serves every POST test unchanged.
+	// Registered second, after the header stub above; it reads req.Form, so
+	// it is POST-only by construction and declines every GET.
 	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		if req.Form("test_principal_reject") == "true" {
 			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")
