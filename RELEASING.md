@@ -39,7 +39,7 @@ make next-version
 
 ## When you change pkg/dpop/
 
-If you've modified anything under `pkg/dpop/`, **cut a new pkg/dpop release first**, BEFORE the next zeroid release:
+If you've modified **Go build inputs** under `pkg/dpop/` — any `*.go` (tests included), `go.mod`, or `go.sum` — **cut a new pkg/dpop release first**, BEFORE the next zeroid release:
 
 ```bash
 # 1. Cut a new pkg/dpop release (tags pkg/dpop/vX.Y.Z + opens a PR
@@ -56,7 +56,8 @@ make release-dpop VERSION=v1.6.1
 If you skip step 1-2 and try to cut a zeroid release directly, `release.yml`'s drift guard fails with a clear error:
 
 ```
-::error::pkg/dpop/ source has drifted from pkg/dpop/v1.6.0 but go.mod still references it.
+::error::pkg/dpop/ build inputs have drifted from pkg/dpop/v1.6.0 but go.mod still references it:
+::error::  pkg/dpop/verifier.go
 ::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop v1.6.0, while
 ::error::in-repo tests passed against the NEW local source. Silent regression risk.
 ::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update
@@ -66,6 +67,29 @@ If you skip step 1-2 and try to cut a zeroid release directly, `release.yml`'s d
 ```
 
 This is the safety net — you can't silently ship a zeroid binary built against a different pkg/dpop than what consumers will resolve from the proxy.
+
+### Docs-only changes under pkg/dpop/ do not block a release
+
+A change to `pkg/dpop/README.md` (or anything else that isn't a Go build input)
+is **reported as a warning and does not fail the release**:
+
+```
+::warning::pkg/dpop/ has non-build drift from pkg/dpop/v1.6.0 (docs only — not blocking this release):
+::warning::  pkg/dpop/README.md
+::warning::pkg.go.dev serves these from the pinned tag, so they stay stale until the next
+::warning::pkg/dpop release. Fold a version bump in when convenient.
+```
+
+The drift is real — pkg.go.dev renders the README from the pinned tag, so the
+correction isn't visible to consumers until the next genuine `pkg/dpop` release —
+but it cannot corrupt a binary, so it doesn't get a veto over shipping. Fold a
+`make release-dpop` in when convenient.
+
+This scoping exists because the guard used to diff all of `pkg/dpop/`. A one-line
+README correction (#176) consequently blocked **every** zeroid release: v1.8.6 and
+v1.8.7 both failed here and published nothing, so two releases were silently
+un-shipped by a prose edit. A tripwire that halts the release train over docs is
+one people learn to route around, which costs more than the drift it was watching.
 
 ---
 

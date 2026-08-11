@@ -109,6 +109,31 @@ jobs:
       # the pinned tag) while in-repo tests passed against the NEW
       # local source — a silent regression. Fail loudly instead.
       #
+      # Scoped to files that can actually cause that regression: *.go,
+      # go.mod, go.sum. The hazard this guard exists for is a BINARY
+      # built against different code than consumers resolve from the
+      # proxy, and only Go build inputs can produce it.
+      #
+      # *_test.go is deliberately left in the blocking set even though
+      # it never reaches a binary. It is still published module source,
+      # a divergence there means pkg/dpop changed materially, and "any
+      # .go file means cut a pkg/dpop release" is a rule a maintainer
+      # can hold in their head. Cheap conservatism on a rare case.
+      #
+      # It used to diff all of pkg/dpop/, which meant a one-line
+      # README correction (#176, pkg/dpop/README.md) blocked EVERY
+      # zeroid release until someone cut a pkg/dpop version for it.
+      # v1.8.6 and v1.8.7 both failed here and published nothing —
+      # two releases silently un-shipped by a docs edit. A tripwire
+      # that halts the release train over prose is a tripwire people
+      # learn to route around, which costs more than the drift it
+      # was watching for.
+      #
+      # Non-build drift is still REPORTED, just not fatal: it's real
+      # (pkg.go.dev serves the README from the pinned tag, so docs lag
+      # until the next genuine pkg/dpop release) but it cannot corrupt
+      # a binary, so it does not get a veto over shipping.
+      #
       # pkg/authjwt is NOT checked because it's imported only from
       # tests/integration. Go does not follow test imports across
       # module boundaries, so its version reference (currently
@@ -132,15 +157,34 @@ jobs:
             echo "::error::Either fix go.mod to reference an existing pkg/dpop tag, or run release-dpop.yml."
             exit 1
           fi
-          if ! git diff --quiet "${TAG}" -- pkg/dpop/; then
-            echo "::error::pkg/dpop/ source has drifted from ${TAG} but go.mod still references it."
+
+          # Build inputs only — these are what a shipped binary is made of.
+          # Git pathspec wildcards cross '/' by default (unlike shell globs), so
+          # 'pkg/dpop/*.go' also covers any future subpackage. Verified against
+          # a nested pkg/dpop/internal/sub/x.go.
+          BUILD_PATHS=('pkg/dpop/*.go' 'pkg/dpop/go.mod' 'pkg/dpop/go.sum')
+          BUILD_DRIFT=$(git diff --name-only "${TAG}" -- "${BUILD_PATHS[@]}")
+          # Everything else under pkg/dpop/ (README, docs, examples).
+          OTHER_DRIFT=$(git diff --name-only "${TAG}" -- pkg/dpop/ \
+            "${BUILD_PATHS[@]/#/:(exclude)}")
+
+          if [[ -n "${BUILD_DRIFT}" ]]; then
+            echo "::error::pkg/dpop/ build inputs have drifted from ${TAG} but go.mod still references it:"
+            while IFS= read -r f; do echo "::error::  ${f}"; done <<< "${BUILD_DRIFT}"
             echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
             echo "::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update zeroid/go.mod's reference:"
             echo "::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>"
             echo "::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release."
             exit 1
           fi
-          echo "✓ pkg/dpop/ source matches ${TAG} — safe to release"
+
+          if [[ -n "${OTHER_DRIFT}" ]]; then
+            echo "::warning::pkg/dpop/ has non-build drift from ${TAG} (docs only — not blocking this release):"
+            while IFS= read -r f; do echo "::warning::  ${f}"; done <<< "${OTHER_DRIFT}"
+            echo "::warning::pkg.go.dev serves these from the pinned tag, so they stay stale until the next pkg/dpop release. Fold a version bump in when convenient: make release-dpop VERSION=<next-dpop-vX.Y.Z>"
+          fi
+
+          echo "✓ pkg/dpop/ build inputs match ${TAG} — safe to release"
 
   tag-submodules:
     needs:
