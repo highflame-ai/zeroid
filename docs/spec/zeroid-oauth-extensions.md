@@ -1000,6 +1000,13 @@ Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, 
 error redirection applies again. The discriminator is registration provenance
 (`registration_source`), not the CIMD mechanism.
 
+`allowed_domains` is deployment-wide, with no tenant dimension, so this
+re-enablement is meaningful only where the deployment serves a single tenant. A
+multi-tenant deployment cannot scope it per `(account_id, project_id)` — and the
+tenant is unknown at the point a CIMD document is resolved, since resolution
+precedes principal resolution by design (Section 12.5's whole premise). See
+zeroid#286.
+
 ### 12.6 Caching
 
 Outcomes are memoised in a bounded in-memory cache (1000 entries, evicted on

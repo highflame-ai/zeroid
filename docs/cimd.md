@@ -97,10 +97,18 @@ interactive-login redirect is refused for them too — an unvetted client does n
 get to borrow your login surface's credibility.
 
 The cost is real and worth naming: a browser-driven CIMD client cannot learn its
-error from the callback and has to read the JSON body. **Setting
-`cimd.allowed_domains` restores the redirect**, because vetting which hosts may
+error from the callback and has to read the JSON body. Setting
+`cimd.allowed_domains` restores the redirect, because vetting which hosts may
 publish restores the assumption §4.1.2.1 is built on. The gate is provenance, not
 CIMD.
+
+**That hatch only works on a single-tenant deployment.** `allowed_domains` is one
+deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
+cannot express one customer's policy, and setting it accepts one customer's
+publishers on behalf of all of them. There it is effectively all-or-nothing, which
+in practice means CIMD clients do not get error redirects. Tracked in zeroid#286;
+the tenant is not even known at the point CIMD resolves, so this is a design
+question rather than a missing config field.
 
 Three things a deployer must handle:
 
