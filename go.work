@@ -7,12 +7,10 @@
 // versions (required for downstream `go get` resolution) without
 // breaking the in-repo dev loop.
 //
-// pkg/authjwt is also covered by a `replace ./pkg/authjwt` directive in
-// zeroid/go.mod. That replace is redundant with this workspace for the
-// common dev path, but keeps `GOWORK=off` builds working (some CI
-// matrix variants disable workspace mode). pkg/dpop has no such
-// replace — its version reference in zeroid/go.mod is a real
-// published version (decoupled release cadence via release-dpop.yml).
+// Both nested modules also have `replace => ./pkg/...` in zeroid/go.mod
+// so GOWORK=off paths (Docker layer cache `go mod download`, some CI)
+// use local source. Downstream consumers ignore those replaces; the
+// require pins remain the published versions (pkg/dpop via release-dpop).
 //
 // Releases: see RELEASING.md. Normal zeroid release is just "click
 // Publish in UI" — no version-bumping ceremony required because
