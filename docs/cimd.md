@@ -63,12 +63,15 @@ to carry application state only. ZeroID round-trips it verbatim when present and
 does not require it. It is shown because most clients have somewhere to return
 the user to.
 
-**The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
-ship.** A browser cannot set a custom header on a top-level navigation, and the
-resolver-facing `Form` accessor is bound to the POST body, so a resolver that
-reads `req.Form(...)` sees nothing on a GET.
+**Serving the browser leg *directly* at `/oauth2/authorize` needs a GET-capable
+`PrincipalResolver`, which ZeroID does not ship.** A browser cannot set a custom
+header on a top-level navigation, and the resolver-facing `Form` accessor is
+bound to the POST body, so a resolver that reads `req.Form(...)` sees nothing on
+a GET.
 
-There are two ways to supply it, and the second is usually the better one:
+Direct access is not the only shape, though. There are two ways to connect the
+browser leg, and the second — which needs no GET-capable resolver at all — is
+usually the better one:
 
 1. **Register a cookie-reading resolver** (`req.Cookie(...)`) and own the login
    and consent screens behind it. This makes `/oauth2/authorize` itself the
@@ -81,22 +84,36 @@ There are two ways to supply it, and the second is usually the better one:
    and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
    reads — an RFC 7523 assertion signed by that surface, say, verified against
    its published JWKS. The browser never reaches this endpoint, so no GET-capable
-   resolver is needed and the CSRF exposure does not arise: the caller is your
-   own server, not a navigation.
+   resolver is needed.
+
+   What route 2 does **not** remove is authorization-request CSRF — it moves it
+   to your surface. An attacker can still navigate a victim's browser to that
+   surface with an attacker-published `client_id`; if it authenticates from a
+   `SameSite=Lax` session cookie and mints the assertion without further
+   interaction, the same code is issued for the victim, one hop earlier. The
+   CSRF-protected interaction — an explicit consent gesture behind an
+   anti-forgery token — has to happen at the fronting surface before the
+   assertion is minted. What the route removes is the exposure at
+   `/oauth2/authorize` itself, which is no longer reachable by navigation.
 
 Highflame's own deployment takes route 2 — Studio authenticates the user, mints
 an assertion, and POSTs; AuthN's assertion resolver verifies it and ZeroID mints
-the code. Route 1 exists for deployers with no such surface. Either way ZeroID
-stays the engine: it validates the CIMD document, enforces the `redirect_uri`
-allow-list, and issues the code.
+the code. (For MCP clients specifically that routing is in flight: today Studio
+mints their codes locally with its own CIMD check, and highflame-studio#1392
+brings them back through this path.) Route 1 exists for deployers with no such
+surface. Either way ZeroID stays the engine: it validates the CIMD document,
+enforces the `redirect_uri` allow-list, and issues the code.
 
 **ZeroID cannot detect this for you.** Its AS metadata omits the
 `authorization_code` grant when *no* resolver is registered, but it cannot
 introspect what a registered resolver reads — so a deployment whose resolvers are
-all form-based advertises the grant and then 401s every browser redirect. If that
-is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })`
-until a GET-capable resolver exists; otherwise the metadata promises a flow the
+all form-based *and* has no fronting surface advertises the grant and then 401s
+every browser redirect. If that is you, call
+`Server.SetAuthorizationCodeAvailable(func() bool { return false })` until one of
+the two routes above exists; otherwise the metadata promises a flow the
 endpoint cannot finish, which is exactly the failure this is meant to prevent.
+(A route-2 deployment is fine as-is: its form-based resolver *is* the browser
+leg's back end, fed by the surface.)
 
 A `false` answer turns the flow **off**, not merely unadvertised:
 `/oauth2/authorize` answers 503 on both GET and POST. Reach for it if you run a
