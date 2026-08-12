@@ -256,7 +256,9 @@ func TestAuthorizeGET_UnregisteredRedirectURIStaysJSON(t *testing.T) {
 }
 
 // TestAuthorizeGET_MissingRequiredParam keeps the field gate working when the
-// parameters arrive via the query string rather than the body.
+// parameters arrive via the query string rather than the body — and, since the
+// client and redirect_uri are valid, RFC 6749 §4.1.2.1 wants the failure
+// reported by redirect (invalid_request), not as a JSON dead end.
 func TestAuthorizeGET_MissingRequiredParam(t *testing.T) {
 	query, _ := authorizeGETQuery(t)
 	query.Del("code_challenge")
@@ -264,16 +266,22 @@ func TestAuthorizeGET_MissingRequiredParam(t *testing.T) {
 	resp := getAuthorize(t, query, principalHeaders())
 	defer func() { _ = resp.Body.Close() }()
 
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, http.StatusFound, resp.StatusCode)
 
-	var body map[string]string
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	require.Equal(t, "invalid_request", body["error"])
-	require.Contains(t, body["error_description"], "code_challenge")
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(resp.Header.Get("Location"), testRedirectURI),
+		"error must be reported to the registered redirect_uri")
+	require.Equal(t, "invalid_request", loc.Query().Get("error"))
+	require.Contains(t, loc.Query().Get("error_description"), "code_challenge")
+	require.Equal(t, "get-state-abc", loc.Query().Get("state"),
+		"state must round-trip on the error redirect (§4.1.2.1)")
 }
 
 // TestAuthorizeGET_RejectsNonCodeResponseType keeps OAuth 2.1's no-implicit rule
-// enforced on the new leg.
+// enforced on the new leg. The refusal rides the §4.1.2.1 redirect under the
+// code that section defines for it, unsupported_response_type — the client and
+// redirect_uri are valid, so there is a vetted place to report it.
 func TestAuthorizeGET_RejectsNonCodeResponseType(t *testing.T) {
 	query, _ := authorizeGETQuery(t)
 	query.Set("response_type", "token")
@@ -281,11 +289,15 @@ func TestAuthorizeGET_RejectsNonCodeResponseType(t *testing.T) {
 	resp := getAuthorize(t, query, principalHeaders())
 	defer func() { _ = resp.Body.Close() }()
 
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, http.StatusFound, resp.StatusCode)
 
-	var body map[string]string
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	require.Contains(t, strings.ToLower(body["error_description"]), "response_type")
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(resp.Header.Get("Location"), testRedirectURI),
+		"error must be reported to the registered redirect_uri")
+	require.Equal(t, "unsupported_response_type", loc.Query().Get("error"))
+	require.Contains(t, strings.ToLower(loc.Query().Get("error_description")), "response_type")
+	require.Equal(t, "get-state-abc", loc.Query().Get("state"))
 }
 
 // TestAuthorizePOST_BodyParamsStillWork guards against the GET split breaking
@@ -364,30 +376,36 @@ func TestAuthorizeGET_ErrorDescriptionIsInCharset(t *testing.T) {
 	}
 }
 
-// TestAuthorizeGET_NonS256IsRejectedBeforeAnyLookup keeps a request that cannot
-// possibly succeed from costing anything.
+// TestAuthorizeGET_NonS256IsRejectedBeforeLogin keeps a request that cannot
+// possibly succeed from reaching principal resolution.
 //
 // code_challenge_method=plain used to be caught only inside IssueAuthCode, at the
 // very end. With the interactive-login hook in place that meant an unauthenticated
 // caller could be sent through the deployer's login surface, authenticate, and
-// only then be told their own parameter was wrong. The check costs a string
-// comparison, so it belongs in the cheap gate.
-func TestAuthorizeGET_NonS256IsRejectedBeforeAnyLookup(t *testing.T) {
+// only then be told their own parameter was wrong. The gate now sits between
+// client validation (step 3.5) and the resolver chain (step 4): late enough that
+// the failure redirects to the registered redirect_uri per RFC 6749 §4.1.2.1,
+// early enough that nobody is asked to sign in first.
+func TestAuthorizeGET_NonS256IsRejectedBeforeLogin(t *testing.T) {
 	query, _ := authorizeGETQuery(t)
 	query.Set("code_challenge_method", "plain")
 
-	// No credential: if the S256 check did not run first, this request would reach
-	// principal resolution and be reported as access_denied (or a login redirect)
+	// No credential: if the S256 check did not run before step 4, this request
+	// would be reported as access_denied (or bounce through the login surface)
 	// rather than as the invalid_request it is.
 	resp := getAuthorize(t, query, nil)
 	defer func() { _ = resp.Body.Close() }()
 
-	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	require.Empty(t, resp.Header.Get("Location"),
-		"a request that cannot succeed must not be redirected anywhere, least of all to a login surface")
+	require.Equal(t, http.StatusFound, resp.StatusCode)
 
-	var body map[string]string
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-	require.Equal(t, "invalid_request", body["error"])
-	require.Contains(t, body["error_description"], "S256")
+	location := resp.Header.Get("Location")
+	require.True(t, strings.HasPrefix(location, testRedirectURI),
+		"the failure must be reported to the registered redirect_uri, never to the login surface")
+	require.NotContains(t, location, testInteractiveLoginURL,
+		"a request that cannot succeed must not send anyone through the login surface")
+
+	loc, err := url.Parse(location)
+	require.NoError(t, err)
+	require.Equal(t, "invalid_request", loc.Query().Get("error"))
+	require.Contains(t, loc.Query().Get("error_description"), "S256")
 }

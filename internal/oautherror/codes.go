@@ -81,6 +81,17 @@ const (
 	ServerError = "server_error"
 )
 
+// ── RFC 6749 §4.1.2.1 — authorization-endpoint error codes ──────────────────
+// https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2.1
+// (AccessDenied, also defined here, is declared in the CIBA group below where
+// it was first introduced; both specs define the same wire value.)
+const (
+	// UnsupportedResponseType indicates the authorization server does not
+	// support obtaining an authorization code using this method — i.e. the
+	// request's response_type names a flow this endpoint does not offer.
+	UnsupportedResponseType = "unsupported_response_type"
+)
+
 // ── RFC 8693 §2.2.2 — OAuth 2.0 Token Exchange error codes ──────────────────
 // https://www.rfc-editor.org/rfc/rfc8693#section-2.2.2
 const (

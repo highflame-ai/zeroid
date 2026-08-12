@@ -74,11 +74,14 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //  1. Parse application/x-www-form-urlencoded body
 //  2. Build a typed AuthorizeRequest snapshot from the parsed form +
 //     headers + cookies (read-only — resolvers never see *http.Request)
-//  3. Required-field gate + response_type=code + S256 check (cheap,
-//     before any DB hits)
+//  3. client_id / redirect_uri presence gate — ONLY the two
+//     §4.1.2.1-exempt parameters are checked before the client lookup.
 //     3.5. Resolve the client and validate redirect_uri
 //     (OAuthService.ResolveAuthorizeClient) — BEFORE the resolver chain,
 //     so later failures have somewhere safe to be reported.
+//     3.75. Remaining protocol-parameter gates (response_type=code, PKCE
+//     presence, S256) — after 3.5 so their failures can redirect, before
+//     step 4 so a doomed request never reaches a login surface.
 //  4. Walk the registered PrincipalResolver chain. First non-nil
 //     Principal wins. No matches → access_denied.
 //  5. Intersect (caller-requested scope ∩ resolver-narrowed scope) —
@@ -95,11 +98,12 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // a missing or unregistered redirect_uri.
 //
 // So everything decided BEFORE step 3.5 — the availability gate, the
-// parse error, the required-field gate, and client validation itself —
-// answers with an RFC 6749 §5.2 JSON body via writeAuthorizeError,
-// because there is no validated redirect_uri to trust yet. Everything
-// after it goes through failAuthorize, which redirects on GET and keeps
-// JSON on POST (see that function for why the method matters).
+// parse error, the client_id/redirect_uri presence gate, and client
+// validation itself — answers with an RFC 6749 §5.2 JSON body via
+// writeAuthorizeError, because there is no validated redirect_uri to
+// trust yet. Everything after it goes through failAuthorize, which
+// redirects on GET and keeps JSON on POST (see that function for why the
+// method matters).
 //
 // Ordering was the whole difficulty, and it was upstream of this
 // handler's own steps: principal resolution used to run before any client
@@ -193,63 +197,20 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// ── Step 3: required-field gate ──────────────────────────────────
-	// Caller errors before any DB hits — fail fast with a clear
-	// message. The service layer enforces the same gates again at
-	// IssueAuthCode (defense in depth for programmatic callers that
-	// bypass the handler), but we surface a per-field error here so
-	// CLI clients get actionable feedback.
+	// ── Step 3: client_id / redirect_uri presence ────────────────────
+	// ONLY the two §4.1.2.1-exempt parameters are gated before client
+	// resolution. Every other protocol-parameter check waits until after
+	// step 3.5 — with the client and redirect_uri validated, those
+	// failures can be reported the way the spec wants, a 302 back to the
+	// client, instead of a JSON dead end in the browser. The service
+	// layer enforces the same gates again at IssueAuthCode (defense in
+	// depth for programmatic callers that bypass the handler).
 	if req.ClientID == "" {
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "client_id is required")
 		return
 	}
 	if req.RedirectURI == "" {
 		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "redirect_uri is required")
-		return
-	}
-	if req.CodeChallenge == "" {
-		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "code_challenge is required")
-		return
-	}
-	if req.CodeChallengeMethod == "" {
-		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest, "code_challenge_method is required")
-		return
-	}
-	// RFC 6749 §4.1.1 makes response_type REQUIRED. Enforce it on GET: the
-	// browser leg is new surface with no back-compat obligation, and every
-	// real OAuth client sends it. POST stays lenient because CLI callers have
-	// been permitted to omit it since v1 and "code" is the only value this
-	// endpoint has ever supported, so tightening it there would break them for
-	// no security gain.
-	if r.Method == http.MethodGet && req.ResponseType == "" {
-		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
-			"response_type is required (RFC 6749 §4.1.1) and must be 'code'")
-
-		return
-	}
-
-	if req.ResponseType != "" && req.ResponseType != "code" {
-		// response_type is optional in our shape (we only support
-		// "code" anyway), but if the caller passes something else
-		// they have the wrong shape in their head — surface it
-		// instead of silently accepting.
-		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
-			"response_type must be 'code' (only authorization_code grant is supported at /oauth2/authorize)")
-		return
-	}
-
-	// S256 is checked HERE, not only at IssueAuthCode, because it is the one
-	// remaining step-6 gate that a request can fail on values it supplied itself.
-	// Leaving it downstream means a request carrying code_challenge_method=plain
-	// now survives long enough to send the user through the deployer's login
-	// surface (step 4's interaction hook) and only fails after they authenticate.
-	// Making somebody sign in to be told their own parameter was wrong is a poor
-	// trade for a check that costs a string comparison. IssueAuthCode still
-	// enforces it for programmatic callers that bypass this handler.
-	if req.CodeChallengeMethod != "S256" {
-		writeAuthorizeError(w, http.StatusBadRequest, oautherror.InvalidRequest,
-			"code_challenge_method must be S256 (plain is not supported)")
-
 		return
 	}
 
@@ -282,6 +243,74 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		writeAuthorizeError(w, status, code, description)
+
+		return
+	}
+
+	// ── Step 3.75: remaining protocol-parameter gates ────────────────
+	// AFTER client resolution, deliberately: §4.1.2.1 puts invalid_request
+	// and unsupported_response_type on the redirect list, so a browser
+	// client with a perfectly good registered redirect_uri learns about
+	// its own malformed parameter from the callback, not from a JSON blob
+	// it never reads. failAuthorize keeps these as JSON on POST (CLI
+	// callers have parsed that shape since v1) and for self-asserted
+	// clients (see that function for why).
+	//
+	// Still BEFORE principal resolution: a request that cannot possibly
+	// succeed must not send a user through the deployer's login surface
+	// (step 4's interaction hook) only to be told its own parameter was
+	// wrong after they authenticate.
+	//
+	// RFC 6749 §4.1.1 makes response_type REQUIRED. Enforce it on GET: the
+	// browser leg is new surface with no back-compat obligation, and every
+	// real OAuth client sends it. POST stays lenient because CLI callers
+	// have been permitted to omit it since v1 and "code" is the only value
+	// this endpoint has ever supported, so tightening it there would break
+	// them for no security gain.
+	if r.Method == http.MethodGet && req.ResponseType == "" {
+		a.failAuthorize(w, r, req, oauthClient, http.StatusBadRequest,
+			oautherror.InvalidRequest, oautherror.InvalidRequest,
+			"response_type is required (RFC 6749 §4.1.1) and must be 'code'")
+
+		return
+	}
+
+	if req.ResponseType != "" && req.ResponseType != "code" {
+		// The redirect code is unsupported_response_type — the vocabulary
+		// §4.1.2.1 defines for exactly this. The JSON code stays
+		// invalid_request: that is what POST callers have parsed since v1,
+		// and this PR pins POST behaviour unchanged.
+		a.failAuthorize(w, r, req, oauthClient, http.StatusBadRequest,
+			oautherror.InvalidRequest, oautherror.UnsupportedResponseType,
+			"response_type must be 'code' (only authorization_code grant is supported at /oauth2/authorize)")
+
+		return
+	}
+
+	if req.CodeChallenge == "" {
+		a.failAuthorize(w, r, req, oauthClient, http.StatusBadRequest,
+			oautherror.InvalidRequest, oautherror.InvalidRequest,
+			"code_challenge is required")
+
+		return
+	}
+
+	if req.CodeChallengeMethod == "" {
+		a.failAuthorize(w, r, req, oauthClient, http.StatusBadRequest,
+			oautherror.InvalidRequest, oautherror.InvalidRequest,
+			"code_challenge_method is required")
+
+		return
+	}
+
+	// S256 is checked HERE, not only at IssueAuthCode, because it is the one
+	// remaining step-6 gate that a request can fail on values it supplied
+	// itself. IssueAuthCode still enforces it for programmatic callers that
+	// bypass this handler.
+	if req.CodeChallengeMethod != "S256" {
+		a.failAuthorize(w, r, req, oauthClient, http.StatusBadRequest,
+			oautherror.InvalidRequest, oautherror.InvalidRequest,
+			"code_challenge_method must be S256 (plain is not supported)")
 
 		return
 	}
@@ -371,8 +400,12 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ── Step 6: mint via service ─────────────────────────────────────
 	// Client is the one resolved at step 3.5, so IssueAuthCode skips the
-	// lookup and the redirect_uri allow-list rather than repeating them —
-	// one resolution per request, and one place that decides the policy.
+	// LOOKUP — the expensive half, a DB read or a CIMD fetch. The policy
+	// gates (active/public state, grant-type allow-list, redirect_uri
+	// allow-list) are deliberately RE-RUN inside IssueAuthCode via
+	// checkAuthorizeClientPolicy: they are I/O-free, and re-running them
+	// is the only arrangement in which a caller supplying a pre-resolved
+	// Client cannot skip a gate. See IssueAuthCodeRequest.Client.
 	code, err := a.oauthSvc.IssueAuthCode(r.Context(), service.IssueAuthCodeRequest{
 		ClientID:            req.ClientID,
 		RedirectURI:         req.RedirectURI,
