@@ -450,6 +450,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	agentAuthCfg := internalMiddleware.AgentAuthConfig{
 		PublicKey: jwksSvc.PublicKey(),
 		Issuer:    cfg.Token.Issuer,
+		// Enforce cnf.jkt sender-constraint on bound tokens (minted at
+		// issuance when a proof accompanied the token request).
+		DPoPVerifier: dpopVerifier,
 		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
 		// document so they can chain resource → PRM → AS metadata.
 		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
