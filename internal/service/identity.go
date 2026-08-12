@@ -551,6 +551,45 @@ func (s *IdentityService) PruneStaleDiscovered(ctx context.Context, accountID, p
 	return n, nil
 }
 
+// ReleaseDiscoveredSource unclaims every still-`discovered` identity belonging
+// to one discovery source, so a future connector can adopt them. Returns the
+// number released.
+//
+// Called when a connector is DELETED. Reconcile only ever adopts a source_id
+// onto a row that has none (so a live connector can't claim another live
+// connector's rows), which means a deleted connector's rows stay bound to it
+// forever — it never syncs again, and prune is scoped to a single source_id, so
+// no sweep can reach them. They would sit as `discovered` indefinitely, reading
+// as live inventory. Releasing the claim restores them to the adoptable state
+// they had before that connector first saw them.
+//
+// Deliberately NOT a deactivation: these rows are a human's pending
+// adopt/dismiss queue, and a connector being replaced is not a decision about
+// the agents it found. Rows whose agent is genuinely gone from the source stay
+// `discovered` with no owner until dismissed by hand — the same as any other
+// discovered row nobody acts on.
+//
+// Scoped like prune: origin and sourceID are both required, so a release can
+// never unclaim a whole tenant's inventory.
+func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: release requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: release requires a source_id (a release is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_release_source")
+	n, err := s.repo.ReleaseDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery release: unclaimed discovered identities from a deleted source")
+	}
+	return n, nil
+}
+
 // GetIdentity retrieves an identity by ID.
 func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByID(ctx, id, accountID, projectID)

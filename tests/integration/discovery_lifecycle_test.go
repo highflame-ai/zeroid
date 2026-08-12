@@ -710,3 +710,140 @@ func TestDiscovered_PruneRejectsBadTimestamp(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	_ = resp.Body.Close()
 }
+
+// ── Source release on connector delete ──────────────────────────────────────
+
+// releaseDiscoveredSource POSTs /identities/discovered/release-source and
+// returns the decoded body ({released}).
+func releaseDiscoveredSource(t *testing.T, origin, sourceID string) map[string]any {
+	t.Helper()
+	resp := post(t, adminPath("/identities/discovered/release-source"), map[string]any{
+		"origin": origin, "source_id": sourceID,
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode, "release source: expected 200")
+	return decode(t, resp)
+}
+
+// TestDiscovered_ReleaseSourceLetsAReplacementConnectorAdopt is the whole point
+// of the endpoint.
+//
+// Reconcile adopts a source_id only onto a row that has none, so that one live
+// connector cannot claim another's rows. The consequence: a DELETED connector's
+// rows stay bound to it forever — it never syncs again, and prune is scoped
+// `WHERE source_id = ?`, so nothing can sweep them. They sit as `discovered`
+// indefinitely, reading as live inventory. Releasing at delete time restores
+// them to adoptable.
+func TestDiscovered_ReleaseSourceLetsAReplacementConnectorAdopt(t *testing.T) {
+	var (
+		ext     = uid("okta-agent")
+		oldConn = uid("connector-old")
+		newConn = uid("connector-new")
+		notSeen = time.Now().Add(time.Hour) // deliberately future-ish for the later assert
+	)
+	_ = notSeen
+
+	// The original connector discovers the agent and claims the row.
+	first := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": oldConn,
+	})
+	id := first["identity"].(map[string]any)["id"].(string)
+	require.Equal(t, oldConn, first["identity"].(map[string]any)["source_id"])
+
+	// A replacement connector rediscovers the same agent. WITHOUT a release it
+	// cannot take ownership — this is the guard that strands the row.
+	stillOld := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": newConn,
+	})
+	require.Equal(t, id, stillOld["identity"].(map[string]any)["id"], "must reconcile to the same row")
+	assert.Equal(t, oldConn, stillOld["identity"].(map[string]any)["source_id"],
+		"reconcile must NOT overwrite a live source_id — that guard is what this endpoint works around")
+
+	// Delete-time release unclaims it.
+	out := releaseDiscoveredSource(t, "okta", oldConn)
+	assert.Equal(t, float64(1), out["released"], "the stranded row must be released")
+
+	// Now the replacement's next sync claims it, and the row is back in prune scope.
+	adopted := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": newConn,
+	})
+	require.Equal(t, id, adopted["identity"].(map[string]any)["id"], "still the same row — no duplicate")
+	assert.Equal(t, newConn, adopted["identity"].(map[string]any)["source_id"],
+		"after release, the replacement connector must be able to adopt the row")
+}
+
+// TestDiscovered_ReleaseSourceIsScopedToItsSource guards the blast radius: a
+// release must never unclaim another connector's rows, or a whole tenant's.
+func TestDiscovered_ReleaseSourceIsScopedToItsSource(t *testing.T) {
+	var (
+		mine     = uid("connector-mine")
+		theirs   = uid("connector-theirs")
+		extMine  = uid("okta-mine")
+		extOther = uid("okta-theirs")
+	)
+
+	ingestDiscovered(t, map[string]any{
+		"external_id": extMine, "origin": "okta", "name": "mine", "source_id": mine,
+	})
+	other := ingestDiscovered(t, map[string]any{
+		"external_id": extOther, "origin": "okta", "name": "theirs", "source_id": theirs,
+	})
+	otherID := other["identity"].(map[string]any)["id"].(string)
+
+	out := releaseDiscoveredSource(t, "okta", mine)
+	assert.Equal(t, float64(1), out["released"], "only this source's row may be released")
+
+	// The other connector's row is untouched — still claimed, still prunable by it.
+	resp := get(t, adminPath("/identities/"+otherID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	got := decode(t, resp)
+	assert.Equal(t, theirs, got["source_id"],
+		"a release must never unclaim another connector's rows")
+}
+
+// TestDiscovered_ReleaseSourceLeavesAdoptedProvenance: an adopted identity is
+// outside prune scope, so its source_id is history, not a claim. Clearing it
+// would destroy the record of where the identity came from.
+func TestDiscovered_ReleaseSourceLeavesAdoptedProvenance(t *testing.T) {
+	var (
+		ext  = uid("okta-adopted")
+		conn = uid("connector-adopted")
+	)
+
+	created := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "adopted agent", "source_id": conn,
+	})
+	id := created["identity"].(map[string]any)["id"].(string)
+
+	adoptResp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+id+"/adopt"), map[string]any{
+		"owner_user_id": "user-adopter",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, adoptResp.StatusCode)
+
+	out := releaseDiscoveredSource(t, "okta", conn)
+	assert.Equal(t, float64(0), out["released"], "an adopted row is not a pending claim and must not be released")
+
+	resp := get(t, adminPath("/identities/"+id), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	got := decode(t, resp)
+	assert.Equal(t, conn, got["source_id"], "adopted identities keep source_id as provenance")
+}
+
+// TestDiscovered_ReleaseSourceValidation: scoping is mandatory, so a release can
+// never sweep a tenant.
+func TestDiscovered_ReleaseSourceValidation(t *testing.T) {
+	t.Run("native origin rejected", func(t *testing.T) {
+		resp := post(t, adminPath("/identities/discovered/release-source"), map[string]any{
+			"origin": "native", "source_id": uid("c"),
+		}, adminHeaders())
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
+
+	t.Run("missing source_id rejected", func(t *testing.T) {
+		resp := post(t, adminPath("/identities/discovered/release-source"), map[string]any{
+			"origin": "okta",
+		}, adminHeaders())
+		assert.GreaterOrEqual(t, resp.StatusCode, http.StatusBadRequest,
+			"source_id is required — an unscoped release could unclaim a whole tenant")
+	})
+}
