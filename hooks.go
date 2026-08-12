@@ -83,6 +83,14 @@ type AuthorizeRequest = service.AuthorizeRequest
 // See internal/service/principal.go for the canonical doc comment.
 type PrincipalResolver = service.PrincipalResolver
 
+// FederatedExchangeRequest is the input to Server.FederatedCredentialExchange —
+// the Workload-Identity-Federation broker path (ADR 0028). Re-exported from
+// internal/service so deployer code stays at the top-level public surface;
+// both names refer to the same type.
+//
+// See internal/service/federation.go for the canonical doc comment.
+type FederatedExchangeRequest = service.FederatedExchangeRequest
+
 // ErrPrincipalNotApplicable is the sentinel returned by a
 // PrincipalResolver that does not apply to the current request. zeroid
 // moves to the next registered resolver; when every resolver returns

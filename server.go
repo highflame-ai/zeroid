@@ -744,6 +744,19 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 	})
 }
 
+// FederatedCredentialExchange mints a short-lived, provider-audienced assertion
+// for a Workload-Identity-Federation broker (ADR 0028 / CAP-IDN-023). The
+// caller (an authenticated trusted service, e.g. the AI gateway) has already
+// authenticated the agent and resolved its tenant + WIMSE; ZeroID stamps a
+// free-form provider audience and an `act.sub` = the authenticated broker,
+// returning a token whose `sub` is the agent. Unlike ExternalPrincipalExchange
+// the audience is not a scope profile and the token carries no ZeroID scopes —
+// see service.OAuthService.FederatedCredentialExchange for the security
+// contract and its compensating controls.
+func (s *Server) FederatedCredentialExchange(ctx context.Context, req FederatedExchangeRequest) (*domain.AccessToken, error) {
+	return s.oauthSvc.FederatedCredentialExchange(ctx, req)
+}
+
 // OnClaimsIssue registers a claims enricher called during JWT issuance.
 func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
