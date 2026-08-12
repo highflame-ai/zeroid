@@ -43,6 +43,8 @@ func TestFederatedCredentialExchange(t *testing.T) {
 		assert.Equal(t, "firehog", act["sub"], "act.sub is the AUTHENTICATED broker, not caller-supplied")
 
 		assert.Empty(t, scopesOf(t, claims), "the assertion carries NO ZeroID scopes")
+		assert.Equal(t, "provider_federation", claims["token_use"],
+			"token_use marks the assertion so the shared verifier rejects it for Highflame auth (audit round 1)")
 		assert.Equal(t, "agent-x", claims["external_id"], "external_id recorded for audit correlation")
 		assert.Equal(t, testIssuer, claims["iss"], "iss is the ZeroID issuer the provider trusts")
 		assert.Equal(t, testAccountID, tok.AccountID)

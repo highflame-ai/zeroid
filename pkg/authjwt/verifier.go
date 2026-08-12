@@ -184,7 +184,19 @@ func (v *Verifier) verify(ctx context.Context, tokenString string) (*Claims, err
 		return nil, err
 	}
 
-	return extractClaims(token), nil
+	claims := extractClaims(token)
+
+	// A federation assertion (ADR 0028) is minted for an EXTERNAL provider's WIF
+	// endpoint and, by design, handed to that provider. It is a valid
+	// ZeroID-signed token but MUST NEVER authenticate a caller to Highflame's own
+	// services — otherwise a leaked / provider-logged assertion could ride
+	// ZeroID's tenant-membership auth gates. Reject it here, in the shared
+	// verifier every Highflame service uses, so the block holds platform-wide.
+	if claims.TokenUse == TokenUseProviderFederation {
+		return nil, fmt.Errorf("%w: federation assertion is not valid for Highflame authentication", ErrInvalidToken)
+	}
+
+	return claims, nil
 }
 
 // checkAlgorithm parses the JWS header to verify the algorithm is allowed.

@@ -873,3 +873,35 @@ func assertStatus(t *testing.T, rec *httptest.ResponseRecorder, want int) {
 		t.Fatalf("status = %d, want %d; body: %s", rec.Code, want, rec.Body.String())
 	}
 }
+
+// TestVerify_RejectsFederationAssertion locks the audit-round-1 replay defense
+// (ADR 0028): a provider-audienced federation assertion is a valid ZeroID
+// signature with real tenant claims, but token_use=provider_federation MUST make
+// the shared verifier refuse it for Highflame authentication — otherwise a
+// leaked / provider-logged assertion could ride Highflame's tenant-membership
+// auth gates.
+func TestVerify_RejectsFederationAssertion(t *testing.T) {
+	ks := newTestKeySet(t)
+	issuer := "https://auth.test.com"
+	v := newVerifier(t, ks, issuer)
+
+	c := baseClaims(issuer)
+	c["aud"] = []string{"https://api.anthropic.com"}
+	c["token_use"] = authjwt.TokenUseProviderFederation
+	_, err := v.Verify(context.Background(), ks.signRS256(t, c))
+	if err == nil {
+		t.Fatal("a federation assertion must be rejected for Highflame authentication")
+	}
+	if !errors.Is(err, authjwt.ErrInvalidToken) {
+		t.Fatalf("want ErrInvalidToken, got %v", err)
+	}
+
+	// A normal token (no token_use) still verifies and reports empty TokenUse.
+	claims, err := v.Verify(context.Background(), ks.signRS256(t, baseClaims(issuer)))
+	if err != nil {
+		t.Fatalf("a normal token must still verify: %v", err)
+	}
+	if claims.TokenUse != "" {
+		t.Fatalf("normal token TokenUse must be empty, got %q", claims.TokenUse)
+	}
+}

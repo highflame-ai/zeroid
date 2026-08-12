@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
 // FederatedExchangeRequest is the input to FederatedCredentialExchange — the
@@ -47,15 +49,36 @@ const (
 //   - It stamps a FREE-FORM provider audience, bypassing the audience-scope
 //     profile gate. Compensating controls: (1) the trusted-service gate — only
 //     an authenticated internal service (the AI gateway) can call this;
-//     (2) the audience is validated as an absolute https URL with a host and no
-//     userinfo; (3) the minted token carries NO ZeroID scopes, so it conveys
-//     zero authority against ZeroID/Highflame resources — it is usable ONLY as
-//     a bearer assertion at the external provider whose federation rule accepts
-//     its (sub, aud, iss).
+//     (2) the audience is validated as an absolute https URL with a public host
+//     (no userinfo, no loopback/private IP); (3) the token is stamped
+//     token_use=provider_federation, which the shared verifier (pkg/authjwt)
+//     REJECTS for Highflame authentication, and carries NO ZeroID scopes — so a
+//     leaked assertion cannot ride Highflame's own tenant-membership auth gates
+//     and conveys zero ZeroID authority. It is usable ONLY as a bearer assertion
+//     at the external provider whose federation rule accepts its (sub, aud, iss).
 //   - It records an RFC 8693 `act.sub` = the AUTHENTICATED service name (never
 //     a caller-supplied value), so the token is an honest delegation: `sub` is
 //     the agent, `act.sub` is the broker. It is never impersonation — the
 //     subject is never rewritten to the gateway.
+//
+// Trust boundary (audit round 1, accepted-and-documented):
+//   - The caller asserts `SubjectWIMSE` and the tenant (account/project); ZeroID
+//     does NOT re-verify the WIMSE against the identity store here (it mints for
+//     a synthetic identity). So a compromised trusted service could mint an
+//     assertion for an arbitrary agent WIMSE in an arbitrary tenant. The bound
+//     is the PROVIDER's federation rule (subject_prefix / audience), which only
+//     accepts subjects it recognizes — not ZeroID. A subject-belongs-to-tenant
+//     lookup (mirroring ExternalPrincipalExchange's ApplicationID branch) is a
+//     tracked hardening.
+//   - `act.sub` is the trusted-service NAME authenticated by the shared internal
+//     secret, so it identifies "a holder of the internal secret," not a specific
+//     binary. Any trusted internal service can call this (same trust boundary as
+//     the downstream-token routes); restricting the mint to the gateway service
+//     is a tracked hardening.
+//   - The free-form audience is validated (https, public host, no userinfo) but
+//     NOT allowlisted to known providers; an allowlist is a tracked hardening,
+//     lower priority now that the token_use marker makes a mis-audienced
+//     assertion useless against Highflame's own services.
 func (s *OAuthService) FederatedCredentialExchange(ctx context.Context, req FederatedExchangeRequest) (*domain.AccessToken, error) {
 	// Step 1: Trusted-service gate. The broker (actor) identity is taken from
 	// HERE, so a caller can never forge who brokered the assertion.
@@ -95,7 +118,11 @@ func (s *OAuthService) FederatedCredentialExchange(ctx context.Context, req Fede
 		Status:       domain.IdentityStatusActive,
 	}
 
-	custom := map[string]any{}
+	// Mark the assertion as federation-only so the shared verifier (pkg/authjwt)
+	// refuses it for Highflame authentication — it is handed to an external
+	// provider and must never ride Highflame's own tenant-membership auth gates
+	// if it leaks (audit round 1).
+	custom := map[string]any{"token_use": authjwt.TokenUseProviderFederation}
 	if req.ExternalID != "" {
 		custom["external_id"] = req.ExternalID
 	}
@@ -139,5 +166,18 @@ func validateFederationAudience(aud string) error {
 	if u.User != nil {
 		return errors.New("audience must not contain userinfo")
 	}
+	// A real provider audience is a public host. Refuse loopback / private /
+	// link-local literal IPs (audit round 1, H1) — they are never a legitimate
+	// federation provider and only serve to point an assertion somewhere it
+	// should not go.
+	if ip := net.ParseIP(u.Hostname()); ip != nil && !isPublicIP(ip) {
+		return errors.New("audience host must not be a loopback or private address")
+	}
 	return nil
+}
+
+// isPublicIP reports whether ip is a globally routable unicast address (not
+// loopback, private, link-local, or unspecified).
+func isPublicIP(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }

@@ -88,15 +88,20 @@ func TestValidateFederationAudience(t *testing.T) {
 	}
 
 	bad := map[string]string{
-		"empty":            "",
-		"http":             "http://api.anthropic.com",
-		"http loopback":    "http://127.0.0.1:8040/t",
-		"no scheme":        "api.anthropic.com",
-		"opaque":           "anthropic",
-		"no host":          "https:///path",
-		"userinfo spoof":   "https://api.anthropic.com:x@evil.example/h",
-		"userinfo present": "https://user@api.anthropic.com/t",
-		"ftp":              "ftp://api.anthropic.com",
+		"empty":             "",
+		"http":              "http://api.anthropic.com",
+		"http loopback":     "http://127.0.0.1:8040/t",
+		"https loopback":    "https://127.0.0.1/t",
+		"https ipv6 loop":   "https://[::1]/t",
+		"https private 10":  "https://10.0.0.5/t",
+		"https private 192": "https://192.168.1.1/t",
+		"https link-local":  "https://169.254.169.254/t",
+		"no scheme":         "api.anthropic.com",
+		"opaque":            "anthropic",
+		"no host":           "https:///path",
+		"userinfo spoof":    "https://api.anthropic.com:x@evil.example/h",
+		"userinfo present":  "https://user@api.anthropic.com/t",
+		"ftp":               "ftp://api.anthropic.com",
 	}
 	for name, a := range bad {
 		t.Run(name, func(t *testing.T) {

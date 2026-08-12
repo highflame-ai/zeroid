@@ -15,6 +15,14 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwt"
 )
 
+// TokenUseProviderFederation marks a token minted by
+// Server.FederatedCredentialExchange (ADR 0028): a provider-audienced assertion
+// handed to an EXTERNAL Workload-Identity-Federation endpoint. It is a valid
+// ZeroID-signed token but MUST NEVER authenticate a caller to Highflame's own
+// services — Verify rejects any token carrying it (see verifier.go). The mint
+// stamps it as the `token_use` claim.
+const TokenUseProviderFederation = "provider_federation"
+
 // Claims represents the verified claims extracted from a ZeroID-issued JWT.
 // Fields align with ZeroID's TokenClaims in domain/token.go.
 type Claims struct {
@@ -25,6 +33,13 @@ type Claims struct {
 	IssuedAt  time.Time `json:"iat"`
 	ExpiresAt time.Time `json:"exp"`
 	JWTID     string    `json:"jti"`
+
+	// TokenUse marks a special-purpose token. Today the only value is
+	// TokenUseProviderFederation; empty for every normal ZeroID token. Verify
+	// fails closed on a federation assertion so it cannot ride Highflame's
+	// tenant-membership auth gates if it leaks from the provider it was minted
+	// for.
+	TokenUse string `json:"token_use,omitempty"`
 
 	// Resource is the RFC 8707 `resource` claim — the resource(s) this token
 	// was bound to AT THE MINT. Non-empty ONLY when ZeroID recorded an explicit
@@ -292,6 +307,7 @@ func extractClaims(token jwt.Token) *Claims {
 	}
 
 	// Tenant
+	c.TokenUse = getString("token_use")
 	c.AccountID = getString("account_id")
 	c.ProjectID = getString("project_id")
 
