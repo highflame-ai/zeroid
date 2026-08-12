@@ -283,6 +283,15 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Scoped to one (origin, source_id): deactivates only still-`discovered` rows last seen before `not_seen_since`. Never touches adopted/active identities, and never another connector's rows. The offboarding half of a connector reconcile.",
 		Tags:        []string{"Identities"},
 	}, a.pruneStaleDiscoveredOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "release-discovered-source",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/release-source",
+		Summary:     "Unclaim a deleted connector's discovered identities so another can adopt them",
+		Description: "Scoped to one (origin, source_id): clears source_id on still-`discovered` rows so a future connector's reconcile can claim them. Called when a connector is DELETED — otherwise its rows stay bound to a source that never syncs again, and prune (which is source-scoped) can never reach them. Does NOT deactivate: adopt/dismiss remains a human decision. Adopted and dismissed rows keep their source_id as provenance.",
+		Tags:        []string{"Identities"},
+	}, a.releaseDiscoveredSourceOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -873,5 +882,38 @@ func (a *API) pruneStaleDiscoveredOp(ctx context.Context, input *PruneDiscovered
 
 	out := &PruneDiscoveredOutput{}
 	out.Body.Deactivated = n
+	return out, nil
+}
+
+type ReleaseDiscoveredSourceInput struct {
+	Body struct {
+		Origin   string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the deleted connector enumerated (e.g. okta)"`
+		SourceID string `json:"source_id" required:"true" minLength:"1" doc:"The deleted connector's id — scopes the release to one source"`
+	}
+}
+
+type ReleaseDiscoveredSourceOutput struct {
+	Body struct {
+		Released int `json:"released"`
+	}
+}
+
+func (a *API) releaseDiscoveredSourceOp(ctx context.Context, input *ReleaseDiscoveredSourceInput) (*ReleaseDiscoveredSourceOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	n, err := a.identitySvc.ReleaseDiscoveredSource(ctx, tenant.AccountID, tenant.ProjectID, domain.Origin(input.Body.Origin), input.Body.SourceID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Msg("failed to release discovered source")
+		return nil, huma.Error500InternalServerError("failed to release discovered source")
+	}
+
+	out := &ReleaseDiscoveredSourceOutput{}
+	out.Body.Released = n
 	return out, nil
 }
