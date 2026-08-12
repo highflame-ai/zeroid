@@ -160,6 +160,12 @@ var reservedClaims = map[string]bool{
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
+	// `token_use` marks a special-purpose token (today: provider_federation,
+	// which the shared verifier REJECTS for Highflame auth). Only
+	// FederatedCredentialExchange may set it, via the internal CustomClaims
+	// interface — reserving it here keeps a trusted caller from injecting it
+	// through the ungated additional_claims map on any other grant.
+	"token_use": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to

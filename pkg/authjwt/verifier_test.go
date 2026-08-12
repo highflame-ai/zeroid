@@ -888,12 +888,21 @@ func TestVerify_RejectsFederationAssertion(t *testing.T) {
 	c := baseClaims(issuer)
 	c["aud"] = []string{"https://api.anthropic.com"}
 	c["token_use"] = authjwt.TokenUseProviderFederation
-	_, err := v.Verify(context.Background(), ks.signRS256(t, c))
+	assertion := ks.signRS256(t, c)
+
+	_, err := v.Verify(context.Background(), assertion)
 	if err == nil {
 		t.Fatal("a federation assertion must be rejected for Highflame authentication")
 	}
 	if !errors.Is(err, authjwt.ErrInvalidToken) {
 		t.Fatalf("want ErrInvalidToken, got %v", err)
+	}
+
+	// VerifyRealTime does local validation (Verify) BEFORE introspection, so it
+	// must reject the assertion too — guards against a future refactor that
+	// drops the local step.
+	if _, rterr := v.VerifyRealTime(context.Background(), assertion); rterr == nil {
+		t.Fatal("VerifyRealTime must also reject a federation assertion")
 	}
 
 	// A normal token (no token_use) still verifies and reports empty TokenUse.
