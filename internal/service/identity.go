@@ -575,6 +575,14 @@ func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID
 	if !origin.IsExternal() {
 		return 0, fmt.Errorf("%w: release requires an external origin (got %q)", ErrInvalidIdentityField, origin)
 	}
+	// Shape-check too: IsExternal only rejects "" and "native", so a malformed
+	// value like "Okta" would reach the WHERE clause, match nothing, and return
+	// released=0 — indistinguishable from "there was nothing to release". Reject
+	// it instead, so a caller with a typo'd origin learns that rather than
+	// believing the release succeeded.
+	if !domain.ValidOrigin(string(origin)) {
+		return 0, fmt.Errorf("%w: invalid origin %q: must be a lowercase ecosystem identifier (e.g. okta, entra)", ErrInvalidIdentityField, origin)
+	}
 	if sourceID == "" {
 		return 0, fmt.Errorf("%w: release requires a source_id (a release is always scoped to one discovery source)", ErrInvalidIdentityField)
 	}

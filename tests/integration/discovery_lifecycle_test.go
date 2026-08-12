@@ -846,4 +846,17 @@ func TestDiscovered_ReleaseSourceValidation(t *testing.T) {
 		assert.GreaterOrEqual(t, resp.StatusCode, http.StatusBadRequest,
 			"source_id is required — an unscoped release could unclaim a whole tenant")
 	})
+
+	// IsExternal only rejects "" and "native", so a malformed origin would
+	// otherwise reach the WHERE clause, match nothing, and report released=0 —
+	// indistinguishable from "nothing to release". A typo must not read as success.
+	for _, bad := range []string{"Okta", "okta-prod", "OKTA"} {
+		t.Run("malformed origin rejected: "+bad, func(t *testing.T) {
+			resp := post(t, adminPath("/identities/discovered/release-source"), map[string]any{
+				"origin": bad, "source_id": uid("c"),
+			}, adminHeaders())
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+				"a malformed origin must be rejected, not silently released as 0")
+		})
+	}
 }
