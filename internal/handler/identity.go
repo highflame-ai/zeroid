@@ -80,16 +80,22 @@ type GetIdentityByWIMSEInput struct {
 	URI string `query:"uri" required:"true" doc:"WIMSE/SPIFFE URI to resolve (e.g. spiffe://highflame.io/acme/prod/agent/claude-bot)"`
 }
 
+// Multi-value filters are tagged `,explode` for the reason documented on
+// splitCSV in agent.go: without it huma reads only the first occurrence of a
+// repeated param, so ?status=a&status=b silently narrows to ["a"]. Kept in
+// lockstep with ListAgentsInput — these two list surfaces are the same filter
+// contract and drift between them is invisible until a caller picks the wrong
+// spelling.
 type ListIdentitiesInput struct {
-	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	IdentityType  []string `query:"identity_type,explode" doc:"Filter by identity type. Repeat or comma-separate for multiple (e.g. agent,application)."`
 	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel    []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple (e.g. unverified,verified_third_party)."`
+	TrustLevel    []string `query:"trust_level,explode" doc:"Filter by trust level. Repeat or comma-separate for multiple (e.g. unverified,verified_third_party)."`
 	IsActive      string   `query:"is_active" doc:"Filter by active status"`
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
 	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
-	Status        []string `query:"status" doc:"Filter by exact lifecycle status. Comma-separated for multiple (e.g. discovered,pending,active)."`
+	Status        []string `query:"status,explode" doc:"Filter by exact lifecycle status. Repeat or comma-separate for multiple (e.g. discovered,pending,active)."`
 	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
 	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
