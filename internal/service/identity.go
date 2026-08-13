@@ -355,11 +355,18 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
 	}
-	// The discovery path can never assert first_party: connector-sourced trust
-	// tops out at verified_third_party, earned by directory verification
-	// (CAP-DSC-004). first_party is reserved for natively-registered identities.
-	if req.TrustLevel == domain.TrustLevelFirstParty {
+	// The discovery path can only carry trust it can EARN: unverified or
+	// verified_third_party (directory verification, CAP-DSC-004). first_party
+	// is reserved for natively-registered identities, and anything else is a
+	// caller bug that must not be written — this guard is the single entry
+	// point for both the create and reconcile paths, so the attested
+	// declarative apply downstream never sees an unvalidated value.
+	switch req.TrustLevel {
+	case "", domain.TrustLevelUnverified, domain.TrustLevelVerifiedThirdParty:
+	case domain.TrustLevelFirstParty:
 		return nil, false, fmt.Errorf("%w: a discovered identity cannot be first_party", ErrInvalidIdentityField)
+	default:
+		return nil, false, fmt.Errorf("%w: invalid trust_level for a discovered identity: %q", ErrInvalidIdentityField, req.TrustLevel)
 	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {

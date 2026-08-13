@@ -97,20 +97,26 @@ func TestApplyDiscoveredOwnerAttribution_AdoptedRowsUntouched(t *testing.T) {
 	}
 }
 
-func TestUpsertDiscoveredIdentity_RejectsFirstParty(t *testing.T) {
+func TestUpsertDiscoveredIdentity_RejectsFirstPartyAndUnknownTrust(t *testing.T) {
 	t.Parallel()
-	// Connector-sourced trust tops out at verified_third_party (CAP-DSC-004);
-	// the guard must fire before any repository access (nil deps would panic).
+	// Connector-sourced trust tops out at verified_third_party (CAP-DSC-004),
+	// and an unknown value is a caller bug that must never be written. The
+	// guard must fire before any repository access (nil deps would panic).
 	svc := &IdentityService{}
 
-	_, _, err := svc.UpsertDiscoveredIdentity(t.Context(), DiscoveredIdentityRequest{
-		AccountID:  "acct",
-		ProjectID:  "proj",
-		ExternalID: "ext-1",
-		Origin:     domain.Origin("entra"),
-		TrustLevel: domain.TrustLevelFirstParty,
-	})
-	if err == nil {
-		t.Fatal("first_party from the discovery path must be rejected")
+	for _, trust := range []domain.TrustLevel{
+		domain.TrustLevelFirstParty,
+		domain.TrustLevel("trusted"), // not a real enum value
+	} {
+		_, _, err := svc.UpsertDiscoveredIdentity(t.Context(), DiscoveredIdentityRequest{
+			AccountID:  "acct",
+			ProjectID:  "proj",
+			ExternalID: "ext-1",
+			Origin:     domain.Origin("entra"),
+			TrustLevel: trust,
+		})
+		if err == nil {
+			t.Fatalf("trust_level %q from the discovery path must be rejected", trust)
+		}
 	}
 }

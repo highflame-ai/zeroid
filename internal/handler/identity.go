@@ -636,7 +636,7 @@ type CreateDiscoveredIdentityInput struct {
 		Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
 		IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
 		SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
-		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path — connector-sourced trust tops out at verified_third_party (CAP-DSC-004)."`
 		OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
 		// OwnerResolved attests the connector definitively verified owner
 		// attribution against the tenant directory this sync (CAP-DSC-004);
@@ -789,7 +789,7 @@ type DiscoveredAgentItem struct {
 	Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
 	IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
 	SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
-	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path (CAP-DSC-004)."`
 	OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner"`
 	// See CreateDiscoveredIdentityInput.OwnerResolved (CAP-DSC-004).
 	OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync"`
