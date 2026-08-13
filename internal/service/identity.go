@@ -311,14 +311,23 @@ type DiscoveredIdentityRequest struct {
 	SubType      domain.SubType
 	TrustLevel   domain.TrustLevel
 	OwnerUserID  string // optional
-	Framework    string
-	Version      string
-	Publisher    string
-	Description  string
-	Capabilities json.RawMessage
-	Labels       json.RawMessage
-	Metadata     json.RawMessage
-	CreatedBy    string
+	// OwnerResolved attests that the connector DEFINITIVELY computed owner
+	// attribution this sync (CAP-DSC-004): it verified the IdP-asserted owner
+	// against the tenant human directory and OwnerUserID/TrustLevel carry the
+	// result — including an empty owner (verification failed or the agent is
+	// ownerless). Only with this attestation does a reconcile apply owner and
+	// trust to a still-discovered row, declaratively; without it (default, and
+	// whenever the directory was unreachable) the prior attribution is
+	// preserved, so a resolve outage never flaps verification state.
+	OwnerResolved bool
+	Framework     string
+	Version       string
+	Publisher     string
+	Description   string
+	Capabilities  json.RawMessage
+	Labels        json.RawMessage
+	Metadata      json.RawMessage
+	CreatedBy     string
 }
 
 // UpsertDiscoveredIdentity idempotently ingests an identity observed in an
@@ -345,6 +354,12 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	// first create.
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
+	}
+	// The discovery path can never assert first_party: connector-sourced trust
+	// tops out at verified_third_party, earned by directory verification
+	// (CAP-DSC-004). first_party is reserved for natively-registered identities.
+	if req.TrustLevel == domain.TrustLevelFirstParty {
+		return nil, false, fmt.Errorf("%w: a discovered identity cannot be first_party", ErrInvalidIdentityField)
 	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
@@ -394,10 +409,40 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	return identity, true, nil
 }
 
+// applyDiscoveredOwnerAttribution applies a connector's verified owner
+// attribution (CAP-DSC-004) to a still-discovered row. Declarative on
+// purpose: with the OwnerResolved attestation, OwnerUserID and TrustLevel are
+// the definitive result of directory verification — including an empty owner
+// (verification failed, or the agent is ownerless) — and an empty trust level
+// normalizes to unverified so a cleared verification can never leave a stale
+// verified_third_party behind. Rows past `discovered` (adoption assigned the
+// accountable human) and requests without the attestation (resolve outage)
+// are untouched.
+func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredIdentityRequest) {
+	if !req.OwnerResolved || identity.Status != domain.IdentityStatusDiscovered {
+		return
+	}
+
+	identity.OwnerUserID = req.OwnerUserID
+
+	identity.TrustLevel = req.TrustLevel
+	if identity.TrustLevel == "" {
+		identity.TrustLevel = domain.TrustLevelUnverified
+	}
+}
+
 // reconcileDiscovered refreshes the connector-sourced descriptive fields on an
 // existing row without touching lifecycle, ownership, policy, or origin. Only
 // non-empty inputs overwrite, so a connector that omits a field leaves the
 // curated value intact. Returns (identity, created=false).
+//
+// One deliberate exception (CAP-DSC-004): when the request carries the
+// OwnerResolved attestation AND the row is still in the `discovered` state,
+// owner_user_id and trust_level are applied DECLARATIVELY — including clearing
+// them — because pre-adoption those fields are connector-owned (the verified
+// link to the tenant directory). The instant a row leaves `discovered`
+// (adoption assigns the accountable human), connector syncs stop touching
+// ownership and trust entirely.
 //
 // A native-origin row that happens to share this external_id is a genuine
 // collision, not the same agent: discovery must never mutate a natively-managed
@@ -408,6 +453,7 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
 	}
+	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
 	// ingested manually first, then a connector picked it up). Never overwrite a
 	// non-empty source_id, so one connector can't claim another's row.

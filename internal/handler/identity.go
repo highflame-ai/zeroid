@@ -630,21 +630,26 @@ func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 
 type CreateDiscoveredIdentityInput struct {
 	Body struct {
-		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
-		Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
-		SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
-		Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
-		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
-		TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
-		OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
-		Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
-		Version      string          `json:"version,omitempty" doc:"Agent version string"`
-		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
-		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
-		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
-		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
-		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+		ExternalID   string `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
+		Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
+		SourceID     string `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
+		Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
+		IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+		SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+		OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
+		// OwnerResolved attests the connector definitively verified owner
+		// attribution against the tenant directory this sync (CAP-DSC-004);
+		// only then does a reconcile apply owner_user_id/trust_level to a
+		// still-discovered row (declaratively, clearing included).
+		OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync; applies them to still-discovered rows on reconcile"`
+		Framework     string          `json:"framework,omitempty" doc:"Agent framework"`
+		Version       string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher     string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description   string          `json:"description,omitempty" doc:"Human-readable description"`
+		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels        json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 	}
 }
 
@@ -689,24 +694,25 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 	}
 
 	identity, created, err := a.identitySvc.UpsertDiscoveredIdentity(ctx, service.DiscoveredIdentityRequest{
-		AccountID:    tenant.AccountID,
-		ProjectID:    tenant.ProjectID,
-		ExternalID:   input.Body.ExternalID,
-		Origin:       origin,
-		SourceID:     input.Body.SourceID,
-		Name:         input.Body.Name,
-		IdentityType: identityType,
-		SubType:      subType,
-		TrustLevel:   trustLevel,
-		OwnerUserID:  input.Body.OwnerUserID,
-		Framework:    input.Body.Framework,
-		Version:      input.Body.Version,
-		Publisher:    input.Body.Publisher,
-		Description:  input.Body.Description,
-		Capabilities: input.Body.Capabilities,
-		Labels:       input.Body.Labels,
-		Metadata:     input.Body.Metadata,
-		CreatedBy:    internalMiddleware.GetCallerName(ctx),
+		AccountID:     tenant.AccountID,
+		ProjectID:     tenant.ProjectID,
+		ExternalID:    input.Body.ExternalID,
+		Origin:        origin,
+		SourceID:      input.Body.SourceID,
+		Name:          input.Body.Name,
+		IdentityType:  identityType,
+		SubType:       subType,
+		TrustLevel:    trustLevel,
+		OwnerUserID:   input.Body.OwnerUserID,
+		OwnerResolved: input.Body.OwnerResolved,
+		Framework:     input.Body.Framework,
+		Version:       input.Body.Version,
+		Publisher:     input.Body.Publisher,
+		Description:   input.Body.Description,
+		Capabilities:  input.Body.Capabilities,
+		Labels:        input.Body.Labels,
+		Metadata:      input.Body.Metadata,
+		CreatedBy:     internalMiddleware.GetCallerName(ctx),
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -777,21 +783,23 @@ func (a *API) dismissIdentityOp(ctx context.Context, input *IdentityIDInput) (*I
 // DiscoveredAgentItem is one agent in a bulk discovery ingest — the same shape
 // as the single-ingest body.
 type DiscoveredAgentItem struct {
-	ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
-	Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
-	SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
-	Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
-	IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
-	SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
-	TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
-	OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner"`
-	Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
-	Version      string          `json:"version,omitempty" doc:"Agent version"`
-	Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher"`
-	Description  string          `json:"description,omitempty" doc:"Description"`
-	Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
-	Labels       json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
-	Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+	ExternalID   string `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
+	Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
+	SourceID     string `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
+	Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
+	IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+	SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
+	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
+	OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner"`
+	// See CreateDiscoveredIdentityInput.OwnerResolved (CAP-DSC-004).
+	OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync"`
+	Framework     string          `json:"framework,omitempty" doc:"Agent framework"`
+	Version       string          `json:"version,omitempty" doc:"Agent version"`
+	Publisher     string          `json:"publisher,omitempty" doc:"Agent publisher"`
+	Description   string          `json:"description,omitempty" doc:"Description"`
+	Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
+	Labels        json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+	Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 }
 
 type BatchDiscoveredInput struct {
@@ -814,24 +822,25 @@ func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscovere
 	reqs := make([]service.DiscoveredIdentityRequest, 0, len(input.Body.Agents))
 	for _, item := range input.Body.Agents {
 		reqs = append(reqs, service.DiscoveredIdentityRequest{
-			AccountID:    tenant.AccountID,
-			ProjectID:    tenant.ProjectID,
-			ExternalID:   item.ExternalID,
-			Origin:       domain.Origin(item.Origin),
-			SourceID:     item.SourceID,
-			Name:         item.Name,
-			IdentityType: domain.IdentityType(item.IdentityType),
-			SubType:      domain.SubType(item.SubType),
-			TrustLevel:   domain.TrustLevel(item.TrustLevel),
-			OwnerUserID:  item.OwnerUserID,
-			Framework:    item.Framework,
-			Version:      item.Version,
-			Publisher:    item.Publisher,
-			Description:  item.Description,
-			Capabilities: item.Capabilities,
-			Labels:       item.Labels,
-			Metadata:     item.Metadata,
-			CreatedBy:    createdBy,
+			AccountID:     tenant.AccountID,
+			ProjectID:     tenant.ProjectID,
+			ExternalID:    item.ExternalID,
+			Origin:        domain.Origin(item.Origin),
+			SourceID:      item.SourceID,
+			Name:          item.Name,
+			IdentityType:  domain.IdentityType(item.IdentityType),
+			SubType:       domain.SubType(item.SubType),
+			TrustLevel:    domain.TrustLevel(item.TrustLevel),
+			OwnerUserID:   item.OwnerUserID,
+			OwnerResolved: item.OwnerResolved,
+			Framework:     item.Framework,
+			Version:       item.Version,
+			Publisher:     item.Publisher,
+			Description:   item.Description,
+			Capabilities:  item.Capabilities,
+			Labels:        item.Labels,
+			Metadata:      item.Metadata,
+			CreatedBy:     createdBy,
 		})
 	}
 
