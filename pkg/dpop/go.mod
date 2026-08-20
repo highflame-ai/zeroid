@@ -1,9 +1,9 @@
 module github.com/highflame-ai/zeroid/pkg/dpop
 
-go 1.26.0
+go 1.27.0
 
 require (
-	github.com/lestrrat-go/jwx/v4 v4.0.2
+	github.com/lestrrat-go/jwx/v4 v4.3.0
 	github.com/rs/zerolog v1.35.1
 )
 
