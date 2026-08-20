@@ -10,6 +10,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 func (a *API) registerAuthVerifyRoute(router chi.Router) {
@@ -27,8 +28,12 @@ func (a *API) registerAuthVerifyRoute(router chi.Router) {
 //
 //  1. Reads the Bearer JWT from the Authorization header.
 //  2. Introspects it (signature + revocation check).
-//  3. On success: returns 200 with identity claims as response headers.
-//  4. On failure: returns 401.
+//  3. When the token carries cnf.jkt, requires a matching DPoP proof
+//     (RFC 9449 §6.1 sender-constraint). Forward-auth is the resource
+//     server for every proxied upstream; surfacing cnf without enforcing
+//     it would accept a stolen bound token as a bare Bearer.
+//  4. On success: returns 200 with identity claims as response headers.
+//  5. On failure: returns 401.
 //
 // Proxy config snippets:
 //
@@ -78,6 +83,10 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if rejectBoundTokenWithoutDPoP(w, r, token, claims, a.dpopVerifier, prm) {
+		return
+	}
+
 	headerMap := map[string]string{
 		"sub":           "X-Forwarded-User",
 		"identity_type": "X-Zeroid-Identity-Type",
@@ -102,4 +111,65 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"active":true}`))
+}
+
+// cnfJKTFromClaims pulls cnf.jkt from an introspection result. Introspect
+// surfaces cnf as map[string]any (JWT nested object); issuance also uses
+// map[string]string. Accept both so a shape quirk cannot skip enforcement.
+func cnfJKTFromClaims(claims map[string]any) string {
+	raw, ok := claims["cnf"]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch cnf := raw.(type) {
+	case map[string]any:
+		if jkt, _ := cnf["jkt"].(string); jkt != "" {
+			return jkt
+		}
+	case map[string]string:
+		return cnf["jkt"]
+	}
+	return ""
+}
+
+// rejectBoundTokenWithoutDPoP enforces RFC 9449 §6.1 sender-constraint for
+// DPoP-bound access tokens on the forward-auth path. Returns true when the
+// response has already been written (caller must return). Unbound tokens and
+// a nil verifier leave the request untouched.
+func rejectBoundTokenWithoutDPoP(w http.ResponseWriter, r *http.Request, accessToken string, claims map[string]any, verifier *dpop.Verifier, prm string) bool {
+	jkt := cnfJKTFromClaims(claims)
+	if jkt == "" || verifier == nil {
+		return false
+	}
+
+	proofJWT := r.Header.Get("DPoP")
+	if proofJWT == "" {
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidToken, "token is DPoP-bound; DPoP proof header is required", prm))
+		http.Error(w, `{"error":"invalid_token","error_description":"token is DPoP-bound; DPoP proof header is required"}`, http.StatusUnauthorized)
+		return true
+	}
+
+	htu := middleware.EffectiveRequestURL(r.Context())
+	if htu == "" {
+		// RequestURLMiddleware always installs on the public router; keep a
+		// defensive fallback for unit tests that call the helper directly.
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		htu = scheme + "://" + r.Host + r.URL.Path
+	}
+
+	if _, err := verifier.ValidateBoundToToken(r.Context(), dpop.ValidateRequest{
+		ProofJWT:    proofJWT,
+		Method:      r.Method,
+		URL:         htu,
+		AccessToken: accessToken,
+	}, jkt); err != nil {
+		log.Warn().Err(err).Str("path", r.URL.Path).Msg("auth/verify: DPoP proof rejected")
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidToken, "invalid DPoP proof", prm))
+		http.Error(w, `{"error":"invalid_token","error_description":"invalid DPoP proof"}`, http.StatusUnauthorized)
+		return true
+	}
+	return false
 }
