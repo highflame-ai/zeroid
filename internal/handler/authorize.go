@@ -475,13 +475,15 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
-//   - A self-asserted (CIMD) client whose publishing host nobody vetted. Sending
-//     a user through the deployment's real login page on behalf of such a client
-//     is the more damaging half of the same problem failAuthorize declines: the
-//     victim authenticates for real, and the flow resumes toward an
-//     attacker-published redirect_uri. Refusing here means an unvetted client
-//     cannot borrow the login surface's credibility. Setting cimd.allowed_domains
-//     vets the publishing hosts and lifts the refusal — see refusesRedirectTo.
+//   - A self-asserted (CIMD) client heading for an unvetted REMOTE destination.
+//     Sending a user through the deployment's real login page on behalf of such a
+//     client is the more damaging half of the same problem failAuthorize declines:
+//     the victim authenticates for real, and the flow resumes toward an
+//     attacker-published redirect_uri. A loopback or private-use redirect_uri is
+//     not that — the code lands on the user's own machine — so those proceed, which
+//     is what keeps the native/CLI/MCP browser leg working. Setting
+//     cimd.allowed_domains lifts the refusal for remote hosts too. See
+//     refusesRedirectTo.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -500,7 +502,7 @@ func (a *API) redirectToInteractiveLogin(
 	client *domain.OAuthClient, resolverName string,
 ) bool {
 	if r.Method != http.MethodGet || a.interactiveLoginURL == nil ||
-		a.refusesRedirectTo(client) {
+		a.refusesRedirectTo(client, req.RedirectURI) {
 		return false
 	}
 
@@ -583,9 +585,13 @@ func (a *API) redirectToInteractiveLogin(
 // target nobody vetted. Registered and dynamically-registered clients — where
 // somebody did — are unaffected and get the conformant redirect.
 //
-// Deployers who want CIMD clients to receive redirects can restore them by
-// setting cimd.allowed_domains, which re-establishes the vetting the rule assumes;
-// see docs/cimd.md. The gate is provenance, not the CIMD feature itself.
+// Two things narrow that deviation, because it is provenance-and-reach, not the
+// CIMD feature itself. A loopback or private-use redirect_uri is redirected
+// normally — it delivers to the caller's own device, so there is no third party
+// to hand an error or a code to, which is the same reasoning RFC 8252 §7.3 uses
+// to accept those callbacks from unregistered native clients. And setting
+// cimd.allowed_domains restores redirects to remote hosts as well, by
+// re-establishing the vetting the rule assumes. See docs/cimd.md.
 //
 // jsonCode vs redirectCode: the wire code sometimes has to differ between the
 // two shapes. A failed resolver is invalid_client to a programmatic POST caller
@@ -602,7 +608,7 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || a.refusesRedirectTo(client) {
+	if r.Method != http.MethodGet || a.refusesRedirectTo(client, req.RedirectURI) {
 		writeAuthorizeError(w, status, jsonCode, description)
 
 		return

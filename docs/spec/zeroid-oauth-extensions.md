@@ -1021,7 +1021,7 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Error reporting is not redirected for an unvetted client
+### 12.5 Error reporting is not redirected to an unvetted remote destination
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
 redirecting to the client's registered `redirect_uri`. ZeroID does that for
@@ -1042,10 +1042,19 @@ both redirects apply again — the error redirect and the interactive-login one,
 which are the same check. The discriminator is registration provenance
 (`registration_source`) qualified by that allow-list, not the CIMD mechanism.
 
+A loopback `http://` or private-use `redirect_uri` is **exempt from both
+refusals**, whatever the allow-list says. Those destinations resolve on the
+requester's own device, so the redirect has no remote hop and no third-party
+recipient — the property RFC 8252 §7.3 already relies on to accept such callbacks
+from unregistered native clients. The carve-out's premise is a remote
+attacker-chosen destination and does not hold for them.
+
 This is what makes a browser-driven CIMD client — the MCP 2025-11-25 case —
-completable at all: an unvetted one is never sent to the deployment's login
-surface, so a user with no existing session cannot establish one. A deployment
-intending to serve browser CIMD clients **MUST** set `cimd.allowed_domains`.
+completable. The ordinary desktop/CLI client publishes loopback callbacks and is
+therefore unaffected: it reaches the login surface and completes with no
+allow-list. A deployment serving CIMD clients whose callbacks are remote
+`https://` URLs **MUST** set `cimd.allowed_domains`, or those clients can never
+sign a user in.
 
 `allowed_domains` is deployment-wide, with no tenant dimension, so this
 re-enablement is meaningful only where the deployment serves a single tenant. A

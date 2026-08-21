@@ -738,3 +738,36 @@ func TestRedirectHostsAllowed(t *testing.T) {
 		}
 	})
 }
+
+// TestRedirectDeliversLocally pins the reachability judgement the authorize
+// carve-out delegates to. A false negative costs the native/MCP browser leg; a
+// false positive hands an attacker-chosen remote host a redirect from the AS's
+// own origin. The look-alike case is the one worth having a test for.
+func TestRedirectDeliversLocally(t *testing.T) {
+	local := []string{
+		"http://127.0.0.1:3000/callback",
+		"http://localhost/cb",
+		"http://[::1]:8080/cb",
+		"myapp:/cb",
+		"com.example.app:/oauth",
+	}
+	remote := []string{
+		"https://app.example.com/cb",
+		"https://127.0.0.1/cb",         // https is remote-capable regardless of host
+		"http://127.0.0.1.evil.com/cb", // look-alike: not loopback
+		"http://evil.example/cb",
+		"/relative/cb", // no scheme — validateCIMDRedirectURI rejects; fail closed
+	}
+
+	for _, u := range local {
+		if !RedirectDeliversLocally(u) {
+			t.Errorf("%s must count as local delivery — refusing it breaks native clients", u)
+		}
+	}
+
+	for _, u := range remote {
+		if RedirectDeliversLocally(u) {
+			t.Errorf("%s must NOT count as local delivery", u)
+		}
+	}
+}

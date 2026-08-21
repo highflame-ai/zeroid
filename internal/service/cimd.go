@@ -673,6 +673,52 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	}, nil
 }
 
+// RedirectDeliversLocally reports whether a redirect destination can only reach
+// the caller's own device: a loopback http:// callback (RFC 8252 §7.3) or a
+// private-use scheme (§7.1). Both are the native/CLI/MCP client shape.
+//
+// It exists so the self-asserted carve-out can ask the question it actually
+// means. That carve-out refuses to redirect to a CIMD client because its
+// redirect_uris are attacker-CHOSEN, which would make the authorization
+// endpoint an unauthenticated redirector "with the AS's own origin as the first
+// hop" — a threat about a REMOTE destination. A 302 to 127.0.0.1 has no remote
+// hop and no third party: the code lands on the machine the user is sitting at,
+// and an attacker who can listen there already has local code execution. That is
+// the same reasoning RFC 8252 uses to accept loopback callbacks from clients
+// nobody registered, and it does not weaken with CIMD.
+//
+// It matters because loopback is the DOMINANT MCP shape — the canonical document
+// in docs/cimd.md lists exactly these — so refusing there costs the entire
+// browser leg and buys nothing. Web MCP clients with real https callbacks are a
+// different case and stay subject to the allow-list.
+//
+// Private-use schemes are included on the same footing validateCIMDRedirectURI
+// already gives them. Squatting one needs an attacker app installed on the
+// victim's device, which is the local-code-execution case again; RFC 8252 §8.1
+// notes the risk and still accepts them.
+//
+// Callers must pass a redirect_uri already matched against the client's
+// registered list — this judges reachability, not membership.
+func RedirectDeliversLocally(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+
+	switch u.Scheme {
+	case "https":
+		return false
+	case "http":
+		return isLoopbackHost(u.Hostname())
+	case "":
+		// Not an absolute URI. validateCIMDRedirectURI rejects these, so this is
+		// unreachable for a CIMD client; fail closed rather than guess.
+		return false
+	default:
+		return true
+	}
+}
+
 // validateCIMDRedirectURI enforces OAuth 2.1 §2.3-style redirect URI scheme
 // rules on a CIMD document entry: https:// always OK; http:// only for
 // loopback hosts (native/CLI callbacks per RFC 8252 §7.3); any other non-empty
