@@ -475,12 +475,13 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
-//   - A self-asserted (CIMD) client. Sending a user through the deployment's real
-//     login page on behalf of a client nobody vetted is the more damaging half of
-//     the same problem failAuthorize declines: the victim authenticates for real,
-//     and the flow resumes toward an attacker-published redirect_uri. Refusing
-//     here means an unvetted client cannot borrow the login surface's credibility.
-//     Set cimd.allowed_domains to vet the publishing hosts and this applies again.
+//   - A self-asserted (CIMD) client whose publishing host nobody vetted. Sending
+//     a user through the deployment's real login page on behalf of such a client
+//     is the more damaging half of the same problem failAuthorize declines: the
+//     victim authenticates for real, and the flow resumes toward an
+//     attacker-published redirect_uri. Refusing here means an unvetted client
+//     cannot borrow the login surface's credibility. Setting cimd.allowed_domains
+//     vets the publishing hosts and lifts the refusal — see refusesRedirectTo.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -499,7 +500,7 @@ func (a *API) redirectToInteractiveLogin(
 	client *domain.OAuthClient, resolverName string,
 ) bool {
 	if r.Method != http.MethodGet || a.interactiveLoginURL == nil ||
-		client == nil || client.SelfAsserted() {
+		client == nil || a.refusesRedirectTo(client) {
 		return false
 	}
 
@@ -601,7 +602,7 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || client == nil || client.SelfAsserted() {
+	if r.Method != http.MethodGet || client == nil || a.refusesRedirectTo(client) {
 		writeAuthorizeError(w, status, jsonCode, description)
 
 		return

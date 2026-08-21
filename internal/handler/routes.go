@@ -15,6 +15,7 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
@@ -49,6 +50,16 @@ type API struct {
 	// SetCIMDEnabled after construction; defaults false so a build that doesn't
 	// wire CIMD doesn't advertise it.
 	cimdEnabled bool
+
+	// cimdPublishersVetted reports whether cimd.allowed_domains names at least
+	// one host, i.e. whether a deployer decided which hosts may publish a
+	// metadata document. It is the gate that lets a CIMD client be treated as
+	// a redirect destination — see failAuthorize and redirectToInteractiveLogin,
+	// which refuse a self-asserted client only while this is false. Set via
+	// SetCIMDPublishersVetted from the EFFECTIVE allow-list, not the raw config
+	// slice: NewCIMDService lower-cases and drops blank entries, so
+	// allowed_domains: [""] has length 1 and vets nothing.
+	cimdPublishersVetted bool
 
 	// authorizationCodeAvailable reports whether /oauth2/authorize can
 	// actually serve a request — i.e. whether the deployer registered any
@@ -251,6 +262,32 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 // by Server.NewServer from cfg.CIMD.Enabled.
 func (a *API) SetCIMDEnabled(enabled bool) {
 	a.cimdEnabled = enabled
+}
+
+// SetCIMDPublishersVetted records whether cimd.allowed_domains is in force,
+// which decides whether a CIMD client may be redirected to — its error
+// redirect per RFC 6749 §4.1.2.1, and the interactive-login redirect.
+//
+// Both are refused for a self-asserted client by default because a CIMD
+// document's redirect_uris are attacker-CHOSEN, not merely attacker-supplied:
+// with no allow-list, any public HTTPS host can publish one. An allow-list is
+// the deployer saying which hosts may publish, which restores the vetting
+// §4.1.2.1's redirect rule assumes — so the refusal lifts with it.
+//
+// Called by Server.NewServer with CIMDService.AllowedDomainCount() > 0. A bool
+// rather than a predicate because the allow-list comes from config and cannot
+// change after construction, unlike the resolver registry.
+func (a *API) SetCIMDPublishersVetted(vetted bool) {
+	a.cimdPublishersVetted = vetted
+}
+
+// refusesRedirectTo reports whether client is a destination this deployment
+// declines to redirect a user agent to — a self-asserted (CIMD) client whose
+// publishing host nobody vetted. The single predicate behind both
+// failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's refusal,
+// so the two cannot drift: they answer the same question about the same client.
+func (a *API) refusesRedirectTo(client *domain.OAuthClient) bool {
+	return client.SelfAsserted() && !a.cimdPublishersVetted
 }
 
 // SetAuthorizationCodeAvailable records a predicate reporting whether

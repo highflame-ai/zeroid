@@ -84,8 +84,11 @@ usually the better one:
    `ErrPrincipalInteractionRequired` from the resolver when there is no session
    and register the surface with `Server.SetInteractiveLoginURL`. See the
    resolver bullet below for what that does and does not do — in particular
-   **it is refused for a CIMD client**, so on this route a CIMD authorization
-   request only succeeds for a user who already has a session.
+   **it is refused for a CIMD client unless `cimd.allowed_domains` is set**, so
+   on an open-mode deployment a CIMD authorization request only succeeds for a
+   user who already has a session. If you want browser-driven CIMD clients to
+   complete this route — the MCP case — you have to name the hosts that may
+   publish.
 2. **Front the browser leg above ZeroID and hand off over POST.** Your own
    surface owns the redirect, authenticates the human however you already do,
    and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
@@ -171,8 +174,10 @@ Three things a deployer must handle:
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
-  conjure a surface the deployment does not have — and it is refused outright for a
-  CIMD client, per the provenance rule above.
+  conjure a surface the deployment does not have — and it is refused for an
+  *unvetted* CIMD client, per the provenance rule above. Setting
+  `cimd.allowed_domains` lifts that refusal along with the error-redirect one:
+  they are the same check.
 
   Use `Server.Use` middleware instead if you want to own the whole interaction
   including the 302.

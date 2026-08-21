@@ -981,12 +981,13 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Error reporting is not redirected
+### 12.5 Error reporting is not redirected for an unvetted client
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
 redirecting to the client's registered `redirect_uri`. ZeroID does that for
-registered clients and **deliberately does not for CIMD clients**, which answer
-with an RFC 6749 §5.2 JSON body instead. The interactive-authentication redirect
+registered clients and **deliberately does not for CIMD clients whose publishing
+host is not on an allow-list**, which answer with an RFC 6749 §5.2 JSON body
+instead. The interactive-authentication redirect
 (`ErrPrincipalInteractionRequired`) is likewise refused for them.
 
 The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
@@ -997,8 +998,14 @@ from the authorization server's own origin, because the failure being reported i
 precisely "no credential was presented".
 
 Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, and
-error redirection applies again. The discriminator is registration provenance
-(`registration_source`), not the CIMD mechanism.
+both redirects apply again — the error redirect and the interactive-login one,
+which are the same check. The discriminator is registration provenance
+(`registration_source`) qualified by that allow-list, not the CIMD mechanism.
+
+This is what makes a browser-driven CIMD client — the MCP 2025-11-25 case —
+completable at all: an unvetted one is never sent to the deployment's login
+surface, so a user with no existing session cannot establish one. A deployment
+intending to serve browser CIMD clients **MUST** set `cimd.allowed_domains`.
 
 `allowed_domains` is deployment-wide, with no tenant dimension, so this
 re-enablement is meaningful only where the deployment serves a single tenant. A
