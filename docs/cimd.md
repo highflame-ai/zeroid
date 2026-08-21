@@ -84,11 +84,11 @@ usually the better one:
    `ErrPrincipalInteractionRequired` from the resolver when there is no session
    and register the surface with `Server.SetInteractiveLoginURL`. See the
    resolver bullet below for what that does and does not do — in particular
-   **it is refused for a CIMD client unless `cimd.allowed_domains` is set**, so
-   on an open-mode deployment a CIMD authorization request only succeeds for a
-   user who already has a session. If you want browser-driven CIMD clients to
-   complete this route — the MCP case — you have to name the hosts that may
-   publish.
+   **for a CIMD client it is refused only when the `redirect_uri` is a remote
+   `https://` host that `cimd.allowed_domains` does not cover.** A loopback or
+   private-use callback — the ordinary desktop/CLI MCP client — is exempt and
+   completes this route with no allowlist. A hosted client with a real `https://`
+   callback needs you to name the hosts that may publish.
 2. **Front the browser leg above ZeroID and hand off over POST.** Your own
    surface owns the redirect, authenticates the human however you already do,
    and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
@@ -132,7 +132,7 @@ cookie resolver is safe while POST is the only route, because `SameSite=Lax`
 withholds the cookie on a cross-site POST, and becomes reachable by cross-site
 top-level navigation once GET is mounted.
 
-**Errors are not redirected to an *unvetted* CIMD client.** RFC 6749 §4.1.2.1 says report most
+**Errors are not redirected to an *unvetted, remote* CIMD destination.** RFC 6749 §4.1.2.1 says report most
 `/oauth2/authorize` failures by redirecting to the client's registered
 `redirect_uri`, and ZeroID does — for clients somebody registered. A CIMD client's
 `redirect_uris` come from a document it published itself, so with `allowed_domains`
@@ -143,11 +143,21 @@ your origin. CIMD clients therefore get the §5.2 JSON body instead, and the
 interactive-login redirect is refused for them too — an unvetted client does not
 get to borrow your login surface's credibility.
 
-The cost is real and worth naming: a browser-driven CIMD client cannot learn its
-error from the callback and has to read the JSON body. Setting
-`cimd.allowed_domains` restores the redirect, because vetting which hosts may
-publish restores the assumption §4.1.2.1 is built on. The gate is provenance, not
-CIMD.
+**A loopback or private-use `redirect_uri` is exempt, and that is most MCP
+clients.** The threat above is about a *remote* destination — an unauthenticated
+redirector with your origin as the first hop. A 302 to `127.0.0.1` has no remote
+hop: the code lands on the machine the user is sitting at, and an attacker able
+to listen there already has local code execution. RFC 8252 §7.3 accepts loopback
+callbacks from clients nobody registered for exactly that reason, and CIMD does
+not weaken it. Since the document shape at the top of this page — the ordinary
+desktop/CLI MCP client — lists only loopback callbacks, the carve-out simply does
+not apply to it, and its browser leg works with no allowlist configured.
+
+The cost, for the clients it does apply to: a browser-driven CIMD client with a
+real `https://` callback cannot learn its error from that callback and has to
+read the JSON body. Setting `cimd.allowed_domains` restores the redirect there
+too, because vetting which hosts may publish restores the assumption §4.1.2.1 is
+built on. The gate is provenance and reach, not CIMD.
 
 **That hatch only works on a single-tenant deployment.** `allowed_domains` is one
 deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
@@ -174,10 +184,10 @@ Three things a deployer must handle:
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
-  conjure a surface the deployment does not have — and it is refused for an
-  *unvetted* CIMD client, per the provenance rule above. Setting
-  `cimd.allowed_domains` lifts that refusal along with the error-redirect one:
-  they are the same check.
+  conjure a surface the deployment does not have — and it is refused for a CIMD
+  client headed to an unvetted *remote* destination, per the rule above. Loopback
+  and private-use callbacks are exempt, and `cimd.allowed_domains` lifts the
+  refusal for remote hosts. Same check as the error redirect, either way.
 
   Use `Server.Use` middleware instead if you want to own the whole interaction
   including the 302.

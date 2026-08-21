@@ -108,10 +108,12 @@ type CIMDConfig struct {
 	// It is not only a fetch lever. It also decides whether a CIMD client is a
 	// destination this AS will redirect a user agent to — both the RFC 6749
 	// §4.1.2.1 error redirect and the interactive-login redirect are refused for
-	// a self-asserted client while this is empty. A browser-driven CIMD client
-	// (the MCP case) therefore CANNOT sign a user in on an open-mode deployment:
-	// with no allowlist there is nowhere to send someone who has no session yet.
-	// Set this if you intend to serve browser CIMD clients.
+	// a self-asserted client heading for a REMOTE https destination while this is
+	// empty. Loopback and private-use callbacks are exempt — they deliver to the
+	// requester's own device — so the ordinary desktop/CLI MCP client is
+	// unaffected and completes with no allowlist. Set this if you serve CIMD
+	// clients whose callbacks are remote https URLs; without it they can never
+	// sign a user in.
 	//
 	// Listing a host asserts that you vet who publishes there, and ZeroID holds
 	// the destination to the same bar: an https redirect_uri must be on the

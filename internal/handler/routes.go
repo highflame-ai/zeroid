@@ -281,18 +281,38 @@ func (a *API) SetCIMDPublishersVetted(vetted bool) {
 	a.cimdPublishersVetted = vetted
 }
 
-// refusesRedirectTo reports whether client is a destination this deployment
-// declines to redirect a user agent to — a self-asserted (CIMD) client whose
-// publishing host nobody vetted. The single predicate behind both
-// failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's refusal,
-// so the two cannot drift: they answer the same question about the same client.
+// refusesRedirectTo reports whether redirectURI is a destination this deployment
+// declines to send a user agent to on behalf of client. The single predicate
+// behind both failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's
+// refusal, so the two cannot drift: they answer the same question about the same
+// request.
+//
+// The question is whether the destination can reach a THIRD PARTY the client
+// chose for itself. Three ways it cannot, in the order they matter:
+//
+//   - Local delivery. A loopback or private-use redirect_uri resolves on the
+//     machine the user is sitting at, so there is no remote hop and nobody but
+//     the caller receives anything — see service.RedirectDeliversLocally. This is
+//     the native/CLI/MCP shape and the reason most CIMD clients are unaffected by
+//     the carve-out at all.
+//   - Not self-asserted. Somebody vetted the client at registration.
+//   - Vetted publisher. cimd.allowed_domains names who may publish, and
+//     redirectHostsAllowed holds https destinations to that same list.
 //
 // A nil client refuses. Both callers happen to check that themselves, but a
 // security predicate that answers "go ahead" for the case where there is no
 // client to reason about is the wrong default to leave lying around for the
 // third caller.
-func (a *API) refusesRedirectTo(client *domain.OAuthClient) bool {
-	return client == nil || (client.SelfAsserted() && !a.cimdPublishersVetted)
+func (a *API) refusesRedirectTo(client *domain.OAuthClient, redirectURI string) bool {
+	if client == nil {
+		return true
+	}
+
+	if !client.SelfAsserted() || a.cimdPublishersVetted {
+		return false
+	}
+
+	return !service.RedirectDeliversLocally(redirectURI)
 }
 
 // SetAuthorizationCodeAvailable records a predicate reporting whether
