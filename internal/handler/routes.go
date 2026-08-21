@@ -320,8 +320,13 @@ func (a *API) SetCIMDPublishersVetted(vetted bool) {
 // publishing host nobody vetted. The single predicate behind both
 // failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's refusal,
 // so the two cannot drift: they answer the same question about the same client.
+//
+// A nil client refuses. Both callers happen to check that themselves, but a
+// security predicate that answers "go ahead" for the case where there is no
+// client to reason about is the wrong default to leave lying around for the
+// third caller.
 func (a *API) refusesRedirectTo(client *domain.OAuthClient) bool {
-	return client.SelfAsserted() && !a.cimdPublishersVetted
+	return client == nil || (client.SelfAsserted() && !a.cimdPublishersVetted)
 }
 
 // SetAuthorizationCodeAvailable records a predicate reporting whether

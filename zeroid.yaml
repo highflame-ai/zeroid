@@ -141,6 +141,18 @@ cimd:
   # Set this to the hosts you trust to run CIMD as a closed ecosystem —
   # recommended for enterprise/closed deployments. Leave empty only for open
   # agent ecosystems, and rate-limit /oauth2/authorize at the edge. YAML only.
+  #
+  # REQUIRED to serve BROWSER-driven CIMD clients (the MCP case). While this is
+  # empty, a self-asserted client gets neither the RFC 6749 4.1.2.1 error
+  # redirect nor the interactive-login redirect, so a user with no session has
+  # nowhere to be sent and the authorization_code flow cannot complete for them.
+  # "Leave empty for open agent ecosystems" above holds for PROGRAMMATIC clients
+  # only — an open browser ecosystem is not a configuration that works.
+  #
+  # Listing a host asserts you vet who publishes there — an https redirect_uri
+  # must then be on the client_id's own host or on this list. Do not list a host
+  # where anyone can publish a path (user content, a raw-file CDN, a broadly
+  # writable bucket).
   # allowed_domains: ["client.example.com", "apps.acme.dev"]
   #
   # Relaxes the SSRF guard on the metadata-document fetch. Default false rejects

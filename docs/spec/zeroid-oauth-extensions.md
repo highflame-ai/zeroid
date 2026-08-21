@@ -1005,6 +1005,14 @@ overrides the document.
 - `grant_types` defaults to `["authorization_code"]`, **MUST** include
   `authorization_code`, and may contain only `authorization_code` and
   `refresh_token`.
+- When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
+  entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
+  is a deviation**, and it is what makes the allow-list load-bearing for Section
+  12.5: allow-listing a publisher vets the destination only if the destination is
+  vetted too, and on a host with multiple publishers it otherwise does not.
+  Loopback `http://` and private-use schemes are exempt — they resolve on the
+  caller's own device, not at a published host. Constrains nothing in open mode,
+  where those redirects are refused regardless.
 - `response_types`, when present, **MUST** include `code`.
 - Outer-shape validation only, by default. Per-type schema validation is opt-in
   through the `RegisterAuthorizationDetailValidator`-style hook pattern.
@@ -1023,7 +1031,7 @@ instead. The interactive-authentication redirect
 (`ErrPrincipalInteractionRequired`) is likewise refused for them.
 
 The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
-self-asserted, and with no `allowed_domains` allow-list (Section 12.6, the default)
+self-asserted, and with no `allowed_domains` allow-list (Section 12.7, the default)
 any host may publish a document naming any destination — so the redirect target is
 attacker-chosen. Honouring §4.1.2.1 there yields an unauthenticated open redirect
 from the authorization server's own origin, because the failure being reported is
