@@ -79,6 +79,13 @@ usually the better one:
    `SameSite=Lax` still sends the cookie on a cross-site top-level navigation,
    and CIMD accepts an attacker-published `client_id` with its own
    `redirect_uri`.
+
+   ZeroID will send the user to that login screen for you: return
+   `ErrPrincipalInteractionRequired` from the resolver when there is no session
+   and register the surface with `Server.SetInteractiveLoginURL`. See the
+   resolver bullet below for what that does and does not do — in particular
+   **it is refused for a CIMD client**, so on this route a CIMD authorization
+   request only succeeds for a user who already has a session.
 2. **Front the browser leg above ZeroID and hand off over POST.** Your own
    surface owns the redirect, authenticates the human however you already do,
    and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
