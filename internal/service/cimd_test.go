@@ -556,3 +556,124 @@ func TestCIMDPositiveCacheTTL(t *testing.T) {
 		}
 	}
 }
+
+// TestRedirectHostsAllowed is the check that makes cimd.allowed_domains mean
+// what the authorize-handler gate assumes it means.
+//
+// That gate (API.refusesRedirectTo) reads "an allow-listed publisher is a vetted
+// party, so §4.1.2.1 redirects and the interactive-login redirect apply again."
+// Allow-listing the client_id host alone does not establish that: on any host
+// where more than one party can publish a path — user content, a raw-file CDN, a
+// bucket with broad write, a shared internal app host — an attacker publishes a
+// document naming redirect_uri https://evil.example/cb and gets an
+// unauthenticated 302 to evil.example, plus a victim walked through the real
+// login page first. The redirect destination has to be vetted too, or the switch
+// re-opens what the carve-out closed.
+func TestRedirectHostsAllowed(t *testing.T) {
+	svc := NewCIMDService(CIMDConfig{Enabled: true, AllowedDomains: []string{"apps.acme.dev"}})
+
+	const publisher = "apps.acme.dev"
+
+	t.Run("same host as client_id passes unlisted", func(t *testing.T) {
+		// The ordinary case: a document names callbacks on the host that
+		// published it. Requiring that host to also appear in the allow-list
+		// would be redundant — it is already there, since it resolved at all.
+		if err := svc.redirectHostsAllowed(publisher, []string{"https://apps.acme.dev/cb"}); err != nil {
+			t.Fatalf("same-host redirect must pass: %v", err)
+		}
+	})
+
+	t.Run("another allow-listed host passes", func(t *testing.T) {
+		svc2 := NewCIMDService(CIMDConfig{
+			Enabled:        true,
+			AllowedDomains: []string{"apps.acme.dev", "cb.acme.dev"},
+		})
+		if err := svc2.redirectHostsAllowed(publisher, []string{"https://cb.acme.dev/cb"}); err != nil {
+			t.Fatalf("a vetted destination host must pass: %v", err)
+		}
+	})
+
+	t.Run("foreign https host is refused", func(t *testing.T) {
+		err := svc.redirectHostsAllowed(publisher, []string{"https://evil.example/cb"})
+		if !errors.Is(err, ErrCIMDDomainNotAllowed) {
+			t.Fatalf("want ErrCIMDDomainNotAllowed, got %v", err)
+		}
+	})
+
+	t.Run("one bad entry poisons the document", func(t *testing.T) {
+		// Not "drop the bad one and keep going": the client would then hold a
+		// redirect_uris list the deployer never approved, and redirectURIAllowed
+		// matches against whichever entry the request names.
+		err := svc.redirectHostsAllowed(publisher, []string{
+			"https://apps.acme.dev/cb",
+			"https://evil.example/cb",
+		})
+		if !errors.Is(err, ErrCIMDDomainNotAllowed) {
+			t.Fatalf("want ErrCIMDDomainNotAllowed, got %v", err)
+		}
+	})
+
+	t.Run("loopback and private-use schemes are exempt", func(t *testing.T) {
+		// These deliver to the caller's own machine, not to a host anybody
+		// publishes to, so a deployment-wide host allow-list has nothing to say
+		// about them — and they are the native/MCP client shape.
+		for _, ru := range []string{
+			"http://127.0.0.1:9000/cb",
+			"http://localhost:9000/cb",
+			"myapp:/cb",
+		} {
+			if err := svc.redirectHostsAllowed(publisher, []string{ru}); err != nil {
+				t.Errorf("%s must stay usable: %v", ru, err)
+			}
+		}
+	})
+
+	t.Run("open mode constrains nothing", func(t *testing.T) {
+		// domainAllowed admits every host with no allow-list, so this is a
+		// no-op there — correctly: open mode refuses these redirects outright,
+		// so there is no vetting claim to keep honest.
+		open := NewCIMDService(CIMDConfig{Enabled: true})
+		if err := open.redirectHostsAllowed(publisher, []string{"https://anywhere.example/cb"}); err != nil {
+			t.Fatalf("open mode must not reject: %v", err)
+		}
+	})
+
+	t.Run("host match is case-insensitive", func(t *testing.T) {
+		if err := svc.redirectHostsAllowed("APPS.ACME.DEV", []string{"https://apps.acme.dev/cb"}); err != nil {
+			t.Fatalf("host comparison must be case-insensitive: %v", err)
+		}
+	})
+}
+
+// TestRedirectDeliversLocally pins the reachability judgement the authorize
+// carve-out delegates to. A false negative costs the native/MCP browser leg; a
+// false positive hands an attacker-chosen remote host a redirect from the AS's
+// own origin. The look-alike case is the one worth having a test for.
+func TestRedirectDeliversLocally(t *testing.T) {
+	local := []string{
+		"http://127.0.0.1:3000/callback",
+		"http://localhost/cb",
+		"http://[::1]:8080/cb",
+		"myapp:/cb",
+		"com.example.app:/oauth",
+	}
+	remote := []string{
+		"https://app.example.com/cb",
+		"https://127.0.0.1/cb",         // https is remote-capable regardless of host
+		"http://127.0.0.1.evil.com/cb", // look-alike: not loopback
+		"http://evil.example/cb",
+		"/relative/cb", // no scheme — validateCIMDRedirectURI rejects; fail closed
+	}
+
+	for _, u := range local {
+		if !RedirectDeliversLocally(u) {
+			t.Errorf("%s must count as local delivery — refusing it breaks native clients", u)
+		}
+	}
+
+	for _, u := range remote {
+		if RedirectDeliversLocally(u) {
+			t.Errorf("%s must NOT count as local delivery", u)
+		}
+	}
+}

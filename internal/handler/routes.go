@@ -15,6 +15,7 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
@@ -49,6 +50,16 @@ type API struct {
 	// SetCIMDEnabled after construction; defaults false so a build that doesn't
 	// wire CIMD doesn't advertise it.
 	cimdEnabled bool
+
+	// cimdPublishersVetted reports whether cimd.allowed_domains names at least
+	// one host, i.e. whether a deployer decided which hosts may publish a
+	// metadata document. It is the gate that lets a CIMD client be treated as
+	// a redirect destination — see failAuthorize and redirectToInteractiveLogin,
+	// which refuse a self-asserted client only while this is false. Set via
+	// SetCIMDPublishersVetted from the EFFECTIVE allow-list, not the raw config
+	// slice: NewCIMDService lower-cases and drops blank entries, so
+	// allowed_domains: [""] has length 1 and vets nothing.
+	cimdPublishersVetted bool
 
 	// authorizationCodeAvailable reports whether /oauth2/authorize can
 	// actually serve a request — i.e. whether the deployer registered any
@@ -251,6 +262,57 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 // by Server.NewServer from cfg.CIMD.Enabled.
 func (a *API) SetCIMDEnabled(enabled bool) {
 	a.cimdEnabled = enabled
+}
+
+// SetCIMDPublishersVetted records whether cimd.allowed_domains is in force,
+// which decides whether a CIMD client may be redirected to — its error
+// redirect per RFC 6749 §4.1.2.1, and the interactive-login redirect.
+//
+// Both are refused for a self-asserted client by default because a CIMD
+// document's redirect_uris are attacker-CHOSEN, not merely attacker-supplied:
+// with no allow-list, any public HTTPS host can publish one. An allow-list is
+// the deployer saying which hosts may publish, which restores the vetting
+// §4.1.2.1's redirect rule assumes — so the refusal lifts with it.
+//
+// Called by Server.NewServer with CIMDService.AllowedDomainCount() > 0. A bool
+// rather than a predicate because the allow-list comes from config and cannot
+// change after construction, unlike the resolver registry.
+func (a *API) SetCIMDPublishersVetted(vetted bool) {
+	a.cimdPublishersVetted = vetted
+}
+
+// refusesRedirectTo reports whether redirectURI is a destination this deployment
+// declines to send a user agent to on behalf of client. The single predicate
+// behind both failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's
+// refusal, so the two cannot drift: they answer the same question about the same
+// request.
+//
+// The question is whether the destination can reach a THIRD PARTY the client
+// chose for itself. Three ways it cannot, in the order they matter:
+//
+//   - Local delivery. A loopback or private-use redirect_uri resolves on the
+//     machine the user is sitting at, so there is no remote hop and nobody but
+//     the caller receives anything — see service.RedirectDeliversLocally. This is
+//     the native/CLI/MCP shape and the reason most CIMD clients are unaffected by
+//     the carve-out at all.
+//   - Not self-asserted. Somebody vetted the client at registration.
+//   - Vetted publisher. cimd.allowed_domains names who may publish, and
+//     redirectHostsAllowed holds https destinations to that same list.
+//
+// A nil client refuses. Both callers happen to check that themselves, but a
+// security predicate that answers "go ahead" for the case where there is no
+// client to reason about is the wrong default to leave lying around for the
+// third caller.
+func (a *API) refusesRedirectTo(client *domain.OAuthClient, redirectURI string) bool {
+	if client == nil {
+		return true
+	}
+
+	if !client.SelfAsserted() || a.cimdPublishersVetted {
+		return false
+	}
+
+	return !service.RedirectDeliversLocally(redirectURI)
 }
 
 // SetAuthorizationCodeAvailable records a predicate reporting whether

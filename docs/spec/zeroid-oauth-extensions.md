@@ -973,6 +973,14 @@ overrides the document.
 - `grant_types` defaults to `["authorization_code"]`, **MUST** include
   `authorization_code`, and may contain only `authorization_code` and
   `refresh_token`.
+- When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
+  entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
+  is a deviation**, and it is what makes the allow-list load-bearing for Section
+  12.5: allow-listing a publisher vets the destination only if the destination is
+  vetted too, and on a host with multiple publishers it otherwise does not.
+  Loopback `http://` and private-use schemes are exempt — they resolve on the
+  caller's own device, not at a published host. Constrains nothing in open mode,
+  where those redirects are refused regardless.
 - `response_types`, when present, **MUST** include `code`.
 - Outer-shape validation only, by default. Per-type schema validation is opt-in
   through the `RegisterAuthorizationDetailValidator`-style hook pattern.
@@ -981,24 +989,40 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Error reporting is not redirected
+### 12.5 Error reporting is not redirected to an unvetted remote destination
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
 redirecting to the client's registered `redirect_uri`. ZeroID does that for
-registered clients and **deliberately does not for CIMD clients**, which answer
-with an RFC 6749 §5.2 JSON body instead. The interactive-authentication redirect
+registered clients and **deliberately does not for CIMD clients whose publishing
+host is not on an allow-list**, which answer with an RFC 6749 §5.2 JSON body
+instead. The interactive-authentication redirect
 (`ErrPrincipalInteractionRequired`) is likewise refused for them.
 
 The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
-self-asserted, and with no `allowed_domains` allow-list (Section 12.6, the default)
+self-asserted, and with no `allowed_domains` allow-list (Section 12.7, the default)
 any host may publish a document naming any destination — so the redirect target is
 attacker-chosen. Honouring §4.1.2.1 there yields an unauthenticated open redirect
 from the authorization server's own origin, because the failure being reported is
 precisely "no credential was presented".
 
 Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, and
-error redirection applies again. The discriminator is registration provenance
-(`registration_source`), not the CIMD mechanism.
+both redirects apply again — the error redirect and the interactive-login one,
+which are the same check. The discriminator is registration provenance
+(`registration_source`) qualified by that allow-list, not the CIMD mechanism.
+
+A loopback `http://` or private-use `redirect_uri` is **exempt from both
+refusals**, whatever the allow-list says. Those destinations resolve on the
+requester's own device, so the redirect has no remote hop and no third-party
+recipient — the property RFC 8252 §7.3 already relies on to accept such callbacks
+from unregistered native clients. The carve-out's premise is a remote
+attacker-chosen destination and does not hold for them.
+
+This is what makes a browser-driven CIMD client — the MCP 2025-11-25 case —
+completable. The ordinary desktop/CLI client publishes loopback callbacks and is
+therefore unaffected: it reaches the login surface and completes with no
+allow-list. A deployment serving CIMD clients whose callbacks are remote
+`https://` URLs **MUST** set `cimd.allowed_domains`, or those clients can never
+sign a user in.
 
 `allowed_domains` is deployment-wide, with no tenant dimension, so this
 re-enablement is meaningful only where the deployment serves a single tenant. A
