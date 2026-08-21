@@ -86,6 +86,9 @@ var testDB *bun.DB
 // service name (the `trusted_by` claim).
 const testTrustedServiceHeader = "X-Test-Trusted-Service"
 
+// testInteractiveLoginURL is the stub consent surface for the #276 tests.
+const testInteractiveLoginURL = "https://studio.example.test/login"
+
 // trustedServiceCtxKey is the context key the test global middleware uses to
 // pass the trusted-service name through to the validator.
 type trustedServiceCtxKey struct{}
@@ -299,6 +302,13 @@ func runTests(m *testing.M) int {
 			next.ServeHTTP(w, r)
 		})
 	})
+	// Login surface for the interactive-authentication tests (#276). A real
+	// deployer points this at their own consent page; the tests only need a
+	// stable absolute URL to assert the redirect and its return_to against.
+	srv.SetInteractiveLoginURL(func(*zeroid.AuthorizeRequest) string {
+		return testInteractiveLoginURL
+	})
+
 	srv.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
 		if name, ok := ctx.Value(trustedServiceCtxKey{}).(string); ok && name != "" {
 			return name, nil
@@ -316,6 +326,14 @@ func runTests(m *testing.M) int {
 	// ErrPrincipalNotApplicable) whenever its header is absent, so the
 	// form-field stub still serves every POST test unchanged.
 	srv.RegisterPrincipalResolver("test-header-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		// Interaction trigger for the #276 tests: stands in for a session-cookie
+		// resolver that recognises the request but finds nobody signed in.
+		// Checked before the credential header so a test can ask for the
+		// interaction path without also supplying a principal.
+		if req.Header("X-Test-Interaction-Required") != "" {
+			return nil, zeroid.ErrPrincipalInteractionRequired
+		}
+
 		acct := req.Header("X-Test-Principal-Account")
 		if acct == "" {
 			return nil, zeroid.ErrPrincipalNotApplicable

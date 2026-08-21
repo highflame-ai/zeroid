@@ -41,12 +41,73 @@ import (
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
-// middlewareHolder stores an optional middleware in a thread-safe way.
-// The middleware closure is registered at router-build time; the actual function
-// is set later (before Start) via a setter method.
+// middlewareHolder stores optional middleware in a thread-safe way.
+// The middleware closure is registered at router-build time; the actual
+// functions are set later (before Start) via a setter method.
+//
+// fns is a slice, not a single slot, so Server.Use can APPEND. A single slot
+// meant a second Use call silently discarded the first — see Server.Use.
+// adminAuthState still only ever holds one entry, set through fn().
 type middlewareHolder struct {
-	mu sync.RWMutex
-	fn func(http.Handler) http.Handler
+	mu  sync.RWMutex
+	fns []func(http.Handler) http.Handler
+	// composed is fns wrapped into a single middleware, rebuilt whenever fns
+	// changes. Cached rather than composed per call because chain() runs on EVERY
+	// request through EVERY route: composing there cost a slice copy plus a
+	// closure allocation per request, which the previous single-slot read did not.
+	// nil when fns is empty, so the router closure can skip the wrap entirely.
+	composed func(http.Handler) http.Handler
+}
+
+// rebuildLocked recomputes composed. Caller must hold the write lock.
+//
+// Wraps in reverse so fns[0] ends up OUTERMOST, matching chi and net/http:
+// middleware runs in registration order, and one that annotates context has to
+// run before one that reads it.
+func (h *middlewareHolder) rebuildLocked() {
+	if len(h.fns) == 0 {
+		h.composed = nil
+
+		return
+	}
+
+	fns := make([]func(http.Handler) http.Handler, len(h.fns))
+	copy(fns, h.fns)
+
+	h.composed = func(next http.Handler) http.Handler {
+		wrapped := next
+		for i := len(fns) - 1; i >= 0; i-- {
+			wrapped = fns[i](wrapped)
+		}
+
+		return wrapped
+	}
+}
+
+// fn returns the single registered middleware, or nil. For holders that only
+// ever carry one (adminAuthState), which is set by replacing the slice.
+func (h *middlewareHolder) fn() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.fns) == 0 {
+		return nil
+	}
+
+	return h.fns[0]
+}
+
+// chain returns the registered middleware composed so the FIRST registered is
+// outermost, matching chi and net/http convention. Nil when none are set.
+//
+// Read-only and allocation-free: it hands back the cached composition. Use is
+// documented as callable after NewServer, so the cache is rebuilt on mutation
+// rather than assumed immutable.
+func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.composed
 }
 
 // Server is the main ZeroID server.
@@ -102,8 +163,12 @@ type Server struct {
 	// /oauth2/authorize can complete an authorization_code flow. nil means
 	// "use the built-in guess". See SetAuthorizationCodeAvailable.
 	authzCodeAvailable func() bool
-	adminAuthState     *middlewareHolder
-	globalMWState      *middlewareHolder
+	// interactiveLoginURL is the deployer's login surface for resolvers that
+	// report ErrPrincipalInteractionRequired. nil means "no surface", which
+	// degrades that sentinel to access_denied. See SetInteractiveLoginURL.
+	interactiveLoginURL func(*AuthorizeRequest) string
+	adminAuthState      *middlewareHolder
+	globalMWState       *middlewareHolder
 }
 
 // namedPrincipalResolver pairs a registered PrincipalResolver with the
@@ -423,11 +488,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// without blocking unauthenticated callers.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			globalMW.mu.RLock()
-			mw := globalMW.fn
-			globalMW.mu.RUnlock()
-			if mw != nil {
+			if mw := globalMW.chain(); mw != nil {
 				mw(next).ServeHTTP(w, req)
+
 				return
 			}
 			next.ServeHTTP(w, req)
@@ -474,11 +537,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				authState.mu.RLock()
-				auth := authState.fn
-				authState.mu.RUnlock()
-				if auth != nil {
+				if auth := authState.fn(); auth != nil {
 					auth(next).ServeHTTP(w, req)
+
 					return
 				}
 				next.ServeHTTP(w, req)
@@ -558,6 +619,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// RegisterPrincipalResolver is documented as safe to call after NewServer
 	// and before Start (#263).
 	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
+	apiHandler.SetInteractiveLoginURL(srv.resolveInteractiveLoginURL)
 
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
@@ -799,15 +861,20 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // issuance has to sit behind an explicit user interaction — a consent
 // screen carrying a CSRF token — the way a real authorization server does.
 //
-// A PrincipalResolver CANNOT implement that: its signature returns
-// (*Principal, error), so it has no ResponseWriter, cannot redirect, and
-// cannot render or resume a consent screen. Its only lever is failing the
-// request. Do the interaction in Server.Use middleware, which sees the
-// raw request and response and can 302 to a consent page before the
-// handler runs; the resolver then only has to recognise the session the
-// consent flow established. See docs/cimd.md, highflame-authn#157 for a
-// worked example, and #276 for why this is more awkward than it should
-// be.
+// A PrincipalResolver cannot render that screen itself: its signature
+// returns (*Principal, error), so it has no ResponseWriter. It CAN start
+// the interaction, though — return ErrPrincipalInteractionRequired and
+// zeroid redirects the user agent to the surface registered with
+// Server.SetInteractiveLoginURL, appending return_to so the flow resumes
+// once your surface has authenticated them. Your resolver then only has
+// to recognise the session that established. That keeps redirects out of
+// resolver code, which is the point of the split.
+//
+// Rendering and CSRF-protecting the consent screen itself remains yours.
+// Server.Use middleware is the other option if you want to own the whole
+// interaction, including the 302, before the handler runs; it chains, so
+// it composes with whatever you already registered. See docs/cimd.md and
+// highflame-authn#157 for a worked example.
 //
 // Header-based resolvers (api_key, mTLS, a signed assertion) do not have
 // this exposure: a browser cannot set a custom header on a top-level
@@ -835,10 +902,20 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     AS metadata omits the authorization_code grant in that state, so
 //     discovery never promises a flow the endpoint cannot serve.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
-//     returns (nil, "", nil). Handler maps to 401 invalid_client.
-//   - Any resolver returning a non-sentinel error → returns
-//     (nil, resolverName, err). The chain stops at the first such
-//     error; handler surfaces it as 401 invalid_client.
+//     returns (nil, "", nil). The handler reports access_denied: on a GET
+//     that is a 302 back to the client's redirect_uri per RFC 6749
+//     §4.1.2.1, on a POST a 401 invalid_client JSON body.
+//   - A resolver returning ErrPrincipalInteractionRequired → returns
+//     (nil, resolverName, err) and STOPS the chain, like any other
+//     non-sentinel error. On a GET the handler redirects the user agent
+//     to Server.SetInteractiveLoginURL's target instead of refusing; with
+//     no target set, or on a POST, it degrades to access_denied. A
+//     resolver that wants the chain to continue must return
+//     ErrPrincipalNotApplicable instead.
+//   - Any other resolver error → returns (nil, resolverName, err). The
+//     chain stops at the first such error; the handler reports it the
+//     same way as the no-match case (access_denied / 401), without
+//     revealing which resolver matched.
 func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
 	s.mu.RLock()
 	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
@@ -872,10 +949,21 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
+// Calling it again REPLACES the previous middleware — admin auth is one
+// decision, not a stack. Passing nil removes it.
 func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 	s.adminAuthState.mu.Lock()
 	defer s.adminAuthState.mu.Unlock()
-	s.adminAuthState.fn = middleware
+
+	if middleware == nil {
+		s.adminAuthState.fns = nil
+		s.adminAuthState.rebuildLocked()
+
+		return
+	}
+
+	s.adminAuthState.fns = []func(http.Handler) http.Handler{middleware}
+	s.adminAuthState.rebuildLocked()
 }
 
 // Use adds a global middleware that runs on ALL routes (public + admin).
@@ -886,11 +974,98 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 // trusted service identity from headers so that TrustedServiceValidator can read it
 // during external principal token exchange.
 //
+// Calling it more than once APPENDS. Middleware runs in registration order, so
+// the first registered is outermost — the same convention as chi and net/http.
+// It used to replace instead, which silently discarded everything but the last
+// registration: a deployer who added a second concern lost the first with no
+// error, and since the slot is typically already occupied (annotating trusted
+// service identity, say) the loss landed on whatever was registered first
+// (#276).
+//
+// A note on what belongs here. Middleware on this path sees /oauth2/authorize,
+// including requests from CIMD clients, which are unregistered and inherently
+// third-party. Treat anything registered here as security-relevant on that
+// route, and prefer to keep it to context annotation.
+//
 // Can be called after NewServer and before Start.
+//
+// Passing nil is IGNORED, not a way to unregister — there is no removal for an
+// appending registry, and silently dropping every previously registered
+// middleware would be a worse answer than doing nothing. This differs from
+// AdminAuth(nil), which does clear, because that one is a single slot.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {
+	if middleware == nil {
+		return
+	}
+
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
-	s.globalMWState.fn = middleware
+	s.globalMWState.fns = append(s.globalMWState.fns, middleware)
+	s.globalMWState.rebuildLocked()
+}
+
+// SetInteractiveLoginURL supplies the login surface a user agent is sent to when
+// a PrincipalResolver reports ErrPrincipalInteractionRequired.
+//
+// This is the missing half of the resolver contract. A PrincipalResolver returns
+// (*Principal, error) and so cannot redirect — it has no ResponseWriter — which
+// left a cookie-based resolver with no way to start a login: declining reads as
+// "wrong credential type", and failing reads as "bad credential". Neither sends
+// the user anywhere. Now the resolver returns the sentinel and ZeroID does the
+// redirect, so the resolver still never touches the transport.
+//
+// The contract:
+//
+//   - fn is called only after the client and redirect_uri have been validated, so
+//     the request it receives is one ZeroID has already vetted.
+//   - ZeroID appends return_to, rebuilt from the validated protocol parameters,
+//     pointing back at /oauth2/authorize. Your surface should send the user there
+//     after authenticating, at which point your resolver should recognise the
+//     session it established. return_to deliberately excludes anything else from
+//     the inbound query — see redirectToInteractiveLogin.
+//   - Returning "" declines, as does leaving fn nil: the sentinel then degrades
+//     to access_denied, because a resolver cannot conjure a surface the
+//     deployment does not have.
+//   - Honoured on GET only. A POST caller has no user agent to redirect.
+//   - return_to is ZeroID's parameter name and is SET on whatever you return, so
+//     a target already carrying one loses it. Put your own state elsewhere.
+//
+// **Your surface must not bounce back to return_to unconditionally.** ZeroID has
+// no loop guard here: if the user is returned without a session established —
+// they cancelled, cookies are blocked, a third-party-cookie policy intervened —
+// your resolver reports the sentinel again and the redirect repeats. Send them
+// back only once you can satisfy the resolver, and show them a terminal error
+// otherwise.
+//
+// **Derive the target from configuration, not from the request.** fn receives the
+// AuthorizeRequest so the target can vary by tenant, client or locale — but
+// building it out of request data turns this into an open redirect, and ZeroID
+// does not validate what you return because deployer config is trusted.
+//
+// Passing nil removes the target. Safe to call after NewServer.
+func (s *Server) SetInteractiveLoginURL(fn func(*AuthorizeRequest) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactiveLoginURL = fn
+}
+
+// resolveInteractiveLoginURL is wired into the handler at build time, so the
+// deployer can call SetInteractiveLoginURL any time before Start. Returns "" when
+// no target is set, which the handler reads as "decline".
+func (s *Server) resolveInteractiveLoginURL(req *service.AuthorizeRequest) string {
+	// Snapshot under the lock, then release BEFORE calling the deployer's func —
+	// RWMutex is not reentrant, so invoking an arbitrary callback while holding
+	// s.mu deadlocks if it touches any locking Server method. Same pattern as
+	// canServeAuthorizationCode.
+	s.mu.RLock()
+	fn := s.interactiveLoginURL
+	s.mu.RUnlock()
+
+	if fn == nil {
+		return ""
+	}
+
+	return fn(req)
 }
 
 // SetAuthorizationCodeAvailable overrides ZeroID's guess about whether
@@ -1119,8 +1294,20 @@ func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
 // The validator reads from context (populated by deployer-provided global middleware
 // via Server.Use). When nil (default), external principal exchange is disabled.
 //
+// Passing nil disables external principal exchange, as the default does. It used
+// to wrap the nil in a non-nil closure, so the service saw a validator that
+// existed and called it — turning "disabled" into a nil-deref panic on the first
+// external-principal exchange, which is both the opposite of what this godoc
+// promised and a crash on a request path rather than at startup.
+//
 // Can be called after NewServer and before Start.
 func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
+	if v == nil {
+		s.oauthSvc.SetTrustedServiceValidator(nil)
+
+		return
+	}
+
 	s.oauthSvc.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
 		return v(ctx)
 	})

@@ -855,7 +855,7 @@ baseline:
 | `backchannel_token_delivery_modes_supported` | `["poll","ping","push"]` | CIBA Core |
 | `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
 | `backchannel_authentication_request_signing_alg_values_supported` | `[]` (signed bc-authorize requests unsupported) | CIBA Core |
-| `client_id_metadata_document_supported` | `true` (gated — see Section 12.7) | CIMD draft-02 |
+| `client_id_metadata_document_supported` | `true` (gated — see Section 12.8) | CIMD draft-02 |
 
 ### 11.2 Protected Resource Metadata (RFC 9728)
 
@@ -958,6 +958,12 @@ overrides the document.
   `https`, loopback `http`, or a private-use scheme (RFC 8252 §7.1 native-app
   callbacks). Plaintext non-loopback `http` is rejected, as are userinfo and
   fragments.
+- `client_name` is **REQUIRED and non-empty** (trimmed). **This is a deviation** —
+  the draft only RECOMMENDS it. It is the string a consent screen shows the user,
+  and a CIMD publisher is anonymous by construction, so this label is most of what
+  consent has to go on. ZeroID previously fell back to the `client_id`, which made
+  a document that declined to name itself indistinguishable from a well-formed one
+  and let whoever chose the URL choose what the user reads.
 - `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
   `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
   establish itself as confidential via `token_endpoint_auth_method` and
@@ -975,7 +981,33 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Caching
+### 12.5 Error reporting is not redirected
+
+RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
+redirecting to the client's registered `redirect_uri`. ZeroID does that for
+registered clients and **deliberately does not for CIMD clients**, which answer
+with an RFC 6749 §5.2 JSON body instead. The interactive-authentication redirect
+(`ErrPrincipalInteractionRequired`) is likewise refused for them.
+
+The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
+self-asserted, and with no `allowed_domains` allow-list (Section 12.6, the default)
+any host may publish a document naming any destination — so the redirect target is
+attacker-chosen. Honouring §4.1.2.1 there yields an unauthenticated open redirect
+from the authorization server's own origin, because the failure being reported is
+precisely "no credential was presented".
+
+Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, and
+error redirection applies again. The discriminator is registration provenance
+(`registration_source`), not the CIMD mechanism.
+
+`allowed_domains` is deployment-wide, with no tenant dimension, so this
+re-enablement is meaningful only where the deployment serves a single tenant. A
+multi-tenant deployment cannot scope it per `(account_id, project_id)` — and the
+tenant is unknown at the point a CIMD document is resolved, since resolution
+precedes principal resolution by design (Section 12.5's whole premise). See
+zeroid#286.
+
+### 12.6 Caching
 
 Outcomes are memoised in a bounded in-memory cache (1000 entries, evicted on
 pressure). Nothing is persisted.
@@ -996,7 +1028,7 @@ force a fresh timeout-bounded outbound fetch on every request.
 The positive TTL is also why the `/oauth2/authorize` → `/oauth2/token`
 round-trip does not fetch twice.
 
-### 12.6 Deployment policy and what it cannot do
+### 12.7 Deployment policy and what it cannot do
 
 `cimd.allowed_domains` restricts CIMD to `client_id` URLs whose host appears in
 an exact, case-insensitive allow-list, checked **before** any outbound fetch. It
@@ -1021,7 +1053,7 @@ CIMD model rather than of this implementation:
   key shared across the whole population — a constraint on what "confidential
   CIMD client" can mean (zeroid#264).
 
-### 12.7 Discovery
+### 12.8 Discovery
 
 `client_id_metadata_document_supported: true` is advertised in Authorization
 Server Metadata (Section 11.1) when CIMD is enabled **and** the deployment can

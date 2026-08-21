@@ -89,6 +89,18 @@ type PrincipalResolver = service.PrincipalResolver
 // this sentinel, the request fails with 401 invalid_client.
 var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 
+// ErrPrincipalInteractionRequired is the sentinel a PrincipalResolver returns
+// when the request could be satisfied by a human logging in, but nobody is
+// authenticated yet. zeroid stops the chain and redirects the user agent to the
+// target set via Server.SetInteractiveLoginURL, appending return_to so the flow
+// can resume.
+//
+// This is how a resolver starts a login without being able to redirect itself:
+// its signature returns (*Principal, error), so it has no ResponseWriter. See
+// SetInteractiveLoginURL for the contract, including that it only applies on GET
+// and degrades to access_denied when no target is configured.
+var ErrPrincipalInteractionRequired = service.ErrPrincipalInteractionRequired
+
 // ErrNoResolversRegistered is the sentinel surfaced by zeroid when
 // /oauth2/authorize is reached but no PrincipalResolver has been
 // registered via Server.RegisterPrincipalResolver. The handler maps

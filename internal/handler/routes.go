@@ -58,6 +58,15 @@ type API struct {
 	// (embedders that never call the setter keep the old behaviour).
 	authorizationCodeAvailable func() bool
 
+	// interactiveLoginURL returns where to send a user agent when a resolver
+	// reports ErrPrincipalInteractionRequired. Nil means the deployment has no
+	// login surface, in which case that sentinel degrades to access_denied — a
+	// resolver cannot conjure a surface that does not exist.
+	//
+	// A func rather than a string so the target can vary per request (tenant,
+	// client, locale) without the resolver having to construct redirects itself.
+	interactiveLoginURL func(*service.AuthorizeRequest) string
+
 	// resolvePrincipal walks the PrincipalResolver chain registered on
 	// the top-level Server. Wired unconditionally by Server.NewServer via
 	// SetPrincipalResolverFunc, which passes a BOUND METHOD — so this is
@@ -269,6 +278,13 @@ func (a *API) SetAuthorizationCodeAvailable(fn func() bool) {
 // true when no predicate was set.
 func (a *API) canServeAuthorizationCode() bool {
 	return a.authorizationCodeAvailable == nil || a.authorizationCodeAvailable()
+}
+
+// SetInteractiveLoginURL records where to send a user agent when a
+// PrincipalResolver reports ErrPrincipalInteractionRequired. See
+// Server.SetInteractiveLoginURL for the contract.
+func (a *API) SetInteractiveLoginURL(fn func(*service.AuthorizeRequest) string) {
+	a.interactiveLoginURL = fn
 }
 
 // RegisterAdmin registers admin/management endpoints:

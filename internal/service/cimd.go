@@ -101,7 +101,7 @@ const (
 	// downstream code can distinguish them from "internal" (admin) and
 	// "dynamic" (RFC 7591) clients. Kept out of the DB — CIMD clients are
 	// never persisted.
-	cimdRegistrationSource = "cimd"
+	cimdRegistrationSource = domain.RegistrationSourceCIMD
 )
 
 // CIMD error sentinels. Callers wrap these into RFC 6749 §5.2 OAuth errors via
@@ -513,11 +513,22 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		return nil, fmt.Errorf("%w: response_types must include \"code\"", ErrCIMDInvalidDocument)
 	}
 
-	name := doc.ClientName
+	// client_name is REQUIRED here, though the draft only RECOMMENDS it.
+	//
+	// It is the string a human is asked to trust: a consent screen identifies the
+	// application by client_name, so an absent one degrades the prompt to a raw
+	// URL — both less legible and, for a URL an attacker chose, actively
+	// misleading. The document's publisher is anonymous by construction: there is
+	// no registration and no secret, so this label is most of what consent has to
+	// go on.
+	//
+	// We used to fall back to the client_id. That made the weakest case — a
+	// document that declined to name itself — silently indistinguishable from a
+	// well-formed one, and put the choice of what the user reads in the hands of
+	// whoever picked the URL.
+	name := strings.TrimSpace(doc.ClientName)
 	if name == "" {
-		// client_name is RECOMMENDED, not required. Fall back to the URL so
-		// consent screens / logs have a stable label.
-		name = clientID
+		return nil, fmt.Errorf("%w: client_name is required and must be non-empty", ErrCIMDInvalidDocument)
 	}
 
 	// An empty scope means "no client-side scope ceiling": the principal
