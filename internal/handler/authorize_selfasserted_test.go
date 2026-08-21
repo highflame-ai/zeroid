@@ -159,3 +159,81 @@ func TestSelfAsserted_InteractiveLoginIsRefused(t *testing.T) {
 		}
 	})
 }
+
+// TestVettedPublishers_RestoresRedirects is the other side of the carve-out, and
+// the reason it is a carve-out rather than a ban.
+//
+// The refusal above is not about CIMD the feature — it is about a destination
+// nobody vetted. cimd.allowed_domains is the deployer naming which hosts may
+// publish a metadata document, which restores exactly the assumption §4.1.2.1's
+// redirect rule is built on. So with an allow-list in force a CIMD client is a
+// redirect destination like any other, and both refusals lift together.
+//
+// This test exists because the behaviour was documented in three places —
+// failAuthorize's godoc, redirectToInteractiveLogin's, and docs/cimd.md — before
+// it was implemented, and a promise nobody executes is the kind that rots.
+func TestVettedPublishers_RestoresRedirects(t *testing.T) {
+	get := httptest.NewRequest(http.MethodGet, "/oauth2/authorize", nil)
+
+	vetted := func() *API {
+		api := &API{issuer: "https://as.example.test"}
+		api.SetCIMDPublishersVetted(true)
+		api.SetInteractiveLoginURL(func(*service.AuthorizeRequest) string { return saLoginURL })
+
+		return api
+	}
+
+	t.Run("error redirects to the CIMD client", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		vetted().failAuthorize(rec, get, saRequest(), cimdClient(),
+			http.StatusUnauthorized, oautherror.InvalidClient, oautherror.AccessDenied, "no credential")
+
+		if rec.Code != http.StatusFound {
+			t.Fatalf("an allow-list vets the publisher, so §4.1.2.1 applies again; got %d", rec.Code)
+		}
+
+		loc, err := url.Parse(rec.Header().Get("Location"))
+		if err != nil {
+			t.Fatalf("Location did not parse: %v", err)
+		}
+
+		if got := loc.Query().Get("error"); got != oautherror.AccessDenied {
+			t.Errorf("error = %q, want access_denied", got)
+		}
+
+		if got := loc.Query().Get("state"); got != "sa-state" {
+			t.Errorf("state = %q, want it echoed back", got)
+		}
+	})
+
+	t.Run("interactive login is reachable", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+
+		if !vetted().redirectToInteractiveLogin(rec, get, saRequest(), cimdClient(), "session") {
+			t.Fatal("with vetted publishers a CIMD client must reach the login surface — " +
+				"this is what makes the MCP browser leg completable")
+		}
+
+		if rec.Header().Get("Location") == "" {
+			t.Fatal("expected a Location to the login surface")
+		}
+	})
+
+	// The gate is the allow-list, not the client: a nil client is still refused,
+	// and a non-GET still gets JSON. Pinned so "vetted" never becomes a blanket
+	// bypass of the other two conditions.
+	t.Run("vetting does not bypass the other refusals", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		vetted().failAuthorize(rec, get, saRequest(), nil,
+			http.StatusUnauthorized, oautherror.InvalidClient, oautherror.AccessDenied, "no credential")
+
+		if loc := rec.Header().Get("Location"); loc != "" {
+			t.Fatalf("a nil client must not be redirected, got %q", loc)
+		}
+
+		post := httptest.NewRequest(http.MethodPost, "/oauth2/authorize", nil)
+		if vetted().redirectToInteractiveLogin(httptest.NewRecorder(), post, saRequest(), cimdClient(), "session") {
+			t.Fatal("POST has no user agent to redirect, allow-list or not")
+		}
+	})
+}

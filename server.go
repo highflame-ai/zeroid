@@ -385,7 +385,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// one for a closed deployment, and the difference is invisible unless
 		// somebody says so at boot.
 		if effectiveDomains == 0 {
-			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. Set an allowlist to run CIMD as a closed ecosystem.")
+			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. " +
+				"Set an allowlist to run CIMD as a closed ecosystem. Until then CIMD clients also get no error redirect and no " +
+				"interactive-login redirect (RFC 6749 4.1.2.1 carve-out), so a browser-driven CIMD client cannot sign a user in.")
 		}
 	}
 
@@ -463,6 +465,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
+	// An allow-list is the deployer vetting which hosts may publish a metadata
+	// document, which is what lets a CIMD client be redirected to at all. The
+	// EFFECTIVE count, for the same reason the startup log uses it: the raw
+	// slice counts entries the service already dropped.
+	apiHandler.SetCIMDPublishersVetted(cimdSvc.AllowedDomainCount() > 0)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
