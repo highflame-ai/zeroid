@@ -122,20 +122,59 @@ cookie resolver is safe while POST is the only route, because `SameSite=Lax`
 withholds the cookie on a cross-site POST, and becomes reachable by cross-site
 top-level navigation once GET is mounted.
 
+**Errors are not redirected to a CIMD client.** RFC 6749 §4.1.2.1 says report most
+`/oauth2/authorize` failures by redirecting to the client's registered
+`redirect_uri`, and ZeroID does — for clients somebody registered. A CIMD client's
+`redirect_uris` come from a document it published itself, so with `allowed_domains`
+empty the destination is attacker-*chosen*, and honouring the rule would make the
+endpoint an unauthenticated redirector: the failure being reported is "you have no
+credential", so no credential is needed to trigger it, and the first hop carries
+your origin. CIMD clients therefore get the §5.2 JSON body instead, and the
+interactive-login redirect is refused for them too — an unvetted client does not
+get to borrow your login surface's credibility.
+
+The cost is real and worth naming: a browser-driven CIMD client cannot learn its
+error from the callback and has to read the JSON body. Setting
+`cimd.allowed_domains` restores the redirect, because vetting which hosts may
+publish restores the assumption §4.1.2.1 is built on. The gate is provenance, not
+CIMD.
+
+**That hatch only works on a single-tenant deployment.** `allowed_domains` is one
+deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
+cannot express one customer's policy, and setting it accepts one customer's
+publishers on behalf of all of them. There it is effectively all-or-nothing, which
+in practice means CIMD clients do not get error redirects. Tracked in zeroid#286;
+the tenant is not even known at the point CIMD resolves, so this is a design
+question rather than a missing config field.
+
 Three things a deployer must handle:
 
-* **The interaction cannot live in the resolver.** `PrincipalResolver` returns
-  `(*Principal, error)` — no `ResponseWriter`, no redirect, no way to render or
-  resume a consent screen. Do it in `Server.Use` middleware, which sees the raw
-  request and can 302 to a consent page before the handler runs; the resolver
-  then only recognises the session that flow established.
+* **The resolver starts the interaction; it does not render it.**
+  `PrincipalResolver` returns `(*Principal, error)` and has no `ResponseWriter`,
+  so it cannot render a consent screen — but it can ask for one. Return
+  `ErrPrincipalInteractionRequired` and ZeroID redirects the user agent to the
+  surface you registered with `Server.SetInteractiveLoginURL`, appending
+  `return_to` so the flow resumes at `/oauth2/authorize` once you have
+  authenticated them. Your resolver then only has to recognise the session that
+  established.
 
-  **`Server.Use` replaces rather than chains.** A second call silently discards
-  the first, despite the name. If you already use it for anything else — and
-  most deployers do — compose both into one function at the call site. Adding
-  the consent gate as a second `Use` call drops one of the two with no error,
-  and if the loser is the consent gate, the protection below simply is not
-  running. Tracked in zeroid#276.
+  `return_to` is rebuilt from the parameters ZeroID validated, never copied from
+  the inbound URL, so nothing extraneous a caller appended — including a
+  credential in the wrong channel — is forwarded to your login surface.
+
+  Only GET is redirected: a POST caller has no user agent. With no target
+  configured the sentinel degrades to `access_denied`, because a resolver cannot
+  conjure a surface the deployment does not have — and it is refused outright for a
+  CIMD client, per the provenance rule above.
+
+  Use `Server.Use` middleware instead if you want to own the whole interaction
+  including the 302.
+
+  `Server.Use` chains, so registering the consent gate alongside whatever else
+  you already use it for is safe: middleware runs in registration order, first
+  registered outermost. (It used to *replace*, silently dropping everything but
+  the last registration — if you are reading older notes that say to compose
+  manually at the call site, that is no longer necessary. Fixed in zeroid#276.)
 * **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
   from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
   attacker-published `client_id` + its own `redirect_uri`. Require an explicit

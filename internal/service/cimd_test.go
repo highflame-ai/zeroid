@@ -72,19 +72,39 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		}
 	})
 
-	t.Run("client_name falls back to URL", func(t *testing.T) {
+	// client_name is the string a consent screen shows the user, and a CIMD
+	// document's publisher is anonymous by construction — no registration, no
+	// secret — so this label is most of what consent has to go on. It used to
+	// fall back to the client_id, which made a document that declined to name
+	// itself indistinguishable from a well-formed one and let whoever chose the
+	// URL choose what the user reads.
+	t.Run("missing client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}}
+		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Errorf("expected ErrCIMDInvalidDocument for absent client_name, got %v", err)
+		}
+	})
+
+	t.Run("whitespace-only client_name is rejected", func(t *testing.T) {
+		doc := &cimdMetadataDocument{ClientID: url, ClientName: "   \t ", RedirectURIs: []string{"https://x/cb"}}
+		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Errorf("expected ErrCIMDInvalidDocument for whitespace-only client_name, got %v", err)
+		}
+	})
+
+	t.Run("client_name is carried through verbatim", func(t *testing.T) {
+		doc := &cimdMetadataDocument{ClientID: url, ClientName: "Example MCP Client", RedirectURIs: []string{"https://x/cb"}}
 		c, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.Name != url {
-			t.Errorf("Name = %q, want fallback to URL %q", c.Name, url)
+		if c.Name != "Example MCP Client" {
+			t.Errorf("Name = %q, want the document's client_name", c.Name)
 		}
 	})
 
 	t.Run("scope parsed into slice", func(t *testing.T) {
-		doc := &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, Scope: "read write"}
+		doc := &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, Scope: "read write"}
 		c, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -97,6 +117,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 	t.Run("refresh_token grant is allowed", func(t *testing.T) {
 		doc := &cimdMetadataDocument{
 			ClientID:     url,
+			ClientName:   "N",
 			RedirectURIs: []string{"https://x/cb"},
 			GrantTypes:   []string{"authorization_code", "refresh_token"},
 		}
@@ -110,15 +131,15 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		name string
 		doc  *cimdMetadataDocument
 	}{
-		{"self-reference mismatch", &cimdMetadataDocument{ClientID: "https://evil.example/other.json", RedirectURIs: []string{"https://x/cb"}}},
-		{"missing redirect_uris", &cimdMetadataDocument{ClientID: url}},
-		{"empty redirect_uris", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{}}},
-		{"confidential auth method", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
-		{"private_key_jwt auth method", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
-		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
-		{"disallowed grant type", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"authorization_code", "client_credentials"}}},
-		{"response_types without code", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}, ResponseTypes: []string{"token"}}},
-		{"plaintext non-loopback redirect_uri", &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"http://app.example.com/cb"}}},
+		{"self-reference mismatch", &cimdMetadataDocument{ClientID: "https://evil.example/other.json", ClientName: "N", RedirectURIs: []string{"https://x/cb"}}},
+		{"missing redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N"}},
+		{"empty redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{}}},
+		{"confidential auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
+		{"private_key_jwt auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
+		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
+		{"disallowed grant type", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"authorization_code", "client_credentials"}}},
+		{"response_types without code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, ResponseTypes: []string{"token"}}},
+		{"plaintext non-loopback redirect_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"http://app.example.com/cb"}}},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -412,7 +433,7 @@ func TestCIMDResolveClient_ClientIDLengthCap(t *testing.T) {
 func TestCIMDCacheEviction(t *testing.T) {
 	var docURL string
 	svc, base, _ := newCIMDTestServer(t, CIMDConfig{Enabled: true}, func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, `{"client_id":%q,"redirect_uris":["https://x/cb"]}`, docURL)
+		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Evict","redirect_uris":["https://x/cb"]}`, docURL)
 	})
 	svc.maxCacheEntries = 2
 

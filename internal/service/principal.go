@@ -124,6 +124,35 @@ type PrincipalResolver func(ctx context.Context, req *AuthorizeRequest) (*Princi
 // is invalid."
 var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not applicable")
 
+// ErrPrincipalInteractionRequired is the sentinel a PrincipalResolver returns
+// when it recognises the request as one a HUMAN could satisfy, but nobody is
+// authenticated yet — a session-cookie resolver seeing no session, typically.
+// It means "not a failure; send this user somewhere they can log in."
+//
+// It exists because PrincipalResolver returns (*Principal, error) and so cannot
+// redirect. Without it a resolver's only options were to decline (which reads as
+// "wrong credential type" and ends in access_denied) or to fail — neither of
+// which starts a login. Returning this sentinel lets zeroid do the redirect on
+// the resolver's behalf, so the resolver still never touches the transport.
+//
+// Distinguish all three:
+//
+//   - ErrPrincipalNotApplicable — "this is not my kind of credential." Try the
+//     next resolver.
+//   - ErrPrincipalInteractionRequired — "this IS my kind of request, and it can
+//     be satisfied by logging in." Stop the chain and redirect.
+//   - any other error — "I found my credential and it is bad." Stop and fail.
+//
+// Only honoured on GET, where a user agent exists to redirect, and only when the
+// deployer has supplied a target via Server.SetInteractiveLoginURL. Returned on a
+// POST, or with no target configured, it degrades to the same access_denied a
+// declining chain produces — a resolver cannot conjure a login surface that the
+// deployment does not have.
+//
+// Returning it stops the chain: a resolver that wants to defer to a later one
+// should return ErrPrincipalNotApplicable instead.
+var ErrPrincipalInteractionRequired = errors.New("zeroid: principal requires interactive authentication")
+
 // ErrNoResolversRegistered is the sentinel Server.resolvePrincipal
 // returns when the /oauth2/authorize endpoint is reached but the
 // deployer never registered any PrincipalResolver. The handler maps
