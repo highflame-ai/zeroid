@@ -569,6 +569,47 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 	return int(n), nil
 }
 
+// ReleaseDiscoveredSource clears source_id on every still-`discovered` identity
+// belonging to (origin, source_id), returning the number of rows released.
+//
+// Called when a discovery connector is deleted. Reconcile adopts a source_id
+// only onto a row that has none — it never overwrites one, so that a live
+// connector cannot claim another live connector's rows. That guard is right,
+// but it leaves a deleted connector's rows pointing at it forever: the
+// connector never syncs again, and prune is scoped `WHERE source_id = ?`, so
+// nothing can sweep them. Releasing the claim at delete time lets the existing
+// adopt-when-empty branch hand those rows to whichever connector rediscovers
+// them next.
+//
+// Only `discovered` rows are touched. An adopted or dismissed identity keeps
+// its source_id as provenance — it is outside prune scope anyway, so a stale
+// pointer there is a historical record, not a leak.
+func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("source_id = ?", "").
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // ListExpiredActive returns identities whose expires_at has passed while
 // their status is still 'active'. Used by the cleanup worker's identity
 // sweep. The partial index on (expires_at) WHERE status='active' makes
