@@ -500,7 +500,7 @@ func (a *API) redirectToInteractiveLogin(
 	client *domain.OAuthClient, resolverName string,
 ) bool {
 	if r.Method != http.MethodGet || a.interactiveLoginURL == nil ||
-		client == nil || a.refusesRedirectTo(client) {
+		a.refusesRedirectTo(client) {
 		return false
 	}
 
@@ -602,7 +602,7 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || client == nil || a.refusesRedirectTo(client) {
+	if r.Method != http.MethodGet || a.refusesRedirectTo(client) {
 		writeAuthorizeError(w, status, jsonCode, description)
 
 		return

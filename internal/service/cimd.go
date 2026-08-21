@@ -359,6 +359,10 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
 		return nil, err
 	}
+	if err := s.redirectHostsAllowed(u.Hostname(), client.RedirectURIs); err != nil {
+		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
+		return nil, err
+	}
 
 	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
 	log.Info().
@@ -367,6 +371,53 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 		Int("redirect_uris", len(client.RedirectURIs)).
 		Msg("CIMD: resolved client from metadata document")
 	return client, nil
+}
+
+// redirectHostsAllowed enforces the allow-list on https redirect destinations,
+// not just on the host that published the document.
+//
+// The allow-list is what lets a CIMD client be redirected to at all — see
+// API.refusesRedirectTo. That gate reads "an allow-listed publisher is a vetted
+// party", and the two only mean the same thing if the destination is vetted too.
+// Without this check they come apart on any host where more than one party can
+// publish a path: a user-content path, a raw-file CDN, a bucket with broad
+// write, a shared internal app host. Publish a document there naming
+// redirect_uri https://evil.example/cb and the deployment 302s an
+// unauthenticated caller to evil.example — and worse, sends a victim through
+// the real login page first, so the code arrives after a genuine sign-in. That
+// is exactly what the self-asserted carve-out was added to prevent, reachable
+// through the switch that is supposed to lift it safely.
+//
+// Same host as the client_id passes without being listed: a document may always
+// name callbacks on the host that published it, which is the ordinary case and
+// needs no extra configuration.
+//
+// Loopback http and private-use schemes are exempt. Their destination is the
+// caller's own machine, not a host anybody publishes to, so a deployment-wide
+// host allow-list has nothing to say about them — and they are the native and
+// MCP client shape, which must keep working.
+//
+// In open mode (no allow-list) domainAllowed admits everything, so this is a
+// no-op — correctly, since open mode refuses these redirects outright.
+func (s *CIMDService) redirectHostsAllowed(clientIDHost string, redirectURIs []string) error {
+	for _, raw := range redirectURIs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" {
+			// Non-https was already scheme-checked by validateCIMDRedirectURI;
+			// a parse failure cannot survive it either.
+			continue
+		}
+
+		host := u.Hostname()
+		if strings.EqualFold(host, clientIDHost) || s.domainAllowed(host) {
+			continue
+		}
+
+		return fmt.Errorf("%w: redirect_uri host %q is neither the client_id host nor in cimd.allowed_domains",
+			ErrCIMDDomainNotAllowed, host)
+	}
+
+	return nil
 }
 
 // domainAllowed reports whether host passes the optional allowlist. An empty
