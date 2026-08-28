@@ -9,6 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -510,6 +511,13 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 // identity's expires_at so a rotated key on a time-bound agent expires
 // alongside its parent — without this, rotation silently extends the
 // key's lifetime past the agent's authority window.
+//
+// The new key also inherits a human in CreatedBy, because the api_key
+// grant copies that field into the token's act.sub (see oauth.go's
+// apiKeyGrant, ActingUserID: sk.CreatedBy). Rotation changes the secret,
+// not who is accountable, so stamping the rotation subsystem there
+// severed the human→agent audit chain for the rotated credential and
+// every identity delegated from it (#281).
 func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID string) (*AgentRegistrationResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
@@ -525,12 +533,30 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	// Revoke existing keys.
 	s.revokeKeysByIdentity(ctx, identity.ID)
 
+	// Who the rotated key attributes its tokens to, most specific first:
+	//   1. the caller who asked for the rotation (X-User-ID). Already
+	//      stripped of the reserved system: prefix by TenantContextMiddleware,
+	//      so a caller cannot forge subsystem attribution here.
+	//   2. the identity's registered owner, when the caller is unattributed
+	//      (an internal service relay that sends no X-User-ID).
+	//   3. the system principal, only when no human is known at all — an
+	//      ownerless discovered identity rotated by an unattributed caller.
+	// Case 3 is the honest answer, not a placeholder: nothing in the
+	// request or the row names a human.
+	createdBy := middleware.GetCallerName(ctx)
+	if createdBy == "" {
+		createdBy = identity.OwnerUserID
+	}
+	if createdBy == "" {
+		createdBy = middleware.SystemCallerPrefix + "key_rotation"
+	}
+
 	// Create new key. ExpiresAt propagates from the identity so the
 	// rotated key inherits the parent's time-bound window.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:  identity.AccountID,
 		ProjectID:  identity.ProjectID,
-		CreatedBy:  "system:key_rotation",
+		CreatedBy:  createdBy,
 		Name:       fmt.Sprintf("Agent: %s", identity.Name),
 		IdentityID: identity.ID,
 		ExpiresAt:  identity.ExpiresAt,
@@ -542,6 +568,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	log.Info().
 		Str("external_id", identity.ExternalID).
 		Str("identity_id", identity.ID).
+		Str("created_by", createdBy).
 		Msg("Agent API key rotated")
 
 	return &AgentRegistrationResponse{
