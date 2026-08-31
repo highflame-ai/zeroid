@@ -17,7 +17,7 @@
 // zeroid/go.mod pins pkg/dpop to a specific released version that
 // stays static across most zeroid releases.
 
-go 1.26.0
+go 1.27.0
 
 use (
 	.

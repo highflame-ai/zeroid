@@ -38,8 +38,7 @@ on:
         type: string
 
 env:
-  GO_VER: "1.26.0"
-  GOEXPERIMENT: "jsonv2"
+  GO_VER: "1.27.0"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 
 permissions:
