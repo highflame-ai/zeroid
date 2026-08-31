@@ -179,6 +179,9 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// token endpoint will accept on the DPoP header. Symmetric algs are
 		// excluded by spec.
 		"dpop_signing_alg_values_supported": []string{"ES256", "RS256"},
+		// RFC 9449 §5.1 — true only under token.require_dpop, where the
+		// token endpoint refuses proof-less issuance.
+		"dpop_bound_access_tokens_required": a.dpopRequired.Load(),
 
 		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
 		// let CIBA-aware clients auto-discover that this AS supports

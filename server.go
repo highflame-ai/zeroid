@@ -130,6 +130,7 @@ type Server struct {
 	credentialSvc       *service.CredentialService
 	credentialPolicySvc *service.CredentialPolicyService
 	attestationSvc      *service.AttestationService
+	apiHandler          *handler.API
 	proofSvc            *service.ProofService
 	oauthSvc            *service.OAuthService
 	oauthClientSvc      *service.OAuthClientService
@@ -461,6 +462,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	)
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
+	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
@@ -583,6 +585,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		credentialSvc:          credentialSvc,
 		credentialPolicySvc:    credentialPolicySvc,
 		attestationSvc:         attestationSvc,
+		apiHandler:             apiHandler,
 		proofSvc:               proofSvc,
 		oauthSvc:               oauthSvc,
 		oauthClientSvc:         oauthClientSvc,
@@ -1259,6 +1262,14 @@ func (s *Server) SetBackchannelNotifyDispatchSync(sync bool) {
 // configuration and never call this.
 func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
+}
+
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token at runtime.
+// Mirrors the token.require_dpop config gate: when true, issuance without a
+// valid RFC 9449 proof is refused with invalid_dpop_proof and the AS
+// metadata advertises dpop_bound_access_tokens_required: true.
+func (s *Server) SetDPoPRequired(required bool) {
+	s.apiHandler.SetDPoPRequired(required)
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the

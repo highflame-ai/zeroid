@@ -19,6 +19,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
+	"sync/atomic"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.
@@ -49,6 +50,11 @@ type API struct {
 	// SetCIMDEnabled after construction; defaults false so a build that doesn't
 	// wire CIMD doesn't advertise it.
 	cimdEnabled bool
+
+	// dpopRequired makes a valid DPoP proof mandatory on every /oauth2/token
+	// issuance (token.require_dpop). Atomic because tests toggle it while the
+	// server is handling requests; defaults false (Bearer fallback stands).
+	dpopRequired atomic.Bool
 
 	// authorizationCodeAvailable reports whether /oauth2/authorize can
 	// actually serve a request — i.e. whether the deployer registered any
@@ -243,6 +249,14 @@ func (a *API) RegisterPublic(api huma.API, router chi.Router) {
 // updates the registry that this function reads from).
 func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 	a.resolvePrincipal = fn
+}
+
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token (token.require_dpop):
+// when true, issuance without a valid proof is refused with invalid_dpop_proof
+// and the AS metadata advertises dpop_bound_access_tokens_required: true.
+// Safe to call at runtime.
+func (a *API) SetDPoPRequired(required bool) {
+	a.dpopRequired.Store(required)
 }
 
 // SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution
