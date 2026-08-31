@@ -277,12 +277,22 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		// the trust level (or verified attestation) this record grants, and
 		// issuing first made verification fail against the pre-promotion
 		// identity — a chicken-and-egg 500 for any trust-gated policy.
-		promotedTrust := trustLevelForAttestation(locked.Level)
-		promoted, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
-			TrustLevel: promotedTrust,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to promote identity trust level: %w", err)
+		// Promotion is a CLAMP, never an overwrite: verifying a weaker
+		// attestation must not demote an identity that already holds a
+		// higher trust level (a first_party identity verifying a
+		// software-level attestation stays first_party — an unconditional
+		// write here previously demoted it, and with issuance judging the
+		// post-write identity, a first_party-gated policy then turned the
+		// verify into a rollback).
+		promoted := identity
+		if promotedTrust := trustLevelForAttestation(locked.Level); domain.TrustLevelRank(string(promotedTrust)) > domain.TrustLevelRank(string(identity.TrustLevel)) {
+			updated, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
+				TrustLevel: promotedTrust,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to promote identity trust level: %w", err)
+			}
+			promoted = updated
 		}
 
 		now := time.Now()
@@ -291,6 +301,13 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		if result.ExpiresAt != nil {
 			locked.ExpiresAt = result.ExpiresAt
 		}
+		// This first Update is LOAD-BEARING for required_attestation
+		// policies, not just bookkeeping: IssueCredential's policy
+		// chokepoint reads verification back through the tx-aware
+		// attestationRepo.GetHighestVerifiedLevel, so is_verified must be
+		// TRUE in this transaction before issuance or every
+		// attestation-gated policy regresses to a chicken-and-egg refusal.
+		// Do not merge it into the CredentialID update below.
 		if err := s.repo.Update(ctx, locked); err != nil {
 			return fmt.Errorf("failed to update attestation record: %w", err)
 		}

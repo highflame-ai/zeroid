@@ -320,3 +320,75 @@ func TestCIBAOffboardByOwnerReachesCIBACredentials(t *testing.T) {
 	intro2 := post(t, "/oauth2/token/introspect", map[string]any{"token": accessToken}, nil)
 	require.Equal(t, false, decode(t, intro2)["active"], "CIBA token dead after owner offboarding")
 }
+
+// Pre-burn gates must leave the approval redeemable: a deterministic refusal
+// (bound identity suspended) returns 4xx WITHOUT consuming the single-use
+// auth_req_id, so once the condition clears the same approval still redeems.
+// Pre-fix, all bound-identity checks ran after MarkIssued and any refusal or
+// transient failure permanently burned the human's approval.
+func TestCIBAPreBurnGatesPreserveApproval(t *testing.T) {
+	headers := adminHeaders()
+	owner := uid("carol") + "@example.com"
+
+	idResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id": uid("ciba-preburn"), "owner_user_id": owner,
+		"identity_type": "agent", "sub_type": "human_proxy",
+		"allowed_scopes": []string{"openid"}, "trust_level": "first_party",
+	}, headers)
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	identityID := decode(t, idResp)["id"].(string)
+
+	clientID := uid("ciba-preburn")
+	clResp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id": clientID, "name": "preburn ciba client", "confidential": true,
+		"identity_id": identityID,
+		"grant_types": []string{"urn:openid:params:grant-type:ciba"},
+		"scopes":      []string{"openid"},
+	}, headers)
+	require.Equal(t, http.StatusCreated, clResp.StatusCode)
+	clientSecret := decode(t, clResp)["client_secret"].(string)
+
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id": clientID, "client_secret": clientSecret,
+		"account_id": testAccountID, "project_id": testProjectID,
+		"login_hint": "carol@example.com", "scope": "openid",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	authReqID := decode(t, resp)["auth_req_id"].(string)
+
+	appr := post(t, adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"), map[string]any{
+		"subject_id": "user-carol-002", "subject_email": "carol@example.com",
+	}, headers)
+	require.Equal(t, http.StatusOK, appr.StatusCode)
+
+	// Suspend the bound identity, then poll: refused 4xx, approval NOT burned.
+	patchReq := newRequest(t, http.MethodPatch, adminPath("/identities/"+identityID),
+		map[string]any{"status": "suspended"}, headers)
+	patchResp, err := http.DefaultClient.Do(patchReq)
+	require.NoError(t, err)
+	patchResp.Body.Close()
+	require.Equal(t, http.StatusOK, patchResp.StatusCode)
+
+	poll := func() *http.Response {
+		return post(t, "/oauth2/token", map[string]any{
+			"grant_type": "urn:openid:params:grant-type:ciba", "auth_req_id": authReqID,
+			"client_id": clientID, "client_secret": clientSecret,
+		}, nil)
+	}
+	refused := poll()
+	require.Equal(t, http.StatusBadRequest, refused.StatusCode)
+	require.Equal(t, "access_denied", decode(t, refused)["error"])
+
+	// Reactivate; the SAME approval must still redeem — proof it wasn't burned.
+	patchReq = newRequest(t, http.MethodPatch, adminPath("/identities/"+identityID),
+		map[string]any{"status": "active"}, headers)
+	patchResp, err = http.DefaultClient.Do(patchReq)
+	require.NoError(t, err)
+	patchResp.Body.Close()
+	require.Equal(t, http.StatusOK, patchResp.StatusCode)
+
+	issued := poll()
+	require.Equal(t, http.StatusOK, issued.StatusCode,
+		"the approval must survive a pre-burn refusal and redeem once the gate clears")
+	require.NotEmpty(t, decode(t, issued)["access_token"])
+}
