@@ -39,7 +39,7 @@ func TestCIBAHardening(t *testing.T) {
 	bcRepo := postgres.NewBackchannelRequestRepository(testDB)
 	oauthClientRepo := postgres.NewOAuthClientRepository(testDB)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
-	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, service.DefaultBackchannelConfig())
+	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, nil, service.DefaultBackchannelConfig())
 
 	t.Run("Redeem_OmittedClientID_Refused", func(t *testing.T) {
 		// FIX #1: Redeem must require a non-empty client_id and always compare

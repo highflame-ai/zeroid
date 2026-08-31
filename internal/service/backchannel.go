@@ -40,6 +40,7 @@ type BackchannelService struct {
 	repo                *postgres.BackchannelRequestRepository
 	oauthClientSvc      *OAuthClientService
 	credentialSvc       *CredentialService
+	identitySvc         *IdentityService
 	cfg                 BackchannelServiceConfig
 	mu                  sync.RWMutex
 	notifier            BackchannelNotifierFunc
@@ -148,6 +149,7 @@ func NewBackchannelService(
 	repo *postgres.BackchannelRequestRepository,
 	oauthClientSvc *OAuthClientService,
 	credentialSvc *CredentialService,
+	identitySvc *IdentityService,
 	cfg BackchannelServiceConfig,
 ) *BackchannelService {
 	if cfg.DefaultExpiry == 0 {
@@ -176,6 +178,7 @@ func NewBackchannelService(
 		repo:                repo,
 		oauthClientSvc:      oauthClientSvc,
 		credentialSvc:       credentialSvc,
+		identitySvc:         identitySvc,
 		cfg:                 cfg,
 		notifyDispatchAsync: true,
 		svcCtx:              svcCtx,
@@ -816,14 +819,34 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 	}
 
-	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
-	// the issued token to identify the user; we mirror ExternalPrincipalExchange
-	// (the human-token path).
+	// Anchor the credential row to the client's bound agent identity so the
+	// revocation planes can reach CIBA-issued credentials: with the previous
+	// synthesised anonymous identity, issued_credentials.identity_id was NULL
+	// and both the owner-offboarding cascade (revoke_credentials_by_owner
+	// joins on identity_id) and identity-keyed CAE revocation silently missed
+	// every human-approved token. SubjectOverride below keeps the token's sub
+	// as the approving human (CIBA Core §10.1.2) — the identity anchors the
+	// row, not the subject. A bound identity that is no longer usable refuses
+	// issuance (fail closed); an unbound client keeps the legacy anonymous
+	// shape.
 	identity := &domain.Identity{
 		AccountID:    row.AccountID,
 		ProjectID:    row.ProjectID,
 		IdentityType: domain.IdentityTypeService,
 		Status:       domain.IdentityStatusActive,
+	}
+	if s.identitySvc != nil {
+		if client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, row.ClientID); cerr == nil && client.IdentityID != nil && *client.IdentityID != "" {
+			bound, ierr := s.identitySvc.GetIdentity(ctx, *client.IdentityID, row.AccountID, row.ProjectID)
+			if ierr != nil {
+				return nil, oauthServerError("failed to load the client's bound identity", ierr)
+			}
+			if !bound.Status.IsUsable() {
+				return nil, oauthBadRequest(oautherror.AccessDenied,
+					"the client's bound identity is suspended or deactivated")
+			}
+			identity = bound
+		}
 	}
 	customClaims := map[string]any{
 		"token_exchange":        "ciba",

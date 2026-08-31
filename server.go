@@ -436,7 +436,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
-	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
 	// DPoP verifier — validates RFC 9449 proofs (and the bh extension claim)

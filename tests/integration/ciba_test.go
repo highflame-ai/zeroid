@@ -256,3 +256,67 @@ func intField(m map[string]any, key string) int {
 // zeroidGrantTypeCIBA mirrors domain.GrantTypeCIBA without importing the
 // internal domain package from the test (which already imports zeroid).
 const zeroidGrantTypeCIBA = "urn:openid:params:grant-type:ciba"
+
+// Regression: CIBA-issued credentials must be reachable by the
+// owner-offboarding cascade. The token path used to synthesise an anonymous
+// identity, persisting issued_credentials.identity_id = NULL — so
+// revoke_credentials_by_owner (which joins on identity_id) and identity-keyed
+// CAE revocation both silently missed every human-approved token. The
+// credential is now anchored to the OAuth client's bound identity
+// (internal/service/backchannel.go); sub remains the approving human.
+func TestCIBAOffboardByOwnerReachesCIBACredentials(t *testing.T) {
+	headers := adminHeaders()
+	owner := uid("bob") + "@example.com"
+
+	idResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id": uid("ciba-anchor"), "owner_user_id": owner,
+		"identity_type": "agent", "sub_type": "human_proxy",
+		"allowed_scopes": []string{"openid"}, "trust_level": "first_party",
+	}, headers)
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	identityID := decode(t, idResp)["id"].(string)
+
+	clientID := uid("ciba-bound")
+	clResp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id": clientID, "name": "bound ciba client", "confidential": true,
+		"identity_id": identityID,
+		"grant_types": []string{"urn:openid:params:grant-type:ciba"},
+		"scopes":      []string{"openid"},
+	}, headers)
+	require.Equal(t, http.StatusCreated, clResp.StatusCode)
+	clientSecret := decode(t, clResp)["client_secret"].(string)
+
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id": clientID, "client_secret": clientSecret,
+		"account_id": testAccountID, "project_id": testProjectID,
+		"login_hint": "carol@example.com", "scope": "openid",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	authReqID := decode(t, resp)["auth_req_id"].(string)
+
+	appr := post(t, adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"), map[string]any{
+		"subject_id": "user-carol-001", "subject_email": "carol@example.com",
+	}, headers)
+	require.Equal(t, http.StatusOK, appr.StatusCode)
+
+	tokResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:openid:params:grant-type:ciba", "auth_req_id": authReqID,
+		"client_id": clientID, "client_secret": clientSecret,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+	accessToken := decode(t, tokResp)["access_token"].(string)
+
+	intro := post(t, "/oauth2/token/introspect", map[string]any{"token": accessToken}, nil)
+	require.Equal(t, true, decode(t, intro)["active"], "CIBA token active before offboarding")
+
+	off := post(t, adminPath("/identities/offboard-by-owner"), map[string]any{"owner_user_id": owner}, headers)
+	require.Equal(t, http.StatusOK, off.StatusCode)
+	offBody := decode(t, off)
+	require.GreaterOrEqual(t, intField(offBody, "identities_deactivated"), 1)
+	// credentials_revoked counts only final-sweep stragglers and is ~0 on a
+	// healthy run (per-identity deactivation cleanup already cascades) — the
+	// invariant is the token's death, asserted below.
+
+	intro2 := post(t, "/oauth2/token/introspect", map[string]any{"token": accessToken}, nil)
+	require.Equal(t, false, decode(t, intro2)["active"], "CIBA token dead after owner offboarding")
+}
