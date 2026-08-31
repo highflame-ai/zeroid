@@ -1,4 +1,4 @@
-FROM golang:1.27.0-alpine3.22 AS build-stage
+FROM golang:1.27.0-alpine3.23 AS build-stage
 LABEL maintainer="Highflame Team"
 
 ENV CGO_ENABLED=0
