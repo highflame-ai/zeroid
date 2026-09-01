@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -16,6 +17,14 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
+
+// ErrIdentityLinkRequired is returned by CreateKey when the caller supplies
+// neither IdentityID nor Product. Every API key links an identity: the caller
+// names one directly, or names a product and EnsureServiceIdentity provisions
+// a service identity for it. With neither there is nothing to link, and the
+// unlinked key would skip credential-policy resolution at grant time. The
+// omission is caller-fixable, so handlers map this to 400.
+var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
@@ -72,11 +81,20 @@ type CreateAPIKeyResponse struct {
 // Every key is linked to an identity and assigned a credential policy.
 // If IdentityID is empty and Product is set, a service identity is auto-provisioned
 // (or reused if one already exists for this account+project+product).
+// If both are empty the request is rejected with ErrIdentityLinkRequired.
 // If CredentialPolicyID is empty, the tenant's default policy is auto-created and assigned.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
-	// Ensure every key has an identity link.
-	// When no identity is provided, auto-provision a service identity for the product.
-	if req.IdentityID == "" && req.Product != "" {
+	// Every key has an identity link, and the caller supplies one of the two
+	// ways to establish it. Reject the empty case here rather than letting an
+	// unlinked key reach the insert, where the empty IdentityID fails the
+	// UUID cast and surfaces a caller mistake as a server fault.
+	if req.IdentityID == "" && req.Product == "" {
+		return nil, ErrIdentityLinkRequired
+	}
+
+	// The caller named a product rather than an identity — provision (or
+	// reuse) the service identity that stands for that product.
+	if req.IdentityID == "" {
 		identity, err := s.identitySvc.EnsureServiceIdentity(ctx, req.AccountID, req.ProjectID, req.Product, req.CreatedBy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure service identity for product %s: %w", req.Product, err)
