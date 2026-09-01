@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -40,6 +41,7 @@ type BackchannelService struct {
 	repo                *postgres.BackchannelRequestRepository
 	oauthClientSvc      *OAuthClientService
 	credentialSvc       *CredentialService
+	identitySvc         *IdentityService
 	cfg                 BackchannelServiceConfig
 	mu                  sync.RWMutex
 	notifier            BackchannelNotifierFunc
@@ -148,6 +150,7 @@ func NewBackchannelService(
 	repo *postgres.BackchannelRequestRepository,
 	oauthClientSvc *OAuthClientService,
 	credentialSvc *CredentialService,
+	identitySvc *IdentityService,
 	cfg BackchannelServiceConfig,
 ) *BackchannelService {
 	if cfg.DefaultExpiry == 0 {
@@ -176,6 +179,7 @@ func NewBackchannelService(
 		repo:                repo,
 		oauthClientSvc:      oauthClientSvc,
 		credentialSvc:       credentialSvc,
+		identitySvc:         identitySvc,
 		cfg:                 cfg,
 		notifyDispatchAsync: true,
 		svcCtx:              svcCtx,
@@ -802,6 +806,121 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// initiate a new bc-authorize. That's preferable to silently minting two
 	// tokens — the failure is loud (HTTP 500) and the client's
 	// retry-with-new-auth-req-id path handles it cleanly.
+	// ── Bound-identity resolution and gates — BEFORE the MarkIssued claim ──
+	//
+	// Everything fallible that pure reads can decide runs before the row is
+	// burned: a refusal here is a 4xx that leaves the approval redeemable,
+	// instead of consuming the single-use auth_req_id and stranding the
+	// human's approval (the previous ordering did exactly that for transient
+	// lookup errors and deterministic policy refusals — and in push mode the
+	// loss was silent). MarkIssued below remains the at-most-once gate.
+	//
+	// Anchoring rationale: with a synthesised anonymous identity,
+	// issued_credentials.identity_id was NULL and both the owner-offboarding
+	// cascade (revoke_credentials_by_owner joins on identity_id) and
+	// identity-keyed CAE revocation silently missed every human-approved
+	// token. The credential is therefore anchored to the OAuth client's
+	// bound agent identity; SubjectOverride keeps the token's sub as the
+	// approving human (CIBA Core §10.1.2).
+	if s.identitySvc == nil {
+		// Fail closed AND loud: minting without the identity service would
+		// silently produce unanchored credentials invisible to the
+		// revocation planes — the exact bug the anchoring exists to fix.
+		return nil, oauthServerError("backchannel service is missing its identity service; refusing to mint unanchored credentials", nil)
+	}
+	identity := &domain.Identity{
+		AccountID:    row.AccountID,
+		ProjectID:    row.ProjectID,
+		IdentityType: domain.IdentityTypeService,
+		Status:       domain.IdentityStatusActive,
+	}
+	ttl := 900 // seconds — short-lived, matching ExternalPrincipalExchange; clamped to the bound identity's policy ceiling below
+	var identityPolicyID string
+	client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, row.ClientID)
+	if cerr != nil {
+		if !errors.Is(cerr, ErrOAuthClientNotFound) {
+			// Only a definitive not-found may fall back to the unbound shape.
+			// Any other error (a transient DB failure, say) must fail the
+			// request: falling back here would silently mint an unanchored
+			// credential for a client that IS bound — fail-open on the exact
+			// property this block exists to guarantee.
+			return nil, oauthServerError("failed to load the OAuth client for credential anchoring", cerr)
+		}
+		// The row was created for a registered client; a since-deleted client
+		// keeps the legacy unbound shape rather than stranding the approval.
+		log.Warn().Str("client_id", row.ClientID).Msg("CIBA redemption for a client that no longer resolves; minting unanchored")
+	} else if client.IdentityID != nil && *client.IdentityID != "" {
+		bound, ierr := s.identitySvc.GetIdentity(ctx, *client.IdentityID, row.AccountID, row.ProjectID)
+		if ierr != nil {
+			if errors.Is(ierr, ErrIdentityNotFound) {
+				// Tenant scoping: the identity exists in the client's home
+				// tenant but the bc-authorize carried a different
+				// account/project. Deterministic client error, not a 500.
+				return nil, oauthBadRequest(oautherror.InvalidGrant,
+					"the client's bound identity does not exist in the request's tenant")
+			}
+			return nil, oauthServerError("failed to load the client's bound identity", ierr)
+		}
+		if !bound.Status.IsUsable() {
+			return nil, oauthBadRequest(oautherror.AccessDenied,
+				"the client's bound identity is suspended or deactivated")
+		}
+		if bound.IsExpired() {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+		}
+		// Identity credential policy — the same governance ceiling the
+		// authorization_code path enforces for bound clients: resolve it here
+		// and hand its ID to the IssueCredential chokepoint. The axes
+		// checkable from the row are pre-enforced before the burn so a
+		// deterministic policy refusal costs the human's approval nothing.
+		policy, perr := s.identitySvc.ResolveCredentialPolicy(ctx, bound)
+		if perr != nil {
+			return nil, oauthServerError("failed to resolve the bound identity's credential policy", perr)
+		}
+		identityPolicyID = policy.ID
+		if !slices.Contains(policy.AllowedGrantTypes, string(domain.NormalizeGrantType(string(domain.GrantTypeCIBA)))) {
+			return nil, oauthBadRequest(oautherror.AccessDenied,
+				"the bound identity's credential policy does not permit the CIBA grant")
+		}
+		requested := parseScopeString(row.Scope)
+		if len(policy.AllowedScopes) > 0 {
+			allowed := make(map[string]bool, len(policy.AllowedScopes))
+			for _, sc := range policy.AllowedScopes {
+				allowed[sc] = true
+			}
+			for _, sc := range requested {
+				if !allowed[sc] {
+					return nil, oauthBadRequest(oautherror.InvalidScope,
+						fmt.Sprintf("scope %q is not permitted by the bound identity's credential policy", sc))
+				}
+			}
+		}
+		if len(bound.AllowedScopes) > 0 {
+			allowed := make(map[string]bool, len(bound.AllowedScopes))
+			for _, sc := range bound.AllowedScopes {
+				allowed[sc] = true
+			}
+			for _, sc := range requested {
+				if !allowed[sc] {
+					return nil, oauthBadRequest(oautherror.InvalidScope,
+						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
+				}
+			}
+		}
+		if policy.MaxTTLSeconds > 0 && policy.MaxTTLSeconds < ttl {
+			ttl = policy.MaxTTLSeconds
+		}
+		// The anchor carries the bound identity's attributes, except Name:
+		// the OIDC-standard `name` claim must keep identifying the approving
+		// HUMAN (IssueCredential prefers Identity.Name over the UserName
+		// fallback) — sub, user_email and user_name all name the human, and
+		// an agent display name on that claim would misattribute the token
+		// in every RP and audit pipeline that reads it.
+		anchor := *bound
+		anchor.Name = ""
+		identity = &anchor
+	}
+
 	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
 	// additionally rejects an approved row that has outlived both expires_at
 	// and the post-approval grace window — the atomic DB-layer counterpart to
@@ -816,15 +935,6 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
 	}
 
-	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
-	// the issued token to identify the user; we mirror ExternalPrincipalExchange
-	// (the human-token path).
-	identity := &domain.Identity{
-		AccountID:    row.AccountID,
-		ProjectID:    row.ProjectID,
-		IdentityType: domain.IdentityTypeService,
-		Status:       domain.IdentityStatusActive,
-	}
 	customClaims := map[string]any{
 		"token_exchange":        "ciba",
 		"backchannel_client_id": row.ClientID,
@@ -852,9 +962,10 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
+		IdentityPolicyID:  identityPolicyID,
 		Scopes:            parseScopeString(row.Scope),
 		GrantType:         domain.GrantTypeCIBA,
-		TTL:               900, // 15 minutes — short-lived; matches ExternalPrincipalExchange
+		TTL:               ttl,
 		UseRS256:          true,
 		SubjectOverride:   row.ApprovedSubjectID,
 		UserEmail:         row.ApprovedSubjectEmail,
@@ -863,6 +974,19 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		DPoPKeyThumbprint: dpopKeyThumbprint,
 	})
 	if err != nil {
+		// The pre-burn gates above catch the deterministic refusals; anything
+		// landing here is a race-window state change or an axis only the
+		// chokepoint can check (trust level, verified attestation). Map the
+		// known refusals to the 4xx codes sibling grant paths use instead of
+		// a blanket 500.
+		switch {
+		case errors.Is(err, ErrScopesNotAllowed):
+			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
+		case errors.Is(err, ErrPolicyViolation):
+			return nil, oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", err)
+		case errors.Is(err, domain.ErrIdentityNotUsable), errors.Is(err, domain.ErrIdentityExpired):
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "the bound identity is no longer usable", err)
+		}
 		return nil, oauthServerError("failed to issue CIBA-grant token", err)
 	}
 

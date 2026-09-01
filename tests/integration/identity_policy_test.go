@@ -552,3 +552,139 @@ func fetchIdentityWIMSEByExternalID(t *testing.T, externalID string) string {
 	t.Fatalf("identity with external_id=%s not found", externalID)
 	return ""
 }
+
+// Regression: a credential policy that requires the very trust level (or
+// verified attestation) an attestation grants must not make attestation
+// verification fail. Verify used to issue the post-attestation credential
+// against the PRE-promotion identity, so required_trust_level turned every
+// verify into a 500 — a chicken-and-egg that made trust-gated policies
+// unusable. Promotion and record-verification now precede issuance in the
+// same tx (internal/service/attestation.go).
+func TestAttestationVerifySucceedsUnderTrustRequiringPolicy(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-trustgate-"+uid(""), "proj-trustgate-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("trust-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_trust_level": "verified_third_party",
+	}, headers)
+	idID := registerIdentityWithPolicy(t, uid("attest-gate"), polID, "", []string{"data:read"}, headers)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID,
+		"level":       "software",
+		"proof_type":  "oidc_token",
+		"proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode, "submit expected 201")
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verify must succeed under a trust-requiring policy (was a chicken-and-egg 500)")
+	body := decode(t, resp)
+	record, ok := body["record"].(map[string]any)
+	require.True(t, ok, "verify response missing record")
+	assert.Equal(t, true, record["is_verified"])
+	require.NotEmpty(t, body["token"], "post-attestation credential must be issued")
+
+	// Trust must be promoted (software-level attestation -> verified_third_party).
+	req := newRequest(t, http.MethodGet, adminPath("/identities/"+idID), nil, headers)
+	getResp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+	require.Equal(t, http.StatusOK, getResp.StatusCode)
+	ident := decode(t, getResp)
+	assert.Equal(t, "verified_third_party", ident["trust_level"])
+}
+
+// Companion to TestAttestationVerifySucceedsUnderTrustRequiringPolicy: the
+// required_attestation axis exercises the tx-internal read-back
+// (GetHighestVerifiedLevel) that depends on the attestation record being
+// marked verified BEFORE the post-attestation credential is issued. The
+// trust-level variant alone would stay green if that early Update were
+// merged away, silently regressing every attestation-gated policy.
+func TestAttestationVerifySucceedsUnderAttestationRequiringPolicy(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-attgate-"+uid(""), "proj-attgate-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("att-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_attestation": "software",
+	}, headers)
+	idID := registerIdentityWithPolicy(t, uid("att-gate"), polID, "", []string{"data:read"}, headers)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID, "level": "software",
+		"proof_type": "oidc_token", "proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode)
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verify must succeed under an attestation-requiring policy (needs is_verified=true visible in-tx before issuance)")
+	require.NotEmpty(t, decode(t, resp)["token"], "post-attestation credential must be issued")
+}
+
+// Verifying a WEAKER attestation must never demote an identity's trust level:
+// promotion is a clamp. Pre-clamp, a software-level attestation overwrote a
+// first_party identity down to verified_third_party — and with issuance
+// judging the post-write identity, a first_party-gated policy turned the
+// verify into a policy-violation rollback.
+func TestAttestationVerifyDoesNotDemoteTrust(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-noclamp-"+uid(""), "proj-noclamp-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("first-party-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_trust_level": "first_party",
+	}, headers)
+
+	idResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id": uid("noclamp"), "owner_user_id": "user-noclamp-owner",
+		"trust_level": "first_party", "allowed_scopes": []string{"data:read"},
+		"credential_policy_id": polID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	idID := decode(t, idResp)["id"].(string)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID, "level": "software",
+		"proof_type": "oidc_token", "proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode)
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verifying a weaker attestation must not fail a first_party-gated identity")
+
+	req := newRequest(t, http.MethodGet, adminPath("/identities/"+idID), nil, headers)
+	getResp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+	assert.Equal(t, "first_party", decode(t, getResp)["trust_level"],
+		"trust level must be clamped, never demoted by a weaker attestation")
+}

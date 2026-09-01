@@ -286,6 +286,17 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// RequireDPoP makes a valid DPoP proof (RFC 9449) mandatory on every
+	// /oauth2/token issuance: absent proof is refused with invalid_dpop_proof
+	// instead of falling back to a Bearer token, and the AS metadata
+	// advertises dpop_bound_access_tokens_required: true (RFC 9449 §5.1).
+	// Off by default — opt-in is the deliberate posture because flipping it
+	// strands clients that cannot construct proofs; a conformance-minded
+	// deployment (ODIS-L1-09 secret-zero/holder-of-key posture) turns it on.
+	// Existing unbound refresh tokens keep working: the client starts sending
+	// a proof and the rotation binds the new token to that key.
+	RequireDPoP bool `koanf:"require_dpop"`
+
 	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
 	// token minted by the external-principal exchange when the trusted caller
 	// requests one (GrantRequest.IssueRefreshToken). It bounds how long an

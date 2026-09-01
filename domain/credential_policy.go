@@ -39,6 +39,13 @@ func DefaultAllowedGrantTypes() []string {
 		string(GrantTypeAPIKey),
 		string(GrantTypeJWTBearer),
 		string(GrantTypeTokenExchange),
+		// CIBA joined when bound-client redemption started enforcing the
+		// identity's credential policy (the anchoring change): without it,
+		// every bound client under a tenant-default policy would be refused.
+		// NOTE for upgrades: default-policy rows are created once and do not
+		// self-heal — tenants whose stored default predates this entry must
+		// add the CIBA grant to that policy to use bound-client CIBA.
+		string(GrantTypeCIBA),
 	}
 }
 

@@ -48,6 +48,13 @@ token:
   issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
+  # require_dpop makes a valid DPoP proof (RFC 9449) mandatory on every
+  # /oauth2/token issuance. Off by default: without a proof the token falls
+  # back to Bearer. When true, proof-less issuance is refused with
+  # invalid_dpop_proof and AS metadata advertises
+  # dpop_bound_access_tokens_required: true. Turn on for a holder-of-key
+  # conformance posture (every issued credential proof-of-possession-bound).
+  require_dpop: false
   # hmac_secret signs/verifies stateless authorization_code JWTs (HS256).
   # Only needed if the authorization_code grant is enabled. When set it
   # MUST be at least 32 bytes (Validate() rejects shorter secrets — a short

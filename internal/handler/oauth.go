@@ -341,8 +341,20 @@ func advertiseFormContentType(api huma.API, paths ...string) {
 }
 
 func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, error) {
-	// DPoP: optional. When a proof is present the issued token is bound to the
-	// proof key via cnf.jkt and token_type is returned as "DPoP" (RFC 9449).
+	// DPoP: optional by default — a present proof binds the issued token to
+	// the proof key via cnf.jkt and token_type is returned as "DPoP"
+	// (RFC 9449). Under token.require_dpop the fallback is closed: issuance
+	// without a proof is refused outright, so every credential this AS mints
+	// is proof-of-possession-bound (the ODIS-L1-09 holder-of-key posture).
+	if a.dpopRequired.Load() && input.DPoPProof == "" {
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body: oauthErrorBody{
+				Error:            oautherror.InvalidDPoPProof,
+				ErrorDescription: "DPoP proof required: this authorization server issues only DPoP-bound tokens (RFC 9449 §5)",
+			},
+		}, nil
+	}
 	var dpopThumbprint string
 	if input.DPoPProof != "" {
 		if a.dpopVerifier == nil {
