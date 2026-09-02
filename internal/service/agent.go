@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -124,6 +126,10 @@ type AgentListResponse struct {
 	Total  int             `json:"total"`
 	Limit  int             `json:"limit"`
 	Offset int             `json:"offset"`
+	// Parents holds parent agents hydrated for sub-agents on this page whose parent
+	// is not itself on the page, so a paginated caller can nest them. Context only
+	// — NOT counted in Total/Limit/Offset.
+	Parents []AgentResponse `json:"parents,omitempty"`
 }
 
 // UpdateAgentRequest holds PATCH fields for updating an agent.
@@ -261,7 +267,7 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 
 // ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
 // label, and metadata (key presence or key:value).
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) (*AgentListResponse, error) {
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int, includeParents bool) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -270,8 +276,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 	}
 
 	// origin/status surface the unified native∪discovered inventory through the
-	// agent registry list (the endpoint admin/Studio proxy) — same filters the
-	// identities list exposes.
+	// agent registry list endpoint — the same filters the identities list exposes.
 	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
 	if err != nil {
 		return nil, err
@@ -294,18 +299,24 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 		}
 	}
 
+	prefixes := s.keyPrefixesFor(ctx, identities)
 	agents := make([]AgentResponse, len(identities))
 	for i, id := range identities {
-		keyPrefix := s.getKeyPrefix(ctx, id.ID)
-		agents[i] = identityToAgentResponse(id, keyPrefix)
+		agents[i] = identityToAgentResponse(id, prefixes[id.ID])
 		agents[i].DelegationDepth = depthMap[id.ID]
 	}
 
+	var parents []AgentResponse
+	if includeParents {
+		parents = s.hydrateParents(ctx, accountID, projectID, identities)
+	}
+
 	return &AgentListResponse{
-		Agents: agents,
-		Total:  total,
-		Limit:  limit,
-		Offset: offset,
+		Agents:  agents,
+		Total:   total,
+		Limit:   limit,
+		Offset:  offset,
+		Parents: parents,
 	}, nil
 }
 
@@ -501,6 +512,15 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 // identity's expires_at so a rotated key on a time-bound agent expires
 // alongside its parent — without this, rotation silently extends the
 // key's lifetime past the agent's authority window.
+//
+// The new key also inherits a human in CreatedBy, because the api_key
+// grant copies that field into the token's act.sub (see oauth.go's
+// apiKeyGrant, ActingUserID: sk.CreatedBy). Rotation changes the secret,
+// not who is accountable, so stamping the rotation subsystem there
+// severed the human→agent audit chain for the rotated credential and
+// every identity delegated from it (#281). See rotationAttribution for
+// which human the new key names, and why it is not the operator who
+// performed the rotation.
 func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID string) (*AgentRegistrationResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
@@ -516,12 +536,14 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	// Revoke existing keys.
 	s.revokeKeysByIdentity(ctx, identity.ID)
 
+	createdBy := rotationAttribution(identity, middleware.GetCallerName(ctx))
+
 	// Create new key. ExpiresAt propagates from the identity so the
 	// rotated key inherits the parent's time-bound window.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:  identity.AccountID,
 		ProjectID:  identity.ProjectID,
-		CreatedBy:  "system:key_rotation",
+		CreatedBy:  createdBy,
 		Name:       fmt.Sprintf("Agent: %s", identity.Name),
 		IdentityID: identity.ID,
 		ExpiresAt:  identity.ExpiresAt,
@@ -533,6 +555,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	log.Info().
 		Str("external_id", identity.ExternalID).
 		Str("identity_id", identity.ID).
+		Str("created_by", createdBy).
 		Msg("Agent API key rotated")
 
 	return &AgentRegistrationResponse{
@@ -585,12 +608,182 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 	}
 }
 
+// agentMeta is the subset of an agent's opaque metadata this service reads to
+// resolve agent → sub-agent hierarchy: a sub-agent points at its parent agent via
+// the parent_external_id key.
+type agentMeta struct {
+	ParentExternalID string `json:"parent_external_id"`
+}
+
+// hydrateParents returns the parent agents of any sub-agents in page whose parent
+// is not itself on the page — an agent is treated as a sub-agent when its metadata
+// carries a parent_external_id. It walks the ancestor chain so nested sub-agents
+// also resolve. Parents are fetched by external_id regardless of status/filter, so
+// a sub-agent whose parent is on another page — or filtered out (e.g. deactivated)
+// — can still be nested under it by a paginated caller.
+func (s *AgentService) hydrateParents(ctx context.Context, accountID, projectID string, page []*domain.Identity) []AgentResponse {
+	present := make(map[string]bool, len(page))
+	for _, id := range page {
+		present[id.ExternalID] = true
+	}
+
+	missing := missingParentExternalIDs(page, present)
+	var hydrated []AgentResponse
+
+	// Ancestor chains are shallow; cap rounds so a pathological/cyclic
+	// parent_external_id can never loop forever.
+	const maxRounds = 8
+	for round := 0; round < maxRounds && len(missing) > 0; round++ {
+		fetched, err := s.identitySvc.ListByExternalIDs(ctx, accountID, projectID, missing)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to hydrate parent agents, continuing without")
+
+			break
+		}
+		if len(fetched) == 0 {
+			break
+		}
+		prefixes := s.keyPrefixesFor(ctx, fetched)
+		for _, id := range fetched {
+			present[id.ExternalID] = true
+			hydrated = append(hydrated, identityToAgentResponse(id, prefixes[id.ID]))
+		}
+		missing = missingParentExternalIDs(fetched, present)
+	}
+
+	return hydrated
+}
+
+// missingParentExternalIDs collects the distinct parent_external_id of every
+// sub-agent in ids (an agent whose metadata sets parent_external_id) whose parent
+// is not already in present.
+func missingParentExternalIDs(ids []*domain.Identity, present map[string]bool) []string {
+	seen := make(map[string]bool)
+
+	var out []string
+
+	for _, id := range ids {
+		if len(id.Metadata) == 0 {
+			continue
+		}
+
+		var meta agentMeta
+		if err := json.Unmarshal(id.Metadata, &meta); err != nil {
+			continue
+		}
+		if meta.ParentExternalID == "" {
+			continue
+		}
+		if present[meta.ParentExternalID] || seen[meta.ParentExternalID] {
+			continue
+		}
+
+		seen[meta.ParentExternalID] = true
+		out = append(out, meta.ParentExternalID)
+	}
+
+	return out
+}
+
+// keyPrefixesFor returns identity ID → active API-key prefix for a batch of
+// identities in one query — the batched form of getKeyPrefix. Identities
+// without an active key (or the whole batch, on a lookup error) are absent
+// from the map, yielding the same "" a getKeyPrefix miss produces.
+func (s *AgentService) keyPrefixesFor(ctx context.Context, identities []*domain.Identity) map[string]string {
+	ids := make([]string, len(identities))
+	for i, id := range identities {
+		ids[i] = id.ID
+	}
+	keys, err := s.apiKeyRepo.ListActiveByIdentityIDs(ctx, ids)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to batch-fetch API key prefixes, continuing without")
+		return nil
+	}
+	prefixes := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prefixes[k.IdentityID] = k.KeyPrefix
+	}
+	return prefixes
+}
+
 func (s *AgentService) getKeyPrefix(ctx context.Context, identityID string) string {
 	sk, err := s.apiKeyRepo.GetActiveByIdentityID(ctx, identityID)
 	if err != nil {
 		return ""
 	}
 	return sk.KeyPrefix
+}
+
+// maxAttributionLen bounds a human identifier written to service_keys.created_by,
+// which is VARCHAR(255) (migrations/006_service_keys.up.sql). RotateKey revokes
+// the outgoing keys BEFORE it creates the replacement, so an over-long value
+// would fail the INSERT and leave the identity with no usable key at all. A
+// caller-supplied header must never be able to reach that state.
+const maxAttributionLen = 255
+
+// usableHuman returns v as an attribution value, or "" when v cannot serve as
+// one. It rejects, rather than repairs, three shapes:
+//
+//   - padded or blank. A padded id matches nothing stored unpadded, so it is a
+//     silent audit break rather than a near-miss. IdentityService.OffboardOwner
+//     rejects the same shape for the same reason.
+//   - the reserved system: prefix, in any case. TenantContextMiddleware already
+//     drops this from X-User-ID, but identity.OwnerUserID and identity.CreatedBy
+//     reach us from columns that no write path filters — POST /agents/register
+//     takes created_by straight from the request body. Filtering at the point of
+//     use covers every source, not just the HTTP header.
+//   - longer than the destination column.
+//
+// Rejecting falls through to the next source in rotationAttribution, so a
+// malformed value degrades attribution instead of failing the rotation.
+func usableHuman(v string) string {
+	if v == "" || strings.TrimSpace(v) != v {
+		return ""
+	}
+	if len(v) > maxAttributionLen {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(v), middleware.SystemCallerPrefix) {
+		return ""
+	}
+	return v
+}
+
+// rotationAttribution picks the human that a rotated API key names in
+// CreatedBy, which the api_key grant copies into the token's act.sub.
+//
+// Precedence, and why the rotation operator is not first:
+//
+//  1. identity.OwnerUserID — the human accountable for what this agent does.
+//     act.sub means "the end user the principal acts on behalf of"
+//     (IssueRequest.ActingUserID), and the key mints tokens for the whole of
+//     its remaining life. An SRE who rotates a key after a leak scare is not
+//     who the agent subsequently acts for, and naming them would leave every
+//     token disagreeing with its own owner_user_id claim — a divergence that
+//     never occurs for a freshly registered agent, where RegisterAgent sets
+//     both from one value.
+//  2. identity.CreatedBy — the same fallback the identity store already uses
+//     to answer "who is the human for this identity"
+//     (COALESCE(NULLIF(owner_user_id, ”), created_by), see the created_by
+//     facet in store/postgres/identity.go). Covers rows predating the
+//     ownership invariant, and deployer-imported rows.
+//  3. callerName — a human performed this rotation and the row names nobody.
+//     Better than a subsystem, and the last human available.
+//  4. The system principal. Nothing names a human, and saying so is the
+//     honest answer.
+//
+// The operator is not lost by ranking them third: RotateKey logs created_by,
+// and identity_audit_logs records the X-User-ID caller separately from the
+// identity's owner (migrations/010_identity_audit_logs.up.sql). Who performed
+// the action and who the credential acts for are different questions, and
+// service_keys.created_by answers only the second.
+func rotationAttribution(identity *domain.Identity, callerName string) string {
+	for _, candidate := range []string{identity.OwnerUserID, identity.CreatedBy, callerName} {
+		if v := usableHuman(candidate); v != "" {
+			return v
+		}
+	}
+	return middleware.SystemCallerPrefix + "key_rotation"
 }
 
 func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID string) {

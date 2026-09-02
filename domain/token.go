@@ -135,7 +135,9 @@ type OAuthClient struct {
 
 	// Dynamic Client Registration (RFC 7591/7592)
 	// RegistrationSource is "internal" for clients created via the admin/internal
-	// API path, "dynamic" for clients created via POST /oauth2/register.
+	// API path, "dynamic" for clients created via POST /oauth2/register, and
+	// RegistrationSourceCIMD for an ephemeral client synthesized from a Client ID
+	// Metadata Document. See SelfAsserted.
 	RegistrationSource string `bun:"registration_source" json:"registration_source,omitempty"`
 	// RegistrationAccessToken is a bcrypt hash of the management bearer token
 	// returned at RFC 7591 registration. NULL for internal clients (the column
@@ -168,4 +170,22 @@ type ProofToken struct {
 	IsUsed     bool       `bun:"is_used"        json:"is_used"`
 	UsedAt     *time.Time `bun:"used_at"        json:"used_at,omitempty"`
 	CreatedAt  time.Time  `bun:"created_at"     json:"created_at"`
+}
+
+// RegistrationSourceCIMD marks a client synthesized from a Client ID Metadata
+// Document rather than registered. See OAuthClient.SelfAsserted.
+const RegistrationSourceCIMD = "cimd"
+
+// SelfAsserted reports whether this client's registration came from a document
+// the client itself published (CIMD) rather than from a registry row somebody
+// vetted.
+//
+// The distinction matters wherever ZeroID is about to act on the client's own
+// claims about itself. A CIMD document is anonymous by construction — no
+// registration, no secret, and by default no host allow-list — so its
+// redirect_uris are attacker-choosable, not merely attacker-supplied. Anywhere a
+// registered client's redirect_uri can be treated as a vetted destination, a
+// self-asserted one cannot.
+func (c *OAuthClient) SelfAsserted() bool {
+	return c != nil && c.RegistrationSource == RegistrationSourceCIMD
 }

@@ -226,6 +226,64 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	return identities, total, nil
 }
 
+// ListByOwnerForOffboard returns every not-yet-deactivated identity owned by
+// ownerUserID within accountID — deliberately ACROSS ALL PROJECTS, unlike List:
+// offboarding a human (INV-IDN-010 / ADR 0028 D5) must sweep every project the
+// account has, mirroring the (owner_user_id, account_id) scoping of the
+// revoke_credentials_by_owner cascade (migration 041). No status default is
+// applied beyond excluding already-deactivated rows: discovered/pending/
+// suspended/expired identities all transition legally to deactivated
+// (domain.CanTransitionTo), and an offboarding must not leave a suspended or
+// discovered row able to return to service later.
+//
+// Both arguments are required: identities.owner_user_id is NOT NULL, so
+// ownerless identities store the empty string and a blank owner would match
+// every one of them (the same footgun the service-layer and SQL guards on the
+// credential cascade close — see RevokeAllActiveForOwner).
+func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUserID, accountID string) ([]*domain.Identity, error) {
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return nil, fmt.Errorf(
+			"ListByOwnerForOffboard requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ownerUserID, accountID)
+	}
+
+	var identities []*domain.Identity
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("owner_user_id = ?", ownerUserID).
+		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		OrderExpr("created_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list identities for owner %s in account %s: %w", ownerUserID, accountID, err)
+	}
+	return identities, nil
+}
+
+// ListByExternalIDs fetches identities by external_id within a tenant. external_id
+// is UNIQUE per (account, project) and indexed, so this is an indexed lookup. Used
+// to hydrate the parent agents of sub-agents that landed on a list page without
+// their parent, so a paginated caller can still nest them. It deliberately applies
+// no status/class filter: a sub-agent's parent must resolve even when the parent
+// would otherwise be filtered out (e.g. deactivated).
+func (r *IdentityRepository) ListByExternalIDs(ctx context.Context, accountID, projectID string, externalIDs []string) ([]*domain.Identity, error) {
+	if len(externalIDs) == 0 {
+		return nil, nil
+	}
+	var identities []*domain.Identity
+	db := dbOrTx(ctx, r.db)
+	if err := db.NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("external_id IN (?)", bun.List(externalIDs)).
+		Scan(ctx); err != nil {
+		return nil, fmt.Errorf("failed to list identities by external_ids: %w", err)
+	}
+	return identities, nil
+}
+
 // FacetValue is a single value+count pair in a faceted aggregation.
 type FacetValue struct {
 	Value string `json:"value"`
@@ -507,6 +565,47 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("deactivate stale discovered rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// ReleaseDiscoveredSource clears source_id on every still-`discovered` identity
+// belonging to (origin, source_id), returning the number of rows released.
+//
+// Called when a discovery connector is deleted. Reconcile adopts a source_id
+// only onto a row that has none — it never overwrites one, so that a live
+// connector cannot claim another live connector's rows. That guard is right,
+// but it leaves a deleted connector's rows pointing at it forever: the
+// connector never syncs again, and prune is scoped `WHERE source_id = ?`, so
+// nothing can sweep them. Releasing the claim at delete time lets the existing
+// adopt-when-empty branch hand those rows to whichever connector rediscovers
+// them next.
+//
+// Only `discovered` rows are touched. An adopted or dismissed identity keeps
+// its source_id as provenance — it is outside prune scope anyway, so a stale
+// pointer there is a historical record, not a leak.
+func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("source_id = ?", "").
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source rows: %w", err)
 	}
 	return int(n), nil
 }

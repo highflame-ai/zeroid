@@ -19,6 +19,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
+	"sync/atomic"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.
@@ -44,11 +45,43 @@ type API struct {
 	issuer               string
 	startTime            time.Time
 
+	// cimdEnabled advertises CIMD support in the OAuth 2.0 Authorization Server
+	// Metadata document (client_id_metadata_document_supported). Set via
+	// SetCIMDEnabled after construction; defaults false so a build that doesn't
+	// wire CIMD doesn't advertise it.
+	cimdEnabled bool
+
+	// dpopRequired makes a valid DPoP proof mandatory on every /oauth2/token
+	// issuance (token.require_dpop). Atomic because tests toggle it while the
+	// server is handling requests; defaults false (Bearer fallback stands).
+	dpopRequired atomic.Bool
+
+	// authorizationCodeAvailable reports whether /oauth2/authorize can
+	// actually serve a request — i.e. whether the deployer registered any
+	// PrincipalResolver. A PREDICATE, not a snapshot: resolvers may be
+	// registered after NewServer and before Start, so a bool captured at
+	// construction time would be wrong. Nil means "assume available"
+	// (embedders that never call the setter keep the old behaviour).
+	authorizationCodeAvailable func() bool
+
+	// interactiveLoginURL returns where to send a user agent when a resolver
+	// reports ErrPrincipalInteractionRequired. Nil means the deployment has no
+	// login surface, in which case that sentinel degrades to access_denied — a
+	// resolver cannot conjure a surface that does not exist.
+	//
+	// A func rather than a string so the target can vary per request (tenant,
+	// client, locale) without the resolver having to construct redirects itself.
+	interactiveLoginURL func(*service.AuthorizeRequest) string
+
 	// resolvePrincipal walks the PrincipalResolver chain registered on
-	// the top-level Server. Wired by Server.NewServer via
-	// SetPrincipalResolverFunc; nil when no resolvers are registered
-	// (the /oauth2/authorize handler then returns 503 so deployers
-	// see a clear "not configured" signal).
+	// the top-level Server. Wired unconditionally by Server.NewServer via
+	// SetPrincipalResolverFunc, which passes a BOUND METHOD — so this is
+	// never nil, even with an empty registry. An empty chain surfaces as
+	// ErrNoResolversRegistered from the call, which the /oauth2/authorize
+	// handler maps to 503.
+	//
+	// It therefore cannot be used to test whether the deployment has any
+	// resolvers; that is what authorizationCodeAvailable is for.
 	resolvePrincipal PrincipalResolverFunc
 }
 
@@ -218,6 +251,56 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 	a.resolvePrincipal = fn
 }
 
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token (token.require_dpop):
+// when true, issuance without a valid proof is refused with invalid_dpop_proof
+// and the AS metadata advertises dpop_bound_access_tokens_required: true.
+// Safe to call at runtime.
+func (a *API) SetDPoPRequired(required bool) {
+	a.dpopRequired.Store(required)
+}
+
+// SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution
+// is active on this deployment, so the OAuth 2.0 Authorization Server Metadata
+// document advertises client_id_metadata_document_supported accordingly. Called
+// by Server.NewServer from cfg.CIMD.Enabled.
+func (a *API) SetCIMDEnabled(enabled bool) {
+	a.cimdEnabled = enabled
+}
+
+// SetAuthorizationCodeAvailable records a predicate reporting whether
+// /oauth2/authorize can serve a request on this deployment.
+//
+// AS metadata is a promise. ZeroID previously advertised
+// authorization_code and client_id_metadata_document_supported
+// unconditionally while /oauth2/authorize answered 503 for every
+// deployment that registered no PrincipalResolver — and an MCP client
+// that believed the metadata skipped CIMD and fell back to dynamic client
+// registration (#263). Discovery must not name a flow the endpoint cannot
+// complete.
+//
+// The predicate gates the endpoint as well as the document: authorizeHandler
+// answers 503 when it reports false, on both GET and POST. Editing only the
+// metadata would leave a deployer who turned the flow off still serving it.
+//
+// A predicate rather than a bool because RegisterPrincipalResolver is
+// documented as safe to call after NewServer.
+func (a *API) SetAuthorizationCodeAvailable(fn func() bool) {
+	a.authorizationCodeAvailable = fn
+}
+
+// canServeAuthorizationCode reports the predicate's answer, defaulting to
+// true when no predicate was set.
+func (a *API) canServeAuthorizationCode() bool {
+	return a.authorizationCodeAvailable == nil || a.authorizationCodeAvailable()
+}
+
+// SetInteractiveLoginURL records where to send a user agent when a
+// PrincipalResolver reports ErrPrincipalInteractionRequired. See
+// Server.SetInteractiveLoginURL for the contract.
+func (a *API) SetInteractiveLoginURL(fn func(*service.AuthorizeRequest) string) {
+	a.interactiveLoginURL = fn
+}
+
 // RegisterAdmin registers admin/management endpoints:
 // identities, credentials, policies, attestation, signals, oauth clients, proof verify.
 // These run on the admin port which is protected at the network layer.
@@ -237,6 +320,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerExpiringSoonRoute(api)
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
+	a.registerObservedResourceRoutes(api)
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

@@ -40,6 +40,7 @@ type Config struct {
 	Logging     LoggingConfig     `koanf:"logging"`
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
+	CIMD        CIMDConfig        `koanf:"cimd"`
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
@@ -79,6 +80,46 @@ type BackchannelConfig struct {
 	// register endpoints like https://localhost:9000/. Production deployments
 	// MUST keep this false (see GHSA-599q-j34m-33vc).
 	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+}
+
+// CIMDConfig governs Client ID Metadata Documents
+// (draft-ietf-oauth-client-id-metadata-document). CIMD lets an OAuth client
+// onboard with zero pre-registration by using a stable https:// URL as its
+// client_id; ZeroID fetches + validates the JSON metadata document published
+// at that URL and treats it as an ephemeral public PKCE client on the
+// authorization_code flow. See docs/cimd.md.
+type CIMDConfig struct {
+	// Enabled turns CIMD resolution on. Default TRUE (on out of the box) — set
+	// ZEROID_CIMD_ENABLED=false / cimd.enabled=false to disable, in which case
+	// https:// client_id URLs fall back to the client registry (and miss).
+	Enabled bool `koanf:"enabled"`
+
+	// AllowedDomains is the primary PRODUCTION HARDENING LEVER for CIMD. It
+	// restricts CIMD to client_id URLs whose host is in this exact,
+	// case-insensitive list; a host not in the list is rejected BEFORE any
+	// outbound fetch. Empty (default) accepts any public HTTPS host — the SSRF
+	// guard (see AllowPrivateMetadataEndpoints) still blocks private/loopback/
+	// metadata ranges, but ZeroID will otherwise fetch arbitrary
+	// request-supplied URLs. Set an allowlist to run CIMD as a closed ecosystem
+	// (recommended for enterprise/closed deployments). YAML only (a list), e.g.:
+	//   cimd:
+	//     allowed_domains: ["client.example.com", "apps.acme.dev"]
+	AllowedDomains []string `koanf:"allowed_domains"`
+
+	// AllowPrivateMetadataEndpoints relaxes the SSRF guard on the metadata
+	// document fetch. Default false (production-safe): a client_id URL whose
+	// host resolves to a private, loopback, link-local, multicast, CGN, or
+	// unspecified address is refused (DNS-rebinding-safe dialer). Set true ONLY
+	// in single-tenant test/dev deployments that publish documents on
+	// localhost / a private network. Production MUST keep this false.
+	AllowPrivateMetadataEndpoints bool `koanf:"allow_private_metadata_endpoints"`
+
+	// MaxDocumentBytes caps the fetched document size. 0 (default) ⇒ 5 KiB.
+	MaxDocumentBytes int64 `koanf:"max_document_bytes"`
+
+	// CacheTTLSeconds is how long a resolved client is cached in memory. 0
+	// (default) ⇒ 3600 (1 h); values above 86400 (24 h) are clamped to 24 h.
+	CacheTTLSeconds int `koanf:"cache_ttl_seconds"`
 }
 
 // AttestationConfig governs the attestation verification subsystem. The
@@ -244,6 +285,17 @@ type TokenConfig struct {
 	Issuer     string `koanf:"issuer"`
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
+
+	// RequireDPoP makes a valid DPoP proof (RFC 9449) mandatory on every
+	// /oauth2/token issuance: absent proof is refused with invalid_dpop_proof
+	// instead of falling back to a Bearer token, and the AS metadata
+	// advertises dpop_bound_access_tokens_required: true (RFC 9449 §5.1).
+	// Off by default — opt-in is the deliberate posture because flipping it
+	// strands clients that cannot construct proofs; a conformance-minded
+	// deployment (ODIS-L1-09 secret-zero/holder-of-key posture) turns it on.
+	// Existing unbound refresh tokens keep working: the client starts sending
+	// a proof and the rotation binds the new token to that key.
+	RequireDPoP bool `koanf:"require_dpop"`
 
 	// ExternalPrincipalRefreshTokenTTL is the lifetime (seconds) of a refresh
 	// token minted by the external-principal exchange when the trusted caller
@@ -621,6 +673,13 @@ func loadDefaults(k *koanf.Koanf) error {
 		// issuer is on localhost/a private network opt in.
 		"attestation.allow_private_issuer_endpoints": false,
 
+		// CIMD (Client ID Metadata Documents) — on by default so agents can
+		// onboard against this AS with zero pre-registration. Disable with
+		// ZEROID_CIMD_ENABLED=false / cimd.enabled=false. The SSRF-guard
+		// relaxation defaults false (production-safe).
+		"cimd.enabled":                          true,
+		"cimd.allow_private_metadata_endpoints": false,
+
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
 		// key stays verifiable for a long audit window (400d) so
@@ -698,6 +757,14 @@ func loadEnvVars(k *koanf.Koanf) error {
 		// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
 		// test/dev deployments only. Production MUST leave this false.
 		"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
+
+		// CIMD (Client ID Metadata Documents). Enabled by default; disable with
+		// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
+		// test/dev only — production MUST leave it false.
+		"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
+		"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",
+		"ZEROID_CIMD_MAX_DOCUMENT_BYTES":      "cimd.max_document_bytes",
+		"ZEROID_CIMD_CACHE_TTL_SECONDS":       "cimd.cache_ttl_seconds",
 
 		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
 		// directly by the OTel SDK (spec-compliant).

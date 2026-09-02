@@ -96,7 +96,19 @@ func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, 
 	if product != "" {
 		q = q.Where("sk.product = ?", product)
 	}
-	if state != "" {
+	// Expiry is derived from expires_at, not stored in sk.state (rows only
+	// ever hold 'active' or 'revoked'), so the filter translates states:
+	// active = active row that has not aged out; expired = active row past
+	// its expires_at; revoked = raw state match.
+	switch state {
+	case "":
+	case domain.APIKeyStateActive:
+		q = q.Where("sk.state = ?", state).
+			Where("(sk.expires_at IS NULL OR sk.expires_at > now())")
+	case domain.APIKeyStateExpired:
+		q = q.Where("sk.state = ?", domain.APIKeyStateActive).
+			Where("sk.expires_at <= now()")
+	default:
 		q = q.Where("sk.state = ?", state)
 	}
 	if label != "" {
@@ -143,6 +155,28 @@ func (r *APIKeyRepository) Revoke(ctx context.Context, id, accountID, projectID,
 		return 0, err
 	}
 	return n, nil
+}
+
+// ListActiveByIdentityIDs retrieves the active API key for each of the given
+// identities in one query — the batch form of GetActiveByIdentityID (same
+// per-identity pick: most recently created active key). Identities without an
+// active key are simply absent from the result.
+func (r *APIKeyRepository) ListActiveByIdentityIDs(ctx context.Context, identityIDs []string) ([]*domain.APIKey, error) {
+	if len(identityIDs) == 0 {
+		return nil, nil
+	}
+	var keys []*domain.APIKey
+	err := r.db.NewSelect().
+		Model(&keys).
+		DistinctOn("identity_id").
+		Where("identity_id IN (?)", bun.List(identityIDs)).
+		Where("state = ?", domain.APIKeyStateActive).
+		OrderExpr("identity_id, created_at DESC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list API keys by identity: %w", err)
+	}
+	return keys, nil
 }
 
 // GetActiveByIdentityID retrieves the active API key for an identity.

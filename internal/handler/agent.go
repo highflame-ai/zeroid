@@ -28,6 +28,12 @@ func mapErr(err error) error {
 	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
 		return huma.Error400BadRequest(err.Error())
 	}
+	// Malformed owner/account on the owner-scoped destructive paths: a 400
+	// tells the SCIM outbox worker the event is a data bug to surface, not a
+	// transient fault to retry forever.
+	if errors.Is(err, service.ErrInvalidOwnerArgument) {
+		return huma.Error400BadRequest(err.Error())
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no rows in result set"), strings.Contains(msg, "not found"):
@@ -86,6 +92,14 @@ type GetAgentOutput struct {
 
 // splitCSV expands comma-separated values in a []string slice so callers can
 // use either ?status=a,b or ?status=a&status=b.
+//
+// This only holds if the query tag carries `explode`. huma disables explode by
+// default for query params, and its non-explode slice path reads
+// strings.Split(ctx.Query(name), ",") — ctx.Query returns the FIRST occurrence
+// only, so a repeated ?status=a&status=b silently binds to just ["a"] before
+// this function ever sees it. Every multi-value filter below is therefore
+// tagged `,explode`, which makes huma collect all occurrences and leaves the
+// comma form to splitCSV. Both spellings then reach the repo intact.
 func splitCSV(vals []string) []string {
 	var out []string
 	for _, v := range vals {
@@ -100,20 +114,21 @@ func splitCSV(vals []string) []string {
 }
 
 type ListAgentsInput struct {
-	AgentType     string   `query:"agent_type" doc:"Filter by agent type"`
-	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
-	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel    []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple."`
-	IsActive      string   `query:"is_active" doc:"Filter by active status"`
-	Search        string   `query:"search" doc:"Search by name or external_id"`
-	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
-	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
-	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
-	Status        []string `query:"status" doc:"Filter by lifecycle status. Comma-separated for multiple."`
-	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
-	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
-	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
-	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
+	AgentType      string   `query:"agent_type" doc:"Filter by agent type"`
+	IdentityType   []string `query:"identity_type,explode" doc:"Filter by identity type. Repeat or comma-separate for multiple (e.g. agent,application)."`
+	Label          string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
+	TrustLevel     []string `query:"trust_level,explode" doc:"Filter by trust level. Repeat or comma-separate for multiple."`
+	IsActive       string   `query:"is_active" doc:"Filter by active status"`
+	Search         string   `query:"search" doc:"Search by name or external_id"`
+	Metadata       string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
+	IdentityClass  string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
+	Origin         string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
+	Status         []string `query:"status,explode" doc:"Filter by lifecycle status. Repeat or comma-separate for multiple."`
+	OwnerUserID    string   `query:"owner_user_id" doc:"Filter by owner user ID"`
+	Ownerless      string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
+	Limit          int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
+	Offset         int      `query:"offset" default:"0" doc:"Offset for pagination"`
+	IncludeParents bool     `query:"include_parents" doc:"Also return, in \"parents\", the parent agents of any sub-agents on this page whose parent is not itself on the page, so a paginated caller can nest them. Context only: not counted in total/limit/offset."`
 }
 
 type ListAgentsOutput struct {
@@ -417,7 +432,7 @@ func (a *API) listAgentsOp(ctx context.Context, input *ListAgentsInput) (*ListAg
 		return nil, huma.Error400BadRequest("invalid ownerless filter: must be true or false")
 	}
 
-	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, input.Limit, input.Offset)
+	resp, err := a.agentSvc.ListAgents(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, input.Limit, input.Offset, input.IncludeParents)
 	if err != nil {
 		return nil, mapErr(err)
 	}

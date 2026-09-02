@@ -54,6 +54,23 @@ type IdentityIDInput struct {
 	ID string `path:"id" doc:"Identity UUID"`
 }
 
+// OffboardByOwnerInput is the request for POST /identities/offboard-by-owner.
+// account_id comes from tenant context, never the body — the payload cannot
+// steer tenancy (INV-IDN-002 applied to the admin surface).
+type OffboardByOwnerInput struct {
+	Body struct {
+		OwnerUserID string `json:"owner_user_id" required:"true" minLength:"1" doc:"Stable user ID of the offboarded human (identities.owner_user_id)"`
+		Reason      string `json:"reason,omitempty" maxLength:"256" doc:"Audit reason recorded on the revocations (defaults to owner_deactivated)"`
+	}
+}
+
+type OffboardByOwnerOutput struct {
+	Body struct {
+		IdentitiesDeactivated int   `json:"identities_deactivated" doc:"Identities deactivated this call — the field to key offboarding evidence and zero-alerts on"`
+		CredentialsRevoked    int64 `json:"credentials_revoked" doc:"Stragglers caught by the final owner-scoped sweep only; ~0 on a healthy run because each identity's deactivation already cascade-revoked its credentials and descendants"`
+	}
+}
+
 // GetIdentityByWIMSEInput is the query for GET /identities/by-wimse.
 // The URI is supplied as a query param (rather than a path segment) because
 // SPIFFE URIs contain slashes that would conflict with route segmentation
@@ -63,16 +80,22 @@ type GetIdentityByWIMSEInput struct {
 	URI string `query:"uri" required:"true" doc:"WIMSE/SPIFFE URI to resolve (e.g. spiffe://highflame.io/acme/prod/agent/claude-bot)"`
 }
 
+// Multi-value filters are tagged `,explode` for the reason documented on
+// splitCSV in agent.go: without it huma reads only the first occurrence of a
+// repeated param, so ?status=a&status=b silently narrows to ["a"]. Kept in
+// lockstep with ListAgentsInput — these two list surfaces are the same filter
+// contract and drift between them is invisible until a caller picks the wrong
+// spelling.
 type ListIdentitiesInput struct {
-	IdentityType  []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	IdentityType  []string `query:"identity_type,explode" doc:"Filter by identity type. Repeat or comma-separate for multiple (e.g. agent,application)."`
 	Label         string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel    []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple (e.g. unverified,verified_third_party)."`
+	TrustLevel    []string `query:"trust_level,explode" doc:"Filter by trust level. Repeat or comma-separate for multiple (e.g. unverified,verified_third_party)."`
 	IsActive      string   `query:"is_active" doc:"Filter by active status"`
 	Search        string   `query:"search" doc:"Search by name or external_id"`
 	Metadata      string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
 	Origin        string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
-	Status        []string `query:"status" doc:"Filter by exact lifecycle status. Comma-separated for multiple (e.g. discovered,pending,active)."`
+	Status        []string `query:"status,explode" doc:"Filter by exact lifecycle status. Repeat or comma-separate for multiple (e.g. discovered,pending,active)."`
 	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
 	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
@@ -151,6 +174,21 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Lookup endpoint used by downstream gateways to verify a JWT's sub claim still resolves to an active identity row in the caller's tenant before forwarding the request.",
 		Tags:        []string{"Identities"},
 	}, a.getIdentityByWIMSEOp)
+
+	// Literal segment, registered before /identities/{id} like by-wimse above.
+	huma.Register(api, huma.Operation{
+		OperationID: "offboard-identities-by-owner",
+		Method:      http.MethodPost,
+		Path:        "/identities/offboard-by-owner",
+		Summary:     "Offboard a human: deactivate every identity they own and cascade-revoke credentials",
+		Description: "Human-offboarding composition (INV-IDN-010 / ADR 0028): deactivates every " +
+			"identity owned by the given user in the caller's account — across ALL projects; the " +
+			"X-Project-ID header is required by the admin surface but not used to scope this sweep — " +
+			"sweeping each identity's API keys and credentials and emitting retirement CAE signals, " +
+			"then runs the owner-scoped credential cascade to catch delegated descendants. Idempotent: " +
+			"safe to retry until 200. Intended caller: admin's SCIM deactivation outbox worker.",
+		Tags: []string{"Identities"},
+	}, a.offboardByOwnerOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "get-identity",
@@ -245,6 +283,15 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Scoped to one (origin, source_id): deactivates only still-`discovered` rows last seen before `not_seen_since`. Never touches adopted/active identities, and never another connector's rows. The offboarding half of a connector reconcile.",
 		Tags:        []string{"Identities"},
 	}, a.pruneStaleDiscoveredOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "release-discovered-source",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/release-source",
+		Summary:     "Unclaim a deleted connector's discovered identities so another can adopt them",
+		Description: "Scoped to one (origin, source_id): clears source_id on still-`discovered` rows so a future connector's reconcile can claim them. Called when a connector is DELETED — otherwise its rows stay bound to a source that never syncs again, and prune (which is source-scoped) can never reach them. Does NOT deactivate: adopt/dismiss remains a human decision. Adopted and dismissed rows keep their source_id as provenance.",
+		Tags:        []string{"Identities"},
+	}, a.releaseDiscoveredSourceOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -529,6 +576,41 @@ func (a *API) deleteIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 	return &IdentityOutput{Body: identity}, nil
 }
 
+// offboardByOwnerOp drives IdentityService.OffboardOwner. Failure mapping is
+// retry-oriented for the SCIM outbox worker: a partial application (some
+// identities failed to deactivate, or the credential cascade errored after
+// some deactivations) returns 502 so the worker retries the idempotent
+// operation; only a fully-applied offboarding returns 200.
+func (a *API) offboardByOwnerOp(ctx context.Context, input *OffboardByOwnerInput) (*OffboardByOwnerOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	result, err := a.identitySvc.OffboardOwner(ctx, input.Body.OwnerUserID, tenant.AccountID, input.Body.Reason)
+	if err != nil {
+		log.Error().Err(err).
+			Str("owner_user_id", input.Body.OwnerUserID).
+			Str("account_id", tenant.AccountID).
+			Msg("owner offboarding failed or partially applied")
+		if result == nil {
+			// Nothing applied: argument guard or list failure.
+			return nil, mapErr(err)
+		}
+		// Partially applied — the worker must retry until it gets a 200.
+		// Fixed message: the wrapped chain can carry DB driver text, and this
+		// surface's convention (mapErr) is generic client messages with
+		// details logged server-side.
+		return nil, huma.Error502BadGateway("offboarding partially applied; retry (the operation is idempotent)")
+	}
+
+	out := &OffboardByOwnerOutput{}
+	out.Body.IdentitiesDeactivated = result.IdentitiesDeactivated
+	out.Body.CredentialsRevoked = result.CredentialsRevoked
+
+	return out, nil
+}
+
 func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*IdentityOutput, error) {
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
@@ -548,21 +630,26 @@ func (a *API) expireIdentityOp(ctx context.Context, input *IdentityIDInput) (*Id
 
 type CreateDiscoveredIdentityInput struct {
 	Body struct {
-		ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
-		Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
-		SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
-		Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
-		SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
-		TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
-		OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
-		Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
-		Version      string          `json:"version,omitempty" doc:"Agent version string"`
-		Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
-		Description  string          `json:"description,omitempty" doc:"Human-readable description"`
-		Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
-		Labels       json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
-		Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+		ExternalID   string `json:"external_id" required:"true" minLength:"1" doc:"IdP object id — the reconciliation key (unique within this project)"`
+		Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the identity was discovered in (e.g. okta, entra, google_workspace). Must not be 'native'."`
+		SourceID     string `json:"source_id,omitempty" doc:"Discovery source instance (connector) that found this identity. Enables source-scoped stale pruning when a tenant runs several connectors of one origin."`
+		Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
+		IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+		SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path — connector-sourced trust tops out at verified_third_party (CAP-DSC-004)."`
+		OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner — discovered identities may be ownerless until adopted"`
+		// OwnerResolved attests the connector definitively verified owner
+		// attribution against the tenant directory this sync (CAP-DSC-004);
+		// only then does a reconcile apply owner_user_id/trust_level to a
+		// still-discovered row (declaratively, clearing included).
+		OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync; applies them to still-discovered rows on reconcile"`
+		Framework     string          `json:"framework,omitempty" doc:"Agent framework"`
+		Version       string          `json:"version,omitempty" doc:"Agent version string"`
+		Publisher     string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
+		Description   string          `json:"description,omitempty" doc:"Human-readable description"`
+		Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
+		Labels        json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
+		Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 	}
 }
 
@@ -607,24 +694,25 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 	}
 
 	identity, created, err := a.identitySvc.UpsertDiscoveredIdentity(ctx, service.DiscoveredIdentityRequest{
-		AccountID:    tenant.AccountID,
-		ProjectID:    tenant.ProjectID,
-		ExternalID:   input.Body.ExternalID,
-		Origin:       origin,
-		SourceID:     input.Body.SourceID,
-		Name:         input.Body.Name,
-		IdentityType: identityType,
-		SubType:      subType,
-		TrustLevel:   trustLevel,
-		OwnerUserID:  input.Body.OwnerUserID,
-		Framework:    input.Body.Framework,
-		Version:      input.Body.Version,
-		Publisher:    input.Body.Publisher,
-		Description:  input.Body.Description,
-		Capabilities: input.Body.Capabilities,
-		Labels:       input.Body.Labels,
-		Metadata:     input.Body.Metadata,
-		CreatedBy:    internalMiddleware.GetCallerName(ctx),
+		AccountID:     tenant.AccountID,
+		ProjectID:     tenant.ProjectID,
+		ExternalID:    input.Body.ExternalID,
+		Origin:        origin,
+		SourceID:      input.Body.SourceID,
+		Name:          input.Body.Name,
+		IdentityType:  identityType,
+		SubType:       subType,
+		TrustLevel:    trustLevel,
+		OwnerUserID:   input.Body.OwnerUserID,
+		OwnerResolved: input.Body.OwnerResolved,
+		Framework:     input.Body.Framework,
+		Version:       input.Body.Version,
+		Publisher:     input.Body.Publisher,
+		Description:   input.Body.Description,
+		Capabilities:  input.Body.Capabilities,
+		Labels:        input.Body.Labels,
+		Metadata:      input.Body.Metadata,
+		CreatedBy:     internalMiddleware.GetCallerName(ctx),
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
@@ -695,21 +783,23 @@ func (a *API) dismissIdentityOp(ctx context.Context, input *IdentityIDInput) (*I
 // DiscoveredAgentItem is one agent in a bulk discovery ingest — the same shape
 // as the single-ingest body.
 type DiscoveredAgentItem struct {
-	ExternalID   string          `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
-	Origin       string          `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
-	SourceID     string          `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
-	Name         string          `json:"name,omitempty" doc:"Human-readable identity name"`
-	IdentityType string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
-	SubType      string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
-	TrustLevel   string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (default unverified)"`
-	OwnerUserID  string          `json:"owner_user_id,omitempty" doc:"Optional owner"`
-	Framework    string          `json:"framework,omitempty" doc:"Agent framework"`
-	Version      string          `json:"version,omitempty" doc:"Agent version"`
-	Publisher    string          `json:"publisher,omitempty" doc:"Agent publisher"`
-	Description  string          `json:"description,omitempty" doc:"Description"`
-	Capabilities json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
-	Labels       json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
-	Metadata     json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
+	ExternalID   string `json:"external_id" required:"true" minLength:"1" doc:"IdP object id (unique within this project)"`
+	Origin       string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem (e.g. okta). Must not be 'native'."`
+	SourceID     string `json:"source_id,omitempty" doc:"Discovery source instance (connector)"`
+	Name         string `json:"name,omitempty" doc:"Human-readable identity name"`
+	IdentityType string `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (default agent)"`
+	SubType      string `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
+	TrustLevel   string `json:"trust_level,omitempty" enum:"unverified,verified_third_party" doc:"Trust level (default unverified). first_party is not assertable on the discovery path (CAP-DSC-004)."`
+	OwnerUserID  string `json:"owner_user_id,omitempty" doc:"Optional owner"`
+	// See CreateDiscoveredIdentityInput.OwnerResolved (CAP-DSC-004).
+	OwnerResolved bool            `json:"owner_resolved,omitempty" doc:"Attests owner_user_id/trust_level carry a definitive directory-verification result for this sync"`
+	Framework     string          `json:"framework,omitempty" doc:"Agent framework"`
+	Version       string          `json:"version,omitempty" doc:"Agent version"`
+	Publisher     string          `json:"publisher,omitempty" doc:"Agent publisher"`
+	Description   string          `json:"description,omitempty" doc:"Description"`
+	Capabilities  json.RawMessage `json:"capabilities,omitempty" doc:"Capabilities"`
+	Labels        json.RawMessage `json:"labels,omitempty" doc:"Key-value labels"`
+	Metadata      json.RawMessage `json:"metadata,omitempty" doc:"Product-specific metadata"`
 }
 
 type BatchDiscoveredInput struct {
@@ -732,24 +822,25 @@ func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscovere
 	reqs := make([]service.DiscoveredIdentityRequest, 0, len(input.Body.Agents))
 	for _, item := range input.Body.Agents {
 		reqs = append(reqs, service.DiscoveredIdentityRequest{
-			AccountID:    tenant.AccountID,
-			ProjectID:    tenant.ProjectID,
-			ExternalID:   item.ExternalID,
-			Origin:       domain.Origin(item.Origin),
-			SourceID:     item.SourceID,
-			Name:         item.Name,
-			IdentityType: domain.IdentityType(item.IdentityType),
-			SubType:      domain.SubType(item.SubType),
-			TrustLevel:   domain.TrustLevel(item.TrustLevel),
-			OwnerUserID:  item.OwnerUserID,
-			Framework:    item.Framework,
-			Version:      item.Version,
-			Publisher:    item.Publisher,
-			Description:  item.Description,
-			Capabilities: item.Capabilities,
-			Labels:       item.Labels,
-			Metadata:     item.Metadata,
-			CreatedBy:    createdBy,
+			AccountID:     tenant.AccountID,
+			ProjectID:     tenant.ProjectID,
+			ExternalID:    item.ExternalID,
+			Origin:        domain.Origin(item.Origin),
+			SourceID:      item.SourceID,
+			Name:          item.Name,
+			IdentityType:  domain.IdentityType(item.IdentityType),
+			SubType:       domain.SubType(item.SubType),
+			TrustLevel:    domain.TrustLevel(item.TrustLevel),
+			OwnerUserID:   item.OwnerUserID,
+			OwnerResolved: item.OwnerResolved,
+			Framework:     item.Framework,
+			Version:       item.Version,
+			Publisher:     item.Publisher,
+			Description:   item.Description,
+			Capabilities:  item.Capabilities,
+			Labels:        item.Labels,
+			Metadata:      item.Metadata,
+			CreatedBy:     createdBy,
 		})
 	}
 
@@ -800,5 +891,38 @@ func (a *API) pruneStaleDiscoveredOp(ctx context.Context, input *PruneDiscovered
 
 	out := &PruneDiscoveredOutput{}
 	out.Body.Deactivated = n
+	return out, nil
+}
+
+type ReleaseDiscoveredSourceInput struct {
+	Body struct {
+		Origin   string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the deleted connector enumerated (e.g. okta)"`
+		SourceID string `json:"source_id" required:"true" minLength:"1" doc:"The deleted connector's id — scopes the release to one source"`
+	}
+}
+
+type ReleaseDiscoveredSourceOutput struct {
+	Body struct {
+		Released int `json:"released"`
+	}
+}
+
+func (a *API) releaseDiscoveredSourceOp(ctx context.Context, input *ReleaseDiscoveredSourceInput) (*ReleaseDiscoveredSourceOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	n, err := a.identitySvc.ReleaseDiscoveredSource(ctx, tenant.AccountID, tenant.ProjectID, domain.Origin(input.Body.Origin), input.Body.SourceID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Msg("failed to release discovered source")
+		return nil, huma.Error500InternalServerError("failed to release discovered source")
+	}
+
+	out := &ReleaseDiscoveredSourceOutput{}
+	out.Body.Released = n
 	return out, nil
 }

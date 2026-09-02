@@ -41,12 +41,73 @@ import (
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
-// middlewareHolder stores an optional middleware in a thread-safe way.
-// The middleware closure is registered at router-build time; the actual function
-// is set later (before Start) via a setter method.
+// middlewareHolder stores optional middleware in a thread-safe way.
+// The middleware closure is registered at router-build time; the actual
+// functions are set later (before Start) via a setter method.
+//
+// fns is a slice, not a single slot, so Server.Use can APPEND. A single slot
+// meant a second Use call silently discarded the first — see Server.Use.
+// adminAuthState still only ever holds one entry, set through fn().
 type middlewareHolder struct {
-	mu sync.RWMutex
-	fn func(http.Handler) http.Handler
+	mu  sync.RWMutex
+	fns []func(http.Handler) http.Handler
+	// composed is fns wrapped into a single middleware, rebuilt whenever fns
+	// changes. Cached rather than composed per call because chain() runs on EVERY
+	// request through EVERY route: composing there cost a slice copy plus a
+	// closure allocation per request, which the previous single-slot read did not.
+	// nil when fns is empty, so the router closure can skip the wrap entirely.
+	composed func(http.Handler) http.Handler
+}
+
+// rebuildLocked recomputes composed. Caller must hold the write lock.
+//
+// Wraps in reverse so fns[0] ends up OUTERMOST, matching chi and net/http:
+// middleware runs in registration order, and one that annotates context has to
+// run before one that reads it.
+func (h *middlewareHolder) rebuildLocked() {
+	if len(h.fns) == 0 {
+		h.composed = nil
+
+		return
+	}
+
+	fns := make([]func(http.Handler) http.Handler, len(h.fns))
+	copy(fns, h.fns)
+
+	h.composed = func(next http.Handler) http.Handler {
+		wrapped := next
+		for i := len(fns) - 1; i >= 0; i-- {
+			wrapped = fns[i](wrapped)
+		}
+
+		return wrapped
+	}
+}
+
+// fn returns the single registered middleware, or nil. For holders that only
+// ever carry one (adminAuthState), which is set by replacing the slice.
+func (h *middlewareHolder) fn() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.fns) == 0 {
+		return nil
+	}
+
+	return h.fns[0]
+}
+
+// chain returns the registered middleware composed so the FIRST registered is
+// outermost, matching chi and net/http convention. Nil when none are set.
+//
+// Read-only and allocation-free: it hands back the cached composition. Use is
+// documented as callable after NewServer, so the cache is rebuilt on mutation
+// rather than assumed immutable.
+func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.composed
 }
 
 // Server is the main ZeroID server.
@@ -69,6 +130,7 @@ type Server struct {
 	credentialSvc       *service.CredentialService
 	credentialPolicySvc *service.CredentialPolicyService
 	attestationSvc      *service.AttestationService
+	apiHandler          *handler.API
 	proofSvc            *service.ProofService
 	oauthSvc            *service.OAuthService
 	oauthClientSvc      *service.OAuthClientService
@@ -97,8 +159,17 @@ type Server struct {
 	mu                 sync.RWMutex
 	claimsEnrichers    []ClaimsEnricher
 	principalResolvers []namedPrincipalResolver
-	adminAuthState     *middlewareHolder
-	globalMWState      *middlewareHolder
+
+	// authzCodeAvailable is the deployer's override for whether
+	// /oauth2/authorize can complete an authorization_code flow. nil means
+	// "use the built-in guess". See SetAuthorizationCodeAvailable.
+	authzCodeAvailable func() bool
+	// interactiveLoginURL is the deployer's login surface for resolvers that
+	// report ErrPrincipalInteractionRequired. nil means "no surface", which
+	// degrades that sentinel to access_denied. See SetInteractiveLoginURL.
+	interactiveLoginURL func(*AuthorizeRequest) string
+	adminAuthState      *middlewareHolder
+	globalMWState       *middlewareHolder
 }
 
 // namedPrincipalResolver pairs a registered PrincipalResolver with the
@@ -279,6 +350,45 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 
+	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
+	// the authorization_code flow by fetching + validating their published
+	// metadata documents. The document fetch reuses the same DNS-rebinding-safe
+	// SSRF-guarded HTTP client as the OIDC attestation verifier and CIBA
+	// dispatch, so a client_id URL can never make ZeroID reach a private /
+	// loopback / metadata address (unless the deployer opts into the test/dev
+	// relaxation). Enabled by default (cfg.CIMD.Enabled defaults true).
+	cimdSvc := service.NewCIMDService(service.CIMDConfig{
+		Enabled:          cfg.CIMD.Enabled,
+		AllowedDomains:   cfg.CIMD.AllowedDomains,
+		MaxDocumentBytes: cfg.CIMD.MaxDocumentBytes,
+		CacheTTL:         time.Duration(cfg.CIMD.CacheTTLSeconds) * time.Second,
+		HTTPClient:       attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints),
+	})
+	oauthSvc.SetCIMDService(cimdSvc)
+	if cfg.CIMD.Enabled {
+		// Report the EFFECTIVE allow-list, not len(cfg.CIMD.AllowedDomains).
+		// NewCIMDService lower-cases and drops blank/whitespace-only entries, so
+		// the raw slice and the policy actually in force disagree — and they
+		// disagree in the worst direction: allowed_domains: [""] has length 1
+		// and an effective count of 0, i.e. open mode reported as locked down.
+		effectiveDomains := cimdSvc.AllowedDomainCount()
+
+		log.Info().
+			Int("allowed_domains", effectiveDomains).
+			Bool("allow_private_endpoints", cfg.CIMD.AllowPrivateMetadataEndpoints).
+			Msg("CIMD (Client ID Metadata Documents) enabled")
+		// cimd.allowed_domains is documented as the primary production
+		// hardening lever, and it ships off. Empty means any public HTTPS host
+		// can publish a document that mints a client here — anyone who can
+		// serve a path on any reachable domain, which inside an org is a low
+		// bar. That is a legitimate posture for an open ecosystem and a poor
+		// one for a closed deployment, and the difference is invisible unless
+		// somebody says so at boot.
+		if effectiveDomains == 0 {
+			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. Set an allowlist to run CIMD as a closed ecosystem.")
+		}
+	}
+
 	// Build the external-issuer registry when the deployer has configured
 	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
@@ -302,6 +412,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// skip replay protection. Backed by the id_jag_jti table (migration 034),
 	// swept by the cleanup worker.
 	oauthSvc.SetIDJAGReplayStore(postgres.NewIDJAGReplayStore(db))
+	// Observed-MCP-server inventory (zeroid#259). Backed by
+	// observed_idjag_resources (migration 040). Best-effort and off the critical
+	// path: a failure here is logged and the token is still issued.
+	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
@@ -322,7 +436,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
-	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
 	// DPoP verifier — validates RFC 9449 proofs (and the bh extension claim)
@@ -346,6 +460,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		signingCredSvc, db,
 		cfg.Token.Issuer,
 	)
+	// Advertise CIMD support in the AS metadata document only when enabled.
+	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
+	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
@@ -373,11 +490,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// without blocking unauthenticated callers.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			globalMW.mu.RLock()
-			mw := globalMW.fn
-			globalMW.mu.RUnlock()
-			if mw != nil {
+			if mw := globalMW.chain(); mw != nil {
 				mw(next).ServeHTTP(w, req)
+
 				return
 			}
 			next.ServeHTTP(w, req)
@@ -424,11 +539,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				authState.mu.RLock()
-				auth := authState.fn
-				authState.mu.RUnlock()
-				if auth != nil {
+				if auth := authState.fn(); auth != nil {
 					auth(next).ServeHTTP(w, req)
+
 					return
 				}
 				next.ServeHTTP(w, req)
@@ -472,6 +585,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		credentialSvc:          credentialSvc,
 		credentialPolicySvc:    credentialPolicySvc,
 		attestationSvc:         attestationSvc,
+		apiHandler:             apiHandler,
 		proofSvc:               proofSvc,
 		oauthSvc:               oauthSvc,
 		oauthClientSvc:         oauthClientSvc,
@@ -500,6 +614,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
+
+	// Discovery must not promise a flow /oauth2/authorize cannot serve: with no
+	// PrincipalResolver registered the endpoint 503s, so the authorization_code
+	// grant (and CIMD, which only applies to that flow) stays out of the
+	// metadata document. Evaluated per request, because
+	// RegisterPrincipalResolver is documented as safe to call after NewServer
+	// and before Start (#263).
+	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
+	apiHandler.SetInteractiveLoginURL(srv.resolveInteractiveLoginURL)
 
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
@@ -639,7 +762,9 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 // let alone mint a token. The shared core (resolveAPIKeyContext) is
 // the single source of truth.
 //
-// Typical usage from a PrincipalResolver:
+// Typical usage from a PrincipalResolver. As with the example on
+// RegisterPrincipalResolver, req.Form is POST-only — read a header or
+// cookie instead if the resolver must serve the browser GET leg.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -696,7 +821,13 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // the first to return a non-nil Principal wins. name is used for
 // log/metric attribution and must be non-empty.
 //
-// Typical usage from a deployer that owns api_key resolution:
+// Typical usage from a deployer that owns api_key resolution. NOTE this
+// shape serves POST ONLY: req.Form is bound to the POST body, so it
+// returns ErrPrincipalNotApplicable on every browser GET. A GET-capable
+// resolver must read req.Header(...) or req.Cookie(...) instead — and if
+// ALL your resolvers are form-based, call
+// Server.SetAuthorizationCodeAvailable(func() bool { return false }) so
+// AS metadata stops advertising a flow that will 401.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -719,6 +850,39 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // supported — register the most-specific first (e.g. session cookie
 // before api_key fallback) because order determines precedence on
 // overlapping requests.
+//
+// # Writing a cookie-based resolver
+//
+// /oauth2/authorize serves GET (RFC 6749 §3.1), so a resolver that
+// authenticates from a cookie is reachable by top-level navigation from
+// any site — SameSite=Lax still sends the cookie on a cross-site GET.
+// Combined with CIMD, which accepts any attacker-published client_id and
+// its own redirect_uri, a bare redirect would hand the attacker a code
+// for the victim's principal.
+//
+// A cookie resolver therefore MUST NOT be sufficient on its own. Code
+// issuance has to sit behind an explicit user interaction — a consent
+// screen carrying a CSRF token — the way a real authorization server does.
+//
+// A PrincipalResolver cannot render that screen itself: its signature
+// returns (*Principal, error), so it has no ResponseWriter. It CAN start
+// the interaction, though — return ErrPrincipalInteractionRequired and
+// zeroid redirects the user agent to the surface registered with
+// Server.SetInteractiveLoginURL, appending return_to so the flow resumes
+// once your surface has authenticated them. Your resolver then only has
+// to recognise the session that established. That keeps redirects out of
+// resolver code, which is the point of the split.
+//
+// Rendering and CSRF-protecting the consent screen itself remains yours.
+// Server.Use middleware is the other option if you want to own the whole
+// interaction, including the 302, before the handler runs; it chains, so
+// it composes with whatever you already registered. See docs/cimd.md and
+// highflame-authn#157 for a worked example.
+//
+// Header-based resolvers (api_key, mTLS, a signed assertion) do not have
+// this exposure: a browser cannot set a custom header on a top-level
+// navigation, which is also why the handler binds AuthorizeRequest.Form
+// to the POST body only.
 func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 	if name == "" || r == nil {
 		return
@@ -738,11 +902,23 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
 //     so the deployer sees a clear "you forgot to wire this up"
 //     signal, distinct from the 401 "credential didn't match" case.
+//     AS metadata omits the authorization_code grant in that state, so
+//     discovery never promises a flow the endpoint cannot serve.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
-//     returns (nil, "", nil). Handler maps to 401 invalid_client.
-//   - Any resolver returning a non-sentinel error → returns
-//     (nil, resolverName, err). The chain stops at the first such
-//     error; handler surfaces it as 401 invalid_client.
+//     returns (nil, "", nil). The handler reports access_denied: on a GET
+//     that is a 302 back to the client's redirect_uri per RFC 6749
+//     §4.1.2.1, on a POST a 401 invalid_client JSON body.
+//   - A resolver returning ErrPrincipalInteractionRequired → returns
+//     (nil, resolverName, err) and STOPS the chain, like any other
+//     non-sentinel error. On a GET the handler redirects the user agent
+//     to Server.SetInteractiveLoginURL's target instead of refusing; with
+//     no target set, or on a POST, it degrades to access_denied. A
+//     resolver that wants the chain to continue must return
+//     ErrPrincipalNotApplicable instead.
+//   - Any other resolver error → returns (nil, resolverName, err). The
+//     chain stops at the first such error; the handler reports it the
+//     same way as the no-match case (access_denied / 401), without
+//     revealing which resolver matched.
 func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
 	s.mu.RLock()
 	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
@@ -776,10 +952,21 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
+// Calling it again REPLACES the previous middleware — admin auth is one
+// decision, not a stack. Passing nil removes it.
 func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 	s.adminAuthState.mu.Lock()
 	defer s.adminAuthState.mu.Unlock()
-	s.adminAuthState.fn = middleware
+
+	if middleware == nil {
+		s.adminAuthState.fns = nil
+		s.adminAuthState.rebuildLocked()
+
+		return
+	}
+
+	s.adminAuthState.fns = []func(http.Handler) http.Handler{middleware}
+	s.adminAuthState.rebuildLocked()
 }
 
 // Use adds a global middleware that runs on ALL routes (public + admin).
@@ -790,11 +977,155 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 // trusted service identity from headers so that TrustedServiceValidator can read it
 // during external principal token exchange.
 //
+// Calling it more than once APPENDS. Middleware runs in registration order, so
+// the first registered is outermost — the same convention as chi and net/http.
+// It used to replace instead, which silently discarded everything but the last
+// registration: a deployer who added a second concern lost the first with no
+// error, and since the slot is typically already occupied (annotating trusted
+// service identity, say) the loss landed on whatever was registered first
+// (#276).
+//
+// A note on what belongs here. Middleware on this path sees /oauth2/authorize,
+// including requests from CIMD clients, which are unregistered and inherently
+// third-party. Treat anything registered here as security-relevant on that
+// route, and prefer to keep it to context annotation.
+//
 // Can be called after NewServer and before Start.
+//
+// Passing nil is IGNORED, not a way to unregister — there is no removal for an
+// appending registry, and silently dropping every previously registered
+// middleware would be a worse answer than doing nothing. This differs from
+// AdminAuth(nil), which does clear, because that one is a single slot.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {
+	if middleware == nil {
+		return
+	}
+
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
-	s.globalMWState.fn = middleware
+	s.globalMWState.fns = append(s.globalMWState.fns, middleware)
+	s.globalMWState.rebuildLocked()
+}
+
+// SetInteractiveLoginURL supplies the login surface a user agent is sent to when
+// a PrincipalResolver reports ErrPrincipalInteractionRequired.
+//
+// This is the missing half of the resolver contract. A PrincipalResolver returns
+// (*Principal, error) and so cannot redirect — it has no ResponseWriter — which
+// left a cookie-based resolver with no way to start a login: declining reads as
+// "wrong credential type", and failing reads as "bad credential". Neither sends
+// the user anywhere. Now the resolver returns the sentinel and ZeroID does the
+// redirect, so the resolver still never touches the transport.
+//
+// The contract:
+//
+//   - fn is called only after the client and redirect_uri have been validated, so
+//     the request it receives is one ZeroID has already vetted.
+//   - ZeroID appends return_to, rebuilt from the validated protocol parameters,
+//     pointing back at /oauth2/authorize. Your surface should send the user there
+//     after authenticating, at which point your resolver should recognise the
+//     session it established. return_to deliberately excludes anything else from
+//     the inbound query — see redirectToInteractiveLogin.
+//   - Returning "" declines, as does leaving fn nil: the sentinel then degrades
+//     to access_denied, because a resolver cannot conjure a surface the
+//     deployment does not have.
+//   - Honoured on GET only. A POST caller has no user agent to redirect.
+//   - return_to is ZeroID's parameter name and is SET on whatever you return, so
+//     a target already carrying one loses it. Put your own state elsewhere.
+//
+// **Your surface must not bounce back to return_to unconditionally.** ZeroID has
+// no loop guard here: if the user is returned without a session established —
+// they cancelled, cookies are blocked, a third-party-cookie policy intervened —
+// your resolver reports the sentinel again and the redirect repeats. Send them
+// back only once you can satisfy the resolver, and show them a terminal error
+// otherwise.
+//
+// **Derive the target from configuration, not from the request.** fn receives the
+// AuthorizeRequest so the target can vary by tenant, client or locale — but
+// building it out of request data turns this into an open redirect, and ZeroID
+// does not validate what you return because deployer config is trusted.
+//
+// Passing nil removes the target. Safe to call after NewServer.
+func (s *Server) SetInteractiveLoginURL(fn func(*AuthorizeRequest) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactiveLoginURL = fn
+}
+
+// resolveInteractiveLoginURL is wired into the handler at build time, so the
+// deployer can call SetInteractiveLoginURL any time before Start. Returns "" when
+// no target is set, which the handler reads as "decline".
+func (s *Server) resolveInteractiveLoginURL(req *service.AuthorizeRequest) string {
+	// Snapshot under the lock, then release BEFORE calling the deployer's func —
+	// RWMutex is not reentrant, so invoking an arbitrary callback while holding
+	// s.mu deadlocks if it touches any locking Server method. Same pattern as
+	// canServeAuthorizationCode.
+	s.mu.RLock()
+	fn := s.interactiveLoginURL
+	s.mu.RUnlock()
+
+	if fn == nil {
+		return ""
+	}
+
+	return fn(req)
+}
+
+// SetAuthorizationCodeAvailable overrides ZeroID's guess about whether
+// /oauth2/authorize can actually complete an authorization_code flow on this
+// deployment. When the answer is false, AS metadata omits the
+// authorization_code grant, response_types_supported, the PKCE method list,
+// and client_id_metadata_document_supported, so no client discovers a flow it
+// cannot finish (#263).
+//
+// # Why an override exists
+//
+// ZeroID's built-in guess is "at least one PrincipalResolver is registered".
+// That is NECESSARY but NOT SUFFICIENT, and only the deployer knows the
+// difference: a resolver that reads its credential from req.Form cannot serve
+// a browser GET at all, because Form is bound to the POST body (see
+// RegisterPrincipalResolver). A deployment whose resolvers are all form-based
+// serves POST fine and 401s every browser redirect — while the default guess
+// happily advertises the grant.
+//
+// So: if your resolvers are form-only, call this with a func returning false
+// until you add a header- or cookie-based one. ZeroID cannot introspect what a
+// resolver reads, which is why it cannot work this out itself.
+//
+// A false answer turns the flow OFF, it does not merely stop advertising it:
+// /oauth2/authorize answers 503 on both GET and POST. That distinction matters
+// to a deployer running a cookie-based resolver, which is safe while POST is
+// the only route (SameSite=Lax withholds the cookie on a cross-site POST) and
+// CSRF-reachable once a top-level navigation can drive the endpoint. A hatch
+// that only edited the discovery document would have left that endpoint live.
+//
+// A predicate rather than a bool so the answer can change as resolvers are
+// registered. Passing nil restores the built-in guess. Safe to call after
+// NewServer.
+func (s *Server) SetAuthorizationCodeAvailable(fn func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authzCodeAvailable = fn
+}
+
+// canServeAuthorizationCode answers the deployer's override when one is set,
+// otherwise falls back to the built-in guess (any resolver registered).
+func (s *Server) canServeAuthorizationCode() bool {
+	// Snapshot under the lock, then release it BEFORE calling the deployer's
+	// predicate. Go's RWMutex is not reentrant, so invoking an arbitrary
+	// callback while holding s.mu deadlocks the moment that callback touches
+	// any Server method that locks — RegisterPrincipalResolver, for one. Same
+	// pattern resolvePrincipal uses for the resolver chain.
+	s.mu.RLock()
+	fn := s.authzCodeAvailable
+	resolverCount := len(s.principalResolvers)
+	s.mu.RUnlock()
+
+	if fn != nil {
+		return fn()
+	}
+
+	return resolverCount > 0
 }
 
 // SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA
@@ -933,6 +1264,14 @@ func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
 }
 
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token at runtime.
+// Mirrors the token.require_dpop config gate: when true, issuance without a
+// valid RFC 9449 proof is refused with invalid_dpop_proof and the AS
+// metadata advertises dpop_bound_access_tokens_required: true.
+func (s *Server) SetDPoPRequired(required bool) {
+	s.apiHandler.SetDPoPRequired(required)
+}
+
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
 // introspection (RFC 7662) and revocation (RFC 7009) endpoints. Mirrors the
 // token.allow_unauthenticated_token_inspection config gate (require ==
@@ -966,8 +1305,20 @@ func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
 // The validator reads from context (populated by deployer-provided global middleware
 // via Server.Use). When nil (default), external principal exchange is disabled.
 //
+// Passing nil disables external principal exchange, as the default does. It used
+// to wrap the nil in a non-nil closure, so the service saw a validator that
+// existed and called it — turning "disabled" into a nil-deref panic on the first
+// external-principal exchange, which is both the opposite of what this godoc
+// promised and a crash on a request path rather than at startup.
+//
 // Can be called after NewServer and before Start.
 func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
+	if v == nil {
+		s.oauthSvc.SetTrustedServiceValidator(nil)
+
+		return
+	}
+
 	s.oauthSvc.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
 		return v(ctx)
 	})
@@ -1148,6 +1499,23 @@ func parseDurationOrDefault(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// logSafePath is what request loggers record instead of r.RequestURI.
+//
+// RequestURI carries the query string, and ZeroID does not control what a
+// caller puts there. /oauth2/authorize takes its protocol parameters from
+// the query on a GET, so a client author who mirrors a documented POST form
+// into a GET puts their api_key in the URL. The resolver correctly ignores
+// it — Form is bound to the POST body — but a logger reading RequestURI has
+// already written the secret to disk and shipped it to whatever log sink the
+// deployer runs, twice per request.
+//
+// The path alone cannot hide a credential, and no ZeroID endpoint takes a
+// query parameter worth logging. A deployer who wants query detail can add
+// their own middleware and decide their own redaction.
+func logSafePath(r *http.Request) string {
+	return r.URL.Path
+}
+
 // errorRecoveryMiddleware recovers from panics and returns a 500 JSON error response.
 func errorRecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1156,7 +1524,7 @@ func errorRecoveryMiddleware(next http.Handler) http.Handler {
 				log.Error().
 					Interface("panic", err).
 					Str("method", r.Method).
-					Str("path", r.RequestURI).
+					Str("path", logSafePath(r)).
 					Msg("Panic recovered in request handler")
 
 				w.Header().Set("Content-Type", "application/json")
@@ -1365,7 +1733,7 @@ func writeValidationError(w http.ResponseWriter, r *http.Request, msg string) {
 	log.Info().
 		Str("request_id", reqID).
 		Str("method", r.Method).
-		Str("path", r.RequestURI).
+		Str("path", logSafePath(r)).
 		Str("content_type", r.Header.Get("Content-Type")).
 		Str("reason", msg).
 		Msg("request validation rejected")
@@ -1396,7 +1764,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		log.Info().
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Str("remote_addr", r.RemoteAddr).
 			Msg("request.start")
 
@@ -1415,7 +1783,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		logLevel.
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Int("status", ww.Status()).
 			Dur("duration", duration).
 			Msg("request.complete")

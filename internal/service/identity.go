@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -310,14 +311,23 @@ type DiscoveredIdentityRequest struct {
 	SubType      domain.SubType
 	TrustLevel   domain.TrustLevel
 	OwnerUserID  string // optional
-	Framework    string
-	Version      string
-	Publisher    string
-	Description  string
-	Capabilities json.RawMessage
-	Labels       json.RawMessage
-	Metadata     json.RawMessage
-	CreatedBy    string
+	// OwnerResolved attests that the connector DEFINITIVELY computed owner
+	// attribution this sync (CAP-DSC-004): it verified the IdP-asserted owner
+	// against the tenant human directory and OwnerUserID/TrustLevel carry the
+	// result — including an empty owner (verification failed or the agent is
+	// ownerless). Only with this attestation does a reconcile apply owner and
+	// trust to a still-discovered row, declaratively; without it (default, and
+	// whenever the directory was unreachable) the prior attribution is
+	// preserved, so a resolve outage never flaps verification state.
+	OwnerResolved bool
+	Framework     string
+	Version       string
+	Publisher     string
+	Description   string
+	Capabilities  json.RawMessage
+	Labels        json.RawMessage
+	Metadata      json.RawMessage
+	CreatedBy     string
 }
 
 // UpsertDiscoveredIdentity idempotently ingests an identity observed in an
@@ -344,6 +354,19 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	// first create.
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
+	}
+	// The discovery path can only carry trust it can EARN: unverified or
+	// verified_third_party (directory verification, CAP-DSC-004). first_party
+	// is reserved for natively-registered identities, and anything else is a
+	// caller bug that must not be written — this guard is the single entry
+	// point for both the create and reconcile paths, so the attested
+	// declarative apply downstream never sees an unvalidated value.
+	switch req.TrustLevel {
+	case "", domain.TrustLevelUnverified, domain.TrustLevelVerifiedThirdParty:
+	case domain.TrustLevelFirstParty:
+		return nil, false, fmt.Errorf("%w: a discovered identity cannot be first_party", ErrInvalidIdentityField)
+	default:
+		return nil, false, fmt.Errorf("%w: invalid trust_level for a discovered identity: %q", ErrInvalidIdentityField, req.TrustLevel)
 	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
@@ -393,10 +416,40 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	return identity, true, nil
 }
 
+// applyDiscoveredOwnerAttribution applies a connector's verified owner
+// attribution (CAP-DSC-004) to a still-discovered row. Declarative on
+// purpose: with the OwnerResolved attestation, OwnerUserID and TrustLevel are
+// the definitive result of directory verification — including an empty owner
+// (verification failed, or the agent is ownerless) — and an empty trust level
+// normalizes to unverified so a cleared verification can never leave a stale
+// verified_third_party behind. Rows past `discovered` (adoption assigned the
+// accountable human) and requests without the attestation (resolve outage)
+// are untouched.
+func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredIdentityRequest) {
+	if !req.OwnerResolved || identity.Status != domain.IdentityStatusDiscovered {
+		return
+	}
+
+	identity.OwnerUserID = req.OwnerUserID
+
+	identity.TrustLevel = req.TrustLevel
+	if identity.TrustLevel == "" {
+		identity.TrustLevel = domain.TrustLevelUnverified
+	}
+}
+
 // reconcileDiscovered refreshes the connector-sourced descriptive fields on an
 // existing row without touching lifecycle, ownership, policy, or origin. Only
 // non-empty inputs overwrite, so a connector that omits a field leaves the
 // curated value intact. Returns (identity, created=false).
+//
+// One deliberate exception (CAP-DSC-004): when the request carries the
+// OwnerResolved attestation AND the row is still in the `discovered` state,
+// owner_user_id and trust_level are applied DECLARATIVELY — including clearing
+// them — because pre-adoption those fields are connector-owned (the verified
+// link to the tenant directory). The instant a row leaves `discovered`
+// (adoption assigns the accountable human), connector syncs stop touching
+// ownership and trust entirely.
 //
 // A native-origin row that happens to share this external_id is a genuine
 // collision, not the same agent: discovery must never mutate a natively-managed
@@ -407,6 +460,7 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
 	}
+	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
 	// ingested manually first, then a connector picked it up). Never overwrite a
 	// non-empty source_id, so one connector can't claim another's row.
@@ -550,6 +604,53 @@ func (s *IdentityService) PruneStaleDiscovered(ctx context.Context, accountID, p
 	return n, nil
 }
 
+// ReleaseDiscoveredSource unclaims every still-`discovered` identity belonging
+// to one discovery source, so a future connector can adopt them. Returns the
+// number released.
+//
+// Called when a connector is DELETED. Reconcile only ever adopts a source_id
+// onto a row that has none (so a live connector can't claim another live
+// connector's rows), which means a deleted connector's rows stay bound to it
+// forever — it never syncs again, and prune is scoped to a single source_id, so
+// no sweep can reach them. They would sit as `discovered` indefinitely, reading
+// as live inventory. Releasing the claim restores them to the adoptable state
+// they had before that connector first saw them.
+//
+// Deliberately NOT a deactivation: these rows are a human's pending
+// adopt/dismiss queue, and a connector being replaced is not a decision about
+// the agents it found. Rows whose agent is genuinely gone from the source stay
+// `discovered` with no owner until dismissed by hand — the same as any other
+// discovered row nobody acts on.
+//
+// Scoped like prune: origin and sourceID are both required, so a release can
+// never unclaim a whole tenant's inventory.
+func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: release requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	// Shape-check too: IsExternal only rejects "" and "native", so a malformed
+	// value like "Okta" would reach the WHERE clause, match nothing, and return
+	// released=0 — indistinguishable from "there was nothing to release". Reject
+	// it instead, so a caller with a typo'd origin learns that rather than
+	// believing the release succeeded.
+	if !domain.ValidOrigin(string(origin)) {
+		return 0, fmt.Errorf("%w: invalid origin %q: must be a lowercase ecosystem identifier (e.g. okta, entra)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: release requires a source_id (a release is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_release_source")
+	n, err := s.repo.ReleaseDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery release: unclaimed discovered identities from a deleted source")
+	}
+	return n, nil
+}
+
 // GetIdentity retrieves an identity by ID.
 func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByID(ctx, id, accountID, projectID)
@@ -611,6 +712,13 @@ func (s *IdentityService) GetIdentityByWIMSEURI(ctx context.Context, wimseURI, a
 // ecosystem.
 func (s *IdentityService) ListIdentities(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) ([]*domain.Identity, int, error) {
 	return s.repo.List(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
+}
+
+// ListByExternalIDs fetches identities by external_id within a tenant, used to
+// hydrate the parent agents of sub-agents so a paginated caller can nest them
+// regardless of pagination/filtering.
+func (s *IdentityService) ListByExternalIDs(ctx context.Context, accountID, projectID string, externalIDs []string) ([]*domain.Identity, error) {
+	return s.repo.ListByExternalIDs(ctx, accountID, projectID, externalIDs)
 }
 
 // GetFacets returns grouped counts for each filterable identity dimension.
@@ -964,6 +1072,130 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	}
 
 	return updated, nil
+}
+
+// OffboardResult reports what an owner offboarding actually did, so the caller
+// (admin's SCIM outbox worker) can log evidence and decide whether to retry.
+type OffboardResult struct {
+	// IdentitiesDeactivated counts identities the loop successfully drove to
+	// deactivated. The list excludes already-deactivated rows, so this is the
+	// fresh count in practice; a row deactivated concurrently between list and
+	// loop is still counted (DeactivateIdentity no-ops idempotently). This is
+	// the field the SCIM worker should key evidence and zero-alerts on.
+	IdentitiesDeactivated int
+	// FailedIdentityIDs lists identities whose deactivation errored. Non-empty
+	// means the offboarding is INCOMPLETE and the caller must retry (the whole
+	// operation is idempotent).
+	FailedIdentityIDs []string
+	// CredentialsRevoked is the count from the FINAL owner-scoped cascade
+	// (revoke_credentials_by_owner) only. Expect it to be ~0 on a healthy run:
+	// each identity's deactivation cleanup already cascade-revokes that
+	// identity's credentials AND their delegated descendants
+	// (revoke_credentials_cascade, migration 031), so the final sweep usually
+	// finds nothing left. A non-zero value here means the sweep caught
+	// stragglers — descendants of identities that failed to deactivate, or
+	// credentials issued mid-loop. Do NOT alert on this being zero.
+	CredentialsRevoked int64
+}
+
+// OffboardOwner is the human-offboarding composition (INV-IDN-010 / ADR 0028
+// D5): when the org IdP deactivates a person, every agent identity they own in
+// the account — across all projects — is deactivated, and the owner-scoped
+// credential cascade sweeps anything delegation reached beyond them.
+//
+// Order matters and both halves are required:
+//
+//  1. Deactivate each owned identity via the shared DeactivateIdentity path
+//     (sweeps linked API keys, cascade-revokes that identity's credentials,
+//     emits the retirement CAE signal). Credential revocation alone would be
+//     cosmetic — a surviving zid_sk_* service key just re-exchanges for a
+//     fresh token via the api_key grant.
+//  2. RevokeAllActiveForOwner — the single-statement atomic sweep that also
+//     catches delegated descendants owned by other humans (parent_jti chain)
+//     and any credential issued while step 1 was looping.
+//
+// Failure semantics are retry-oriented, not fail-fast: a per-identity
+// deactivation error is recorded and the loop continues, and the credential
+// cascade runs regardless, so one bad row cannot shield the rest of the fleet.
+// A non-nil error alongside a non-nil result means "partially applied, retry
+// me" — every step is idempotent (already-deactivated identities no-op,
+// already-revoked credentials emit no duplicate revocation events).
+//
+// Re-activation is deliberately NOT offered here: a SCIM active:true after an
+// offboarding restores org membership only (ADR 0028 D6); agents are never
+// silently resurrected.
+func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accountID, reason string) (*OffboardResult, error) {
+	// Trim-aware, not just non-empty: " " passes a == "" check, matches NO row
+	// (ownerless identities store "", and Postgres VARCHAR equality is exact),
+	// and would turn the offboarding into a silent 200 no-op — the SCIM worker
+	// records success while the departing human's fleet keeps running. A
+	// padded owner (e.g. "alice ") likewise matches nothing stored as "alice".
+	// Both are malformed events that must fail loudly (ErrInvalidOwnerArgument
+	// → 400), not read as healthy.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return nil, fmt.Errorf(
+			"%w: OffboardOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
+	}
+
+	if reason == "" {
+		reason = "owner_deactivated"
+	}
+
+	identities, err := s.repo.ListByOwnerForOffboard(ctx, ownerUserID, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &OffboardResult{}
+	for _, identity := range identities {
+		// A canceled caller must not burn one error log + one failure append
+		// per remaining identity on a large fleet; stop and report partial so
+		// the worker retries.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+
+			return result, fmt.Errorf("offboard interrupted after %d deactivations: %w", result.IdentitiesDeactivated, ctxErr)
+		}
+
+		if _, err := s.DeactivateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID); err != nil {
+			log.Error().Err(err).
+				Str("identity_id", identity.ID).
+				Str("owner_user_id", ownerUserID).
+				Str("account_id", accountID).
+				Msg("offboard: failed to deactivate owned identity")
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+			continue
+		}
+		result.IdentitiesDeactivated++
+	}
+
+	// The owner-scoped cascade runs even when some deactivations failed — it
+	// does not depend on identity status and every credential it can reach
+	// must die on this call, not on the retry.
+	revoked, err := s.credentialSvc.RevokeAllActiveForOwner(ctx, ownerUserID, accountID, reason)
+	if err != nil {
+		return result, fmt.Errorf("offboard: owner-scoped credential cascade failed (deactivated %d identities first): %w",
+			result.IdentitiesDeactivated, err)
+	}
+	result.CredentialsRevoked = revoked
+
+	if len(result.FailedIdentityIDs) > 0 {
+		return result, fmt.Errorf("offboard incomplete: %d of %d identities failed to deactivate — retry (idempotent)",
+			len(result.FailedIdentityIDs), len(identities))
+	}
+
+	log.Info().
+		Str("owner_user_id", ownerUserID).
+		Str("account_id", accountID).
+		Str("reason", reason).
+		Int("identities_deactivated", result.IdentitiesDeactivated).
+		Int64("credentials_revoked", result.CredentialsRevoked).
+		Msg("offboard: owner offboarding complete")
+
+	return result, nil
 }
 
 // ExpireIdentity transitions an active identity to expired. It runs the same

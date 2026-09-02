@@ -86,6 +86,9 @@ var testDB *bun.DB
 // service name (the `trusted_by` claim).
 const testTrustedServiceHeader = "X-Test-Trusted-Service"
 
+// testInteractiveLoginURL is the stub consent surface for the #276 tests.
+const testInteractiveLoginURL = "https://studio.example.test/login"
+
 // trustedServiceCtxKey is the context key the test global middleware uses to
 // pass the trusted-service name through to the validator.
 type trustedServiceCtxKey struct{}
@@ -299,11 +302,48 @@ func runTests(m *testing.M) int {
 			next.ServeHTTP(w, r)
 		})
 	})
+	// Login surface for the interactive-authentication tests (#276). A real
+	// deployer points this at their own consent page; the tests only need a
+	// stable absolute URL to assert the redirect and its return_to against.
+	srv.SetInteractiveLoginURL(func(*zeroid.AuthorizeRequest) string {
+		return testInteractiveLoginURL
+	})
+
 	srv.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
 		if name, ok := ctx.Value(trustedServiceCtxKey{}).(string); ok && name != "" {
 			return name, nil
 		}
 		return "", fmt.Errorf("caller is not a trusted service")
+	})
+
+	// Header-based stub for the GET leg. The form-field stub below cannot
+	// serve GET at all: the handler binds AuthorizeRequest.Form to the POST
+	// body only, so on a GET req.Form is empty by construction — that IS the
+	// property keeping credentials out of URLs. A GET-capable resolver must
+	// therefore read headers, which is exactly what deployers are told to do.
+	//
+	// Registered FIRST so it wins when both are present; it declines (returns
+	// ErrPrincipalNotApplicable) whenever its header is absent, so the
+	// form-field stub still serves every POST test unchanged.
+	srv.RegisterPrincipalResolver("test-header-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		// Interaction trigger for the #276 tests: stands in for a session-cookie
+		// resolver that recognises the request but finds nobody signed in.
+		// Checked before the credential header so a test can ask for the
+		// interaction path without also supplying a principal.
+		if req.Header("X-Test-Interaction-Required") != "" {
+			return nil, zeroid.ErrPrincipalInteractionRequired
+		}
+
+		acct := req.Header("X-Test-Principal-Account")
+		if acct == "" {
+			return nil, zeroid.ErrPrincipalNotApplicable
+		}
+
+		return &zeroid.Principal{
+			AccountID: acct,
+			ProjectID: req.Header("X-Test-Principal-Project"),
+			UserID:    req.Header("X-Test-Principal-User"),
+		}, nil
 	})
 
 	// Stub PrincipalResolver for /oauth2/authorize tests. Reads its
@@ -317,6 +357,9 @@ func runTests(m *testing.M) int {
 	//   test_principal_user    → UserID
 	//   test_principal_reject  → "true" returns a non-sentinel error
 	//   (anything else)        → ErrPrincipalNotApplicable
+	//
+	// Registered second, after the header stub above; it reads req.Form, so
+	// it is POST-only by construction and declines every GET.
 	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		if req.Form("test_principal_reject") == "true" {
 			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")

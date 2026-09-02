@@ -14,6 +14,14 @@ func isDuplicateKeyError(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Field('C') == "23505"
 }
 
+// ErrInvalidOwnerArgument marks a caller-fixable owner/account argument on the
+// owner-scoped destructive paths (OffboardOwner, RevokeAllActiveForOwner): an
+// empty, whitespace-only, or unpadded-vs-stored owner is a malformed request —
+// typically a broken SCIM event — not a transient fault. Handlers map it to
+// 400 so a retry-driven worker surfaces the event as a data bug instead of
+// retrying a "500" forever.
+var ErrInvalidOwnerArgument = errors.New("invalid owner-scoped revocation argument")
+
 // IdentityDeactivatedConflictError is returned by RegisterIdentity when the
 // external_id collides with an existing identity that is DEACTIVATED (soft
 // deleted). Because deletes are soft, the deactivated row keeps the

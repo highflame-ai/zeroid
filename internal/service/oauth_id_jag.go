@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
@@ -38,6 +39,64 @@ func isIDJAGAssertion(assertion string) bool {
 		return false
 	}
 	return hdr.Typ == idJAGTyp
+}
+
+// buildIDJAGCustomClaims assembles the custom claim set for an ID-JAG-minted
+// access token. Extracted from idJAGBearer so the claim set — notably the
+// RFC 8707 resource binding, which is security-load-bearing — is unit-testable
+// without a full mint (the repo's other ID-JAG tests are all fail-closed and
+// never reach issuance).
+//
+// role and privilege_scope are reservedClaims (an untrusted caller can never
+// inject them via additional_claims), but here ZeroID itself sources them from
+// the IdP-verified ID-JAG, so they are set directly into CustomClaims — which
+// bypasses the additional_claims blocklist by design, the same pattern the
+// trusted broker path uses.
+func buildIDJAGCustomClaims(
+	rawClaims map[string]any,
+	cfg domain.ExternalIssuerConfig,
+	upstreamIss string,
+	resources []string,
+) map[string]any {
+	customClaims := map[string]any{
+		"token_exchange": "id_jag",
+		"user_id_iss":    upstreamIss,
+	}
+
+	// Map IdP group/role claims into Cedar principal attributes (D3). OPTIONAL —
+	// present only when the ID-JAG carries the claim AND ClaimMapping routes it.
+	if role, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["role"]); ok && role != "" {
+		customClaims["role"] = role
+	}
+
+	if ps, ok := extractMappedClaimStrings(rawClaims, cfg.ClaimMapping["privilege_scope"]); ok && len(ps) > 0 {
+		customClaims["privilege_scope"] = ps
+	}
+
+	// Honest propagation of RFC 9068 authentication-context claims — only
+	// forward auth_time/acr/amr when the deployer asked for them AND the ID-JAG
+	// actually set them. Never default-fill.
+	for _, claim := range cfg.PropagateClaims {
+		if v, present := rawClaims[claim]; present {
+			customClaims[claim] = v
+		}
+	}
+
+	// RFC 8707 resource binding (D4), stamped as its own claim so downstream PEPs
+	// have an EXPLICIT signal that this token was resource-bound at the mint.
+	// `aud` carries the same value for RFC 8707 §2 conformance, but it cannot
+	// serve as the signal: ZeroID stamps `aud` on every token it issues,
+	// defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
+	// says nothing about whether a binding exists. Shield treating it as if it did
+	// denied every MCP-targeted request in prod (shield#366). Presence of THIS
+	// claim is the discriminator; its absence means "not resource-bound".
+	//
+	// Set LAST, after the PropagateClaims loop, so a deployer who lists "resource"
+	// in propagate_claims cannot clobber the value validated by the caller. Also
+	// in reservedClaims, so additional_claims cannot inject or widen it.
+	customClaims["resource"] = resources
+
+	return customClaims
 }
 
 // idJAGBearer mints an audience-restricted ZeroID access token from an MCP
@@ -188,30 +247,13 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// itself sources them from the IdP-verified ID-JAG, so we set them directly
 	// into CustomClaims (which bypasses the additional_claims blocklist by
 	// design — same pattern the trusted broker path uses for role/privilege_scope).
-	customClaims := map[string]any{
-		"token_exchange": "id_jag",
-		"user_id_iss":    upstreamIss,
-	}
-	if role, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["role"]); ok && role != "" {
-		customClaims["role"] = role
-	}
-	if ps, ok := extractMappedClaimStrings(rawClaims, cfg.ClaimMapping["privilege_scope"]); ok && len(ps) > 0 {
-		customClaims["privilege_scope"] = ps
-	}
+	customClaims := buildIDJAGCustomClaims(rawClaims, cfg, upstreamIss, resources)
+
 	// trust_level, when the IdP supplies it via ClaimMapping, overrides the
 	// synthetic identity's default so the minted trust_level claim reflects the
 	// IdP's assessment (e.g. an Okta group → verified_third_party).
 	if tl, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["trust_level"]); ok && tl != "" {
 		identity.TrustLevel = domain.TrustLevel(tl)
-	}
-
-	// Honest propagation of RFC 9068 authentication-context claims — only
-	// forward auth_time/acr/amr when the deployer asked for them AND the ID-JAG
-	// actually set them. Never default-fill.
-	for _, claim := range cfg.PropagateClaims {
-		if v, present := rawClaims[claim]; present {
-			customClaims[claim] = v
-		}
 	}
 
 	// Resolve the identity's credential policy when we have a real identity row
@@ -299,6 +341,19 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	accessToken.ProjectID = req.ProjectID
 	accessToken.UserID = userID
 
+	// Record the MCP servers this exchange authorized (zeroid#259). We just
+	// audience-restricted a token to them, which makes this the authoritative
+	// answer to "which MCP servers do our agents actually reach" — the one
+	// inventory that sees an enterprise's PRIVATE servers, which no public
+	// registry knows and no reachability probe can necessarily resolve.
+	//
+	// Deliberately AFTER issuance. Placement is the security control: reaching
+	// here means every gate above passed, so a rejected exchange can never plant
+	// an entry in a tenant's inventory.
+	if s.observedIDJAGResources != nil {
+		s.recordObservedResources(ctx, req.AccountID, req.ProjectID, upstreamIss, resources)
+	}
+
 	log.Info().
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).
@@ -308,4 +363,43 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		Msg("ID-JAG jwt-bearer exchange succeeded")
 
 	return accessToken, nil
+}
+
+// observedResourceRecordTimeout bounds the inventory write. It is generous
+// relative to a healthy upsert and tight relative to anything a client would
+// notice: the token is already minted, so this is the maximum extra latency a
+// degraded database can add to a request that has already succeeded.
+const observedResourceRecordTimeout = 2 * time.Second
+
+// recordObservedResources writes the observed-MCP-server inventory for a
+// successful exchange (zeroid#259), off the critical path.
+//
+// Three properties, each load-bearing:
+//
+//   - context.WithoutCancel. The caller's context is cancelled the moment the
+//     HTTP response is written. Inheriting it would race the response and drop
+//     observations non-deterministically — and on a fast client, drop most of
+//     them, which looks like an inventory that mysteriously under-reports.
+//   - A bounded timeout. Every exchange for a given MCP server UPDATEs the same
+//     row by design (one row per resource), so concurrent redemptions for a
+//     popular server serialize on that row lock. Without a deadline, lock waits
+//     or pool exhaustion would add unbounded latency to a token that is already
+//     issued — exactly the availability risk this is supposed to avoid.
+//   - Errors are logged, never returned. The token exists; withholding it over a
+//     bookkeeping row would turn an inventory feature into an auth-path outage.
+func (s *OAuthService) recordObservedResources(
+	ctx context.Context,
+	accountID, projectID, upstreamIss string,
+	resources []string,
+) {
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), observedResourceRecordTimeout)
+	defer cancel()
+
+	if err := s.observedIDJAGResources.Record(recordCtx, accountID, projectID, upstreamIss, resources); err != nil {
+		log.Warn().Err(err).
+			Str("account_id", accountID).
+			Str("project_id", projectID).
+			Strs("resources", resources).
+			Msg("failed to record observed ID-JAG resources (token was still issued)")
+	}
 }
