@@ -20,9 +20,9 @@ type CreateAPIKeyInput struct {
 	Body struct {
 		Name               string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
 		Description        string          `json:"description,omitempty" doc:"Key description"`
-		IdentityID         string          `json:"identity_id,omitempty" doc:"Optional identity link"`
+		IdentityID         string          `json:"identity_id,omitempty" doc:"Identity to link this key to. Required unless product is supplied"`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: tenant default policy)"`
-		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping"`
+		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping. Required unless identity_id is supplied — a service identity is provisioned for the product"`
 		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
 		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
 		ExpiresInDays      *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
@@ -133,6 +133,12 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Metadata:           input.Body.Metadata,
 	})
 	if err != nil {
+		// Neither identity_id nor product supplied — the key has no identity to
+		// link. A caller-side omission, so return 400 naming both fields
+		// instead of a 500 from the failed UUID cast at insert time.
+		if errors.Is(err, service.ErrIdentityLinkRequired) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		// Caller-supplied credential_policy_id that doesn't exist in this tenant
 		// is a client error, not a server error — return 400 so the caller can
 		// correct the request.
