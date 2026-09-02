@@ -651,6 +651,51 @@ func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID
 	return n, nil
 }
 
+// PurgeDiscoveredSource removes every still-`discovered` identity found by one
+// discovery source. Returns the number removed.
+//
+// Called when a connector is DELETED: the agents it found are inventory
+// belonging to that connection, so removing the connection removes them
+// (highflame-discovery#65) — no stale agents left visible, and nothing left for
+// a user to act on.
+//
+// Only `discovered` rows. Anything a human has acted on — `pending` (an owner
+// was assigned), `active`, `suspended` — has graduated past inventory and is
+// deliberately left alone: retiring a real identity is an identity-lifecycle
+// decision, not a side effect of removing a connector.
+//
+// A delete rather than a deactivation, because `deactivated` is terminal
+// (CanTransitionTo permits only →active) and reconcile never touches lifecycle.
+// Deactivating would make the agents invisible forever, including after the
+// same connector is re-added — the rediscovery would reconcile onto the dead
+// row and leave it dead. Deleting lets a re-added connector rebuild the
+// inventory. The audit trigger records the deletion, so the history survives
+// the row.
+//
+// Scoped like prune and release: origin and sourceID are both required, so a
+// purge can never sweep a whole tenant's inventory.
+func (s *IdentityService) PurgeDiscoveredSource(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: purge requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	if !domain.ValidOrigin(string(origin)) {
+		return 0, fmt.Errorf("%w: invalid origin %q: must be a lowercase ecosystem identifier (e.g. okta, entra)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: purge requires a source_id (a purge is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_purge_source")
+	n, err := s.repo.PurgeDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery purge: removed discovered identities of a deleted source")
+	}
+	return n, nil
+}
+
 // GetIdentity retrieves an identity by ID.
 func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByID(ctx, id, accountID, projectID)

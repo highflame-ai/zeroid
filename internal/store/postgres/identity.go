@@ -610,6 +610,67 @@ func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accoun
 	return int(n), nil
 }
 
+// PurgeDiscoveredSource hard-deletes every still-`discovered` identity belonging
+// to (origin, source_id), returning the number of rows removed.
+//
+// Called when a discovery connector is deleted: the agents it found are
+// inventory belonging to that connection, so removing the connection removes
+// them (highflame-discovery#65). A `discovered` row carries no owner and no
+// credentials — nothing cascades — so this is a plain delete rather than the
+// deactivation cascade a real identity would need.
+//
+// DELETE rather than a status flip on purpose. `deactivated` is terminal
+// (CanTransitionTo allows only →active) and reconcile never touches lifecycle,
+// so a deactivated row would be resurrected by nothing: re-adding the same
+// connector would rediscover the agent, reconcile onto the dead row, and leave
+// it invisible forever. Deleting lets a re-added connector recreate it cleanly.
+//
+// Only `discovered` rows are removed. Anything a human has acted on — `pending`
+// (owner assigned), `active`, `suspended` — has graduated past inventory and is
+// left alone; retiring those is a deliberate identity-lifecycle decision, not a
+// side effect of removing a connector.
+//
+// modified_by is stamped immediately before the delete because the audit trigger
+// reads OLD.modified_by on DELETE (see 012_identity_audit_trigger). Without it
+// the audit row attributes the removal to whoever last touched the identity
+// rather than to the purge. The audit log therefore survives the row.
+func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
+	db := dbOrTx(ctx, r.db)
+
+	scope := func(q *bun.UpdateQuery) *bun.UpdateQuery {
+		return q.Where("account_id = ?", accountID).
+			Where("project_id = ?", projectID).
+			Where("origin = ?", origin).
+			Where("source_id = ?", sourceID).
+			Where("status = ?", string(domain.IdentityStatusDiscovered))
+	}
+
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		if _, err := scope(db.NewUpdate().
+			TableExpr("identities").
+			Set("modified_by = ?", callerID)).Exec(ctx); err != nil {
+			return 0, fmt.Errorf("stamp modified_by before purge: %w", err)
+		}
+	}
+
+	res, err := db.NewDelete().
+		TableExpr("identities").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source rows: %w", err)
+	}
+	return int(n), nil
+}
+
 // ListExpiredActive returns identities whose expires_at has passed while
 // their status is still 'active'. Used by the cleanup worker's identity
 // sweep. The partial index on (expires_at) WHERE status='active' makes
