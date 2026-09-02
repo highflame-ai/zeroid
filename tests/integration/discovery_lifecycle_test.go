@@ -860,3 +860,161 @@ func TestDiscovered_ReleaseSourceValidation(t *testing.T) {
 		})
 	}
 }
+
+// ── Source purge on connector delete (highflame-discovery#65) ───────────────
+
+// purgeDiscoveredSource POSTs /identities/discovered/purge-source and returns
+// the decoded body ({removed}).
+func purgeDiscoveredSource(t *testing.T, origin, sourceID string) map[string]any {
+	t.Helper()
+	resp := post(t, adminPath("/identities/discovered/purge-source"), map[string]any{
+		"origin": origin, "source_id": sourceID,
+	}, adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode, "purge source: expected 200")
+	return decode(t, resp)
+}
+
+// TestDiscovered_PurgeSourceRemovesTheConnectorsAgents is the acceptance
+// criterion: removing a connection removes the agents it found, and nothing
+// stale stays visible.
+func TestDiscovered_PurgeSourceRemovesTheConnectorsAgents(t *testing.T) {
+	var (
+		ext  = uid("okta-purge")
+		conn = uid("connector-purged")
+	)
+
+	created := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": conn,
+	})
+	id := created["identity"].(map[string]any)["id"].(string)
+
+	out := purgeDiscoveredSource(t, "okta", conn)
+	assert.Equal(t, float64(1), out["removed"], "the connector's discovered agent must be removed")
+
+	// Gone, not merely hidden — a user cannot act on what does not exist.
+	resp := get(t, adminPath("/identities/"+id), adminHeaders())
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"a purged agent must no longer be retrievable")
+	_ = resp.Body.Close()
+}
+
+// TestDiscovered_PurgeSourceThenReAddRediscovers is why this is a DELETE and
+// not a deactivation.
+//
+// `deactivated` is terminal — CanTransitionTo permits only →active — and
+// reconcile never touches lifecycle. Had purge flipped status instead, re-adding
+// the same connector would rediscover the agent, reconcile onto the dead row,
+// and leave it invisible forever. Deleting lets the re-added connector rebuild
+// its inventory.
+func TestDiscovered_PurgeSourceThenReAddRediscovers(t *testing.T) {
+	var (
+		ext     = uid("okta-readd")
+		oldConn = uid("connector-before")
+		newConn = uid("connector-after")
+	)
+
+	first := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": oldConn,
+	})
+	firstID := first["identity"].(map[string]any)["id"].(string)
+
+	purgeDiscoveredSource(t, "okta", oldConn)
+
+	// Re-add the connection: the agent must come back, as a live discovered row
+	// owned by the NEW connector (so its prune scope works too).
+	readded := ingestDiscovered(t, map[string]any{
+		"external_id": ext, "origin": "okta", "name": "agent", "source_id": newConn,
+	})
+	assert.Equal(t, true, readded["created"],
+		"after a purge the agent must be rediscovered as a new row, not resurrected")
+	identity := readded["identity"].(map[string]any)
+	assert.NotEqual(t, firstID, identity["id"], "the purged row is gone; this is a fresh one")
+	assert.Equal(t, "discovered", identity["status"],
+		"a re-added connector's agents must be visible again — the failure mode a status flip would cause")
+	assert.Equal(t, newConn, identity["source_id"],
+		"the new connector owns the rediscovered row, so its prune is scoped correctly")
+}
+
+// TestDiscovered_PurgeSourceSpares_HumanActedRows: removing a connection must
+// not delete identities somebody has taken accountability for. Those graduated
+// past inventory; retiring them is a deliberate identity decision.
+func TestDiscovered_PurgeSourceSpares_HumanActedRows(t *testing.T) {
+	var (
+		conn        = uid("connector-mixed")
+		extPending  = uid("okta-adopted")
+		extUntouche = uid("okta-untouched")
+	)
+
+	adopted := ingestDiscovered(t, map[string]any{
+		"external_id": extPending, "origin": "okta", "name": "adopted", "source_id": conn,
+	})
+	adoptedID := adopted["identity"].(map[string]any)["id"].(string)
+
+	ingestDiscovered(t, map[string]any{
+		"external_id": extUntouche, "origin": "okta", "name": "untouched", "source_id": conn,
+	})
+
+	// A human adopts one of them (discovered → pending).
+	adoptResp, err := doRaw(t, http.MethodPost, adminPath("/identities/"+adoptedID+"/adopt"), map[string]any{
+		"owner_user_id": "user-adopter",
+	}, adminHeaders())
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, adoptResp.StatusCode)
+
+	out := purgeDiscoveredSource(t, "okta", conn)
+	assert.Equal(t, float64(1), out["removed"],
+		"only the still-discovered row may be removed")
+
+	// The adopted identity survives, with its provenance intact.
+	resp := get(t, adminPath("/identities/"+adoptedID), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"an adopted identity must survive its connector being removed")
+	got := decode(t, resp)
+	assert.Equal(t, "pending", got["status"], "its lifecycle state is untouched")
+	assert.Equal(t, conn, got["source_id"], "and it keeps source_id as provenance")
+}
+
+// TestDiscovered_PurgeSourceIsScopedToItsSource: a purge must never reach
+// another connector's agents, or a whole tenant's.
+func TestDiscovered_PurgeSourceIsScopedToItsSource(t *testing.T) {
+	var (
+		mine     = uid("connector-doomed")
+		theirs   = uid("connector-spared")
+		extMine  = uid("okta-doomed")
+		extOther = uid("okta-spared")
+	)
+
+	ingestDiscovered(t, map[string]any{
+		"external_id": extMine, "origin": "okta", "name": "doomed", "source_id": mine,
+	})
+	other := ingestDiscovered(t, map[string]any{
+		"external_id": extOther, "origin": "okta", "name": "spared", "source_id": theirs,
+	})
+	otherID := other["identity"].(map[string]any)["id"].(string)
+
+	out := purgeDiscoveredSource(t, "okta", mine)
+	assert.Equal(t, float64(1), out["removed"], "only this source's rows may be removed")
+
+	resp := get(t, adminPath("/identities/"+otherID), adminHeaders())
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"another connector's agents must survive")
+	_ = resp.Body.Close()
+}
+
+// TestDiscovered_PurgeSourceValidation: scoping is mandatory, so a purge can
+// never sweep a tenant, and a typo'd origin must not read as "nothing to remove".
+func TestDiscovered_PurgeSourceValidation(t *testing.T) {
+	cases := map[string]map[string]any{
+		"native origin":     {"origin": "native", "source_id": uid("c")},
+		"missing source_id": {"origin": "okta"},
+		"malformed origin":  {"origin": "Okta", "source_id": uid("c")},
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp := post(t, adminPath("/identities/discovered/purge-source"), body, adminHeaders())
+			assert.GreaterOrEqual(t, resp.StatusCode, http.StatusBadRequest,
+				"an unscoped or malformed purge must be rejected, never silently applied")
+			_ = resp.Body.Close()
+		})
+	}
+}

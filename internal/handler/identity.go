@@ -292,6 +292,15 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		Description: "Scoped to one (origin, source_id): clears source_id on still-`discovered` rows so a future connector's reconcile can claim them. Called when a connector is DELETED — otherwise its rows stay bound to a source that never syncs again, and prune (which is source-scoped) can never reach them. Does NOT deactivate: adopt/dismiss remains a human decision. Adopted and dismissed rows keep their source_id as provenance.",
 		Tags:        []string{"Identities"},
 	}, a.releaseDiscoveredSourceOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "purge-discovered-source",
+		Method:      http.MethodPost,
+		Path:        "/identities/discovered/purge-source",
+		Summary:     "Remove a deleted connector's discovered identities",
+		Description: "Scoped to one (origin, source_id): hard-deletes still-`discovered` rows so no stale agents remain visible after a connector is removed. Identities a human has acted on — pending/active/suspended — are left alone; retiring those is a deliberate identity decision. A delete rather than a deactivation because `deactivated` is terminal, so a deactivated row could never be rediscovered if the connector were re-added. The audit trigger records the removal.",
+		Tags:        []string{"Identities"},
+	}, a.purgeDiscoveredSourceOp)
 }
 
 type IdentitySchemaOutput struct {
@@ -924,5 +933,38 @@ func (a *API) releaseDiscoveredSourceOp(ctx context.Context, input *ReleaseDisco
 
 	out := &ReleaseDiscoveredSourceOutput{}
 	out.Body.Released = n
+	return out, nil
+}
+
+type PurgeDiscoveredSourceInput struct {
+	Body struct {
+		Origin   string `json:"origin" required:"true" minLength:"1" doc:"External ecosystem the deleted connector enumerated (e.g. okta)"`
+		SourceID string `json:"source_id" required:"true" minLength:"1" doc:"The deleted connector's id — scopes the purge to one source"`
+	}
+}
+
+type PurgeDiscoveredSourceOutput struct {
+	Body struct {
+		Removed int `json:"removed"`
+	}
+}
+
+func (a *API) purgeDiscoveredSourceOp(ctx context.Context, input *PurgeDiscoveredSourceInput) (*PurgeDiscoveredSourceOutput, error) {
+	tenant, err := internalMiddleware.GetTenant(ctx)
+	if err != nil {
+		return nil, huma.Error401Unauthorized("missing tenant context")
+	}
+
+	n, err := a.identitySvc.PurgeDiscoveredSource(ctx, tenant.AccountID, tenant.ProjectID, domain.Origin(input.Body.Origin), input.Body.SourceID)
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidIdentityField) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
+		log.Error().Err(err).Msg("failed to purge discovered source")
+		return nil, huma.Error500InternalServerError("failed to purge discovered source")
+	}
+
+	out := &PurgeDiscoveredSourceOutput{}
+	out.Body.Removed = n
 	return out, nil
 }
