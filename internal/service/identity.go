@@ -684,6 +684,10 @@ func (s *IdentityService) PurgeDiscoveredSource(ctx context.Context, accountID, 
 	if sourceID == "" {
 		return 0, fmt.Errorf("%w: purge requires a source_id (a purge is always scoped to one discovery source)", ErrInvalidIdentityField)
 	}
+	// This caller name is what attributes the removal in the audit log. The audit
+	// trigger reads OLD.modified_by on DELETE, so the store stamps it onto the
+	// matched rows immediately before deleting them; without it the audit entry
+	// would credit whoever last touched each identity rather than the purge.
 	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_purge_source")
 	n, err := s.repo.PurgeDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
 	if err != nil {

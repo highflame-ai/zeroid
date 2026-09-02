@@ -637,8 +637,13 @@ func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accoun
 func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
 	db := dbOrTx(ctx, r.db)
 
-	scope := func(q *bun.UpdateQuery) *bun.UpdateQuery {
-		return q.Where("account_id = ?", accountID).
+	// The stamp and the delete MUST match on exactly the same rows: a wider
+	// delete would remove identities the stamp never attributed, and a narrower
+	// one would leave rows stamped-but-present. bun.QueryBuilder is the shared
+	// interface over UpdateQuery and DeleteQuery, so both take their predicate
+	// from this one definition rather than from two lists kept in step by hand.
+	scope := func(qb bun.QueryBuilder) bun.QueryBuilder {
+		return qb.Where("account_id = ?", accountID).
 			Where("project_id = ?", projectID).
 			Where("origin = ?", origin).
 			Where("source_id = ?", sourceID).
@@ -646,21 +651,16 @@ func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountI
 	}
 
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
-		if _, err := scope(db.NewUpdate().
-			TableExpr("identities").
-			Set("modified_by = ?", callerID)).Exec(ctx); err != nil {
+		stamp := db.NewUpdate().TableExpr("identities").Set("modified_by = ?", callerID)
+		scope(stamp.QueryBuilder())
+		if _, err := stamp.Exec(ctx); err != nil {
 			return 0, fmt.Errorf("stamp modified_by before purge: %w", err)
 		}
 	}
 
-	res, err := db.NewDelete().
-		TableExpr("identities").
-		Where("account_id = ?", accountID).
-		Where("project_id = ?", projectID).
-		Where("origin = ?", origin).
-		Where("source_id = ?", sourceID).
-		Where("status = ?", string(domain.IdentityStatusDiscovered)).
-		Exec(ctx)
+	del := db.NewDelete().TableExpr("identities")
+	scope(del.QueryBuilder())
+	res, err := del.Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("purge discovered source: %w", err)
 	}
