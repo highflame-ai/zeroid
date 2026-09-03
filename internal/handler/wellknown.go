@@ -34,6 +34,13 @@ type OAuthMetadataOutput struct {
 	Body map[string]any
 }
 
+// OpenIDConfigurationOutput is the OpenID Connect Discovery 1.0 document
+// published at /.well-known/openid-configuration. See openidConfigurationOp for
+// why ZeroID serves this path despite not being an OpenID Provider.
+type OpenIDConfigurationOutput struct {
+	Body map[string]any
+}
+
 // ProtectedResourceMetadataOutput is the RFC 9728 OAuth 2.0 Protected Resource
 // Metadata document published at /.well-known/oauth-protected-resource. Agents
 // that hit a 401 with a WWW-Authenticate: Bearer resource_metadata="…" header
@@ -69,6 +76,14 @@ func (a *API) registerWellKnownRoutes(api huma.API) {
 		Summary:     "OAuth 2.0 Authorization Server Metadata",
 		Tags:        []string{"Discovery"},
 	}, a.oauthMetadataOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "openid-configuration",
+		Method:      http.MethodGet,
+		Path:        "/.well-known/openid-configuration",
+		Summary:     "OpenID Connect Discovery 1.0 metadata",
+		Tags:        []string{"Discovery"},
+	}, a.openidConfigurationOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "oauth-protected-resource",
@@ -114,6 +129,15 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 }
 
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
+	return &OAuthMetadataOutput{Body: a.buildASMetadata()}, nil
+}
+
+// buildASMetadata constructs the RFC 8414 Authorization Server Metadata
+// document. Returns a FRESH map on every call — both /.well-known/
+// oauth-authorization-server and /.well-known/openid-configuration serve it,
+// and the OIDC document adds members to what it gets back. A shared or cached
+// map would let the OIDC-only members leak into the RFC 8414 document.
+func (a *API) buildASMetadata() map[string]any {
 	// Evaluate the gate ONCE per request. The predicate is deliberately
 	// dynamic — a deployer may register resolvers after NewServer — so calling
 	// it twice could emit a document advertising CIMD without the
@@ -229,7 +253,100 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		body["client_id_metadata_document_supported"] = true
 	}
 
-	return &OAuthMetadataOutput{Body: body}, nil
+	return body
+}
+
+// openidConfigurationOp serves OpenID Connect Discovery 1.0 metadata at
+// /.well-known/openid-configuration.
+//
+// # Why an AS that issues no id_token serves an OIDC discovery document
+//
+// This document is here for FEDERATION TRUST ESTABLISHMENT, not for OIDC login.
+// Every cloud that can be taught to trust an external issuer — AWS IAM OIDC
+// identity providers, Azure federated identity credentials, GCP workload
+// identity pools — discovers that issuer by fetching this exact path to find
+// its `jwks_uri`. All three were written against OpenID Connect Discovery, not
+// against RFC 8414, so publishing only /.well-known/oauth-authorization-server
+// leaves ZeroID undiscoverable to all of them even though the keyset it would
+// verify against is already public at /.well-known/jwks.json. Serving this
+// document is what makes "configure your cloud to trust identities ZeroID
+// issued" a one-time setup rather than an impossibility (ADR 0028 D8).
+//
+// # ZeroID is NOT an OpenID Provider
+//
+// It issues no id_token. Do not read this document as evidence otherwise, and
+// do not add members here that imply an OIDC authentication flow. The structural
+// guard is `response_types_supported`, inherited from the RFC 8414 document: it
+// carries at most "code" and never "id_token"/"id_token token", so no relying
+// party can request an id_token from this AS no matter what it discovers here.
+// When id_token issuance lands, that is the member that changes — along with
+// adding "openid" to a scopes_supported list — and it should change in the same
+// PR that makes the claim true.
+//
+// Body is the RFC 8414 document plus the two members OIDC Discovery §3 makes
+// REQUIRED that RFC 8414 §2 does not define. The remaining OIDC-required
+// members (issuer, authorization_endpoint, token_endpoint, jwks_uri,
+// response_types_supported) are already in the base document, which is why this
+// is a superset rather than a separate document — two hand-maintained documents
+// describing one AS is how they drift.
+func (a *API) openidConfigurationOp(_ context.Context, _ *struct{}) (*OpenIDConfigurationOutput, error) {
+	body := a.buildASMetadata()
+
+	// OIDC Discovery §3 REQUIRED. "public" means every relying party sees the
+	// same `sub` for the same principal — which is what ZeroID does: `sub` is
+	// the stable identity ID. The alternative, "pairwise", would mean minting a
+	// per-RP pseudonymous subject, and a per-RP `sub` would break the federation
+	// use case this document exists for: a cloud role trust policy pins a
+	// literal `sub` value, so that value has to be stable across verifiers.
+	body["subject_types_supported"] = []string{"public"}
+
+	// OIDC Discovery §3 REQUIRED. Derived from the live keyset rather than
+	// hardcoded, so it cannot drift from what /.well-known/jwks.json actually
+	// publishes — a federation verifier that trusts an alg we no longer sign
+	// with (or refuses one we do) fails at token-verification time, far from
+	// this file.
+	//
+	// Read this as a statement about the algorithms this ISSUER SIGNS WITH,
+	// which is what a federation verifier consumes it as. It is not a promise
+	// that id_tokens are available — see the note above on response_types_supported.
+	body["id_token_signing_alg_values_supported"] = a.signingAlgValues()
+
+	return &OpenIDConfigurationOutput{Body: body}, nil
+}
+
+// signingAlgValues returns the distinct `alg` values of the published signing
+// keys, in keyset order (ES256 first — it is always loaded; RS256 only when the
+// deployer configured an RSA key). Keys with no `alg` are skipped rather than
+// emitted as "": an empty string is not a JWA algorithm name and would make the
+// discovery document invalid for every consumer, not just the one key.
+func (a *API) signingAlgValues() []string {
+	set := a.jwksSvc.KeySet()
+
+	// Non-nil zero-length start: this member is REQUIRED, and a nil slice
+	// marshals to `null`, which is not the "no algorithms" the empty array is.
+	algs := []string{}
+	seen := map[string]struct{}{}
+
+	for i := range set.Len() {
+		key, ok := set.Key(i)
+		if !ok {
+			continue
+		}
+
+		alg, ok := key.Algorithm()
+		if !ok || alg.String() == "" {
+			continue
+		}
+
+		if _, dup := seen[alg.String()]; dup {
+			continue
+		}
+
+		seen[alg.String()] = struct{}{}
+		algs = append(algs, alg.String())
+	}
+
+	return algs
 }
 
 // protectedResourceMetadataOp serves RFC 9728 OAuth 2.0 Protected Resource
