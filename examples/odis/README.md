@@ -36,6 +36,27 @@ pip install requests pyjwt cryptography jupyter
 jupyter notebook examples/odis/odis-walkthrough.ipynb
 ```
 
+The SDK notebook additionally needs `pip install "highflame==0.3.17"` — the
+version its committed outputs were generated against.
+
+## Which configuration each notebook runs under
+
+Both notebooks execute against the stock compose deployment — in particular
+`token.require_dpop: false`, the default:
+
+- The raw-HTTP walkthrough **chooses** the default so §5 can show the Bearer
+  fallback and the configuration switch that closes it; every DPoP behavior
+  (holder binding, replay rejection) is still demonstrated live.
+- The SDK walkthrough **requires** the default: the Python SDK (0.3.17) cannot
+  construct DPoP proofs yet (highflame-sdk#105), so under `require_dpop: true`
+  — the hardened posture the role-capability statement grades L1-09 against —
+  its issuance calls are refused with `invalid_dpop_proof`.
+
+The committed outputs contain no credential material: cells print decoded
+claims and selected fields, never raw tokens, API keys, or private keys. CI
+enforces this with a credential-material lint and re-executes both notebooks
+against a fresh server on every PR (`highflame-notebook-check`).
+
 Upgrading an existing checkout? Tenant default credential policies are
 created once and don't self-heal: a postgres volume from before the CIBA
 grant joined the defaults will refuse §7's bound-client redemption
