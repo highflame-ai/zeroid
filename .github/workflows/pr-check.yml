@@ -259,11 +259,22 @@ jobs:
 
       - name: Install notebook execution deps
         shell: bash
-        run: pip install --quiet --upgrade pytest nbmake ipykernel highflame cryptography "PyJWT>=2.8"
+        run: pip install --quiet --upgrade pytest nbmake ipykernel highflame cryptography "PyJWT>=2.8" requests
 
-      - name: Execute the quickstart notebook against the live server
+      # Committed outputs must never contain credential material: raw JWTs,
+      # zeroid API keys, or private keys. Guards the ODIS walkthroughs' policy
+      # of printing decoded claims / selected fields only.
+      - name: Lint committed notebook outputs for credential material
         shell: bash
-        run: pytest --nbmake --nbmake-timeout=300 examples/zeroid_quickstart.ipynb -v
+        run: |
+          if grep -RInE 'eyJ[A-Za-z0-9_-]{20,}|zid_sk_[A-Za-z0-9]|BEGIN[A-Z ]*PRIVATE KEY' \
+              examples/*.ipynb examples/odis/*.ipynb; then
+            echo "::error::credential-looking material found in committed notebook(s)"; exit 1
+          fi
+
+      - name: Execute the quickstart + ODIS notebooks against the live server
+        shell: bash
+        run: pytest --nbmake --nbmake-timeout=300 examples/zeroid_quickstart.ipynb examples/odis/odis-walkthrough.ipynb examples/odis/odis-walkthrough-sdk.ipynb -v
 
       - name: Dump zeroid logs on failure
         if: failure()
