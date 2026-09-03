@@ -873,6 +873,7 @@ graph TD
 | GET | `/.well-known/jwks.json` | JWKS public keys |
 | GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata (RFC 8414) |
 | GET | `/.well-known/oauth-protected-resource` | Protected Resource Metadata (RFC 9728) — discovery entry point clients hit before AS metadata |
+| GET | `/.well-known/openid-configuration` | OIDC Discovery 1.0 metadata — the path AWS / Azure / GCP fetch to federate to ZeroID as an external issuer. AS metadata plus `subject_types_supported` and `id_token_signing_alg_values_supported`. ZeroID issues no `id_token`; this document exists for trust establishment, not OIDC login |
 | GET | `/.well-known/spiffe-trust-bundle.json` | SPIFFE JWT-SVID trust bundle |
 | POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
@@ -943,6 +944,7 @@ The extensions ZeroID layers on these baseline specs — the additional JWT clai
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
 | OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
 | OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
+| OpenID Connect Discovery 1.0 | OpenID | `/.well-known/openid-configuration` — the discovery path cloud workload-identity federation (AWS IAM OIDC providers, Azure federated identity credentials, GCP workload identity pools) requires to trust ZeroID as an external issuer. Metadata only: ZeroID is not an OpenID Provider and issues no `id_token` |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
 | Shared Signals Framework (SSF) | OpenID SSF | Real-time revocation event propagation |
 | CAEP | OpenID CAEP | Continuous access evaluation signals |
