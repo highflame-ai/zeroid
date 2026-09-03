@@ -269,6 +269,56 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 
 ---
 
+## Specification revision and deviations
+
+**Implemented against:** [`draft-ietf-oauth-client-id-metadata-document-02`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), adopted by the OAuth WG in October 2025.
+
+This is a **draft at revision 02 and it will change.** The section exists so that when it does, the next reader can tell which behaviours were the spec, which were our choices, and which were deliberately left unbuilt — rather than reverse-engineering that from the validator.
+
+### Where ZeroID is deliberately STRICTER than the draft
+
+Both of these will reject a document some other implementation accepts. That is intended, but it is also the part most likely to age badly: a later revision can bless what we refuse, and then we are rejecting valid clients for a reason nobody remembers choosing. Revisit both on each draft bump.
+
+| Rule | Draft says | ZeroID does | Why |
+|---|---|---|---|
+| Query string in `client_id` | SHOULD NOT | **Rejects** | The `client_id` a client presents must stay byte-identical to the URL the document was fetched from — that is exactly what the §4 self-reference check compares. Stripping or tolerating a query gives one document two spellings. |
+| `client_name` | RECOMMENDED | **Required, non-empty** | It is the string a human is asked to trust on a consent screen. Absent, the prompt degrades to a raw URL — and for a URL an attacker chose, that is actively misleading. The publisher is anonymous by construction (no registration, no secret), so this label is most of what consent has to work with. |
+
+### Deliberately not implemented
+
+- **Confidential CIMD clients** — `token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`. ZeroID accepts no `private_key_jwt` token-endpoint auth for any client; CIMD is public-PKCE-only.
+- **`software_statement`** — signed metadata is not consumed. CIMD trust here is domain-ownership based.
+
+Both are areas the draft is more likely to move in than the core resolution rules, which is part of why they are not built on.
+
+### The change most likely to break silently
+
+A rename of the discovery field **`client_id_metadata_document_supported`**.
+
+If a later draft renames it, nothing errors. The authorization server keeps advertising a key clients no longer look for, every client falls back to `registration_endpoint` and DCR, and the whole flow keeps working — via exactly the row-per-client path CIMD exists to remove.
+
+Tests do not help here. They assert the server *emits* that field, so they stay green while no client can see it. The only guard is tracking the draft.
+
+### What makes drift survivable
+
+Two properties worth knowing about before a spec change forces a decision:
+
+- **DCR is retained as a fallback.** `registration_endpoint` stays advertised alongside CIMD deliberately, so a client that cannot complete CIMD still has a path.
+- **Registry-first resolution is a pinning mechanism.** A client registered under its CIMD URL overrides the document (see step 1 of resolution). So a specific client caught by a spec change can be pinned by registering it, without waiting on a ZeroID release.
+
+### Deployment note: the cache is per process
+
+`CIMDService` holds its resolution cache in memory, so a deployment running N replicas has N independent caches. Concurrent resolutions of the same `client_id` are coalesced **within** a process (singleflight), not across them.
+
+Two consequences worth planning around:
+
+- **Fan-out** is up to N fetches per document per TTL, and negative caching is likewise per replica — so replaying a dead URL costs N times as much. Bounded in practice by edge rate limiting, which is required for an open deployment anyway.
+- **Staleness is non-uniform.** Two replicas can serve different versions of one document for up to the TTL, so a client that removes a `redirect_uri` may find the change effective on some replicas and not others, with no way to tell which served it.
+
+A shared cache (Redis) would fix the fan-out and make replicas *consistently* stale — it would not make them *fresher*. Revocation latency is governed by the TTL and by the document's `Cache-Control` (ZeroID takes the shorter, floored at 60s), independent of where the cache lives. Note also that a shared cache holds `redirect_uris`, the primary anti-impersonation control, so write access to it becomes equivalent to choosing where authorization codes are delivered.
+
+---
+
 ## Security considerations
 
 - **Redirect-URI allow-list is the load-bearing control.** Copying a `client_id` is useless without control of a host in its `redirect_uris`. PKCE binds the code to the verifier on top of that.
@@ -276,14 +326,16 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 - **Localhost redirects.** Loopback `redirect_uris` are matched port-agnostically (RFC 8252) so native/CLI callbacks work, but any process on the user's machine can bind a loopback port. Treat localhost CIMD clients with the same caution as any native public client.
 - **DNS / TLS trust.** CIMD's integrity rests on the same DNS + TLS + certificate-transparency assumptions as any HTTPS-based trust model. **`allowed_domains` is the hard boundary** — see [Production hardening](#production-hardening--set-allowed_domains).
 - **No persistence, no secret.** CIMD clients are ephemeral and hold no symmetric secret at the broker — there is nothing to leak from ZeroID's side.
-- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — bounded cache (1000 entries), negative caching of failures (10 s fetch / 60 s validation), 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist — but the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch. Deployers running fully open CIMD (empty allowlist) should additionally rate-limit `/oauth2/authorize` at the edge like any public endpoint.
+- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public, and client resolution runs *before* the principal chain), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — concurrent resolutions of the same `client_id` are **coalesced into one fetch** (singleflight), plus a bounded cache (1000 entries), negative caching of failures (10 s fetch / 60 s validation), 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist.
+
+  Be precise about what each control bounds. The caps bound the cost of *one* fetch. Coalescing bounds *duplicate concurrent* work for one `client_id`. Neither bounds a caller cycling **distinct** URLs: each unique path is a fresh flight, misses the cache, walks past negative caching, and churns cache eviction. So the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch — and a deployment running fully open (empty allowlist) **must** rate-limit `/oauth2/authorize` at the edge. That is the deployer's job; no in-process control substitutes for it.
 
 ---
 
 ## Limitations / future work
 
-- **Confidential CIMD clients** (`token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`) are not supported — ZeroID does not yet accept `private_key_jwt` token-endpoint auth for any client. v1 is public-PKCE-only.
-- **`software_statement`** (signed metadata) — not consumed; CIMD trust is domain-ownership based.
+- **Unimplemented draft features** — confidential CIMD clients (`private_key_jwt` + `jwks_uri`) and `software_statement`. Both are covered under [Specification revision and deviations](#deliberately-not-implemented), which is the single place that records what is and is not built against the draft; they are not repeated here so the two cannot drift apart.
+- **Cross-replica cache coherence** — the resolution cache is per process, so N replicas hold N caches. See [Deployment note: the cache is per process](#deployment-note-the-cache-is-per-process) for the fan-out and staleness consequences, and why a shared cache addresses the first but not the second.
 
 ---
 

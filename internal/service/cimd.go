@@ -49,6 +49,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -171,6 +173,23 @@ type CIMDService struct {
 
 	mu    sync.Mutex
 	cache map[string]cimdCacheEntry
+
+	// flights collapses concurrent resolutions of the SAME client_id into one
+	// outbound fetch. The cache only helps once a fetch has COMPLETED; until
+	// then every arriving request was a miss and started its own fetch, so N
+	// simultaneous first-time requests for one client_id meant N DNS
+	// resolutions, N TLS handshakes, and N × up-to-5s of request occupancy for
+	// a document that is identical every time.
+	//
+	// That is the amplification an unauthenticated endpoint should not offer:
+	// client resolution runs BEFORE the principal chain, so no credential is
+	// needed to trigger it, and concurrency was free to the caller.
+	//
+	// This bounds duplicate work per client_id. It does NOT bound distinct-URL
+	// abuse — a caller cycling unique paths gets a fresh flight each time, and
+	// walks past negative caching too. Only an edge rate limit closes that;
+	// see the "Fetch abuse" note in docs/cimd.md.
+	flights singleflight.Group
 	// maxCacheEntries is maxCIMDCacheEntries in production; overridable in
 	// tests to exercise eviction without inserting a thousand entries.
 	maxCacheEntries int
@@ -341,6 +360,49 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 		return client, cachedErr
 	}
 
+	// Cache miss. Collapse concurrent misses for this client_id into one
+	// fetch; every other caller waits on that result rather than issuing its
+	// own. See CIMDService.flights.
+	//
+	// The returned client is cloned PER CALLER below: singleflight hands the
+	// same value to every waiter, and callers get a mutable *domain.OAuthClient
+	// — the same reason cachedResult returns a copy. Sharing one instance
+	// across waiters would let any of them mutate what the others hold.
+	res, err, _ := s.flights.Do(clientID, func() (any, error) {
+		// Re-check under the flight. A fetch may have completed and populated
+		// the cache between the miss above and this call, in which case
+		// starting a fetch would be duplicate work the flight cannot see.
+		if client, cachedErr, hit := s.cachedResult(clientID); hit {
+			if cachedErr != nil {
+				return nil, cachedErr
+			}
+
+			return client, nil
+		}
+
+		return s.resolveUncached(ctx, clientID)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	client, ok := res.(*domain.OAuthClient)
+	if !ok || client == nil {
+		// Unreachable: every non-error path above returns a non-nil
+		// *domain.OAuthClient. Kept because singleflight erases the type, so a
+		// future edit that returns something else would otherwise surface as a
+		// nil-pointer panic inside the authorize handler rather than an error.
+		return nil, fmt.Errorf("%w: resolution returned no client", ErrCIMDInvalidDocument)
+	}
+
+	return cloneCIMDClient(client), nil
+}
+
+// resolveUncached performs the actual fetch, validation, synthesis and caching
+// for one client_id. Split out of ResolveClient so the singleflight callback
+// stays readable; it must only be called from inside a flight, because it
+// assumes the caller has established there is no usable cache entry.
+func (s *CIMDService) resolveUncached(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	doc, docTTL, err := s.fetch(ctx, clientID)
 	if err != nil {
 		// Negative-cache the failure so replaying a dead URL can't force a
