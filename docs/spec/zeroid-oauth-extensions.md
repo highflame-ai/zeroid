@@ -818,8 +818,11 @@ either side — only ZeroID's standard issuer surface:
   compatibility test.
 - **Issuer discovery.** `/.well-known/oauth-authorization-server` (Section 11.1)
   advertises `issuer` and `jwks_uri`; a relying party either points its JWKS
-  source at that discovery document or is given the JWKS URL explicitly. ZeroID
-  does not publish an `/.well-known/openid-configuration` document.
+  source at that discovery document or is given the JWKS URL explicitly.
+  Relying parties that discover an external issuer the OIDC way — AWS IAM OIDC
+  identity providers, Azure federated identity credentials and GCP workload
+  identity pools all fetch `/.well-known/openid-configuration` and do not read
+  RFC 8414's path — are served by the OIDC discovery document (Section 11.4).
 - **SPIFFE consumers.** `/.well-known/spiffe-trust-bundle.json` (Section 11.3)
   serves the same keys with `use="JWT-SVID"` for SPIFFE-strict validators.
 
@@ -875,6 +878,35 @@ baseline:
 JWT-SVID trust bundle: each key's `use` is `JWT-SVID`, and the document carries
 `spiffe_sequence` and `spiffe_refresh_hint` per the SPIFFE bundle format. This
 lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
+
+### 11.4 OpenID Connect Discovery metadata
+
+`GET /.well-known/openid-configuration` serves the Section 11.1 document plus
+the two members OpenID Connect Discovery 1.0 §3 makes REQUIRED that RFC 8414 §2
+does not define:
+
+| Field | Value | Source spec |
+|---|---|---|
+| `subject_types_supported` | `["public"]` | OIDC Discovery §3 |
+| `id_token_signing_alg_values_supported` | derived from the live keyset (`["ES256","RS256"]` in the reference deployment) | OIDC Discovery §3 |
+
+The document exists for **federation trust establishment**, not for OIDC login.
+It is the discovery path the cloud relying parties in Section 10 fetch to locate
+`jwks_uri`; publishing only RFC 8414's path leaves ZeroID undiscoverable to them
+even though the keyset is already public.
+
+`subject_types_supported` is `public` — not `pairwise` — because ZeroID's `sub`
+is the workload's WIMSE URI (Section 3.1) and is identical for every verifier. A
+per-relying-party pseudonymous subject would break the cloud role trust policies
+that pin a literal `sub` value.
+
+**ZeroID is not an OpenID Provider.** It issues no `id_token`, and this document
+**MUST NOT** be read as advertising one. `response_types_supported` is inherited
+from Section 11.1 and carries at most `"code"` — never `"id_token"` or
+`"id_token token"` — so no relying party can request an ID Token from this
+authorization server. `scopes_supported` is not advertised, so `openid` is not
+offered either. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
+discovery, and every ID Token clause are out of scope.
 
 ## 12. Client ID Metadata Documents (CIMD)
 
@@ -1175,8 +1207,8 @@ See §9.1 / §9.2.
 
 ### 14.5 Discovery fields
 
-See §11.1 / §11.2 / §11.3. `client_id_metadata_document_supported` is specified
-in §12.7.
+See §11.1 / §11.2 / §11.3 / §11.4. `client_id_metadata_document_supported` is
+specified in §12.7.
 
 ### 14.6 Workload Identity Federation
 
@@ -1184,8 +1216,8 @@ Inbound: proof types (`oidc_token`, `image_hash`, `tpm`) and the
 `OIDCPolicyConfig` / `OIDCIssuerConfig` policy fields (`issuers`, `url`,
 `audiences`, `required_claims`) — §10.1–10.3. Outbound: the
 ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
-`oauth-authorization-server` `issuer`/`jwks_uri`, and the SPIFFE trust bundle
-(§10.4).
+`oauth-authorization-server` and `openid-configuration` `issuer`/`jwks_uri`, and
+the SPIFFE trust bundle (§10.4, §11.4).
 
 ## 15. References
 

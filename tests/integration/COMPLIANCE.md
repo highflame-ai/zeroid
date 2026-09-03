@@ -43,8 +43,15 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 9396 (Rich Authorization Requests) | `rar_compliance_test.go` | Covered |
 | RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
 | OpenID CIBA Core 1.0 | `ciba_compliance_test.go` | Covered |
+| OpenID Connect Discovery 1.0 | `oidc_discovery_compliance_test.go` | Partial — metadata only, see note |
 | SPIFFE ID + JWT-SVID | `spiffe_compliance_test.go` | Covered |
 | OpenID SSF / CAEP | `cae_test.go` (behavioral) | Partial — see note |
+
+### OpenID Connect Discovery 1.0 scope note
+
+ZeroID serves `/.well-known/openid-configuration` for **federation trust establishment**, not for OIDC login: it is the path AWS IAM OIDC identity providers, Azure federated identity credentials and GCP workload identity pools all fetch to discover an external issuer's keyset, and none of them read RFC 8414's path. ZeroID is **not** an OpenID Provider — it issues no `id_token` — so only the §3 metadata clauses and the §4 retrieval clauses are in scope. The §5 UserInfo, §2 issuer-discovery-via-WebFinger, and every ID Token clause are deliberately out of scope and untested.
+
+The suite therefore carries an unusual test — `TestOIDCDiscovery_NeverAdvertisesIDToken` — asserting the *absence* of a capability. That is the guard keeping this document honest while ZeroID publishes OIDC metadata it cannot fully back. When `id_token` issuance lands, that test is the one that must be deleted, in the same PR that makes the claim true.
 
 ### OpenID SSF / CAEP scope note
 
