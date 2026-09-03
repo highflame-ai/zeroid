@@ -37,7 +37,12 @@ jupyter notebook examples/odis/odis-walkthrough.ipynb
 ```
 
 The SDK notebook additionally needs `pip install "highflame==0.3.17"` — the
-version its committed outputs were generated against.
+version its committed outputs were generated against. The pin is deliberate,
+not stale: from 0.3.23 the Python SDK targets the SaaS-shaped admin plane
+(admin routes at the server root, authenticated with an `nhi:manage` bearer),
+while stock open-source zeroid mounts the admin API under `/api/v1`
+(`server.admin_path_prefix`), so newer SDKs 404 on every admin call against
+this compose deployment.
 
 ## Which configuration each notebook runs under
 
