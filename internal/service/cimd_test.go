@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -554,5 +555,98 @@ func TestCIMDPositiveCacheTTL(t *testing.T) {
 		if got := s.positiveCacheTTL(tc.header); got != tc.want {
 			t.Errorf("positiveCacheTTL(%q) = %v, want %v", tc.header, got, tc.want)
 		}
+	}
+}
+
+// TestCIMDResolveClient_CoalescesConcurrentFetches pins that N simultaneous
+// first-time resolutions of one client_id perform ONE outbound fetch.
+//
+// The cache alone cannot provide this: it is only populated once a fetch has
+// completed, so before that every arriving request is a miss and starts its
+// own fetch. N concurrent requests for the same new client_id meant N DNS
+// resolutions, N TLS handshakes, and N × up-to-5s of request occupancy for a
+// document that is byte-identical every time — reachable without a credential,
+// since client resolution runs ahead of the principal chain.
+//
+// The handler blocks until every caller has arrived, so the test fails if the
+// implementation serialises rather than coalesces: without singleflight all
+// concurrent callers reach the handler and the barrier releases, and the fetch
+// count is N.
+func TestCIMDResolveClient_CoalescesConcurrentFetches(t *testing.T) {
+	const callers = 8
+
+	var docURL string
+
+	release := make(chan struct{})
+	arrived := make(chan struct{}, callers)
+
+	svc, base, hits := newCIMDTestServer(t, CIMDConfig{Enabled: true, CacheTTL: time.Hour},
+		func(w http.ResponseWriter, _ *http.Request) {
+			// Hold the first fetch open so the other callers are guaranteed to
+			// be inside ResolveClient while it is still in flight. Without
+			// this the first could complete and populate the cache before the
+			// others start, and the test would pass for the wrong reason.
+			arrived <- struct{}{}
+			<-release
+			fmt.Fprint(w, docJSON(docURL, ""))
+		})
+	docURL = base + "/client.json"
+
+	var wg sync.WaitGroup
+
+	results := make([]*domain.OAuthClient, callers)
+	errs := make([]error, callers)
+
+	for i := range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			results[i], errs[i] = svc.ResolveClient(context.Background(), docURL)
+		}()
+	}
+
+	// Exactly one caller should reach the handler; let it finish.
+	<-arrived
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(hits); got != 1 {
+		t.Errorf("concurrent resolutions performed %d fetches, want 1 — "+
+			"they are not being coalesced, so an unauthenticated caller can "+
+			"multiply outbound work by simply issuing requests in parallel", got)
+	}
+
+	for i := range callers {
+		if errs[i] != nil {
+			t.Fatalf("caller %d: %v", i, errs[i])
+		}
+
+		if results[i] == nil {
+			t.Fatalf("caller %d got a nil client", i)
+		}
+
+		if results[i].ClientID != docURL {
+			t.Errorf("caller %d: client_id = %q, want %q", i, results[i].ClientID, docURL)
+		}
+	}
+
+	// Every waiter must hold its OWN client. singleflight hands the same value
+	// to all of them, so without a per-caller clone one caller mutating its
+	// result would corrupt what the others are holding — the same reason
+	// cachedResult returns a copy.
+	for i := 1; i < callers; i++ {
+		if results[i] == results[0] {
+			t.Fatalf("caller %d shares a *domain.OAuthClient with caller 0; "+
+				"singleflight results must be cloned per caller", i)
+		}
+	}
+
+	results[0].RedirectURIs[0] = "https://mutated.example/cb"
+
+	if results[1].RedirectURIs[0] == "https://mutated.example/cb" {
+		t.Error("mutating one caller's RedirectURIs changed another's — the " +
+			"slice is shared, so the clone is shallow where it must be deep")
 	}
 }
