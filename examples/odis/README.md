@@ -36,7 +36,7 @@ pip install requests pyjwt cryptography jupyter
 jupyter notebook examples/odis/odis-walkthrough.ipynb
 ```
 
-The SDK notebook additionally needs `pip install "highflame==0.3.17"` — the
+The SDK notebook additionally needs `pip install "highflame==0.3.23"` — the
 version its committed outputs were generated against.
 
 ## Which configuration each notebook runs under
@@ -47,7 +47,7 @@ Both notebooks execute against the stock compose deployment — in particular
 - The raw-HTTP walkthrough **chooses** the default so §5 can show the Bearer
   fallback and the configuration switch that closes it; every DPoP behavior
   (holder binding, replay rejection) is still demonstrated live.
-- The SDK walkthrough **requires** the default: the Python SDK (0.3.17) cannot
+- The SDK walkthrough **requires** the default: the Python SDK (0.3.23) cannot
   construct DPoP proofs yet (highflame-sdk#105), so under `require_dpop: true`
   — the hardened posture the role-capability statement grades L1-09 against —
   its issuance calls are refused with `invalid_dpop_proof`.
