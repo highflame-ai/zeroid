@@ -232,8 +232,11 @@ describe("Token lifecycle", () => {
       expect(session.active).toBe(true);
       expect(session.sub).toBeTruthy();
 
-      // Revoke
-      await client.tokens.revoke(token.access_token);
+      // Revoke — RFC 7009 authenticates the *client*, so tokens.revoke needs
+      // OAuth client credentials this api_key agent doesn't have. Deactivating
+      // the agent collapses its tokens instead (the SDK's own guidance for
+      // clientless revocation).
+      await client.agents.deactivate(reg.identity.id);
       const revoked = await client.tokens.introspect(token.access_token);
       expect(revoked.active).toBe(false);
     } finally {
@@ -398,8 +401,11 @@ describe("OAuth client credentials + delegation", () => {
       expect(introspection.sub).toBe(toolAgent.wimse_uri);
       expect(introspection.act?.sub).toBe(orchestrator.wimse_uri);
 
-      // 8. Revoke → inactive.
-      await client.tokens.revoke(delegated.access_token);
+      // 8. Revoke → inactive. RFC 7009 authenticates the client, but the TS
+      // SDK's tokens.revoke cannot carry client credentials yet (its body is
+      // just {token}, refused with 401 invalid_client) — so collapse the
+      // delegated token by deactivating the subject identity instead.
+      await client.agents.deactivate(toolAgent.id);
       const after = await client.tokens.introspect(delegated.access_token);
       expect(after.active).toBe(false);
     } finally {

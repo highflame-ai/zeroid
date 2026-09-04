@@ -59,7 +59,8 @@ const (
 )
 
 // adminPath prepends the default admin route prefix to a relative path.
-// Usage: adminPath("/identities") → "/api/v1/identities"
+// With the default prefix "" (admin at the router root) this is the identity
+// function; it stays so tests keep working if a deployment prefix returns.
 func adminPath(path string) string {
 	return zeroid.DefaultAdminPathPrefix + path
 }
