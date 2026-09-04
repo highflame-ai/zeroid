@@ -36,8 +36,9 @@ pip install requests pyjwt cryptography jupyter
 jupyter notebook examples/odis/odis-walkthrough.ipynb
 ```
 
-The SDK notebook additionally needs `pip install "highflame==0.3.23"` — the
-version its committed outputs were generated against.
+The SDK notebook additionally needs `pip install highflame` (latest — CI executes
+it against the latest release on every PR; the committed outputs were generated with
+highflame 0.3.23).
 
 ## Which configuration each notebook runs under
 
