@@ -95,7 +95,7 @@ describe("zeroid ciba approve", () => {
     let projectHeader = "";
 
     server.use(
-      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/approve`, async ({ request }) => {
+      http.post(`${BASE_URL}/bc-authorize/ari_test_123/approve`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         accountHeader = request.headers.get("x-account-id") ?? "";
         projectHeader = request.headers.get("x-project-id") ?? "";
@@ -132,7 +132,7 @@ describe("zeroid ciba approve", () => {
     let internalSecretHeader = "";
 
     server.use(
-      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/approve`, async ({ request }) => {
+      http.post(`${BASE_URL}/bc-authorize/ari_test_123/approve`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         accountHeader = request.headers.get("x-account-id") ?? "";
         projectHeader = request.headers.get("x-project-id") ?? "";
@@ -172,7 +172,7 @@ describe("zeroid ciba deny", () => {
     let accountHeader = "";
 
     server.use(
-      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/deny`, async ({ request }) => {
+      http.post(`${BASE_URL}/bc-authorize/ari_test_123/deny`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         accountHeader = request.headers.get("x-account-id") ?? "";
         return HttpResponse.json({ auth_req_id: "ari_test_123", status: "denied" });
@@ -200,7 +200,7 @@ describe("zeroid ciba deny", () => {
     let internalSecretHeader = "";
 
     server.use(
-      http.post(`${BASE_URL}/oauth2/bc-authorize/ari_test_123/deny`, async ({ request }) => {
+      http.post(`${BASE_URL}/bc-authorize/ari_test_123/deny`, async ({ request }) => {
         accountHeader = request.headers.get("x-account-id") ?? "";
         projectHeader = request.headers.get("x-project-id") ?? "";
         internalServiceHeader = request.headers.get("x-internal-service") ?? "";

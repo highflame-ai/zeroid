@@ -203,7 +203,7 @@ zeroid token revoke eyJhbGc...
 
 ### `zeroid ciba init`
 
-Initiate an OpenID CIBA backchannel authentication request. The CLI sends tenant context in the request body because `/oauth2/bc-authorize` is a public OAuth endpoint.
+Initiate an OpenID CIBA backchannel authentication request. The CLI sends tenant context in the request body because `/bc-authorize` is a public OAuth endpoint.
 
 ```bash
 zeroid ciba init \
@@ -266,13 +266,13 @@ zeroid ciba approve ari_... --subject-id user@example.com --admin-prefix ""
 | `--subject-email <email>` | Approved user's email |
 | `--subject-name <name>` | Approved user's display name |
 | `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
-| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--admin-prefix <path>` | Admin route prefix before `/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or none (admin routes at the server root) |
 | `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
 | `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |
 | `--json` | Output raw JSON |
 
-Use `--admin-prefix ""` for deployers such as Highflame AuthN that mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID keeps the default `/api/v1` prefix.
+Use `--admin-prefix ""` for deployers such as Highflame AuthN that mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID serves admin routes at the server root by default; deployments that set `server.admin_path_prefix` pass the same value here.
 
 ---
 
@@ -292,7 +292,7 @@ zeroid ciba deny ari_... --reason "user rejected" --admin-prefix ""
 |---|---|
 | `--reason <text>` | Operator note sent when supported by the server |
 | `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
-| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--admin-prefix <path>` | Admin route prefix before `/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or none (admin routes at the server root) |
 | `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
 | `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |

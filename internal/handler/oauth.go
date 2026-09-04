@@ -287,7 +287,7 @@ func (a *API) registerBackchannelAdminRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "oauth-bc-approve",
 		Method:      http.MethodPost,
-		Path:        "/oauth2/bc-authorize/{auth_req_id}/approve",
+		Path:        "/bc-authorize/{auth_req_id}/approve",
 		Summary:     "Approve a pending CIBA authentication request",
 		Description: "Admin-side; tenant-scoped. The deployer's user-auth gateway " +
 			"authenticates the end user before forwarding to this endpoint.",
@@ -297,7 +297,7 @@ func (a *API) registerBackchannelAdminRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "oauth-bc-deny",
 		Method:      http.MethodPost,
-		Path:        "/oauth2/bc-authorize/{auth_req_id}/deny",
+		Path:        "/bc-authorize/{auth_req_id}/deny",
 		Summary:     "Deny a pending CIBA authentication request",
 		Tags:        []string{"OAuth"},
 	}, a.bcDenyOp)

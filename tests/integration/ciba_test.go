@@ -89,7 +89,7 @@ func TestCIBA_PollingLifecycle(t *testing.T) {
 
 	// ── Step 3: admin approves ───────────────────────────────────────────────
 	approveResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{
 			"subject_id":    approvedUserID,
 			"subject_email": approvedUserEmail,
@@ -147,7 +147,7 @@ func TestCIBA_PollingLifecycle(t *testing.T) {
 	require.NotEmpty(t, authReqID2)
 
 	denyResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID2+"/deny"),
+		adminPath("/bc-authorize/"+authReqID2+"/deny"),
 		struct{}{},
 		adminHeaders(),
 	)
@@ -186,7 +186,7 @@ func TestCIBA_TenantIsolation_OnApprove(t *testing.T) {
 		"X-Project-ID": "proj-other-999",
 	}
 	approveResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": "user-alice-001"},
 		wrongTenant,
 	)
@@ -294,7 +294,7 @@ func TestCIBAOffboardByOwnerReachesCIBACredentials(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID := decode(t, resp)["auth_req_id"].(string)
 
-	appr := post(t, adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"), map[string]any{
+	appr := post(t, adminPath("/bc-authorize/"+authReqID+"/approve"), map[string]any{
 		"subject_id": "user-carol-001", "subject_email": "carol@example.com",
 	}, headers)
 	require.Equal(t, http.StatusOK, appr.StatusCode)
@@ -356,7 +356,7 @@ func TestCIBAPreBurnGatesPreserveApproval(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID := decode(t, resp)["auth_req_id"].(string)
 
-	appr := post(t, adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"), map[string]any{
+	appr := post(t, adminPath("/bc-authorize/"+authReqID+"/approve"), map[string]any{
 		"subject_id": "user-carol-002", "subject_email": "carol@example.com",
 	}, headers)
 	require.Equal(t, http.StatusOK, appr.StatusCode)

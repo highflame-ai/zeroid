@@ -551,26 +551,21 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Tenant context extraction from X-Account-ID / X-Project-ID headers.
 		r.Use(internalMiddleware.TenantContextMiddleware)
 
-		// With no prefix the admin group shares the router root with the
-		// public API, and a spec-carrying huma instance here would shadow the
-		// canonical /openapi.json (chi last-registration wins) — the agent-auth
-		// copy would additionally gate it behind its 401 middleware. Register
-		// speclessly at the root; prefixed mounts keep their own spec at
-		// {prefix}/openapi.json.
-		newHumaAPI := handler.NewHumaAPI
-		if adminPrefix == "" {
-			newHumaAPI = handler.NewHumaAPISpecless
-		}
-
-		humaAdmin := newHumaAPI(r)
+		// The admin group's spec lives under {mount}/admin/* — it cannot reuse
+		// the canonical /openapi.json when sharing the router root with the
+		// public API (chi last-registration wins, and the shadow would drop
+		// the public OAuth paths from the served spec).
+		humaAdmin := handler.NewHumaAPIAdmin(r)
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
 		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
 		// the agentAuthCfg defined above for the public self-service group.
+		// Specless: a spec route registered here would sit behind the 401
+		// middleware and shadow whichever sibling spec shares its path.
 		r.Group(func(r chi.Router) {
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
-			humaAgentAuth := newHumaAPI(r)
+			humaAgentAuth := handler.NewHumaAPISpecless(r)
 			apiHandler.RegisterAgentAuth(humaAgentAuth)
 		})
 	}
@@ -661,7 +656,17 @@ func (s *Server) Start() error {
 		}
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
 		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*")
+		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*, bc-authorize/*")
+		// The admin plane has no built-in auth, and since the default mount
+		// moved from /api/v1 to the router root (PR #318) a network rule that
+		// matched /api/v1/* no longer covers it. Say so loudly on every start
+		// of a root-mounted deployment. (Config loading materializes the
+		// default into AdminPathPrefix, so test the effective value.)
+		if s.cfg.Server.GetAdminPathPrefix() == "" {
+			log.Warn().Msg("admin routes are mounted at the router root with no built-in auth " +
+				"(default changed from /api/v1 in v1.2 / PR #318) — expose only /health, /.well-known/*, " +
+				"/oauth2/* publicly, or set server.admin_path_prefix / an AdminAuth hook")
+		}
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}

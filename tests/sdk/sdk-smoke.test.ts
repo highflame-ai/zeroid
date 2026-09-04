@@ -401,11 +401,20 @@ describe("OAuth client credentials + delegation", () => {
       expect(introspection.sub).toBe(toolAgent.wimse_uri);
       expect(introspection.act?.sub).toBe(orchestrator.wimse_uri);
 
-      // 8. Revoke → inactive. RFC 7009 authenticates the client, but the TS
+      // 8. Revoke → inactive. RFC 7009 authenticates the client, and the TS
       // SDK's tokens.revoke cannot carry client credentials yet (its body is
-      // just {token}, refused with 401 invalid_client) — so collapse the
-      // delegated token by deactivating the subject identity instead.
-      await client.agents.deactivate(toolAgent.id);
+      // just {token}) — post the authenticated revocation directly so the
+      // endpoint itself stays covered until the SDK gains credential support.
+      const revokeResp = await fetch(`${baseUrl}/oauth2/token/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: delegated.access_token,
+          client_id: orchExternalId,
+          client_secret: created.client_secret,
+        }),
+      });
+      expect(revokeResp.ok).toBe(true);
       const after = await client.tokens.introspect(delegated.access_token);
       expect(after.active).toBe(false);
     } finally {

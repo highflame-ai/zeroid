@@ -60,7 +60,7 @@ func TestCIBA_PushMode_HappyPath(t *testing.T) {
 
 	// Approve ──────────────────────────────────────────────────────────────
 	approveResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": "user-dave-001", "subject_email": "dave@example.com"},
 		adminHeaders(),
 	)
@@ -127,7 +127,7 @@ func TestCIBA_PushMode_Denial(t *testing.T) {
 	authReqID, _ := decode(t, bcResp)["auth_req_id"].(string)
 
 	denyResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID+"/deny"),
+		adminPath("/bc-authorize/"+authReqID+"/deny"),
 		struct{}{},
 		adminHeaders(),
 	)

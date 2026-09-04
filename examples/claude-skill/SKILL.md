@@ -34,7 +34,7 @@ echo "ZEROID_ACCOUNT_ID=${ZEROID_ACCOUNT_ID:-not set}"
 echo "ZEROID_PROJECT_ID=${ZEROID_PROJECT_ID:-not set}"
 ```
 
-Admin routes (`/api/v1/*`) may use `X-Account-ID` and `X-Project-ID` headers for tenant context if required by the deployment. Public routes (`/oauth2/*`, `/health`, `/.well-known/*`) do not require any tenant headers.
+Admin routes (`/*`) may use `X-Account-ID` and `X-Project-ID` headers for tenant context if required by the deployment. Public routes (`/oauth2/*`, `/health`, `/.well-known/*`) do not require any tenant headers.
 
 ## API Reference
 
@@ -48,7 +48,7 @@ Use this to verify the server is reachable before performing other operations.
 
 ### Register an Agent
 
-**POST /api/v1/agents/register** -- creates an identity + API key atomically.
+**POST /agents/register** -- creates an identity + API key atomically.
 
 Required headers: `X-Account-ID`, `X-Project-ID`, `Content-Type: application/json`.
 
@@ -155,7 +155,7 @@ Request body:
 Returns `{"revoked": true}`. Always returns 200 per RFC 7009.
 
 **2. Revoke a credential by ID (admin endpoint):**
-**POST /api/v1/credentials/{id}/revoke**
+**POST /credentials/{id}/revoke**
 
 Required headers: `X-Account-ID`, `X-Project-ID`.
 
@@ -165,7 +165,7 @@ Request body:
 Revocation is immediate and cascades. Revoking any token in a delegation chain invalidates it and everything downstream -- no waiting for token expiry.
 
 **3. Revoke an API key:**
-**POST /api/v1/api-keys/{id}/revoke**
+**POST /api-keys/{id}/revoke**
 
 Required headers: `X-Account-ID`, `X-Project-ID`.
 
@@ -173,7 +173,7 @@ Ask the user whether they want to revoke by token value or by credential/API key
 
 ### Credential Policies
 
-**POST /api/v1/credential-policies** -- create a governance template.
+**POST /credential-policies** -- create a governance template.
 
 Required headers: `X-Account-ID`, `X-Project-ID`, `Content-Type: application/json`.
 
@@ -188,10 +188,10 @@ Request body fields:
 - `max_delegation_depth` (optional) -- maximum delegation chain depth
 
 Other policy endpoints:
-- **GET /api/v1/credential-policies/{id}** -- get a policy by ID
-- **GET /api/v1/credential-policies** -- list all policies
-- **PATCH /api/v1/credential-policies/{id}** -- update a policy
-- **DELETE /api/v1/credential-policies/{id}** -- delete a policy
+- **GET /credential-policies/{id}** -- get a policy by ID
+- **GET /credential-policies** -- list all policies
+- **PATCH /credential-policies/{id}** -- update a policy
+- **DELETE /credential-policies/{id}** -- delete a policy
 
 Policies define each agent's operational envelope programmatically. They enforce what grant types, scopes, TTLs, and delegation depths are allowed.
 
@@ -210,13 +210,13 @@ Returns the token's claims including `active`, `sub` (WIMSE URI), `scope`, `act`
 
 Additional agent management endpoints:
 
-- **GET /api/v1/agents/registry/{id}** -- get agent details
-- **GET /api/v1/agents/registry** -- list agents (supports filters: `identity_type`, `label`, `trust_level`, `is_active`, `search`)
-- **PATCH /api/v1/agents/registry/{id}** -- update agent fields
-- **DELETE /api/v1/agents/registry/{id}** -- deactivate agent (soft delete) and revoke its keys
-- **POST /api/v1/agents/registry/{id}/activate** -- reactivate a deactivated agent
-- **POST /api/v1/agents/registry/{id}/deactivate** -- deactivate without deleting
-- **POST /api/v1/agents/registry/{id}/rotate-key** -- rotate API key (revokes old, issues new)
+- **GET /agents/registry/{id}** -- get agent details
+- **GET /agents/registry** -- list agents (supports filters: `identity_type`, `label`, `trust_level`, `is_active`, `search`)
+- **PATCH /agents/registry/{id}** -- update agent fields
+- **DELETE /agents/registry/{id}** -- deactivate agent (soft delete) and revoke its keys
+- **POST /agents/registry/{id}/activate** -- reactivate a deactivated agent
+- **POST /agents/registry/{id}/deactivate** -- deactivate without deleting
+- **POST /agents/registry/{id}/rotate-key** -- rotate API key (revokes old, issues new)
 
 All require `X-Account-ID` and `X-Project-ID` headers.
 

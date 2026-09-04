@@ -74,7 +74,7 @@ func TestCIBA_PingMode_HappyPath(t *testing.T) {
 
 	// ── Approve ─────────────────────────────────────────────────────────────
 	approveResp := post(t,
-		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": "user-bob-001", "subject_email": "bob@example.com"},
 		adminHeaders(),
 	)
