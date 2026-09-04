@@ -76,7 +76,7 @@ token:
 
 wimse_domain: "highflame.ai"
 
-# Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.
+# Admin routes (/api/v1/*) have no built-in auth.
 # In production, protect them at the network layer (reverse proxy, VPN, firewall)
 # or use the AdminAuth hook when embedding ZeroID as a library.
 

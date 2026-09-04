@@ -31,22 +31,15 @@ interface ConfigFile {
   profiles: Record<string, Profile>;
 }
 
-// ZID_CONFIG_DIR overrides where profiles live (tests isolate through it;
-// when set, the legacy path is not consulted). Resolved per call so a
-// process can re-point it.
-function configDir(): string {
-  return process.env.ZID_CONFIG_DIR || join(homedir(), ".config", "zeroid");
-}
-function configPath(): string {
-  return join(configDir(), "config.json");
-}
+const CONFIG_DIR = join(homedir(), ".config", "zeroid");
+const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const LEGACY_CONFIG_PATH = join(homedir(), ".config", "zid", "config.json");
 
 function _read(): ConfigFile {
-  if (existsSync(configPath())) {
-    return readConfigFile(configPath());
+  if (existsSync(CONFIG_PATH)) {
+    return readConfigFile(CONFIG_PATH);
   }
-  if (!process.env.ZID_CONFIG_DIR && existsSync(LEGACY_CONFIG_PATH)) {
+  if (existsSync(LEGACY_CONFIG_PATH)) {
     return readConfigFile(LEGACY_CONFIG_PATH);
   }
   return { active_profile: "", profiles: {} };
@@ -63,8 +56,8 @@ function readConfigFile(path: string): ConfigFile {
 }
 
 function _write(cfg: ConfigFile): void {
-  mkdirSync(configDir(), { recursive: true, mode: 0o700 });
-  writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
 }
 
 export function getProfile(name?: string): Profile | undefined {

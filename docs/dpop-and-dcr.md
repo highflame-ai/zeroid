@@ -50,7 +50,7 @@ The access token's claims include a `cnf` (confirmation) member with `jkt` = the
 Per RFC 9449 §7, the access token is presented with the `DPoP` (not `Bearer`) auth scheme, and a **new** proof JWT is signed for **this** call. The new proof carries an `ath` claim — `base64url(SHA-256(access_token))` — that binds the proof to this specific access token.
 
 ```http
-POST /transfer HTTP/1.1
+POST /api/v1/transfer HTTP/1.1
 Host: payments.example.com
 Authorization: DPoP eyJ0eXAi...
 DPoP: eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7... (different jti, ath claim set)
@@ -163,7 +163,7 @@ ZeroID has two registration paths; the right one depends on what you're register
 
 | Use case | Endpoint | Auth shape |
 |---|---|---|
-| **Agent identity** participating in delegation chains (`token_exchange`, multi-hop `jwt-bearer`) | `POST /agents/register` with `public_key_pem` | Keypair owned by the agent; public PEM uploaded to the broker at registration. Self-signed JWT assertions verify against the stored key. |
+| **Agent identity** participating in delegation chains (`token_exchange`, multi-hop `jwt-bearer`) | `POST /api/v1/agents/register` with `public_key_pem` | Keypair owned by the agent; public PEM uploaded to the broker at registration. Self-signed JWT assertions verify against the stored key. |
 | **Confidential OAuth client** — vendor MCP server, installer bootstrap, single-hop tool — that does not participate in delegation chains | `POST /oauth2/register` (this doc) with `client_secret_basic` / `client_secret_post`, optionally inline `jwks` for jwt-bearer assertions | Client secret minted at registration; assertion-signing keys (if used) held at the broker. |
 
 The split is deliberate. DCR-registered clients are **explicitly blocked from `token_exchange`** (enforced at the grant-type allow-list — see "What ZeroID enforces" below) because they have no `IdentityID` binding and cannot legitimately act as a delegation actor. Agents that need to participate in chains must register through the agent identity path. See the [agent registration walkthrough in the README](../README.md#1-register-an-agent) for that side of the API.

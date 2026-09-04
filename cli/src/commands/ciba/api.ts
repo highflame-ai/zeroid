@@ -116,7 +116,7 @@ export function resolveCibaAdminRequest(
 
   return {
     baseUrl: nonEmpty(opts.adminBaseUrl) ?? readEnv("ZID_ADMIN_BASE_URL") ?? context.base_url,
-    prefix: readOptionOrEnvAllowEmpty(opts.adminPrefix, "ZID_ADMIN_PREFIX") ?? "",
+    prefix: readOptionOrEnvAllowEmpty(opts.adminPrefix, "ZID_ADMIN_PREFIX") ?? "/api/v1",
     headers: cleanHeaders({
       "X-Internal-Service": internalService,
       "X-Internal-Service-Secret": internalServiceSecret,

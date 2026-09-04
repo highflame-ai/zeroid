@@ -248,11 +248,8 @@ class TestTokenLifecycle:
             assert session.active is True
             assert session.sub
 
-            # Revoke — RFC 7009 authenticates the *client*, so tokens.revoke
-            # needs OAuth client credentials this api_key agent doesn't have.
-            # Deactivating the agent collapses its tokens instead (the SDK's
-            # own guidance for clientless revocation).
-            client.agents.deactivate(reg.identity.id)
+            # Revoke
+            client.tokens.revoke(token.access_token)
             revoked = client.tokens.introspect(token.access_token)
             assert revoked.active is False
         finally:
@@ -420,13 +417,8 @@ class TestOAuthClientCredentialsAndDelegation:
             assert introspection.sub == tool_agent.wimse_uri
             assert introspection.act and introspection.act.get("sub") == orchestrator.wimse_uri
 
-            # 8. Revoke → inactive. RFC 7009 authenticates the client, and this
-            #    flow has one — the confidential client from step 3.
-            client.tokens.revoke(
-                delegated.access_token,
-                client_id=orch_external_id,
-                client_secret=created.client_secret,
-            )
+            # 8. Revoke → inactive.
+            client.tokens.revoke(delegated.access_token)
             assert client.tokens.introspect(delegated.access_token).active is False
         finally:
             if oauth_client_id:

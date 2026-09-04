@@ -22,7 +22,9 @@ export function registerIssue(tokenCmd: Command): void {
       try {
         const profile = requireProfile(opts.profile as string | undefined);
         const client = makeClientFromProfile(profile);
-        const token = await client.tokens.issueApiKey(profile.api_key, {
+        const token = await client.tokens.issue({
+          grant_type: "api_key",
+          api_key: profile.api_key,
           scope: (opts.scope as string).trim() || undefined,
         });
 

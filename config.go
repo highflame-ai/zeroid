@@ -18,11 +18,9 @@ import (
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
-// Admin routes are served at the router root, matching the SaaS deployment
-// shape and what the highflame SDKs (Python and TypeScript, ≥0.3.23) expect.
-// Deployers can override this via ServerConfig.AdminPathPrefix (pre-flip
-// deployments that scripted against /api/v1 set it back explicitly).
-const DefaultAdminPathPrefix = ""
+// Standalone ZeroID serves admin routes at /api/v1/*. Deployers can override
+// this via ServerConfig.AdminPathPrefix.
+const DefaultAdminPathPrefix = "/api/v1"
 
 // DefaultSigningJWKSName is the default suffix for the workload-attested
 // signing-credential verification JWKS, served at
@@ -204,12 +202,13 @@ type ServerConfig struct {
 	ShutdownTimeoutSeconds int    `koanf:"shutdown_timeout_seconds"`
 
 	// AdminPathPrefix is the URL prefix for admin API routes (identities, agents,
-	// credentials, etc.). Defaults to "" — admin routes at the router root.
+	// credentials, etc.). Defaults to "/api/v1" for standalone deployments.
 	//
 	// Deployers that mount ZeroID under their own path structure can override this.
-	// For example, highflame-authn mounts the router at "/v1/auth" so admin routes
-	// become /v1/auth/identities/schema; a standalone deployment wanting the
-	// pre-flip shape sets "/api/v1".
+	// For example, highflame-authn sets this to "" and mounts the router at "/v1/auth"
+	// so admin routes become /v1/auth/identities/schema instead of /api/v1/identities/schema.
+	//
+	// Set to empty string ("") to register admin routes at the router root.
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
 
 	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
@@ -221,8 +220,8 @@ type ServerConfig struct {
 	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
-// GetAdminPathPrefix returns the admin route prefix. Defaults to "" (router
-// root) when not explicitly set.
+// GetAdminPathPrefix returns the admin route prefix. Defaults to "/api/v1"
+// when not explicitly set.
 func (s *ServerConfig) GetAdminPathPrefix() string {
 	if s.AdminPathPrefix != nil {
 		return *s.AdminPathPrefix

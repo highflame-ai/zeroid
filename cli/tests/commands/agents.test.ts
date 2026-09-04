@@ -5,10 +5,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { runCLI, BASE_URL, tokenMintHandler } from "../helpers.js";
+import { runCLI, BASE_URL } from "../helpers.js";
 import type { AgentResponse, AgentRegistered, AgentListResponse } from "@highflame/sdk";
 
-const server = setupServer(tokenMintHandler());
+const server = setupServer();
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
@@ -58,8 +58,8 @@ const ROTATED: AgentRegistered = {
 // ---------------------------------------------------------------------------
 
 describe("zeroid agents list", () => {
-  it("GET /agents/registry and renders a table", async () => {
-    server.use(http.get(`${BASE_URL}/agents/registry`, () => HttpResponse.json(AGENT_LIST)));
+  it("GET /api/v1/agents/registry and renders a table", async () => {
+    server.use(http.get(`${BASE_URL}/api/v1/agents/registry`, () => HttpResponse.json(AGENT_LIST)));
     const { stdout, exitCode } = await runCLI(["agents", "list"]);
     expect(exitCode).toBeUndefined();
     const out = stdout.join("\n");
@@ -72,7 +72,7 @@ describe("zeroid agents list", () => {
   it("forwards --type as query param", async () => {
     let qs = "";
     server.use(
-      http.get(`${BASE_URL}/agents/registry`, ({ request }) => {
+      http.get(`${BASE_URL}/api/v1/agents/registry`, ({ request }) => {
         qs = new URL(request.url).search;
         return HttpResponse.json(AGENT_LIST);
       }),
@@ -82,7 +82,7 @@ describe("zeroid agents list", () => {
   });
 
   it("outputs a JSON array with --json", async () => {
-    server.use(http.get(`${BASE_URL}/agents/registry`, () => HttpResponse.json(AGENT_LIST)));
+    server.use(http.get(`${BASE_URL}/api/v1/agents/registry`, () => HttpResponse.json(AGENT_LIST)));
     const { stdout } = await runCLI(["agents", "list", "--json"]);
     const parsed = JSON.parse(stdout.join("")) as AgentResponse[];
     expect(Array.isArray(parsed)).toBe(true);
@@ -91,7 +91,7 @@ describe("zeroid agents list", () => {
 
   it("prints 'No agents found' when list is empty", async () => {
     server.use(
-      http.get(`${BASE_URL}/agents/registry`, () =>
+      http.get(`${BASE_URL}/api/v1/agents/registry`, () =>
         HttpResponse.json({ agents: [], total: 0, limit: 50, offset: 0 }),
       ),
     );
@@ -110,7 +110,7 @@ describe("zeroid agents list", () => {
 
   it("exits 1 on API error", async () => {
     server.use(
-      http.get(`${BASE_URL}/agents/registry`, () =>
+      http.get(`${BASE_URL}/api/v1/agents/registry`, () =>
         HttpResponse.json({ title: "Unauthorized" }, { status: 401 }),
       ),
     );
@@ -124,9 +124,9 @@ describe("zeroid agents list", () => {
 // ---------------------------------------------------------------------------
 
 describe("zeroid agents get", () => {
-  it("GET /agents/registry/:id and prints agent details", async () => {
+  it("GET /api/v1/agents/registry/:id and prints agent details", async () => {
     server.use(
-      http.get(`${BASE_URL}/agents/registry/agt_abc123`, () => HttpResponse.json(AGENT)),
+      http.get(`${BASE_URL}/api/v1/agents/registry/agt_abc123`, () => HttpResponse.json(AGENT)),
     );
     const { stdout, exitCode } = await runCLI(["agents", "get", "agt_abc123"]);
     expect(exitCode).toBeUndefined();
@@ -138,7 +138,7 @@ describe("zeroid agents get", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.get(`${BASE_URL}/agents/registry/agt_abc123`, () => HttpResponse.json(AGENT)),
+      http.get(`${BASE_URL}/api/v1/agents/registry/agt_abc123`, () => HttpResponse.json(AGENT)),
     );
     const { stdout } = await runCLI(["agents", "get", "--json", "agt_abc123"]);
     const parsed = JSON.parse(stdout.join("")) as AgentResponse;
@@ -148,7 +148,7 @@ describe("zeroid agents get", () => {
 
   it("exits 1 when agent not found", async () => {
     server.use(
-      http.get(`${BASE_URL}/agents/registry/ghost`, () =>
+      http.get(`${BASE_URL}/api/v1/agents/registry/ghost`, () =>
         HttpResponse.json({ title: "Not Found", detail: "identity not found" }, { status: 404 }),
       ),
     );
@@ -162,9 +162,9 @@ describe("zeroid agents get", () => {
 // ---------------------------------------------------------------------------
 
 describe("zeroid agents rotate-key", () => {
-  it("POST /agents/registry/:id/rotate-key and prints new key", async () => {
+  it("POST /api/v1/agents/registry/:id/rotate-key and prints new key", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/rotate-key`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/rotate-key`, () =>
         HttpResponse.json(ROTATED),
       ),
     );
@@ -177,7 +177,7 @@ describe("zeroid agents rotate-key", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/rotate-key`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/rotate-key`, () =>
         HttpResponse.json(ROTATED),
       ),
     );
@@ -190,7 +190,7 @@ describe("zeroid agents rotate-key", () => {
 
   it("exits 1 when agent not found", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/ghost/rotate-key`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/ghost/rotate-key`, () =>
         HttpResponse.json({ title: "Not Found", detail: "identity not found" }, { status: 404 }),
       ),
     );
@@ -204,10 +204,10 @@ describe("zeroid agents rotate-key", () => {
 // ---------------------------------------------------------------------------
 
 describe("zeroid agents deactivate", () => {
-  it("POST /agents/registry/:id/deactivate", async () => {
+  it("POST /api/v1/agents/registry/:id/deactivate", async () => {
     const deactivated = { ...AGENT, status: "deactivated" as const };
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/deactivate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/deactivate`, () =>
         HttpResponse.json(deactivated),
       ),
     );
@@ -219,7 +219,7 @@ describe("zeroid agents deactivate", () => {
   it("outputs raw JSON with --json", async () => {
     const deactivated = { ...AGENT, status: "deactivated" as const };
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/deactivate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/deactivate`, () =>
         HttpResponse.json(deactivated),
       ),
     );
@@ -232,7 +232,7 @@ describe("zeroid agents deactivate", () => {
 
   it("exits 1 on API error", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/ghost/deactivate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/ghost/deactivate`, () =>
         HttpResponse.json({ title: "Not Found" }, { status: 404 }),
       ),
     );
@@ -242,9 +242,9 @@ describe("zeroid agents deactivate", () => {
 });
 
 describe("zeroid agents activate", () => {
-  it("POST /agents/registry/:id/activate", async () => {
+  it("POST /api/v1/agents/registry/:id/activate", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/activate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/activate`, () =>
         HttpResponse.json(AGENT),
       ),
     );
@@ -255,7 +255,7 @@ describe("zeroid agents activate", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/agt_abc123/activate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/agt_abc123/activate`, () =>
         HttpResponse.json(AGENT),
       ),
     );
@@ -268,7 +268,7 @@ describe("zeroid agents activate", () => {
 
   it("exits 1 on API error", async () => {
     server.use(
-      http.post(`${BASE_URL}/agents/registry/ghost/activate`, () =>
+      http.post(`${BASE_URL}/api/v1/agents/registry/ghost/activate`, () =>
         HttpResponse.json({ title: "Not Found" }, { status: 404 }),
       ),
     );

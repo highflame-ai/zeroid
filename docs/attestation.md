@@ -131,7 +131,7 @@ A policy ties a tenant + proof type to the rules a submitted proof must satisfy.
 ### Endpoint
 
 ```
-PUT /attestation-policies
+PUT /api/v1/attestation-policies
 Content-Type: application/json
 
 {
@@ -169,7 +169,7 @@ Content-Type: application/json
 A workflow in `myorg/myrepo` on `main` is allowed to attest. Anything else is rejected.
 
 ```bash
-curl -X PUT https://zeroid.example.com/attestation-policies \
+curl -X PUT https://zeroid.example.com/api/v1/attestation-policies \
   -H "Content-Type: application/json" \
   -H "X-Account-ID: acct_123" -H "X-Project-ID: proj_456" \
   -d '{
@@ -194,8 +194,8 @@ In the workflow:
   with:
     script: |
       const token = await core.getIDToken('https://github.com/myorg');
-      // POST to /attestation/submit with proof_type=oidc_token, proof_value=token
-      // then POST /attestation/verify with the returned record id
+      // POST to /api/v1/attestation/submit with proof_type=oidc_token, proof_value=token
+      // then POST /api/v1/attestation/verify with the returned record id
 ```
 
 ### Worked example: GCP Workload Identity Federation

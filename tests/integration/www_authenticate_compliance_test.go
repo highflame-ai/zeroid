@@ -51,7 +51,7 @@ func extractResourceMetadata(wwwAuthenticate string) string {
 // agentAuthProtectedPath is a POST endpoint mounted inside the agent-auth
 // middleware sub-group — POSTing to it exercises the middleware's 401
 // emission path. The agent-auth group lives under the admin path prefix
-// (adminPath("..."), default "" so the full URL is "/proof/generate").
+// (adminPath("...")) so the full URL is "/api/v1/proof/generate".
 func agentAuthProtectedPath() string { return adminPath("/proof/generate") }
 
 func TestRFC9728_S5_1_AgentAuthMiddleware_EmitsBreadcrumbOnMissingAuth(t *testing.T) {

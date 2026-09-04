@@ -116,7 +116,7 @@ func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
 //   - Public routes (/oauth2/*, /.well-known/*, /health, /ready): No authentication.
 //     These are the token endpoints agents and SDKs call directly.
 //   - Admin routes ({AdminPathPrefix}/*): Identity management, credential policies,
-//     attestation, signals. AdminPathPrefix defaults to "" (router root) for standalone
+//     attestation, signals. AdminPathPrefix defaults to "/api/v1" for standalone
 //     deployments. No built-in auth by default — protect at the network layer
 //     or use the AdminAuth hook.
 type Server struct {
@@ -532,7 +532,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		apiHandler.RegisterAgentSelfService(handler.NewHumaAPISpecless(r))
 	})
 
-	// Admin routes — mounted under AdminPathPrefix (default "": router root).
+	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
 	adminPrefix := cfg.Server.GetAdminPathPrefix()
 	mountAdmin := func(r chi.Router) {
@@ -551,18 +551,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Tenant context extraction from X-Account-ID / X-Project-ID headers.
 		r.Use(internalMiddleware.TenantContextMiddleware)
 
-		// With no prefix the admin group shares the router root with the
-		// public API, and a spec-carrying huma instance here would shadow the
-		// canonical /openapi.json (chi last-registration wins) — the agent-auth
-		// copy would additionally gate it behind its 401 middleware. Register
-		// speclessly at the root; prefixed mounts keep their own spec at
-		// {prefix}/openapi.json.
-		newHumaAPI := handler.NewHumaAPI
-		if adminPrefix == "" {
-			newHumaAPI = handler.NewHumaAPISpecless
-		}
-
-		humaAdmin := newHumaAPI(r)
+		humaAdmin := handler.NewHumaAPI(r)
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
 		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
@@ -570,7 +559,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		r.Group(func(r chi.Router) {
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
-			humaAgentAuth := newHumaAPI(r)
+			humaAgentAuth := handler.NewHumaAPI(r)
 			apiHandler.RegisterAgentAuth(humaAgentAuth)
 		})
 	}
