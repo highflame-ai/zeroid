@@ -8,6 +8,10 @@
 
 import { vi } from "vitest";
 import { Command } from "commander";
+import { http, HttpResponse } from "msw";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { registerInit } from "../src/commands/init.js";
 import { registerDecode } from "../src/commands/token/decode.js";
@@ -24,6 +28,21 @@ import { registerConfig } from "../src/commands/config.js";
 import { registerCiba } from "../src/commands/ciba/index.js";
 
 export const BASE_URL = "http://zeroid.test";
+
+/**
+ * Isolate profile reads/writes from the developer's real ~/.config/zeroid for
+ * the whole test process (init tests save profiles; without this they leak
+ * onto the developer's machine and into later tests). Set once at module load
+ * rather than injected per runCLI, so a test file that re-points
+ * process.env.ZID_CONFIG_DIR itself (e.g. config.test.ts's per-test fresh
+ * dirs) is not overridden.
+ */
+process.env.ZID_CONFIG_DIR ??= mkdtempSync(join(tmpdir(), "zeroid-cli-test-"));
+
+/** A fresh, empty config dir — for tests that must see no saved profile. */
+export function emptyConfigDir(): string {
+  return mkdtempSync(join(tmpdir(), "zeroid-cli-empty-"));
+}
 
 /** Env vars that satisfy requireProfile() without a config file. */
 export const AUTH_ENV = {
@@ -189,4 +208,20 @@ export function makeJWT(opts: FakeJWTOptions = {}): string {
     ...opts.extra,
   };
   return `${b64url(header)}.${b64url(payload)}.fakesig`;
+}
+
+/**
+ * msw handler for the admin-token mint the SDK (≥0.3.23) performs before its
+ * first admin-plane call when constructed with an apiKey. Pass to
+ * setupServer() so it survives resetHandlers(); per-test server.use()
+ * handlers for /oauth2/token still take precedence.
+ */
+export function tokenMintHandler() {
+  return http.post(`${BASE_URL}/oauth2/token`, () =>
+    HttpResponse.json({
+      access_token: makeJWT({ scopes: ["nhi:manage"] }),
+      token_type: "Bearer",
+      expires_in: 900,
+    }),
+  );
 }

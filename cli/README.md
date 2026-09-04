@@ -266,13 +266,13 @@ zeroid ciba approve ari_... --subject-id user@example.com --admin-prefix ""
 | `--subject-email <email>` | Approved user's email |
 | `--subject-name <name>` | Approved user's display name |
 | `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
-| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or none (admin routes at the server root) |
 | `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
 | `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |
 | `--json` | Output raw JSON |
 
-Use `--admin-prefix ""` for deployers such as Highflame AuthN that mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID keeps the default `/api/v1` prefix.
+The CLI's default (no prefix) matches Highflame AuthN and the SaaS deployment, which mount ZeroID admin routes directly under the configured base URL. Standalone ZeroID mounts admin routes under `/api/v1` by default, so against a self-hosted server pass `--admin-prefix /api/v1` (or set `ZID_ADMIN_PREFIX`) — the value of that deployment's `server.admin_path_prefix`.
 
 ---
 
@@ -292,7 +292,7 @@ zeroid ciba deny ari_... --reason "user rejected" --admin-prefix ""
 |---|---|
 | `--reason <text>` | Operator note sent when supported by the server |
 | `--admin-base-url <url>` | Admin API base URL; defaults to `ZID_ADMIN_BASE_URL` or the profile base URL |
-| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or `/api/v1` |
+| `--admin-prefix <path>` | Admin route prefix before `/oauth2/bc-authorize`; defaults to `ZID_ADMIN_PREFIX` or none (admin routes at the server root) |
 | `--internal-service <name>` | Adds `X-Internal-Service`; defaults to `ZID_INTERNAL_SERVICE` |
 | `--internal-service-secret <secret>` | Adds `X-Internal-Service-Secret`; defaults to `ZID_INTERNAL_SERVICE_SECRET` |
 | `--profile <name>` | Profile to use |

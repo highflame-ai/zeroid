@@ -160,6 +160,27 @@ func NewHumaAPISpecless(router chi.Router) huma.API {
 	config.OpenAPIPath = ""
 	config.DocsPath = ""
 	config.SchemasPath = ""
+	// DefaultConfig installs the $schema link transformer via a create hook
+	// keyed to SchemasPath; with no schemas route those links would 404 in
+	// every response body. Drop the hook so specless responses carry no
+	// $schema field at all.
+	config.CreateHooks = nil
+	return humachi.New(router, config)
+}
+
+// NewHumaAPIAdmin creates the admin group's huma API with its spec, docs and
+// schemas under /admin/* (relative to wherever the group is mounted). The
+// admin group shares the router root with the public API by default, so it
+// cannot reuse the canonical /openapi.json — chi last-registration wins and
+// the shadow would drop the public OAuth paths from the served spec. Distinct
+// paths keep the ~70 admin operations documented (GET /admin/openapi.json,
+// /admin/docs) and keep response $schema links resolvable (/admin/schemas/*),
+// in both root-mounted and prefixed deployments.
+func NewHumaAPIAdmin(router chi.Router) huma.API {
+	config := zeroidHumaConfig()
+	config.OpenAPIPath = "/admin/openapi"
+	config.DocsPath = "/admin/docs"
+	config.SchemasPath = "/admin/schemas"
 	return humachi.New(router, config)
 }
 

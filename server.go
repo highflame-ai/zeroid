@@ -551,15 +551,25 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Tenant context extraction from X-Account-ID / X-Project-ID headers.
 		r.Use(internalMiddleware.TenantContextMiddleware)
 
+		// Prefixed mounts keep the admin spec at {prefix}/openapi.json. With no
+		// prefix the admin group shares the router root with the public API,
+		// and a spec at /openapi.json would shadow the canonical public one
+		// (chi last-registration wins) — so root mounts serve it under
+		// /admin/* instead. Embedders like highflame-authn hit this case.
 		humaAdmin := handler.NewHumaAPI(r)
+		if adminPrefix == "" {
+			humaAdmin = handler.NewHumaAPIAdmin(r)
+		}
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
 		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
 		// the agentAuthCfg defined above for the public self-service group.
+		// Specless: a spec route registered here would sit behind the 401
+		// middleware and shadow the admin spec that shares its path.
 		r.Group(func(r chi.Router) {
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
-			humaAgentAuth := handler.NewHumaAPI(r)
+			humaAgentAuth := handler.NewHumaAPISpecless(r)
 			apiHandler.RegisterAgentAuth(humaAgentAuth)
 		})
 	}
@@ -651,6 +661,16 @@ func (s *Server) Start() error {
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
 		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
 		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*")
+		// Root-mounted admin routes share the namespace with the public API and
+		// have no built-in auth; that is only a safe posture when the embedder
+		// gates the admin group itself (highflame-authn does, via AdminAuth).
+		// Warn when a deployment chose "" without installing a hook. Checked at
+		// Start so embedders have had NewServer→AdminAuth to set it.
+		if s.cfg.Server.GetAdminPathPrefix() == "" && s.adminAuthState.fn() == nil {
+			log.Warn().Msg("admin routes are mounted at the router root with no AdminAuth hook and no built-in auth — " +
+				"expose only /health, /.well-known/*, /oauth2/* publicly, install an AdminAuth hook, " +
+				"or set server.admin_path_prefix (default /api/v1)")
+		}
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}

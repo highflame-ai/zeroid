@@ -885,7 +885,7 @@ graph TD
 
 ### Admin (protect at network layer)
 
-Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit under `/oauth2/bc-authorize/{auth_req_id}/*` because the deployer's user-auth gateway authenticates the end user before forwarding to them.
+Most admin endpoints live under `/api/v1/*` (`server.admin_path_prefix`; embedders that gate the admin group with their own `AdminAuth` middleware — the SaaS deployment does — set it to `""` and serve admin routes at the router root, which the server flags at startup when no such hook is installed); the CIBA approve/deny endpoints sit under `/oauth2/bc-authorize/{auth_req_id}/*` because the deployer's user-auth gateway authenticates the end user before forwarding to them.
 
 | Method | Path | Description |
 |--------|------|-------------|
