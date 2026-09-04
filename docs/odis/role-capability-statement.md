@@ -2,7 +2,7 @@
 
 **Status**: Draft for submission to the CoSAI/OASIS WS4 ODIS workstream
 **ODIS reference**: [ODIS.md draft](https://github.com/cosai-oasis/ws4-odis/blob/main/RFCs/ODIS.md) (unapproved contributor draft)
-**ZeroID version**: commit `d2531cd` on `main` (PR #304's `token.require_dpop`, attestation trust-clamp, and CIBA credential anchoring; PR #318's root-mounted admin API; Apache-2.0, <https://github.com/highflame-ai/zeroid>)
+**ZeroID version**: commit `054a2dc` on `main` (PR #304's `token.require_dpop`, attestation trust-clamp, and CIBA credential anchoring; PR #318's root-mounted admin API and PR #319's hardening of it; Apache-2.0, <https://github.com/highflame-ai/zeroid>)
 **Claim type**: role-capability statement per ODIS §8. **This is not an ODIS Core, Extended, or Safety profile claim** — §8 reserves those for a complete conformance target, and this document itself identifies unmet MUSTs.
 
 ZeroID is an OAuth 2.1/OIDC authorization server for AI-agent identity, built
