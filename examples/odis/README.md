@@ -57,11 +57,10 @@ claims and selected fields, never raw tokens, API keys, or private keys. CI
 enforces this with a credential-material lint and re-executes both notebooks
 against a fresh server on every PR (`highflame-notebook-check`).
 
-Upgrading an existing checkout? Tenant default credential policies are
-created once and don't self-heal: a postgres volume from before the CIBA
-grant joined the defaults will refuse §7's bound-client redemption
-(`access_denied`). `docker compose down -v` for a fresh volume, or add the
-CIBA grant to the stored default policy.
+Upgrading a checkout whose postgres volume predates the CIBA grant joining
+the default credential policy? Current zeroid heals stored default policies
+on startup (migration `044_default_policy_add_ciba_grant`); if you are
+running an older build, `docker compose down -v` for a fresh volume.
 
 The notebook is re-runnable: every run registers fresh identities under a
 random suffix. The committed outputs are from a real run against a local

@@ -160,6 +160,8 @@ Prefer a runnable walkthrough after installing the SDK? Open the [ZeroID Quickst
 
 Want a LangChain-specific intro? Open the [Scope-Aware Tools notebook](examples/langchain/scope_aware_tools.ipynb) to see the same agent gain or lose tool access purely by changing its ZeroID token.
 
+Mapping ZeroID to the [ODIS draft](https://github.com/cosai-oasis/ws4-odis/blob/main/RFCs/ODIS.md) (CoSAI/OASIS WS4)? The [role-capability statement](docs/odis/role-capability-statement.md) grades every Layer 1–2 requirement against code and tests, and the [ODIS walkthrough notebooks](examples/odis/) run the same story — Agent Registration Record → Agent Runtime Credential → Delegation Record → cascade revocation — against a local instance with real outputs.
+
 **Run ZeroID locally** (Docker — 30 seconds):
 
 ```bash
@@ -954,6 +956,8 @@ ZeroID implements the complete stack for production agent identity systems. No p
 References: [OpenID Agentic AI](https://openid.net/wp-content/uploads/2025/10/Identity-Management-for-Agentic-AI.pdf)
 
 The extensions ZeroID layers on these baseline specs — the additional JWT claims, the CIBA `group_hint` parameter, the DPoP `bh` claim, RFC 8693 attenuation/depth semantics, the WIMSE URI scheme, reserved-claims gating, CAE signal types, and the non-standard endpoints — are specified normatively in [`docs/spec/zeroid-oauth-extensions.md`](docs/spec/zeroid-oauth-extensions.md).
+
+How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, native mode), including the requirements ZeroID does *not* meet, is in [`docs/odis/role-capability-statement.md`](docs/odis/role-capability-statement.md), with executable companions in [`examples/odis/`](examples/odis/).
 
 | Standard | RFC / Spec | Used For |
 |----------|-----------|----------|

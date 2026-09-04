@@ -275,7 +275,7 @@ jobs:
             echo "::error::no committed notebooks found — lint target list is broken"; exit 1
           fi
           status=0
-          grep -InE 'eyJ[A-Za-z0-9_-]{20,}|zid_sk_[A-Za-z0-9]|BEGIN[A-Z ]*PRIVATE KEY' $files || status=$?
+          grep -InE 'eyJ[A-Za-z0-9_-]{20,}|zid_(sk|rt)_[A-Za-z0-9_-]{20,}|BEGIN[A-Z ]*PRIVATE KEY' $files || status=$?
           if [ "$status" -eq 0 ]; then
             echo "::error::credential-looking material found in committed notebook(s)"; exit 1
           elif [ "$status" -ne 1 ]; then
