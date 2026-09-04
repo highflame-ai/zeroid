@@ -5,10 +5,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { runCLI, BASE_URL } from "../helpers.js";
+import { runCLI, BASE_URL, tokenMintHandler } from "../helpers.js";
 import type { CredentialListResponse, IssuedCredential } from "@highflame/sdk";
 
-const server = setupServer();
+const server = setupServer(tokenMintHandler());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
@@ -51,10 +51,10 @@ const LIST_RESPONSE: CredentialListResponse = {
 };
 
 describe("zeroid creds list", () => {
-  it("GET /api/v1/credentials?identity_id=<agent> and renders table", async () => {
+  it("GET /credentials?identity_id=<agent> and renders table", async () => {
     let capturedUrl = "";
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, ({ request }) => {
+      http.get(`${BASE_URL}/credentials`, ({ request }) => {
         capturedUrl = request.url;
         return HttpResponse.json(LIST_RESPONSE);
       }),
@@ -73,7 +73,7 @@ describe("zeroid creds list", () => {
 
   it("--active filters out revoked credentials", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
+      http.get(`${BASE_URL}/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
     );
 
     const { stdout } = await runCLI(["creds", "list", "--agent", "agt_abc123", "--active"]);
@@ -85,7 +85,7 @@ describe("zeroid creds list", () => {
 
   it("shows scopes in the table", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
+      http.get(`${BASE_URL}/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
     );
     const { stdout } = await runCLI(["creds", "list", "--agent", "agt_abc123"]);
     expect(stdout.join("\n")).toContain("repo:read pr:write");
@@ -93,7 +93,7 @@ describe("zeroid creds list", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
+      http.get(`${BASE_URL}/credentials`, () => HttpResponse.json(LIST_RESPONSE)),
     );
     const { stdout } = await runCLI(["creds", "list", "--agent", "agt_abc123", "--json"]);
     const parsed = JSON.parse(stdout.join("")) as IssuedCredential[];
@@ -105,7 +105,7 @@ describe("zeroid creds list", () => {
 
   it("prints 'No credentials found' when list is empty", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () =>
+      http.get(`${BASE_URL}/credentials`, () =>
         HttpResponse.json({ credentials: [], total: 0 }),
       ),
     );
@@ -115,7 +115,7 @@ describe("zeroid creds list", () => {
 
   it("normalizes null credentials to an empty array", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () =>
+      http.get(`${BASE_URL}/credentials`, () =>
         HttpResponse.json({ credentials: null, total: 0 }),
       ),
     );
@@ -130,7 +130,7 @@ describe("zeroid creds list", () => {
 
   it("exits 1 on API error", async () => {
     server.use(
-      http.get(`${BASE_URL}/api/v1/credentials`, () =>
+      http.get(`${BASE_URL}/credentials`, () =>
         HttpResponse.json({ title: "Not Found" }, { status: 404 }),
       ),
     );

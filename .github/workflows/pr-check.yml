@@ -189,7 +189,7 @@ jobs:
         shell: bash
         run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
-          pip install --quiet "highflame==0.3.17"
+          pip install --quiet "highflame==0.3.23"
 
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
@@ -200,7 +200,7 @@ jobs:
         run: |-
           npm init -y
           npm install --save-dev vitest typescript @testcontainers/postgresql
-          npm install @highflame/sdk@0.3.17
+          npm install @highflame/sdk@0.3.23
 
       - name: Run TypeScript SDK smoke tests
         working-directory: tests/sdk
@@ -259,7 +259,7 @@ jobs:
 
       - name: Install notebook execution deps
         shell: bash
-        run: pip install --quiet pytest nbmake ipykernel "highflame==0.3.17" cryptography "PyJWT>=2.8"
+        run: pip install --quiet pytest nbmake ipykernel "highflame==0.3.23" cryptography "PyJWT>=2.8"
 
       - name: Execute the quickstart notebook against the live server
         shell: bash

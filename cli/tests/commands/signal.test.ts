@@ -5,10 +5,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { runCLI, BASE_URL } from "../helpers.js";
+import { runCLI, BASE_URL, tokenMintHandler } from "../helpers.js";
 import type { CAESignal, CreateSignalRequest } from "@highflame/sdk";
 
-const server = setupServer();
+const server = setupServer(tokenMintHandler());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
@@ -25,10 +25,10 @@ const SIGNAL_RESPONSE: CAESignal = {
 };
 
 describe("zeroid signal", () => {
-  it("POST /api/v1/signals/ingest with all required fields", async () => {
+  it("POST /signals/ingest with all required fields", async () => {
     let captured: CreateSignalRequest = {} as CreateSignalRequest;
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, async ({ request }) => {
+      http.post(`${BASE_URL}/signals/ingest`, async ({ request }) => {
         captured = (await request.json()) as CreateSignalRequest;
         return HttpResponse.json(SIGNAL_RESPONSE);
       }),
@@ -51,7 +51,7 @@ describe("zeroid signal", () => {
   it("stores --reason in payload.reason", async () => {
     let captured: CreateSignalRequest = {} as CreateSignalRequest;
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, async ({ request }) => {
+      http.post(`${BASE_URL}/signals/ingest`, async ({ request }) => {
         captured = (await request.json()) as CreateSignalRequest;
         return HttpResponse.json(SIGNAL_RESPONSE);
       }),
@@ -72,7 +72,7 @@ describe("zeroid signal", () => {
   it("omits payload when --reason is not given", async () => {
     let captured: CreateSignalRequest = {} as CreateSignalRequest;
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, async ({ request }) => {
+      http.post(`${BASE_URL}/signals/ingest`, async ({ request }) => {
         captured = (await request.json()) as CreateSignalRequest;
         return HttpResponse.json(SIGNAL_RESPONSE);
       }),
@@ -91,7 +91,7 @@ describe("zeroid signal", () => {
 
   it("prints signal ID on success", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, () => HttpResponse.json(SIGNAL_RESPONSE)),
+      http.post(`${BASE_URL}/signals/ingest`, () => HttpResponse.json(SIGNAL_RESPONSE)),
     );
     const { stdout, exitCode } = await runCLI([
       "signal",
@@ -106,7 +106,7 @@ describe("zeroid signal", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, () => HttpResponse.json(SIGNAL_RESPONSE)),
+      http.post(`${BASE_URL}/signals/ingest`, () => HttpResponse.json(SIGNAL_RESPONSE)),
     );
     const { stdout } = await runCLI([
       "signal",
@@ -143,7 +143,7 @@ describe("zeroid signal", () => {
 
   it("exits 1 on API error", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/signals/ingest`, () =>
+      http.post(`${BASE_URL}/signals/ingest`, () =>
         HttpResponse.json({ title: "Bad Request" }, { status: 400 }),
       ),
     );
