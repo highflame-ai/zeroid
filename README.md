@@ -885,39 +885,62 @@ graph TD
 
 ### Admin (protect at network layer)
 
-Most admin endpoints live under `/api/v1/*`; the CIBA approve/deny endpoints sit under `/oauth2/bc-authorize/{auth_req_id}/*` because the deployer's user-auth gateway authenticates the end user before forwarding to them.
+Admin endpoints are served at the **router root** by default (`server.admin_path_prefix: ""`;
+set it to e.g. `/api/v1` to restore a prefix — deployments upgrading from the prefixed
+default must update any network rules that matched `/api/v1/*`). None of these routes
+carry built-in auth. This mirrors how the SaaS deployment runs: the same routes, with
+Highflame AuthN authenticating every admin call in front of them via the `AdminAuth` hook.
+Self-hosting, you provide that layer yourself — either the `AdminAuth` hook when
+embedding, or network rules that expose only the public surface (`/health`,
+`/.well-known/*`, `/oauth2/*`) and block everything else.
+
+**CIBA approve/deny need a user-auth gateway in production.** The two admin endpoints
+`POST /oauth2/bc-authorize/{auth_req_id}/approve` and `.../deny` take the approving
+human's `subject_id` in the request body — ZeroID has no user login of its own — so
+whoever can reach them approves *as anyone*. Note that they live inside `/oauth2/*`, so a
+public-prefix allowlist does **not** protect them: route them through the gateway that
+authenticates your users (SaaS does this through AuthN, which resolves the approver from
+the signed-in session) and deny them from the public edge, ahead of the `/oauth2/` allow:
+
+```nginx
+location ~ ^/oauth2/bc-authorize/[^/]+/(approve|deny)$ { deny all; }   # admin — gateway only
+location /oauth2/ { proxy_pass http://zeroid; }                          # public OAuth surface
+```
+
+Deployments that never use CIBA should still add that rule: the endpoints are registered
+regardless, and the default credential policy permits the CIBA grant.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/v1/agents/register` | Register agent (identity + credential, atomic) |
-| GET | `/api/v1/agents/registry` | List agents |
-| GET | `/api/v1/agents/registry/{id}` | Get agent |
-| PATCH | `/api/v1/agents/registry/{id}` | Update agent |
-| DELETE | `/api/v1/agents/registry/{id}` | Deactivate agent |
-| POST | `/api/v1/identities` | Register identity (manual) |
-| GET | `/api/v1/identities/{id}` | Get identity |
-| PATCH | `/api/v1/identities/{id}` | Update identity |
-| DELETE | `/api/v1/identities/{id}` | Deactivate identity |
-| GET | `/api/v1/identities` | List identities |
-| POST | `/api/v1/oauth/clients` | Register OAuth2 client |
-| POST | `/api/v1/api-keys` | Create API key |
-| POST | `/api/v1/credential-policies` | Create credential policy |
-| GET | `/api/v1/credential-policies/{id}` | Get credential policy |
-| PATCH | `/api/v1/credential-policies/{id}` | Update credential policy |
-| POST | `/api/v1/credentials/{id}/revoke` | Revoke credential |
-| POST | `/api/v1/attestation/submit` | Submit attestation proof |
-| POST | `/api/v1/attestation/verify` | Verify proof + promote trust + issue credential |
-| GET | `/api/v1/attestation/{id}` | Get attestation record |
-| PUT | `/api/v1/attestation-policies` | Upsert per-tenant attestation policy |
-| GET | `/api/v1/attestation-policies` | List attestation policies |
-| DELETE | `/api/v1/attestation-policies/{id}` | Delete attestation policy |
-| POST | `/api/v1/signals/ingest` | Ingest CAE signal |
-| GET | `/api/v1/signals/stream` | SSE signal stream |
-| POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
-| POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
-| GET | `/api/v1/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
-| GET | `/api/v1/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
-| GET | `/api/v1/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
+| POST | `/agents/register` | Register agent (identity + credential, atomic) |
+| GET | `/agents/registry` | List agents |
+| GET | `/agents/registry/{id}` | Get agent |
+| PATCH | `/agents/registry/{id}` | Update agent |
+| DELETE | `/agents/registry/{id}` | Deactivate agent |
+| POST | `/identities` | Register identity (manual) |
+| GET | `/identities/{id}` | Get identity |
+| PATCH | `/identities/{id}` | Update identity |
+| DELETE | `/identities/{id}` | Deactivate identity |
+| GET | `/identities` | List identities |
+| POST | `/oauth/clients` | Register OAuth2 client |
+| POST | `/api-keys` | Create API key |
+| POST | `/credential-policies` | Create credential policy |
+| GET | `/credential-policies/{id}` | Get credential policy |
+| PATCH | `/credential-policies/{id}` | Update credential policy |
+| POST | `/credentials/{id}/revoke` | Revoke credential |
+| POST | `/attestation/submit` | Submit attestation proof |
+| POST | `/attestation/verify` | Verify proof + promote trust + issue credential |
+| GET | `/attestation/{id}` | Get attestation record |
+| PUT | `/attestation-policies` | Upsert per-tenant attestation policy |
+| GET | `/attestation-policies` | List attestation policies |
+| DELETE | `/attestation-policies/{id}` | Delete attestation policy |
+| POST | `/signals/ingest` | Ingest CAE signal |
+| GET | `/signals/stream` | SSE signal stream |
+| POST | `/proofs/generate` | Generate WIMSE proof token |
+| POST | `/proofs/verify` | Verify WIMSE proof token |
+| GET | `/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
+| GET | `/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
+| GET | `/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
@@ -971,7 +994,7 @@ The extensions ZeroID layers on these baseline specs — the additional JWT clai
 - **Delegation Explorer** — three read-only endpoints that expose the delegation graph stored in `issued_credentials`: `/delegations/graph` (depth-bounded subgraph centered on any identity, with per-edge scope attenuation), `/delegations/by-jti/{jti}` (forensic lineage walk root → leaf), and `/delegations/chains` (mission summary list with time-window filtering). All three are tenant-scoped and driven by `parent_jti` recursive CTEs — no dependency on `mission_id` for correctness.
 
 **Planned**
-- Human-in-the-loop approval workflow (`/api/v1/approvals`)
+- Human-in-the-loop approval workflow (`/approvals`)
 - `zeroid` CLI
 - GitHub Actions OIDC upstream validator — stamp `environment=ci` claims verified against GitHub's JWKS
 

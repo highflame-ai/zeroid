@@ -21,7 +21,7 @@ ZeroID is open-source identity infrastructure for autonomous AI agents. It assig
 
 ## Authentication
 
-All `/api/v1/*` endpoints require an API key passed via the `Authorization` header:
+All `/*` endpoints require an API key passed via the `Authorization` header:
 
 ```
 Authorization: Bearer $ZEROID_API_KEY
@@ -36,7 +36,7 @@ The `/oauth2/*` and `/health` endpoints are public (no auth required).
 Create an agent identity with a WIMSE/SPIFFE URI and receive an API key. This is the recommended way to onboard agents — it atomically creates the identity record and issues a long-lived API key (`zid_sk_...`).
 
 ```bash
-curl -s -X POST "$ZEROID_BASE_URL/api/v1/agents/register" \
+curl -s -X POST "$ZEROID_BASE_URL/agents/register" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -66,7 +66,7 @@ The `sub_type` field classifies the agent role: `orchestrator`, `autonomous`, `t
 To register a bare identity without an API key (for manual credential management):
 
 ```bash
-curl -s -X POST "$ZEROID_BASE_URL/api/v1/identities" \
+curl -s -X POST "$ZEROID_BASE_URL/identities" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -86,7 +86,7 @@ Exchange OAuth2 client credentials for a short-lived JWT access token. First reg
 **Register an OAuth2 client:**
 
 ```bash
-curl -s -X POST "$ZEROID_BASE_URL/api/v1/oauth/clients" \
+curl -s -X POST "$ZEROID_BASE_URL/oauth/clients" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -177,7 +177,7 @@ Multi-hop delegation is supported — a sub-agent can delegate further to a tool
 Revoke a credential immediately. Revocation cascades — revoking an orchestrator's credential invalidates all downstream delegated tokens in the chain.
 
 ```bash
-curl -s -X POST "$ZEROID_BASE_URL/api/v1/credentials/{credential_id}/revoke" \
+curl -s -X POST "$ZEROID_BASE_URL/credentials/{credential_id}/revoke" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json"
 ```
@@ -204,7 +204,7 @@ curl -s -X POST "$ZEROID_BASE_URL/oauth2/token/revoke" \
 To deactivate an entire agent (revokes all its tokens):
 
 ```bash
-curl -s -X DELETE "$ZEROID_BASE_URL/api/v1/agents/registry/{agent_id}" \
+curl -s -X DELETE "$ZEROID_BASE_URL/agents/registry/{agent_id}" \
   -H "Authorization: Bearer $ZEROID_API_KEY"
 ```
 
@@ -215,7 +215,7 @@ curl -s -X DELETE "$ZEROID_BASE_URL/api/v1/agents/registry/{agent_id}" \
 Create governance templates that enforce TTL limits, allowed grant types, required trust levels, and maximum delegation depth. Policies are assigned to API keys and enforced at token issuance time.
 
 ```bash
-curl -s -X POST "$ZEROID_BASE_URL/api/v1/credential-policies" \
+curl -s -X POST "$ZEROID_BASE_URL/credential-policies" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -247,14 +247,14 @@ curl -s -X POST "$ZEROID_BASE_URL/api/v1/credential-policies" \
 **Get a policy:**
 
 ```bash
-curl -s "$ZEROID_BASE_URL/api/v1/credential-policies/{policy_id}" \
+curl -s "$ZEROID_BASE_URL/credential-policies/{policy_id}" \
   -H "Authorization: Bearer $ZEROID_API_KEY"
 ```
 
 **Update a policy:**
 
 ```bash
-curl -s -X PATCH "$ZEROID_BASE_URL/api/v1/credential-policies/{policy_id}" \
+curl -s -X PATCH "$ZEROID_BASE_URL/credential-policies/{policy_id}" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -294,19 +294,19 @@ curl -s "$ZEROID_BASE_URL/ready"
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/agents/registry` | List all registered agents |
-| GET | `/api/v1/agents/registry/{id}` | Get agent details |
-| PATCH | `/api/v1/agents/registry/{id}` | Update agent metadata |
-| GET | `/api/v1/identities/{id}` | Get identity by ID |
-| GET | `/api/v1/identities` | List identities |
+| GET | `/agents/registry` | List all registered agents |
+| GET | `/agents/registry/{id}` | Get agent details |
+| PATCH | `/agents/registry/{id}` | Update agent metadata |
+| GET | `/identities/{id}` | Get identity by ID |
+| GET | `/identities` | List identities |
 | POST | `/oauth2/token/introspect` | Introspect a token (RFC 7662) |
 | GET | `/oauth2/token/verify` | Forward-auth endpoint for reverse proxies |
 | GET | `/.well-known/jwks.json` | JWKS public keys for local verification |
 | GET | `/.well-known/oauth-authorization-server` | OAuth2 server metadata |
-| POST | `/api/v1/attestations` | Submit attestation evidence |
-| POST | `/api/v1/proofs/generate` | Generate WIMSE proof token |
-| POST | `/api/v1/proofs/verify` | Verify WIMSE proof token |
-| POST | `/api/v1/signals/ingest` | Ingest CAE signal for continuous access evaluation |
+| POST | `/attestations` | Submit attestation evidence |
+| POST | `/proofs/generate` | Generate WIMSE proof token |
+| POST | `/proofs/verify` | Verify WIMSE proof token |
+| POST | `/signals/ingest` | Ingest CAE signal for continuous access evaluation |
 
 ## Resources
 

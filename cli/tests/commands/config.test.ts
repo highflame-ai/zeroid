@@ -1,40 +1,34 @@
 /**
  * Tests for `zeroid config use-profile` and `zeroid config list-profiles`.
  *
- * Uses a temp HOME dir so reads/writes don't touch the real config file.
+ * Isolation: each test gets a fresh ZID_CONFIG_DIR (the same knob production
+ * code honors), so the direct setProfile() writes and the CLI reads land on
+ * the same throwaway config file — no homedir mocking.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCLI } from "../helpers.js";
+import { setProfile } from "../../src/lib/config.js";
 
-// Normalise the tmp base (strip trailing slash) and join with an explicit "/".
-// Plain concatenation crashed on Linux CI where TMPDIR is unset → "/tmp" with no
-// slash → "/tmpzeroid-config-cmd-test-<pid>" at the filesystem root → EACCES.
-const TEST_HOME = vi.hoisted(() => {
-  const base = (process.env.TMPDIR ?? process.env.TEMP ?? "/tmp").replace(/\/+$/, "");
-  return `${base}/zeroid-config-cmd-test-${process.pid}`;
-});
-vi.mock("node:os", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:os")>();
-  return { ...actual, homedir: () => TEST_HOME };
-});
-
-// Import config functions after mock is in place so they use TEST_HOME.
-const { setProfile } = await import("../../src/lib/config.js");
-
-// runCLI injects a per-file ZID_CONFIG_DIR (see helpers.ts); this file isolates
-// through the mocked homedir instead, so blank the override to keep the direct
-// setProfile() writes above and the CLI reads on the same config file.
-const HOME_CONFIG = { ZID_CONFIG_DIR: "" };
+let configDir: string;
+let savedConfigDir: string | undefined;
 
 beforeEach(() => {
-  mkdirSync(join(TEST_HOME, ".config", "zeroid"), { recursive: true });
+  savedConfigDir = process.env.ZID_CONFIG_DIR;
+  configDir = mkdtempSync(join(tmpdir(), "zeroid-config-cmd-test-"));
+  process.env.ZID_CONFIG_DIR = configDir;
 });
 
 afterEach(() => {
-  rmSync(TEST_HOME, { recursive: true, force: true });
+  rmSync(configDir, { recursive: true, force: true });
+  if (savedConfigDir === undefined) {
+    delete process.env.ZID_CONFIG_DIR;
+  } else {
+    process.env.ZID_CONFIG_DIR = savedConfigDir;
+  }
 });
 
 describe("zeroid config list-profiles", () => {
@@ -42,7 +36,6 @@ describe("zeroid config list-profiles", () => {
     const { stdout } = await runCLI(["config", "list-profiles"], {
       // Clear auth env so it doesn't mask the empty config
       ZID_API_KEY: "",
-      ...HOME_CONFIG,
     });
     expect(stdout.join("")).toMatch(/no profiles/i);
   });
@@ -51,7 +44,7 @@ describe("zeroid config list-profiles", () => {
     setProfile("dev", { base_url: "http://dev", account_id: "a", project_id: "p", api_key: "k1" });
     setProfile("prod", { base_url: "http://prod", account_id: "a", project_id: "p", api_key: "k2" });
 
-    const { stdout } = await runCLI(["config", "list-profiles"], HOME_CONFIG);
+    const { stdout } = await runCLI(["config", "list-profiles"]);
     const out = stdout.join("\n");
     expect(out).toContain("dev");
     expect(out).toContain("prod");
@@ -65,17 +58,17 @@ describe("zeroid config use-profile", () => {
     setProfile("dev", { base_url: "http://dev", account_id: "a", project_id: "p", api_key: "k1" });
     setProfile("prod", { base_url: "http://prod", account_id: "a", project_id: "p", api_key: "k2" });
 
-    const { stdout, exitCode } = await runCLI(["config", "use-profile", "prod"], HOME_CONFIG);
+    const { stdout, exitCode } = await runCLI(["config", "use-profile", "prod"]);
     expect(exitCode).toBeUndefined();
     expect(stdout.join("")).toContain("prod");
 
     // Verify it's now active by listing
-    const { stdout: list } = await runCLI(["config", "list-profiles"], HOME_CONFIG);
+    const { stdout: list } = await runCLI(["config", "list-profiles"]);
     expect(list.join("\n")).toContain("* prod");
   });
 
   it("exits 1 when the profile does not exist", async () => {
-    const { exitCode, stderr } = await runCLI(["config", "use-profile", "ghost"], HOME_CONFIG);
+    const { exitCode, stderr } = await runCLI(["config", "use-profile", "ghost"]);
     expect(exitCode).toBe(1);
     expect(stderr.join("")).toMatch(/not found/i);
   });
