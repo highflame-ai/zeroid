@@ -660,9 +660,13 @@ func (s *Server) Start() error {
 		// The admin plane has no built-in auth, and since the default mount
 		// moved from /api/v1 to the router root (PR #318) a network rule that
 		// matched /api/v1/* no longer covers it. Say so loudly on every start
-		// of a root-mounted deployment. (Config loading materializes the
-		// default into AdminPathPrefix, so test the effective value.)
-		if s.cfg.Server.GetAdminPathPrefix() == "" {
+		// of a root-mounted deployment that has NOT installed an AdminAuth
+		// hook — embedders such as highflame-authn mount at the root by
+		// design and gate the admin group themselves, so for them the warning
+		// would be noise. (Config loading materializes the default into
+		// AdminPathPrefix, so test the effective value; the hook is checked
+		// at Start, after embedders have had NewServer→AdminAuth to set it.)
+		if s.cfg.Server.GetAdminPathPrefix() == "" && s.adminAuthState.fn() == nil {
 			log.Warn().Msg("admin routes are mounted at the router root with no built-in auth " +
 				"(default changed from /api/v1 in v1.2 / PR #318) — expose only /health, /.well-known/*, " +
 				"/oauth2/* publicly, or set server.admin_path_prefix / an AdminAuth hook")
