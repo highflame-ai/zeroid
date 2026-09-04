@@ -30,11 +30,14 @@ import { registerCiba } from "../src/commands/ciba/index.js";
 export const BASE_URL = "http://zeroid.test";
 
 /**
- * Per-test-file config dir so profile reads/writes never touch the real
- * ~/.config/zeroid (init tests save profiles; without this they leak onto the
- * developer's machine and into later tests).
+ * Isolate profile reads/writes from the developer's real ~/.config/zeroid for
+ * the whole test process (init tests save profiles; without this they leak
+ * onto the developer's machine and into later tests). Set once at module load
+ * rather than injected per runCLI, so a test file that re-points
+ * process.env.ZID_CONFIG_DIR itself (e.g. config.test.ts's per-test fresh
+ * dirs) is not overridden.
  */
-export const TEST_CONFIG_DIR = mkdtempSync(join(tmpdir(), "zeroid-cli-test-"));
+process.env.ZID_CONFIG_DIR ??= mkdtempSync(join(tmpdir(), "zeroid-cli-test-"));
 
 /** A fresh, empty config dir — for tests that must see no saved profile. */
 export function emptyConfigDir(): string {
@@ -47,7 +50,6 @@ export const AUTH_ENV = {
   ZID_ACCOUNT_ID: "acct_test",
   ZID_PROJECT_ID: "proj_test",
   ZID_BASE_URL: BASE_URL,
-  ZID_CONFIG_DIR: TEST_CONFIG_DIR,
 };
 
 /** Result of running a CLI command in test. */

@@ -87,7 +87,7 @@ def _fetch_all_identities() -> dict[str, tuple[str, str]]:
     offset, limit = 0, 100
     while True:
         resp = client._transport.request(
-            "GET", f"/api/v1/identities?limit={limit}&offset={offset}"
+            "GET", f"/identities?limit={limit}&offset={offset}"
         )
         page = resp.json().get("identities") or []
         for i in page:
