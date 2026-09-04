@@ -77,6 +77,10 @@ token:
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.
+# That includes the CIBA approve/deny endpoints, which sit inside /oauth2/*
+# (/oauth2/bc-authorize/{id}/approve|deny) and take the approving human's subject_id
+# in the body — a public-prefix allowlist does NOT cover them. In production, route them
+# through your user-auth gateway (SaaS does this via AuthN) and deny them at the edge.
 # In production, protect them at the network layer (reverse proxy, VPN, firewall)
 # or use the AdminAuth hook when embedding ZeroID as a library.
 

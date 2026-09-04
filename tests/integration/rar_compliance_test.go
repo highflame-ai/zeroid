@@ -351,7 +351,7 @@ func issueRARToken(t *testing.T, rar []map[string]any) (tokenBody map[string]any
 	require.NotEmpty(t, authReqID)
 
 	approveResp := post(t,
-		adminPath("/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": "compliance-subject"},
 		adminHeaders(),
 	)
@@ -406,7 +406,7 @@ func TestRFC9396_S5_2_TokenResponseCarriesEmptyArrayForLegacyFlow(t *testing.T) 
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 
 	approveResp := post(t,
-		adminPath("/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": "compliance-subject-legacy"},
 		adminHeaders(),
 	)

@@ -463,7 +463,7 @@ func TestCIBA_RAR_TokenSideEndToEnd(t *testing.T) {
 
 	// ── Step 2: admin approves ──────────────────────────────────────────────
 	approveResp := post(t,
-		adminPath("/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{
 			"subject_id":    approvedUserID,
 			"subject_email": approvedUserEmail,
@@ -544,7 +544,7 @@ func TestCIBA_RAR_LegacyFlowCarriesEmptyArray(t *testing.T) {
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 
 	approveResp := post(t,
-		adminPath("/bc-authorize/"+authReqID+"/approve"),
+		adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"),
 		map[string]any{"subject_id": approvedUserID},
 		adminHeaders(),
 	)

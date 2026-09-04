@@ -22,7 +22,7 @@ export function registerCibaApprove(cibaCmd: Command): void {
     .option("--admin-base-url <url>", "Admin API base URL (defaults to profile base URL)")
     .option(
       "--admin-prefix <path>",
-      'Admin route prefix before /bc-authorize (default: none — admin routes at the server root; set /api/v1 for pre-flip deployments)',
+      'Admin route prefix before /oauth2/bc-authorize (default: none — admin routes at the server root; set /api/v1 for pre-flip deployments)',
     )
     .option("--internal-service <name>", "Internal service name header for protected admin routes")
     .option("--internal-service-secret <secret>", "Internal service secret header")
@@ -48,7 +48,7 @@ export function registerCibaApprove(cibaCmd: Command): void {
           context,
           buildCibaAdminPath(
             admin,
-            `/bc-authorize/${encodeURIComponent(authReqID)}/approve`,
+            `/oauth2/bc-authorize/${encodeURIComponent(authReqID)}/approve`,
           ),
           {
             subject_id: opts.subjectId as string,

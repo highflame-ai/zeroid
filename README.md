@@ -888,11 +888,27 @@ graph TD
 Admin endpoints are served at the **router root** by default (`server.admin_path_prefix: ""`;
 set it to e.g. `/api/v1` to restore a prefix — deployments upgrading from the prefixed
 default must update any network rules that matched `/api/v1/*`). None of these routes
-carry built-in auth: expose only the public surface (`/health`, `/.well-known/*`,
-`/oauth2/*`) and block everything else, or use the `AdminAuth` hook when embedding.
-The CIBA approve/deny endpoints live at `/bc-authorize/{auth_req_id}/*` — deliberately
-*outside* `/oauth2/*`, so an allowlist of the public OAuth surface never exposes them;
-the deployer's user-auth gateway authenticates the end user before forwarding to them.
+carry built-in auth. This mirrors how the SaaS deployment runs: the same routes, with
+Highflame AuthN authenticating every admin call in front of them via the `AdminAuth` hook.
+Self-hosting, you provide that layer yourself — either the `AdminAuth` hook when
+embedding, or network rules that expose only the public surface (`/health`,
+`/.well-known/*`, `/oauth2/*`) and block everything else.
+
+**CIBA approve/deny need a user-auth gateway in production.** The two admin endpoints
+`POST /oauth2/bc-authorize/{auth_req_id}/approve` and `.../deny` take the approving
+human's `subject_id` in the request body — ZeroID has no user login of its own — so
+whoever can reach them approves *as anyone*. Note that they live inside `/oauth2/*`, so a
+public-prefix allowlist does **not** protect them: route them through the gateway that
+authenticates your users (SaaS does this through AuthN, which resolves the approver from
+the signed-in session) and deny them from the public edge, ahead of the `/oauth2/` allow:
+
+```nginx
+location ~ ^/oauth2/bc-authorize/[^/]+/(approve|deny)$ { deny all; }   # admin — gateway only
+location /oauth2/ { proxy_pass http://zeroid; }                          # public OAuth surface
+```
+
+Deployments that never use CIBA should still add that rule: the endpoints are registered
+regardless, and the default credential policy permits the CIBA grant.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -925,8 +941,8 @@ the deployer's user-auth gateway authenticates the end user before forwarding to
 | GET | `/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
 | GET | `/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
 | GET | `/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
-| POST | `/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
-| POST | `/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
+| POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
+| POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
 Full interactive docs at `GET /docs` when running.
 

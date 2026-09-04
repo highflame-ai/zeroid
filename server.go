@@ -655,8 +655,8 @@ func (s *Server) Start() error {
 			prefix = "/"
 		}
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
-		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*, bc-authorize/*")
+		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/* — except the admin CIBA endpoints /oauth2/bc-authorize/{id}/approve|deny")
+		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*, oauth2/bc-authorize/{id}/approve|deny")
 		// The admin plane has no built-in auth, and since the default mount
 		// moved from /api/v1 to the router root (PR #318) a network rule that
 		// matched /api/v1/* no longer covers it. Say so loudly on every start
@@ -667,9 +667,10 @@ func (s *Server) Start() error {
 		// AdminPathPrefix, so test the effective value; the hook is checked
 		// at Start, after embedders have had NewServer→AdminAuth to set it.)
 		if s.cfg.Server.GetAdminPathPrefix() == "" && s.adminAuthState.fn() == nil {
-			log.Warn().Msg("admin routes are mounted at the router root with no built-in auth " +
-				"(default changed from /api/v1 in v1.2 / PR #318) — expose only /health, /.well-known/*, " +
-				"/oauth2/* publicly, or set server.admin_path_prefix / an AdminAuth hook")
+			log.Warn().Msg("admin routes are mounted at the router root with no AdminAuth hook and no built-in auth " +
+				"(default changed from /api/v1 in PR #318) — install an AdminAuth hook, or expose only " +
+				"/health, /.well-known/* and /oauth2/* publicly while denying the admin CIBA endpoints " +
+				"/oauth2/bc-authorize/{id}/approve|deny at the edge (see README, Admin)")
 		}
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
