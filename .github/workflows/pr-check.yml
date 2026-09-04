@@ -266,10 +266,20 @@ jobs:
       # of printing decoded claims / selected fields only.
       - name: Lint committed notebook outputs for credential material
         shell: bash
+        # git ls-files (not a shell glob) so a moved/renamed notebook dir can
+        # never silently disarm the lint: grep exit 2 (error) fails the step
+        # instead of reading as "no match", and an empty file list is an error.
         run: |
-          if grep -RInE 'eyJ[A-Za-z0-9_-]{20,}|zid_sk_[A-Za-z0-9]|BEGIN[A-Z ]*PRIVATE KEY' \
-              examples/*.ipynb examples/odis/*.ipynb; then
+          files=$(git ls-files 'examples/**/*.ipynb' 'examples/*.ipynb')
+          if [ -z "$files" ]; then
+            echo "::error::no committed notebooks found — lint target list is broken"; exit 1
+          fi
+          status=0
+          grep -InE 'eyJ[A-Za-z0-9_-]{20,}|zid_sk_[A-Za-z0-9]|BEGIN[A-Z ]*PRIVATE KEY' $files || status=$?
+          if [ "$status" -eq 0 ]; then
             echo "::error::credential-looking material found in committed notebook(s)"; exit 1
+          elif [ "$status" -ne 1 ]; then
+            echo "::error::credential lint failed to run (grep exit $status)"; exit "$status"
           fi
 
       - name: Execute the quickstart + ODIS notebooks against the live server
