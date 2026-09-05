@@ -1,8 +1,13 @@
 package integration_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -91,7 +96,11 @@ func TestResourceIndicator_BindsClientCredentialsToken(t *testing.T) {
 
 		assert.Nil(t, resourceClaimOf(t, claims),
 			"an unbound token must carry no resource claim at all")
-		assert.NotEqual(t, []string{mcpGithub}, audienceOf(t, claims))
+		// Assert what aud IS, not what it is not: NotEqual passes for any token
+		// not bound to that exact URL, and nothing could make an unrequested
+		// resource appear there.
+		assert.Equal(t, []string{testIssuer}, audienceOf(t, claims),
+			"an unbound token's aud must stay the issuer default")
 	})
 
 	t.Run("array form binds every value", func(t *testing.T) {
@@ -144,7 +153,7 @@ func TestResourceIndicator_Rejections(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b := clientCredsBody(t, "res-reject")
+			b := clientCredsBody(t, "res-reject-"+strings.ReplaceAll(tc.name, " ", "-"))
 			b["resource"] = tc.resource
 
 			resp := post(t, "/oauth2/token", b, nil)
@@ -345,9 +354,14 @@ func TestResourceIndicator_FormEncoded(t *testing.T) {
 		f["client_id"] = []string{f.Get("client_id"), "someone-else"}
 
 		resp := postForm(t, "/oauth2/token", f)
-		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		assert.NotEqual(t, http.StatusOK, resp.StatusCode,
 			"duplicate client_id must not be accepted")
+		// Assert WHY. Without this the case passes if the request failed for any
+		// unrelated reason, which would hide the carve-out becoming too broad.
+		assert.Contains(t, string(body), "duplicate OAuth parameter",
+			"must be rejected by the duplicate-parameter guard specifically")
 	})
 
 	t.Run("valueless resource is treated as omitted", func(t *testing.T) {
@@ -362,5 +376,131 @@ func TestResourceIndicator_FormEncoded(t *testing.T) {
 
 		assert.Nil(t, resourceClaimOf(t, claims),
 			"an empty resource parameter must leave the token unbound, not bound to \"\"")
+	})
+}
+
+// ── One test per ISSUANCE SITE, not per grant-type string ────────────────────
+//
+// `resourceSupportedGrants` is keyed by grant type, but several grants fork
+// internally to different IssueCredential call sites, and each fork must bind
+// independently. Covering "the grant" is not the same as covering "the site":
+// a fork that misses bindResourceOnIssue returns 200 with an UNBOUND token, and
+// Shield then allows it at every MCP server because the discriminator claim is
+// absent. Each test below is mutation-checked to fail if its call is removed.
+
+func TestResourceIndicator_BindsAPIKeyGrant(t *testing.T) {
+	agent := registerAgent(t, uid("res-apikey"))
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    agent.APIKey,
+		"resource":   mcpGithub,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+	_ = resp.Body.Close()
+
+	assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims),
+		"api_key grant must bind aud to the requested resource")
+	assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims),
+		"api_key grant must stamp the resource claim")
+}
+
+func TestResourceIndicator_BindsNHIDelegationExchange(t *testing.T) {
+	// token-exchange fork 1 of 3: NHI delegation (actor_token present).
+	scopes := []string{"data:read"}
+	_, _, parent := issueRootCredential(t, "", "res-deleg-root", scopes)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	extID := uid("res-deleg-child")
+	registerIdentityWithPolicy(t, extID, "", ecPublicKeyPEM(t, key), scopes, adminHeaders())
+	wimse := fetchIdentityWIMSEByExternalID(t, extID)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": parent,
+		"actor_token":   buildAssertion(t, key, wimse),
+		"scope":         "data:read",
+		"resource":      mcpGithub,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+	_ = resp.Body.Close()
+
+	assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims),
+		"a delegated token must carry the requested binding")
+	assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims))
+}
+
+func TestResourceIndicator_BindsExternalPrincipalExchange(t *testing.T) {
+	// token-exchange fork 2 of 3: trusted external-principal (no actor_token,
+	// no audience profile).
+	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": "external-principal-assertion",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"user_id":       uid("res-extprin"),
+		"resource":      mcpGithub,
+	}, trusted)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+	_ = resp.Body.Close()
+
+	assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims))
+	assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims))
+}
+
+// TestResourceIndicator_ExternalPrincipalBoundGetsNoRefreshToken pins the
+// invariant the code only ASSERTS in a comment: the external-principal refresh
+// token is gated on a profiled audience, and audience/resource are mutually
+// exclusive, so a bound request can never reach it.
+//
+// The reasoning is correct today, but it is one refactor from being wrong —
+// changing that gate from `len(audience) > 0` to `len(issue.Audience) > 0`
+// (which bindResourceOnIssue populates) would mint a refresh token for a bound
+// request, and the rotated token would come back unbound with nothing failing.
+func TestResourceIndicator_ExternalPrincipalBoundGetsNoRefreshToken(t *testing.T) {
+	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}
+	base := func(userID string) map[string]any {
+		return map[string]any{
+			"grant_type":          "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":       "external-principal-assertion",
+			"account_id":          testAccountID,
+			"project_id":          testProjectID,
+			"user_id":             userID,
+			"issue_refresh_token": true,
+		}
+	}
+
+	t.Run("baseline: a profiled audience DOES get a refresh token", func(t *testing.T) {
+		// Guards the assertion below from passing for the wrong reason.
+		b := base(uid("res-ep-base"))
+		b["audience"] = "codeoid"
+
+		resp := post(t, "/oauth2/token", b, trusted)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		token := decode(t, resp)
+		_ = resp.Body.Close()
+		assert.NotEmpty(t, token["refresh_token"])
+	})
+
+	t.Run("resource-bound gets none even with issue_refresh_token", func(t *testing.T) {
+		b := base(uid("res-ep-bound"))
+		b["resource"] = mcpGithub
+
+		resp := post(t, "/oauth2/token", b, trusted)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		token := decode(t, resp)
+		_ = resp.Body.Close()
+
+		assert.Empty(t, token["refresh_token"],
+			"a resource-bound token must never come with a refresh token — the "+
+				"binding is not carried across rotation")
+		claims := decodeJWTPayload(t, token["access_token"].(string))
+		assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims))
 	})
 }

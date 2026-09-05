@@ -1593,8 +1593,27 @@ var jsonShapedFormFields = map[string]struct{}{
 //
 // Repeats are collapsed into a JSON array so the downstream binder
 // (handler.resourceParam) sees the same shape a JSON caller would send.
-var repeatableFormFields = map[string]struct{}{
-	"resource": {},
+//
+// Scoped to /oauth2/token, the only endpoint that binds `resource`. Applying it
+// across every OAuthFormEndpoint would make a repeated `resource` on
+// /oauth2/bc-authorize parse cleanly and then be discarded by a body struct
+// that has no such field — advertising support for a parameter that does
+// nothing. Narrow the carve-out to where the parameter is real.
+var repeatableFormFields = map[string]map[string]struct{}{
+	"/oauth2/token": {
+		"resource": {},
+	},
+}
+
+// formFieldRepeatable reports whether parameter k may legally appear more than
+// once on the given endpoint.
+func formFieldRepeatable(path, k string) bool {
+	fields, ok := repeatableFormFields[path]
+	if !ok {
+		return false
+	}
+	_, repeatable := fields[k]
+	return repeatable
 }
 
 // mediaTypeEquals parses a Content-Type header and reports whether the media
@@ -1656,7 +1675,7 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 			// the parameter repeatable (repeatableFormFields), in which case
 			// every occurrence is preserved as a JSON array.
 			if len(vs) > 1 {
-				if _, repeatable := repeatableFormFields[k]; !repeatable {
+				if !formFieldRepeatable(r.URL.Path, k) {
 					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
 					return
 				}
