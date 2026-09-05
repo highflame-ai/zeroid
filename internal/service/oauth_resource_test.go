@@ -70,7 +70,13 @@ func TestValidateResourceIndicators(t *testing.T) {
 	})
 
 	t.Run("preserves order of first appearance", func(t *testing.T) {
-		got, _ := validateResourceIndicators([]string{"https://b.example", "https://a.example", "https://b.example"})
+		got, err := validateResourceIndicators([]string{"https://b.example", "https://a.example", "https://b.example"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("expected 2 values after de-duplication, got %#v", got)
+		}
 		if got[0] != "https://b.example" || got[1] != "https://a.example" {
 			t.Fatalf("order not preserved: %#v", got)
 		}
@@ -104,6 +110,7 @@ func TestValidateResourceIndicators(t *testing.T) {
 		{"non-empty fragment", "https://gw.example.com/mcp#frag", "fragment"},
 		{"bare trailing fragment marker", "https://gw.example.com/mcp#", "fragment"},
 		{"https with no host", "https://", "host"},
+		{"http with no host", "http://", "host"},
 	}
 	for _, tc := range rejects {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
@@ -115,6 +122,47 @@ func TestValidateResourceIndicators(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("rejects a value url.Parse itself cannot handle", func(t *testing.T) {
+		// Distinct from the !IsAbs path: "not-a-uri" parses fine and is caught by
+		// the absolute check. This exercises the parse-error branch, which was
+		// otherwise the only unreached statement in the function.
+		_, err := validateResourceIndicators([]string{"https://[::1"})
+		oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+		if !strings.Contains(oe.Description, "not a valid URI") {
+			t.Fatalf("expected the parse-error message, got %q", oe.Description)
+		}
+		if !errors.Is(err, err) || oe.Unwrap() == nil {
+			t.Fatal("the parse error must be wrapped as the cause")
+		}
+	})
+
+	t.Run("rejects a value over the per-value length cap", func(t *testing.T) {
+		// The COUNT cap does not bound token size; without this, eight huge URIs
+		// pass validation and land in aud, the resource claim, the signed JWT,
+		// the credentials row, and the logs.
+		long := "https://gw.example.com/mcp/" + strings.Repeat("a", maxResourceIndicatorLen)
+		_, err := validateResourceIndicators([]string{long})
+		oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+		if !strings.Contains(oe.Description, "maximum length") {
+			t.Fatalf("expected a length rejection, got %q", oe.Description)
+		}
+		if strings.Contains(oe.Description, "aaaa") {
+			t.Fatal("the error must not echo the oversized value back")
+		}
+	})
+
+	t.Run("a value exactly at the cap is accepted", func(t *testing.T) {
+		// Pins the boundary as inclusive, so a later off-by-one is a deliberate
+		// change rather than an accident.
+		exact := "https://gw.example.com/" + strings.Repeat("a", maxResourceIndicatorLen-23)
+		if len(exact) != maxResourceIndicatorLen {
+			t.Fatalf("test fixture is %d bytes, expected %d", len(exact), maxResourceIndicatorLen)
+		}
+		if _, err := validateResourceIndicators([]string{exact}); err != nil {
+			t.Fatalf("a value exactly at the cap must be accepted: %v", err)
+		}
+	})
 
 	t.Run("rejects more than the cap", func(t *testing.T) {
 		many := make([]string, 0, maxResourceIndicators+1)
@@ -280,8 +328,8 @@ func TestBindResourceOnIssue(t *testing.T) {
 		if issue.Audience != nil {
 			t.Fatalf("aud was set with no resource: %#v", issue.Audience)
 		}
-		if issue.CustomClaims != nil {
-			t.Fatalf("CustomClaims allocated with no resource: %#v", issue.CustomClaims)
+		if issue.CustomClaims["resource"] != nil {
+			t.Fatalf("a resource claim appeared with no resource requested: %#v", issue.CustomClaims)
 		}
 	})
 

@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/highflame-ai/zeroid/internal/oautherror"
@@ -46,6 +48,7 @@ func TestTokenGate_SupportedGrantsPassTheGate(t *testing.T) {
 
 	for _, grant := range []string{
 		"client_credentials",
+		"api_key",
 		"urn:ietf:params:oauth:grant-type:token-exchange",
 		"authorization_code",
 	} {
@@ -54,8 +57,17 @@ func TestTokenGate_SupportedGrantsPassTheGate(t *testing.T) {
 				GrantType: grant,
 				Resource:  []string{"https://gw.example/mcp/github"},
 			})
-			// invalid_request = reached the grant's own validation.
-			wantOAuthError(t, err, oautherror.InvalidRequest)
+			// Assert the PROPERTY — the gate did not intercept — rather than each
+			// grant's internal validation order. Pinning the exact first error
+			// would break this test when an unrelated guard is added to any of
+			// these grants, which is a false signal about the resource gate.
+			if err == nil {
+				t.Fatal("expected the grant's own validation to reject an otherwise-empty request")
+			}
+			var oe *OAuthError
+			if errors.As(err, &oe) && oe.Code == oautherror.InvalidTarget {
+				t.Fatalf("resource gate intercepted a supported grant: %s", oe.Description)
+			}
 		})
 	}
 }
@@ -129,8 +141,12 @@ func TestJWTBearer_SelfSignedRejectsResource(t *testing.T) {
 		Resource:  []string{"https://gw.example/mcp/github"},
 	})
 	oe := wantOAuthError(t, err, oautherror.InvalidTarget)
-	if oe.Description == "" {
-		t.Fatal("rejection should explain which path refused the parameter")
+	// Must name the self-signed path. Asserting only the CODE would pass even if
+	// jwt-bearer were removed from resourceSupportedGrants entirely — the
+	// Token() gate returns the same invalid_target — so the whole ID-JAG
+	// narrowing capability could be deleted with this test still green.
+	if !strings.Contains(oe.Description, "self-signed") {
+		t.Fatalf("rejection must come from the NHI path, not the dispatch gate: %q", oe.Description)
 	}
 }
 

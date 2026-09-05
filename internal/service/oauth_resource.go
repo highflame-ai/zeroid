@@ -33,6 +33,15 @@ import (
 // that matters for token size.
 const maxResourceIndicators = 8
 
+// maxResourceIndicatorLen bounds each individual value. The count cap alone does
+// NOT bound token size — eight megabyte-long URIs pass a count check and then
+// land in `aud`, in the `resource` claim, in the signed JWT, in the credentials
+// row, and in the error/log lines that echo them. 2 KiB is far above any real
+// RFC 9728 identifier (`<origin>/mcp/<slug>` is tens of bytes) and far below
+// anything that inflates a token. Mirrors maxObservedResourceLen, which the
+// inventory path already enforces.
+const maxResourceIndicatorLen = 2048
+
 // validateResourceIndicators checks a `resource` request parameter against
 // RFC 8707 §2 and returns the de-duplicated list to bind.
 //
@@ -77,6 +86,12 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 		if strings.TrimSpace(raw) == "" {
 			return nil, oauthBadRequest(oautherror.InvalidTarget,
 				"resource must not be empty")
+		}
+		// Checked before parsing so a pathological value is rejected without
+		// url.Parse walking it, and the error never echoes the oversized input.
+		if len(raw) > maxResourceIndicatorLen {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource exceeds the maximum length of %d bytes", maxResourceIndicatorLen))
 		}
 		// Deliberately NOT TrimSpace'd into the parse: a value with surrounding
 		// whitespace is a malformed identifier, not one to silently repair.
