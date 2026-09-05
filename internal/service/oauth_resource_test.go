@@ -57,6 +57,14 @@ func TestValidateResourceIndicators(t *testing.T) {
 		}
 	})
 
+	t.Run("accepts a non-http scheme that DOES name an authority", func(t *testing.T) {
+		// The authority rule is about naming a host when you claim one, not about
+		// which schemes are allowed.
+		if _, err := validateResourceIndicators([]string{"ftp://files.example.com/mcp"}); err != nil {
+			t.Fatalf("authority-bearing non-http scheme rejected: %v", err)
+		}
+	})
+
 	t.Run("de-duplicates rather than rejecting", func(t *testing.T) {
 		got, err := validateResourceIndicators([]string{
 			"https://a.example/mcp", "https://a.example/mcp", "https://b.example/mcp",
@@ -111,6 +119,10 @@ func TestValidateResourceIndicators(t *testing.T) {
 		{"bare trailing fragment marker", "https://gw.example.com/mcp#", "fragment"},
 		{"https with no host", "https://", "host"},
 		{"http with no host", "http://", "host"},
+		// Any scheme that declares an authority must name one — the rule is the
+		// "//" marker, not an http/https allow-list.
+		{"ftp with no host", "ftp://", "host"},
+		{"unknown scheme with no host", "foo://", "host"},
 	}
 	for _, tc := range rejects {
 		t.Run("rejects "+tc.name, func(t *testing.T) {

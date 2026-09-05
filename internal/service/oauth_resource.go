@@ -105,11 +105,17 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 				fmt.Sprintf("resource %q must be an absolute URI (RFC 8707 §2)", raw))
 		}
 		// url.Parse accepts "https://" with no host and yields IsAbs()==true, so
-		// the absolute check alone is not enough to reject a hostless value for
-		// the network schemes we actually bind against.
-		if (u.Scheme == "http" || u.Scheme == "https") && u.Host == "" {
+		// the absolute check alone is not enough to reject a hostless value.
+		//
+		// Keyed on the "//" authority marker rather than an http/https allow-list:
+		// any scheme that declares an authority must actually name one, so
+		// "ftp://" and "foo://" are rejected on the same grounds as "https://".
+		// A scheme with no authority component is left alone — "urn:example:mcp"
+		// is a legitimate absolute URI with no host to require, and RFC 8707 §2
+		// says absolute URI, not http(s) URL.
+		if strings.Contains(raw, "://") && u.Host == "" {
 			return nil, oauthBadRequest(oautherror.InvalidTarget,
-				fmt.Sprintf("resource %q must include a host", raw))
+				fmt.Sprintf("resource %q declares an authority but names no host", raw))
 		}
 		// Fragment is checked via the raw string as well as the parsed struct:
 		// a trailing "#" parses to an empty Fragment but is still a fragment
