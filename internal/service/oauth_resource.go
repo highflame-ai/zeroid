@@ -173,9 +173,12 @@ func narrowResourcesTo(authorized, requested []string) ([]string, error) {
 // issued no refresh token at all, so the case should not arise — this is the
 // second lock on that door.
 var resourceSupportedGrants = map[string]bool{
-	// Populated as each grant's binding lands. Empty means every `resource`
-	// request is refused with invalid_target — accepted-and-ignored is the one
-	// outcome that must never happen.
+	// jwt-bearer covers the ID-JAG profile, where `resource` SELECTS a subset of
+	// the resources the corporate IdP already authorized (narrowResourcesTo).
+	// The NHI self-signed jwt-bearer path shares this grant type and rejects the
+	// parameter itself — see jwtBearer — because it has no authorized set to
+	// narrow against.
+	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
 }
 
 func grantSupportsResource(grantType string) bool {

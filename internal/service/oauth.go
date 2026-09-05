@@ -693,6 +693,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return s.idJAGBearer(ctx, req)
 	}
 
+	// `resource` is honoured on the ID-JAG profile only, where it narrows the
+	// set the corporate IdP authorized. The NHI self-signed path has no such
+	// authorized set — the assertion proves possession of a registered key and
+	// says nothing about which resources the agent may reach — so there is
+	// nothing to narrow against and binding would be an unreviewed grant of
+	// exactly the kind CAP-IDN-026 avoids by only ever narrowing. Reject rather
+	// than ignore: the grant type is marked as supporting `resource`, so without
+	// this the parameter would be silently dropped here.
+	if err := rejectUnsupportedResource(req, "self-signed jwt-bearer (RFC 7523)"); err != nil {
+		return nil, err
+	}
+
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
 	if err := jwtalg.Validate(req.Subject); err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
