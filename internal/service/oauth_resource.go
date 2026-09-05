@@ -187,7 +187,7 @@ var resourceSupportedGrants = map[string]bool{
 	"client_credentials": true,
 	"api_key":            true,
 	"urn:ietf:params:oauth:grant-type:token-exchange": true,
-	"authorization_code": true,
+	"authorization_code":                              true,
 }
 
 func grantSupportsResource(grantType string) bool {
