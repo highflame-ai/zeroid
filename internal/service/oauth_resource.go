@@ -179,10 +179,51 @@ var resourceSupportedGrants = map[string]bool{
 	// parameter itself — see jwtBearer — because it has no authorized set to
 	// narrow against.
 	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
+	// The ordinary grants bind directly (bindResourceOnIssue): there is no
+	// upstream authorized set to narrow against, so the requested resource
+	// simply restricts where the token they would have minted anyway is
+	// honoured. This is the case zeroid#258 exists for — a resource-bound token
+	// with no enterprise IdP in the loop.
+	"client_credentials": true,
+	"api_key":            true,
+	"urn:ietf:params:oauth:grant-type:token-exchange": true,
+	"authorization_code": true,
 }
 
 func grantSupportsResource(grantType string) bool {
 	return resourceSupportedGrants[grantType]
+}
+
+// bindResourceOnIssue stamps an RFC 8707 binding onto an issuance request.
+//
+// Two claims, deliberately, because they answer different questions:
+//
+//   - `aud` — RFC 8707 §2 conformance. A resource-indicator request produces a
+//     token audienced to the resource, which is what a spec-following resource
+//     server checks.
+//   - `resource` — the discriminator INV-IDN-006 enforcement keys on. It cannot
+//     read `aud` for this: ZeroID stamps `aud` on every token it issues,
+//     defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
+//     says nothing about whether a binding exists. Treating it as if it did
+//     denied every MCP-targeted request in prod (shield#366). Presence of the
+//     `resource` claim is the signal; its absence means "not bound".
+//
+// `resource` is in reservedClaims, so setting it here — the same direct-to-
+// CustomClaims route the ID-JAG path uses — is the ONLY way it can appear. A
+// caller can never inject or widen one through additional_claims, which is what
+// keeps the claim's presence load-bearing.
+//
+// A no-op when nothing was requested, so callers can apply it unconditionally
+// and no grant's default issuance shape changes.
+func bindResourceOnIssue(issue *IssueRequest, resources []string) {
+	if len(resources) == 0 {
+		return
+	}
+	issue.Audience = resources
+	if issue.CustomClaims == nil {
+		issue.CustomClaims = make(map[string]any, 1)
+	}
+	issue.CustomClaims["resource"] = resources
 }
 
 // rejectUnsupportedResource fails a request that carries `resource` on a grant

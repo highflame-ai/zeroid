@@ -270,3 +270,88 @@ func TestRefreshTokenNeverSupportsResource(t *testing.T) {
 		t.Fatal("refresh_token must never accept a resource parameter")
 	}
 }
+
+func TestBindResourceOnIssue(t *testing.T) {
+	resources := []string{"https://gw.example/mcp/github"}
+
+	t.Run("no resource leaves issuance untouched", func(t *testing.T) {
+		issue := IssueRequest{Scopes: []string{"mcp:connect"}}
+		bindResourceOnIssue(&issue, nil)
+		if issue.Audience != nil {
+			t.Fatalf("aud was set with no resource: %#v", issue.Audience)
+		}
+		if issue.CustomClaims != nil {
+			t.Fatalf("CustomClaims allocated with no resource: %#v", issue.CustomClaims)
+		}
+	})
+
+	t.Run("stamps both aud and the resource claim", func(t *testing.T) {
+		var issue IssueRequest
+		bindResourceOnIssue(&issue, resources)
+		if len(issue.Audience) != 1 || issue.Audience[0] != resources[0] {
+			t.Fatalf("aud not stamped: %#v", issue.Audience)
+		}
+		got, ok := issue.CustomClaims["resource"].([]string)
+		if !ok || len(got) != 1 || got[0] != resources[0] {
+			t.Fatalf("resource claim not stamped: %#v", issue.CustomClaims["resource"])
+		}
+	})
+
+	t.Run("preserves existing custom claims", func(t *testing.T) {
+		issue := IssueRequest{CustomClaims: map[string]any{"role": "admin"}}
+		bindResourceOnIssue(&issue, resources)
+		if issue.CustomClaims["role"] != "admin" {
+			t.Fatal("an existing custom claim was dropped")
+		}
+		if issue.CustomClaims["resource"] == nil {
+			t.Fatal("resource claim missing")
+		}
+	})
+
+	t.Run("resource claim wins over a pre-set one", func(t *testing.T) {
+		// Defence in depth. `resource` is in reservedClaims so additional_claims
+		// can never reach here, but if some future path pre-populates it, the
+		// value validated for THIS request must be the one that lands — a
+		// binding must never be widened by a leftover.
+		issue := IssueRequest{CustomClaims: map[string]any{
+			"resource": []string{"https://gw.example/mcp/everything"},
+		}}
+		bindResourceOnIssue(&issue, resources)
+		got := issue.CustomClaims["resource"].([]string)
+		if len(got) != 1 || got[0] != resources[0] {
+			t.Fatalf("pre-set resource was not overwritten: %#v", got)
+		}
+	})
+
+	t.Run("aud is replaced, not appended", func(t *testing.T) {
+		// A binding narrows; leaving a prior audience alongside it would widen
+		// where the token is accepted.
+		issue := IssueRequest{Audience: []string{"https://auth.highflame.ai"}}
+		bindResourceOnIssue(&issue, resources)
+		if len(issue.Audience) != 1 || issue.Audience[0] != resources[0] {
+			t.Fatalf("aud was widened rather than replaced: %#v", issue.Audience)
+		}
+	})
+
+	t.Run("binds every requested resource", func(t *testing.T) {
+		multi := []string{"https://gw.example/mcp/a", "https://gw.example/mcp/b"}
+		var issue IssueRequest
+		bindResourceOnIssue(&issue, multi)
+		if len(issue.Audience) != 2 {
+			t.Fatalf("aud dropped a resource: %#v", issue.Audience)
+		}
+		if len(issue.CustomClaims["resource"].([]string)) != 2 {
+			t.Fatalf("claim dropped a resource: %#v", issue.CustomClaims["resource"])
+		}
+	})
+}
+
+// TestResourceIsReserved is a tripwire: bindResourceOnIssue is only the sole
+// writer of the `resource` claim for as long as additional_claims cannot reach
+// it. If reservedClaims ever loses the entry, the claim stops being proof that
+// ZeroID recorded a binding and INV-IDN-006 enforcement becomes forgeable.
+func TestResourceIsReserved(t *testing.T) {
+	if !reservedClaims["resource"] {
+		t.Fatal("resource must stay in reservedClaims — the claim's presence is the security signal")
+	}
+}

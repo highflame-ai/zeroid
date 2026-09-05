@@ -659,13 +659,16 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -998,7 +1001,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// child that survives the parent's expiry — and once the parent row
 	// expires, the cascade-revocation walk can no longer reach the child
 	// (the traversal anchors on live ancestry).
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:            actorIdentity,
 		IdentityPolicyID:    actorPolicy.ID,
 		Scopes:              scopes,
@@ -1009,7 +1012,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -1175,7 +1181,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		audience = []string{req.Audience}
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
@@ -1189,7 +1195,16 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	// The external-principal exchange binds too. It cannot collide with the
+	// audience profile above — `audience` and `resource` are mutually exclusive
+	// at the Token() gate, so exactly one of them is ever non-empty here. That
+	// exclusivity also means the refresh token in step 6 is unreachable for a
+	// bound request (it is gated on a profiled audience), which is why this path
+	// needs no separate refresh suppression.
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
@@ -1442,7 +1457,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		scopes = intersectScopes(scopes, identity.AllowedScopes)
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:           identity,
 		IdentityPolicyID:   identityPolicyID,
 		CredentialPolicyID: sk.CredentialPolicyID,
@@ -1457,7 +1472,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -2046,7 +2064,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
@@ -2056,7 +2074,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		TTL:               ttl,
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -2067,8 +2088,35 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	var refreshFamilyID string
 
+	// A resource-bound access token is issued WITHOUT a refresh token, even for
+	// a client registered for the refresh_token grant (CAP-IDN-026).
+	//
+	// The refresh path re-mints from state carried on the refresh-token row —
+	// scopes, mission, the audience-profile name — and the RFC 8707 binding is
+	// not among them: it lives in CustomClaims, which rotation does not carry.
+	// So a rotated token would come back UNBOUND, silently. Bind to server X,
+	// refresh, use anywhere — no error at any step, and INV-IDN-006 enforcement
+	// goes quiet because the discriminator claim is simply gone.
+	//
+	// Suppressing is the fail-closed answer and needs no schema change. It also
+	// matches what the binding is for: an RFC 8707 binding is a narrow, short-
+	// lived grant for one resource, and long-lived continuity for a deliberately
+	// narrow credential is a smell. A client that wants a fresh bound token asks
+	// for one — that is a new authorization decision, which is the right shape.
+	//
+	// Carrying the binding on the refresh row instead (a `resource` column,
+	// mirroring migration 039's `audience`) is the alternative if long-lived
+	// resource-bound sessions ever have a real use case.
+	resourceBound := len(req.Resource) > 0
+	if resourceBound && hasRefreshGrant {
+		log.Info().
+			Str("client_id", req.ClientID).
+			Strs("resource", req.Resource).
+			Msg("resource-bound authorization_code exchange: refresh token suppressed (binding is not carried across rotation)")
+	}
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
-	if hasRefreshGrant && s.refreshTokenSvc != nil {
+	if hasRefreshGrant && !resourceBound && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:          req.ClientID,
 			AccountID:         authCode.AccountID,
