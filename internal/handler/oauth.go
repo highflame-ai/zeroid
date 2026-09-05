@@ -47,7 +47,12 @@ type TokenInput struct {
 		// MUST use `assertion`. Both may be sent only if they carry the same
 		// value — see resolveAssertion for why a mismatch is refused rather
 		// than resolved.
-		Subject string `json:"subject,omitempty" doc:"DEPRECATED alias for assertion — use assertion (RFC 7523 §2.1)"`
+		// `deprecated:"true"` flows into the generated OpenAPI schema, so
+		// generated clients and spec tooling surface the parameter as
+		// deprecated. This PR's whole audience is standards-conformant external
+		// clients, and the schema is the channel they actually read — a doc
+		// string alone would deprecate it only for humans reading Go.
+		Subject string `json:"subject,omitempty" deprecated:"true" doc:"DEPRECATED alias for assertion — use assertion (RFC 7523 §2.1)"`
 		APIKey  string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
 		// token_exchange (RFC 8693) fields:
 		SubjectToken     string `json:"subject_token,omitempty" doc:"Subject token being exchanged"`
@@ -203,16 +208,6 @@ type OAuthRevokeOutput struct {
 // client-auth attempt fails (RFC 6749 §5.2).
 const basicAuthChallenge = `Basic realm="zeroid", charset="UTF-8"`
 
-// resolveInspectionClientAuth merges the two supported client authentication
-// methods on the introspection/revocation endpoints: client_secret_basic
-// (Authorization header) and client_secret_post (body fields). Returns the
-// effective credentials plus whether the Basic header was the source (drives
-// the RFC 6749 §5.2 WWW-Authenticate echo on failure).
-//
-// Per RFC 6749 §2.3 a client MUST NOT use more than one method in a single
-// request — presenting both is rejected as invalid_request. Non-Basic
-// Authorization schemes are ignored (treated as not presented) so bearer
-// headers from generic middleware don't break the anonymous internal path.
 // resolveAssertion picks the JWT for the jwt-bearer grant from the RFC 7523
 // §2.1 `assertion` parameter, falling back to ZeroID's legacy `subject`
 // spelling.
@@ -242,6 +237,16 @@ func resolveAssertion(assertion, subject string) (string, error) {
 	}
 }
 
+// resolveInspectionClientAuth merges the two supported client authentication
+// methods on the introspection/revocation endpoints: client_secret_basic
+// (Authorization header) and client_secret_post (body fields). Returns the
+// effective credentials plus whether the Basic header was the source (drives
+// the RFC 6749 §5.2 WWW-Authenticate echo on failure).
+//
+// Per RFC 6749 §2.3 a client MUST NOT use more than one method in a single
+// request — presenting both is rejected as invalid_request. Non-Basic
+// Authorization schemes are ignored (treated as not presented) so bearer
+// headers from generic middleware don't break the anonymous internal path.
 // Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
 func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
 	badRequest := func(desc string) *service.OAuthError {
@@ -435,6 +440,18 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 			}, nil
 		}
 		dpopThumbprint = res.Thumbprint
+	}
+
+	// Adoption telemetry for the deprecated alias. Without a signal, deciding
+	// when `subject` can be removed is a guess, and the alias lives forever.
+	// Logged at the call site rather than inside resolveAssertion so the record
+	// carries grant_type — which tells you WHICH caller still needs migrating,
+	// not merely that someone does. Never log the assertion itself: it is
+	// credential material.
+	if input.Body.Assertion == "" && input.Body.Subject != "" {
+		log.Debug().
+			Str("grant_type", input.Body.GrantType).
+			Msg("deprecated `subject` parameter used; clients should send `assertion` (RFC 7523 §2.1)")
 	}
 
 	assertion, assertionErr := resolveAssertion(input.Body.Assertion, input.Body.Subject)

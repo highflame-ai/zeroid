@@ -154,6 +154,34 @@ func TestRFC7523_S2_1_SubjectRemainsAcceptedAsDeprecatedAlias(t *testing.T) {
 	assert.NotEmpty(t, body["access_token"])
 }
 
+func TestRFC7523_S2_1_SubjectMarkedDeprecatedInOpenAPI(t *testing.T) {
+	// Not an RFC clause. The audience for this deprecation is machines —
+	// generated SDKs, spec tooling, the clients we are asking to migrate onto
+	// `assertion`. A Go doc string deprecates the field only for people reading
+	// our source, which is nobody in that audience. This asserts the signal
+	// reaches the channel they actually read, and keeps it from being dropped
+	// by a future refactor of the request struct.
+	resp := get(t, "/openapi.json", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	spec := decode(t, resp)
+	components, _ := spec["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	body, _ := schemas["TokenInputBody"].(map[string]any)
+	props, _ := body["properties"].(map[string]any)
+	require.NotNil(t, props, "TokenInputBody schema must expose its properties")
+
+	require.Contains(t, props, "assertion",
+		"the RFC 7523 §2.1 parameter must appear in the published schema, or a "+
+			"generated client has no way to discover it")
+
+	subject, _ := props["subject"].(map[string]any)
+	require.NotNil(t, subject, "the deprecated alias stays in the schema while it still works")
+	assert.Equal(t, true, subject["deprecated"],
+		"`subject` must be advertised as deprecated so generated clients and "+
+			"spec tooling steer callers to `assertion`")
+}
+
 func TestRFC7523_S2_1_ConflictingAssertionAndSubjectRejected(t *testing.T) {
 	// Not an RFC clause — the disambiguation rule the alias forces us to have.
 	// Two DIFFERENT assertions in one request is a red flag, not a merge:
