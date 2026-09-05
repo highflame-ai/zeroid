@@ -380,7 +380,7 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 			return client, nil
 		}
 
-		return s.resolveUncached(ctx, clientID)
+		return s.resolveUncached(ctx, clientID, u.Hostname())
 	})
 	if err != nil {
 		return nil, err
@@ -402,7 +402,15 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 // for one client_id. Split out of ResolveClient so the singleflight callback
 // stays readable; it must only be called from inside a flight, because it
 // assumes the caller has established there is no usable cache entry.
-func (s *CIMDService) resolveUncached(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
+//
+// clientIDHost is the already-parsed host of clientID, passed in rather than
+// re-derived: ResolveClient has parsed it and run it past domainAllowed before
+// entering the flight, so re-parsing here would repeat that work and introduce
+// an error branch that cannot be reached. It is a pure function of clientID,
+// which is the singleflight key, so every caller sharing a flight agrees on it.
+func (s *CIMDService) resolveUncached(
+	ctx context.Context, clientID, clientIDHost string,
+) (*domain.OAuthClient, error) {
 	doc, docTTL, err := s.fetch(ctx, clientID)
 	if err != nil {
 		// Negative-cache the failure so replaying a dead URL can't force a
@@ -421,6 +429,10 @@ func (s *CIMDService) resolveUncached(ctx context.Context, clientID string) (*do
 		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
 		return nil, err
 	}
+	if err := s.redirectHostsAllowed(clientIDHost, client.RedirectURIs); err != nil {
+		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
+		return nil, err
+	}
 
 	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
 	log.Info().
@@ -429,6 +441,53 @@ func (s *CIMDService) resolveUncached(ctx context.Context, clientID string) (*do
 		Int("redirect_uris", len(client.RedirectURIs)).
 		Msg("CIMD: resolved client from metadata document")
 	return client, nil
+}
+
+// redirectHostsAllowed enforces the allow-list on https redirect destinations,
+// not just on the host that published the document.
+//
+// The allow-list is what lets a CIMD client be redirected to at all — see
+// API.refusesRedirectTo. That gate reads "an allow-listed publisher is a vetted
+// party", and the two only mean the same thing if the destination is vetted too.
+// Without this check they come apart on any host where more than one party can
+// publish a path: a user-content path, a raw-file CDN, a bucket with broad
+// write, a shared internal app host. Publish a document there naming
+// redirect_uri https://evil.example/cb and the deployment 302s an
+// unauthenticated caller to evil.example — and worse, sends a victim through
+// the real login page first, so the code arrives after a genuine sign-in. That
+// is exactly what the self-asserted carve-out was added to prevent, reachable
+// through the switch that is supposed to lift it safely.
+//
+// Same host as the client_id passes without being listed: a document may always
+// name callbacks on the host that published it, which is the ordinary case and
+// needs no extra configuration.
+//
+// Loopback http and private-use schemes are exempt. Their destination is the
+// caller's own machine, not a host anybody publishes to, so a deployment-wide
+// host allow-list has nothing to say about them — and they are the native and
+// MCP client shape, which must keep working.
+//
+// In open mode (no allow-list) domainAllowed admits everything, so this is a
+// no-op — correctly, since open mode refuses these redirects outright.
+func (s *CIMDService) redirectHostsAllowed(clientIDHost string, redirectURIs []string) error {
+	for _, raw := range redirectURIs {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "https" {
+			// Non-https was already scheme-checked by validateCIMDRedirectURI;
+			// a parse failure cannot survive it either.
+			continue
+		}
+
+		host := u.Hostname()
+		if strings.EqualFold(host, clientIDHost) || s.domainAllowed(host) {
+			continue
+		}
+
+		return fmt.Errorf("%w: redirect_uri host %q is neither the client_id host nor in cimd.allowed_domains",
+			ErrCIMDDomainNotAllowed, host)
+	}
+
+	return nil
 }
 
 // domainAllowed reports whether host passes the optional allowlist. An empty
@@ -612,6 +671,52 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}, nil
+}
+
+// RedirectDeliversLocally reports whether a redirect destination can only reach
+// the caller's own device: a loopback http:// callback (RFC 8252 §7.3) or a
+// private-use scheme (§7.1). Both are the native/CLI/MCP client shape.
+//
+// It exists so the self-asserted carve-out can ask the question it actually
+// means. That carve-out refuses to redirect to a CIMD client because its
+// redirect_uris are attacker-CHOSEN, which would make the authorization
+// endpoint an unauthenticated redirector "with the AS's own origin as the first
+// hop" — a threat about a REMOTE destination. A 302 to 127.0.0.1 has no remote
+// hop and no third party: the code lands on the machine the user is sitting at,
+// and an attacker who can listen there already has local code execution. That is
+// the same reasoning RFC 8252 uses to accept loopback callbacks from clients
+// nobody registered, and it does not weaken with CIMD.
+//
+// It matters because loopback is the DOMINANT MCP shape — the canonical document
+// in docs/cimd.md lists exactly these — so refusing there costs the entire
+// browser leg and buys nothing. Web MCP clients with real https callbacks are a
+// different case and stay subject to the allow-list.
+//
+// Private-use schemes are included on the same footing validateCIMDRedirectURI
+// already gives them. Squatting one needs an attacker app installed on the
+// victim's device, which is the local-code-execution case again; RFC 8252 §8.1
+// notes the risk and still accepts them.
+//
+// Callers must pass a redirect_uri already matched against the client's
+// registered list — this judges reachability, not membership.
+func RedirectDeliversLocally(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+
+	switch u.Scheme {
+	case "https":
+		return false
+	case "http":
+		return isLoopbackHost(u.Hostname())
+	case "":
+		// Not an absolute URI. validateCIMDRedirectURI rejects these, so this is
+		// unreachable for a CIMD client; fail closed rather than guess.
+		return false
+	default:
+		return true
+	}
 }
 
 // validateCIMDRedirectURI enforces OAuth 2.1 §2.3-style redirect URI scheme

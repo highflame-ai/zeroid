@@ -63,20 +63,67 @@ to carry application state only. ZeroID round-trips it verbatim when present and
 does not require it. It is shown because most clients have somewhere to return
 the user to.
 
-**The browser leg needs a GET-capable `PrincipalResolver`, which ZeroID does not
-ship.** A browser cannot set a custom header on a top-level navigation, and the
-resolver-facing `Form` accessor is bound to the POST body, so a resolver that
-reads `req.Form(...)` sees nothing on a GET. The deployer must register one that
-reads a session cookie (`req.Cookie(...)`) and own the login and consent screens
-behind it.
+**Serving the browser leg *directly* at `/oauth2/authorize` needs a GET-capable
+`PrincipalResolver`, which ZeroID does not ship.** A browser cannot set a custom
+header on a top-level navigation, and the resolver-facing `Form` accessor is
+bound to the POST body, so a resolver that reads `req.Form(...)` sees nothing on
+a GET.
+
+Direct access is not the only shape, though. There are two ways to connect the
+browser leg, and the second — which needs no GET-capable resolver at all — is
+usually the better one:
+
+1. **Register a cookie-reading resolver** (`req.Cookie(...)`) and own the login
+   and consent screens behind it. This makes `/oauth2/authorize` itself the
+   browser-facing endpoint, which brings the CSRF obligations described below —
+   `SameSite=Lax` still sends the cookie on a cross-site top-level navigation,
+   and CIMD accepts an attacker-published `client_id` with its own
+   `redirect_uri`.
+
+   ZeroID will send the user to that login screen for you: return
+   `ErrPrincipalInteractionRequired` from the resolver when there is no session
+   and register the surface with `Server.SetInteractiveLoginURL`. See the
+   resolver bullet below for what that does and does not do — in particular
+   **for a CIMD client it is refused only when the `redirect_uri` is a remote
+   `https://` host that `cimd.allowed_domains` does not cover.** A loopback or
+   private-use callback — the ordinary desktop/CLI MCP client — is exempt and
+   completes this route with no allowlist. A hosted client with a real `https://`
+   callback needs you to name the hosts that may publish.
+2. **Front the browser leg above ZeroID and hand off over POST.** Your own
+   surface owns the redirect, authenticates the human however you already do,
+   and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
+   reads — an RFC 7523 assertion signed by that surface, say, verified against
+   its published JWKS. The browser never reaches this endpoint, so no GET-capable
+   resolver is needed.
+
+   What route 2 does **not** remove is authorization-request CSRF — it moves it
+   to your surface. An attacker can still navigate a victim's browser to that
+   surface with an attacker-published `client_id`; if it authenticates from a
+   `SameSite=Lax` session cookie and mints the assertion without further
+   interaction, the same code is issued for the victim, one hop earlier. The
+   CSRF-protected interaction — an explicit consent gesture behind an
+   anti-forgery token — has to happen at the fronting surface before the
+   assertion is minted. What the route removes is the exposure at
+   `/oauth2/authorize` itself, which is no longer reachable by navigation.
+
+Highflame's own deployment takes route 2 — Studio authenticates the user, mints
+an assertion, and POSTs; AuthN's assertion resolver verifies it and ZeroID mints
+the code. (For MCP clients specifically that routing is in flight: today Studio
+mints their codes locally with its own CIMD check, and highflame-studio#1392
+brings them back through this path.) Route 1 exists for deployers with no such
+surface. Either way ZeroID stays the engine: it validates the CIMD document,
+enforces the `redirect_uri` allow-list, and issues the code.
 
 **ZeroID cannot detect this for you.** Its AS metadata omits the
 `authorization_code` grant when *no* resolver is registered, but it cannot
 introspect what a registered resolver reads — so a deployment whose resolvers are
-all form-based advertises the grant and then 401s every browser redirect. If that
-is you, call `Server.SetAuthorizationCodeAvailable(func() bool { return false })`
-until a GET-capable resolver exists; otherwise the metadata promises a flow the
+all form-based *and* has no fronting surface advertises the grant and then 401s
+every browser redirect. If that is you, call
+`Server.SetAuthorizationCodeAvailable(func() bool { return false })` until one of
+the two routes above exists; otherwise the metadata promises a flow the
 endpoint cannot finish, which is exactly the failure this is meant to prevent.
+(A route-2 deployment is fine as-is: its form-based resolver *is* the browser
+leg's back end, fed by the surface.)
 
 A `false` answer turns the flow **off**, not merely unadvertised:
 `/oauth2/authorize` answers 503 on both GET and POST. Reach for it if you run a
@@ -85,7 +132,7 @@ cookie resolver is safe while POST is the only route, because `SameSite=Lax`
 withholds the cookie on a cross-site POST, and becomes reachable by cross-site
 top-level navigation once GET is mounted.
 
-**Errors are not redirected to a CIMD client.** RFC 6749 §4.1.2.1 says report most
+**Errors are not redirected to an *unvetted, remote* CIMD destination.** RFC 6749 §4.1.2.1 says report most
 `/oauth2/authorize` failures by redirecting to the client's registered
 `redirect_uri`, and ZeroID does — for clients somebody registered. A CIMD client's
 `redirect_uris` come from a document it published itself, so with `allowed_domains`
@@ -96,11 +143,21 @@ your origin. CIMD clients therefore get the §5.2 JSON body instead, and the
 interactive-login redirect is refused for them too — an unvetted client does not
 get to borrow your login surface's credibility.
 
-The cost is real and worth naming: a browser-driven CIMD client cannot learn its
-error from the callback and has to read the JSON body. Setting
-`cimd.allowed_domains` restores the redirect, because vetting which hosts may
-publish restores the assumption §4.1.2.1 is built on. The gate is provenance, not
-CIMD.
+**A loopback or private-use `redirect_uri` is exempt, and that is most MCP
+clients.** The threat above is about a *remote* destination — an unauthenticated
+redirector with your origin as the first hop. A 302 to `127.0.0.1` has no remote
+hop: the code lands on the machine the user is sitting at, and an attacker able
+to listen there already has local code execution. RFC 8252 §7.3 accepts loopback
+callbacks from clients nobody registered for exactly that reason, and CIMD does
+not weaken it. Since the document shape at the top of this page — the ordinary
+desktop/CLI MCP client — lists only loopback callbacks, the carve-out simply does
+not apply to it, and its browser leg works with no allowlist configured.
+
+The cost, for the clients it does apply to: a browser-driven CIMD client with a
+real `https://` callback cannot learn its error from that callback and has to
+read the JSON body. Setting `cimd.allowed_domains` restores the redirect there
+too, because vetting which hosts may publish restores the assumption §4.1.2.1 is
+built on. The gate is provenance and reach, not CIMD.
 
 **That hatch only works on a single-tenant deployment.** `allowed_domains` is one
 deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
@@ -127,8 +184,10 @@ Three things a deployer must handle:
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
-  conjure a surface the deployment does not have — and it is refused outright for a
-  CIMD client, per the provenance rule above.
+  conjure a surface the deployment does not have — and it is refused for a CIMD
+  client headed to an unvetted *remote* destination, per the rule above. Loopback
+  and private-use callbacks are exempt, and `cimd.allowed_domains` lifts the
+  refusal for remote hosts. Same check as the error redirect, either way.
 
   Use `Server.Use` middleware instead if you want to own the whole interaction
   including the 302.
@@ -196,11 +255,13 @@ Implemented in [`internal/service/cimd.go`](../internal/service/cimd.go); wired 
    Two of these carry their own weight beyond conformance. Userinfo is the phishing shape — `https://legit.example.com@evil.example/client.json` resolves to `evil.example` while *reading* as `legit.example.com` on a consent screen or in an audit log. Dot segments would give one document many spellings, splitting the resolution cache and handing one client several identities the §4 self-reference check cannot distinguish.
 
    ZeroID also rejects a **query string**, where the draft says only SHOULD NOT. That is deliberate and stricter than required: the `client_id` a client presents must stay byte-identical to the URL the document was fetched from, which is exactly what the self-reference check compares.
-3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
+3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity — and, since it also gates redirects (§ below), *where documents from those hosts may send a user*. **Only list hosts whose publishing you control.** On a host where anyone can serve a path — user content, a raw-file CDN, a broadly writable bucket — allow-listing hands that party a vetted-client status the redirect gate then honours. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
 4. **Fetch (SSRF-guarded, no redirects).** `GET` via the same DNS-rebinding-safe client the OIDC attestation verifier and CIBA dispatch use ([`attestation.NewSSRFGuardedHTTPClient`](../internal/attestation/oidc.go)): the host is resolved once, every answer is checked against the private/loopback/link-local/multicast/CGN/reserved blocklist, and the connection is pinned to the validated IP. TLS still verifies against the original hostname. Response is size-capped (5 KiB default) and timeout-bounded (5 s). **HTTP redirects are not followed** — the `client_id` is a canonical location; a 3xx is a resolution failure.
 5. **Validate the document.**
    - **Self-reference** (draft §4): the document's `client_id` field MUST equal the URL it was fetched from. This is what stops a document from claiming someone else's identity.
    - `redirect_uris` is **required and non-empty** — CIMD's primary anti-impersonation control. Each entry must satisfy OAuth 2.1 scheme rules: `https://`, loopback `http://`, or a private-use scheme (native apps); plaintext non-loopback `http://` is rejected. The requested `redirect_uri` is matched against the list by the existing `redirectURIAllowed` logic (exact match, with RFC 8252 §7.3 port-agnostic matching for loopback callbacks).
+
+     When `cimd.allowed_domains` is set, an `https://` entry must additionally be on the `client_id`'s own host or on that list — a **deviation**, and the reason the allowlist can be trusted as the switch that restores redirects (see below). Allow-listing the *publisher* only vets the destination if the destination is vetted too; otherwise any host where more than one party can publish a path lets an attacker name `https://evil.example/cb` and collect codes from a real sign-in. Loopback and private-use schemes are exempt: they deliver to the caller's own machine, not to a published host. In open mode this constrains nothing, because open mode refuses those redirects outright.
    - `token_endpoint_auth_method` must be `none` (omitted defaults to `none`). **Confidential CIMD clients (`private_key_jwt`) are not supported in v1.**
    - `grant_types` defaults to `["authorization_code"]`, must include `authorization_code`, and may only contain `authorization_code` / `refresh_token`.
    - `response_types`, if present, must include `code`.
