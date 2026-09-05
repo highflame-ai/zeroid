@@ -232,6 +232,23 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing required resource claim — cannot audience-restrict the minted token")
 	}
 
+	// RFC 8707 `resource` on the token request NARROWS the binding to a subset of
+	// what the IdP authorized (CAP-IDN-026). Where an ID-JAG names several
+	// servers, the client — which knows which one it is about to call — selects;
+	// without the parameter the claim decides for it and the token is minted good
+	// for every server in the assertion, which is wider than any single call
+	// needs. Every requested value must appear in the claim, so this can only
+	// shrink the set, never extend it: the IdP remains the sole source of
+	// authority and the client only spends less of it.
+	//
+	// Placed AFTER the missing-claim check so an assertion with no resource fails
+	// with the D4 error regardless of what the request asked for, and BEFORE the
+	// single-use jti is consumed so a bad `resource` does not burn the grant.
+	resources, err = narrowResourcesTo(resources, req.Resource)
+	if err != nil {
+		return nil, err
+	}
+
 	// Resolve the application identity if requested (IDOR-guarded, same as the
 	// id_token-exchange path); otherwise synthesize a service identity for the
 	// external principal.
