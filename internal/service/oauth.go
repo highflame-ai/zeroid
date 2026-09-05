@@ -470,8 +470,12 @@ type TokenRequest struct {
 	Scope        string
 	AccountID    string // tenant — required for client_credentials and external principal exchange
 	ProjectID    string // tenant — required for client_credentials and external principal exchange
-	Subject      string // assertion JWT for jwt_bearer grant
-	APIKey       string // zid_sk_* API key for api_key grant
+	// Assertion is the RFC 7523 §2.1 assertion JWT for the jwt-bearer grant.
+	// Named for the spec rather than ZeroID's legacy `subject` wire spelling,
+	// which now survives only as the deprecated request alias the handler
+	// resolves — so the old name lives at exactly one place instead of three.
+	Assertion string
+	APIKey    string // zid_sk_* API key for api_key grant
 	// token_exchange (RFC 8693) fields:
 	SubjectToken     string // the subject token being exchanged
 	SubjectTokenType string // urn:ietf:params:oauth:token-type:access_token or jwt
@@ -640,8 +644,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 // The assertion is validated against the identity's registered public_key_pem.
 // iss must equal the agent's WIMSE URI; aud must equal the issuer URL.
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.Subject == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
+	if req.Assertion == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "assertion is required for the jwt-bearer grant (RFC 7523 §2.1)")
 	}
 
 	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
@@ -652,17 +656,17 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	// work so the two validation modes stay cleanly separate (D2: the branch
 	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
 	// NHI self-signed behavior below.
-	if isIDJAGAssertion(req.Subject) {
+	if isIDJAGAssertion(req.Assertion) {
 		return s.idJAGBearer(ctx, req)
 	}
 
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
-	if err := jwtalg.Validate(req.Subject); err != nil {
+	if err := jwtalg.Validate(req.Assertion); err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
-	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
+	peeked, err := jwt.ParseInsecure([]byte(req.Assertion))
 	if err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT is malformed", err)
 	}
@@ -699,7 +703,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// Fully validate the assertion JWT against the agent's registered public key.
-	assertionToken, err := jwt.Parse([]byte(req.Subject),
+	assertionToken, err := jwt.Parse([]byte(req.Assertion),
 		jwt.WithKey(jwa.ES256(), agentPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),

@@ -33,8 +33,27 @@ type TokenInput struct {
 		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
 		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID"`
 		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID"`
-		Subject      string `json:"subject,omitempty" doc:"JWT assertion for jwt_bearer grant"`
-		APIKey       string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
+		// Assertion is the RFC 7523 §2.1 parameter name for the JWT presented
+		// on the jwt-bearer grant, and is the name every standards-conformant
+		// client sends. ZeroID originally read this value from `subject`
+		// (below) and nothing else, which meant no conformant client could
+		// redeem an ID-JAG against us at all — the assertion arrived under the
+		// spec's name, bound to no field, and the request failed as though it
+		// carried no assertion. Every EMA interop row passed only because our
+		// own harness spoke our own dialect.
+		Assertion string `json:"assertion,omitempty" doc:"JWT assertion for the jwt-bearer grant (RFC 7523 §2.1)"`
+		// Subject is the pre-RFC-7523 spelling of Assertion, kept because
+		// in-tree callers and deployed SDKs send it. DEPRECATED: new callers
+		// MUST use `assertion`. Both may be sent only if they carry the same
+		// value — see resolveAssertion for why a mismatch is refused rather
+		// than resolved.
+		// `deprecated:"true"` flows into the generated OpenAPI schema, so
+		// generated clients and spec tooling surface the parameter as
+		// deprecated. This PR's whole audience is standards-conformant external
+		// clients, and the schema is the channel they actually read — a doc
+		// string alone would deprecate it only for humans reading Go.
+		Subject string `json:"subject,omitempty" deprecated:"true" doc:"DEPRECATED alias for assertion — use assertion (RFC 7523 §2.1)"`
+		APIKey  string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
 		// token_exchange (RFC 8693) fields:
 		SubjectToken     string `json:"subject_token,omitempty" doc:"Subject token being exchanged"`
 		SubjectTokenType string `json:"subject_token_type,omitempty" doc:"RFC 8693 subject token type URI"`
@@ -188,6 +207,77 @@ type OAuthRevokeOutput struct {
 // basicAuthChallenge is the WWW-Authenticate value returned when a Basic
 // client-auth attempt fails (RFC 6749 §5.2).
 const basicAuthChallenge = `Basic realm="zeroid", charset="UTF-8"`
+
+// maxLoggedGrantType bounds grant_type in log output. The field is an
+// unvalidated, attacker-supplied string with no length cap of its own — a
+// deliberate design choice, since Server.RegisterGrant lets a deployer name a
+// custom grant anything, which is why an `enum` tag would be wrong here. Under
+// the endpoint's 10 MiB body cap that means one request could otherwise emit a
+// multi-megabyte log line. Log injection is not the concern (zerolog emits
+// JSON and escapes control characters); volume is.
+const maxLoggedGrantType = 64
+
+// truncateForLog bounds an untrusted string for log output, marking any value
+// it shortened so a truncated field is never mistaken for the real one.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	return s[:maxLen] + "…(truncated)"
+}
+
+// isJWTBearerGrant reports whether the wire grant_type names RFC 7523's
+// jwt-bearer grant. Goes through domain.NormalizeGrantType rather than matching
+// the URN literally so the short form (`jwt_bearer`) and the URN both count —
+// the token endpoint accepts either, and a check that recognised only one would
+// silently skip half the traffic it is meant to observe.
+func isJWTBearerGrant(grantType string) bool {
+	return domain.NormalizeGrantType(grantType) == domain.GrantTypeJWTBearer
+}
+
+// resolveAssertion picks the JWT for the jwt-bearer grant from the RFC 7523
+// §2.1 `assertion` parameter, falling back to ZeroID's legacy `subject`
+// spelling.
+//
+// A client that sends BOTH with DIFFERENT values is refused rather than
+// resolved. Silently preferring one would mean accepting a request that
+// presented two different assertions and picking a winner the caller did not
+// choose — the same "two meanings on one channel with no discriminator" shape
+// that produced the resource-binding bug in INV-IDN-006. Identical values are
+// allowed: a client migrating from `subject` to `assertion` may reasonably send
+// both during the transition, and that is unambiguous.
+//
+// LIMIT OF THIS CHECK — do not read it as an endpoint-wide guarantee. It
+// compares the two values AFTER the JSON binder has run, and the binder
+// (goccy/go-json, like encoding/json) matches field names case-insensitively
+// and takes last-key-wins on duplicates. So `{"assertion":"A","ASSERTION":"B"}`
+// arrives here as a single value with nothing to compare, and the form path
+// does not catch it either: oauthFormCompatMiddleware rejects duplicates by
+// comparing raw form keys case-SENSITIVELY, so `assertion=A&ASSERTION=B` is two
+// distinct keys that both bind to this one field. Closing that requires
+// canonicalising parameter names at the binder boundary for every OAuth
+// parameter — client_secret, api_key, refresh_token and subject_token bind the
+// same way — which is a behaviour change for callers relying on the current
+// case-insensitivity, so it is tracked separately rather than smuggled in here.
+// What this function guarantees is narrower than it first reads: two
+// canonically-spelled parameters carrying different assertions are refused.
+//
+// Returns "" with no error when neither is present; the grant handler owns the
+// "assertion is required" message so the error stays accurate per grant type
+// (only jwt-bearer requires one).
+func resolveAssertion(assertion, subject string) (string, error) {
+	switch {
+	case assertion != "" && subject != "" && assertion != subject:
+		return "", errors.New(
+			"assertion and subject are both present with different values — " +
+				"send only `assertion` (RFC 7523 §2.1); `subject` is a deprecated alias")
+	case assertion != "":
+		return assertion, nil
+	default:
+		return subject, nil
+	}
+}
 
 // resolveInspectionClientAuth merges the two supported client authentication
 // methods on the introspection/revocation endpoints: client_secret_basic
@@ -394,6 +484,63 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		dpopThumbprint = res.Thumbprint
 	}
 
+	// Adoption telemetry for the deprecated alias. Without a signal, deciding
+	// when `subject` can be removed is a guess, and the alias lives forever.
+	// Logged at the call site rather than inside resolveAssertion so the record
+	// carries grant_type — which tells you WHICH caller still needs migrating,
+	// not merely that someone does. Never log the assertion itself: it is
+	// credential material.
+	// Warn, not Debug: the point of this signal is deciding when the alias can
+	// be removed, and that decision needs PRODUCTION traffic. Prod runs zerolog
+	// at info, where Debug is dropped — so a debug line would have scoped the
+	// evidence to dev/test and the alias would outlive its usefulness for
+	// exactly the reason this telemetry exists. Warn is also the conventional
+	// level for deprecated-API use.
+	//
+	// KNOWN DOMINANT CALLER: highflame-cerberus MintAgentToken
+	// (internal/admin/token.go) sends `subject` on every code-agent root
+	// session-token mint. Until that migrates, this Warn reads "the alias is
+	// heavily used" when it actually means "cerberus hasn't been migrated yet",
+	// and it will be loud. Migrate cerberus in the window between this shipping
+	// and authn bumping to a release containing it — after that, remaining
+	// volume is genuinely external clients, which is the signal this exists for.
+	// Note the ordering: cerberus MUST NOT switch to `assertion` until the authn
+	// deployment it talks to accepts it, or every agent session mint breaks.
+	//
+	// Gated on the jwt-bearer grant for two reasons. It is the only grant that
+	// reads the field, so `subject` on client_credentials is noise, not a legacy
+	// client. And this runs before client authentication on an unauthenticated
+	// endpoint with no rate limiting, so an ungated Warn is an anonymous
+	// log-volume amplifier — and worse, lets anyone fabricate the very signal
+	// the alias-removal decision is meant to rest on. Even gated, treat the
+	// count as a lower bound from an anonymous-write channel rather than as
+	// proof migration is complete.
+	//
+	// Fires whenever `subject` is present, not only when `assertion` is absent:
+	// a client sending both (the mid-migration shape) is still using the alias
+	// and is exactly the population that needs chasing.
+	if isJWTBearerGrant(input.Body.GrantType) && input.Body.Subject != "" {
+		log.Warn().
+			Str("grant_type", truncateForLog(input.Body.GrantType, maxLoggedGrantType)).
+			Bool("also_sent_assertion", input.Body.Assertion != "").
+			Msg("deprecated `subject` parameter used; clients should send `assertion` (RFC 7523 §2.1)")
+	}
+
+	assertion, assertionErr := resolveAssertion(input.Body.Assertion, input.Body.Subject)
+	if assertionErr != nil {
+		// The one branch worth a record: a caller presented two conflicting
+		// credentials in a single request. Parameter names and grant type only —
+		// the values are assertions, i.e. credential material.
+		log.Warn().
+			Str("grant_type", truncateForLog(input.Body.GrantType, maxLoggedGrantType)).
+			Msg("conflicting `assertion` and `subject` parameters carrying different values; request refused")
+
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: oautherror.InvalidRequest, ErrorDescription: assertionErr.Error()},
+		}, nil
+	}
+
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
 		GrantType:         input.Body.GrantType,
 		ClientID:          input.Body.ClientID,
@@ -401,7 +548,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		Scope:             input.Body.Scope,
 		AccountID:         input.Body.AccountID,
 		ProjectID:         input.Body.ProjectID,
-		Subject:           input.Body.Subject,
+		Assertion:         assertion,
 		APIKey:            input.Body.APIKey,
 		SubjectToken:      input.Body.SubjectToken,
 		SubjectTokenType:  input.Body.SubjectTokenType,

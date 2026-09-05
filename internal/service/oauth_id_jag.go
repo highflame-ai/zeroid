@@ -134,7 +134,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Peek at the assertion to extract iss without verifying — we need iss to
 	// look up which IdP's JWKS to validate against. (typ was already confirmed
 	// as oauth-id-jag+jwt by the caller's isIDJAGAssertion branch.)
-	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
+	peeked, err := jwt.ParseInsecure([]byte(req.Assertion))
 	if err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "ID-JAG assertion is malformed", err)
 	}
@@ -189,7 +189,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
 	// the wire field for ID-JAG callers.
-	verified, err := s.validateExternalAssertion(ctx, req.Subject, entry, "assertion")
+	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion")
 	if err != nil {
 		return nil, err
 	}
