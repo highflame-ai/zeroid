@@ -33,8 +33,22 @@ type TokenInput struct {
 		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
 		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID"`
 		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID"`
-		Subject      string `json:"subject,omitempty" doc:"JWT assertion for jwt_bearer grant"`
-		APIKey       string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
+		// Assertion is the RFC 7523 §2.1 parameter name for the JWT presented
+		// on the jwt-bearer grant, and is the name every standards-conformant
+		// client sends. ZeroID originally read this value from `subject`
+		// (below) and nothing else, which meant no conformant client could
+		// redeem an ID-JAG against us at all — the assertion arrived under the
+		// spec's name, bound to no field, and the request failed as though it
+		// carried no assertion. Every EMA interop row passed only because our
+		// own harness spoke our own dialect.
+		Assertion string `json:"assertion,omitempty" doc:"JWT assertion for the jwt-bearer grant (RFC 7523 §2.1)"`
+		// Subject is the pre-RFC-7523 spelling of Assertion, kept because
+		// in-tree callers and deployed SDKs send it. DEPRECATED: new callers
+		// MUST use `assertion`. Both may be sent only if they carry the same
+		// value — see resolveAssertion for why a mismatch is refused rather
+		// than resolved.
+		Subject string `json:"subject,omitempty" doc:"DEPRECATED alias for assertion — use assertion (RFC 7523 §2.1)"`
+		APIKey  string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
 		// token_exchange (RFC 8693) fields:
 		SubjectToken     string `json:"subject_token,omitempty" doc:"Subject token being exchanged"`
 		SubjectTokenType string `json:"subject_token_type,omitempty" doc:"RFC 8693 subject token type URI"`
@@ -199,6 +213,35 @@ const basicAuthChallenge = `Basic realm="zeroid", charset="UTF-8"`
 // request — presenting both is rejected as invalid_request. Non-Basic
 // Authorization schemes are ignored (treated as not presented) so bearer
 // headers from generic middleware don't break the anonymous internal path.
+// resolveAssertion picks the JWT for the jwt-bearer grant from the RFC 7523
+// §2.1 `assertion` parameter, falling back to ZeroID's legacy `subject`
+// spelling.
+//
+// A client that sends BOTH with DIFFERENT values is refused rather than
+// resolved. Silently preferring one would mean accepting a request that
+// presented two different assertions and picking a winner the caller did not
+// choose — the same "two meanings on one channel with no discriminator" shape
+// that produced the resource-binding bug in INV-IDN-006. Two distinct
+// assertions in one request is a red flag, not a merge. Identical values are
+// allowed: a client migrating from `subject` to `assertion` may reasonably send
+// both during the transition, and that is unambiguous.
+//
+// Returns "" with no error when neither is present; the grant handler owns the
+// "assertion is required" message so the error stays accurate per grant type
+// (only jwt-bearer requires one).
+func resolveAssertion(assertion, subject string) (string, error) {
+	switch {
+	case assertion != "" && subject != "" && assertion != subject:
+		return "", errors.New(
+			"assertion and subject are both present with different values — " +
+				"send only `assertion` (RFC 7523 §2.1); `subject` is a deprecated alias")
+	case assertion != "":
+		return assertion, nil
+	default:
+		return subject, nil
+	}
+}
+
 // Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
 func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
 	badRequest := func(desc string) *service.OAuthError {
@@ -394,6 +437,14 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		dpopThumbprint = res.Thumbprint
 	}
 
+	assertion, assertionErr := resolveAssertion(input.Body.Assertion, input.Body.Subject)
+	if assertionErr != nil {
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: oautherror.InvalidRequest, ErrorDescription: assertionErr.Error()},
+		}, nil
+	}
+
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
 		GrantType:         input.Body.GrantType,
 		ClientID:          input.Body.ClientID,
@@ -401,7 +452,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		Scope:             input.Body.Scope,
 		AccountID:         input.Body.AccountID,
 		ProjectID:         input.Body.ProjectID,
-		Subject:           input.Body.Subject,
+		Subject:           assertion,
 		APIKey:            input.Body.APIKey,
 		SubjectToken:      input.Body.SubjectToken,
 		SubjectTokenType:  input.Body.SubjectTokenType,
