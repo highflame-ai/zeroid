@@ -154,6 +154,30 @@ func TestRFC7523_S2_1_SubjectRemainsAcceptedAsDeprecatedAlias(t *testing.T) {
 	assert.NotEmpty(t, body["access_token"])
 }
 
+func TestRFC7523_S2_1_MissingAssertionErrorNamesTheRFCParameter(t *testing.T) {
+	// Not an RFC clause — the diagnostic that teaches a client our dialect.
+	// The "required" error used to read "subject (assertion JWT) is required",
+	// so a conformant client that omitted the assertion was steered at the
+	// deprecated name by the very message meant to help it. Error text is how
+	// integrators learn a wire format; pointing them at `subject` here would
+	// keep reproducing the bug this suite exists to close.
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"scope":      "data:read",
+		// neither assertion nor subject supplied
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_request", body["error"])
+
+	desc, _ := body["error_description"].(string)
+	assert.Contains(t, desc, "assertion",
+		"the required-parameter error must name the RFC 7523 §2.1 parameter")
+	assert.NotContains(t, desc, "subject",
+		"the error must not steer a conformant client at the deprecated alias")
+}
+
 func TestRFC7523_S2_1_SubjectMarkedDeprecatedInOpenAPI(t *testing.T) {
 	// Not an RFC clause. The audience for this deprecation is machines —
 	// generated SDKs, spec tooling, the clients we are asking to migrate onto

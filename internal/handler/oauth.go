@@ -448,8 +448,16 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	// carries grant_type — which tells you WHICH caller still needs migrating,
 	// not merely that someone does. Never log the assertion itself: it is
 	// credential material.
+	// Warn, not Debug: the point of this signal is deciding when the alias can
+	// be removed, and that decision needs PRODUCTION traffic. Prod runs zerolog
+	// at info, where Debug is dropped — so a debug line would have scoped the
+	// evidence to dev/test and the alias would outlive its usefulness for
+	// exactly the reason this telemetry exists. Warn is also the conventional
+	// level for deprecated-API use. Volume is not a concern: no first-party
+	// SDK, CLI, doc or example sends `subject`, so anything this catches is a
+	// genuine legacy client — which is precisely what we want to see.
 	if input.Body.Assertion == "" && input.Body.Subject != "" {
-		log.Debug().
+		log.Warn().
 			Str("grant_type", input.Body.GrantType).
 			Msg("deprecated `subject` parameter used; clients should send `assertion` (RFC 7523 §2.1)")
 	}
@@ -469,7 +477,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		Scope:             input.Body.Scope,
 		AccountID:         input.Body.AccountID,
 		ProjectID:         input.Body.ProjectID,
-		Subject:           assertion,
+		Assertion:         assertion,
 		APIKey:            input.Body.APIKey,
 		SubjectToken:      input.Body.SubjectToken,
 		SubjectTokenType:  input.Body.SubjectTokenType,
