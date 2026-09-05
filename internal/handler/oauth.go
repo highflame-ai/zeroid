@@ -497,6 +497,16 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	// exactly the reason this telemetry exists. Warn is also the conventional
 	// level for deprecated-API use.
 	//
+	// KNOWN DOMINANT CALLER: highflame-cerberus MintAgentToken
+	// (internal/admin/token.go) sends `subject` on every code-agent root
+	// session-token mint. Until that migrates, this Warn reads "the alias is
+	// heavily used" when it actually means "cerberus hasn't been migrated yet",
+	// and it will be loud. Migrate cerberus in the window between this shipping
+	// and authn bumping to a release containing it — after that, remaining
+	// volume is genuinely external clients, which is the signal this exists for.
+	// Note the ordering: cerberus MUST NOT switch to `assertion` until the authn
+	// deployment it talks to accepts it, or every agent session mint breaks.
+	//
 	// Gated on the jwt-bearer grant for two reasons. It is the only grant that
 	// reads the field, so `subject` on client_credentials is noise, not a legacy
 	// client. And this runs before client authentication on an unauthenticated
