@@ -514,6 +514,24 @@ type TokenRequest struct {
 	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
 	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
 	IssueRefreshToken bool
+	// Resource carries the RFC 8707 `resource` request parameter — the protected
+	// resource(s) the minted token is being bound to (CAP-IDN-026). A single
+	// value or several; the wire accepts a bare string or an array, and a
+	// form-encoded request may repeat the parameter (RFC 8707 §2).
+	//
+	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
+	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// grant no authority the grant did not already carry — which is why an
+	// arbitrary caller-supplied identifier is safe to accept without a registry
+	// of known resource servers.
+	//
+	// Mutually exclusive with Audience: that names a server-defined scope profile
+	// (it widens), this names a resource (it narrows). Both on one request is
+	// `invalid_request` — see checkResourceAudienceExclusive.
+	//
+	// Validated once in Token() before dispatch, so every grant sees a list that
+	// is already syntax-checked and de-duplicated.
+	Resource []string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -533,6 +551,25 @@ type TokenRequest struct {
 
 // Token handles the /oauth2/token endpoint dispatch.
 func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
+	// grant dispatch so every grant — including custom ones registered via
+	// RegisterGrant — sees the same validated list and no grant can forget the
+	// exclusivity rule. Order matters: the audience/resource conflict is a
+	// malformed REQUEST (invalid_request) and is reported as such even when the
+	// resource values would also have failed validation, so a caller that made
+	// both mistakes is told about the structural one first.
+	if err := checkResourceAudienceExclusive(req); err != nil {
+		return nil, err
+	}
+	validatedResources, err := validateResourceIndicators(req.Resource)
+	if err != nil {
+		return nil, err
+	}
+	req.Resource = validatedResources
+	if len(req.Resource) > 0 && !grantSupportsResource(req.GrantType) {
+		return nil, rejectUnsupportedResource(req, req.GrantType)
+	}
+
 	switch req.GrantType {
 	case "client_credentials":
 		return s.clientCredentials(ctx, req)

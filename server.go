@@ -1581,6 +1581,22 @@ var jsonShapedFormFields = map[string]struct{}{
 	"authorization_details": {},
 }
 
+// repeatableFormFields are OAuth form parameters that a spec explicitly permits
+// to appear MORE THAN ONCE, overriding RFC 6749 §3.1's blanket "MUST NOT be
+// included more than once".
+//
+// Today only RFC 8707 `resource` qualifies: §2 states "the parameter can be
+// included multiple times to indicate multiple resources". Without this set the
+// duplicate-key guard below would reject a conformant multi-resource request
+// with `duplicate OAuth parameter: resource` — a spec violation that would look
+// to an interop tester like we do not support the parameter at all.
+//
+// Repeats are collapsed into a JSON array so the downstream binder
+// (handler.resourceParam) sees the same shape a JSON caller would send.
+var repeatableFormFields = map[string]struct{}{
+	"resource": {},
+}
+
 // mediaTypeEquals parses a Content-Type header and reports whether the media
 // type portion matches want (case-insensitive per RFC 7231 §3.1.1.1).
 // Parameters like charset are ignored for the comparison.
@@ -1636,10 +1652,28 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 		for k, vs := range r.PostForm {
 			// RFC 6749 §3.1: request parameters MUST NOT be included more
 			// than once. Duplicate keys are rejected rather than silently
-			// collapsed to vs[0].
+			// collapsed to vs[0] — EXCEPT where a later spec explicitly makes
+			// the parameter repeatable (repeatableFormFields), in which case
+			// every occurrence is preserved as a JSON array.
 			if len(vs) > 1 {
-				writeValidationError(w, r, "duplicate OAuth parameter: "+k)
-				return
+				if _, repeatable := repeatableFormFields[k]; !repeatable {
+					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
+					return
+				}
+				// Drop valueless occurrences per RFC 6749 §3.2 before binding,
+				// so `resource=https://a&resource=` yields one resource rather
+				// than one resource plus an empty string.
+				kept := make([]string, 0, len(vs))
+				for _, v := range vs {
+					if v != "" {
+						kept = append(kept, v)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				flat[k] = kept
+				continue
 			}
 			if len(vs) == 0 {
 				continue
