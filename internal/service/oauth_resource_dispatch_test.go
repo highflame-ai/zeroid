@@ -16,11 +16,16 @@ func TestTokenGate_ResourceOnUnsupportedGrant(t *testing.T) {
 	svc := &OAuthService{}
 
 	for _, grant := range []string{
-		"client_credentials",
-		"api_key",
-		"urn:ietf:params:oauth:grant-type:token-exchange",
-		"authorization_code",
+		// A refresh continues an existing grant; re-targeting a token already
+		// held is a fresh authorization decision that belongs at the original
+		// grant. Permanently excluded, not pending.
 		"refresh_token",
+		// CIBA redeems through BackchannelService, which takes no resource —
+		// binding would have to be plumbed there deliberately rather than
+		// inherited.
+		"urn:openid:params:grant-type:ciba",
+		// Unknown / custom grants registered via RegisterGrant: fail closed.
+		"no_such_grant",
 	} {
 		t.Run(grant, func(t *testing.T) {
 			_, err := svc.Token(context.Background(), TokenRequest{
@@ -28,6 +33,29 @@ func TestTokenGate_ResourceOnUnsupportedGrant(t *testing.T) {
 				Resource:  []string{"https://gw.example/mcp/github"},
 			})
 			wantOAuthError(t, err, oautherror.InvalidTarget)
+		})
+	}
+}
+
+// TestTokenGate_SupportedGrantsPassTheGate proves the enabled grants are not
+// intercepted: each must fail on its OWN missing-parameter validation, not on
+// the resource gate. Without this the suite would still pass if a grant were
+// accidentally left out of resourceSupportedGrants.
+func TestTokenGate_SupportedGrantsPassTheGate(t *testing.T) {
+	svc := &OAuthService{}
+
+	for _, grant := range []string{
+		"client_credentials",
+		"urn:ietf:params:oauth:grant-type:token-exchange",
+		"authorization_code",
+	} {
+		t.Run(grant, func(t *testing.T) {
+			_, err := svc.Token(context.Background(), TokenRequest{
+				GrantType: grant,
+				Resource:  []string{"https://gw.example/mcp/github"},
+			})
+			// invalid_request = reached the grant's own validation.
+			wantOAuthError(t, err, oautherror.InvalidRequest)
 		})
 	}
 }
