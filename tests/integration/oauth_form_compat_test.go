@@ -194,3 +194,57 @@ func TestOAuthFormCompatOpenAPIAdvertisesFormContentType(t *testing.T) {
 			"%s must advertise form encoding per RFC 6749/7662/7009", p)
 	}
 }
+
+// TestOpenAPIAdvertisesResourceUnionShape pins the RFC 8707 `resource` parameter's
+// documented wire shape (CAP-IDN-026).
+//
+// resourceParam implements huma.SchemaProvider specifically so the OpenAPI
+// document shows `oneOf: [string, array<string>]` — without it Huma infers an
+// array-only schema from the underlying []string and the single-string form,
+// which is what form-encoded clients and the MCP interop harness actually send,
+// looks unsupported. The Schema() method reads 0% in coverage because Huma calls
+// it during registry construction, so nothing else would notice if the union
+// silently regressed to an array.
+func TestOpenAPIAdvertisesResourceUnionShape(t *testing.T) {
+	resp, err := http.Get(testServer.URL + "/openapi.json")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var spec map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&spec))
+
+	components, _ := spec["components"].(map[string]any)
+	require.NotNil(t, components, "openapi.json has no components section")
+	schemas, _ := components["schemas"].(map[string]any)
+	require.NotNil(t, schemas)
+
+	body, _ := schemas["TokenInputBody"].(map[string]any)
+	require.NotNil(t, body, "TokenInputBody schema missing from openapi.json")
+	props, _ := body["properties"].(map[string]any)
+	require.NotNil(t, props)
+
+	resource, _ := props["resource"].(map[string]any)
+	require.NotNil(t, resource, "the resource parameter is not documented on /oauth2/token")
+
+	oneOf, ok := resource["oneOf"].([]any)
+	require.True(t, ok,
+		"resource must be documented as a union; got %#v — an array-only schema "+
+			"tells clients the single-string form is unsupported", resource)
+	require.Len(t, oneOf, 2, "expected exactly the string and array variants")
+
+	var sawString, sawArray bool
+	for _, variant := range oneOf {
+		v, _ := variant.(map[string]any)
+		switch v["type"] {
+		case "string":
+			sawString = true
+		case "array":
+			items, _ := v["items"].(map[string]any)
+			require.Equal(t, "string", items["type"], "the array variant must hold strings")
+			sawArray = true
+		}
+	}
+	require.True(t, sawString, "the single-URI string form must be advertised")
+	require.True(t, sawArray, "the multi-resource array form must be advertised")
+}
