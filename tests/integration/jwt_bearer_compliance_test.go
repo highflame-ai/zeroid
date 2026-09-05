@@ -65,7 +65,7 @@ func postJwtBearer(t *testing.T, assertion string) *http.Response {
 	t.Helper()
 	return post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion,
+		"assertion":  assertion,
 		"scope":      "data:read",
 	}, nil)
 }

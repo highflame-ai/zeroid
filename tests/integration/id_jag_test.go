@@ -82,7 +82,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 	idJAGBody := func(idjag string) map[string]any {
 		return map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-			"subject":       idjag,
+			"assertion":     idjag,
 			"account_id":    fedCfg.AccountID,
 			"project_id":    fedCfg.ProjectID,
 			"client_id":     client.ClientID,
@@ -187,7 +187,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-			"subject":       idjag,
+			"assertion":     idjag,
 			"account_id":    "acct-not-in-allowlist",
 			"project_id":    fedCfg.ProjectID,
 			"client_id":     client.ClientID,
@@ -308,7 +308,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		// No client_id / client_secret presented.
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-			"subject":    idjag,
+			"assertion":  idjag,
 			"account_id": fedCfg.AccountID,
 			"project_id": fedCfg.ProjectID,
 		})
@@ -332,7 +332,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-			"subject":       idjag,
+			"assertion":     idjag,
 			"account_id":    fedCfg.AccountID,
 			"project_id":    fedCfg.ProjectID,
 			"client_id":     client.ClientID,
@@ -380,7 +380,7 @@ func TestIDJAG_NHISelfSignedRegression(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    buildAssertion(t, agentKey, identity.WIMSEURI),
+		"assertion":  buildAssertion(t, agentKey, identity.WIMSEURI),
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode,
@@ -442,7 +442,7 @@ func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 
 	resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 		"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":       idjag,
+		"assertion":     idjag,
 		"account_id":    fedCfg.AccountID,
 		"project_id":    fedCfg.ProjectID,
 		"client_id":     client.ClientID,
