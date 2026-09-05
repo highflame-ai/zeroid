@@ -228,6 +228,33 @@ func grantSupportsResource(grantType string) bool {
 // caller can never inject or widen one through additional_claims, which is what
 // keeps the claim's presence load-bearing.
 //
+// ── `aud` IS NOT AN AUTHORIZATION SIGNAL ─────────────────────────────────────
+//
+// Setting Audience here means that on the ordinary grants (client_credentials,
+// api_key, token-exchange, authorization_code) the CALLER chooses `aud`. That is
+// deliberate and safe only because nothing on this platform treats `aud` as an
+// authorization input:
+//
+//   - Shield, Observatory, Cerberus, Discovery and AuthN all construct
+//     authjwt.VerifierConfig with Issuer + JWKSURL and leave Audience unset.
+//   - INV-IDN-006 enforcement keys on the `resource` claim precisely because
+//     `aud` cannot carry that meaning — ZeroID stamps it on every token,
+//     defaulting to the issuer URL for JWT-SVID §3.
+//
+// The "a binding only ever NARROWS" argument — the reason ZeroID accepts an
+// arbitrary resource URI with no registry of known resource servers — applies to
+// the `resource` claim, which is presence-gated and therefore restrict-only. It
+// does NOT extend to `aud`, which is an accept/reject gate: swapping it from the
+// issuer to a caller-chosen value is not a subset operation.
+//
+// So: a relying party MUST NOT use `aud` to decide whether to accept a ZeroID
+// token. Pinning authjwt's optional Audience to your own identifier does not
+// establish that the token was minted for you — any tenant principal can request
+// that value. Authorize on `resource` (a binding ZeroID recorded), on `scopes`,
+// and on the principal. If a future need genuinely requires an unforgeable
+// audience, it needs the resource-server registry RFC 8707 §2's
+// invalid_target-for-unknown-resource exists for, not a tweak here.
+//
 // A no-op when nothing was requested, so callers can apply it unconditionally
 // and no grant's default issuance shape changes.
 func bindResourceOnIssue(issue *IssueRequest, resources []string) {
