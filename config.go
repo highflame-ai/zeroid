@@ -106,6 +106,22 @@ type CIMDConfig struct {
 	// (recommended for enterprise/closed deployments). YAML only (a list), e.g.:
 	//   cimd:
 	//     allowed_domains: ["client.example.com", "apps.acme.dev"]
+	//
+	// It is not only a fetch lever. It also decides whether a CIMD client is a
+	// destination this AS will redirect a user agent to — both the RFC 6749
+	// §4.1.2.1 error redirect and the interactive-login redirect are refused for
+	// a self-asserted client heading for a REMOTE https destination while this is
+	// empty. Loopback and private-use callbacks are exempt — they deliver to the
+	// requester's own device — so the ordinary desktop/CLI MCP client is
+	// unaffected and completes with no allowlist. Set this if you serve CIMD
+	// clients whose callbacks are remote https URLs; without it they can never
+	// sign a user in.
+	//
+	// Listing a host asserts that you vet who publishes there, and ZeroID holds
+	// the destination to the same bar: an https redirect_uri must be on the
+	// client_id's own host or on this list. Do not list a host where anyone can
+	// publish a path (user content, a raw-file CDN, a broadly writable bucket) —
+	// there, "allow-listed publisher" stops meaning "vetted party".
 	AllowedDomains []string `koanf:"allowed_domains"`
 
 	// AllowPrivateMetadataEndpoints relaxes the SSRF guard on the metadata

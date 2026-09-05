@@ -295,6 +295,68 @@ func TestCIMDResolveClient_DomainAllowlist(t *testing.T) {
 	}
 }
 
+// TestCIMDResolveClient_OffListRedirectURIRefused pins the invariant the
+// authorize-handler gate depends on but cannot see.
+//
+// Once cimd.allowed_domains names a host, API.refusesRedirectTo stops refusing
+// redirects for self-asserted clients deployment-wide — it does NOT re-check the
+// individual client's redirect host. That is only safe if resolution has already
+// refused any document declaring an off-list https redirect_uri. Vetting the
+// PUBLICATION host is not enough: on any host where more than one party can
+// publish a path, an attacker publishes a document on the allow-listed host
+// naming redirect_uri https://evil.example/cb and gets an unauthenticated 302.
+//
+// TestRedirectHostsAllowed covers the predicate in isolation. This covers the
+// wiring — that ResolveClient actually calls it — which is the part that can
+// silently disappear. It did: rebasing this branch onto the #312 singleflight
+// refactor moved the fetch into resolveUncached and severed this call. That
+// break happened to be a compile error, so it surfaced; a refactor that left a
+// same-named host variable in scope would have kept compiling while vetting the
+// wrong host, and no existing test would have noticed.
+func TestCIMDResolveClient_OffListRedirectURIRefused(t *testing.T) {
+	// The document is served BY the allow-listed host (the httptest server binds
+	// 127.0.0.1), so publication-host vetting passes and the redirect host is the
+	// only thing left to catch this.
+	doc := func(clientID, redirectURI string) string {
+		return fmt.Sprintf(
+			`{"client_id":%q,"client_name":"Test","redirect_uris":[%q]}`,
+			clientID, redirectURI,
+		)
+	}
+
+	t.Run("off-list https redirect host is refused at resolution", func(t *testing.T) {
+		var docURL string
+		svc, base, _ := newCIMDTestServer(t,
+			CIMDConfig{Enabled: true, AllowedDomains: []string{"127.0.0.1"}},
+			func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, doc(docURL, "https://evil.example/cb"))
+			})
+		docURL = base + "/client.json"
+
+		_, err := svc.ResolveClient(context.Background(), docURL)
+		if !errors.Is(err, ErrCIMDDomainNotAllowed) {
+			t.Fatalf("a document on an allow-listed host declaring an off-list https "+
+				"redirect_uri must be refused: got %v", err)
+		}
+	})
+
+	t.Run("redirect host on the allow-list resolves", func(t *testing.T) {
+		// The control. Without it the test above would still pass if resolution
+		// rejected every https redirect_uri, which would break real clients.
+		var docURL string
+		svc, base, _ := newCIMDTestServer(t,
+			CIMDConfig{Enabled: true, AllowedDomains: []string{"127.0.0.1"}},
+			func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, doc(docURL, "https://127.0.0.1/cb"))
+			})
+		docURL = base + "/client.json"
+
+		if _, err := svc.ResolveClient(context.Background(), docURL); err != nil {
+			t.Fatalf("a redirect host that is itself allow-listed must resolve: %v", err)
+		}
+	})
+}
+
 // TestCIMDAllowedDomainCount_ReportsEffectivePolicy — the constructor lower-cases
 // and drops blank/whitespace-only entries, so the raw config slice and the policy
 // actually in force disagree. They disagree in the worst direction: a config of
@@ -648,5 +710,137 @@ func TestCIMDResolveClient_CoalescesConcurrentFetches(t *testing.T) {
 	if results[1].RedirectURIs[0] == "https://mutated.example/cb" {
 		t.Error("mutating one caller's RedirectURIs changed another's — the " +
 			"slice is shared, so the clone is shallow where it must be deep")
+	}
+}
+
+// TestRedirectHostsAllowed is the check that makes cimd.allowed_domains mean
+// what the authorize-handler gate assumes it means.
+//
+// That gate (API.refusesRedirectTo) reads "an allow-listed publisher is a vetted
+// party, so §4.1.2.1 redirects and the interactive-login redirect apply again."
+// Allow-listing the client_id host alone does not establish that: on any host
+// where more than one party can publish a path — user content, a raw-file CDN, a
+// bucket with broad write, a shared internal app host — an attacker publishes a
+// document naming redirect_uri https://evil.example/cb and gets an
+// unauthenticated 302 to evil.example, plus a victim walked through the real
+// login page first. The redirect destination has to be vetted too, or the switch
+// re-opens what the carve-out closed.
+func TestRedirectHostsAllowed(t *testing.T) {
+	svc := NewCIMDService(CIMDConfig{Enabled: true, AllowedDomains: []string{"apps.acme.dev"}})
+
+	const publisher = "apps.acme.dev"
+
+	t.Run("same host as client_id passes unlisted", func(t *testing.T) {
+		// The ordinary case: a document names callbacks on the host that
+		// published it. Requiring that host to also appear in the allow-list
+		// would be redundant — it is already there, since it resolved at all.
+		if err := svc.redirectHostsAllowed(publisher, []string{"https://apps.acme.dev/cb"}); err != nil {
+			t.Fatalf("same-host redirect must pass: %v", err)
+		}
+	})
+
+	t.Run("another allow-listed host passes", func(t *testing.T) {
+		svc2 := NewCIMDService(CIMDConfig{
+			Enabled:        true,
+			AllowedDomains: []string{"apps.acme.dev", "cb.acme.dev"},
+		})
+		if err := svc2.redirectHostsAllowed(publisher, []string{"https://cb.acme.dev/cb"}); err != nil {
+			t.Fatalf("a vetted destination host must pass: %v", err)
+		}
+	})
+
+	t.Run("foreign https host is refused", func(t *testing.T) {
+		err := svc.redirectHostsAllowed(publisher, []string{"https://evil.example/cb"})
+		if !errors.Is(err, ErrCIMDDomainNotAllowed) {
+			t.Fatalf("want ErrCIMDDomainNotAllowed, got %v", err)
+		}
+	})
+
+	t.Run("one bad entry poisons the document", func(t *testing.T) {
+		// Not "drop the bad one and keep going": the client would then hold a
+		// redirect_uris list the deployer never approved, and redirectURIAllowed
+		// matches against whichever entry the request names.
+		err := svc.redirectHostsAllowed(publisher, []string{
+			"https://apps.acme.dev/cb",
+			"https://evil.example/cb",
+		})
+		if !errors.Is(err, ErrCIMDDomainNotAllowed) {
+			t.Fatalf("want ErrCIMDDomainNotAllowed, got %v", err)
+		}
+	})
+
+	t.Run("loopback and private-use schemes are exempt", func(t *testing.T) {
+		// These deliver to the caller's own machine, not to a host anybody
+		// publishes to, so a deployment-wide host allow-list has nothing to say
+		// about them — and they are the native/MCP client shape.
+		for _, ru := range []string{
+			"http://127.0.0.1:9000/cb",
+			"http://localhost:9000/cb",
+			"myapp:/cb",
+		} {
+			if err := svc.redirectHostsAllowed(publisher, []string{ru}); err != nil {
+				t.Errorf("%s must stay usable: %v", ru, err)
+			}
+		}
+	})
+
+	t.Run("open mode constrains nothing", func(t *testing.T) {
+		// domainAllowed admits every host with no allow-list, so this is a
+		// no-op there — correctly: open mode refuses these redirects outright,
+		// so there is no vetting claim to keep honest.
+		open := NewCIMDService(CIMDConfig{Enabled: true})
+		if err := open.redirectHostsAllowed(publisher, []string{"https://anywhere.example/cb"}); err != nil {
+			t.Fatalf("open mode must not reject: %v", err)
+		}
+	})
+
+	t.Run("host match is case-insensitive", func(t *testing.T) {
+		if err := svc.redirectHostsAllowed("APPS.ACME.DEV", []string{"https://apps.acme.dev/cb"}); err != nil {
+			t.Fatalf("host comparison must be case-insensitive: %v", err)
+		}
+	})
+}
+
+// TestRedirectDeliversLocally pins the reachability judgement the authorize
+// carve-out delegates to. A false negative costs the native/MCP browser leg; a
+// false positive hands an attacker-chosen remote host a redirect from the AS's
+// own origin. The look-alike case is the one worth having a test for.
+func TestRedirectDeliversLocally(t *testing.T) {
+	local := []string{
+		"http://127.0.0.1:3000/callback",
+		"http://localhost/cb",
+		"http://[::1]:8080/cb",
+		"myapp:/cb",
+		"com.example.app:/oauth",
+	}
+	remote := []string{
+		"https://app.example.com/cb",
+		"https://127.0.0.1/cb",         // https is remote-capable regardless of host
+		"http://127.0.0.1.evil.com/cb", // look-alike: not loopback
+		"http://evil.example/cb",
+		"/relative/cb", // no scheme — validateCIMDRedirectURI rejects; fail closed
+		// Userinfo confusion: the authority is `evil.com`, and `127.0.0.1` is a
+		// username. Anything eyeballing the prefix — or splitting on the wrong
+		// delimiter — reads this as loopback and hands an authorization code to
+		// evil.com. url.Parse().Hostname() gets it right; this pins that we keep
+		// using it rather than string-matching the raw URI.
+		"http://127.0.0.1@evil.com/cb",
+		// Browsers commonly normalise 0.0.0.0 to loopback, so a client could
+		// plausibly listen there. We classify it remote, which fails CLOSED: the
+		// redirect is refused rather than wrongly trusted. Pinned so the choice
+		// is deliberate — widening it later is a security decision, not a typo fix.
+		"http://0.0.0.0/cb",
+	}
+
+	for _, u := range local {
+		if !RedirectDeliversLocally(u) {
+			t.Errorf("%s must count as local delivery — refusing it breaks native clients", u)
+		}
+	}
+
+	for _, u := range remote {
+		if RedirectDeliversLocally(u) {
+			t.Errorf("%s must NOT count as local delivery", u)
+		}
 	}
 }
