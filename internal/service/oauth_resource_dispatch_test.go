@@ -137,7 +137,7 @@ func TestJWTBearer_SelfSignedRejectsResource(t *testing.T) {
 	// branch. The rejection lands before any algorithm or signature work.
 	_, err := svc.Token(context.Background(), TokenRequest{
 		GrantType: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		Subject:   "not.a.real.assertion",
+		Assertion: "not.a.real.assertion",
 		Resource:  []string{"https://gw.example/mcp/github"},
 	})
 	oe := wantOAuthError(t, err, oautherror.InvalidTarget)
@@ -157,7 +157,7 @@ func TestJWTBearer_SelfSignedUnaffectedWithoutResource(t *testing.T) {
 	// (invalid_grant), not on the resource gate.
 	_, err := svc.Token(context.Background(), TokenRequest{
 		GrantType: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		Subject:   "not.a.real.assertion",
+		Assertion: "not.a.real.assertion",
 	})
 	wantOAuthError(t, err, oautherror.InvalidGrant)
 }
