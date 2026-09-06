@@ -94,7 +94,23 @@ type TokenInput struct {
 		// resource(s) the minted token is bound to (CAP-IDN-026). Accepts a
 		// single URI string or an array of them; a form-encoded request may
 		// repeat the parameter. Mutually exclusive with Audience.
-		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment"`
+		//
+		// THE TOKEN REQUEST IS THE ONLY PLACE A BINDING IS ESTABLISHED.
+		// /oauth2/authorize accepts and ignores `resource` (RFC 6749 §3.1's
+		// ignore-unrecognized posture), and the binding is not carried on the
+		// authorization code — so a client that sends it only at the
+		// authorization request receives an UNBOUND token, with no error at any
+		// step. The MCP authorization profile requires `resource` on both the
+		// authorization and the token request, so a conformant MCP client is
+		// bound correctly; a client following RFC 8707 §2 alone, which permits
+		// the token request to rely on the code's binding, is not.
+		// Tracked for a follow-up that persists the authorized set on the code
+		// row and cross-checks it at redemption.
+		//
+		// Note also that a request carrying `resource` is issued NO refresh
+		// token: the binding is not carried across rotation, so a refresh would
+		// silently unbind the token.
+		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment. Must be sent on THIS request: /oauth2/authorize ignores it and the binding is not carried on the authorization code. A resource-bound request receives no refresh_token."`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
