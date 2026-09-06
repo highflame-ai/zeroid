@@ -1609,6 +1609,41 @@ var jsonShapedFormFields = map[string]struct{}{
 	"authorization_details": {},
 }
 
+// repeatableFormFields are OAuth form parameters that a spec explicitly permits
+// to appear MORE THAN ONCE, overriding RFC 6749 §3.1's blanket "MUST NOT be
+// included more than once".
+//
+// Today only RFC 8707 `resource` qualifies: §2 states "the parameter can be
+// included multiple times to indicate multiple resources". Without this set the
+// duplicate-key guard below would reject a conformant multi-resource request
+// with `duplicate OAuth parameter: resource` — a spec violation that would look
+// to an interop tester like we do not support the parameter at all.
+//
+// Repeats are collapsed into a JSON array so the downstream binder
+// (handler.resourceParam) sees the same shape a JSON caller would send.
+//
+// Scoped to /oauth2/token, the only endpoint that binds `resource`. Applying it
+// across every OAuthFormEndpoint would make a repeated `resource` on
+// /oauth2/bc-authorize parse cleanly and then be discarded by a body struct
+// that has no such field — advertising support for a parameter that does
+// nothing. Narrow the carve-out to where the parameter is real.
+var repeatableFormFields = map[string]map[string]struct{}{
+	"/oauth2/token": {
+		"resource": {},
+	},
+}
+
+// formFieldRepeatable reports whether parameter k may legally appear more than
+// once on the given endpoint.
+func formFieldRepeatable(path, k string) bool {
+	fields, ok := repeatableFormFields[path]
+	if !ok {
+		return false
+	}
+	_, repeatable := fields[k]
+	return repeatable
+}
+
 // mediaTypeEquals parses a Content-Type header and reports whether the media
 // type portion matches want (case-insensitive per RFC 7231 §3.1.1.1).
 // Parameters like charset are ignored for the comparison.
@@ -1664,10 +1699,45 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 		for k, vs := range r.PostForm {
 			// RFC 6749 §3.1: request parameters MUST NOT be included more
 			// than once. Duplicate keys are rejected rather than silently
-			// collapsed to vs[0].
+			// collapsed to vs[0] — EXCEPT where a later spec explicitly makes
+			// the parameter repeatable (repeatableFormFields), in which case
+			// every occurrence is preserved as a JSON array.
 			if len(vs) > 1 {
-				writeValidationError(w, r, "duplicate OAuth parameter: "+k)
-				return
+				if !formFieldRepeatable(r.URL.Path, k) {
+					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
+					return
+				}
+				// Bound the repeat count HERE, not only at the service's
+				// stricter cap. The token endpoint is unauthenticated, and
+				// without this a 10 MiB body of repeated `resource=` produces
+				// ~800k values that are collected, re-marshalled to JSON, and
+				// URI-validated per element by the request binder before the
+				// service rejects the count. That work is linear rather than
+				// amplifying, so it is not a denial-of-service on its own — but
+				// it is unbounded work admitted on the caller's say-so, and one
+				// comparison removes it. Deliberately looser than the service's
+				// own limit so THAT stays the single authority on how many
+				// resources a request may name, with its own error message.
+				const maxFormRepeats = 64
+				if len(vs) > maxFormRepeats {
+					writeValidationError(w, r,
+						"too many repeated values for OAuth parameter: "+k)
+					return
+				}
+				// Drop valueless occurrences per RFC 6749 §3.2 before binding,
+				// so `resource=https://a&resource=` yields one resource rather
+				// than one resource plus an empty string.
+				kept := make([]string, 0, len(vs))
+				for _, v := range vs {
+					if v != "" {
+						kept = append(kept, v)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				flat[k] = kept
+				continue
 			}
 			if len(vs) == 0 {
 				continue

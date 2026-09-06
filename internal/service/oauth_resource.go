@@ -1,0 +1,334 @@
+package service
+
+import (
+	"fmt"
+	"net/url"
+	"slices"
+	"strings"
+
+	"github.com/highflame-ai/zeroid/internal/oautherror"
+)
+
+// ── RFC 8707 resource indicators ─────────────────────────────────────────────
+//
+// `resource` is a REQUEST parameter naming the protected resource(s) a token is
+// being minted for (CAP-IDN-026). It is the minting half of INV-IDN-006, whose
+// enforcement half (Shield) gates on the `resource` CLAIM this parameter
+// produces.
+//
+// The security model rests on one property: a resource binding only ever
+// NARROWS. Stamping a resource on a token strictly reduces where that token is
+// honoured and grants no authority the grant did not already carry. That is why
+// ZeroID can accept an arbitrary caller-supplied identifier without a registry
+// of known resource servers — the worst a caller can do by naming a resource
+// that does not exist is mint a token nothing will accept. Any future change
+// that makes `resource` widen anything (select a scope profile, pick a policy,
+// route to a different identity) breaks this and needs a registry first.
+
+// maxResourceIndicators bounds how many resources one request may name. RFC 8707
+// sets no limit; an unbounded list would let a caller inflate every issued JWT
+// (the values land in both `aud` and the `resource` claim) and, on the ID-JAG
+// path, force a large subset comparison. Eight is far above the realistic case —
+// a token is normally bound to exactly one MCP server — and far below anything
+// that matters for token size.
+const maxResourceIndicators = 8
+
+// maxResourceIndicatorLen bounds each individual value. The count cap alone does
+// NOT bound token size — eight megabyte-long URIs pass a count check and then
+// land in `aud`, in the `resource` claim, in the signed JWT, in the credentials
+// row, and in the error/log lines that echo them. 2 KiB is far above any real
+// RFC 9728 identifier (`<origin>/mcp/<slug>` is tens of bytes) and far below
+// anything that inflates a token. Mirrors maxObservedResourceLen, which the
+// inventory path already enforces.
+const maxResourceIndicatorLen = 2048
+
+// validateResourceIndicators checks a `resource` request parameter against
+// RFC 8707 §2 and returns the de-duplicated list to bind.
+//
+// Per §2 each value MUST be an absolute URI and MUST NOT include a fragment.
+// The absolute-URI rule is what keeps the identifier globally meaningful: a
+// relative reference ("/mcp/github") means nothing to a resource server that
+// did not issue it, and Shield's origin comparison (sameOrigin) silently fails
+// closed on one, so a token bound to a relative value would be dead on arrival
+// in a way the client could not diagnose. The no-fragment rule matters because
+// fragments are not sent over the wire — two identifiers differing only by
+// fragment are the same resource to every party that matters, so accepting one
+// would create bindings that compare unequal for no observable reason.
+//
+// A query component IS permitted (§2 explicitly allows it when the resource
+// server uses one). Values are compared and stamped verbatim, with no
+// normalization: the identifier a client sends must be byte-identical to what
+// the resource server advertises in its RFC 9728 metadata, and silently
+// canonicalizing (lowercasing a host, stripping a default port, adding a
+// trailing slash) would produce a binding the client did not ask for.
+//
+// Duplicates are collapsed rather than rejected — repeating a resource is
+// harmless and RFC 8707 §2 explicitly permits the parameter to appear multiple
+// times, so a client that lists one twice gets what it asked for.
+//
+// Returns an *OAuthError with `invalid_target` (RFC 8707 §2 names this the
+// error for an invalid or unknown resource) on any violation.
+func validateResourceIndicators(resources []string) ([]string, error) {
+	if len(resources) == 0 {
+		return nil, nil
+	}
+	if len(resources) > maxResourceIndicators {
+		return nil, oauthBadRequest(oautherror.InvalidTarget,
+			fmt.Sprintf("too many resource indicators (max %d)", maxResourceIndicators))
+	}
+
+	out := make([]string, 0, len(resources))
+	for _, raw := range resources {
+		// A caller that sends `resource=` (empty) on a form body never reaches
+		// here — the form-compat middleware drops valueless parameters per
+		// RFC 6749 §3.2. A JSON caller can still send "", so reject explicitly
+		// rather than binding a token to the empty string.
+		if strings.TrimSpace(raw) == "" {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				"resource must not be empty")
+		}
+		// Checked before parsing so a pathological value is rejected without
+		// url.Parse walking it, and the error never echoes the oversized input.
+		if len(raw) > maxResourceIndicatorLen {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource exceeds the maximum length of %d bytes", maxResourceIndicatorLen))
+		}
+		// RFC 3986 §2 confines a URI to a subset of printable ASCII: anything
+		// else — a space, a tab, a control character, a raw non-ASCII rune —
+		// must be percent-encoded. url.Parse is lenient about several of these
+		// (a space passes), so without this a value that can never match an
+		// RFC 9728 advertisement is accepted and bound, then appears verbatim
+		// in a signed token, an audit record and a log line where a space or an
+		// embedded newline makes the identifier ambiguous to read.
+		//
+		// Rejecting outright rather than percent-encoding for the caller: the
+		// identifier has to match what the resource server advertises byte for
+		// byte, and silently repairing it would produce a binding the client
+		// never asked for.
+		if i := strings.IndexFunc(raw, func(r rune) bool { return r < 0x21 || r > 0x7e }); i >= 0 {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource contains a character that RFC 3986 requires be percent-encoded (offset %d)", i))
+		}
+		// Deliberately NOT TrimSpace'd into the parse: a value with surrounding
+		// whitespace is a malformed identifier, not one to silently repair.
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, oauthBadRequestCause(oautherror.InvalidTarget,
+				fmt.Sprintf("resource %q is not a valid URI", raw), err)
+		}
+		if !u.IsAbs() {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource %q must be an absolute URI (RFC 8707 §2)", raw))
+		}
+		// url.Parse accepts "https://" with no host and yields IsAbs()==true, so
+		// the absolute check alone is not enough to reject a hostless value.
+		//
+		// Keyed on the "//" authority marker rather than an http/https allow-list:
+		// any scheme that declares an authority must actually name one, so
+		// "ftp://" and "foo://" are rejected on the same grounds as "https://".
+		// A scheme with no authority component is left alone — "urn:example:mcp"
+		// is a legitimate absolute URI with no host to require, and RFC 8707 §2
+		// says absolute URI, not http(s) URL.
+		if strings.Contains(raw, "://") && u.Host == "" {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource %q declares an authority but names no host", raw))
+		}
+		// Userinfo is rejected, and the rejection deliberately does NOT echo the
+		// value back.
+		//
+		// A resource indicator is a public identifier that gets stamped into a
+		// SIGNED token (both `aud` and the `resource` claim), persisted on the
+		// credential row, recorded in the observed-resource inventory, and
+		// logged. A userinfo component puts a password into every one of those,
+		// and a signed JWT cannot be un-issued — so this is a durable disclosure
+		// rather than a caller-harms-only-themselves mistake, and "a binding only
+		// narrows" does not cover it.
+		//
+		// It is also confusable: in "https://a:80@b/x" a reader sees host "a"
+		// port 80, while every URL parser resolves the origin to "b" — so an
+		// auditor and the enforcement point disagree about which server a token
+		// is bound to. The same repo already rejects userinfo on the analogous
+		// redirect_uri check (redirectURIAllowed), so accepting it here was an
+		// inconsistency rather than a decision.
+		if u.User != nil {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				"resource must not include a userinfo component (RFC 8707 §2 identifiers are public)")
+		}
+		// Fragment is checked via the raw string as well as the parsed struct:
+		// a trailing "#" parses to an empty Fragment but is still a fragment
+		// component per RFC 3986 §3.5, and §2 forbids the component, not just a
+		// non-empty one.
+		if u.Fragment != "" || strings.Contains(raw, "#") {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource %q must not include a fragment (RFC 8707 §2)", raw))
+		}
+		if !slices.Contains(out, raw) {
+			out = append(out, raw)
+		}
+	}
+	return out, nil
+}
+
+// checkResourceAudienceExclusive rejects a request that carries BOTH the
+// audience-profile `audience` parameter and the RFC 8707 `resource` parameter.
+//
+// The two look similar and both end up influencing `aud`, but they mean
+// different things: `audience` names a server-defined SCOPE PROFILE (it widens —
+// it adds that profile's fixed scope set), while `resource` names a protected
+// resource (it only narrows). Letting them coexist would put two meanings on one
+// claim with no discriminator — which is exactly the failure that made Shield
+// deny every MCP-targeted request in prod (shield#366, INV-IDN-006). Refusing
+// the combination outright means there is no precedence rule to get wrong, and
+// no profiled-audience token ever also carries a resource binding.
+//
+// If a concrete need for "profiled AND resource-bound" ever appears, it needs a
+// separate deliberate design (likely a distinct claim), not a precedence tweak
+// here.
+func checkResourceAudienceExclusive(req TokenRequest) error {
+	if req.Audience != "" && len(req.Resource) > 0 {
+		return oauthBadRequest(oautherror.InvalidRequest,
+			"audience and resource are mutually exclusive: audience names a scope profile, "+
+				"resource names an RFC 8707 protected resource")
+	}
+	return nil
+}
+
+// narrowResourcesTo restricts an authorized resource set to the subset the
+// client requested, for grants where an upstream authority (today: an ID-JAG's
+// own `resource` claim) already decided which resources are permissible.
+//
+// Every requested value MUST appear in authorized, compared as an exact string.
+// This is the direction that makes the parameter safe here: the client SELECTS
+// from what the IdP granted, and can never add to it. Comparison is exact
+// because both sides are opaque identifiers — a prefix or origin match would let
+// "https://gw.example/mcp/github-admin" be satisfied by an authorization for
+// "https://gw.example/mcp/github".
+//
+// An empty request returns the full authorized set unchanged: omitting the
+// parameter keeps the pre-CAP-IDN-026 behaviour, where the claim decides.
+func narrowResourcesTo(authorized, requested []string) ([]string, error) {
+	if len(requested) == 0 {
+		return authorized, nil
+	}
+	for _, want := range requested {
+		if !slices.Contains(authorized, want) {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource %q is not among the resources this grant authorizes", want))
+		}
+	}
+	return requested, nil
+}
+
+// grantSupportsResource reports whether a grant honours the `resource`
+// parameter. Grants are enabled here as their binding lands; anything not
+// listed rejects the parameter outright (rejectUnsupportedResource) rather than
+// accepting and ignoring it.
+//
+// refresh_token is deliberately absent and stays that way: a refresh continues
+// an existing grant, so accepting a NEW binding there would let a client
+// re-target a token it already holds, and re-binding is a fresh authorization
+// decision that belongs at the original grant. A resource-bound request is
+// issued no refresh token at all, so the case should not arise — this is the
+// second lock on that door.
+var resourceSupportedGrants = map[string]bool{
+	// jwt-bearer covers the ID-JAG profile, where `resource` SELECTS a subset of
+	// the resources the corporate IdP already authorized (narrowResourcesTo).
+	// The NHI self-signed jwt-bearer path shares this grant type and rejects the
+	// parameter itself — see jwtBearer — because it has no authorized set to
+	// narrow against.
+	"urn:ietf:params:oauth:grant-type:jwt-bearer": true,
+	// The ordinary grants bind directly (bindResourceOnIssue): there is no
+	// upstream authorized set to narrow against, so the requested resource
+	// simply restricts where the token they would have minted anyway is
+	// honoured. This is the case zeroid#258 exists for — a resource-bound token
+	// with no enterprise IdP in the loop.
+	"client_credentials": true,
+	"api_key":            true,
+	"urn:ietf:params:oauth:grant-type:token-exchange": true,
+	"authorization_code":                              true,
+}
+
+func grantSupportsResource(grantType string) bool {
+	return resourceSupportedGrants[grantType]
+}
+
+// bindResourceOnIssue stamps an RFC 8707 binding onto an issuance request.
+//
+// Two claims, deliberately, because they answer different questions:
+//
+//   - `aud` — RFC 8707 §2 conformance. A resource-indicator request produces a
+//     token audienced to the resource, which is what a spec-following resource
+//     server checks.
+//   - `resource` — the discriminator INV-IDN-006 enforcement keys on. It cannot
+//     read `aud` for this: ZeroID stamps `aud` on every token it issues,
+//     defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
+//     says nothing about whether a binding exists. Treating it as if it did
+//     denied every MCP-targeted request in prod (shield#366). Presence of the
+//     `resource` claim is the signal; its absence means "not bound".
+//
+// `resource` is in reservedClaims, so setting it here — the same direct-to-
+// CustomClaims route the ID-JAG path uses — is the ONLY way it can appear. A
+// caller can never inject or widen one through additional_claims, which is what
+// keeps the claim's presence load-bearing.
+//
+// ── `aud` IS NOT AN AUTHORIZATION SIGNAL ─────────────────────────────────────
+//
+// Setting Audience here means that on the ordinary grants (client_credentials,
+// api_key, token-exchange, authorization_code) the CALLER chooses `aud`. That is
+// deliberate and safe only because nothing on this platform treats `aud` as an
+// authorization input:
+//
+//   - Shield, Observatory, Cerberus, Discovery and AuthN all construct
+//     authjwt.VerifierConfig with Issuer + JWKSURL and leave Audience unset.
+//   - INV-IDN-006 enforcement keys on the `resource` claim precisely because
+//     `aud` cannot carry that meaning — ZeroID stamps it on every token,
+//     defaulting to the issuer URL for JWT-SVID §3.
+//
+// The "a binding only ever NARROWS" argument — the reason ZeroID accepts an
+// arbitrary resource URI with no registry of known resource servers — applies to
+// the `resource` claim, which is presence-gated and therefore restrict-only. It
+// does NOT extend to `aud`, which is an accept/reject gate: swapping it from the
+// issuer to a caller-chosen value is not a subset operation.
+//
+// So: a relying party MUST NOT use `aud` to decide whether to accept a ZeroID
+// token. Pinning authjwt's optional Audience to your own identifier does not
+// establish that the token was minted for you — any tenant principal can request
+// that value. Authorize on `resource` (a binding ZeroID recorded), on `scopes`,
+// and on the principal. If a future need genuinely requires an unforgeable
+// audience, it needs the resource-server registry RFC 8707 §2's
+// invalid_target-for-unknown-resource exists for, not a tweak here.
+//
+// A no-op when nothing was requested, so callers can apply it unconditionally
+// and no grant's default issuance shape changes.
+func bindResourceOnIssue(issue *IssueRequest, resources []string) {
+	if len(resources) == 0 {
+		return
+	}
+	issue.Audience = resources
+	if issue.CustomClaims == nil {
+		issue.CustomClaims = make(map[string]any, 1)
+	}
+	// Cloned rather than aliased. `resources` can arrive with cap > len (the
+	// validator allocates cap for the pre-dedup count), so sharing one backing
+	// array between `aud` and the `resource` claim means a later
+	// append(issue.Audience, …) would write THROUGH into the claim Shield
+	// enforces on — silently changing a binding with no error anywhere. Nothing
+	// appends today; one word removes the whole class.
+	issue.CustomClaims["resource"] = slices.Clone(resources)
+}
+
+// rejectUnsupportedResource fails a request that carries `resource` on a grant
+// that does not yet honour it.
+//
+// Fail loud, never silently ignore. A caller that asks for a resource-bound
+// token and receives an UNBOUND one has a token that works everywhere while
+// believing it works in one place — the exact confusion INV-IDN-006 exists to
+// prevent. RFC 8707 §2 specifies `invalid_target` for a resource the AS cannot
+// honour, which covers "not on this grant" as well as "not a valid URI".
+func rejectUnsupportedResource(req TokenRequest, grant string) error {
+	if len(req.Resource) == 0 {
+		return nil
+	}
+	return oauthBadRequest(oautherror.InvalidTarget,
+		fmt.Sprintf("the resource parameter is not supported on the %s grant", grant))
+}
