@@ -149,6 +149,33 @@ func TestValidateResourceIndicators(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects a userinfo component without echoing it", func(t *testing.T) {
+		// A resource indicator lands in a SIGNED token, the credential row, the
+		// observed-resource inventory and the logs. A userinfo component puts a
+		// secret in all four, and a signed JWT cannot be un-issued — so this is a
+		// durable disclosure, not a caller-harms-only-themselves mistake.
+		secret := "s3cr3t"
+		at := string(rune(64))
+		_, err := validateResourceIndicators([]string{
+			"https://user:" + secret + at + "gw.example.com/mcp/github"})
+		oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+		if !strings.Contains(oe.Description, "userinfo") {
+			t.Fatalf("expected a userinfo rejection, got %q", oe.Description)
+		}
+		if strings.Contains(oe.Description, secret) {
+			t.Fatal("the rejection must not echo the credential back to the caller")
+		}
+	})
+
+	t.Run("rejects userinfo that reads like a host:port", func(t *testing.T) {
+		// "https://a:80@b/x" reads to a human as host a, port 80; every URL parser
+		// resolves the origin to b. An auditor and the enforcement point would
+		// disagree about which server the token is bound to.
+		at := string(rune(64))
+		_, err := validateResourceIndicators([]string{"https://a:80" + at + "b/mcp/github"})
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
 	t.Run("rejects a value over the per-value length cap", func(t *testing.T) {
 		// The COUNT cap does not bound token size; without this, eight huge URIs
 		// pass validation and land in aud, the resource claim, the signed JWT,

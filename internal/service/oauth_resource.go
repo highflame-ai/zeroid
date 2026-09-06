@@ -117,6 +117,27 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 			return nil, oauthBadRequest(oautherror.InvalidTarget,
 				fmt.Sprintf("resource %q declares an authority but names no host", raw))
 		}
+		// Userinfo is rejected, and the rejection deliberately does NOT echo the
+		// value back.
+		//
+		// A resource indicator is a public identifier that gets stamped into a
+		// SIGNED token (both `aud` and the `resource` claim), persisted on the
+		// credential row, recorded in the observed-resource inventory, and
+		// logged. A userinfo component puts a password into every one of those,
+		// and a signed JWT cannot be un-issued — so this is a durable disclosure
+		// rather than a caller-harms-only-themselves mistake, and "a binding only
+		// narrows" does not cover it.
+		//
+		// It is also confusable: in "https://a:80@b/x" a reader sees host "a"
+		// port 80, while every URL parser resolves the origin to "b" — so an
+		// auditor and the enforcement point disagree about which server a token
+		// is bound to. The same repo already rejects userinfo on the analogous
+		// redirect_uri check (redirectURIAllowed), so accepting it here was an
+		// inconsistency rather than a decision.
+		if u.User != nil {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				"resource must not include a userinfo component (RFC 8707 §2 identifiers are public)")
+		}
 		// Fragment is checked via the raw string as well as the parsed struct:
 		// a trailing "#" parses to an empty Fragment but is still a fragment
 		// component per RFC 3986 §3.5, and §2 forbids the component, not just a
@@ -271,7 +292,13 @@ func bindResourceOnIssue(issue *IssueRequest, resources []string) {
 	if issue.CustomClaims == nil {
 		issue.CustomClaims = make(map[string]any, 1)
 	}
-	issue.CustomClaims["resource"] = resources
+	// Cloned rather than aliased. `resources` can arrive with cap > len (the
+	// validator allocates cap for the pre-dedup count), so sharing one backing
+	// array between `aud` and the `resource` claim means a later
+	// append(issue.Audience, …) would write THROUGH into the claim Shield
+	// enforces on — silently changing a binding with no error anywhere. Nothing
+	// appends today; one word removes the whole class.
+	issue.CustomClaims["resource"] = slices.Clone(resources)
 }
 
 // rejectUnsupportedResource fails a request that carries `resource` on a grant
