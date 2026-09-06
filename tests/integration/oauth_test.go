@@ -110,7 +110,7 @@ func TestJWTBearerFlow(t *testing.T) {
 	// Agent: exchange assertion for a ZeroID-issued JWT.
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion,
+		"assertion":  assertion,
 		"scope":      "data:read",
 	}, nil) // public endpoint — no admin headers
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -143,7 +143,7 @@ func TestJWTBearerWrongKey(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion,
+		"assertion":  assertion,
 		"scope":      "data:read",
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)

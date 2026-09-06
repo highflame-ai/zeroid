@@ -263,7 +263,7 @@ func TestIDJAGBearer_UnknownIssuer_InvalidGrant(t *testing.T) {
 
 	svc := &OAuthService{externalIssuerRegistry: registry}
 	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   stranger,
+		Assertion: stranger,
 		AccountID: acct,
 		ProjectID: "proj",
 	})
@@ -296,7 +296,7 @@ func TestIDJAGBearer_NoClientAuth_InvalidClient(t *testing.T) {
 	svc := &OAuthService{externalIssuerRegistry: registry}
 	// No ClientID presented → invalid_client, before any signature/JWKS work.
 	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   idjag,
+		Assertion: idjag,
 		AccountID: acct,
 		ProjectID: "proj",
 	})
@@ -320,7 +320,7 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 	svc := &OAuthService{externalIssuerRegistry: registry}
 	// account_id NOT in AllowedAccounts → fail closed before any verification.
 	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Subject:   idjag,
+		Assertion: idjag,
 		AccountID: "acct-not-allowed",
 		ProjectID: "proj",
 	})
