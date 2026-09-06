@@ -149,6 +149,37 @@ func TestValidateResourceIndicators(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects characters RFC 3986 requires be percent-encoded", func(t *testing.T) {
+		// url.Parse is lenient about several of these — a space passes — so
+		// without an explicit rule a value that can never match an RFC 9728
+		// advertisement is bound, and then appears verbatim in a signed token and
+		// an audit record where whitespace makes it ambiguous to read.
+		for name, bad := range map[string]string{
+			"space":     "https://gw.example.com/mcp/a b",
+			"tab":       "https://gw.example.com/mcp/a\tb",
+			"newline":   "https://gw.example.com/mcp/a\nb",
+			"del":       "https://gw.example.com/mcp/a\x7f",
+			"non-ascii": "https://gw.example.com/mcp/caf\u00e9",
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := validateResourceIndicators([]string{bad})
+				oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+				if !strings.Contains(oe.Description, "percent-encoded") {
+					t.Fatalf("expected the character-set rejection, got %q", oe.Description)
+				}
+			})
+		}
+	})
+
+	t.Run("a percent-encoded equivalent is accepted", func(t *testing.T) {
+		// The rule rejects the RAW character, not the encoding of it — otherwise
+		// a legitimately encoded path would be unbindable.
+		if _, err := validateResourceIndicators([]string{
+			"https://gw.example.com/mcp/a%20b"}); err != nil {
+			t.Fatalf("a percent-encoded value was rejected: %v", err)
+		}
+	})
+
 	t.Run("rejects a userinfo component without echoing it", func(t *testing.T) {
 		// A resource indicator lands in a SIGNED token, the credential row, the
 		// observed-resource inventory and the logs. A userinfo component puts a

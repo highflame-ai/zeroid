@@ -93,6 +93,22 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 			return nil, oauthBadRequest(oautherror.InvalidTarget,
 				fmt.Sprintf("resource exceeds the maximum length of %d bytes", maxResourceIndicatorLen))
 		}
+		// RFC 3986 §2 confines a URI to a subset of printable ASCII: anything
+		// else — a space, a tab, a control character, a raw non-ASCII rune —
+		// must be percent-encoded. url.Parse is lenient about several of these
+		// (a space passes), so without this a value that can never match an
+		// RFC 9728 advertisement is accepted and bound, then appears verbatim
+		// in a signed token, an audit record and a log line where a space or an
+		// embedded newline makes the identifier ambiguous to read.
+		//
+		// Rejecting outright rather than percent-encoding for the caller: the
+		// identifier has to match what the resource server advertises byte for
+		// byte, and silently repairing it would produce a binding the client
+		// never asked for.
+		if i := strings.IndexFunc(raw, func(r rune) bool { return r < 0x21 || r > 0x7e }); i >= 0 {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				fmt.Sprintf("resource contains a character that RFC 3986 requires be percent-encoded (offset %d)", i))
+		}
 		// Deliberately NOT TrimSpace'd into the parse: a value with surrounding
 		// whitespace is a malformed identifier, not one to silently repair.
 		u, err := url.Parse(raw)

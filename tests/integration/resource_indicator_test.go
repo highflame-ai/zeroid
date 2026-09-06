@@ -149,6 +149,12 @@ func TestResourceIndicator_Rejections(t *testing.T) {
 		{"bare host", "gw.example.com/mcp", "invalid_target"},
 		{"empty string", "", "invalid_target"},
 		{"one bad value among good ones", []string{mcpGithub, "not-a-uri"}, "invalid_target"},
+		// Values that huma's `format: uri` would itself reject. These MUST still
+		// come back as an RFC 6749 §5.2 error object, not a binder 422 — the
+		// token endpoint's error shape is part of its contract, and an interop
+		// tester probing error handling reads the body, not just the status.
+		{"embedded space", "https://gw.example.com/mcp/a b", "invalid_target"},
+		{"control character", "https://gw.example.com/mcp/a\x7f", "invalid_target"},
 	}
 
 	for _, tc := range cases {

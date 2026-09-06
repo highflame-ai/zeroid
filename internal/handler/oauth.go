@@ -175,7 +175,22 @@ func (r *resourceParam) UnmarshalJSON(b []byte) error {
 // accepted. Without this, Huma would infer a plain array from the underlying
 // []string and the string form would look unsupported.
 func (resourceParam) Schema(huma.Registry) *huma.Schema {
-	uri := &huma.Schema{Type: "string", Format: "uri"}
+	// Deliberately `type: string` with NO `format: uri`.
+	//
+	// huma validates formats at bind time, not only in the document, so a
+	// `format: uri` here would reject a malformed value with a binder 422 and a
+	// {"title":"Unprocessable Entity"} body. RFC 6749 §5.2 requires the token
+	// endpoint to answer with an error object — {"error":"invalid_target",…} —
+	// and an interop tester probing error handling reads the body, not just the
+	// status. It also made validateResourceIndicators' own parse-error branch
+	// unreachable over HTTP: two validators, one of them dead, disagreeing about
+	// the response shape.
+	//
+	// So the service is the single authority on what a resource indicator may
+	// be, and the schema documents the shape (string or array of strings)
+	// without enforcing the grammar. The RFC 8707 §2 rules — absolute URI, no
+	// fragment, no userinfo — live in one place and answer in one shape.
+	uri := &huma.Schema{Type: "string"}
 	return &huma.Schema{
 		Description: "RFC 8707 resource indicator(s): absolute URI(s) identifying the " +
 			"protected resource the token is bound to. A single URI or an array; " +
