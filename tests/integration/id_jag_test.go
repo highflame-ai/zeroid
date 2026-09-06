@@ -157,6 +157,122 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"minted aud must contain every resource in the ID-JAG resource array")
 	})
 
+	// ── RFC 8707 `resource` request parameter (CAP-IDN-026) ──────────────────
+	//
+	// Where an ID-JAG authorizes several servers, the CLIENT — which knows which
+	// one it is about to call — selects at redemption time. Without the
+	// parameter the claim decides and the token is minted good for every server
+	// the assertion names, which is wider than any single call needs.
+	//
+	// These pin the wiring, not just the helper: narrowResourcesTo is unit-
+	// tested in isolation, but nothing proved idJAGBearer actually calls it,
+	// with the right arguments, at the right point in the sequence.
+
+	t.Run("resource request parameter narrows aud to the selected server", func(t *testing.T) {
+		now := time.Now()
+		const mcpResource2 = "https://mcp-server-2.idjag.test"
+		idjag := signIDJAG(t, map[string]any{
+			"iss":      upstreamIss,
+			"aud":      federationAud,
+			"sub":      "00uNARROW01",
+			"resource": []any{mcpResource, mcpResource2},
+			"scope":    "tools:read",
+			"iat":      now.Unix(),
+			"exp":      now.Add(5 * time.Minute).Unix(),
+		})
+
+		body := idJAGBody(idjag)
+		body["resource"] = mcpResource2
+
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		// Both claims, not just aud: `aud` is RFC 8707 conformance, but the
+		// `resource` claim is what Shield enforces INV-IDN-006 on. A narrowing
+		// that reached only one of them would leave enforcement disagreeing with
+		// the audience.
+		require.ElementsMatch(t, []any{mcpResource2}, claims["aud"],
+			"aud must be EXACTLY the requested resource, not the full authorized set")
+		require.ElementsMatch(t, []any{mcpResource2}, claims["resource"],
+			"the resource claim must be narrowed alongside aud")
+	})
+
+	t.Run("cannot select a resource the ID-JAG does not authorize", func(t *testing.T) {
+		now := time.Now()
+		idjag := signIDJAG(t, map[string]any{
+			"iss":      upstreamIss,
+			"aud":      federationAud,
+			"sub":      "00uNARROW02",
+			"resource": mcpResource,
+			"scope":    "tools:read",
+			"iat":      now.Unix(),
+			"exp":      now.Add(5 * time.Minute).Unix(),
+		})
+
+		body := idJAGBody(idjag)
+		body["resource"] = "https://mcp-server-unauthorized.idjag.test"
+
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_target", resp.Error, "body=%s", resp.RawBody)
+		// The message distinguishes narrowing-rejected from gate-rejected. Without
+		// this the test would still pass if the narrowing were deleted and the
+		// Token() gate happened to reject for an unrelated reason.
+		require.Contains(t, resp.RawBody, "not among the resources this grant authorizes",
+			"rejection must come from narrowing, not from the dispatch gate")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("a rejected resource does not burn the single-use jti", func(t *testing.T) {
+		// The ordering claim from oauth_id_jag.go: narrowing runs BEFORE the jti
+		// is consumed. If it ran after, an attacker could destroy a victim's
+		// one-shot grant by replaying it with a deliberately bad `resource` —
+		// and nothing would error at the time.
+		now := time.Now()
+		idjag := signIDJAG(t, map[string]any{
+			"iss":      upstreamIss,
+			"aud":      federationAud,
+			"sub":      "00uNARROW03",
+			"resource": mcpResource,
+			"scope":    "tools:read",
+			"iat":      now.Unix(),
+			"exp":      now.Add(5 * time.Minute).Unix(),
+		})
+
+		bad := idJAGBody(idjag)
+		bad["resource"] = "https://mcp-server-unauthorized.idjag.test"
+		rejected := postFederation(t, fedHTTPSrv.URL, bad)
+		require.Equal(t, http.StatusBadRequest, rejected.StatusCode, "body=%s", rejected.RawBody)
+
+		// SAME assertion, same jti — must still be redeemable.
+		resp := postFederation(t, fedHTTPSrv.URL, idJAGBody(idjag))
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"the jti was consumed by a request that failed the resource check; body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.ElementsMatch(t, []any{mcpResource}, claims["aud"])
+	})
+
+	t.Run("omitting the parameter still binds to the whole authorized set", func(t *testing.T) {
+		// The pre-CAP-IDN-026 behaviour every existing ID-JAG caller depends on.
+		now := time.Now()
+		const mcpResource2 = "https://mcp-server-2.idjag.test"
+		idjag := signIDJAG(t, map[string]any{
+			"iss":      upstreamIss,
+			"aud":      federationAud,
+			"sub":      "00uNARROW04",
+			"resource": []any{mcpResource, mcpResource2},
+			"scope":    "tools:read",
+			"iat":      now.Unix(),
+			"exp":      now.Add(5 * time.Minute).Unix(),
+		})
+
+		resp := postFederation(t, fedHTTPSrv.URL, idJAGBody(idjag))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.ElementsMatch(t, []any{mcpResource, mcpResource2}, claims["aud"])
+	})
+
 	t.Run("missing resource fails closed (invalid_grant)", func(t *testing.T) {
 		now := time.Now()
 		idjag := signIDJAG(t, map[string]any{

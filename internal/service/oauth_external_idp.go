@@ -153,7 +153,18 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// deployer asked for them and (b) the upstream actually set them.
 	// We never default-fill — RFC 9068 authentication-context claims are
 	// only meaningful when they reflect the IdP's authentication event.
+	//
+	// reservedClaims is enforced here too, not just on the AdditionalClaims loop
+	// below. Config restricts propagate_claims to auth_time/acr/amr today
+	// (domain.ExternalIssuerConfig.Validate), so nothing reserved can reach this
+	// loop — but that is a guarantee held one file away, and `resource` in
+	// particular is only a trustworthy signal while bindResourceOnIssue is its
+	// sole writer. A deployer-controlled list that can name claims must not be
+	// the one place that could quietly become an exception.
 	for _, claim := range cfg.PropagateClaims {
+		if reservedClaims[claim] {
+			continue
+		}
 		if v, present := rawClaims[claim]; present {
 			customClaims[claim] = v
 		}
@@ -182,7 +193,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	scopes := parseScopeString(req.Scope)
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:         identity,
 		IdentityPolicyID: identityPolicyID,
 		// Govern the synthetic-carrier path (no application_id, so no identity
@@ -204,7 +215,24 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		TTL:                   900, // 15 minutes — same short-lived posture as the broker path
 		CustomClaims:          customClaims,
 		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-	})
+	}
+	// RFC 8707 resource binding (CAP-IDN-026). token-exchange forks THREE ways —
+	// this id_token federation path, the trusted external-principal exchange, and
+	// NHI delegation — and the grant type as a whole is in
+	// resourceSupportedGrants, so the Token() gate admits `resource` for all
+	// three. A fork that does not bind here does not ignore the parameter
+	// harmlessly: it returns 200 with an UNBOUND token, and Shield's
+	// checkResourceBinding then allows the request at every MCP server because
+	// the discriminator claim is absent. The caller believes it holds a token
+	// narrowed to one server and holds one honoured everywhere.
+	//
+	// Binding rather than rejecting: this is an ordinary federation grant with no
+	// upstream authorized set to narrow against, so the requested resource simply
+	// restricts the token it would have minted anyway — the same treatment
+	// client_credentials and api_key get.
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
 	}

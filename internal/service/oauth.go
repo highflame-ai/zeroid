@@ -518,6 +518,24 @@ type TokenRequest struct {
 	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
 	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
 	IssueRefreshToken bool
+	// Resource carries the RFC 8707 `resource` request parameter — the protected
+	// resource(s) the minted token is being bound to (CAP-IDN-026). A single
+	// value or several; the wire accepts a bare string or an array, and a
+	// form-encoded request may repeat the parameter (RFC 8707 §2).
+	//
+	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
+	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// grant no authority the grant did not already carry — which is why an
+	// arbitrary caller-supplied identifier is safe to accept without a registry
+	// of known resource servers.
+	//
+	// Mutually exclusive with Audience: that names a server-defined scope profile
+	// (it widens), this names a resource (it narrows). Both on one request is
+	// `invalid_request` — see checkResourceAudienceExclusive.
+	//
+	// Validated once in Token() before dispatch, so every grant sees a list that
+	// is already syntax-checked and de-duplicated.
+	Resource []string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -537,6 +555,25 @@ type TokenRequest struct {
 
 // Token handles the /oauth2/token endpoint dispatch.
 func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
+	// grant dispatch so every grant — including custom ones registered via
+	// RegisterGrant — sees the same validated list and no grant can forget the
+	// exclusivity rule. Order matters: the audience/resource conflict is a
+	// malformed REQUEST (invalid_request) and is reported as such even when the
+	// resource values would also have failed validation, so a caller that made
+	// both mistakes is told about the structural one first.
+	if err := checkResourceAudienceExclusive(req); err != nil {
+		return nil, err
+	}
+	validatedResources, err := validateResourceIndicators(req.Resource)
+	if err != nil {
+		return nil, err
+	}
+	req.Resource = validatedResources
+	if len(req.Resource) > 0 && !grantSupportsResource(req.GrantType) {
+		return nil, rejectUnsupportedResource(req, req.GrantType)
+	}
+
 	switch req.GrantType {
 	case "client_credentials":
 		return s.clientCredentials(ctx, req)
@@ -626,13 +663,16 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -658,6 +698,18 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	// NHI self-signed behavior below.
 	if isIDJAGAssertion(req.Assertion) {
 		return s.idJAGBearer(ctx, req)
+	}
+
+	// `resource` is honoured on the ID-JAG profile only, where it narrows the
+	// set the corporate IdP authorized. The NHI self-signed path has no such
+	// authorized set — the assertion proves possession of a registered key and
+	// says nothing about which resources the agent may reach — so there is
+	// nothing to narrow against and binding would be an unreviewed grant of
+	// exactly the kind CAP-IDN-026 avoids by only ever narrowing. Reject rather
+	// than ignore: the grant type is marked as supporting `resource`, so without
+	// this the parameter would be silently dropped here.
+	if err := rejectUnsupportedResource(req, "self-signed jwt-bearer (RFC 7523)"); err != nil {
+		return nil, err
 	}
 
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
@@ -953,7 +1005,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// child that survives the parent's expiry — and once the parent row
 	// expires, the cascade-revocation walk can no longer reach the child
 	// (the traversal anchors on live ancestry).
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:            actorIdentity,
 		IdentityPolicyID:    actorPolicy.ID,
 		Scopes:              scopes,
@@ -964,7 +1016,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -1130,7 +1185,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		audience = []string{req.Audience}
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
@@ -1144,7 +1199,16 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	// The external-principal exchange binds too. It cannot collide with the
+	// audience profile above — `audience` and `resource` are mutually exclusive
+	// at the Token() gate, so exactly one of them is ever non-empty here. That
+	// exclusivity also means the refresh token in step 6 is unreachable for a
+	// bound request (it is gated on a profiled audience), which is why this path
+	// needs no separate refresh suppression.
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
@@ -1397,7 +1461,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		scopes = intersectScopes(scopes, identity.AllowedScopes)
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:           identity,
 		IdentityPolicyID:   identityPolicyID,
 		CredentialPolicyID: sk.CredentialPolicyID,
@@ -1412,7 +1476,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -2001,7 +2068,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
@@ -2011,7 +2078,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		TTL:               ttl,
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -2022,8 +2092,35 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	var refreshFamilyID string
 
+	// A resource-bound access token is issued WITHOUT a refresh token, even for
+	// a client registered for the refresh_token grant (CAP-IDN-026).
+	//
+	// The refresh path re-mints from state carried on the refresh-token row —
+	// scopes, mission, the audience-profile name — and the RFC 8707 binding is
+	// not among them: it lives in CustomClaims, which rotation does not carry.
+	// So a rotated token would come back UNBOUND, silently. Bind to server X,
+	// refresh, use anywhere — no error at any step, and INV-IDN-006 enforcement
+	// goes quiet because the discriminator claim is simply gone.
+	//
+	// Suppressing is the fail-closed answer and needs no schema change. It also
+	// matches what the binding is for: an RFC 8707 binding is a narrow, short-
+	// lived grant for one resource, and long-lived continuity for a deliberately
+	// narrow credential is a smell. A client that wants a fresh bound token asks
+	// for one — that is a new authorization decision, which is the right shape.
+	//
+	// Carrying the binding on the refresh row instead (a `resource` column,
+	// mirroring migration 039's `audience`) is the alternative if long-lived
+	// resource-bound sessions ever have a real use case.
+	resourceBound := len(req.Resource) > 0
+	if resourceBound && hasRefreshGrant {
+		log.Info().
+			Str("client_id", req.ClientID).
+			Strs("resource", req.Resource).
+			Msg("resource-bound authorization_code exchange: refresh token suppressed (binding is not carried across rotation)")
+	}
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
-	if hasRefreshGrant && s.refreshTokenSvc != nil {
+	if hasRefreshGrant && !resourceBound && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:          req.ClientID,
 			AccountID:         authCode.AccountID,

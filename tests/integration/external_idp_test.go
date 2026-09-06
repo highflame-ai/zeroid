@@ -66,6 +66,71 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
+	// RFC 8707 resource binding on the id_token federation fork (CAP-IDN-026).
+	//
+	// token-exchange forks three ways and the grant type as a whole is in
+	// resourceSupportedGrants, so the Token() gate admits `resource` for ALL of
+	// them. This fork originally did not bind, which meant a 200 with an
+	// UNBOUND token: Shield's checkResourceBinding allows at every MCP server
+	// when the discriminator claim is absent, so the caller held a token good
+	// everywhere while believing it was narrowed to one server. Caught in
+	// review; these pin it.
+	t.Run("resource binds the federated token", func(t *testing.T) {
+		const mcpResource = "https://gw.example.com/mcp/github"
+		now := time.Now()
+		idToken := upstream.SignToken(t, map[string]any{
+			"iss": upstreamIss,
+			"aud": federationAud,
+			"sub": "00uRESOURCEBIND",
+			"iat": now.Unix(),
+			"exp": now.Add(5 * time.Minute).Unix(),
+		})
+
+		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      idToken,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+			"account_id":         fedCfg.AccountID,
+			"project_id":         fedCfg.ProjectID,
+			"resource":           mcpResource,
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.ElementsMatch(t, []any{mcpResource}, claims["aud"],
+			"aud must be the requested resource")
+		require.ElementsMatch(t, []any{mcpResource}, claims["resource"],
+			"the resource claim is what INV-IDN-006 enforcement keys on; without "+
+				"it the token is silently unbound")
+	})
+
+	t.Run("without resource the federated token stays unbound", func(t *testing.T) {
+		// Baseline: absence of the claim is what tells Shield the token is
+		// unbound, so an empty-but-present claim would be a silent enforcement
+		// change for every existing federation caller.
+		now := time.Now()
+		idToken := upstream.SignToken(t, map[string]any{
+			"iss": upstreamIss,
+			"aud": federationAud,
+			"sub": "00uRESOURCEUNBOUND",
+			"iat": now.Unix(),
+			"exp": now.Add(5 * time.Minute).Unix(),
+		})
+
+		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      idToken,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+			"account_id":         fedCfg.AccountID,
+			"project_id":         fedCfg.ProjectID,
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.Nil(t, claims["resource"],
+			"an unbound token must carry no resource claim at all")
+	})
+
 	t.Run("federation happy path emits user_id_iss", func(t *testing.T) {
 		// Mint an Okta-shaped ID token. Okta uses `sub` as a stable string
 		// identifier and emits `auth_time`/`amr` from the authentication event.

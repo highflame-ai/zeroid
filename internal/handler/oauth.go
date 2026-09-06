@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -89,6 +90,27 @@ type TokenInput struct {
 		// external principal can self-rotate its session at /oauth2/token. Honoured
 		// only on that path AND only for a profiled Audience; ignored otherwise.
 		IssueRefreshToken bool `json:"issue_refresh_token,omitempty" doc:"Also mint a rotating refresh token (trusted external-principal exchange with a profiled audience only)"`
+		// Resource is the RFC 8707 §2 resource indicator: the protected
+		// resource(s) the minted token is bound to (CAP-IDN-026). Accepts a
+		// single URI string or an array of them; a form-encoded request may
+		// repeat the parameter. Mutually exclusive with Audience.
+		//
+		// THE TOKEN REQUEST IS THE ONLY PLACE A BINDING IS ESTABLISHED.
+		// /oauth2/authorize accepts and ignores `resource` (RFC 6749 §3.1's
+		// ignore-unrecognized posture), and the binding is not carried on the
+		// authorization code — so a client that sends it only at the
+		// authorization request receives an UNBOUND token, with no error at any
+		// step. The MCP authorization profile requires `resource` on both the
+		// authorization and the token request, so a conformant MCP client is
+		// bound correctly; a client following RFC 8707 §2 alone, which permits
+		// the token request to rely on the code's binding, is not.
+		// Tracked for a follow-up that persists the authorized set on the code
+		// row and cross-checks it at redemption.
+		//
+		// Note also that a request carrying `resource` is issued NO refresh
+		// token: the binding is not carried across rotation, so a refresh would
+		// silently unbind the token.
+		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment. Must be sent on THIS request: /oauth2/authorize ignores it and the binding is not carried on the authorization code. A resource-bound request receives no refresh_token."`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -100,6 +122,83 @@ type TokenInput struct {
 		// RFC 6749 §3.1: the server MUST ignore unrecognized request
 		// parameters rather than rejecting the request outright.
 		_ struct{} `additionalProperties:"true"`
+	}
+}
+
+// resourceParam binds the RFC 8707 `resource` request parameter, which §2
+// defines as repeatable — "the parameter can be included multiple times to
+// indicate multiple resources". That shape has three encodings on the wire and
+// all three must land as the same []string:
+//
+//   - JSON array:  {"resource": ["https://a", "https://b"]}
+//   - JSON string: {"resource": "https://a"}          — the single-resource case
+//   - form body:   resource=https://a&resource=https://b
+//
+// The form case is normalized to a JSON array upstream by
+// oauthFormCompatMiddleware (see repeatableFormFields in server.go); a
+// single-occurrence form parameter still arrives here as a bare string, which is
+// why the string case is not merely a convenience.
+//
+// A JSON `null` binds to nil (parameter absent) rather than erroring: RFC 6749
+// §3.1 tells the server to ignore unrecognized/empty parameters, and a client
+// that serializes an unset optional field as null means "not supplied".
+type resourceParam []string
+
+// UnmarshalJSON accepts either a string or an array of strings. Anything else
+// (number, object, bool) is a client error surfaced by Huma as a 422 binding
+// failure — deliberately not coerced, since a caller sending the wrong type for
+// a security-relevant parameter should be told, not guessed at.
+func (r *resourceParam) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "null" {
+		*r = nil
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		var many []string
+		if err := json.Unmarshal(b, &many); err != nil {
+			return fmt.Errorf("resource must be a URI string or an array of URI strings: %w", err)
+		}
+		*r = many
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(b, &one); err != nil {
+		return fmt.Errorf("resource must be a URI string or an array of URI strings: %w", err)
+	}
+	*r = []string{one}
+	return nil
+}
+
+// Schema advertises the union shape in the OpenAPI document so generated
+// clients and the interop testers reading our spec see that both encodings are
+// accepted. Without this, Huma would infer a plain array from the underlying
+// []string and the string form would look unsupported.
+func (resourceParam) Schema(huma.Registry) *huma.Schema {
+	// Deliberately `type: string` with NO `format: uri`.
+	//
+	// huma validates formats at bind time, not only in the document, so a
+	// `format: uri` here would reject a malformed value with a binder 422 and a
+	// {"title":"Unprocessable Entity"} body. RFC 6749 §5.2 requires the token
+	// endpoint to answer with an error object — {"error":"invalid_target",…} —
+	// and an interop tester probing error handling reads the body, not just the
+	// status. It also made validateResourceIndicators' own parse-error branch
+	// unreachable over HTTP: two validators, one of them dead, disagreeing about
+	// the response shape.
+	//
+	// So the service is the single authority on what a resource indicator may
+	// be, and the schema documents the shape (string or array of strings)
+	// without enforcing the grammar. The RFC 8707 §2 rules — absolute URI, no
+	// fragment, no userinfo — live in one place and answer in one shape.
+	uri := &huma.Schema{Type: "string"}
+	return &huma.Schema{
+		Description: "RFC 8707 resource indicator(s): absolute URI(s) identifying the " +
+			"protected resource the token is bound to. A single URI or an array; " +
+			"form-encoded requests may repeat the parameter.",
+		OneOf: []*huma.Schema{
+			uri,
+			{Type: "array", Items: uri},
+		},
 	}
 }
 
@@ -562,6 +661,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		PrivilegeScope:    input.Body.PrivilegeScope,
 		Audience:          input.Body.Audience,
 		IssueRefreshToken: input.Body.IssueRefreshToken,
+		Resource:          []string(input.Body.Resource),
 		Code:              input.Body.Code,
 		CodeVerifier:      input.Body.CodeVerifier,
 		RedirectURI:       input.Body.RedirectURI,
