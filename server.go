@@ -1707,6 +1707,23 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
 					return
 				}
+				// Bound the repeat count HERE, not only at the service's
+				// stricter cap. The token endpoint is unauthenticated, and
+				// without this a 10 MiB body of repeated `resource=` produces
+				// ~800k values that are collected, re-marshalled to JSON, and
+				// URI-validated per element by the request binder before the
+				// service rejects the count. That work is linear rather than
+				// amplifying, so it is not a denial-of-service on its own — but
+				// it is unbounded work admitted on the caller's say-so, and one
+				// comparison removes it. Deliberately looser than the service's
+				// own limit so THAT stays the single authority on how many
+				// resources a request may name, with its own error message.
+				const maxFormRepeats = 64
+				if len(vs) > maxFormRepeats {
+					writeValidationError(w, r,
+						"too many repeated values for OAuth parameter: "+k)
+					return
+				}
 				// Drop valueless occurrences per RFC 6749 §3.2 before binding,
 				// so `resource=https://a&resource=` yields one resource rather
 				// than one resource plus an empty string.

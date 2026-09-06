@@ -119,3 +119,40 @@ func TestFormCompat_AllValuelessResourceOmitted(t *testing.T) {
 		t.Fatalf("expected resource to be omitted, got %#v", got["resource"])
 	}
 }
+
+// TestFormCompat_RepeatsAreBounded pins the middleware-side repeat bound.
+// The token endpoint is unauthenticated; without this a 10 MiB body of
+// repeated `resource=` is fully collected, re-marshalled and URI-validated per
+// element before the service's stricter cap rejects the count.
+func TestFormCompat_RepeatsAreBounded(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("grant_type=client_credentials")
+	for i := 0; i < 65; i++ {
+		b.WriteString("&resource=https://gw.example.com/mcp/s")
+	}
+
+	got, rec := postForm(t, b.String())
+	if rec.Code == http.StatusOK {
+		t.Fatalf("an unbounded repeat count was accepted: %#v", got)
+	}
+	if !strings.Contains(rec.Body.String(), "too many repeated values") {
+		t.Fatalf("expected the repeat-bound rejection, got %q", rec.Body.String())
+	}
+}
+
+// A repeat count within the bound still binds — the guard must not shadow the
+// service's own (stricter, differently-worded) limit, which stays the single
+// authority on how many resources a request may name.
+func TestFormCompat_RepeatsWithinBoundStillReachTheService(t *testing.T) {
+	got, rec := postForm(t,
+		"grant_type=client_credentials"+
+			"&resource=https://a.example.com/mcp/x"+
+			"&resource=https://b.example.com/mcp/y")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a legal repeat was rejected by the middleware: %q", rec.Body.String())
+	}
+	arr, ok := got["resource"].([]any)
+	if !ok || len(arr) != 2 {
+		t.Fatalf("expected both resources forwarded, got %#v", got["resource"])
+	}
+}
