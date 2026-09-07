@@ -2425,13 +2425,26 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// scopes), breaking the contract that refresh preserves the original
 	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeRefreshToken,
-		UseRS256:          true,
-		SubjectOverride:   oldToken.UserID,
-		ApplicationID:     applicationID,
-		ClientID:          req.ClientID,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeRefreshToken,
+		UseRS256:         true,
+		SubjectOverride:  oldToken.UserID,
+		ApplicationID:    applicationID,
+		// oldToken.ClientID, not req.ClientID — the same source `applicationID`
+		// above already uses. A refresh is continuity of an existing grant, so
+		// the client the token is attributed to must come from the stored grant
+		// rather than from the request that is redeeming it.
+		//
+		// The two are equal in practice: a cross-client refresh is rejected
+		// (verified — it answers invalid_grant). But the only client_id check I
+		// could locate is inside the `audienceRefreshToken != nil` branch, so
+		// for an ordinary refresh token the equality is upheld somewhere I
+		// could not point at. Deriving an attribution claim from a request
+		// field whose validation I cannot locate is the wrong trade: this way
+		// `client_id` and `application_id` are provably the same value, and
+		// neither depends on that check holding.
+		ClientID:          oldToken.ClientID,
 		Audience:          refreshAudience,
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),

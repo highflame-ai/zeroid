@@ -88,4 +88,14 @@ func TestRefreshedAccessTokenKeepsClientIDClaim(t *testing.T) {
 	assert.Equal(t, testMCPClientID, refreshed["client_id"],
 		"the refreshed access token dropped `client_id` — a refresh is continuity "+
 			"of an existing grant, so the client it was granted to must survive it")
+
+	// The two attribution claims must never disagree. They are sourced from the
+	// same field (oldToken.ClientID) precisely so they cannot: an earlier draft
+	// took `client_id` from req.ClientID instead, which is equal in practice but
+	// only because a cross-client refresh is rejected somewhere I could not
+	// locate. A token asserting two different clients would be worse than one
+	// asserting none.
+	assert.Equal(t, refreshed["application_id"], refreshed["client_id"],
+		"client_id and application_id disagree on the refreshed token — they are "+
+			"both meant to name the client this grant belongs to")
 }
