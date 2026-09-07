@@ -158,7 +158,7 @@ npm install @highflame/sdk   # Node / TypeScript
 
 Prefer a runnable walkthrough after installing the SDK? Open the [ZeroID Quickstart notebook](examples/zeroid_quickstart.ipynb) for an end-to-end demo covering agent registration, OAuth client credentials, agent-to-agent delegation, token introspection and revocation, credential policies, and CAE signals.
 
-Want a LangChain-specific intro? Open the [Scope-Aware Tools notebook](examples/langchain/scope_aware_tools.ipynb) to see the same agent gain or lose tool access purely by changing its ZeroID token.
+Building on LangGraph? Open the [Confused Deputy notebook](examples/langgraph/confused_deputy.ipynb) to register two agents, build a delegation chain, and watch an injected payroll command reach the model and still fail at the tool boundary — because the token it holds cannot authorize the write.
 
 Mapping ZeroID to the [ODIS draft](https://github.com/cosai-oasis/ws4-odis/blob/main/RFCs/ODIS.md) (CoSAI/OASIS WS4)? The [role-capability statement](docs/odis/role-capability-statement.md) grades every Layer 1–2 requirement against code and tests, and the [ODIS walkthrough notebooks](examples/odis/) run the same story — Agent Registration Record → Agent Runtime Credential → Delegation Record → cascade revocation — against a local instance with real outputs.
 
