@@ -530,9 +530,11 @@ def ensure_sub_agent_identity(
     except ZeroIDError as e:
         if "409" not in str(e) and getattr(e, "code", "") not in ("conflict", "already_exists"):
             raise
-        # Already registered — find by external_id (list has no filter param) and patch.
+        # Already registered — find by external_id and patch. There is no exact
+        # external_id filter, and list() returns only the first 20 identities, so
+        # walk the whole inventory with iter_all().
         existing = next(
-            (i for i in client.identities.list() if i.external_id == external_id),
+            (i for i in client.identities.iter_all() if i.external_id == external_id),
             None,
         )
         if existing is None:
@@ -832,8 +834,9 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
         if "409" not in str(e) and getattr(e, "code", "") not in ("conflict", "already_exists"):
             raise
         # Already registered — find identity, update scopes, issue a fresh API key.
+        # iter_all() walks every page; list() would stop at the first 20.
         existing_identity = next(
-            (i for i in bootstrap.identities.list() if i.external_id == _ORCH_EXTERNAL_ID),
+            (i for i in bootstrap.identities.iter_all() if i.external_id == _ORCH_EXTERNAL_ID),
             None,
         )
         if existing_identity is None:
@@ -886,6 +889,8 @@ def _build_orch_client(cfg: dict, key_store: "AgentKeyStore"):
 
     # Validate the key with a cheap authenticated call. If it fails with an
     # auth error, the stored key is stale — clear it and re-register.
+    # list() is deliberate here: the rows are discarded, so one page is enough
+    # and iter_all() would only cost extra requests.
     try:
         client.identities.list()
     except Exception as e:
