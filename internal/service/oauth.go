@@ -2459,6 +2459,20 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			return nil, err
 		}
 
+		// The audience/resource exclusivity backstop, hoisted here from just
+		// before issuance. The primary check (near the top of this function)
+		// keys off PeekRefreshTokenIncludingRevoked; if THAT peek fails
+		// transiently the primary check is skipped, and the only remaining
+		// guard used to sit after RotateRefreshToken — where failing closed
+		// burns the client's refresh token and its retry trips reuse detection,
+		// revoking the whole family. Both inputs are available here, on a
+		// non-consuming peek, so there is no reason to check it any later.
+		if peeked.Audience != "" && len(req.Resource) > 0 {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"audience and resource are mutually exclusive: this refresh token was issued "+
+					"for an audience profile, so it cannot be rotated into a resource-bound token")
+		}
+
 		// Identity gate. The link came from the OAuth client at
 		// authorization_code time and was persisted on the refresh_token row.
 		// When present, the linked identity's status + expires_at gate

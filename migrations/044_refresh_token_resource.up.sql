@@ -102,23 +102,50 @@ ALTER TABLE refresh_tokens
 -- ADD CONSTRAINT would take. Every existing row has resource IS NULL and so
 -- already satisfies it; a follow-up migration can VALIDATE CONSTRAINT out of
 -- band once the table size is known.
-ALTER TABLE refresh_tokens
-    ADD CONSTRAINT refresh_tokens_resource_nonempty
-    CHECK (
-        resource IS NULL
-        OR (array_length(resource, 1) >= 1
-            AND array_position(resource, NULL) IS NULL
-            AND '' <> ALL (resource))
-    ) NOT VALID;
+-- cardinality(), NOT array_length(). array_length('{}'::text[], 1) returns NULL
+-- rather than 0, so `array_length(...) >= 1` evaluates to NULL for an empty
+-- array, the whole conjunction collapses to NULL, and a CHECK that evaluates to
+-- NULL is treated as SATISFIED — meaning the constraint would have permitted
+-- '{}', the one case it exists for. cardinality('{}') is 0 and compares
+-- normally. Verified against Postgres for NULL, '{}', '{NULL}', '{""}' and
+-- populated arrays.
+-- Wrapped in a DO block because Postgres has no ADD CONSTRAINT IF NOT EXISTS,
+-- and every other statement in this file is idempotent. Without this, a
+-- re-run — which the dirty-state recovery above can invite — hard-fails on
+-- "constraint already exists" where the rest of the file would no-op.
+DO $$
+BEGIN
+    ALTER TABLE refresh_tokens
+        ADD CONSTRAINT refresh_tokens_resource_nonempty
+        CHECK (
+            resource IS NULL
+            OR (cardinality(resource) >= 1
+                AND array_position(resource, NULL) IS NULL
+                AND '' <> ALL (resource))
+        ) NOT VALID;
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END
+$$;
 
--- Serves the rollback path only: `WHERE resource IS NOT NULL`, the query 044's
--- down migration must run to revoke bound families BEFORE dropping the column.
--- Without it that is a sequential scan on a hot table in the emergency path.
+-- DELIBERATELY NO INDEX ON `resource`, on either the read path or the rollback
+-- path.
 --
--- Built here, while the column is provably all-NULL, because a plain CREATE
--- INDEX is free against zero qualifying rows. Adding it later against real data
--- would need CONCURRENTLY, which cannot run in this file — golang-migrate sends
--- the whole file as one implicit transaction. So it is now or a standalone
--- migration, not casually later.
-CREATE INDEX IF NOT EXISTS idx_refresh_tokens_resource_bound
-    ON refresh_tokens (family_id) WHERE resource IS NOT NULL;
+-- The rollback runbook in the down migration needs `WHERE resource IS NOT
+-- NULL`, and an earlier revision of this file added a partial index for it on
+-- the reasoning that a plain CREATE INDEX is "free" against zero qualifying
+-- rows. That was wrong twice over:
+--
+--   * A PARTIAL index build still evaluates its predicate for every row, so it
+--     is a full heap scan no matter how few rows qualify.
+--   * golang-migrate sends this whole file as ONE implicit transaction, so the
+--     ACCESS EXCLUSIVE lock taken by the ALTER above is still held during the
+--     build. Verified via pg_locks. That blocks readers as well as writers —
+--     strictly worse than migration 033's posture on this same table, where a
+--     standalone CREATE INDEX takes a SHARE lock that at least permits reads.
+--
+-- So the index would have made every deploy of 044 pay an exclusive-locked full
+-- scan to speed up a query that may never run. The revoke is a one-off
+-- emergency step where a sequential scan is acceptable; if it ever needs to be
+-- fast, add the index in its OWN migration with CREATE INDEX CONCURRENTLY,
+-- which cannot run inside this file's implicit transaction.

@@ -121,14 +121,23 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 	// and it is strictly NARROWER than the absent case — so tolerating it costs
 	// nothing, while rejecting it would fail a flow for no security gain.
 	//
-	// Presence is tested with Has rather than by whether a typed read succeeds.
-	// That distinction is the whole fix: `"rsc": null` is PRESENT but decodes to
-	// nil through every typed accessor including jwt.Get[any], so a
-	// read-succeeded test treats it as absent — i.e. as "no ceiling", the
-	// permissive state. Same for `"rsc": []`, which reads as a valid empty
-	// slice. Both are shapes we never mint, so reaching them means our own bug
-	// or a forgery against a leaked HMAC secret, and both must fail rather than
-	// quietly widen.
+	// TWO guards are load-bearing here and they do different jobs. Removing
+	// either one reopens a hole, so be precise about which does what:
+	//
+	//   - token.Has("rsc") distinguishes ABSENT from PRESENT. It exists so an
+	//     absent claim does NOT fall into decodeResourceCeiling's fail-closed
+	//     branch — without it every unbound authorization code would stop
+	//     decoding, breaking the CAP-IDN-026 flow entirely.
+	//   - the len(out)==0 check INSIDE decodeResourceCeiling is what actually
+	//     catches `"rsc": null` and `"rsc": []`. Measured against jwx v4.4.0:
+	//     after a sign/parse round trip `null` and `[]` BOTH succeed through
+	//     jwt.Get[[]any] with length zero, so no typed read fails and Has
+	//     cannot tell them from a populated claim.
+	//
+	// Both shapes are ones we never mint, so reaching them means our own bug or
+	// a forgery against a leaked HMAC secret, and both must fail rather than
+	// quietly widen — an empty ceiling reads as "no ceiling", the permissive
+	// state.
 	if token.Has("rsc") {
 		resources, err := decodeResourceCeiling(token)
 		if err != nil {
@@ -148,34 +157,33 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 func decodeResourceCeiling(token jwt.Token) ([]string, error) {
 	var out []string
 
-	switch {
-	case true:
-		if v, err := jwt.Get[[]string](token, "rsc"); err == nil {
-			out = v
-			break
-		}
+	// Branch order note: after a sign/parse round trip a JSON array comes back
+	// as []any, so for any code WE mint the []any branch below is the one that
+	// fires — Get[[]string] is kept for a token constructed in-process (and
+	// costs nothing), not because it is the common path.
+	if v, err := jwt.Get[[]string](token, "rsc"); err == nil {
+		out = v
+	} else if v, err := jwt.Get[string](token, "rsc"); err == nil {
 		// A bare string is accepted as a single-value ceiling: unambiguous, what
 		// a JSON layer collapsing one-element arrays produces, and strictly
 		// NARROWER than the absent case — so tolerating it costs nothing while
 		// rejecting it would fail a flow for no security gain.
-		if v, err := jwt.Get[string](token, "rsc"); err == nil {
-			out = []string{v}
-			break
-		}
-		if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
-			out = make([]string, 0, len(raw))
-			for _, r := range raw {
-				s, ok := r.(string)
-				if !ok {
-					return nil, fmt.Errorf(
-						"auth code has a malformed rsc claim: element of type %T is not a string", r)
-				}
-				out = append(out, s)
+		out = []string{v}
+	} else if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
+		out = make([]string, 0, len(raw))
+		for _, r := range raw {
+			s, ok := r.(string)
+			if !ok {
+				return nil, fmt.Errorf(
+					"auth code has a malformed rsc claim: element of type %T is not a string", r)
 			}
-			break
+			out = append(out, s)
 		}
-		// Present but unreadable as any accepted shape — an object, a number, a
-		// bool, or JSON null.
+	} else {
+		// Present but unreadable as any accepted shape — an object, a number or
+		// a bool. NOT `null`: measured against jwx v4.4.0, `null` succeeds
+		// through Get[[]any] with length zero and is caught by the len(out)==0
+		// guard below, not here.
 		return nil, fmt.Errorf(
 			"auth code has a malformed rsc claim: expected a string or an array of strings")
 	}
@@ -184,6 +192,10 @@ func decodeResourceCeiling(token jwt.Token) ([]string, error) {
 	// it: absent means the client may still bind at the token endpoint
 	// (CAP-IDN-026), so silently accepting an empty ceiling here would convert
 	// a corrupt consent record into an unconstrained one.
+	//
+	// This is the guard that catches BOTH `"rsc": null` and `"rsc": []` — both
+	// decode cleanly through Get[[]any] with length zero. Do not delete it as
+	// redundant with token.Has: Has only proves the claim is present.
 	if len(out) == 0 {
 		return nil, fmt.Errorf(
 			"auth code has an empty rsc claim: a recorded ceiling must name at least one resource")
@@ -195,7 +207,15 @@ func decodeResourceCeiling(token jwt.Token) ([]string, error) {
 	// access token and enforced on by Shield. Without this, a ceiling of [""]
 	// — which validateResourceIndicators explicitly rejects at issuance —
 	// would mint a token bound to the empty string.
-	if _, err := validateResourceIndicators(out); err != nil {
+	// Take the DE-DUPLICATED result, not just the error. Returning the raw list
+	// would let a duplicated ceiling — `["A","A"]` — decode as two entries, and
+	// downstream `len(ceiling) > 1` checks read that as multi-audience: it would
+	// stamp a duplicated `aud`, and suppress the refresh token on what is really
+	// a single-resource grant. Unreachable today because IssueAuthCode dedups
+	// before minting, but it goes live the moment the cardinality cap moves,
+	// which the design treats as a one-line change.
+	out, err := validateResourceIndicators(out)
+	if err != nil {
 		return nil, fmt.Errorf("auth code has an invalid rsc claim: %w", err)
 	}
 

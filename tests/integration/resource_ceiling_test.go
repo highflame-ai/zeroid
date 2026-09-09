@@ -12,6 +12,7 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uptrace/bun/dialect/pgdialect"
 )
 
 // End-to-end contract for the consented resource ceiling carried on the
@@ -412,6 +413,65 @@ func TestResourceCeiling_AudienceFamilyRefusesResource(t *testing.T) {
 	assert.Nil(t, resourceClaimOf(t, claims),
 		"and the successor must carry no resource binding")
 	_ = good.Body.Close()
+}
+
+// TestResourceCeiling_EmptyArrayIsRejectedByTheDatabase pins migration 044's
+// CHECK constraint at the schema level.
+//
+// This test exists because the constraint was WRONG when first written, in a way
+// only a real database reveals: it used `array_length(resource, 1) >= 1`, and
+// array_length returns NULL rather than 0 for an empty array. `NULL >= 1` is
+// NULL, the whole conjunction collapsed to NULL, and a CHECK evaluating to NULL
+// is treated as SATISFIED — so the constraint permitted '{}', the single case it
+// was added for. cardinality() returns 0 and compares normally.
+//
+// Why '{}' matters: every consumer keys on len(ceiling) == 0, so an empty array
+// reads as "no ceiling" and permits binding to anything — the widening
+// direction. bun's nullzero collapses only a NIL slice, so an empty non-nil
+// slice would write '{}' rather than NULL, and this table's own rollback runbook
+// puts an operator here with UPDATE statements.
+func TestResourceCeiling_EmptyArrayIsRejectedByTheDatabase(t *testing.T) {
+	ctx := context.Background()
+
+	// pgdialect.Array is required for a raw-SQL bind: a bare []string is
+	// serialized as JSON and Postgres rejects it as a malformed array literal.
+	// The domain model gets this for free from its `array` bun tag.
+	insert := func(t *testing.T, resource any) error {
+		t.Helper()
+		if s, ok := resource.([]string); ok {
+			resource = pgdialect.Array(s)
+		}
+		_, err := testDB.ExecContext(ctx, `
+			INSERT INTO refresh_tokens
+				(token_hash, client_id, account_id, project_id, user_id, scopes,
+				 family_id, state, expires_at, resource)
+			VALUES (?, ?, ?, ?, ?, '', gen_random_uuid(), 'active', NOW() + INTERVAL '1 day', ?)`,
+			"hash-"+uid("chk"), testMCPClientID, testAccountID, testProjectID,
+			uid("chk-user"), resource)
+		return err
+	}
+
+	t.Run("NULL is permitted — it means no binding", func(t *testing.T) {
+		require.NoError(t, insert(t, nil))
+	})
+
+	t.Run("a populated ceiling is permitted", func(t *testing.T) {
+		require.NoError(t, insert(t, []string{mcpGithub}))
+	})
+
+	t.Run("an empty array is refused", func(t *testing.T) {
+		err := insert(t, []string{})
+		require.Error(t, err,
+			"'{}' must be refused by the database: it reads as \"no ceiling\" and so "+
+				"widens what the family permits")
+		assert.Contains(t, err.Error(), "refresh_tokens_resource_nonempty",
+			"the CHECK constraint should be what rejects it")
+	})
+
+	t.Run("an empty-string element is refused", func(t *testing.T) {
+		err := insert(t, []string{""})
+		require.Error(t, err, "a token bound to the empty string is dead everywhere")
+	})
 }
 
 // TestResourceCeiling_AuthorizeEndpointRejectsMultipleResources pins the

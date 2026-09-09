@@ -35,8 +35,9 @@
 --    That is fail-OPEN, the opposite of migration 039's down (whose successors
 --    are merely rejected by the daemon).
 --
---    idx_refresh_tokens_resource_bound exists to make this query cheap; without
---    it this is a sequential scan on a hot table in the emergency path.
+--    This is a sequential scan on a hot table. That is deliberate — see the up
+--    migration for why an index was NOT added for it — and acceptable for a
+--    one-off emergency step.
 --
 -- 2. Roll the binary back to a pre-CAP-IDN-027 release.
 --
@@ -51,7 +52,5 @@
 SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE refresh_tokens DROP CONSTRAINT IF EXISTS refresh_tokens_resource_nonempty;
-
-DROP INDEX IF EXISTS idx_refresh_tokens_resource_bound;
 
 ALTER TABLE refresh_tokens DROP COLUMN IF EXISTS resource;

@@ -60,7 +60,7 @@ func TestAuthCodeResourceCeiling_DecodeShapes(t *testing.T) {
 		slack  = "https://gw.example.com/mcp/slack"
 	)
 
-	t.Run("array of strings is the shape we mint", func(t *testing.T) {
+	t.Run("a JSON array of strings decodes (via the []any branch)", func(t *testing.T) {
 		claims, err := decodeAuthCodeJWT(
 			mintRawAuthCode(t, []any{github}), testMintHMAC, testMintIssuer)
 		if err != nil {
@@ -159,9 +159,10 @@ func TestAuthCodeResourceCeiling_DecodeShapes(t *testing.T) {
 	})
 
 	t.Run("JSON null is rejected", func(t *testing.T) {
-		// The shape that motivated switching to token.Has. `null` is present,
-		// but decodes to nil through EVERY typed accessor including
-		// jwt.Get[any] — so a "did any read succeed?" test treats it as absent.
+		// Caught by the len(out)==0 guard, NOT by token.Has: measured against
+		// jwx v4.4.0, `null` succeeds through Get[[]any] with length zero, so
+		// no typed read fails and presence alone cannot distinguish it from a
+		// populated claim.
 		_, err := decodeAuthCodeJWT(
 			mintRawAuthCode(t, nil2()), testMintHMAC, testMintIssuer)
 		if err == nil {

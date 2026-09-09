@@ -69,8 +69,15 @@ type RefreshToken struct {
 	//
 	// A refresh that names `resource` must select a subset of this. One that
 	// omits it re-stamps the ceiling when the ceiling holds exactly one value,
-	// and is refused when it holds more — so raising the authorize-leg
-	// cardinality cap can never quietly begin minting multi-audience tokens.
+	// and is refused when it holds more.
+	//
+	// That refusal covers the REFRESH leg only. The initial mint does not
+	// refuse it: narrowResourcesTo returns the full authorized set for an
+	// omitted request, so an authorization_code exchange against a
+	// multi-valued ceiling would stamp every value into `aud`. So raising
+	// maxAuthorizeResourceIndicators is NOT purely a one-line change — it also
+	// needs a decision about the mint, or it begins issuing multi-audience
+	// access tokens by default. Only the long-lived half is guarded today.
 	//
 	// NIL (⇒ SQL NULL via nullzero) means no binding on this family: the
 	// ordinary authorization_code flow and every pre-migration row, whose
