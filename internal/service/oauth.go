@@ -176,6 +176,21 @@ var reservedClaims = map[string]bool{
 	// route fail closed regardless of which grant is in play.
 	"role":            true,
 	"privilege_scope": true,
+	// RFC 9068 §2.2 `client_id` — set from the OAuth client the grant actually
+	// authenticated or resolved (IssueRequest.ClientID), never from caller
+	// input. It exists so a resource server can attribute a call to a client,
+	// which makes a forgeable one worse than none: the CustomClaims loop in
+	// IssueCredential runs AFTER the dedicated set, so without this entry an
+	// `additional_claims: {"client_id": "..."}` would silently win and let a
+	// caller impersonate any client — including a CIMD client, whose entire
+	// identity is that one string because it has no registration row.
+	//
+	// `application_id` is deliberately NOT added here. It has carried the same
+	// value on the authorization_code path since long before this claim
+	// existed and is equally unreserved, so reserving it now could break a
+	// trusted-service caller that legitimately sets it. That pre-existing gap
+	// is worth its own change rather than being smuggled into this one.
+	"client_id": true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
@@ -2075,6 +2090,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
 		ApplicationID:     authCode.ClientID,
+		ClientID:          authCode.ClientID,
 		TTL:               ttl,
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
@@ -2409,12 +2425,26 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// scopes), breaking the contract that refresh preserves the original
 	// grant's authority.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeRefreshToken,
-		UseRS256:          true,
-		SubjectOverride:   oldToken.UserID,
-		ApplicationID:     applicationID,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeRefreshToken,
+		UseRS256:         true,
+		SubjectOverride:  oldToken.UserID,
+		ApplicationID:    applicationID,
+		// oldToken.ClientID, not req.ClientID — the same source `applicationID`
+		// above already uses. A refresh is continuity of an existing grant, so
+		// the client the token is attributed to must come from the stored grant
+		// rather than from the request that is redeeming it.
+		//
+		// The two are equal in practice: a cross-client refresh is rejected
+		// (verified — it answers invalid_grant). But the only client_id check I
+		// could locate is inside the `audienceRefreshToken != nil` branch, so
+		// for an ordinary refresh token the equality is upheld somewhere I
+		// could not point at. Deriving an attribution claim from a request
+		// field whose validation I cannot locate is the wrong trade: this way
+		// `client_id` and `application_id` are provably the same value, and
+		// neither depends on that check holding.
+		ClientID:          oldToken.ClientID,
 		Audience:          refreshAudience,
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
