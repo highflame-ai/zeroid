@@ -239,8 +239,15 @@ func ValidateAuthorizeResource(resources []string) ([]string, error) {
 	//
 	// That would be both a spec violation and a regression: a client appending
 	// `resource=` from an unset variable used to have the parameter ignored and
-	// the flow succeed. It would also diverge the two endpoints, which is
-	// exactly what this function exists to prevent.
+	// the flow succeed.
+	//
+	// This aligns the two endpoints for the FORM-ENCODED valueless case, which
+	// is the one a real client produces. They still differ for a literal empty
+	// value: a JSON caller POSTing {"resource":[""]} to /oauth2/token gets
+	// invalid_target, because the middleware only strips valueless form
+	// parameters and nothing else re-adds that leniency. Not worth converging —
+	// a JSON caller wrote the empty string deliberately — but do not read this
+	// as full parity between the endpoints.
 	//
 	// Only EMPTY occurrences are dropped. A whitespace-only value is still a
 	// malformed identifier and still rejected below, because a client that sent

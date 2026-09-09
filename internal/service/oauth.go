@@ -2223,6 +2223,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			Strs("resource", resourceCeiling).
 			Msg("multi-resource binding: refresh token suppressed (a refresh family carries a single-valued ceiling only)")
 
+		// Clearing resourceCeiling is a dead store today — the only read of it
+		// is inside the `if issueRefresh` block below, which the next line
+		// disables. Kept deliberately so the two cannot drift: if a later edit
+		// ever reads the ceiling outside that block, it must not find a
+		// multi-valued one here.
 		resourceCeiling = nil
 		issueRefresh = false
 	}
