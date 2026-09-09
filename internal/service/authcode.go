@@ -24,6 +24,24 @@ type AuthCodeClaims struct {
 	OrgID         string    // "oid" — Organization ID
 	AccountID     string    // "aid" — Account ID
 	ProjectID     string    // "pid" — Project ID (optional)
+
+	// Resources is the consented RFC 8707 resource ceiling — "rsc"
+	// (CAP-IDN-027). Optional: absent on every code issued before this
+	// existed, and on any request that did not name a resource.
+	//
+	// A signed CLAIM rather than a database row, for the same reason Scopes
+	// is one. Auth codes are stateless HS256 JWTs and the auth_codes table
+	// is a replay-consumption ledger written at redemption, so there is no
+	// code row at authorization time to persist onto. Granted scope and
+	// granted resource are the same kind of fact — decided at authorize,
+	// needed at redemption, and must not be client-tamperable — and the
+	// signature already covering "scp" covers this at no extra cost.
+	//
+	// Capped at one value on the authorize leg
+	// (maxAuthorizeResourceIndicators) but carried as a slice: cardinality
+	// is a constant, not a shape, so raising the cap must not change what
+	// is on the wire (ADR 0037 D2).
+	Resources []string // "rsc" — consented resource ceiling (optional)
 }
 
 // decodeAuthCodeJWT verifies and decodes a stateless auth code JWT (HS256).
@@ -81,6 +99,46 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 				claims.Scopes = append(claims.Scopes, str)
 			}
 		}
+	}
+
+	// Extract the consented resource ceiling (CAP-IDN-027).
+	//
+	// This one FAILS CLOSED, unlike `scp` above, which skips an element it
+	// cannot read. The asymmetry is deliberate: an ABSENT ceiling means "none
+	// was recorded", which permits the token request to bind to any resource it
+	// names (CAP-IDN-026). So silently dropping an unreadable element would
+	// WIDEN what the code allows — in the limit, a fully malformed claim would
+	// read as no ceiling at all and hand back exactly the unconstrained binding
+	// the ceiling exists to prevent. A skipped scope narrows; a skipped
+	// resource does the opposite.
+	//
+	// The claim is server-minted under a signature we just verified, so a
+	// malformed one is our own bug or a forgery attempt against a leaked HMAC
+	// secret. Neither is input to tolerate.
+	//
+	// A bare string is accepted as a single-value ceiling. It is unambiguous,
+	// it is what a JSON layer that collapses one-element arrays would produce,
+	// and it is strictly NARROWER than the absent case — so tolerating it costs
+	// nothing, while rejecting it would fail a flow for no security gain.
+	if resources, err := jwt.Get[[]string](token, "rsc"); err == nil {
+		claims.Resources = resources
+	} else if one, err := jwt.Get[string](token, "rsc"); err == nil {
+		claims.Resources = []string{one}
+	} else if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
+		out := make([]string, 0, len(raw))
+		for _, r := range raw {
+			str, ok := r.(string)
+			if !ok {
+				return nil, fmt.Errorf(
+					"auth code has a malformed rsc claim: element of type %T is not a string", r)
+			}
+			out = append(out, str)
+		}
+		claims.Resources = out
+	} else if _, err := jwt.Get[any](token, "rsc"); err == nil {
+		// Present, but neither a string nor an array — refuse rather than
+		// fall through to "no ceiling".
+		return nil, fmt.Errorf("auth code has a malformed rsc claim: expected a string or an array of strings")
 	}
 
 	return claims, nil
@@ -199,6 +257,18 @@ func mintAuthCodeJWT(claims *AuthCodeClaims, hmacSecret, issuer string, now time
 			anyScopes[i] = s
 		}
 		builder = builder.Claim("scp", anyScopes)
+	}
+	if len(claims.Resources) > 0 {
+		// Emitted as []any for the same round-trip reason as "scp" above, and
+		// ALWAYS as an array even though the authorize leg caps the ceiling at
+		// one value. Cardinality is a constant, not a shape (ADR 0037 D2):
+		// raising the cap must not change the claim's serialization, or every
+		// code minted before the change becomes a compatibility case.
+		anyResources := make([]any, len(claims.Resources))
+		for i, r := range claims.Resources {
+			anyResources[i] = r
+		}
+		builder = builder.Claim("rsc", anyResources)
 	}
 
 	tok, err := builder.Build()

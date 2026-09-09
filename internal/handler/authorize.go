@@ -169,11 +169,15 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// path: on a GET, req.Form is empty by construction, so a resolver
 	// reading req.Form("api_key") sees nothing and must fall through to
 	// a header or cookie. See registerAuthorizeRoute.
-	params := r.PostForm.Get
+	// `values` is the SAME single source `params` reads, kept so a repeatable
+	// parameter can be read in full. RFC 8707 §2 permits `resource` to appear
+	// more than once, and params/Get would silently return only the first —
+	// dropping a resource the client asked to be bound to.
+	values := r.PostForm
 	if r.Method == http.MethodGet {
-		query := r.URL.Query()
-		params = query.Get
+		values = r.URL.Query()
 	}
+	params := values.Get
 	postForm := r.PostForm
 	header := r.Header
 	req := &service.AuthorizeRequest{
@@ -184,6 +188,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		CodeChallengeMethod: params("code_challenge_method"),
 		State:               params("state"),
 		Scope:               params("scope"),
+		Resource:            values["resource"],
 		Form:                postForm.Get,
 		Header: func(name string) string {
 			return header.Get(name)
@@ -315,6 +320,30 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The RFC 8707 resource ceiling (CAP-IDN-027). Validated HERE, alongside
+	// the other parameters a request can doom itself on, rather than only at
+	// step 6: reaching IssueAuthCode means having passed through the resolver
+	// chain, so a client that sent a malformed identifier would first send its
+	// human to a login surface and only then be refused. IssueAuthCode
+	// re-validates, so a programmatic caller is still gated.
+	//
+	// invalid_target in BOTH vocabularies, unlike the response_type gate above
+	// which splits them. That gate keeps invalid_request in the JSON body for
+	// backward compatibility — "what POST callers have parsed since v1" — and
+	// this gate is new, so it has no such callers to keep faith with. RFC 8707
+	// §2 names invalid_target for a resource the AS cannot honour, and
+	// /oauth2/token already answers that way for the same parameter; splitting
+	// the codes here would mean one parameter reporting two different errors
+	// depending on which endpoint rejected it.
+	resourceCeiling, err := service.ValidateAuthorizeResource(req.Resource)
+	if err != nil {
+		_, desc, status := extractOAuthError(err)
+		a.failAuthorize(w, r, req, oauthClient, status,
+			oautherror.InvalidTarget, oautherror.InvalidTarget, desc)
+
+		return
+	}
+
 	// ── Step 4: principal resolution ─────────────────────────────────
 	// The resolvePrincipal callback is wired unconditionally by
 	// Server.NewServer (it's a method bound to the server's resolver
@@ -416,6 +445,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
 		Scopes:              scopes,
+		Resources:           resourceCeiling,
 		Client:              oauthClient,
 	})
 	if err != nil {

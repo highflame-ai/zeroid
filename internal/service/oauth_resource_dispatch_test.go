@@ -18,10 +18,6 @@ func TestTokenGate_ResourceOnUnsupportedGrant(t *testing.T) {
 	svc := &OAuthService{}
 
 	for _, grant := range []string{
-		// A refresh continues an existing grant; re-targeting a token already
-		// held is a fresh authorization decision that belongs at the original
-		// grant. Permanently excluded, not pending.
-		"refresh_token",
 		// CIBA redeems through BackchannelService, which takes no resource —
 		// binding would have to be plumbed there deliberately rather than
 		// inherited.
@@ -51,6 +47,13 @@ func TestTokenGate_SupportedGrantsPassTheGate(t *testing.T) {
 		"api_key",
 		"urn:ietf:params:oauth:grant-type:token-exchange",
 		"authorization_code",
+		// refresh_token moved here from the unsupported list above with
+		// CAP-IDN-027. It now SELECTS from the ceiling recorded on the refresh
+		// family rather than being refused outright; the narrows-only property
+		// that used to be enforced by exclusion is enforced by
+		// resolveRefreshResources instead, and pinned in
+		// TestRefreshTokenNeverWidensBeyondCeiling.
+		"refresh_token",
 	} {
 		t.Run(grant, func(t *testing.T) {
 			_, err := svc.Token(context.Background(), TokenRequest{

@@ -61,4 +61,22 @@ type RefreshToken struct {
 	// Empty (nullzero ⇒ SQL NULL) ⇒ a normal refresh token (authorization_code
 	// flow, or any pre-migration family): rotation is unchanged, no `aud`.
 	Audience string `bun:"audience,nullzero" json:"audience,omitempty"`
+	// Resources is the RFC 8707 resource CEILING this refresh family was issued
+	// for (CAP-IDN-027). Copied verbatim onto every successor row on rotation
+	// and read back when the refresh grant mints a new access token, so the
+	// binding survives rotation instead of silently vanishing — which is what
+	// made suppressing the refresh token necessary before this existed.
+	//
+	// A refresh that names `resource` must select a subset of this. One that
+	// omits it re-stamps the ceiling when the ceiling holds exactly one value,
+	// and is refused when it holds more — so raising the authorize-leg
+	// cardinality cap can never quietly begin minting multi-audience tokens.
+	//
+	// Empty (nullzero ⇒ SQL NULL) ⇒ no binding on this family: the ordinary
+	// authorization_code flow and every pre-migration row, whose rotation is
+	// unchanged and whose successors carry no `resource` claim.
+	//
+	// TEXT[] though the ceiling is single-valued today: cardinality is a
+	// constant, not a shape (ADR 0037 D2).
+	Resources []string `bun:"resource,array,nullzero" json:"resource,omitempty"`
 }

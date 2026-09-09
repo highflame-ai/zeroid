@@ -169,6 +169,158 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 	return out, nil
 }
 
+// maxAuthorizeResourceIndicators bounds how many resources may be consented at
+// /oauth2/authorize — the CEILING recorded on the authorization code
+// (CAP-IDN-027).
+//
+// One, deliberately, and tighter than the token endpoint's cap. A multi-valued
+// ceiling is what makes a multi-audience access token expressible, and RFC 8707
+// §3 is explicit about the hazard: "if a bearer token has multiple intended
+// recipients (audiences), then the token is valid at more than one protected
+// resource and can be used by any one of those resources to access any of the
+// others." At one, that shape cannot be requested here at all, rather than
+// being permitted and then gated after the fact.
+//
+// This is a CONSTANT, not a shape. The `rsc` claim, the refresh row's column
+// and the subset check are all multi-valued, so raising this to 2 or 3 is this
+// one line plus the multi-audience policy gate — no migration, no claim-shape
+// change, no compatibility window (ADR 0037 D2). Raising it also obliges a
+// second look at the refresh rule, which rejects an omitted `resource` against
+// a ceiling holding more than one value precisely so this cap and that rule
+// cannot drift apart silently.
+//
+// The ID-JAG ceiling is unaffected: it comes from the assertion's own
+// `resource` claim, not from this endpoint, and stays multi-valued.
+const maxAuthorizeResourceIndicators = 1
+
+// maxAuthorizeResourceTotalLen bounds the SERIALIZED size of the ceiling.
+//
+// Count is not what constrains this leg — length is. The ceiling lands in the
+// `rsc` claim of an authorization code that travels back to the client in a
+// redirect Location query string, and the token endpoint's own caps
+// (maxResourceIndicators × maxResourceIndicatorLen) would admit 16 KiB of URIs
+// into a URL, past both browser and reverse-proxy limits. A code that cannot be
+// delivered fails in a way the client cannot diagnose.
+//
+// Bounding total length rather than only per-value length is what lets the
+// count cap above move later without reopening the URL budget. 1 KiB is far
+// above any real RFC 9728 identifier — `<origin>/mcp/<slug>` is tens of bytes —
+// and far below anything that threatens a redirect.
+const maxAuthorizeResourceTotalLen = 1024
+
+// ValidateAuthorizeResource checks a `resource` parameter supplied at
+// /oauth2/authorize and returns the consented ceiling to record on the code.
+//
+// Exported so the /oauth2/authorize handler can run it BEFORE principal
+// resolution. That ordering is the handler's documented posture — a request
+// doomed by its own parameters must not first be sent through a login surface —
+// and it is why this gate cannot live only inside IssueAuthCode, which runs
+// after the resolver chain. IssueAuthCode re-runs it regardless, so a
+// programmatic caller bypassing the handler is still gated.
+//
+// Layered on validateResourceIndicators rather than duplicating it: the RFC
+// 8707 §2 syntax rules are identical at both endpoints, and an identifier that
+// would be rejected at the token endpoint must not be silently accepted here
+// and then fail at redemption — the client would have completed a whole browser
+// trip to obtain a code it can never exchange.
+//
+// Duplicates collapse before the count check, so `resource=X&resource=X` is one
+// resource and passes, matching §2's position that repeating the parameter is
+// harmless.
+func ValidateAuthorizeResource(resources []string) ([]string, error) {
+	out, err := validateResourceIndicators(resources)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if len(out) > maxAuthorizeResourceIndicators {
+		return nil, oauthBadRequest(oautherror.InvalidTarget,
+			fmt.Sprintf("at most %d resource indicator may be consented at /oauth2/authorize "+
+				"(a multi-audience token is not issuable on this grant)",
+				maxAuthorizeResourceIndicators))
+	}
+	total := 0
+	for _, r := range out {
+		total += len(r)
+	}
+	if total > maxAuthorizeResourceTotalLen {
+		return nil, oauthBadRequest(oautherror.InvalidTarget,
+			fmt.Sprintf("resource indicators exceed the maximum combined length of %d bytes",
+				maxAuthorizeResourceTotalLen))
+	}
+	return out, nil
+}
+
+// narrowToCeiling restricts a token request's `resource` to the ceiling the
+// authorization code recorded, and supplies the ceiling when the request names
+// nothing (CAP-IDN-027).
+//
+// This is the whole point of recording a ceiling: the client SELECTS from what
+// the human consented to and can never add to it. Under the single-value cap the
+// subset check degenerates to equality, but it is written as a subset check —
+// reusing narrowResourcesTo, the same function the ID-JAG path uses — so it
+// keeps its meaning unchanged when the cap moves. A bespoke string equality here
+// would have to be rewritten at that point.
+//
+// An empty ceiling means the code carried no consented resource, and the request
+// binds directly (bindResourceOnIssue) exactly as it did before CAP-IDN-027.
+// That case MUST keep working: a resource binding only ever narrows, granting no
+// authority the grant did not already carry, so there is nothing a ceiling would
+// protect against — and rejecting it would break every CAP-IDN-026 caller that
+// sends `resource` only at the token endpoint.
+func narrowToCeiling(ceiling, requested []string) ([]string, error) {
+	if len(ceiling) == 0 {
+		return requested, nil
+	}
+	return narrowResourcesTo(ceiling, requested)
+}
+
+// resolveRefreshResources decides what RFC 8707 binding a rotation re-stamps,
+// given the ceiling recorded on the refresh family and what the request named
+// (CAP-IDN-027).
+//
+// The rule is CARDINALITY-AWARE, and that is the point rather than an
+// implementation detail. RFC 8707 §2.2 says a refresh token "is bound to the
+// full original grant", which reads as "re-stamp the ceiling" — correct and
+// unambiguous while the ceiling holds one value. But at two or more, re-stamping
+// the whole ceiling mints a MULTI-AUDIENCE token by default, which is precisely
+// §3's hazard: "if a bearer token has multiple intended recipients (audiences),
+// then the token is valid at more than one protected resource and can be used by
+// any one of those resources to access any of the others."
+//
+// So the omitted-`resource` case re-stamps only a single-valued ceiling and
+// refuses a wider one, forcing the client to select. Written this way, raising
+// maxAuthorizeResourceIndicators cannot quietly start minting multi-audience
+// tokens: the cap and this rule are coupled deliberately so they cannot drift
+// apart unnoticed. The alternative — requiring `resource` on every refresh of a
+// bound family — was rejected because a conformant client can legitimately omit
+// it: the MCP SDK decides per-request via should_include_resource_param against
+// mutable context (protected-resource metadata can be discovered mid-session),
+// so "require" would 400 a correct client at the moment its token expires.
+//
+// An unbound family (no ceiling) with a named resource NARROWS, which is always
+// safe — it grants no authority the grant did not carry — and an unbound family
+// with nothing named is unchanged.
+func resolveRefreshResources(ceiling, requested []string) ([]string, error) {
+	if len(requested) > 0 {
+		return narrowToCeiling(ceiling, requested)
+	}
+	switch len(ceiling) {
+	case 0:
+		// Unbound family: rotation carries no `resource` claim, exactly as
+		// before CAP-IDN-027.
+		return nil, nil
+	case 1:
+		return ceiling, nil
+	default:
+		return nil, oauthBadRequest(oautherror.InvalidTarget,
+			"this grant authorizes more than one resource: the refresh request must name "+
+				"which one the access token is for (a multi-audience token is not issued by default)")
+	}
+}
+
 // checkResourceAudienceExclusive rejects a request that carries BOTH the
 // audience-profile `audience` parameter and the RFC 8707 `resource` parameter.
 //
@@ -224,12 +376,24 @@ func narrowResourcesTo(authorized, requested []string) ([]string, error) {
 // listed rejects the parameter outright (rejectUnsupportedResource) rather than
 // accepting and ignoring it.
 //
-// refresh_token is deliberately absent and stays that way: a refresh continues
-// an existing grant, so accepting a NEW binding there would let a client
-// re-target a token it already holds, and re-binding is a fresh authorization
-// decision that belongs at the original grant. A resource-bound request is
-// issued no refresh token at all, so the case should not arise — this is the
-// second lock on that door.
+// refresh_token was deliberately absent until CAP-IDN-027, on the grounds that
+// accepting a binding there would let a client re-target a token it already
+// holds — the code called it "the second lock on that door", the first being
+// that a resource-bound request was issued no refresh token at all.
+//
+// Both have been retired together, and the order matters: the lock existed
+// ONLY because the binding was not carried across rotation. Now that the
+// ceiling is recorded on the refresh family, the correct control is the subset
+// check against it (resolveRefreshResources), and the blanket rejection is
+// over-strict rather than protective — it 400s the exact request a conformant
+// client makes, since the MCP SDK sends `resource` on the refresh leg too.
+//
+// Re-targeting is not merely disallowed now, it is INEXPRESSIBLE: the ceiling
+// is capped at one value, so a client can only ever re-assert the single
+// resource it consented to. The lock retires as verified inert, not as an
+// accepted risk. That reasoning depends on maxAuthorizeResourceIndicators
+// staying at 1 — raising it re-opens the question, which is why the
+// omitted-`resource` path refuses a multi-valued ceiling outright.
 var resourceSupportedGrants = map[string]bool{
 	// jwt-bearer covers the ID-JAG profile, where `resource` SELECTS a subset of
 	// the resources the corporate IdP already authorized (narrowResourcesTo).
@@ -246,6 +410,11 @@ var resourceSupportedGrants = map[string]bool{
 	"api_key":            true,
 	"urn:ietf:params:oauth:grant-type:token-exchange": true,
 	"authorization_code":                              true,
+	// refresh_token SELECTS from the ceiling recorded on the refresh family
+	// (resolveRefreshResources), the same narrows-only direction the ID-JAG
+	// path uses. See the note above on why the previous blanket rejection was
+	// removed rather than kept as defence in depth.
+	"refresh_token": true,
 }
 
 func grantSupportsResource(grantType string) bool {

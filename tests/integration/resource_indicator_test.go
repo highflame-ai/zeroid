@@ -232,34 +232,59 @@ func TestResourceIndicator_WideningAttemptViaAdditionalClaims(t *testing.T) {
 	assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims))
 }
 
-// TestResourceIndicator_RefreshGrantRefusesResource pins the permanent
-// exclusion: a refresh continues an existing grant, so re-targeting a token
-// already held would skip a fresh authorization decision.
-func TestResourceIndicator_RefreshGrantRefusesResource(t *testing.T) {
+// TestResourceIndicator_RefreshGrantAcceptsResource replaces
+// TestResourceIndicator_RefreshGrantRefusesResource, which pinned the blanket
+// exclusion of `resource` on the refresh grant.
+//
+// That exclusion was correct only while the binding could not survive rotation.
+// CAP-IDN-027 records the ceiling on the refresh family, so the grant now
+// accepts the parameter and narrows against that ceiling — which it must, since
+// a conformant MCP client sends `resource` on the refresh leg too and would
+// otherwise be refused at the moment its access token expires.
+//
+// What is asserted here is that the request is no longer intercepted by the
+// RESOURCE gate. It still fails, on the refresh token itself, which is the
+// property that matters: an unknown token is rejected as invalid_grant rather
+// than being pre-empted by invalid_target. The narrows-only rule is pinned at
+// the unit level in TestRefreshTokenNeverWidensBeyondCeiling and end-to-end in
+// TestResourceCeiling_SurvivesTwoRotations.
+func TestResourceIndicator_RefreshGrantAcceptsResource(t *testing.T) {
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"refresh_token": "zid_rt_whatever",
+		"client_id":     testMCPClientID,
 		"resource":      mcpGithub,
 	}, nil)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	got := decode(t, resp)
 	_ = resp.Body.Close()
 
-	assert.Equal(t, "invalid_target", got["error"],
-		"rejected on the resource gate, before the refresh token is even looked up")
+	assert.NotEqual(t, "invalid_target", got["error"],
+		"the resource gate must no longer intercept the refresh grant")
+	assert.Equal(t, "invalid_grant", got["error"],
+		"the request should now fail on the unknown refresh token, not on the resource parameter")
 }
 
-// TestResourceIndicator_AuthCodeSuppressesRefreshToken proves the refresh
-// decision end-to-end. testMCPClientID is registered for the refresh_token
-// grant and normally receives one (TestAuthorizationCodeMCPFlow asserts it), so
-// the difference here is attributable to `resource` alone.
+// TestResourceIndicator_AuthCodeIssuesRefreshTokenWhenBound proves the refresh
+// decision end-to-end, and asserts the OPPOSITE of what it did before
+// CAP-IDN-027 (when it was named ..._AuthCodeSuppressesRefreshToken).
 //
-// This is the failure being prevented: the refresh path re-mints from state on
-// the refresh-token row, and the RFC 8707 binding is not on it — it lives in
-// CustomClaims, which rotation does not carry. A rotated token would come back
-// unbound with no error anywhere, so "bind to X, refresh, use anywhere" would
-// work silently and INV-IDN-006 enforcement would go quiet.
-func TestResourceIndicator_AuthCodeSuppressesRefreshToken(t *testing.T) {
+// The suppression it used to pin was the fail-closed answer to a real problem:
+// the refresh path re-mints from state on the refresh-token row, the RFC 8707
+// binding lived only in the access token's CustomClaims, and rotation did not
+// carry it — so a rotated token came back unbound with no error anywhere, and
+// "bind to X, refresh, use anywhere" worked silently while INV-IDN-006
+// enforcement went quiet.
+//
+// The ceiling is now on the refresh row and copied across every rotation, so
+// the reason for suppressing is gone — and suppression had a real cost: a
+// desktop MCP client that bound correctly was sent to a browser every hour,
+// making NOT binding the path of least resistance.
+//
+// testMCPClientID is registered for the refresh_token grant and normally
+// receives one (TestAuthorizationCodeMCPFlow asserts it), so the baseline
+// subtest still guards against this passing for the wrong reason.
+func TestResourceIndicator_AuthCodeIssuesRefreshTokenWhenBound(t *testing.T) {
 	authCodeExchange := func(t *testing.T, userID string, resource any) map[string]any {
 		t.Helper()
 		verifier, challenge := buildPKCEPair(t)
@@ -290,17 +315,17 @@ func TestResourceIndicator_AuthCodeSuppressesRefreshToken(t *testing.T) {
 			"an unbound authorization_code exchange must still receive a refresh token")
 	})
 
-	t.Run("resource-bound exchange receives no refresh token", func(t *testing.T) {
+	t.Run("resource-bound exchange now receives a refresh token", func(t *testing.T) {
 		token := authCodeExchange(t, uid("res-ac-bound"), mcpGithub)
 
-		assert.NotEmpty(t, token["access_token"], "the access token is still issued")
-		assert.Empty(t, token["refresh_token"],
-			"a resource-bound token must not come with a refresh token — the binding "+
-				"is not carried across rotation, so refreshing would silently unbind it")
+		assert.NotEmpty(t, token["access_token"], "the access token is issued")
+		assert.NotEmpty(t, token["refresh_token"],
+			"a resource-bound exchange must now receive a refresh token — the binding is "+
+				"carried on the refresh row and re-stamped on every rotation (CAP-IDN-027)")
 
 		claims := decodeJWTPayload(t, token["access_token"].(string))
 		assert.Equal(t, []string{mcpGithub}, resourceClaimOf(t, claims),
-			"the access token itself is still bound")
+			"the access token is bound")
 		assert.Equal(t, []string{mcpGithub}, audienceOf(t, claims))
 	})
 }

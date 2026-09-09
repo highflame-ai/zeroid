@@ -378,15 +378,76 @@ func TestRejectUnsupportedResource(t *testing.T) {
 	})
 }
 
-// TestRefreshTokenNeverSupportsResource pins the rule that a refresh can never
-// take a NEW resource binding. It is a separate test from the table above
-// because it is a durable security property, not a slice-by-slice rollout
-// state: enabling it later would let a client re-target a token it already
-// holds without a fresh authorization decision.
-func TestRefreshTokenNeverSupportsResource(t *testing.T) {
-	if grantSupportsResource("refresh_token") {
-		t.Fatal("refresh_token must never accept a resource parameter")
-	}
+// TestRefreshTokenNeverWidensBeyondCeiling pins the durable security property
+// on the refresh grant.
+//
+// This REPLACES TestRefreshTokenNeverSupportsResource, which asserted that
+// refresh_token was absent from resourceSupportedGrants. That exclusion was the
+// right control only while the binding was not carried across rotation — it was
+// what the code called the "second lock", the first being that a resource-bound
+// exchange was issued no refresh token at all. CAP-IDN-027 carries the ceiling
+// on the refresh family, so the property worth defending is no longer "refuse
+// the parameter" — which 400s the exact request a conformant MCP client makes,
+// since the SDK sends `resource` on the refresh leg too — but "the parameter can
+// only ever narrow". Same invariant, enforced by a subset check against the
+// consented ceiling instead of by blanket exclusion.
+//
+// Kept separate from the rollout table above for the reason the original was:
+// this is a durable property, not slice-by-slice rollout state.
+func TestRefreshTokenNeverWidensBeyondCeiling(t *testing.T) {
+	const (
+		granted = "https://gw.example/mcp/github"
+		other   = "https://gw.example/mcp/slack"
+	)
+
+	t.Run("the grant accepts the parameter at all", func(t *testing.T) {
+		if !grantSupportsResource("refresh_token") {
+			t.Fatal("refresh_token must accept resource so a client can select from its ceiling")
+		}
+	})
+
+	t.Run("a resource outside the ceiling is invalid_target", func(t *testing.T) {
+		_, err := resolveRefreshResources([]string{granted}, []string{other})
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
+	t.Run("a resource inside the ceiling is honoured", func(t *testing.T) {
+		got, err := resolveRefreshResources([]string{granted}, []string{granted})
+		if err != nil {
+			t.Fatalf("selecting the consented resource failed: %v", err)
+		}
+		if len(got) != 1 || got[0] != granted {
+			t.Fatalf("expected exactly the consented resource, got %#v", got)
+		}
+	})
+
+	t.Run("omitting the parameter re-stamps a single-valued ceiling", func(t *testing.T) {
+		got, err := resolveRefreshResources([]string{granted}, nil)
+		if err != nil {
+			t.Fatalf("omitting resource on a single-valued ceiling failed: %v", err)
+		}
+		if len(got) != 1 || got[0] != granted {
+			t.Fatalf("expected the ceiling re-stamped, got %#v", got)
+		}
+	})
+
+	// The coupling that stops a raised maxAuthorizeResourceIndicators from
+	// silently minting multi-audience tokens. If someone raises that cap and
+	// does not revisit the refresh rule, this is the test that says so.
+	t.Run("omitting the parameter on a multi-valued ceiling is refused", func(t *testing.T) {
+		_, err := resolveRefreshResources([]string{granted, other}, nil)
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
+	t.Run("an unbound family is unchanged", func(t *testing.T) {
+		got, err := resolveRefreshResources(nil, nil)
+		if err != nil {
+			t.Fatalf("unbound refresh must not error: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("unbound refresh must carry no resource claim, got %#v", got)
+		}
+	})
 }
 
 func TestBindResourceOnIssue(t *testing.T) {
