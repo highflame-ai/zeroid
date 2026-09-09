@@ -120,28 +120,86 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 	// it is what a JSON layer that collapses one-element arrays would produce,
 	// and it is strictly NARROWER than the absent case — so tolerating it costs
 	// nothing, while rejecting it would fail a flow for no security gain.
-	if resources, err := jwt.Get[[]string](token, "rsc"); err == nil {
-		claims.Resources = resources
-	} else if one, err := jwt.Get[string](token, "rsc"); err == nil {
-		claims.Resources = []string{one}
-	} else if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
-		out := make([]string, 0, len(raw))
-		for _, r := range raw {
-			str, ok := r.(string)
-			if !ok {
-				return nil, fmt.Errorf(
-					"auth code has a malformed rsc claim: element of type %T is not a string", r)
-			}
-			out = append(out, str)
+	//
+	// Presence is tested with Has rather than by whether a typed read succeeds.
+	// That distinction is the whole fix: `"rsc": null` is PRESENT but decodes to
+	// nil through every typed accessor including jwt.Get[any], so a
+	// read-succeeded test treats it as absent — i.e. as "no ceiling", the
+	// permissive state. Same for `"rsc": []`, which reads as a valid empty
+	// slice. Both are shapes we never mint, so reaching them means our own bug
+	// or a forgery against a leaked HMAC secret, and both must fail rather than
+	// quietly widen.
+	if token.Has("rsc") {
+		resources, err := decodeResourceCeiling(token)
+		if err != nil {
+			return nil, err
 		}
-		claims.Resources = out
-	} else if _, err := jwt.Get[any](token, "rsc"); err == nil {
-		// Present, but neither a string nor an array — refuse rather than
-		// fall through to "no ceiling".
-		return nil, fmt.Errorf("auth code has a malformed rsc claim: expected a string or an array of strings")
+		claims.Resources = resources
 	}
 
 	return claims, nil
+}
+
+// decodeResourceCeiling reads the `rsc` claim of a code that already carries it,
+// and refuses every shape that would otherwise read as an empty ceiling.
+//
+// Callers must gate on token.Has("rsc") — this function treats "cannot read a
+// ceiling" as an error, which is only correct once presence is established.
+func decodeResourceCeiling(token jwt.Token) ([]string, error) {
+	var out []string
+
+	switch {
+	case true:
+		if v, err := jwt.Get[[]string](token, "rsc"); err == nil {
+			out = v
+			break
+		}
+		// A bare string is accepted as a single-value ceiling: unambiguous, what
+		// a JSON layer collapsing one-element arrays produces, and strictly
+		// NARROWER than the absent case — so tolerating it costs nothing while
+		// rejecting it would fail a flow for no security gain.
+		if v, err := jwt.Get[string](token, "rsc"); err == nil {
+			out = []string{v}
+			break
+		}
+		if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
+			out = make([]string, 0, len(raw))
+			for _, r := range raw {
+				s, ok := r.(string)
+				if !ok {
+					return nil, fmt.Errorf(
+						"auth code has a malformed rsc claim: element of type %T is not a string", r)
+				}
+				out = append(out, s)
+			}
+			break
+		}
+		// Present but unreadable as any accepted shape — an object, a number, a
+		// bool, or JSON null.
+		return nil, fmt.Errorf(
+			"auth code has a malformed rsc claim: expected a string or an array of strings")
+	}
+
+	// Present but naming nothing. Distinct from absent, and NOT equivalent to
+	// it: absent means the client may still bind at the token endpoint
+	// (CAP-IDN-026), so silently accepting an empty ceiling here would convert
+	// a corrupt consent record into an unconstrained one.
+	if len(out) == 0 {
+		return nil, fmt.Errorf(
+			"auth code has an empty rsc claim: a recorded ceiling must name at least one resource")
+	}
+
+	// Re-validate on the way IN, not only on the way out. The ceiling was
+	// checked at issuance, but that is a different process, possibly a
+	// different release, and the values are about to be stamped into a signed
+	// access token and enforced on by Shield. Without this, a ceiling of [""]
+	// — which validateResourceIndicators explicitly rejects at issuance —
+	// would mint a token bound to the empty string.
+	if _, err := validateResourceIndicators(out); err != nil {
+		return nil, fmt.Errorf("auth code has an invalid rsc claim: %w", err)
+	}
+
+	return out, nil
 }
 
 // getStringClaim extracts a string claim from a JWT token, returning empty string if not present.

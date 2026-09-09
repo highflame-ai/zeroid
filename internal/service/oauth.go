@@ -2035,6 +2035,34 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "PKCE verification failed")
 	}
 
+	// Resolve the RFC 8707 binding against the ceiling the code recorded
+	// (CAP-IDN-027) BEFORE the code is consumed.
+	//
+	// Three shapes, all correct after this:
+	//   - ceiling present, request omits `resource` → binds to the ceiling.
+	//     This is the row that used to return a silently UNBOUND token: a
+	//     client following RFC 8707 §2 alone sends `resource` at the
+	//     authorization request only, and nothing carried it to the mint.
+	//   - ceiling present, request names a subset → binds to the selection.
+	//   - no ceiling → binds to whatever the request names (CAP-IDN-026).
+	//
+	// Anything outside the ceiling is invalid_target. The client selects; it
+	// can never add.
+	//
+	// Ordered above Consume for the reason the comment below gives about PKCE:
+	// this is a REQUEST-PARAMETER check, so failing it must not burn the code.
+	// Otherwise a client that named the wrong resource would have its code
+	// consumed, and its corrected retry would get invalid_grant ("already
+	// used") plus revokeAuthCodeTokens — forcing the whole browser leg again
+	// over a fixable typo. Both inputs are available here with no extra I/O:
+	// the ceiling came out of the signed code above, and req.Resource was
+	// validated in Token() before dispatch. The refresh path guards the
+	// equivalent case on a non-consuming peek for the same reason.
+	boundResources, err := narrowToCeiling(authCode.Resources, req.Resource)
+	if err != nil {
+		return nil, err
+	}
+
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
 	// Placed after all validation (client, redirect_uri, PKCE) so an
 	// attacker who intercepts a code but doesn't know the verifier cannot
@@ -2122,22 +2150,6 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	}
 
-	// Resolve the binding against the ceiling the code recorded (CAP-IDN-027).
-	//
-	// Three shapes, all correct after this:
-	//   - ceiling present, request omits `resource` → binds to the ceiling.
-	//     This is the row that used to return a silently UNBOUND token: a
-	//     client following RFC 8707 §2 alone sends `resource` at the
-	//     authorization request only, and nothing carried it to the mint.
-	//   - ceiling present, request names a subset → binds to the selection.
-	//   - no ceiling → binds to whatever the request names (CAP-IDN-026).
-	//
-	// Anything outside the ceiling is invalid_target. The client selects; it
-	// can never add.
-	boundResources, err := narrowToCeiling(authCode.Resources, req.Resource)
-	if err != nil {
-		return nil, err
-	}
 	bindResourceOnIssue(&issue, boundResources)
 
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
@@ -2178,8 +2190,45 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		resourceCeiling = boundResources
 	}
 
+	// A refresh family may only carry a SINGLE-VALUED ceiling.
+	//
+	// The authorize leg caps the consented ceiling at one
+	// (maxAuthorizeResourceIndicators), but the fallback above can seed a
+	// family from a token-only binding, and THAT came through the token
+	// endpoint's cap of eight. Storing a multi-valued ceiling breaks the model
+	// in two ways:
+	//
+	//   - It makes multi-audience access tokens durable. A refresh naming both
+	//     values re-mints a token valid at both resources for the family's
+	//     whole life — exactly RFC 8707 §3's lateral-movement shape, and the
+	//     thing the cap of one exists to make unrepresentable.
+	//   - It makes re-targeting expressible: the client can alternate which
+	//     value it selects on each rotation. The blanket `resource`-on-refresh
+	//     rejection was retired on the explicit grounds that a single-valued
+	//     ceiling leaves nothing to re-target between. That reasoning has to
+	//     actually hold.
+	//
+	// So a multi-resource token-only binding gets no refresh token, which is
+	// precisely what it got before CAP-IDN-027 — no regression, just no new
+	// capability for the one shape that cannot carry it safely. The access
+	// token is still bound to every resource requested; only the long-lived
+	// half is withheld.
+	// Deliberately a separate flag rather than clearing hasRefreshGrant, which
+	// states a property of the CLIENT (registered for the grant) and should not
+	// be overwritten to mean "we declined to issue one for this exchange".
+	issueRefresh := hasRefreshGrant
+	if len(resourceCeiling) > 1 {
+		log.Info().
+			Str("client_id", req.ClientID).
+			Strs("resource", resourceCeiling).
+			Msg("multi-resource binding: refresh token suppressed (a refresh family carries a single-valued ceiling only)")
+
+		resourceCeiling = nil
+		issueRefresh = false
+	}
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
-	if hasRefreshGrant && s.refreshTokenSvc != nil {
+	if issueRefresh && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:          req.ClientID,
 			AccountID:         authCode.AccountID,
@@ -2275,6 +2324,30 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	var audienceRefreshToken *domain.RefreshToken
 	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, req.RefreshTokenStr); peekErr == nil && peeked.Audience != "" {
 		audienceRefreshToken = peeked
+	}
+
+	// `audience` and `resource` are mutually exclusive, and on this grant the
+	// audience arrives from the STORED FAMILY rather than from the request — so
+	// checkResourceAudienceExclusive, which compares two request parameters,
+	// cannot see the conflict and lets it through.
+	//
+	// That was unreachable while the refresh grant rejected `resource` outright.
+	// Removing the blanket rejection (CAP-IDN-027) opened it, and the
+	// consequence is not benign: bindResourceOnIssue sets issue.Audience, so a
+	// resource-bound refresh of an audience-profile family would OVERWRITE the
+	// profile `aud` that rotation exists to preserve — the harness daemon
+	// validates `aud` on every message, so the client would break its own
+	// session — while also producing the profiled-audience-plus-resource-binding
+	// token that CAP-IDN-026 states can never exist.
+	//
+	// Checked here, against a non-consuming peek and before any rotation, so a
+	// rejected request never burns the token. invalid_request (not
+	// invalid_target) to match checkResourceAudienceExclusive: the request is
+	// structurally incoherent, not naming an unacceptable resource.
+	if audienceRefreshToken != nil && len(req.Resource) > 0 {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"audience and resource are mutually exclusive: this refresh token was issued for an "+
+				"audience profile, so it cannot be rotated into a resource-bound token")
 	}
 
 	var accessTTL, refreshTokenTTL int
@@ -2530,6 +2603,19 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A
 	// no-op for an unbound family, so ordinary refresh issuance is unchanged.
+	//
+	// The guard is defence in depth, not the primary control: the peek-time
+	// check near the top of this function already refuses `resource` against an
+	// audience-profile family. But bindResourceOnIssue OVERWRITES
+	// issue.Audience, so if that check is ever bypassed — a transient peek
+	// failure, or a future edit that reorders it — the failure mode is a
+	// silently re-audienced token rather than an error. Fail closed instead:
+	// the two are mutually exclusive by contract (CAP-IDN-026), so their
+	// coexistence here is a server bug, not a client one.
+	if len(refreshAudience) > 0 && len(refreshResources) > 0 {
+		return nil, oauthServerError(
+			"refresh family carries both an audience profile and a resource binding", nil)
+	}
 	bindResourceOnIssue(&refreshIssue, refreshResources)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, refreshIssue)

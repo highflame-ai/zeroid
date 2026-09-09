@@ -228,7 +228,31 @@ const maxAuthorizeResourceTotalLen = 1024
 // resource and passes, matching §2's position that repeating the parameter is
 // harmless.
 func ValidateAuthorizeResource(resources []string) ([]string, error) {
-	out, err := validateResourceIndicators(resources)
+	// Drop valueless occurrences BEFORE validating. RFC 6749 §3.1 requires a
+	// parameter sent without a value to be treated as omitted, and at
+	// /oauth2/token that happens for free: oauthFormCompatMiddleware strips
+	// valueless parameters before the body is bound. /oauth2/authorize
+	// deliberately bypasses that middleware (it reads r.PostForm / the query
+	// directly), and `resource` is read as a repeatable parameter — so
+	// `?resource=` arrives here as []string{""} rather than disappearing, and
+	// without this it would fail the request with invalid_target.
+	//
+	// That would be both a spec violation and a regression: a client appending
+	// `resource=` from an unset variable used to have the parameter ignored and
+	// the flow succeed. It would also diverge the two endpoints, which is
+	// exactly what this function exists to prevent.
+	//
+	// Only EMPTY occurrences are dropped. A whitespace-only value is still a
+	// malformed identifier and still rejected below, because a client that sent
+	// " " meant something by it.
+	present := make([]string, 0, len(resources))
+	for _, r := range resources {
+		if r != "" {
+			present = append(present, r)
+		}
+	}
+
+	out, err := validateResourceIndicators(present)
 	if err != nil {
 		return nil, err
 	}

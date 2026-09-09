@@ -32,19 +32,93 @@
 -- Covered by TestResourceCeiling_SurvivesTwoRotations, which rotates twice for
 -- exactly this reason.
 --
--- No backfill, and none is possible or needed: no resource-bound exchange has
--- ever been issued a refresh token, so there is no existing row that ought to
--- hold a value. NULL is correct for every row already present, not a gap.
+-- No backfill needed: no resource-bound exchange has ever been issued a refresh
+-- token (the suppression this change removes gated on exactly that), so there is
+-- no existing row that ought to hold a value. NULL is correct for every row
+-- already present, not a gap. Verified against the pre-change code rather than
+-- assumed — only two call sites ever insert a refresh-token row, and the second
+-- (the external-principal exchange) is structurally unreachable for a bound
+-- request because `audience` and `resource` are mutually exclusive.
 --
--- No index: read only alongside the row it lives on (claimed by token_hash,
--- rotated within its family), never filtered or joined on. Same reasoning as
--- migration 039's `audience`.
+-- No index on the column itself: on the steady-state read path it is read only
+-- alongside the row it lives on (claimed by token_hash, rotated within its
+-- family), never filtered or joined on — same reasoning as migration 039's
+-- `audience`. The partial index below is for the ROLLBACK path, not this one.
 --
--- Lock posture: metadata-only ADD COLUMN on PG 11+ (nullable, no default), so
--- ACCESS EXCLUSIVE but not a table rewrite. lock_timeout scopes any blocking
--- acquire rather than letting it queue behind a long transaction.
+-- ── Lock posture, and the operational hazard behind it ──────────────────────
+--
+-- The ALTER itself is metadata-only on PG 11+ (nullable, no default): ACCESS
+-- EXCLUSIVE but no table rewrite, sub-millisecond once acquired. The risk is the
+-- lock QUEUE, not the ALTER — an ACCESS EXCLUSIVE request queues behind any
+-- in-flight transaction holding ROW EXCLUSIVE on refresh_tokens, and while it
+-- waits it blocks every reader and writer behind it. lock_timeout = '3s'
+-- therefore authorises up to a 3-second stall of the whole token endpoint.
+-- (3s matches migration 039's precedent on this table; consider a tighter value
+-- with an operator-side retry if that stall is unacceptable for your window.)
+--
+-- Named conflicting workload, so this can be scheduled around it: the cleanup
+-- worker runs an UNBATCHED `DELETE FROM refresh_tokens WHERE expires_at < ?` on
+-- a ticker (internal/worker/cleanup.go). That is the long ROW EXCLUSIVE holder
+-- most likely to make this ALTER hit its timeout. Do not apply 044 during a
+-- sweep.
+--
+-- And know the failure mode before you start: golang-migrate marks the version
+-- dirty BEFORE running the statement and clears it after, so a lock_timeout
+-- abort leaves schema_migrations at (44, dirty). Because AutoMigrate defaults
+-- to on, every pod then fails startup on ErrDirty — a 3-second lock wait
+-- becomes an outage. Stage `migrate force 43` in the runbook.
+--
+-- Post-migration verification must check the column TYPE, not just its
+-- presence: ADD COLUMN IF NOT EXISTS silently no-ops against a same-named
+-- column of any type, and the dirty-state recovery above invites a hand-added
+-- one. Assert `udt_name = '_text'` — a `resource text` column would leave this
+-- migration green and every []string scan broken.
 
 SET LOCAL lock_timeout = '3s';
 
 ALTER TABLE refresh_tokens
     ADD COLUMN IF NOT EXISTS resource TEXT[];
+
+-- An EMPTY array must never reach this column.
+--
+-- bun's `nullzero` collapses only a NIL slice to NULL — schema/zerochecker.go
+-- maps reflect.Slice to isNil, not isZeroLen — so a non-nil empty []string
+-- writes '{}' rather than NULL. Every consumer keys on len(ceiling) == 0, so
+-- '{}' reads as "no ceiling", which is the WIDENING direction: it permits the
+-- token request to bind to anything. It also round-trips stably, re-written as
+-- '{}' by every rotation for the family's life.
+--
+-- No code path can produce it today (validateResourceIndicators returns nil for
+-- empty input, and the decoder now rejects a present-but-empty `rsc` claim), but
+-- the state is representable in the schema — and this table's own rollback
+-- runbook puts an operator here with UPDATE statements, where `SET resource =
+-- '{}'` instead of `= NULL` would silently unbind a family with no error
+-- anywhere. A NULL element or an empty-string element is covered too: those
+-- narrow rather than widen (a token bound to "" is dead everywhere), but they
+-- are garbage states with no legitimate producer.
+--
+-- NOT VALID deliberately. It enforces on every new write, which is the half that
+-- matters, without the full-table scan under ACCESS EXCLUSIVE that a validated
+-- ADD CONSTRAINT would take. Every existing row has resource IS NULL and so
+-- already satisfies it; a follow-up migration can VALIDATE CONSTRAINT out of
+-- band once the table size is known.
+ALTER TABLE refresh_tokens
+    ADD CONSTRAINT refresh_tokens_resource_nonempty
+    CHECK (
+        resource IS NULL
+        OR (array_length(resource, 1) >= 1
+            AND array_position(resource, NULL) IS NULL
+            AND '' <> ALL (resource))
+    ) NOT VALID;
+
+-- Serves the rollback path only: `WHERE resource IS NOT NULL`, the query 044's
+-- down migration must run to revoke bound families BEFORE dropping the column.
+-- Without it that is a sequential scan on a hot table in the emergency path.
+--
+-- Built here, while the column is provably all-NULL, because a plain CREATE
+-- INDEX is free against zero qualifying rows. Adding it later against real data
+-- would need CONCURRENTLY, which cannot run in this file — golang-migrate sends
+-- the whole file as one implicit transaction. So it is now or a standalone
+-- migration, not casually later.
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_resource_bound
+    ON refresh_tokens (family_id) WHERE resource IS NOT NULL;
