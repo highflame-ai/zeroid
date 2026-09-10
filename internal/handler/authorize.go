@@ -452,6 +452,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
 		Scopes:              scopes,
+		RequestedScope:      req.Scope,
 		Resources:           resourceCeiling,
 		Client:              oauthClient,
 	})

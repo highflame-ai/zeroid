@@ -1,12 +1,15 @@
 package integration_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"net/http"
+	"net/url"
 	"testing"
 
+	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -156,4 +159,166 @@ func TestJWTBearer_UnauthorizedScopeRequestRejected(t *testing.T) {
 		"jwt_bearer requesting a scope outside allowed_scopes must be rejected")
 	body := decode(t, resp)
 	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// TestAPIKeyGrant_ChainedCeilingDenialSurvivesReWidening is the exact repro
+// for the class of bug the first pass of this fix missed: apiKeyGrant chains
+// up to four ceilings (key scopes, key policy, identity policy, legacy
+// identity.allowed_scopes). Composing them with plain intersectScopes let a
+// real denial at an early step be reinterpreted by the NEXT step as "caller
+// asked for nothing" and reset to that step's full (wider) ceiling —
+// resurrecting a scope an earlier layer explicitly excluded, and even
+// granting scopes that were never requested at all.
+//
+// Here: the API key's own scopes=["tools:read"] denies tools:execute at the
+// first step. The identity's credential policy is wider
+// (["tools:read","tools:execute","tools:admin"]). Before the fix, that
+// denial reset at the policy step and the token minted with
+// tools:execute AND tools:admin — the latter never even asked for.
+func TestAPIKeyGrant_ChainedCeilingDenialSurvivesReWidening(t *testing.T) {
+	identityPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("chain-id-cp"),
+		"allowed_grant_types":  []string{"api_key"},
+		"allowed_scopes":       []string{"tools:read", "tools:execute", "tools:admin"},
+		"max_delegation_depth": 1,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+
+	identityID := registerIdentityWithPolicy(t, uid("chain-target"), identityPolicyID, "", nil, adminHeaders())
+
+	headers := adminHeaders()
+	headers["X-User-ID"] = "test-user"
+	keyResp := post(t, adminPath("/api-keys"), map[string]any{
+		"name": "chain-key",
+		// Same policy as the identity (a subset of itself, so key creation's
+		// own subset-invariant check passes trivially) — the point of this
+		// test is the sk.Scopes-vs-policy CHAIN, not the policy check.
+		"credential_policy_id": identityPolicyID,
+		"identity_id":          identityID,
+		"scopes":               []string{"tools:read"}, // the key's OWN, narrower restriction
+	}, headers)
+	require.Equal(t, http.StatusCreated, keyResp.StatusCode)
+	apiKey, _ := decode(t, keyResp)["key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+		"scope":      "tools:execute",
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, tokenResp.StatusCode,
+		"a denial at the key-scopes step must survive the identity-policy step, not be reinterpreted as an omitted request and reset to the policy's full scope set")
+	body := decode(t, tokenResp)
+	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// TestClientCredentials_IdentityPolicyNarrowsClientScopes covers the Oracle
+// review comment on this PR: clientCredentials computed its grant from
+// client.Scopes alone, never intersecting the linked identity's credential
+// policy at this layer the way apiKeyGrant/jwtBearer do — so a request could
+// pass this function's own check and only then get a differently-shaped
+// hard rejection deeper inside IssueCredential's EnforcePolicy, for what is
+// conceptually the identical failure the other two grants report as
+// invalid_scope. The client here is registered wider than the identity's
+// policy on purpose.
+func TestClientCredentials_IdentityPolicyNarrowsClientScopes(t *testing.T) {
+	identityPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("cc-policy-cp"),
+		"allowed_grant_types":  []string{"client_credentials"},
+		"allowed_scopes":       []string{"tools:read"},
+		"max_delegation_depth": 1,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+
+	clientID := uid("cc-policy-client")
+	registerIdentityWithPolicy(t, clientID, identityPolicyID, "", nil, adminHeaders())
+	client := registerOAuthClient(t, clientID, []string{"tools:execute", "tools:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "tools:execute",
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a scope the client is registered for but the linked identity's credential policy excludes must be rejected by this grant, not just by a deeper, differently-shaped chokepoint check")
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// TestAuthorizationCode_UnauthorizedScopeRequestRejected is the fourth grant
+// path the first pass of this fix missed entirely: /oauth2/authorize's
+// principal resolver narrows to a real denial, but IssueAuthCode's old
+// "empty means no resolver-side narrowing" read reinterpreted that denial as
+// an omitted request and substituted the OAuth CLIENT's entire registered
+// scope surface — worse than the other three grants' bug, since it doesn't
+// just omit the scopes claim, it actively widens to scopes (tools:admin
+// here) the caller never asked for and the principal never held.
+func TestAuthorizationCode_UnauthorizedScopeRequestRejected(t *testing.T) {
+	clientID := uid("authz-code-scope-escalation")
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:     clientID,
+		Name:         clientID + "-test-client",
+		GrantTypes:   []string{"authorization_code"},
+		Scopes:       []string{"tools:read", "tools:execute", "tools:admin"},
+		RedirectURIs: []string{testRedirectURI},
+	})
+	require.NoError(t, err)
+
+	// The request is expected to fail before a code is ever issued, so
+	// there is no verifier to redeem it with later.
+	_, challenge := buildPKCEPair(t)
+	form := url.Values{
+		"client_id":             {clientID},
+		"redirect_uri":          {testRedirectURI},
+		"response_type":         {"code"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"authz-code-scope-escalation-state"},
+		"scope":                 {"tools:execute"},
+		// Stub PrincipalResolver: the principal itself only holds tools:read,
+		// so tools:execute is a real, explicit denial at the resolver layer —
+		// not an omission.
+		"test_principal_account": {testAccountID},
+		"test_principal_project": {testProjectID},
+		"test_principal_user":    {"user-authz-code-scope-test"},
+		"test_principal_scopes":  {"tools:read"},
+	}
+
+	resp := postAuthorize(t, form)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a scope the principal was denied must refuse the authorization code outright, not substitute the client's entire registered scope surface")
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// TestAPIKeyGrant_WhitespaceOnlyScopeTreatedAsOmitted pins the fix to
+// requireGrantableScope's raw-string-vs-parsed-emptiness mismatch: a
+// whitespace-only scope parameter now parses to zero tokens (via
+// parseScopeString/strings.Fields) exactly like an omitted one, everywhere
+// that decision is made, so it can no longer produce a false rejection for
+// an identity with no scope ceiling configured.
+func TestAPIKeyGrant_WhitespaceOnlyScopeTreatedAsOmitted(t *testing.T) {
+	externalID := uid("apikey-scope-whitespace")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":        externalID,
+		"external_id": externalID,
+		"sub_type":    "tool_agent",
+		"trust_level": "first_party",
+		"created_by":  "test-user",
+		// No allowed_scopes: this identity has no scope ceiling of its own.
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+		"scope":      " ",
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode,
+		"a whitespace-only scope must be treated the same as an omitted one, not falsely rejected")
 }
