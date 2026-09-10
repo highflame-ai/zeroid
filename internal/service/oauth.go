@@ -655,6 +655,9 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 
 	// Parse and intersect requested scopes with the client's allowed scopes.
 	scopes := intersectScopes(parseScopeString(req.Scope), client.Scopes)
+	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+		return nil, err
+	}
 
 	// Resolve the identity for this client (external_id == client_id within the tenant).
 	// Tenant comes from the token request — client registration is global.
@@ -804,6 +807,9 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
 	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
+	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+		return nil, err
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
@@ -1474,6 +1480,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	scopes = intersectScopes(scopes, identityPolicyScopes)
 	if len(identityPolicyScopes) == 0 && identity != nil {
 		scopes = intersectScopes(scopes, identity.AllowedScopes)
+	}
+	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+		return nil, err
 	}
 
 	issue := IssueRequest{
@@ -2922,6 +2931,30 @@ func effectiveAllowedScopes(policy *domain.CredentialPolicy, identity *domain.Id
 		return identity.AllowedScopes
 	}
 	return nil
+}
+
+// requireGrantableScope closes the gap between intersectScopes' silent
+// narrowing and IssueCredential's "if len(req.Scopes) > 0" claim-omission
+// (credential.go): when a caller explicitly names a scope and every named
+// scope gets intersected away, minting anyway produces a token with no
+// `scopes` claim at all — indistinguishable downstream from a legacy token
+// that predates the scopes feature. Shield's checkScopeCeiling deliberately
+// treats an absent claim as "check not applicable" for that legacy case (see
+// its own comment), so a caller could otherwise escalate past its ceiling
+// simply by naming a scope it does not hold.
+//
+// Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
+// safety net (this file, tokenExchange), extended to the three grants that
+// mint a token for the caller's own use rather than delegating to another
+// identity. A caller that asks for nothing (requestedRaw == "") is
+// unaffected: intersectScopes' RFC 6749 §3.3 default (empty request grants
+// the full ceiling) still applies, and so does an identity/client with a
+// genuinely empty ceiling and no explicit ask.
+func requireGrantableScope(requestedRaw string, granted []string) error {
+	if requestedRaw == "" || len(granted) > 0 {
+		return nil
+	}
+	return oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
 }
 
 // intersectScopes returns the subset of requested scopes that are in the allowed set.
