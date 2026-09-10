@@ -681,6 +681,97 @@ func issueRootInTenant(t *testing.T, headers map[string]string, namePrefix strin
 // TestDelegationChains_TenantIsolation pins the tenant filter on
 // /chains. A fresh tenant must see only its own chains — never another
 // tenant's, even within an overlapping time window.
+// TestDelegationChains_CarriesRootIdentity pins the field that removes the
+// N+1: each summary names the identity its root credential was issued to.
+//
+// Studio used to discover this by calling /delegations/by-jti once per row,
+// so listing 200 chains cost 201 requests against this service. If these
+// fields ever stop being populated, that loop comes back rather than the
+// screen breaking visibly — which is why it is pinned here and not left to
+// the consumer.
+func TestDelegationChains_CarriesRootIdentity(t *testing.T) {
+	headers := tenantHeaders(
+		"acct-chains-root-"+uid(""),
+		"proj-chains-root-"+uid(""),
+	)
+	identityID, jti := issueRootInTenantWithIdentity(t, headers, "chains-root")
+
+	body := decode(t, get(t, adminPath("/delegations/chains?limit=100"), headers))
+	chains, _ := body["chains"].([]any)
+	require.Len(t, chains, 1)
+
+	first := chains[0].(map[string]any)
+	require.Equal(t, jti, first["chain_id"])
+	assert.Equal(t, identityID, first["root_identity_id"],
+		"the summary must name the identity the root credential was issued to")
+	assert.NotEmpty(t, first["root_wimse_uri"], "the root identity join must resolve")
+}
+
+// TestDelegationChains_FilterByRootIdentity pins the filter, and pins that it
+// runs BEFORE the limit.
+//
+// That ordering is the whole value: a client filtering the returned page can
+// only ever conclude "not among these N", while an empty response to this
+// filter means the agent genuinely has no chains in the window. A filter
+// applied after LIMIT would look identical in a small fixture and be wrong in
+// production, so the limit here is deliberately set to 1 and the wanted chain
+// is issued FIRST — making it the older one, which limit=1 alone would drop.
+func TestDelegationChains_FilterByRootIdentity(t *testing.T) {
+	headers := tenantHeaders(
+		"acct-chains-filter-"+uid(""),
+		"proj-chains-filter-"+uid(""),
+	)
+	wantedID, wantedJTI := issueRootInTenantWithIdentity(t, headers, "chains-wanted")
+	issueRootInTenantWithIdentity(t, headers, "chains-other")
+
+	body := decode(t, get(t,
+		adminPath("/delegations/chains?limit=1&root_identity_id="+url.QueryEscape(wantedID)),
+		headers))
+	chains, _ := body["chains"].([]any)
+	require.Len(t, chains, 1, "the filter must reach the query, not the returned page")
+	assert.Equal(t, wantedJTI, chains[0].(map[string]any)["chain_id"],
+		"limit=1 returned the newest chain, so the filter was applied after the limit")
+
+	// An identity with no chains answers empty, which is a FINDING rather
+	// than "not on this page".
+	none := decode(t, get(t,
+		adminPath("/delegations/chains?limit=100&root_identity_id="+uuid.NewString()),
+		headers))
+	noneChains, _ := none["chains"].([]any)
+	assert.Empty(t, noneChains)
+}
+
+// issueRootInTenantWithIdentity is issueRootInTenant plus the identity id,
+// which the root-identity tests assert on.
+func issueRootInTenantWithIdentity(t *testing.T, headers map[string]string, namePrefix string) (identityID, jti string) {
+	t.Helper()
+	extID := uid(namePrefix)
+	body := map[string]any{
+		"external_id":    extID,
+		"trust_level":    "unverified",
+		"owner_user_id":  "user-test-owner",
+		"allowed_scopes": []string{"data:read"},
+	}
+	idResp := post(t, adminPath("/identities"), body, headers)
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	identityID = decode(t, idResp)["id"].(string)
+
+	client := registerOAuthClient(t, extID, []string{"data:read"})
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    headers["X-Account-ID"],
+		"project_id":    headers["X-Project-ID"],
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return identityID, decodeJWTUnsafe(t, decode(t, resp)["access_token"].(string))["jti"].(string)
+}
+
+// TestDelegationChains_TenantIsolation pins the tenant filter on
+// /chains. A fresh tenant must see only its own chains — never another
+// tenant's, even within an overlapping time window.
 func TestDelegationChains_TenantIsolation(t *testing.T) {
 	tenantA := tenantHeaders(
 		"acct-chains-iso-a-"+uid(""),

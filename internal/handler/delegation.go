@@ -37,6 +37,10 @@ type DelegationChainsInput struct {
 	Since time.Time `query:"since" doc:"Lower bound on issued_at (RFC3339); defaults to until-30d"`
 	Until time.Time `query:"until" doc:"Upper bound on issued_at (RFC3339); defaults to now"`
 	Limit int       `query:"limit" default:"50" minimum:"1" maximum:"500" doc:"Maximum number of chains to return"`
+	// Filtering server-side is the only way to answer "does this agent have
+	// tokens in this range". A client filtering the returned page can say
+	// "not among these N" and nothing more, however large N is.
+	RootIdentityID string `query:"root_identity_id" doc:"Only chains whose ROOT credential was issued to this identity. Applied before the limit, so an empty result means the agent has no chains in the window."`
 }
 
 type DelegationChainsOutput struct {
@@ -71,7 +75,7 @@ func (a *API) registerDelegationRoutes(api huma.API) {
 		Method:      http.MethodGet,
 		Path:        "/delegations/chains",
 		Summary:     "List delegation chain summaries in a time window",
-		Description: "Returns one summary row per delegation tree (grouped by mission_id, falling back to root JTI for legacy credentials), ordered by last activity DESC. Defaults to the last 30 days.",
+		Description: "Returns one summary row per delegation tree (grouped by mission_id, falling back to root JTI for legacy credentials), ordered by last activity DESC. Defaults to the last 30 days. Each row carries the root credential's identity, so callers do not need a per-row /by-jti lookup. Pass root_identity_id to filter server-side, before the limit is applied.",
 		Tags:        []string{"Delegations"},
 	}, a.delegationChainsOp)
 }
@@ -120,7 +124,7 @@ func (a *API) delegationChainsOp(ctx context.Context, input *DelegationChainsInp
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	chains, err := a.delegationSvc.ListChains(ctx, input.Since, input.Until, input.Limit, tenant.AccountID, tenant.ProjectID)
+	chains, err := a.delegationSvc.ListChains(ctx, input.Since, input.Until, input.Limit, tenant.AccountID, tenant.ProjectID, input.RootIdentityID)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list delegation chains")
 		return nil, huma.Error500InternalServerError("failed to list delegation chains")

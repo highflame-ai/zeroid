@@ -51,6 +51,20 @@ type ChainSummary struct {
 	LastActivityAt  time.Time `bun:"last_activity_at"  json:"last_activity_at"`
 	CredentialCount int       `bun:"credential_count"  json:"credential_count"`
 	MaxDepth        int       `bun:"max_depth"         json:"max_depth"`
+
+	// The identity the chain was issued TO — the root credential's subject.
+	//
+	// Carried on the summary so a caller does not have to walk /by-jti once
+	// per row to find out who a chain belongs to. Studio did exactly that,
+	// turning one list request into N+1 against this service, and it is also
+	// what forced the agent filter to run client-side over a capped page:
+	// without an identity on the row, the server had nothing to filter on.
+	//
+	// Empty when the root credential predates the identity link or its
+	// identity row was deleted (identity_id is ON DELETE SET NULL).
+	RootIdentityID   string `bun:"root_identity_id"    json:"root_identity_id,omitempty"`
+	RootIdentityName string `bun:"root_identity_name"  json:"root_identity_name,omitempty"`
+	RootWimseURI     string `bun:"root_wimse_uri"      json:"root_wimse_uri,omitempty"`
 }
 
 // WalkUp returns the credential identified by startJTI plus its ancestors
@@ -205,28 +219,61 @@ func (r *DelegationRepository) WalkDownMulti(ctx context.Context, startJTIs []st
 // post-denormalization majority. The COALESCE prevents the partial
 // index from being used directly in EXPLAIN plans, but tenant-scope
 // filtering still narrows the scan to the active tenant's rows.
-func (r *DelegationRepository) ListChains(ctx context.Context, accountID, projectID string, since, until time.Time, limit int) ([]*ChainSummary, error) {
+func (r *DelegationRepository) ListChains(ctx context.Context, accountID, projectID string, since, until time.Time, limit int, rootIdentityID string) ([]*ChainSummary, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	var rows []*ChainSummary
 	db := dbOrTx(ctx, r.db)
+	// The root credential is found by jti, NOT by picking the lowest
+	// delegation_depth inside the window. chain_id is COALESCE(mission_id,
+	// jti) and mission_id IS the root jti, so this join reaches the true
+	// root even when the root credential was issued before `since` — which
+	// is the behaviour the per-row /by-jti walk had, and losing it would
+	// silently relabel long-running chains whenever the window moved.
+	//
+	// The identity join is LEFT: identity_id is ON DELETE SET NULL, and a
+	// chain whose identity has been deleted must still be listed. Dropping
+	// it would hide exactly the tokens an offboarding review is looking for.
 	const q = `
+		WITH chains AS (
+			SELECT
+				COALESCE(mission_id, jti) AS chain_id,
+				MIN(issued_at)            AS started_at,
+				MAX(issued_at)            AS last_activity_at,
+				COUNT(*)::int             AS credential_count,
+				MAX(delegation_depth)::int AS max_depth
+			FROM issued_credentials
+			WHERE account_id = ?
+			  AND project_id = ?
+			  AND issued_at >= ?
+			  AND issued_at <  ?
+			GROUP BY COALESCE(mission_id, jti)
+		)
 		SELECT
-			COALESCE(mission_id, jti) AS chain_id,
-			MIN(issued_at)            AS started_at,
-			MAX(issued_at)            AS last_activity_at,
-			COUNT(*)::int             AS credential_count,
-			MAX(delegation_depth)::int AS max_depth
-		FROM issued_credentials
-		WHERE account_id = ?
-		  AND project_id = ?
-		  AND issued_at >= ?
-		  AND issued_at <  ?
-		GROUP BY COALESCE(mission_id, jti)
-		ORDER BY MAX(issued_at) DESC
+			c.chain_id,
+			c.started_at,
+			c.last_activity_at,
+			c.credential_count,
+			c.max_depth,
+			COALESCE(root.identity_id::text, '') AS root_identity_id,
+			COALESCE(i.name, '')                 AS root_identity_name,
+			COALESCE(i.wimse_uri, '')            AS root_wimse_uri
+		FROM chains c
+		LEFT JOIN issued_credentials root
+			ON root.jti = c.chain_id
+			AND root.account_id = ?
+			AND root.project_id = ?
+		LEFT JOIN identities i
+			ON i.id = root.identity_id
+		WHERE (? = '' OR root.identity_id::text = ?)
+		ORDER BY c.last_activity_at DESC
 		LIMIT ?`
-	if err := db.NewRaw(q, accountID, projectID, since, until, limit).Scan(ctx, &rows); err != nil {
+	// The filter is applied BEFORE the limit, which is the whole point: a
+	// client filtering a capped page can only ever say "not among these N",
+	// never "this agent has none".
+	if err := db.NewRaw(q, accountID, projectID, since, until,
+		accountID, projectID, rootIdentityID, rootIdentityID, limit).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("list delegation chains: %w", err)
 	}
 	return rows, nil
