@@ -169,11 +169,15 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// path: on a GET, req.Form is empty by construction, so a resolver
 	// reading req.Form("api_key") sees nothing and must fall through to
 	// a header or cookie. See registerAuthorizeRoute.
-	params := r.PostForm.Get
+	// `values` is the SAME single source `params` reads, kept so a repeatable
+	// parameter can be read in full. RFC 8707 §2 permits `resource` to appear
+	// more than once, and params/Get would silently return only the first —
+	// dropping a resource the client asked to be bound to.
+	values := r.PostForm
 	if r.Method == http.MethodGet {
-		query := r.URL.Query()
-		params = query.Get
+		values = r.URL.Query()
 	}
+	params := values.Get
 	postForm := r.PostForm
 	header := r.Header
 	req := &service.AuthorizeRequest{
@@ -184,6 +188,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		CodeChallengeMethod: params("code_challenge_method"),
 		State:               params("state"),
 		Scope:               params("scope"),
+		Resource:            values["resource"],
 		Form:                postForm.Get,
 		Header: func(name string) string {
 			return header.Get(name)
@@ -315,6 +320,37 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The RFC 8707 resource ceiling (CAP-IDN-027). Validated HERE, alongside
+	// the other parameters a request can doom itself on, rather than only at
+	// step 6: reaching IssueAuthCode means having passed through the resolver
+	// chain, so a client that sent a malformed identifier would first send its
+	// human to a login surface and only then be refused. IssueAuthCode
+	// re-validates, so a programmatic caller is still gated.
+	//
+	// invalid_target in BOTH vocabularies, unlike the response_type gate above
+	// which splits them. That gate keeps invalid_request in the JSON body for
+	// backward compatibility — "what POST callers have parsed since v1" — and
+	// this gate is new, so it has no such callers to keep faith with. RFC 8707
+	// §2 names invalid_target for a resource the AS cannot honour, and
+	// /oauth2/token already answers that way for the same parameter; splitting
+	// the codes here would mean one parameter reporting two different errors
+	// depending on which endpoint rejected it.
+	resourceCeiling, err := service.ValidateAuthorizeResource(req.Resource)
+	if err != nil {
+		_, desc, status := extractOAuthError(err)
+		a.failAuthorize(w, r, req, oauthClient, status,
+			oautherror.InvalidTarget, oautherror.InvalidTarget, desc)
+
+		return
+	}
+	// Normalise the snapshot to the VALIDATED, de-duplicated ceiling. Two
+	// consumers depend on this rather than on the raw parameter:
+	// redirectToInteractiveLogin rebuilds return_to from req (and its contract
+	// is that it carries only validated parameters), and any resolver that
+	// reads req.Resource sees the canonical form rather than whatever repeated
+	// or duplicated shape arrived on the wire.
+	req.Resource = resourceCeiling
+
 	// ── Step 4: principal resolution ─────────────────────────────────
 	// The resolvePrincipal callback is wired unconditionally by
 	// Server.NewServer (it's a method bound to the server's resolver
@@ -416,6 +452,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
 		Scopes:              scopes,
+		Resources:           resourceCeiling,
 		Client:              oauthClient,
 	})
 	if err != nil {
@@ -533,6 +570,24 @@ func (a *API) redirectToInteractiveLogin(
 
 	if req.Scope != "" {
 		returnTo.Set("scope", req.Scope)
+	}
+
+	// The RFC 8707 consented ceiling MUST survive the login round trip
+	// (CAP-IDN-027). Omitting it was a silent-unbinding bug of exactly the kind
+	// this capability exists to close: the pre-login pass validates `resource`
+	// and the resumed pass then sees it absent, so the code is minted with no
+	// `rsc` claim, the access token carries no `resource` claim, and Shield —
+	// which keys INV-IDN-006 on that claim's PRESENCE — honours the token at
+	// every MCP server in the tenant. No error at any step. And because it is
+	// the FIRST browser visit that bounces through login, that was the common
+	// path, not an edge case.
+	//
+	// Added with Add rather than Set: RFC 8707 §2 permits the parameter to
+	// repeat, and req.Resource holds the validated, de-duplicated ceiling
+	// (normalised in authorizeHandler right after ValidateAuthorizeResource),
+	// which is what this function's "validated fields only" contract requires.
+	for _, resource := range req.Resource {
+		returnTo.Add("resource", resource)
 	}
 
 	q := u.Query()

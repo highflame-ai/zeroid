@@ -378,15 +378,204 @@ func TestRejectUnsupportedResource(t *testing.T) {
 	})
 }
 
-// TestRefreshTokenNeverSupportsResource pins the rule that a refresh can never
-// take a NEW resource binding. It is a separate test from the table above
-// because it is a durable security property, not a slice-by-slice rollout
-// state: enabling it later would let a client re-target a token it already
-// holds without a fresh authorization decision.
-func TestRefreshTokenNeverSupportsResource(t *testing.T) {
-	if grantSupportsResource("refresh_token") {
-		t.Fatal("refresh_token must never accept a resource parameter")
-	}
+// TestValidateAuthorizeResource covers the authorize-leg validator, whose caps
+// are deliberately TIGHTER than the token endpoint's (CAP-IDN-027).
+//
+// Worth pinning separately from validateResourceIndicators because the two caps
+// exist for different reasons and are allowed to diverge: the token endpoint
+// bounds token size, this leg bounds a multi-audience token into
+// unrepresentability and keeps an authorization code deliverable in a redirect
+// URL.
+func TestValidateAuthorizeResource(t *testing.T) {
+	const (
+		github = "https://gw.example.com/mcp/github"
+		slack  = "https://gw.example.com/mcp/slack"
+	)
+
+	t.Run("no resource is not an error", func(t *testing.T) {
+		got, err := ValidateAuthorizeResource(nil)
+		if err != nil {
+			t.Fatalf("omitting resource must be legal: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("expected no ceiling, got %#v", got)
+		}
+	})
+
+	t.Run("one resource is the consented ceiling", func(t *testing.T) {
+		got, err := ValidateAuthorizeResource([]string{github})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 || got[0] != github {
+			t.Fatalf("expected exactly the requested resource, got %#v", got)
+		}
+	})
+
+	// The interaction worth pinning: dedup happens BEFORE the count check, so a
+	// client that repeats one resource — which RFC 8707 §2 explicitly permits,
+	// since the parameter may appear multiple times — is not tripped by the
+	// cap of one. If the order ever flips, this is a conformant request that
+	// starts failing.
+	t.Run("a repeated identical resource collapses and passes the cap", func(t *testing.T) {
+		got, err := ValidateAuthorizeResource([]string{github, github})
+		if err != nil {
+			t.Fatalf("repeating one resource is harmless per RFC 8707 §2: %v", err)
+		}
+		if len(got) != 1 || got[0] != github {
+			t.Fatalf("duplicates must collapse to one, got %#v", got)
+		}
+	})
+
+	// RFC 6749 §3.1: a parameter sent without a value is treated as omitted.
+	// At /oauth2/token that is free — oauthFormCompatMiddleware strips valueless
+	// parameters before binding. /oauth2/authorize bypasses that middleware and
+	// reads `resource` as a repeatable parameter, so `?resource=` arrives as
+	// []string{""} instead of disappearing. Without the drop it fails the whole
+	// authorization with invalid_target, which is both a spec violation and a
+	// regression for a client that appends the parameter from an unset variable.
+	t.Run("a valueless occurrence is treated as omitted", func(t *testing.T) {
+		got, err := ValidateAuthorizeResource([]string{""})
+		if err != nil {
+			t.Fatalf("`resource=` must be treated as omitted, not rejected: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("expected no ceiling, got %#v", got)
+		}
+	})
+
+	t.Run("a valueless occurrence alongside a real one is ignored", func(t *testing.T) {
+		// `?resource=A&resource=` — the identical pair binds cleanly at the
+		// token endpoint, so it must not diverge here.
+		got, err := ValidateAuthorizeResource([]string{github, ""})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 || got[0] != github {
+			t.Fatalf("expected just the real resource, got %#v", got)
+		}
+	})
+
+	t.Run("whitespace is still malformed, not omitted", func(t *testing.T) {
+		// Only genuinely EMPTY occurrences are dropped. A client that sent " "
+		// meant something by it, and it can never match an RFC 9728
+		// advertisement.
+		_, err := ValidateAuthorizeResource([]string{"   "})
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
+	t.Run("two distinct resources exceed the cap", func(t *testing.T) {
+		_, err := ValidateAuthorizeResource([]string{github, slack})
+		oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+		if !strings.Contains(oe.Description, "multi-audience") {
+			t.Fatalf("the error should say why one is the cap, got: %q", oe.Description)
+		}
+	})
+
+	// Length, not count, is what constrains a redirect URL — and this cap can
+	// be hit by a SINGLE value that the token endpoint would happily accept
+	// (its per-value cap is 2048).
+	t.Run("an over-long single resource is refused", func(t *testing.T) {
+		long := "https://gw.example.com/mcp/" + strings.Repeat("a", maxAuthorizeResourceTotalLen)
+		_, err := ValidateAuthorizeResource([]string{long})
+		oe := wantOAuthError(t, err, oautherror.InvalidTarget)
+		if !strings.Contains(oe.Description, "combined length") {
+			t.Fatalf("expected the length cap to fire, got: %q", oe.Description)
+		}
+	})
+
+	// Syntax rules are inherited rather than reimplemented, so an identifier
+	// rejected at the token endpoint must not be accepted here and then fail at
+	// redemption — that would spend a whole browser round trip to obtain a code
+	// the client can never exchange.
+	t.Run("§2 syntax rules are inherited from the token endpoint", func(t *testing.T) {
+		// NOT including "" — a valueless occurrence is dropped as omitted per
+		// RFC 6749 §3.1 (covered above), which is a different rule from a
+		// malformed identifier.
+		for _, bad := range []string{
+			"/mcp/github",                       // relative
+			"https://gw.example.com/mcp#frag",   // fragment
+			"https://u:p@gw.example.com/mcp/gh", // userinfo
+			"https://",                          // authority with no host
+			"   ",                               // whitespace-only
+		} {
+			if _, err := ValidateAuthorizeResource([]string{bad}); err == nil {
+				t.Fatalf("expected %q to be rejected at the authorize leg", bad)
+			}
+		}
+	})
+}
+
+// TestRefreshTokenNeverWidensBeyondCeiling pins the durable security property
+// on the refresh grant.
+//
+// This REPLACES TestRefreshTokenNeverSupportsResource, which asserted that
+// refresh_token was absent from resourceSupportedGrants. That exclusion was the
+// right control only while the binding was not carried across rotation — it was
+// what the code called the "second lock", the first being that a resource-bound
+// exchange was issued no refresh token at all. CAP-IDN-027 carries the ceiling
+// on the refresh family, so the property worth defending is no longer "refuse
+// the parameter" — which 400s the exact request a conformant MCP client makes,
+// since the SDK sends `resource` on the refresh leg too — but "the parameter can
+// only ever narrow". Same invariant, enforced by a subset check against the
+// consented ceiling instead of by blanket exclusion.
+//
+// Kept separate from the rollout table above for the reason the original was:
+// this is a durable property, not slice-by-slice rollout state.
+func TestRefreshTokenNeverWidensBeyondCeiling(t *testing.T) {
+	const (
+		granted = "https://gw.example/mcp/github"
+		other   = "https://gw.example/mcp/slack"
+	)
+
+	t.Run("the grant accepts the parameter at all", func(t *testing.T) {
+		if !grantSupportsResource("refresh_token") {
+			t.Fatal("refresh_token must accept resource so a client can select from its ceiling")
+		}
+	})
+
+	t.Run("a resource outside the ceiling is invalid_target", func(t *testing.T) {
+		_, err := resolveRefreshResources([]string{granted}, []string{other})
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
+	t.Run("a resource inside the ceiling is honoured", func(t *testing.T) {
+		got, err := resolveRefreshResources([]string{granted}, []string{granted})
+		if err != nil {
+			t.Fatalf("selecting the consented resource failed: %v", err)
+		}
+		if len(got) != 1 || got[0] != granted {
+			t.Fatalf("expected exactly the consented resource, got %#v", got)
+		}
+	})
+
+	t.Run("omitting the parameter re-stamps a single-valued ceiling", func(t *testing.T) {
+		got, err := resolveRefreshResources([]string{granted}, nil)
+		if err != nil {
+			t.Fatalf("omitting resource on a single-valued ceiling failed: %v", err)
+		}
+		if len(got) != 1 || got[0] != granted {
+			t.Fatalf("expected the ceiling re-stamped, got %#v", got)
+		}
+	})
+
+	// The coupling that stops a raised maxAuthorizeResourceIndicators from
+	// silently minting multi-audience tokens. If someone raises that cap and
+	// does not revisit the refresh rule, this is the test that says so.
+	t.Run("omitting the parameter on a multi-valued ceiling is refused", func(t *testing.T) {
+		_, err := resolveRefreshResources([]string{granted, other}, nil)
+		wantOAuthError(t, err, oautherror.InvalidTarget)
+	})
+
+	t.Run("an unbound family is unchanged", func(t *testing.T) {
+		got, err := resolveRefreshResources(nil, nil)
+		if err != nil {
+			t.Fatalf("unbound refresh must not error: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("unbound refresh must carry no resource claim, got %#v", got)
+		}
+	})
 }
 
 func TestBindResourceOnIssue(t *testing.T) {
