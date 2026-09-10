@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -739,6 +740,17 @@ func TestDelegationChains_FilterByRootIdentity(t *testing.T) {
 		headers))
 	noneChains, _ := none["chains"].([]any)
 	assert.Empty(t, noneChains)
+
+	// UUIDs are case-insensitive, and the comparison must be too. This
+	// passed only once the filter stopped comparing identity_id::text —
+	// Postgres renders a uuid lowercase, so an upper-case id matched nothing
+	// and produced the very false negative this filter exists to remove.
+	upper := decode(t, get(t,
+		adminPath("/delegations/chains?limit=100&root_identity_id="+url.QueryEscape(strings.ToUpper(wantedID))),
+		headers))
+	upperChains, _ := upper["chains"].([]any)
+	require.Len(t, upperChains, 1, "an upper-case UUID must match the same chain")
+	assert.Equal(t, wantedJTI, upperChains[0].(map[string]any)["chain_id"])
 }
 
 // issueRootInTenantWithIdentity is issueRootInTenant plus the identity id,
@@ -912,6 +924,31 @@ func TestDelegationChains_InvalidParams_Rejected(t *testing.T) {
 		assert.Less(t, resp.StatusCode, 500,
 			"param %s must NOT 500", bad)
 	}
+
+	// A malformed root_identity_id must be REJECTED, not treated as a filter
+	// that matches nothing. An empty chain list on this endpoint means "this
+	// agent holds no tokens in this window", so a typo answering 200 with []
+	// reads as a clean bill of health.
+	for _, bad := range []string{
+		"not-a-uuid",
+		"12345",
+		"0000-0000",
+		strings.Repeat("a", 40),
+	} {
+		resp := get(t, adminPath("/delegations/chains?root_identity_id="+url.QueryEscape(bad)), adminHeaders())
+		_ = resp.Body.Close()
+		assert.GreaterOrEqual(t, resp.StatusCode, 400,
+			"root_identity_id=%s must be rejected with 4xx, never answered with an empty list", bad)
+		assert.Less(t, resp.StatusCode, 500,
+			"root_identity_id=%s must NOT 500", bad)
+	}
+
+	// Empty stays valid: it is the "no filter" sentinel, and a client that
+	// clears its agent picker sends exactly this.
+	resp := get(t, adminPath("/delegations/chains?root_identity_id="), adminHeaders())
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode,
+		"an empty root_identity_id means no filter and must not be rejected")
 }
 
 // TestDelegationGraph_SiblingsVisibleInFullTree verifies that the

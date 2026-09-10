@@ -266,12 +266,20 @@ func (r *DelegationRepository) ListChains(ctx context.Context, accountID, projec
 			AND root.project_id = ?
 		LEFT JOIN identities i
 			ON i.id = root.identity_id
-		WHERE (? = '' OR root.identity_id::text = ?)
+		WHERE (NULLIF(?, '') IS NULL OR root.identity_id = NULLIF(?, '')::uuid)
 		ORDER BY c.last_activity_at DESC
 		LIMIT ?`
 	// The filter is applied BEFORE the limit, which is the whole point: a
 	// client filtering a capped page can only ever say "not among these N",
 	// never "this agent has none".
+	//
+	// Compared as uuid, not as text. `identity_id::text = ?` would have cast
+	// away the column's type on every row — defeating the index on
+	// identity_id — and would have compared canonical lowercase output
+	// against whatever case the caller sent, so an upper-case UUID silently
+	// matched nothing. NULLIF turns the empty sentinel into NULL before the
+	// cast, so "no filter" never reaches ::uuid; the handler's pattern
+	// guarantees anything that does reach it parses.
 	if err := db.NewRaw(q, accountID, projectID, since, until,
 		accountID, projectID, rootIdentityID, rootIdentityID, limit).Scan(ctx, &rows); err != nil {
 		return nil, fmt.Errorf("list delegation chains: %w", err)

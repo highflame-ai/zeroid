@@ -40,7 +40,16 @@ type DelegationChainsInput struct {
 	// Filtering server-side is the only way to answer "does this agent have
 	// tokens in this range". A client filtering the returned page can say
 	// "not among these N" and nothing more, however large N is.
-	RootIdentityID string `query:"root_identity_id" doc:"Only chains whose ROOT credential was issued to this identity. Applied before the limit, so an empty result means the agent has no chains in the window."`
+	//
+	// The pattern admits a UUID in either case, or nothing at all. Empty is
+	// the "no filter" sentinel and has to stay valid, so it is an explicit
+	// alternative rather than an accident of a lax pattern.
+	//
+	// Validating here is not tidiness: on THIS endpoint a malformed id would
+	// otherwise match no rows and return an empty list, and an empty list
+	// here means "this agent holds no tokens in this window". A typo would
+	// read as a clean bill of health. 400 is the only honest answer.
+	RootIdentityID string `query:"root_identity_id" pattern:"^$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" doc:"Only chains whose ROOT credential was issued to this identity (UUID). Applied before the limit, so an empty result means the agent has no chains in the window."`
 }
 
 type DelegationChainsOutput struct {
