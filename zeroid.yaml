@@ -130,6 +130,30 @@ backchannel:
 # and validates the JSON metadata document published at that URL and treats it as
 # an ephemeral public PKCE client. This is the MCP Authorization 2025-11-25
 # preferred default for open agent ecosystems. See docs/cimd.md.
+# OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
+# proves its identity with a JWT signed by a key it published rather than with a
+# shared secret.
+#
+# Deliberately separate from `cimd` below: relaxing the SSRF guard so CIMD can
+# fetch documents from localhost in dev must NOT also open the client-JWKS
+# fetcher to internal addresses. The two fetchers trust different parties.
+client_auth:
+  # Relaxes the SSRF guard on a registered client's `jwks_uri` fetch.
+  # Default false (production-safe). This matters more than the CIMD
+  # equivalent: a jwks_uri is stored at registration and re-fetched on every
+  # cold cache, so wherever registration is open (DCR) it is an
+  # attacker-supplied URL this server makes repeated outbound requests to.
+  # Set true ONLY in single-tenant dev/test deployments serving client key
+  # sets from localhost. Production MUST keep this false.
+  # Env: ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS
+  allow_private_jwks_endpoints: false
+  # Bounds how many distinct client jwks_uri endpoints are cached at once.
+  # Each cached entry owns a background refresh goroutine, so this caps
+  # goroutines and outbound fetch loops, not just memory. 0 (default) => 256.
+  # Least-recently-used entries are evicted and closed.
+  # Env: ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE
+  jwks_cache_size: 0
+
 cimd:
   # On by default so agents can onboard against this AS without registration.
   # Env: ZEROID_CIMD_ENABLED

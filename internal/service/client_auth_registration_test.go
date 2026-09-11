@@ -186,3 +186,42 @@ func TestRequireNonAssertionClientAuth(t *testing.T) {
 		require.NoError(t, requireNonAssertionClientAuth(nil))
 	})
 }
+
+// hasInlineJWKS distinguishes "no inline key set" from "an inline key set",
+// against the shape real stored data actually has.
+//
+// This is not a theoretical edge. `jwks` is a nullable jsonb column and bun
+// writes a nil json.RawMessage as JSON `null`, not SQL NULL — so a client
+// registered WITHOUT a jwks reads back as the four bytes `null`. Every client
+// deployed in dev1 and prod today has exactly that value. A naive `len(raw) > 0`
+// reads it as "has an inline key set", which would make a private_key_jwt client
+// that published a jwks_uri look like it carried BOTH — rejected as ambiguous,
+// unable to ever authenticate.
+//
+// No in-memory test catches this, because a hand-built domain.OAuthClient has a
+// genuinely nil JWKS while a database round trip does not.
+func TestHasInlineJWKS(t *testing.T) {
+	t.Parallel()
+
+	absent := []string{"", "null", " null ", "\n", "  "}
+	for _, raw := range absent {
+		require.False(t, hasInlineJWKS(json.RawMessage(raw)),
+			"%q must read as ABSENT — this is what a jwks-less client round-trips to", raw)
+	}
+	require.False(t, hasInlineJWKS(nil))
+
+	present := []string{`{"keys":[]}`, `{"keys":[{"kty":"EC"}]}`, `{}`}
+	for _, raw := range present {
+		require.True(t, hasInlineJWKS(json.RawMessage(raw)),
+			"%q must read as PRESENT (validity is a separate question)", raw)
+	}
+}
+
+// The end-to-end consequence of the above: a private_key_jwt client registered
+// with jwks_uri ONLY must not be read as carrying both key sources.
+func TestValidateClientAuthMethod_JWKSURIOnlyWithStoredJSONNull(t *testing.T) {
+	t.Parallel()
+	require.NoError(t,
+		validateClientAuthMethod("private_key_jwt", json.RawMessage("null"), "https://client.example.com/jwks.json"),
+		"a jwks_uri-only client whose empty jwks round-tripped to JSON null must still be valid")
+}

@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"container/list"
 	"context"
+	"encoding/json"
 	"sync"
 
 	"github.com/lestrrat-go/jwx/v4/jwk"
@@ -104,6 +106,25 @@ func (c *ClientJWKSCache) Close() {
 	c.lru.Init()
 }
 
+// hasInlineJWKS reports whether raw carries an actual inline JWK Set, as
+// opposed to being absent.
+//
+// The length check this replaces (`len(raw) > 0`) is wrong against real stored
+// data. `jwks` is a nullable jsonb column, and bun writes a nil json.RawMessage
+// as JSON `null` rather than SQL NULL — so a client registered WITHOUT a jwks
+// reads back as the four bytes `null`, which is non-empty. Every one of the
+// clients deployed in dev1 and prod today has exactly that value.
+//
+// Left unhandled, a private_key_jwt client that published a `jwks_uri` and no
+// inline set would be read as carrying BOTH, be rejected as an ambiguous
+// registration, and never authenticate at all — a failure no in-memory unit test
+// would surface, because a hand-built domain.OAuthClient has a genuinely nil
+// JWKS while a database round trip does not.
+func hasInlineJWKS(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
 // clientVerificationKeys resolves the public keys a client's assertions are
 // verified against: its inline `jwks` document, or the JWKS fetched from its
 // registered `jwks_uri`.
@@ -114,7 +135,7 @@ func (c *ClientJWKSCache) Close() {
 // unloadable issuer JWKS. A client cannot distinguish the two from the response,
 // but the server's own metrics can.
 func (s *OAuthService) clientVerificationKeys(ctx context.Context, client *domain.OAuthClient) (jwk.Set, error) {
-	hasInline := len(client.JWKS) > 0
+	hasInline := hasInlineJWKS(client.JWKS)
 	hasURI := client.JWKSURI != ""
 
 	switch {

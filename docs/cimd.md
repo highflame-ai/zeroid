@@ -347,7 +347,7 @@ Both of these will reject a document some other implementation accepts. That is 
 
 ### Deliberately not implemented
 
-- **Confidential CIMD clients** — `token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`. ZeroID accepts no `private_key_jwt` token-endpoint auth for any client; CIMD is public-PKCE-only.
+- **Confidential CIMD clients** — `token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`. ZeroID now implements `private_key_jwt` for REGISTERED clients (zeroid#206), but CIMD remains public-PKCE-only, and the reason is no longer "unimplemented": a CIMD registration is a self-published document, so honouring key-based auth from one would let any party on the internet assert a confidential client identity with no registration step. Registry-only is the trust boundary, not a missing feature.
 - **`software_statement`** — signed metadata is not consumed. CIMD trust here is domain-ownership based.
 
 Both are areas the draft is more likely to move in than the core resolution rules, which is part of why they are not built on.

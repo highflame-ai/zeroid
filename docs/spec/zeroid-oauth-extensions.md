@@ -1008,9 +1008,12 @@ overrides the document.
 - `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
   `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
   establish itself as confidential via `token_endpoint_auth_method` and
-  `jwks_uri`; ZeroID accepts no `private_key_jwt` anywhere yet, so every CIMD
-  client is public and PKCE is the sole proof of possession. Tracked in
-  zeroid#264.
+  `jwks_uri`. ZeroID implements `private_key_jwt` for REGISTERED clients as of
+  zeroid#206, but still refuses it for CIMD: a CIMD registration is a
+  self-published document, so accepting key-based auth from one would let any
+  party on the internet claim a confidential client identity without
+  registering. Every CIMD client is therefore public and PKCE is the sole proof
+  of possession. Tracked in zeroid#264.
 - `grant_types` defaults to `["authorization_code"]`, **MUST** include
   `authorization_code`, and may contain only `authorization_code` and
   `refresh_token`.

@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -321,4 +322,61 @@ func TestClientAuthDowngrade_ImplementedMethodsAreUnaffected(t *testing.T) {
 			"client_secret_basic is implemented and must keep working")
 		assert.NotEmpty(t, decode(t, resp)["access_token"])
 	})
+}
+
+// A private_key_jwt client that publishes a `jwks_uri` instead of an inline
+// `jwks` must be able to authenticate.
+//
+// This exists because the inline-only tests could not have caught the bug it
+// pins. `jwks` is a nullable jsonb column and bun writes a nil json.RawMessage
+// as JSON `null`, not SQL NULL — so a jwks_uri-only client reads back with a
+// four-byte `null` in its JWKS field. A length check on that field saw "inline
+// key set present", concluded the row carried BOTH sources, and refused the
+// client as an ambiguous registration. It could never have authenticated.
+//
+// In-memory unit tests are structurally blind to this: a hand-built
+// domain.OAuthClient has a genuinely nil JWKS, while a database round trip does
+// not. Only a test that actually persists and reloads the client sees it.
+func TestPrivateKeyJWT_JWKSURIClient(t *testing.T) {
+	clientID := uid("pkjwt-uri")
+	key := generateKey(t)
+
+	jwksBody, err := json.Marshal(clientJWKS(t, key))
+	require.NoError(t, err)
+	jwksServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(jwksBody)
+	}))
+	defer jwksServer.Close()
+
+	reg := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":                  clientID,
+		"name":                       clientID + "-client",
+		"confidential":               false,
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks_uri":                   jwksServer.URL,
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"redirect_uris":              []string{testRedirectURI},
+		"scopes":                     []string{"data:read"},
+	}, nil)
+	require.Equal(t, http.StatusCreated, reg.StatusCode, "jwks_uri registration must succeed")
+	_ = reg.Body.Close()
+
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, clientID, uid("pkjwt-uri-user"), testRedirectURI, challenge, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":            "authorization_code",
+		"client_id":             clientID,
+		"code":                  code,
+		"code_verifier":         verifier,
+		"redirect_uri":          testRedirectURI,
+		"client_assertion":      clientAssertionFor(t, key, clientID),
+		"client_assertion_type": clientAssertionType,
+	}, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"a jwks_uri-backed client must authenticate — the keys are fetched, not stored inline")
+	assert.NotEmpty(t, decode(t, resp)["access_token"])
 }
