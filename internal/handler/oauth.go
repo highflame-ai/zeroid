@@ -95,22 +95,31 @@ type TokenInput struct {
 		// single URI string or an array of them; a form-encoded request may
 		// repeat the parameter. Mutually exclusive with Audience.
 		//
-		// THE TOKEN REQUEST IS THE ONLY PLACE A BINDING IS ESTABLISHED.
-		// /oauth2/authorize accepts and ignores `resource` (RFC 6749 §3.1's
-		// ignore-unrecognized posture), and the binding is not carried on the
-		// authorization code — so a client that sends it only at the
-		// authorization request receives an UNBOUND token, with no error at any
-		// step. The MCP authorization profile requires `resource` on both the
-		// authorization and the token request, so a conformant MCP client is
-		// bound correctly; a client following RFC 8707 §2 alone, which permits
-		// the token request to rely on the code's binding, is not.
-		// Tracked for a follow-up that persists the authorized set on the code
-		// row and cross-checks it at redemption.
+		// A binding may be established at EITHER the authorization request or
+		// the token request (CAP-IDN-027). `/oauth2/authorize` now validates
+		// `resource` and records the consented value as the authorization
+		// code's ceiling, so:
 		//
-		// Note also that a request carrying `resource` is issued NO refresh
-		// token: the binding is not carried across rotation, so a refresh would
-		// silently unbind the token.
-		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment. Must be sent on THIS request: /oauth2/authorize ignores it and the binding is not carried on the authorization code. A resource-bound request receives no refresh_token."`
+		//   - sent at authorize only  → the token binds to the code's ceiling
+		//   - sent at both            → must be a subset of the ceiling, else
+		//                               `invalid_target`
+		//   - sent at token only      → binds directly, as before
+		//
+		// The client SELECTS from what the resource owner consented to and can
+		// never add to it. The authorize leg accepts at most ONE resource: a
+		// multi-audience access token is not issuable on that grant.
+		//
+		// A resource-bound `authorization_code` exchange IS issued a refresh
+		// token, and the binding survives rotation — the ceiling is recorded on
+		// the refresh family and re-stamped on every successor. A refresh may
+		// name `resource` to select within that ceiling; omitting it re-stamps
+		// a single-valued ceiling.
+		//
+		// (The trusted external-principal exchange still returns no refresh
+		// token for a resource-bound request, but for an unrelated structural
+		// reason: refresh tokens there require a profiled `audience`, which is
+		// mutually exclusive with `resource`.)
+		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment. May be sent at /oauth2/authorize (recording the consented ceiling on the code, max 1) and/or here, where it must name a subset of that ceiling. A resource-bound authorization_code exchange receives a refresh_token whose rotations keep the binding."`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
