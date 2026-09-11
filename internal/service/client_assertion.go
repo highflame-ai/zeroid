@@ -147,6 +147,65 @@ func (s *OAuthService) enforceRegisteredClientAuthMethod(
 	return nil
 }
 
+// authenticateRegisteredClient authenticates a REGISTERED client for a grant
+// that authenticates the client directly rather than through
+// verifyConfidentialClientAuth — currently client_credentials and ID-JAG
+// redemption. It replaces a bare VerifyClientSecret call and returns the same
+// client and the same sentinel-mapped errors, so callers keep their existing
+// error surface.
+//
+// Both callers previously went straight to VerifyClientSecret, consulting
+// TokenEndpointAuthMethod nowhere. That left two defects:
+//
+//   - A client registered for private_key_jwt that ALSO held a secret (a state
+//     registration now refuses, but that pre-existing rows may still be in)
+//     authenticated with that secret here, while being refused on
+//     authorization_code, refresh_token and CIBA. The weaker credential won on
+//     whichever grant happened not to check.
+//   - A key-based client with no secret could not authenticate here AT ALL,
+//     failing bcrypt against an empty hash. Since DCR defaults grant_types to
+//     ["client_credentials"], a conformant private_key_jwt DCR registration
+//     produced a client that could authenticate nowhere — the same
+//     "advertised method that cannot work" this issue exists to eliminate.
+//
+// Routing both through the shared enforcement fixes them together.
+func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req TokenRequest) (*domain.OAuthClient, error) {
+	client, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
+	if err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) {
+			return nil, oauthUnauthorized("invalid client credentials", err)
+		}
+		// Operational failure must not be read as "unknown client".
+		return nil, oauthUnauthorized("client verification failed", err)
+	}
+	// GetClientByClientID deliberately does not filter on IsActive (its CIMD
+	// callers need the distinction), unlike VerifyClientSecret which did.
+	// Re-apply it here or deactivation stops being a kill switch on this path.
+	if !client.IsActive {
+		return nil, oauthUnauthorized("invalid client credentials", nil)
+	}
+	if err := rejectUnimplementedClientAuth(client); err != nil {
+		return nil, err
+	}
+	if err := s.enforceRegisteredClientAuthMethod(ctx, client, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
+		return nil, err
+	}
+	// private_key_jwt is fully authenticated by the assertion above.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		return client, nil
+	}
+	// Secret-based (or legacy-unset) client: unchanged behaviour, including
+	// VerifyClientSecret's own constant-time compare and active-client gate.
+	verified, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	if err != nil {
+		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
+			return nil, oauthUnauthorized("invalid client credentials", err)
+		}
+		return nil, oauthUnauthorized("client verification failed", err)
+	}
+	return verified, nil
+}
+
 // requireNonAssertionClientAuth is the client-authentication precondition for
 // surfaces that do NOT accept a client_assertion: currently the CIBA
 // bc-authorize and token-poll paths, which authenticate with a client_secret or

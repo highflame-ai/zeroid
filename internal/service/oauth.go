@@ -669,13 +669,14 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
 	}
 
-	// Validate client credentials against the oauth_clients table.
-	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	// Authenticate the client with whatever its REGISTERED method requires —
+	// a client_secret, or an RFC 7523 §2.2 client_assertion. This used to call
+	// VerifyClientSecret directly and consult the registered method nowhere,
+	// which both accepted a secret from a key-based client and made a
+	// secretless key-based client unable to authenticate here at all.
+	client, err := s.authenticateRegisteredClient(ctx, req)
 	if err != nil {
-		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, oauthUnauthorized("invalid client credentials", err)
-		}
-		return nil, oauthUnauthorized("client verification failed", err)
+		return nil, err
 	}
 
 	// Ensure client_credentials grant is permitted.

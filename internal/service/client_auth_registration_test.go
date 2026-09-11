@@ -25,10 +25,10 @@ func TestValidateClientAuthMethod(t *testing.T) {
 
 	t.Run("accepts the methods this server enforces", func(t *testing.T) {
 		for _, m := range []string{"none", "client_secret_post", "client_secret_basic"} {
-			require.NoError(t, validateClientAuthMethod(m, nil, ""), "method %q must be registrable", m)
+			require.NoError(t, validateClientAuthMethod(m, nil, "", false), "method %q must be registrable", m)
 		}
-		require.NoError(t, validateClientAuthMethod("private_key_jwt", validJWKS, ""))
-		require.NoError(t, validateClientAuthMethod("private_key_jwt", nil, "https://client.example.com/jwks.json"))
+		require.NoError(t, validateClientAuthMethod("private_key_jwt", validJWKS, "", false))
+		require.NoError(t, validateClientAuthMethod("private_key_jwt", nil, "https://client.example.com/jwks.json", false))
 	})
 
 	t.Run("refuses methods this server cannot enforce", func(t *testing.T) {
@@ -36,7 +36,7 @@ func TestValidateClientAuthMethod(t *testing.T) {
 		// class. client_secret_jwt is dropped in OAuth 2.1; tls_client_auth is
 		// deferred pending an mTLS termination story.
 		for _, m := range []string{"client_secret_jwt", "tls_client_auth", "self_signed_tls_client_auth", "private-key-jwt", "", "made_up"} {
-			require.Error(t, validateClientAuthMethod(m, nil, ""), "method %q must not be registrable", m)
+			require.Error(t, validateClientAuthMethod(m, nil, "", false), "method %q must not be registrable", m)
 		}
 	})
 
@@ -44,20 +44,20 @@ func TestValidateClientAuthMethod(t *testing.T) {
 		// Otherwise registration succeeds and produces a client that can never
 		// authenticate — a failure the operator only discovers as a 401 later,
 		// against a client they believe is configured correctly.
-		require.Error(t, validateClientAuthMethod("private_key_jwt", nil, ""))
+		require.Error(t, validateClientAuthMethod("private_key_jwt", nil, "", false))
 	})
 
 	t.Run("jwks and jwks_uri are mutually exclusive", func(t *testing.T) {
 		// RFC 7591 §2. Checked for EVERY method, not just private_key_jwt: an
 		// ambiguous key set is a problem whenever it is stored, and a client can
 		// change its auth method later.
-		require.Error(t, validateClientAuthMethod("private_key_jwt", validJWKS, "https://client.example.com/jwks.json"))
-		require.Error(t, validateClientAuthMethod("client_secret_basic", validJWKS, "https://client.example.com/jwks.json"))
+		require.Error(t, validateClientAuthMethod("private_key_jwt", validJWKS, "https://client.example.com/jwks.json", false))
+		require.Error(t, validateClientAuthMethod("client_secret_basic", validJWKS, "https://client.example.com/jwks.json", false))
 	})
 
 	t.Run("an unparseable inline jwks is refused at registration", func(t *testing.T) {
 		for _, bad := range []string{`{"keys":[]}`, `{"not":"a jwks"}`, `garbage`} {
-			require.Error(t, validateClientAuthMethod("private_key_jwt", json.RawMessage(bad), ""),
+			require.Error(t, validateClientAuthMethod("private_key_jwt", json.RawMessage(bad), "", false),
 				"inline jwks %q must be rejected now, not at first authentication", bad)
 		}
 	})
@@ -222,6 +222,6 @@ func TestHasInlineJWKS(t *testing.T) {
 func TestValidateClientAuthMethod_JWKSURIOnlyWithStoredJSONNull(t *testing.T) {
 	t.Parallel()
 	require.NoError(t,
-		validateClientAuthMethod("private_key_jwt", json.RawMessage("null"), "https://client.example.com/jwks.json"),
+		validateClientAuthMethod("private_key_jwt", json.RawMessage("null"), "https://client.example.com/jwks.json", false),
 		"a jwks_uri-only client whose empty jwks round-tripped to JSON null must still be valid")
 }

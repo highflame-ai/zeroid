@@ -58,25 +58,51 @@ func NewClientJWKSCache(maxSize int, opts ...authjwt.JWKSOption) *ClientJWKSCach
 
 // get returns a JWKS client for the given client_id + jwks_uri, creating one on
 // a miss and evicting the least-recently-used entry when the cache is full.
+// The construction is deliberately performed OUTSIDE the lock.
+// authjwt.NewJWKSClient does a synchronous warm-up fetch of a client-supplied
+// URL, bounded only by a 10s timeout. Holding the cache mutex across it would
+// let anyone who can register clients stall every private_key_jwt verification
+// server-wide: point >maxSize registrations at hosts that accept TCP and never
+// answer, then send unauthenticated token requests naming each one. Every
+// request misses the cache and spends 10s holding the one mutex the whole auth
+// path needs. The JWKS fetch happens before any signature check, so no
+// credential is required to drive it.
+//
+// The cost of building outside the lock is that two concurrent misses on the
+// same key may both construct; the loser is closed immediately and the winner
+// is returned to both callers, so no goroutine leaks and callers still share one
+// client.
 func (c *ClientJWKSCache) get(clientID, jwksURI string) (*authjwt.JWKSClient, error) {
 	key := clientID + "\x00" + jwksURI
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if el, ok := c.entries[key]; ok {
 		c.lru.MoveToFront(el)
-		return el.Value.(*clientJWKSEntry).client, nil
+		client := el.Value.(*clientJWKSEntry).client
+		c.mu.Unlock()
+		return client, nil
 	}
+	c.mu.Unlock()
 
 	client, err := authjwt.NewJWKSClient(jwksURI, c.opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	// Evict before insert so the cache never exceeds maxSize. Closing the
-	// evicted client stops its background refresh goroutine — without this the
-	// cache would bound memory but leak goroutines.
+	c.mu.Lock()
+	// Re-check: another caller may have inserted this key while we fetched.
+	if el, ok := c.entries[key]; ok {
+		winner := el.Value.(*clientJWKSEntry).client
+		c.lru.MoveToFront(el)
+		c.mu.Unlock()
+		client.Close() // we lost the race; don't leak our refresh goroutine
+		return winner, nil
+	}
+
+	// Evict before insert so the cache never exceeds maxSize. Collect the
+	// evicted clients and Close them AFTER releasing the lock — Close blocks on
+	// the refresh goroutine winding down, which can itself be inside a fetch.
+	var evicted []*authjwt.JWKSClient
 	for c.lru.Len() >= c.maxSize {
 		oldest := c.lru.Back()
 		if oldest == nil {
@@ -85,10 +111,15 @@ func (c *ClientJWKSCache) get(clientID, jwksURI string) (*authjwt.JWKSClient, er
 		entry := oldest.Value.(*clientJWKSEntry)
 		c.lru.Remove(oldest)
 		delete(c.entries, entry.key)
-		entry.client.Close()
+		evicted = append(evicted, entry.client)
 	}
 
 	c.entries[key] = c.lru.PushFront(&clientJWKSEntry{key: key, client: client})
+	c.mu.Unlock()
+
+	for _, e := range evicted {
+		e.Close()
+	}
 	return client, nil
 }
 

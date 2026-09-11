@@ -467,6 +467,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
+	// Same flag that relaxes the SSRF guard on the jwks_uri fetch also relaxes
+	// the https requirement at registration — an http loopback URL would be
+	// useless if the dialer refused loopback, so the two move together.
+	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 

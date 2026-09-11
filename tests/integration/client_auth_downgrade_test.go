@@ -380,3 +380,98 @@ func TestPrivateKeyJWT_JWKSURIClient(t *testing.T) {
 		"a jwks_uri-backed client must authenticate — the keys are fetched, not stored inline")
 	assert.NotEmpty(t, decode(t, resp)["access_token"])
 }
+
+// A private_key_jwt client must never also hold a client_secret.
+//
+// `confidential` and `token_endpoint_auth_method` are independent registration
+// inputs, and the secret is minted off the former before the latter is read. The
+// combination therefore produced a client holding BOTH credentials — refused on
+// authorization_code, refresh_token and CIBA (which enforce the registered
+// method), but ACCEPTED on client_credentials and ID-JAG redemption, which
+// verified the secret directly. The weaker credential won on whichever grant
+// happened not to check.
+func TestPrivateKeyJWT_CannotAlsoHoldASecret(t *testing.T) {
+	resp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":                  uid("pkjwt-conf-contradiction"),
+		"name":                       "confidential-and-key-based",
+		"confidential":               true,
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, generateKey(t)),
+		"grant_types":                []string{"client_credentials"},
+	}, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"registering a key-based client as confidential would mint a secret it must not have")
+}
+
+// The other half of the same defect: a key-based client could not use
+// client_credentials AT ALL, because that grant went straight to a bcrypt
+// compare against an empty stored hash. DCR defaults grant_types to
+// ["client_credentials"], so a conformant private_key_jwt DCR registration
+// produced a client that could authenticate nowhere.
+func TestPrivateKeyJWT_ClientCredentialsWithAssertion(t *testing.T) {
+	// client_credentials resolves an identity by client_id, so the client must
+	// be backed by a registered agent — same pairing the control test uses.
+	clientID := uid("pkjwt-cc")
+	registerAgent(t, clientID)
+	key := generateKey(t)
+
+	reg := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":                  clientID,
+		"name":                       clientID + "-client",
+		"confidential":               false,
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, key),
+		"grant_types":                []string{"client_credentials"},
+		"scopes":                     []string{"data:read"},
+	}, nil)
+	require.Equal(t, http.StatusCreated, reg.StatusCode)
+	_ = reg.Body.Close()
+
+	t.Run("a valid assertion authenticates", func(t *testing.T) {
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":            "client_credentials",
+			"account_id":            testAccountID,
+			"project_id":            testProjectID,
+			"client_id":             clientID,
+			"client_assertion":      clientAssertionFor(t, key, clientID),
+			"client_assertion_type": clientAssertionType,
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"a key-based client must be able to use the grant DCR gives it by default")
+		assert.NotEmpty(t, decode(t, resp)["access_token"])
+	})
+
+	t.Run("no credential at all is refused", func(t *testing.T) {
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type": "client_credentials",
+			"account_id": testAccountID,
+			"project_id": testProjectID,
+			"client_id":  clientID,
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	})
+}
+
+// jwks_uri decides who may authenticate as the client, so it must not be
+// fetched over cleartext: anyone on the path could substitute the key set and
+// then mint valid assertions at will. (The suite sets
+// client_auth.allow_private_jwks_endpoints, which is what permits the loopback
+// http fixture above — so this asserts the non-loopback production rule.)
+func TestPrivateKeyJWT_JWKSURIMustNotBePlaintextRemote(t *testing.T) {
+	for _, bad := range []string{"ftp://keys.example.com/jwks", "not-a-url", "/relative/jwks.json"} {
+		resp := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id":                  uid("pkjwt-badscheme"),
+			"name":                       "bad-jwks-uri",
+			"confidential":               false,
+			"token_endpoint_auth_method": "private_key_jwt",
+			"jwks_uri":                   bad,
+		}, nil)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "jwks_uri %q must be refused", bad)
+		_ = resp.Body.Close()
+	}
+}

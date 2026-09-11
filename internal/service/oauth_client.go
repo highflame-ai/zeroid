@@ -46,6 +46,14 @@ type OAuthClientService struct {
 	// in test / single-tenant dev deployments that need to register
 	// loopback-style endpoints like https://localhost:9000/.
 	allowPrivateNotificationEndpoints bool
+	// allowPrivateJWKSEndpoints relaxes the transport requirement on a
+	// registered client's `jwks_uri`: with it set, a plaintext http:// URL
+	// (typically a loopback test fixture) is accepted at registration. Defaults
+	// to false (production-safe), where jwks_uri MUST be absolute https. Set
+	// from ClientAuth.AllowPrivateJWKSEndpoints, the same flag that relaxes the
+	// SSRF guard on the fetch itself — the two must move together, since an
+	// http loopback URL is useless if the dialer refuses loopback.
+	allowPrivateJWKSEndpoints bool
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
@@ -60,6 +68,17 @@ func NewOAuthClientService(repo *postgres.OAuthClientRepository) *OAuthClientSer
 // field; both should be set from the same source in server.go.
 func (s *OAuthClientService) SetAllowPrivateNotificationEndpoints(allow bool) {
 	s.allowPrivateNotificationEndpoints = allow
+}
+
+// SetAllowPrivateJWKSEndpoints toggles the https requirement on a registered
+// `jwks_uri`. Production must keep this false (the default): the key set at
+// that URL decides who may authenticate as the client, so over cleartext anyone
+// on the path can substitute it. Test and single-tenant dev deployments serving
+// key sets from a loopback listener flip it to true. Wired from
+// ClientAuth.AllowPrivateJWKSEndpoints in server.go, alongside the SSRF guard
+// the same flag relaxes.
+func (s *OAuthClientService) SetAllowPrivateJWKSEndpoints(allow bool) {
+	s.allowPrivateJWKSEndpoints = allow
 }
 
 // RegisterClientRequest holds all fields for creating an OAuth2 client.
@@ -167,8 +186,27 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	// registration by a server that could not enforce it — a typo like
 	// "private-key-jwt" landed just as silently and left the client
 	// unauthenticatable with no error at any point.
-	if err := validateClientAuthMethod(authMethod, req.JWKS, req.JWKSURI); err != nil {
+	if err := validateClientAuthMethod(authMethod, req.JWKS, req.JWKSURI, s.allowPrivateJWKSEndpoints); err != nil {
 		return nil, "", err
+	}
+	// A key-based client must NOT also carry a secret. `confidential` and
+	// `token_endpoint_auth_method` are independent inputs, and the block above
+	// mints a secret off the former before the latter is even read — so
+	// {confidential: true, token_endpoint_auth_method: private_key_jwt} would
+	// produce a client holding BOTH credentials.
+	//
+	// That is not cosmetic. The grant paths that route through
+	// enforceRegisteredClientAuthMethod would refuse the secret, but
+	// client_credentials and ID-JAG redemption verify it directly — so the same
+	// client would be refused on one grant and accepted on another, with the
+	// weaker credential winning wherever it was accepted. Refuse the
+	// contradictory registration rather than silently dropping one half of it,
+	// so the operator learns which of the two inputs they did not mean.
+	if authMethod == clientAuthMethodPrivateKeyJWT && req.Confidential {
+		return nil, "", fmt.Errorf(
+			"%w: token_endpoint_auth_method private_key_jwt cannot be combined with confidential=true; "+
+				"a key-based client authenticates with its key and is issued no client_secret",
+			ErrInvalidClientMetadata)
 	}
 
 	grantTypes := req.GrantTypes
@@ -312,6 +350,16 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	if err != nil {
 		return nil, "", ErrOAuthClientNotFound
 	}
+	// Minting a secret for a key-based client would recreate exactly the
+	// two-credential state registration refuses: the secret is unusable on the
+	// grants that enforce the registered method, and usable on the ones that
+	// verify it directly. There is no legitimate reason to rotate a secret a
+	// private_key_jwt client should not have.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		return nil, "", fmt.Errorf(
+			"%w: client is registered for private_key_jwt and has no client_secret to rotate; "+
+				"rotate its key material instead", ErrInvalidClientMetadata)
+	}
 
 	plainSecret, err := generateSecureToken(32)
 	if err != nil {
@@ -379,7 +427,7 @@ var registrableClientAuthMethods = map[string]bool{
 // equivalent of a write-only credential. Refusing at registration turns that
 // into an immediate, actionable error instead of a 401 the operator debugs
 // later against a client they believe is correctly configured.
-func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI string) error {
+func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI string, allowPrivateJWKS bool) error {
 	if !registrableClientAuthMethods[authMethod] {
 		return fmt.Errorf("%w: token_endpoint_auth_method %q is not supported", ErrInvalidClientMetadata, authMethod)
 	}
@@ -397,6 +445,23 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 
 	if authMethod == clientAuthMethodPrivateKeyJWT && !hasInline && !hasURI {
 		return fmt.Errorf("%w: token_endpoint_auth_method private_key_jwt requires jwks or jwks_uri", ErrInvalidClientMetadata)
+	}
+
+	// jwks_uri MUST be absolute HTTPS (RFC 7591 §2, OIDC Core §10). This server
+	// re-fetches it on every cold cache and every background refresh, and the
+	// keys it returns decide who may authenticate as this client — so over
+	// cleartext, anyone on the path can substitute the key set and then mint
+	// valid assertions for the client at will. The sibling
+	// client_notification_endpoint check has required HTTPS for the same reason
+	// since CIBA landed.
+	if hasURI {
+		u, err := url.Parse(jwksURI)
+		if err != nil {
+			return fmt.Errorf("%w: jwks_uri is not a valid URL: %v", ErrInvalidClientMetadata, err)
+		}
+		if u.Host == "" || (u.Scheme != "https" && !(allowPrivateJWKS && u.Scheme == "http")) {
+			return fmt.Errorf("%w: jwks_uri must be an absolute https:// URL (got %q)", ErrInvalidClientMetadata, jwksURI)
+		}
 	}
 
 	// Reject an inline JWKS that is not a parseable key set NOW rather than at
@@ -436,7 +501,7 @@ var dcrAllowedGrantTypes = map[string]bool{
 // validateDCRSubmittedFields runs the service-layer defense for grant_types
 // and token_endpoint_auth_method. Returns the normalised auth method (with
 // the default applied for empty input) or an error.
-func validateDCRSubmittedFields(grantTypes []string, authMethod string, jwks json.RawMessage, jwksURI string) (string, error) {
+func validateDCRSubmittedFields(grantTypes []string, authMethod string, jwks json.RawMessage, jwksURI string, allowPrivateJWKS bool) (string, error) {
 	for _, gt := range grantTypes {
 		if !dcrAllowedGrantTypes[gt] {
 			return "", fmt.Errorf("grant_type %q is not permitted for dynamically-registered clients", gt)
@@ -456,7 +521,7 @@ func validateDCRSubmittedFields(grantTypes []string, authMethod string, jwks jso
 	// contract applies here as on the admin path (exactly one of jwks/jwks_uri,
 	// present, parseable). Shared with RegisterClient so the two registration
 	// surfaces cannot drift.
-	if err := validateClientAuthMethod(authMethod, jwks, jwksURI); err != nil {
+	if err := validateClientAuthMethod(authMethod, jwks, jwksURI, allowPrivateJWKS); err != nil {
 		return "", err
 	}
 	return authMethod, nil
@@ -510,7 +575,7 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"client_credentials"}
 	}
-	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI)
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI, s.allowPrivateJWKSEndpoints)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -664,7 +729,7 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	if grantTypes == nil {
 		grantTypes = []string{"client_credentials"}
 	}
-	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI)
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI, s.allowPrivateJWKSEndpoints)
 	if err != nil {
 		return nil, err
 	}
@@ -692,6 +757,15 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	// away from private_key_jwt while the old keys stayed live.
 	client.JWKS = req.JWKS
 	client.JWKSURI = req.JWKSURI
+	// Switching an existing DCR client to private_key_jwt must REVOKE the
+	// secret it was issued at registration. Leaving it set is the migration an
+	// operator reaching for key-based auth would actually perform — very often
+	// because that secret leaked — and it would leave the leaked credential
+	// live and accepted on client_credentials and ID-JAG forever, with no API
+	// to remove it.
+	if authMethod == clientAuthMethodPrivateKeyJWT {
+		client.ClientSecret = ""
+	}
 	client.SoftwareID = req.SoftwareID
 	client.SoftwareVersion = req.SoftwareVersion
 	client.Contacts = contacts
