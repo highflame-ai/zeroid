@@ -751,11 +751,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.externalIssuerRegistry.Close()
 	}
 
-	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri).
-	if s.clientJWKSCache != nil {
-		s.clientJWKSCache.Close()
-	}
-
 	// Cancel the CIBA backchannel service's lifecycle context so detached
 	// notifier goroutines wind down with the server rather than leaking
 	// past the HTTP listener close.
@@ -772,6 +767,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri)
+	// AFTER the listener has drained. Closing before http.Shutdown lets an
+	// in-flight private_key_jwt verification repopulate the cache on its way
+	// out and spawn a refresh goroutine that nothing will ever close.
+	if s.clientJWKSCache != nil {
+		s.clientJWKSCache.Close()
 	}
 	if err := s.db.Close(); err != nil && firstErr == nil {
 		firstErr = err

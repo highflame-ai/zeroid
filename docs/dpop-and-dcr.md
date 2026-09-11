@@ -296,6 +296,8 @@ curl -s -X POST https://auth.example/oauth2/token \
 
 A registered `jwks_uri` is also a URL this server makes outbound requests to, on every cold cache. It is fetched through the same SSRF-guarded client the external-issuer registry uses, and private/loopback/link-local destinations are refused unless `client_auth.allow_private_jwks_endpoints` is set (dev only). Cached key sets are bounded and LRU-evicted via `client_auth.jwks_cache_size`, because each cached endpoint owns a background refresh goroutine.
 
+**Key-revocation window**: a cached `jwks_uri` refreshes every 5 minutes, so a key removed from the client's published set keeps authenticating for up to that long. Inline `jwks` has no such window — an RFC 7592 `PUT` takes effect immediately. If prompt revocation matters, prefer inline.
+
 > **`private_key_jwt` IS accepted** as `token_endpoint_auth_method` for DCR-registered clients as of zeroid#206. Such a client supplies `jwks` or `jwks_uri` at registration and receives **no `client_secret`** — the key is the credential, and a secret that cannot be used but can still leak is worse than no secret. Keep the two mechanisms distinct: `token_endpoint_auth_method` governs how the client authenticates *itself* (RFC 7523 §2.2), while the jwt-bearer **grant** is about on whose authority a token is issued (§2.1). One request may legitimately carry both.
 
 ### What ZeroID enforces
