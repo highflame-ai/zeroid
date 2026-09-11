@@ -424,9 +424,14 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// The service layer (IssueAuthCode) does the final intersection
 	// against the client's registered scope set. Here we just combine
 	// what the caller asked for with what the resolver pre-narrowed.
+	// Tested with strings.Fields, not req.Scope != "": IssueAuthCode and
+	// requireGrantableScope both decide "did the caller actually ask" by
+	// parsing the scope string, so a whitespace-only scope must look omitted
+	// here too. Branching on != "" narrowed to an empty set here while the
+	// service still read the request as omitted and fell back to the client's
+	// full registered scopes — wider than sending no scope at all.
 	scopes := principal.Scopes
-	if req.Scope != "" {
-		requested := strings.Fields(req.Scope)
+	if requested := strings.Fields(req.Scope); len(requested) > 0 {
 		if len(scopes) > 0 {
 			scopes = intersectStrings(requested, scopes)
 		} else {
