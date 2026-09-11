@@ -12,6 +12,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
@@ -142,6 +143,44 @@ func (s *OAuthService) enforceRegisteredClientAuthMethod(
 	if presented {
 		return oauthUnauthorized(
 			"client is not registered for private_key_jwt and cannot authenticate with a client_assertion", nil)
+	}
+	return nil
+}
+
+// requireNonAssertionClientAuth is the client-authentication precondition for
+// surfaces that do NOT accept a client_assertion: currently the CIBA
+// bc-authorize and token-poll paths, which authenticate with a client_secret or
+// not at all.
+//
+// It exists because those paths test confidentiality as
+// `ClientType == "confidential" || ClientSecret != ""`, and a key-based client
+// satisfies NEITHER — registration derives client_type from the separate
+// `confidential` flag, so such a client lands client_type=public with an empty
+// secret hash and skips the authentication block entirely. On bc-authorize that
+// is not a quiet downgrade: the endpoint fires the deployer's notifier, so an
+// unauthenticated caller could spam real SMS/push approval prompts at arbitrary
+// users under that client's identity.
+//
+// Note this gap predates private_key_jwt support — #346 added
+// rejectUnimplementedClientAuth to the token and inspection paths but not to
+// these two, so a client registered for tls_client_auth could already initiate
+// CIBA unauthenticated. Both halves are closed here.
+//
+// A private_key_jwt client is refused rather than verified because these inputs
+// carry no client_assertion to verify. Failing closed is the same call #346
+// made: refusing is strictly better than proceeding unauthenticated, and it
+// cannot regress a working deployment because no such client can be
+// authenticating correctly on these paths today. Accepting a client_assertion
+// on CIBA (Core §7.1 permits it) is deliberate follow-up, not part of this
+// change.
+func requireNonAssertionClientAuth(client *domain.OAuthClient) error {
+	if err := rejectUnimplementedClientAuth(client); err != nil {
+		return err
+	}
+	if client != nil && client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		return oauthBadRequest(oautherror.InvalidClient,
+			"client is registered for private_key_jwt, which this endpoint does not yet accept; "+
+				"it cannot be authenticated here")
 	}
 	return nil
 }

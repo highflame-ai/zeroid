@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
 
@@ -132,5 +133,56 @@ func TestClientJWKSCache(t *testing.T) {
 		c.Close()
 		require.Equal(t, 0, c.lru.Len())
 		require.NotPanics(t, c.Close)
+	})
+}
+
+// requireNonAssertionClientAuth guards the surfaces that accept no
+// client_assertion — currently CIBA bc-authorize and token-poll.
+//
+// Those paths test confidentiality as `ClientType == "confidential" ||
+// ClientSecret != ""`. A key-based client matches NEITHER half (registration
+// derives client_type from the separate `confidential` flag), so without this
+// guard it skips the authentication block entirely. On bc-authorize that is not
+// a quiet downgrade: the endpoint fires the deployer's notifier, so an
+// unauthenticated caller could spam real approval prompts at arbitrary users
+// under that client's identity.
+func TestRequireNonAssertionClientAuth(t *testing.T) {
+	t.Parallel()
+
+	t.Run("refuses a key-based client", func(t *testing.T) {
+		// The exact shape registration produces: public type, empty secret.
+		err := requireNonAssertionClientAuth(&domain.OAuthClient{
+			ClientType:              "public",
+			ClientSecret:            "",
+			TokenEndpointAuthMethod: clientAuthMethodPrivateKeyJWT,
+		})
+		require.Error(t, err, "a private_key_jwt client must not slip past a secret-shaped confidentiality test")
+	})
+
+	t.Run("refuses a method this server cannot enforce", func(t *testing.T) {
+		// This half predates private_key_jwt support: #346 added the guard to
+		// the token and inspection paths but not to CIBA, so such a client
+		// could already initiate unauthenticated.
+		for _, m := range []string{"tls_client_auth", "client_secret_jwt", "totally_made_up"} {
+			require.Error(t, requireNonAssertionClientAuth(&domain.OAuthClient{
+				ClientType:              "public",
+				TokenEndpointAuthMethod: m,
+			}), "method %q must not reach the CIBA authentication block", m)
+		}
+	})
+
+	t.Run("leaves secret-based and public clients alone", func(t *testing.T) {
+		// The control: CIBA Core §7.1 permits public clients to initiate
+		// unauthenticated, and confidential clients still verify their secret
+		// downstream. This guard must not change either.
+		for _, m := range []string{"", "none", "client_secret_post", "client_secret_basic"} {
+			require.NoError(t, requireNonAssertionClientAuth(&domain.OAuthClient{
+				TokenEndpointAuthMethod: m,
+			}), "method %q must be unaffected", m)
+		}
+	})
+
+	t.Run("a nil client is not this guard's business", func(t *testing.T) {
+		require.NoError(t, requireNonAssertionClientAuth(nil))
 	})
 }
