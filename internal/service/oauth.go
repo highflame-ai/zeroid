@@ -84,6 +84,21 @@ type OAuthService struct {
 	// SetObservedIDJAGResourceStore. Nil is valid and simply means the inventory
 	// is not being collected — it must NEVER affect whether a token is minted.
 	observedIDJAGResources ObservedIDJAGResourceStore
+	// clientAssertionReplay is the single-use ledger for redeemed RFC 7523 §2.2
+	// client-assertion jti values. Wired after construction via
+	// SetClientAssertionReplayStore, backed by the same shared Postgres replay
+	// table DPoP and actor-key proofs use (jtis are namespaced "cla:" so the
+	// three producers cannot collide). Nil makes private_key_jwt client
+	// authentication fail CLOSED — verifyClientAssertion refuses rather than
+	// accept an assertion it cannot mark as spent, because the alternative is
+	// silently downgrading single-use to unlimited-use.
+	clientAssertionReplay clientAssertionReplayGuard
+	// clientJWKS caches a live JWKS client per registered `jwks_uri`. Wired
+	// after construction via SetClientJWKSCache with an SSRF-guarded HTTP
+	// client. Nil means only inline `jwks` clients can authenticate; a
+	// jwks_uri client then fails closed with a server error rather than
+	// skipping verification.
+	clientJWKS *ClientJWKSCache
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -456,6 +471,24 @@ func (s *OAuthService) SetObservedIDJAGResourceStore(store ObservedIDJAGResource
 	s.observedIDJAGResources = store
 }
 
+// SetClientAssertionReplayStore wires the single-use ledger for redeemed RFC
+// 7523 §2.2 client-assertion jti values. REQUIRED for private_key_jwt client
+// authentication: verifyClientAssertion fails closed when this is unset, so a
+// deployment that forgets to wire it rejects key-based clients rather than
+// accepting replayable assertions.
+func (s *OAuthService) SetClientAssertionReplayStore(store clientAssertionReplayGuard) {
+	s.clientAssertionReplay = store
+}
+
+// SetClientJWKSCache wires the per-client JWKS cache used to verify assertions
+// from clients that published a `jwks_uri` rather than an inline `jwks`. The
+// cache must be constructed with an SSRF-guarded HTTP client (server.go does
+// this) — a registered jwks_uri is attacker-supplied input that this server
+// makes outbound requests to.
+func (s *OAuthService) SetClientJWKSCache(cache *ClientJWKSCache) {
+	s.clientJWKS = cache
+}
+
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
 // introspection (RFC 7662) and revocation (RFC 7009) endpoints. When true,
 // anonymous callers are rejected; when false, the accept-and-verify posture
@@ -482,9 +515,19 @@ type TokenRequest struct {
 	GrantType    string
 	ClientID     string
 	ClientSecret string
-	Scope        string
-	AccountID    string // tenant — required for client_credentials and external principal exchange
-	ProjectID    string // tenant — required for client_credentials and external principal exchange
+	// ClientAssertion / ClientAssertionType carry RFC 7523 §2.2 private_key_jwt
+	// CLIENT AUTHENTICATION — distinct from Assertion below, which is the RFC
+	// 7523 §2.1 authorization GRANT. The two are easy to conflate because both
+	// are signed JWTs defined by the same RFC: §2.1 answers "on whose authority
+	// is this token issued", §2.2 answers "which client is asking". A single
+	// request may legitimately carry both (a jwt-bearer grant presented by a
+	// private_key_jwt client), so they are separate fields and are never read
+	// interchangeably.
+	ClientAssertion     string
+	ClientAssertionType string
+	Scope               string
+	AccountID           string // tenant — required for client_credentials and external principal exchange
+	ProjectID           string // tenant — required for client_credentials and external principal exchange
 	// Assertion is the RFC 7523 §2.1 assertion JWT for the jwt-bearer grant.
 	// Named for the spec rather than ZeroID's legacy `subject` wire spelling,
 	// which now survives only as the deprecated request alias the handler
@@ -2093,7 +2136,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// client_secret even on the PKCE authorization_code path — PKCE proves
 	// possession of the code, the secret proves the client's identity (defense
 	// in depth). Public PKCE clients carry no secret and pass through unchanged.
-	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 		return nil, err
 	}
 
@@ -2461,7 +2504,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		}
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
-		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 			return nil, err
 		}
 	} else if err == nil {
@@ -2874,16 +2917,21 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 // to none or client_secret_basic), so an empty value is legacy data and must
 // keep behaving exactly as it did.
 //
-// private_key_jwt, client_secret_jwt and tls_client_auth are ABSENT because
-// nothing in this codebase validates them. private_key_jwt is the live gap
-// (zeroid#206) — registration accepts it and stores key material today;
-// client_secret_jwt is dropped in OAuth 2.1 and will not be added;
-// tls_client_auth (RFC 8705) is deferred pending an mTLS termination story.
+// private_key_jwt is present as of zeroid#206: verifyClientAssertion implements
+// RFC 7523 §2.2 against the client's registered jwks/jwks_uri, and
+// enforceRegisteredClientAuthMethod makes it binding, so such a client is now
+// genuinely authenticated rather than waved through.
+//
+// client_secret_jwt and tls_client_auth remain ABSENT because nothing here
+// validates them: client_secret_jwt is dropped in OAuth 2.1 and will not be
+// added; tls_client_auth (RFC 8705) is deferred pending an mTLS termination
+// story. A client registered for either still fails closed here.
 var implementedClientAuthMethods = map[string]bool{
-	"":                    true,
-	"none":                true,
-	"client_secret_post":  true,
-	"client_secret_basic": true,
+	"":                            true,
+	"none":                        true,
+	"client_secret_post":          true,
+	"client_secret_basic":         true,
+	clientAuthMethodPrivateKeyJWT: true,
 }
 
 // rejectUnimplementedClientAuth refuses a client whose REGISTERED
@@ -2936,7 +2984,7 @@ func rejectUnimplementedClientAuth(client *domain.OAuthClient) error {
 // secret; the caller passes the already-resolved client purely to read its
 // ClientType. The re-fetch is intentional — VerifyClientSecret owns the
 // constant-time comparison and the active-client gate.
-func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
+func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret, assertion, assertionType string) error {
 	if client == nil {
 		return nil
 	}
@@ -2944,6 +2992,14 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 	// not implement, BEFORE the public-client pass-through below.
 	if err := rejectUnimplementedClientAuth(client); err != nil {
 		return err
+	}
+	if err := s.enforceRegisteredClientAuthMethod(ctx, client, clientID, clientSecret, assertion, assertionType); err != nil {
+		return err
+	}
+	// private_key_jwt is fully authenticated by the assertion — the secret
+	// paths below do not apply to it.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		return nil
 	}
 	// A client is confidential if it declares so OR carries a stored secret
 	// hash. The second clause is belt-and-suspenders against an inconsistent
@@ -2984,8 +3040,57 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 // 401) when a presented secret does not verify, when only a client_secret is
 // supplied without a client_id, or when a client_id without a secret does not
 // resolve to a public client. Operational failures surface as 500.
-func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
-	// Anonymous call — neither half presented.
+func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret, assertion, assertionType string) error {
+	// An RFC 7523 §2.2 client assertion, when presented, IS the authentication —
+	// handled before the secret-shaped branches below so a key-based client is
+	// never asked for a secret it does not have.
+	//
+	// Resolution is registry-only (GetClient), matching the no-secret branch's
+	// deliberate exclusion of CIMD clients: introspection has no redirect_uri
+	// binding to protect it, so a self-published metadata document must not be
+	// able to satisfy this gate and turn introspection into a token oracle.
+	if clientAssertionPresented(assertion, assertionType) {
+		if clientSecret != "" {
+			return oauthUnauthorized(
+				"client presented both a client_secret and a client_assertion; exactly one authentication method is permitted", nil)
+		}
+		if clientID == "" {
+			if fromAssertion, ok := ClientIDFromAssertion(assertion); ok {
+				clientID = fromAssertion
+			}
+		}
+		if clientID == "" {
+			return oauthUnauthorized("client_assertion is missing an iss claim identifying the client", nil)
+		}
+		client, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+		if err != nil {
+			if errors.Is(err, ErrOAuthClientNotFound) {
+				return oauthUnauthorized("client authentication required", nil)
+			}
+			// Operational failure (DB outage) — a 500, never a 401. Reading it
+			// as "unregistered" would let a transient store failure decide an
+			// authentication outcome.
+			return oauthServerError("client verification failed", err)
+		}
+		// GetClientByClientID deliberately does NOT gate on IsActive (its CIMD
+		// callers need the distinction), so the check belongs here: a
+		// deactivated client must not be able to authenticate with a key that
+		// is still perfectly valid. The secret path gets this for free —
+		// VerifyClientSecret applies its own active-client gate.
+		if !client.IsActive {
+			return oauthUnauthorized("client authentication required", nil)
+		}
+		if err := rejectUnimplementedClientAuth(client); err != nil {
+			return err
+		}
+		if client.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+			return oauthUnauthorized(
+				"client is not registered for private_key_jwt and cannot authenticate with a client_assertion", nil)
+		}
+		return s.verifyClientAssertion(ctx, client, clientID, assertion, assertionType)
+	}
+
+	// Anonymous call — no credential of any kind presented.
 	if clientID == "" && clientSecret == "" {
 		// Strict mode (RFC 7662 §2.1 / RFC 7009 §2.1): the endpoint MUST
 		// require some form of authorization — reject the anonymous caller.
@@ -3034,6 +3139,20 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 		// VerifyClientSecret fails closed.
 		if err := rejectUnimplementedClientAuth(publicClient); err != nil {
 			return err
+		}
+		// A private_key_jwt client ALSO lands client_type=public with no secret
+		// (registration derives client_type from the separate `confidential`
+		// flag), so it reaches this branch too — and rejectUnimplementedClientAuth
+		// no longer stops it, because the method became implemented. Without this
+		// check, making private_key_jwt work would silently REOPEN the exact
+		// introspection downgrade #346 closed: the client would authenticate by
+		// presenting its client_id and nothing else.
+		//
+		// Key-based clients authenticate here through the client_assertion branch
+		// at the top of this function, never through this one.
+		if publicClient.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+			return oauthUnauthorized(
+				"client is registered for private_key_jwt and must authenticate with a client_assertion (RFC 7523 §2.2)", nil)
 		}
 		return nil
 	}

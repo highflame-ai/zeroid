@@ -43,6 +43,7 @@ type Config struct {
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
 	CIMD        CIMDConfig        `koanf:"cimd"`
+	ClientAuth  ClientAuthConfig  `koanf:"client_auth"`
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
@@ -64,6 +65,36 @@ type Config struct {
 	// verifies the ID token before minting a ZeroID token. Empty list (default)
 	// disables direct federation — only the broker path remains available.
 	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
+}
+
+// ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
+// §2.2 private_key_jwt, where a client proves its identity with a JWT signed by
+// a key it published rather than with a shared secret (zeroid#206).
+//
+// Deliberately its own section rather than fields on CIMDConfig: a deployer who
+// relaxes the SSRF guard to serve CIMD documents from localhost in dev must not
+// thereby also open the client-JWKS fetcher to internal addresses. The two
+// fetchers trust different parties and are configured independently.
+type ClientAuthConfig struct {
+	// AllowPrivateJWKSEndpoints relaxes the SSRF guard applied to a registered
+	// client's `jwks_uri` fetch. Default false (production-safe): a jwks_uri
+	// whose host resolves to a private, loopback, link-local, multicast, CGN or
+	// unspecified address is refused by a DNS-rebinding-safe dialer.
+	//
+	// This matters more than the CIMD equivalent. A `jwks_uri` is stored at
+	// registration and fetched by the server on every cold cache — so wherever
+	// client registration is open (DCR), it is an attacker-supplied URL the
+	// server will make repeated outbound requests to. Set true ONLY in
+	// single-tenant dev/test deployments that host client key sets on
+	// localhost. Production MUST keep this false.
+	AllowPrivateJWKSEndpoints bool `koanf:"allow_private_jwks_endpoints"`
+
+	// JWKSCacheSize bounds how many distinct client jwks_uri endpoints are
+	// cached concurrently. Each cached entry owns a background refresh
+	// goroutine, so this caps goroutines and outbound fetch loops, not just
+	// memory. 0 (default) ⇒ 256. Least-recently-used entries are evicted and
+	// closed.
+	JWKSCacheSize int `koanf:"jwks_cache_size"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields

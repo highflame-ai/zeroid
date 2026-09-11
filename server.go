@@ -146,6 +146,12 @@ type Server struct {
 	// configured.
 	externalIssuerRegistry *service.ExternalIssuerRegistry
 
+	// clientJWKSCache holds a live JWKS client per registered client `jwks_uri`
+	// (RFC 7523 §2.2 private_key_jwt). Each cached entry owns a background
+	// refresh goroutine, so it must be closed on shutdown or those goroutines
+	// outlive the HTTP listener.
+	clientJWKSCache *service.ClientJWKSCache
+
 	// revocationDispatcher fans out RevocationEvents
 	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
 	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
@@ -419,6 +425,29 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// path: a failure here is logged and the token is still issued.
 	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
+	// RFC 7523 §2.2 private_key_jwt client authentication (zeroid#206).
+	//
+	// Both stores are wired UNCONDITIONALLY, for the same reason the ID-JAG
+	// replay store is: verifyClientAssertion fails closed on a nil replay store,
+	// so a deployment that conditionally skipped this wiring would reject every
+	// key-based client rather than degrade quietly — but the better outcome is
+	// simply never to be in that state.
+	//
+	// The jti ledger is the shared DPoP replay table; client-assertion jtis are
+	// namespaced "cla:" before insertion so they cannot collide with DPoP or
+	// actor-key-proof jtis living in the same table.
+	oauthSvc.SetClientAssertionReplayStore(postgres.NewDPoPReplayStore(db))
+	// The JWKS cache fetches from client-supplied `jwks_uri` values, which are
+	// attacker-controlled input wherever registration is open. It therefore gets
+	// the SAME SSRF-guarded HTTP client the external-issuer registry and the
+	// attestation OIDC verifier use — without it, a registered jwks_uri is a
+	// server-side request forgery primitive pointed at cloud metadata endpoints
+	// and internal services.
+	clientJWKSCache := service.NewClientJWKSCache(cfg.ClientAuth.JWKSCacheSize,
+		authjwt.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
+	)
+	oauthSvc.SetClientJWKSCache(clientJWKSCache)
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -609,6 +638,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		jwksSvc:                jwksSvc,
 		refreshTokenSvc:        refreshTokenSvc,
 		externalIssuerRegistry: externalIssuerRegistry,
+		clientJWKSCache:        clientJWKSCache,
 		revocationDispatcher:   revocationDispatcher,
 		cleanupWorker:          worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
 		adminAuthState:         authState,
@@ -715,6 +745,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	if s.externalIssuerRegistry != nil {
 		s.externalIssuerRegistry.Close()
+	}
+
+	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri).
+	if s.clientJWKSCache != nil {
+		s.clientJWKSCache.Close()
 	}
 
 	// Cancel the CIBA backchannel service's lifecycle context so detached

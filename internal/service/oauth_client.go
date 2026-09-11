@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/bcrypt"
 
@@ -28,6 +29,13 @@ var ErrOAuthClientAlreadyExists = errors.New("oauth client already exists")
 
 // ErrInvalidClientSecret is returned when secret verification fails.
 var ErrInvalidClientSecret = errors.New("invalid client secret")
+
+// ErrInvalidClientMetadata marks a registration failure caused by the CALLER's
+// metadata rather than by the server. Handlers map it to 400 (RFC 7591 calls
+// the DCR equivalent invalid_client_metadata); without it every validation
+// failure in RegisterClient surfaces as a 500, telling the client its own bad
+// input was our fault and burying the actionable message in a server log.
+var ErrInvalidClientMetadata = errors.New("invalid client metadata")
 
 // OAuthClientService manages OAuth2 client registration.
 type OAuthClientService struct {
@@ -152,6 +160,15 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 
 	if req.TokenEndpointAuthMethod != "" {
 		authMethod = req.TokenEndpointAuthMethod
+	}
+	// Validate the auth method against the allow-list BEFORE it is persisted
+	// (zeroid#206 scope item 3). Until this check, any string whatsoever was
+	// stored verbatim, which is how `private_key_jwt` came to be accepted at
+	// registration by a server that could not enforce it — a typo like
+	// "private-key-jwt" landed just as silently and left the client
+	// unauthenticatable with no error at any point.
+	if err := validateClientAuthMethod(authMethod, req.JWKS, req.JWKSURI); err != nil {
+		return nil, "", err
 	}
 
 	grantTypes := req.GrantTypes
@@ -331,14 +348,82 @@ func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error 
 // management bearer that survives a single registration call.
 const dcrBcryptCost = 12
 
+// registrableClientAuthMethods are the token_endpoint_auth_method values a
+// client may REGISTER with on the admin/internal path.
+//
+// This is deliberately a superset of nothing and a subset of the RFC 7591
+// registry: only methods this server can actually enforce at authentication
+// time. Registering a method we cannot check is what produced the zeroid#206
+// downgrade — the value was stored, echoed back on read, advertised in the API
+// enum, and never consulted, so the operator had every reason to believe their
+// key-based client was authenticating.
+//
+// client_secret_jwt (dropped in OAuth 2.1) and tls_client_auth (RFC 8705,
+// deferred pending an mTLS termination story) are absent by design. A client
+// needing either must wait for an implementation rather than register a
+// promise this server does not keep.
+var registrableClientAuthMethods = map[string]bool{
+	"none":                        true,
+	"client_secret_post":          true,
+	"client_secret_basic":         true,
+	clientAuthMethodPrivateKeyJWT: true,
+}
+
+// validateClientAuthMethod enforces the registration-time contract for
+// token_endpoint_auth_method and the key material it implies.
+//
+// private_key_jwt carries an extra obligation the other methods do not: the
+// client must publish a key set, because there is no secret to fall back on.
+// Accepting a private_key_jwt registration with neither `jwks` nor `jwks_uri`
+// would create a client that cannot ever authenticate — the registration
+// equivalent of a write-only credential. Refusing at registration turns that
+// into an immediate, actionable error instead of a 401 the operator debugs
+// later against a client they believe is correctly configured.
+func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI string) error {
+	if !registrableClientAuthMethods[authMethod] {
+		return fmt.Errorf("%w: token_endpoint_auth_method %q is not supported", ErrInvalidClientMetadata, authMethod)
+	}
+
+	hasInline := len(jwks) > 0
+	hasURI := jwksURI != ""
+
+	// RFC 7591 §2: "The jwks parameter and the jwks_uri parameter MUST NOT
+	// both be present in the same request." Enforced for every method, not
+	// just private_key_jwt — an ambiguous key set is a problem whenever it is
+	// stored, and a client can change its auth method later.
+	if hasInline && hasURI {
+		return fmt.Errorf("%w: jwks and jwks_uri must not both be present (RFC 7591 §2)", ErrInvalidClientMetadata)
+	}
+
+	if authMethod == clientAuthMethodPrivateKeyJWT && !hasInline && !hasURI {
+		return fmt.Errorf("%w: token_endpoint_auth_method private_key_jwt requires jwks or jwks_uri", ErrInvalidClientMetadata)
+	}
+
+	// Reject an inline JWKS that is not a parseable key set NOW rather than at
+	// first authentication. The parse is cheap and the failure is the client
+	// developer's to fix.
+	if hasInline {
+		set, err := jwk.Parse(jwks)
+		if err != nil {
+			return fmt.Errorf("%w: jwks is not a valid JWK Set: %v", ErrInvalidClientMetadata, err)
+		}
+		if set.Len() == 0 {
+			return fmt.Errorf("%w: jwks contains no keys", ErrInvalidClientMetadata)
+		}
+	}
+
+	return nil
+}
+
 // dcrAllowedAuthMethods are the only token_endpoint_auth_method values
 // dynamically-registered clients may declare. Enforced at the service layer
 // as defense-in-depth so a direct call to DynamicRegisterClient or
 // UpdateDynamicClient (bypassing the handler) cannot smuggle in "none" or
 // an unsupported value.
 var dcrAllowedAuthMethods = map[string]bool{
-	"client_secret_post":  true,
-	"client_secret_basic": true,
+	"client_secret_post":          true,
+	"client_secret_basic":         true,
+	clientAuthMethodPrivateKeyJWT: true,
 }
 
 // dcrAllowedGrantTypes mirrors the handler-layer allow-list. Service-layer
@@ -351,7 +436,7 @@ var dcrAllowedGrantTypes = map[string]bool{
 // validateDCRSubmittedFields runs the service-layer defense for grant_types
 // and token_endpoint_auth_method. Returns the normalised auth method (with
 // the default applied for empty input) or an error.
-func validateDCRSubmittedFields(grantTypes []string, authMethod string) (string, error) {
+func validateDCRSubmittedFields(grantTypes []string, authMethod string, jwks json.RawMessage, jwksURI string) (string, error) {
 	for _, gt := range grantTypes {
 		if !dcrAllowedGrantTypes[gt] {
 			return "", fmt.Errorf("grant_type %q is not permitted for dynamically-registered clients", gt)
@@ -367,6 +452,13 @@ func validateDCRSubmittedFields(grantTypes []string, authMethod string) (string,
 	if !dcrAllowedAuthMethods[authMethod] {
 		return "", fmt.Errorf("token_endpoint_auth_method %q is not permitted for dynamically-registered clients", authMethod)
 	}
+	// private_key_jwt brings key material with it; the same registration-time
+	// contract applies here as on the admin path (exactly one of jwks/jwks_uri,
+	// present, parseable). Shared with RegisterClient so the two registration
+	// surfaces cannot drift.
+	if err := validateClientAuthMethod(authMethod, jwks, jwksURI); err != nil {
+		return "", err
+	}
 	return authMethod, nil
 }
 
@@ -379,10 +471,15 @@ type DynamicRegisterClientRequest struct {
 	Scopes                  []string
 	RedirectURIs            []string
 	TokenEndpointAuthMethod string
-	SoftwareID              string
-	SoftwareVersion         string
-	Contacts                []string
-	Metadata                json.RawMessage
+	// JWKS / JWKSURI carry the client's public key set for
+	// token_endpoint_auth_method=private_key_jwt. Exactly one may be set
+	// (RFC 7591 §2); both empty is valid only for the secret-based methods.
+	JWKS            json.RawMessage
+	JWKSURI         string
+	SoftwareID      string
+	SoftwareVersion string
+	Contacts        []string
+	Metadata        json.RawMessage
 }
 
 // DynamicRegisterClient creates an OAuth2 client via RFC 7591 dynamic registration.
@@ -400,15 +497,6 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
 	}
 
-	plainSecret, err := generateSecureToken(32)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
-	}
-	hashedSecret, err := bcrypt.GenerateFromPassword([]byte(plainSecret), dcrBcryptCost)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to hash client secret: %w", err)
-	}
-
 	plainRegToken, err := generateSecureToken(32)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("failed to generate registration_access_token: %w", err)
@@ -422,10 +510,29 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 	if len(grantTypes) == 0 {
 		grantTypes = []string{"client_credentials"}
 	}
-	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI)
 	if err != nil {
 		return nil, "", "", err
 	}
+
+	// A private_key_jwt client gets NO client_secret. Issuing one anyway would
+	// hand the registrant a second, weaker credential for the same client — and
+	// since enforceRegisteredClientAuthMethod refuses secret-based auth for such
+	// a client, it would be a secret that cannot be used but can still leak.
+	// The registration response omits client_secret entirely in that case.
+	var plainSecret, hashedSecret string
+	if authMethod != clientAuthMethodPrivateKeyJWT {
+		plainSecret, err = generateSecureToken(32)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
+		}
+		hashed, hashErr := bcrypt.GenerateFromPassword([]byte(plainSecret), dcrBcryptCost)
+		if hashErr != nil {
+			return nil, "", "", fmt.Errorf("failed to hash client secret: %w", hashErr)
+		}
+		hashedSecret = string(hashed)
+	}
+
 	scopes := req.Scopes
 	if scopes == nil {
 		scopes = []string{}
@@ -441,15 +548,21 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 
 	now := time.Now()
 	client := &domain.OAuthClient{
-		ID:                      uuid.New().String(),
-		ClientID:                clientID,
-		ClientSecret:            string(hashedSecret),
-		Name:                    req.Name,
+		ID:           uuid.New().String(),
+		ClientID:     clientID,
+		ClientSecret: hashedSecret,
+		Name:         req.Name,
+		// Confidential in the sense that matters: the client authenticates.
+		// A private_key_jwt client holds a key rather than a secret, but it is
+		// emphatically not a public client, and typing it "public" would put it
+		// on verifyConfidentialClientAuth's no-credential pass-through.
 		ClientType:              "confidential",
 		TokenEndpointAuthMethod: authMethod,
 		GrantTypes:              grantTypes,
 		RedirectURIs:            redirectURIs,
 		Scopes:                  scopes,
+		JWKS:                    req.JWKS,
+		JWKSURI:                 req.JWKSURI,
 		SoftwareID:              req.SoftwareID,
 		SoftwareVersion:         req.SoftwareVersion,
 		Contacts:                contacts,
@@ -551,7 +664,7 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	if grantTypes == nil {
 		grantTypes = []string{"client_credentials"}
 	}
-	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod)
+	authMethod, err := validateDCRSubmittedFields(grantTypes, req.TokenEndpointAuthMethod, req.JWKS, req.JWKSURI)
 	if err != nil {
 		return nil, err
 	}
@@ -573,6 +686,12 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	client.Scopes = scopes
 	client.RedirectURIs = redirectURIs
 	client.TokenEndpointAuthMethod = authMethod
+	// RFC 7592 §3 full replacement: key material is replaced along with
+	// everything else. Omitting these would let a client switch to
+	// private_key_jwt while keeping a stale key set, or rotate its auth method
+	// away from private_key_jwt while the old keys stayed live.
+	client.JWKS = req.JWKS
+	client.JWKSURI = req.JWKSURI
 	client.SoftwareID = req.SoftwareID
 	client.SoftwareVersion = req.SoftwareVersion
 	client.Contacts = contacts

@@ -190,6 +190,11 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
 			return nil, huma.Error409Conflict("oauth client with this client_id already exists")
 		}
+		// Caller's metadata is bad — a 400 carrying the reason, not a 500 that
+		// blames the server and hides the actionable message in a log line.
+		if errors.Is(err, service.ErrInvalidClientMetadata) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Msg("failed to register oauth client")
 		return nil, huma.Error500InternalServerError("failed to register oauth client")
 	}

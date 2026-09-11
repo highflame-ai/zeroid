@@ -159,7 +159,19 @@ func (a *API) buildASMetadata() map[string]any {
 		// "none" is advertised because public PKCE clients — including CIMD
 		// clients, whose metadata document is the registration — authenticate
 		// at the token endpoint with PKCE alone and carry no secret.
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
+		//
+		// private_key_jwt is advertised as of zeroid#206, and only as of then.
+		// Registration had accepted the value long before, but nothing
+		// validated a client_assertion, so advertising it would have pointed
+		// conformant clients at a method that could not work. It is listed now
+		// because verifyClientAssertion enforces RFC 7523 §2.2 against the
+		// client's registered jwks/jwks_uri.
+		//
+		// client_secret_basic is likewise only now TRUE for this endpoint: the
+		// token endpoint parses the Authorization header as of the same change.
+		// It had been advertised here before any Basic parsing existed, so a
+		// client following this very document had its header ignored.
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		"grant_types_supported": []string{
 			"refresh_token",
 			"client_credentials",
@@ -186,15 +198,19 @@ func (a *API) buildASMetadata() map[string]any {
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
 		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
-		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		// REQUIRED by RFC 8414 §2 unconditionally — unlike the grant list, this
 		// member must be present even when the flow is unavailable, or the
 		// document is invalid and strict parsers reject the whole thing (the
 		// #263 failure). The VALUE is gated below: an empty array is the
 		// accurate way to say "no response type is supported".
-		"response_types_supported":                         []string{},
-		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
+		"response_types_supported": []string{},
+		// RFC 8414 — the algorithms a private_key_jwt client may sign its
+		// client_assertion with. Kept in step with internal/jwtalg's allow-list,
+		// which is what actually gates the header at verification time; this
+		// member is the advertised subset clients are expected to use.
+		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"},
 
 		// RFC 7591 dynamic client registration.
 		"registration_endpoint": a.issuer + "/oauth2/register",
