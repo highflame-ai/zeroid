@@ -694,8 +694,18 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	scopes := narrow(rawRequested, client.Scopes)
 	scopes = narrow(scopes, effectiveAllowedScopes(policy, identity))
-	if err := requireGrantableScope(req.Scope, scopes); err != nil {
-		return nil, err
+
+	// Stricter than the shared requireGrantableScope, which permits an empty
+	// grant when the caller named no scope. That is safe only where an empty
+	// set means "nothing was asked"; here it can also mean the client's
+	// registered scopes and the policy ceiling are disjoint — a denial. There
+	// is no identity or delegation fallback on this path (see the zero-scope
+	// check above), so either way nothing is grantable, and issuing would mint
+	// a token with no `scopes` claim: IssueCredential's dual-read and
+	// EnforcePolicy scope checks are both gated on len(Scopes) > 0, and a
+	// claimless token reads downstream as "no scope ceiling to check".
+	if len(scopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
 	}
 
 	issue := IssueRequest{

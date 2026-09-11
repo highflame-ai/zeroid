@@ -322,3 +322,98 @@ func TestAPIKeyGrant_WhitespaceOnlyScopeTreatedAsOmitted(t *testing.T) {
 	require.Equal(t, http.StatusOK, tokenResp.StatusCode,
 		"a whitespace-only scope must be treated the same as an omitted one, not falsely rejected")
 }
+
+// TestClientCredentials_OmittedScopeNarrowedToEmptyRejected covers the gap
+// requireGrantableScope leaves open on this grant: it permits an empty grant
+// whenever the caller named no scope, but on client_credentials an empty set
+// has a second meaning — the client's registered scopes and the identity
+// policy's ceiling are disjoint, i.e. a denial. There is no identity or
+// delegation fallback here, so nothing is grantable either way, and minting
+// would hand back a token with NO scopes claim: exactly the
+// "Shield enforces nothing" escalation this file exists to close, reached
+// via the omitted-scope path instead of the explicit-request one.
+func TestClientCredentials_OmittedScopeNarrowedToEmptyRejected(t *testing.T) {
+	identityPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("cc-disjoint-cp"),
+		"allowed_grant_types":  []string{"client_credentials"},
+		"allowed_scopes":       []string{"tools:read"},
+		"max_delegation_depth": 1,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+
+	clientID := uid("cc-disjoint-client")
+	registerIdentityWithPolicy(t, clientID, identityPolicyID, "", nil, adminHeaders())
+	// Registered scopes share nothing with the policy ceiling above.
+	client := registerOAuthClient(t, clientID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		// scope deliberately omitted — the narrowing still resolves to nothing.
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a client whose registered scopes are disjoint from the identity policy's ceiling must be refused, not handed a token with no scopes claim")
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// TestAuthorize_WhitespaceOnlyScopeDoesNotWiden pins the handler side of the
+// same raw-string-vs-parsed-emptiness mismatch as
+// TestAPIKeyGrant_WhitespaceOnlyScopeTreatedAsOmitted. /oauth2/authorize used
+// to branch on `req.Scope != ""` while IssueAuthCode and requireGrantableScope
+// both branch on the PARSED scope, so `scope=" "` narrowed the principal away
+// to an empty set here and then read as an omitted request one layer down —
+// substituting the client's entire registered surface. The result was strictly
+// wider than sending no scope at all.
+func TestAuthorize_WhitespaceOnlyScopeDoesNotWiden(t *testing.T) {
+	clientID := uid("authz-code-scope-whitespace")
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:     clientID,
+		Name:         clientID + "-test-client",
+		GrantTypes:   []string{"authorization_code"},
+		Scopes:       []string{"tools:read", "tools:admin"},
+		RedirectURIs: []string{testRedirectURI},
+	})
+	require.NoError(t, err)
+
+	verifier, challenge := buildPKCEPair(t)
+	form := url.Values{
+		"client_id":             {clientID},
+		"redirect_uri":          {testRedirectURI},
+		"response_type":         {"code"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"state":                 {"authz-code-scope-whitespace-state"},
+		"scope":                 {" "},
+		// The principal holds tools:read only; tools:admin is the client's
+		// registered scope that must never leak into the grant.
+		"test_principal_account": {testAccountID},
+		"test_principal_project": {testProjectID},
+		"test_principal_user":    {"user-authz-code-whitespace-test"},
+		"test_principal_scopes":  {"tools:read"},
+	}
+
+	resp := postAuthorize(t, form)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusFound, resp.StatusCode,
+		"a whitespace-only scope must be treated as omitted, not as a request that narrows to nothing")
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := loc.Query().Get("code")
+	require.NotEmpty(t, code)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     clientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+	scope, _ := decode(t, tokenResp)["scope"].(string)
+	assert.Equal(t, "tools:read", scope,
+		"the grant must stay at the principal's scopes; tools:admin is the client's registered scope and was never held or requested")
+}
