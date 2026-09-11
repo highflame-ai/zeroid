@@ -2866,6 +2866,64 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	return parts[0], parts[1], nil
 }
 
+// implementedClientAuthMethods are the token-endpoint client authentication
+// methods this server can actually ENFORCE.
+//
+// The empty string is included deliberately: it means "unset", which is what a
+// row predating the column carries. Registration never writes it (it defaults
+// to none or client_secret_basic), so an empty value is legacy data and must
+// keep behaving exactly as it did.
+//
+// private_key_jwt, client_secret_jwt and tls_client_auth are ABSENT because
+// nothing in this codebase validates them. private_key_jwt is the live gap
+// (zeroid#206) — registration accepts it and stores key material today;
+// client_secret_jwt is dropped in OAuth 2.1 and will not be added;
+// tls_client_auth (RFC 8705) is deferred pending an mTLS termination story.
+var implementedClientAuthMethods = map[string]bool{
+	"":                    true,
+	"none":                true,
+	"client_secret_post":  true,
+	"client_secret_basic": true,
+}
+
+// rejectUnimplementedClientAuth refuses a client whose REGISTERED
+// token_endpoint_auth_method this server cannot enforce.
+//
+// This closes a silent downgrade, not a missing feature. Registration accepts
+// `token_endpoint_auth_method: private_key_jwt` and stores the client's key
+// material, but sets client_type from the separate `confidential` flag — so a
+// key-based client lands as client_type=public with an empty secret hash, which
+// is precisely the shape verifyConfidentialClientAuth waves through. The result
+// is that a client registered for key-based authentication authenticates with
+// NOTHING on authorization_code, refresh_token, CIBA redemption, introspection
+// and revocation.
+//
+// The asymmetry is what makes it worth refusing rather than leaving to the
+// eventual implementation: a deployer who chose private_key_jwt specifically to
+// avoid shared secrets ends up with WEAKER authentication than one who chose a
+// secret, with no error on any surface to say so. Failing loudly is strictly
+// better than proceeding unauthenticated, and it cannot regress a working
+// deployment because no such client can be authenticating correctly today —
+// there is no code path that would have checked its key.
+//
+// invalid_client (401) rather than invalid_request: the client is well-formed
+// and known, it simply cannot be authenticated as registered. RFC 6749 §5.2
+// assigns invalid_client to failed or absent client authentication.
+//
+// Interim hardening for zeroid#206 scope item 2, deliberately landed ahead of
+// the RFC 7523 §2.2 client-assertion work it is bundled with there: it has no
+// dependency on that work, and leaving the downgrade open while it is built
+// would be the wrong order.
+func rejectUnimplementedClientAuth(client *domain.OAuthClient) error {
+	if client == nil || implementedClientAuthMethods[client.TokenEndpointAuthMethod] {
+		return nil
+	}
+	return oauthUnauthorized(fmt.Sprintf(
+		"client is registered for token_endpoint_auth_method %q, which this authorization "+
+			"server does not implement; it cannot be authenticated",
+		client.TokenEndpointAuthMethod), nil)
+}
+
 // verifyConfidentialClientAuth enforces RFC 6749 §2.3 / §10.4 client
 // authentication for an already-resolved OAuth client. When the client is
 // CONFIDENTIAL it MUST present and prove its client_secret before any grant
@@ -2881,6 +2939,11 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
 	if client == nil {
 		return nil
+	}
+	// Refuse a client registered for an authentication method this server does
+	// not implement, BEFORE the public-client pass-through below.
+	if err := rejectUnimplementedClientAuth(client); err != nil {
+		return err
 	}
 	// A client is confidential if it declares so OR carries a stored secret
 	// hash. The second clause is belt-and-suspenders against an inconsistent
@@ -2956,11 +3019,21 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// safe because redirect_uri binding protects the flow; token INSPECTION
 	// has no equivalent binding, so it stays registry-only.
 	if clientSecret == "" {
-		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
+		publicClient, err := s.oauthClientSvc.GetPublicClient(ctx, clientID)
+		if err != nil {
 			if errors.Is(err, ErrOAuthClientNotFound) {
 				return oauthUnauthorized("client authentication required", nil)
 			}
 			return oauthServerError("client verification failed", err)
+		}
+		// Same downgrade as the grant paths: a client registered for an
+		// unimplementable method lands as public with no secret, so without this
+		// it satisfies the no-secret branch and gets introspection/revocation
+		// with no authentication at all. The secret branch below needs no
+		// equivalent check — such a client has no stored hash, so
+		// VerifyClientSecret fails closed.
+		if err := rejectUnimplementedClientAuth(publicClient); err != nil {
+			return err
 		}
 		return nil
 	}
