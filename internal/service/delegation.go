@@ -318,7 +318,7 @@ func (s *DelegationService) WalkByJTI(ctx context.Context, jti, accountID, proje
 //
 // until defaults to now() when zero; since defaults to until - 30 days
 // when zero. Limit is clamped to [1, 500].
-func (s *DelegationService) ListChains(ctx context.Context, since, until time.Time, limit int, accountID, projectID string) ([]*postgres.ChainSummary, error) {
+func (s *DelegationService) ListChains(ctx context.Context, since, until time.Time, limit int, accountID, projectID, rootIdentityID string) ([]*postgres.ChainSummary, error) {
 	if until.IsZero() {
 		until = time.Now()
 	}
@@ -331,7 +331,7 @@ func (s *DelegationService) ListChains(ctx context.Context, since, until time.Ti
 	if limit > 500 {
 		limit = 500
 	}
-	return s.delegRepo.ListChains(ctx, accountID, projectID, since, until, limit)
+	return s.delegRepo.ListChains(ctx, accountID, projectID, since, until, limit, rootIdentityID)
 }
 
 // IdentityDepths returns the maximum delegation depth per identity for the
