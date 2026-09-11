@@ -24,6 +24,24 @@ type AuthCodeClaims struct {
 	OrgID         string    // "oid" — Organization ID
 	AccountID     string    // "aid" — Account ID
 	ProjectID     string    // "pid" — Project ID (optional)
+
+	// Resources is the consented RFC 8707 resource ceiling — "rsc"
+	// (CAP-IDN-027). Optional: absent on every code issued before this
+	// existed, and on any request that did not name a resource.
+	//
+	// A signed CLAIM rather than a database row, for the same reason Scopes
+	// is one. Auth codes are stateless HS256 JWTs and the auth_codes table
+	// is a replay-consumption ledger written at redemption, so there is no
+	// code row at authorization time to persist onto. Granted scope and
+	// granted resource are the same kind of fact — decided at authorize,
+	// needed at redemption, and must not be client-tamperable — and the
+	// signature already covering "scp" covers this at no extra cost.
+	//
+	// Capped at one value on the authorize leg
+	// (maxAuthorizeResourceIndicators) but carried as a slice: cardinality
+	// is a constant, not a shape, so raising the cap must not change what
+	// is on the wire (ADR 0037 D2).
+	Resources []string // "rsc" — consented resource ceiling (optional)
 }
 
 // decodeAuthCodeJWT verifies and decodes a stateless auth code JWT (HS256).
@@ -83,7 +101,125 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 		}
 	}
 
+	// Extract the consented resource ceiling (CAP-IDN-027).
+	//
+	// This one FAILS CLOSED, unlike `scp` above, which skips an element it
+	// cannot read. The asymmetry is deliberate: an ABSENT ceiling means "none
+	// was recorded", which permits the token request to bind to any resource it
+	// names (CAP-IDN-026). So silently dropping an unreadable element would
+	// WIDEN what the code allows — in the limit, a fully malformed claim would
+	// read as no ceiling at all and hand back exactly the unconstrained binding
+	// the ceiling exists to prevent. A skipped scope narrows; a skipped
+	// resource does the opposite.
+	//
+	// The claim is server-minted under a signature we just verified, so a
+	// malformed one is our own bug or a forgery attempt against a leaked HMAC
+	// secret. Neither is input to tolerate.
+	//
+	// A bare string is accepted as a single-value ceiling. It is unambiguous,
+	// it is what a JSON layer that collapses one-element arrays would produce,
+	// and it is strictly NARROWER than the absent case — so tolerating it costs
+	// nothing, while rejecting it would fail a flow for no security gain.
+	//
+	// TWO guards are load-bearing here and they do different jobs. Removing
+	// either one reopens a hole, so be precise about which does what:
+	//
+	//   - token.Has("rsc") distinguishes ABSENT from PRESENT. It exists so an
+	//     absent claim does NOT fall into decodeResourceCeiling's fail-closed
+	//     branch — without it every unbound authorization code would stop
+	//     decoding, breaking the CAP-IDN-026 flow entirely.
+	//   - the len(out)==0 check INSIDE decodeResourceCeiling is what actually
+	//     catches `"rsc": null` and `"rsc": []`. Measured against jwx v4.4.0:
+	//     after a sign/parse round trip `null` and `[]` BOTH succeed through
+	//     jwt.Get[[]any] with length zero, so no typed read fails and Has
+	//     cannot tell them from a populated claim.
+	//
+	// Both shapes are ones we never mint, so reaching them means our own bug or
+	// a forgery against a leaked HMAC secret, and both must fail rather than
+	// quietly widen — an empty ceiling reads as "no ceiling", the permissive
+	// state.
+	if token.Has("rsc") {
+		resources, err := decodeResourceCeiling(token)
+		if err != nil {
+			return nil, err
+		}
+		claims.Resources = resources
+	}
+
 	return claims, nil
+}
+
+// decodeResourceCeiling reads the `rsc` claim of a code that already carries it,
+// and refuses every shape that would otherwise read as an empty ceiling.
+//
+// Callers must gate on token.Has("rsc") — this function treats "cannot read a
+// ceiling" as an error, which is only correct once presence is established.
+func decodeResourceCeiling(token jwt.Token) ([]string, error) {
+	var out []string
+
+	// Branch order note: after a sign/parse round trip a JSON array comes back
+	// as []any, so for any code WE mint the []any branch below is the one that
+	// fires — Get[[]string] is kept for a token constructed in-process (and
+	// costs nothing), not because it is the common path.
+	if v, err := jwt.Get[[]string](token, "rsc"); err == nil {
+		out = v
+	} else if v, err := jwt.Get[string](token, "rsc"); err == nil {
+		// A bare string is accepted as a single-value ceiling: unambiguous, what
+		// a JSON layer collapsing one-element arrays produces, and strictly
+		// NARROWER than the absent case — so tolerating it costs nothing while
+		// rejecting it would fail a flow for no security gain.
+		out = []string{v}
+	} else if raw, err := jwt.Get[[]any](token, "rsc"); err == nil {
+		out = make([]string, 0, len(raw))
+		for _, r := range raw {
+			s, ok := r.(string)
+			if !ok {
+				return nil, fmt.Errorf(
+					"auth code has a malformed rsc claim: element of type %T is not a string", r)
+			}
+			out = append(out, s)
+		}
+	} else {
+		// Present but unreadable as any accepted shape — an object, a number or
+		// a bool. NOT `null`: measured against jwx v4.4.0, `null` succeeds
+		// through Get[[]any] with length zero and is caught by the len(out)==0
+		// guard below, not here.
+		return nil, fmt.Errorf(
+			"auth code has a malformed rsc claim: expected a string or an array of strings")
+	}
+
+	// Present but naming nothing. Distinct from absent, and NOT equivalent to
+	// it: absent means the client may still bind at the token endpoint
+	// (CAP-IDN-026), so silently accepting an empty ceiling here would convert
+	// a corrupt consent record into an unconstrained one.
+	//
+	// This is the guard that catches BOTH `"rsc": null` and `"rsc": []` — both
+	// decode cleanly through Get[[]any] with length zero. Do not delete it as
+	// redundant with token.Has: Has only proves the claim is present.
+	if len(out) == 0 {
+		return nil, fmt.Errorf(
+			"auth code has an empty rsc claim: a recorded ceiling must name at least one resource")
+	}
+
+	// Re-validate on the way IN, not only on the way out. The ceiling was
+	// checked at issuance, but that is a different process, possibly a
+	// different release, and the values are about to be stamped into a signed
+	// access token and enforced on by Shield. Without this, a ceiling of [""]
+	// — which validateResourceIndicators explicitly rejects at issuance —
+	// would mint a token bound to the empty string.
+	// Take the DE-DUPLICATED result, not just the error. Returning the raw list
+	// would let a duplicated ceiling — `["A","A"]` — decode as two entries, and
+	// downstream `len(ceiling) > 1` checks read that as multi-audience: it would
+	// stamp a duplicated `aud`, and suppress the refresh token on what is really
+	// a single-resource grant. Unreachable today because IssueAuthCode dedups
+	// before minting, but it goes live the moment the cardinality cap moves,
+	// which the design treats as a one-line change.
+	out, err := validateResourceIndicators(out)
+	if err != nil {
+		return nil, fmt.Errorf("auth code has an invalid rsc claim: %w", err)
+	}
+
+	return out, nil
 }
 
 // getStringClaim extracts a string claim from a JWT token, returning empty string if not present.
@@ -199,6 +335,18 @@ func mintAuthCodeJWT(claims *AuthCodeClaims, hmacSecret, issuer string, now time
 			anyScopes[i] = s
 		}
 		builder = builder.Claim("scp", anyScopes)
+	}
+	if len(claims.Resources) > 0 {
+		// Emitted as []any for the same round-trip reason as "scp" above, and
+		// ALWAYS as an array even though the authorize leg caps the ceiling at
+		// one value. Cardinality is a constant, not a shape (ADR 0037 D2):
+		// raising the cap must not change the claim's serialization, or every
+		// code minted before the change becomes a compatibility case.
+		anyResources := make([]any, len(claims.Resources))
+		for i, r := range claims.Resources {
+			anyResources[i] = r
+		}
+		builder = builder.Claim("rsc", anyResources)
 	}
 
 	tok, err := builder.Build()

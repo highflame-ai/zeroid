@@ -838,11 +838,20 @@ ZeroID-issued token as a federated workload credential — granting Anthropic AP
 access without a static Anthropic API key. GCP Workload Identity Federation,
 AWS, and Azure follow the same configuration shape.
 
-> **Audience note.** The public `/oauth2/token` endpoint does not expose an
-> `audience` / `resource` parameter; issued tokens default `aud` to the ZeroID
-> issuer URL. A relying party that enforces a specific audience **MUST**
-> therefore be configured to accept the ZeroID issuer URL as the expected
-> audience (rather than expecting ZeroID to mint a caller-chosen `aud`).
+> **Audience note.** A token issued with no resource indicator defaults `aud` to
+> the ZeroID issuer URL, so a relying party on this federation path **MUST** be
+> configured to accept the issuer URL as the expected audience rather than
+> expecting a caller-chosen `aud`.
+>
+> `/oauth2/token` *does* accept an RFC 8707 `resource` parameter, and
+> `/oauth2/authorize` accepts one that becomes the authorization code's consented
+> ceiling. Both only ever NARROW where a token is honoured, which is why `aud`
+> still cannot be used as an authorization signal: any tenant principal may
+> request any value, so a relying party **MUST NOT** treat a matching `aud` as
+> evidence that the token was minted for it. Authorize on the `resource` claim,
+> the scopes, and the principal. The `audience` parameter is a separate
+> scope-profile mechanism, exposed only on the trusted external-principal
+> exchange and mutually exclusive with `resource`.
 
 ## 11. Discovery Metadata Extensions
 
