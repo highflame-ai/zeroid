@@ -459,7 +459,7 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 		if err != nil {
 			return fmt.Errorf("%w: jwks_uri is not a valid URL: %v", ErrInvalidClientMetadata, err)
 		}
-		if u.Host == "" || (u.Scheme != "https" && !(allowPrivateJWKS && u.Scheme == "http")) {
+		if u.Host == "" || (u.Scheme != "https" && (!allowPrivateJWKS || u.Scheme != "http")) {
 			return fmt.Errorf("%w: jwks_uri must be an absolute https:// URL (got %q)", ErrInvalidClientMetadata, jwksURI)
 		}
 	}
