@@ -23,8 +23,12 @@ package service
 // Scope of this implementation (v1):
 //   - PUBLIC clients only: token_endpoint_auth_method MUST be "none" (PKCE is
 //     the proof of possession). Confidential CIMD clients (private_key_jwt with
-//     a published jwks_uri) are future work — ZeroID does not yet accept
-//     private_key_jwt token-endpoint auth for any client.
+//     a published jwks_uri) remain out of scope — but the reason is no longer
+//     "unimplemented". ZeroID implements private_key_jwt for REGISTERED clients
+//     (zeroid#206); CIMD stays public-PKCE-only because a CIMD registration is a
+//     self-published document, so honouring key-based auth from one would let
+//     any party on the internet assert a confidential client identity with no
+//     registration step.
 //   - authorization_code (+ optional refresh_token) grants only.
 //   - Synthesized clients are NEVER persisted — they live only for the request
 //     that resolves them, plus a short in-memory cache.
@@ -603,7 +607,10 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 
 	// Public client only in v1. An omitted token_endpoint_auth_method defaults to
 	// "none" for a CIMD (public) client; any explicit confidential method is
-	// rejected — ZeroID does not accept private_key_jwt token-endpoint auth yet.
+	// rejected — ZeroID implements private_key_jwt for REGISTERED clients, but
+	// refuses it for CIMD: a CIMD registration is a self-published document, so
+	// honouring key-based auth from one would let any party on the internet
+	// assert a confidential client identity with no registration step.
 	authMethod := doc.TokenEndpointAuthMethod
 	if authMethod == "" {
 		authMethod = "none"

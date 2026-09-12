@@ -1489,6 +1489,31 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
 		updated = true
 	}
+	// token_endpoint_auth_method and its key material are reconciled like any
+	// other config-declared field. They were previously omitted, which was
+	// harmless while the method was decorative — it is now the field that
+	// decides which credential authenticates the client, so leaving it
+	// unreconciled meant a deployer could set private_key_jwt + jwks_uri in
+	// config, restart, get no error and no log line, and still be running a
+	// client_secret_basic client whose old secret authenticates on every grant.
+	// That is the same advertised-but-silently-inert failure this change exists
+	// to remove, reproduced on the programmatic registration surface.
+	//
+	// UpdateClient validates the resulting combination, so an incoherent config
+	// (private_key_jwt with no keys, or alongside a stored secret) surfaces as
+	// an error here rather than persisting.
+	if cfg.TokenEndpointAuthMethod != "" && cfg.TokenEndpointAuthMethod != existing.TokenEndpointAuthMethod {
+		existing.TokenEndpointAuthMethod = cfg.TokenEndpointAuthMethod
+		updated = true
+	}
+	if len(cfg.JWKS) > 0 && !bytes.Equal(cfg.JWKS, existing.JWKS) {
+		existing.JWKS = cfg.JWKS
+		updated = true
+	}
+	if cfg.JWKSURI != "" && cfg.JWKSURI != existing.JWKSURI {
+		existing.JWKSURI = cfg.JWKSURI
+		updated = true
+	}
 	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
 		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
 		updated = true

@@ -15,6 +15,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // Tests for RFC 7523 §2.2 private_key_jwt client authentication (zeroid#206
@@ -479,4 +480,51 @@ func TestVerifyClientAssertion_RejectsOverlongJTI(t *testing.T) {
 		clientAssertionTypeJWTBearer)
 	oe := wantOAuthError(t, err, oautherror.InvalidClient)
 	require.Equal(t, 401, oe.HTTPStatus, "caller-controlled input must not produce a 5xx")
+}
+
+// The ledger row must outlive the ACCEPTANCE window, not the assertion's stated
+// expiry.
+//
+// jwt.WithAcceptableSkew keeps an assertion verifiable until exp+skew, but the
+// row was written with the bare exp — leaving a skew-wide window in which the
+// assertion still verified while its row was already eligible for deletion. The
+// cleanup worker prunes `expires_at < now()` with no grace, and
+// dpop.MemoryStore treats an expired entry as absent and overwrites it, which
+// makes the second redemption succeed deterministically rather than by race.
+func TestVerifyClientAssertion_LedgerRowOutlivesTheAcceptanceWindow(t *testing.T) {
+	t.Parallel()
+	key := newECKey(t)
+	rec := &recordingReplay{seen: map[string]time.Time{}}
+	svc := clientAssertionSvc(rec)
+	client := privateKeyJWTClient(t, "client-exp", key)
+
+	lifetime := 30 * time.Second
+	require.NoError(t, svc.verifyClientAssertion(context.Background(), client, "client-exp",
+		mintAssertion(t, key, "client-exp", assertionOpts{jti: "exp-window", lifetime: lifetime}),
+		clientAssertionTypeJWTBearer))
+
+	require.Len(t, rec.seen, 1)
+	var stored time.Time
+	for _, v := range rec.seen {
+		stored = v
+	}
+	// The assertion stays acceptable until exp+skew, so the row must too.
+	// One second of slack because a JWT `exp` is integer seconds (RFC 7519
+	// §2 NumericDate), so the claim truncates the sub-second component that
+	// time.Now() carries here.
+	minimum := time.Now().Add(lifetime).Add(clientAssertionClockSkew).Add(-time.Second)
+	require.False(t, stored.Before(minimum),
+		"row expires at %s but the assertion is still acceptable until ~%s — that gap is a replay window",
+		stored, minimum)
+}
+
+// recordingReplay captures the expiry each key was stored with.
+type recordingReplay struct{ seen map[string]time.Time }
+
+func (r *recordingReplay) Insert(_ context.Context, jti string, expiresAt time.Time) error {
+	if _, ok := r.seen[jti]; ok {
+		return dpop.ErrReplay
+	}
+	r.seen[jti] = expiresAt
+	return nil
 }

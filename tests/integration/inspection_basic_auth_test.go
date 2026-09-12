@@ -245,3 +245,39 @@ func TestInspectionBasicAuth_MetadataAdvertisesAuthMethods(t *testing.T) {
 			[]any{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"}, methods, key)
 	}
 }
+
+// RFC 8414 §2 makes *_endpoint_auth_signing_alg_values_supported REQUIRED once
+// the corresponding *_auth_methods_supported list contains private_key_jwt.
+//
+// Advertising private_key_jwt for introspection and revocation without them made
+// the discovery document non-conformant — the same strict-parser failure class
+// as #263, and self-defeating for a change whose whole point is that the
+// advertisement is finally honest.
+func TestRFC8414_SigningAlgsPresentWhereverPrivateKeyJWTIsAdvertised(t *testing.T) {
+	resp := get(t, "/.well-known/oauth-authorization-server", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+
+	for _, endpoint := range []string{"token", "introspection", "revocation"} {
+		methods, ok := body[endpoint+"_endpoint_auth_methods_supported"].([]any)
+		require.True(t, ok, "metadata must include %s_endpoint_auth_methods_supported", endpoint)
+
+		advertisesKeyAuth := false
+		for _, m := range methods {
+			if m == "private_key_jwt" || m == "client_secret_jwt" {
+				advertisesKeyAuth = true
+			}
+		}
+		if !advertisesKeyAuth {
+			continue
+		}
+
+		algs, ok := body[endpoint+"_endpoint_auth_signing_alg_values_supported"].([]any)
+		require.True(t, ok,
+			"%s_endpoint_auth_methods_supported advertises private_key_jwt, so RFC 8414 §2 makes "+
+				"%s_endpoint_auth_signing_alg_values_supported REQUIRED", endpoint, endpoint)
+		assert.NotEmpty(t, algs, "an empty alg list tells a client nothing it can sign with")
+		assert.NotContains(t, algs, "none", "alg=none must never be advertised for client authentication")
+		assert.NotContains(t, algs, "HS256", "symmetric algs are not usable for private_key_jwt")
+	}
+}

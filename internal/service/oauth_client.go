@@ -380,7 +380,25 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 }
 
 // UpdateClient persists changes to a client record.
+//
+// The repo write underneath is an unrestricted bun UPDATE — it rewrites
+// token_endpoint_auth_method, client_secret, jwks, jwks_uri, client_type and
+// is_active from whatever struct it is handed. zeroid ships as a library, so
+// this is reachable by an embedder holding a *domain.OAuthClient even though no
+// HTTP route exposes it. Validating here is what makes "a key-based client
+// cannot also carry a secret" true at the ROOT, rather than at two of the three
+// callers of that write.
 func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OAuthClient) error {
+	if client == nil {
+		return fmt.Errorf("%w: client is nil", ErrInvalidClientMetadata)
+	}
+	if err := validateClientAuthMethod(client.TokenEndpointAuthMethod, client.JWKS, client.JWKSURI, s.allowPrivateJWKSEndpoints); err != nil {
+		return err
+	}
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT && client.ClientSecret != "" {
+		return fmt.Errorf(
+			"%w: a private_key_jwt client cannot also carry a client_secret", ErrInvalidClientMetadata)
+	}
 	return s.repo.Update(ctx, client)
 }
 

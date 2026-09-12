@@ -52,6 +52,18 @@ type ProtectedResourceMetadataOutput struct {
 
 // ── Well-known routes ────────────────────────────────────────────────────────
 
+// clientAssertionSigningAlgs is the algorithm set a private_key_jwt client may
+// sign its client_assertion with, advertised on every endpoint that accepts one.
+// Kept deliberately in step with internal/jwtalg's allow-list, which is what
+// actually gates the JWS header at verification time — this member is the
+// advertised view of that same set, and the two drifting apart would recreate
+// the advertised-but-unusable gap this whole change exists to close.
+var clientAssertionSigningAlgs = []string{
+	"ES256", "ES384", "ES512",
+	"RS256", "RS384", "RS512",
+	"PS256", "PS384", "PS512",
+}
+
 func (a *API) registerWellKnownRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
 		OperationID: "jwks",
@@ -200,6 +212,17 @@ func (a *API) buildASMetadata() map[string]any {
 		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
+		// RFC 8414 §2 makes these two REQUIRED once the corresponding
+		// *_auth_methods_supported list contains private_key_jwt (or
+		// client_secret_jwt). They were correctly absent before private_key_jwt
+		// was advertised on these endpoints, and adding it without them made the
+		// document non-conformant — the same strict-parser failure class as
+		// #263, and self-defeating for a change whose point is that the
+		// advertisement is finally honest. Same set as the token endpoint: one
+		// allow-list (internal/jwtalg) gates every client assertion regardless
+		// of which endpoint receives it.
+		"introspection_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
+		"revocation_endpoint_auth_signing_alg_values_supported":    clientAssertionSigningAlgs,
 		// REQUIRED by RFC 8414 §2 unconditionally — unlike the grant list, this
 		// member must be present even when the flow is unavailable, or the
 		// document is invalid and strict parsers reject the whole thing (the
@@ -210,7 +233,7 @@ func (a *API) buildASMetadata() map[string]any {
 		// client_assertion with. Kept in step with internal/jwtalg's allow-list,
 		// which is what actually gates the header at verification time; this
 		// member is the advertised subset clients are expected to use.
-		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "ES384", "ES512", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"},
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
 
 		// RFC 7591 dynamic client registration.
 		"registration_endpoint": a.issuer + "/oauth2/register",

@@ -77,8 +77,11 @@ func clientAssertionReplayKey(clientID, jti string) string {
 // clientAssertionReplayGuard records single-use client-assertion jti values so
 // a captured assertion cannot be redeemed twice inside its (already bounded)
 // lifetime. Satisfied by the shared Postgres replay store that also backs DPoP
-// and actor-key proofs; jtis are namespaced before insertion so they can never
-// collide across those three producers in the shared table.
+// and actor-key proofs. All three producers namespace their keys before
+// insertion ("cla:", "akp:", "dpop:") so they cannot collide in the shared
+// table — a property that only became true when DPoP stopped inserting a raw
+// client-chosen jti, since a prefix partitions nothing unless every writer
+// honours it.
 type clientAssertionReplayGuard interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
 }
@@ -408,7 +411,24 @@ func (s *OAuthService) verifyClientAssertion(
 	if s.clientAssertionReplay == nil {
 		return oauthServerError("client assertion replay store is not configured", nil)
 	}
-	if err := s.clientAssertionReplay.Insert(ctx, clientAssertionReplayKey(clientID, jti), exp); err != nil {
+	// The ledger row must outlive the ACCEPTANCE window, not the assertion's
+	// stated expiry. Those differ: jwt.WithAcceptableSkew means an assertion
+	// stays verifiable until exp+skew, and the explicit exp check above is an
+	// upper bound only. Writing the row with the bare `exp` left a skew-wide
+	// window in which the assertion still verified but its row was already
+	// eligible for deletion — the cleanup worker prunes `expires_at < now()`
+	// with no grace, and dpop.MemoryStore treats an expired entry as absent
+	// (`ok && prev.After(now)`) and silently overwrites it, which makes the
+	// second redemption succeed deterministically rather than by race.
+	//
+	// pkg/dpop already got this right for the same shared table and says why:
+	// "Wall-clock expiry decouples replay defence from anything the client
+	// controls." exp+skew is the client-derived equivalent and is safe for the
+	// same reason the bare exp was not — both ends of the acceptance window
+	// derive from exp, so a client cannot shorten the row below the window it
+	// bought itself, and exp is already capped above.
+	replayExpiry := exp.Add(clientAssertionClockSkew)
+	if err := s.clientAssertionReplay.Insert(ctx, clientAssertionReplayKey(clientID, jti), replayExpiry); err != nil {
 		if errors.Is(err, dpop.ErrReplay) {
 			return oauthUnauthorized("client_assertion has already been used (replay)", nil)
 		}
