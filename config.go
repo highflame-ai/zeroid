@@ -43,6 +43,7 @@ type Config struct {
 	Attestation AttestationConfig `koanf:"attestation"`
 	Backchannel BackchannelConfig `koanf:"backchannel"`
 	CIMD        CIMDConfig        `koanf:"cimd"`
+	ClientAuth  ClientAuthConfig  `koanf:"client_auth"`
 
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
@@ -64,6 +65,36 @@ type Config struct {
 	// verifies the ID token before minting a ZeroID token. Empty list (default)
 	// disables direct federation — only the broker path remains available.
 	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
+}
+
+// ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
+// §2.2 private_key_jwt, where a client proves its identity with a JWT signed by
+// a key it published rather than with a shared secret (zeroid#206).
+//
+// Deliberately its own section rather than fields on CIMDConfig: a deployer who
+// relaxes the SSRF guard to serve CIMD documents from localhost in dev must not
+// thereby also open the client-JWKS fetcher to internal addresses. The two
+// fetchers trust different parties and are configured independently.
+type ClientAuthConfig struct {
+	// AllowPrivateJWKSEndpoints relaxes the SSRF guard applied to a registered
+	// client's `jwks_uri` fetch. Default false (production-safe): a jwks_uri
+	// whose host resolves to a private, loopback, link-local, multicast, CGN or
+	// unspecified address is refused by a DNS-rebinding-safe dialer.
+	//
+	// This matters more than the CIMD equivalent. A `jwks_uri` is stored at
+	// registration and fetched by the server on every cold cache — so wherever
+	// client registration is open (DCR), it is an attacker-supplied URL the
+	// server will make repeated outbound requests to. Set true ONLY in
+	// single-tenant dev/test deployments that host client key sets on
+	// localhost. Production MUST keep this false.
+	AllowPrivateJWKSEndpoints bool `koanf:"allow_private_jwks_endpoints"`
+
+	// JWKSCacheSize bounds how many distinct client jwks_uri endpoints are
+	// cached concurrently. Each cached entry owns a background refresh
+	// goroutine, so this caps goroutines and outbound fetch loops, not just
+	// memory. 0 (default) ⇒ 256. Least-recently-used entries are evicted and
+	// closed.
+	JWKSCacheSize int `koanf:"jwks_cache_size"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -694,6 +725,11 @@ func loadDefaults(k *koanf.Koanf) error {
 		// onboard against this AS with zero pre-registration. Disable with
 		// ZEROID_CIMD_ENABLED=false / cimd.enabled=false. The SSRF-guard
 		// relaxation defaults false (production-safe).
+		// private_key_jwt client auth. Both production-safe at their zero
+		// value; stated explicitly so the resolved config reports them.
+		"client_auth.allow_private_jwks_endpoints": false,
+		"client_auth.jwks_cache_size":              0,
+
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
 
@@ -720,78 +756,91 @@ func loadDefaults(k *koanf.Koanf) error {
 	return nil
 }
 
+// envMapping is the explicit ENV-var -> config-path table. There is no generic
+// ZEROID_ prefix loader, so a variable absent from here is simply not read,
+// however it is documented. Package-level so the sample-config ratchet in
+// config_test.go can assert that every `# Env:` line in zeroid.yaml names a key
+// that actually appears here.
+var envMapping = map[string]string{
+	// Server
+	"ZEROID_PORT":                    "server.port",
+	"ZEROID_ENV":                     "server.env",
+	"ZEROID_ADMIN_PATH_PREFIX":       "server.admin_path_prefix",
+	"ZEROID_TRUST_FORWARDED_HEADERS": "server.trust_forwarded_headers",
+
+	// Database
+	"ZEROID_DATABASE_URL": "database.url",
+	"DB_HOST":             "database.host",
+	"DB_PORT":             "database.port",
+	"DB_USERNAME":         "database.user",
+	"DB_PASSWORD":         "database.password",
+	"ZEROID_DB_NAME":      "database.name",
+	"DB_SSL_MODE":         "database.ssl_mode",
+	"ZEROID_AUTO_MIGRATE": "database.auto_migrate",
+
+	// Keys
+	"ZEROID_PRIVATE_KEY_PATH":     "keys.private_key_path",
+	"ZEROID_PUBLIC_KEY_PATH":      "keys.public_key_path",
+	"ZEROID_KEY_ID":               "keys.key_id",
+	"ZEROID_RSA_PRIVATE_KEY_PATH": "keys.rsa_private_key_path",
+	"ZEROID_RSA_PUBLIC_KEY_PATH":  "keys.rsa_public_key_path",
+	"ZEROID_RSA_KEY_ID":           "keys.rsa_key_id",
+
+	"ZEROID_SIGNING_CREDS_MAX_TTL_SECONDS":      "signing_credentials.max_ttl_seconds",
+	"ZEROID_SIGNING_CREDS_AUDIT_RETENTION_DAYS": "signing_credentials.audit_retention_days",
+	"ZEROID_SIGNING_CREDS_JWKS_PURPOSE":         "signing_credentials.jwks_purpose",
+	"ZEROID_SIGNING_CREDS_WELL_KNOWN_JWKS_NAME": "signing_credentials.well_known_jwks_name",
+
+	// Token
+	"ZEROID_ISSUER":                "token.issuer",
+	"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
+	"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
+	// Evidence clock for issued_credentials (delegation-graph retention).
+	"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
+	// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
+	// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
+	"ZEROID_HMAC_SECRET": "token.hmac_secret",
+	// Strict client auth on introspection/revocation (RFC 7662/7009).
+	// Default true (accept-and-verify); Validate() forces false in production.
+	"ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION": "token.allow_unauthenticated_token_inspection",
+
+	// WIMSE
+	"ZEROID_WIMSE_DOMAIN": "wimse_domain",
+
+	// Attestation
+	"ZEROID_ALLOW_UNSAFE_DEV_STUB":                      "attestation.allow_unsafe_dev_stub",
+	"ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS": "attestation.allow_private_issuer_endpoints",
+
+	// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
+	// test/dev deployments only. Production MUST leave this false.
+	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
+
+	// CIMD (Client ID Metadata Documents). Enabled by default; disable with
+	// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
+	// test/dev only — production MUST leave it false.
+	// RFC 7523 §2.2 private_key_jwt client authentication. The
+	// private-JWKS relaxation is the dev-only lever: it drops the https
+	// requirement on a registered jwks_uri AND relaxes the SSRF guard on
+	// fetching it. Deliberately NOT tied to the CIMD flag below — the two
+	// fetchers trust different parties.
+	"ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS": "client_auth.allow_private_jwks_endpoints",
+	"ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE":              "client_auth.jwks_cache_size",
+
+	"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
+	"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",
+	"ZEROID_CIMD_MAX_DOCUMENT_BYTES":      "cimd.max_document_bytes",
+	"ZEROID_CIMD_CACHE_TTL_SECONDS":       "cimd.cache_ttl_seconds",
+
+	// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
+	// directly by the OTel SDK (spec-compliant).
+	"OTEL_ENABLED":            "telemetry.enabled",
+	"OTEL_TRACES_SAMPLER_ARG": "telemetry.sampling_rate",
+
+	// Logging
+	"ZEROID_LOG_LEVEL": "logging.level",
+}
+
 func loadEnvVars(k *koanf.Koanf) error {
-	envMapping := map[string]string{
-		// Server
-		"ZEROID_PORT":                    "server.port",
-		"ZEROID_ENV":                     "server.env",
-		"ZEROID_ADMIN_PATH_PREFIX":       "server.admin_path_prefix",
-		"ZEROID_TRUST_FORWARDED_HEADERS": "server.trust_forwarded_headers",
-
-		// Database
-		"ZEROID_DATABASE_URL": "database.url",
-		"DB_HOST":             "database.host",
-		"DB_PORT":             "database.port",
-		"DB_USERNAME":         "database.user",
-		"DB_PASSWORD":         "database.password",
-		"ZEROID_DB_NAME":      "database.name",
-		"DB_SSL_MODE":         "database.ssl_mode",
-		"ZEROID_AUTO_MIGRATE": "database.auto_migrate",
-
-		// Keys
-		"ZEROID_PRIVATE_KEY_PATH":     "keys.private_key_path",
-		"ZEROID_PUBLIC_KEY_PATH":      "keys.public_key_path",
-		"ZEROID_KEY_ID":               "keys.key_id",
-		"ZEROID_RSA_PRIVATE_KEY_PATH": "keys.rsa_private_key_path",
-		"ZEROID_RSA_PUBLIC_KEY_PATH":  "keys.rsa_public_key_path",
-		"ZEROID_RSA_KEY_ID":           "keys.rsa_key_id",
-
-		"ZEROID_SIGNING_CREDS_MAX_TTL_SECONDS":      "signing_credentials.max_ttl_seconds",
-		"ZEROID_SIGNING_CREDS_AUDIT_RETENTION_DAYS": "signing_credentials.audit_retention_days",
-		"ZEROID_SIGNING_CREDS_JWKS_PURPOSE":         "signing_credentials.jwks_purpose",
-		"ZEROID_SIGNING_CREDS_WELL_KNOWN_JWKS_NAME": "signing_credentials.well_known_jwks_name",
-
-		// Token
-		"ZEROID_ISSUER":                "token.issuer",
-		"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
-		"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
-		// Evidence clock for issued_credentials (delegation-graph retention).
-		"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
-		// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).
-		// A leak forges auth codes; Validate() enforces >= 32 bytes when set.
-		"ZEROID_HMAC_SECRET": "token.hmac_secret",
-		// Strict client auth on introspection/revocation (RFC 7662/7009).
-		// Default true (accept-and-verify); Validate() forces false in production.
-		"ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION": "token.allow_unauthenticated_token_inspection",
-
-		// WIMSE
-		"ZEROID_WIMSE_DOMAIN": "wimse_domain",
-
-		// Attestation
-		"ZEROID_ALLOW_UNSAFE_DEV_STUB":                      "attestation.allow_unsafe_dev_stub",
-		"ZEROID_ATTESTATION_ALLOW_PRIVATE_ISSUER_ENDPOINTS": "attestation.allow_private_issuer_endpoints",
-
-		// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
-		// test/dev deployments only. Production MUST leave this false.
-		"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
-
-		// CIMD (Client ID Metadata Documents). Enabled by default; disable with
-		// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
-		// test/dev only — production MUST leave it false.
-		"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
-		"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",
-		"ZEROID_CIMD_MAX_DOCUMENT_BYTES":      "cimd.max_document_bytes",
-		"ZEROID_CIMD_CACHE_TTL_SECONDS":       "cimd.cache_ttl_seconds",
-
-		// Telemetry — OTEL_EXPORTER_OTLP_ENDPOINT and TLS settings are read
-		// directly by the OTel SDK (spec-compliant).
-		"OTEL_ENABLED":            "telemetry.enabled",
-		"OTEL_TRACES_SAMPLER_ARG": "telemetry.sampling_rate",
-
-		// Logging
-		"ZEROID_LOG_LEVEL": "logging.level",
-	}
-
 	for envVar, configPath := range envMapping {
 		value, ok := os.LookupEnv(envVar)
 		if !ok {
@@ -808,6 +857,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
 			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {
@@ -821,6 +871,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".default_ttl") ||
 			strings.HasSuffix(configPath, ".max_ttl") ||
 			strings.HasSuffix(configPath, ".audit_retention_days") ||
+			strings.HasSuffix(configPath, ".jwks_cache_size") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
 			intVal, err := strconv.Atoi(value)
 			if err != nil {

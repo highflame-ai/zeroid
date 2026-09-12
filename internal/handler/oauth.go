@@ -27,13 +27,24 @@ type TokenInput struct {
 	// the issued token is bound to the proof key (cnf.jkt) and token_type is
 	// returned as "DPoP" instead of "Bearer".
 	DPoPProof string `header:"DPoP" doc:"DPoP proof JWT (RFC 9449)"`
-	Body      struct {
+	// Authorization carries OPTIONAL client_secret_basic credentials
+	// (RFC 6749 §2.3.1). Body client_id/client_secret remain the
+	// client_secret_post path; using both at once is rejected per §2.3.
+	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
+	Body          struct {
 		GrantType    string `json:"grant_type" required:"true" doc:"OAuth grant type"`
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret"`
-		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
-		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID"`
-		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID"`
+		// ClientAssertion / ClientAssertionType are RFC 7523 §2.2
+		// private_key_jwt CLIENT AUTHENTICATION — a JWT signed by a key the
+		// client published in its registered jwks/jwks_uri, presented instead
+		// of a client_secret. Not to be confused with `assertion` below, which
+		// is the §2.1 authorization GRANT; one request may carry both.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present (RFC 7521 §4.2)"`
+		Scope               string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
+		AccountID           string `json:"account_id,omitempty" doc:"Tenant account ID"`
+		ProjectID           string `json:"project_id,omitempty" doc:"Tenant project ID"`
 		// Assertion is the RFC 7523 §2.1 parameter name for the JWT presented
 		// on the jwt-bearer grant, and is the name every standards-conformant
 		// client sends. ZeroID originally read this value from `subject`
@@ -213,7 +224,14 @@ func (resourceParam) Schema(huma.Registry) *huma.Schema {
 
 type TokenOutput struct {
 	Status int
-	Body   any // domain.AccessToken on success; oauthErrorBody on error
+	// WWWAuthenticate is set on 401 only when the failed attempt used the
+	// Authorization header. RFC 6749 §5.2: an authorization server that
+	// receives a request with an authentication scheme in the Authorization
+	// header MUST respond with a WWW-Authenticate header echoing that scheme.
+	// Mirrors IntrospectOutput, which has carried this since Basic support
+	// landed on the inspection endpoints.
+	WWWAuthenticate string `header:"WWW-Authenticate"`
+	Body            any    // domain.AccessToken on success; oauthErrorBody on error
 }
 
 // oauthErrorBody is the RFC 6749 §5.2 token error response.
@@ -270,6 +288,12 @@ type IntrospectInput struct {
 		// the endpoint preserves the internal/network-isolated access path.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// ClientAssertion / ClientAssertionType are the RFC 7523 §2.2
+		// private_key_jwt alternative to client_secret. A client registered for
+		// private_key_jwt has no secret, so without these it could not
+		// authenticate to this endpoint at all.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present"`
 		// RFC 7662 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
 		_ struct{} `additionalProperties:"true"`
 	}
@@ -293,6 +317,9 @@ type OAuthRevokeInput struct {
 		// authorization). Same accept-and-verify posture as introspection.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// Same RFC 7523 §2.2 private_key_jwt support as introspection.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present"`
 		// RFC 7009 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
 		_ struct{} `additionalProperties:"true"`
 	}
@@ -387,9 +414,17 @@ func resolveAssertion(assertion, subject string) (string, error) {
 	}
 }
 
-// resolveInspectionClientAuth merges the two supported client authentication
-// methods on the introspection/revocation endpoints: client_secret_basic
-// (Authorization header) and client_secret_post (body fields). Returns the
+// resolveBasicClientAuth merges the two secret-carrying client authentication
+// methods — client_secret_basic (Authorization header) and client_secret_post
+// (body fields) — for the token, introspection and revocation endpoints.
+//
+// The token endpoint was NOT a caller until zeroid#206: it read client_secret
+// from the body only, while the RFC 8414 metadata advertised
+// client_secret_basic for it. A client following our own discovery document and
+// sending Basic had its credentials silently ignored and was treated as
+// presenting no secret at all. That failed closed (confidential clients got
+// "client_secret is required" rather than a bypass), but it made an advertised
+// auth method unusable. Returns the
 // effective credentials plus whether the Basic header was the source (drives
 // the RFC 6749 §5.2 WWW-Authenticate echo on failure).
 //
@@ -398,7 +433,7 @@ func resolveAssertion(assertion, subject string) (string, error) {
 // Authorization schemes are ignored (treated as not presented) so bearer
 // headers from generic middleware don't break the anonymous internal path.
 // Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
-func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
+func resolveBasicClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
 	badRequest := func(desc string) *service.OAuthError {
 		return &service.OAuthError{Code: oautherror.InvalidRequest, Description: desc, HTTPStatus: http.StatusBadRequest}
 	}
@@ -649,42 +684,78 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		}, nil
 	}
 
+	// client_secret_basic (Authorization header) or client_secret_post (body).
+	// Presenting both is invalid_request per RFC 6749 §2.3.
+	clientID, clientSecret, viaBasic, basicErr := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	if basicErr != nil {
+		code, desc, status := extractOAuthError(basicErr)
+		out := &TokenOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
+	}
+
+	// A private_key_jwt client may authenticate with client_assertion ALONE and
+	// omit client_id — RFC 7523 §3 already carries the client identifier in the
+	// assertion's iss, and conformant libraries rely on that. Fill it in here,
+	// once, so every downstream grant sees a populated ClientID and none of them
+	// needs to know about this spelling.
+	//
+	// Only when client_id was not supplied: if the caller sent both, the
+	// supplied value is kept and verifyClientAssertion enforces iss == client_id,
+	// so a mismatch is a verification failure rather than a silent override.
+	if clientID == "" {
+		if fromAssertion, ok := service.ClientIDFromAssertion(input.Body.ClientAssertion); ok {
+			clientID = fromAssertion
+		}
+	}
+
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
-		GrantType:         input.Body.GrantType,
-		ClientID:          input.Body.ClientID,
-		ClientSecret:      input.Body.ClientSecret,
-		Scope:             input.Body.Scope,
-		AccountID:         input.Body.AccountID,
-		ProjectID:         input.Body.ProjectID,
-		Assertion:         assertion,
-		APIKey:            input.Body.APIKey,
-		SubjectToken:      input.Body.SubjectToken,
-		SubjectTokenType:  input.Body.SubjectTokenType,
-		ActorToken:        input.Body.ActorToken,
-		UserID:            input.Body.UserID,
-		UserEmail:         input.Body.UserEmail,
-		UserName:          input.Body.UserName,
-		ApplicationID:     input.Body.ApplicationID,
-		AdditionalClaims:  input.Body.AdditionalClaims,
-		Role:              input.Body.Role,
-		PrivilegeScope:    input.Body.PrivilegeScope,
-		Audience:          input.Body.Audience,
-		IssueRefreshToken: input.Body.IssueRefreshToken,
-		Resource:          []string(input.Body.Resource),
-		Code:              input.Body.Code,
-		CodeVerifier:      input.Body.CodeVerifier,
-		RedirectURI:       input.Body.RedirectURI,
-		RefreshTokenStr:   input.Body.RefreshToken,
-		AuthReqID:         input.Body.AuthReqID,
-		DPoPKeyThumbprint: dpopThumbprint,
+		GrantType:           input.Body.GrantType,
+		ClientID:            clientID,
+		ClientSecret:        clientSecret,
+		ClientAssertion:     input.Body.ClientAssertion,
+		ClientAssertionType: input.Body.ClientAssertionType,
+		Scope:               input.Body.Scope,
+		AccountID:           input.Body.AccountID,
+		ProjectID:           input.Body.ProjectID,
+		Assertion:           assertion,
+		APIKey:              input.Body.APIKey,
+		SubjectToken:        input.Body.SubjectToken,
+		SubjectTokenType:    input.Body.SubjectTokenType,
+		ActorToken:          input.Body.ActorToken,
+		UserID:              input.Body.UserID,
+		UserEmail:           input.Body.UserEmail,
+		UserName:            input.Body.UserName,
+		ApplicationID:       input.Body.ApplicationID,
+		AdditionalClaims:    input.Body.AdditionalClaims,
+		Role:                input.Body.Role,
+		PrivilegeScope:      input.Body.PrivilegeScope,
+		Audience:            input.Body.Audience,
+		IssueRefreshToken:   input.Body.IssueRefreshToken,
+		Resource:            []string(input.Body.Resource),
+		Code:                input.Body.Code,
+		CodeVerifier:        input.Body.CodeVerifier,
+		RedirectURI:         input.Body.RedirectURI,
+		RefreshTokenStr:     input.Body.RefreshToken,
+		AuthReqID:           input.Body.AuthReqID,
+		DPoPKeyThumbprint:   dpopThumbprint,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
 		code, desc, status := extractOAuthError(err)
-		return &TokenOutput{
+		out := &TokenOutput{
 			Status: status,
 			Body:   oauthErrorBody{Error: code, ErrorDescription: desc},
-		}, nil
+		}
+		// RFC 6749 §5.2 — echo the scheme back when the client authenticated
+		// (or tried to) via the Authorization header and we answer 401.
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
 	}
 
 	return &TokenOutput{Status: http.StatusOK, Body: accessToken}, nil
@@ -695,9 +766,9 @@ func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*Intros
 	// (Authorization header) or client_secret_post (body). When credentials are
 	// presented they MUST verify; a bad secret is rejected with invalid_client.
 	// When absent, the existing internal/tenant-header access path is preserved.
-	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
 	if err == nil {
-		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	}
 	if err != nil {
 		code, desc, status := extractOAuthError(err)
@@ -722,9 +793,9 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
 	// "always 200" contract holds (including for unknown/already-revoked tokens
 	// and anonymous internal-path callers).
-	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
 	if err == nil {
-		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	}
 	if err != nil {
 		code, desc, status := extractOAuthError(err)

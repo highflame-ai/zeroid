@@ -260,6 +260,13 @@ func runTests(m *testing.M) int {
 		Attestation: zeroid.AttestationConfig{
 			AllowPrivateIssuerEndpoints: true,
 		},
+		// Same reason as the two flags above: the private_key_jwt `jwks_uri`
+		// fixtures serve a key set from an httptest listener on 127.0.0.1,
+		// which the SSRF guard blocks by default. Production keeps this false —
+		// a registered jwks_uri is attacker-supplied wherever DCR is open.
+		ClientAuth: zeroid.ClientAuthConfig{
+			AllowPrivateJWKSEndpoints: true,
+		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a
 		// product deployer supplies. ZeroID itself ships product-agnostic.

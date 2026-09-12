@@ -177,12 +177,12 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if req.ClientID == "" {
 		return nil, oauthUnauthorized("ID-JAG redemption requires confidential client authentication", nil)
 	}
-	authedClient, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	// Same shared enforcement client_credentials uses: the registered
+	// token_endpoint_auth_method decides which credential is acceptable, so a
+	// key-based client can redeem an ID-JAG and a secret from one is refused.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req)
 	if err != nil {
-		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, oauthUnauthorized("invalid client credentials", err)
-		}
-		return nil, oauthUnauthorized("client verification failed", err)
+		return nil, err
 	}
 
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,

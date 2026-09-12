@@ -113,7 +113,7 @@ func TestCIMD_DeactivatedRegistryClientNotResurrected(t *testing.T) {
 	// 2. Introspection/revocation path: same client, same guarantee.
 	t.Run("VerifyPresentedClientAuth refuses deactivated client, no fetch", func(t *testing.T) {
 		before := atomic.LoadInt32(hits)
-		err := oauthSvc.VerifyPresentedClientAuth(ctx, deactivatedID, "")
+		err := oauthSvc.VerifyPresentedClientAuth(ctx, deactivatedID, "", "", "")
 		require.Error(t, err)
 		assert.Equal(t, int32(0), atomic.LoadInt32(hits)-before,
 			"deactivation must be a kill switch — no CIMD document fetch may occur")
@@ -126,7 +126,7 @@ func TestCIMD_DeactivatedRegistryClientNotResurrected(t *testing.T) {
 	//    gate (token oracle) — see VerifyPresentedClientAuth.
 	t.Run("VerifyPresentedClientAuth rejects unregistered CIMD client, no fetch", func(t *testing.T) {
 		before := atomic.LoadInt32(hits)
-		err := oauthSvc.VerifyPresentedClientAuth(ctx, unregisteredID, "")
+		err := oauthSvc.VerifyPresentedClientAuth(ctx, unregisteredID, "", "", "")
 		require.Error(t, err)
 		assert.Equal(t, int32(0), atomic.LoadInt32(hits)-before,
 			"an unregistered CIMD client_id must not trigger a document fetch on the inspection gate")

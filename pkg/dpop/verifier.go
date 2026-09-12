@@ -169,7 +169,20 @@ func (v *Verifier) Validate(ctx context.Context, r ValidateRequest) (*ValidateRe
 	// poison the replay store. Wall-clock expiry decouples replay defence
 	// from anything the client controls.
 	expiresAt := v.nowFn().Add(v.maxAge + v.clockSkew)
-	if err := v.store.Insert(ctx, proof.JTI, expiresAt); err != nil {
+	// Namespaced like every other producer sharing this table (actor-key proofs
+	// use "akp:", client assertions "cla:"). DPoP was the one writer inserting a
+	// raw, CLIENT-CHOSEN primary key, which meant the partition those prefixes
+	// describe did not actually exist: an unauthenticated caller — DPoP proof
+	// validation runs before any client authentication — could write a literal
+	// key belonging to another producer's namespace and lock out that producer's
+	// legitimate holder. Prefixing here is what makes the documented guarantee
+	// true rather than aspirational.
+	//
+	// Changing the stored key format needs no migration: DPoP rows live one
+	// proof lifetime (seconds), so pre-upgrade rows age out on their own. The
+	// only window is that a proof replayed ACROSS the upgrade boundary is not
+	// caught, which is bounded by that same lifetime and self-healing.
+	if err := v.store.Insert(ctx, "dpop:"+proof.JTI, expiresAt); err != nil {
 		var de *Error
 		if errors.As(err, &de) {
 			return nil, de

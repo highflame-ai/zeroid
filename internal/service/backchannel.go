@@ -394,6 +394,14 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	// arbitrary users under that client's identity. Require + verify the
 	// client_secret when the client is confidential. A client is confidential
 	// if it declares so or carries a stored secret hash (belt-and-suspenders).
+	//
+	// Before that test, refuse a client whose registered method this endpoint
+	// cannot enforce. The confidentiality test below is secret-shaped, and a
+	// key-based client matches neither half of it — it would skip
+	// authentication entirely and be free to fire notifier prompts.
+	if err := requireNonAssertionClientAuth(client); err != nil {
+		return nil, err
+	}
 	if client.ClientType == "confidential" || client.ClientSecret != "" {
 		if in.ClientSecret == "" {
 			return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
@@ -705,6 +713,12 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	if client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, in.ClientID); cerr == nil {
 		if !client.IsActive {
 			return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
+		}
+		// Same precondition as bc-authorize: the secret-shaped test below does
+		// not recognise a key-based client, which would therefore skip
+		// authentication on the poll path too.
+		if err := requireNonAssertionClientAuth(client); err != nil {
+			return nil, err
 		}
 		if client.ClientType == "confidential" || client.ClientSecret != "" {
 			if in.ClientSecret == "" {

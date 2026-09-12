@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -43,10 +44,16 @@ type DCRRegisterInput struct {
 		ClientName              string   `json:"client_name" required:"true" doc:"Human-readable client name"`
 		GrantTypes              []string `json:"grant_types,omitempty" doc:"OAuth grant types (defaults to client_credentials)"`
 		Scope                   string   `json:"scope,omitempty" doc:"Space-separated scope list"`
-		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty" doc:"client_secret_post or client_secret_basic"`
-		SoftwareID              string   `json:"software_id,omitempty" doc:"Software identifier (RFC 7591)"`
-		SoftwareVersion         string   `json:"software_version,omitempty" doc:"Software version (RFC 7591)"`
-		Contacts                []string `json:"contacts,omitempty" doc:"Operator contact emails"`
+		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty" doc:"client_secret_post, client_secret_basic, or private_key_jwt"`
+		// JWKS / JWKSURI supply the client's public keys for
+		// token_endpoint_auth_method=private_key_jwt (RFC 7591 §2). Exactly one
+		// may be present. A private_key_jwt registration receives NO
+		// client_secret in the response — the key is the credential.
+		JWKS            json.RawMessage `json:"jwks,omitempty" doc:"Inline JWK Set (required with private_key_jwt unless jwks_uri is given)"`
+		JWKSURI         string          `json:"jwks_uri,omitempty" doc:"URL of the client's JWK Set (alternative to jwks)"`
+		SoftwareID      string          `json:"software_id,omitempty" doc:"Software identifier (RFC 7591)"`
+		SoftwareVersion string          `json:"software_version,omitempty" doc:"Software version (RFC 7591)"`
+		Contacts        []string        `json:"contacts,omitempty" doc:"Operator contact emails"`
 		// RedirectURIs is accepted, persisted, and echoed back on GET/PUT
 		// for RFC 7591/7592 metadata-roundtrip fidelity, but it is not
 		// consulted at /oauth2/token time — DCR clients have no
@@ -85,10 +92,16 @@ type DCRUpdateInput struct {
 		GrantTypes              []string `json:"grant_types,omitempty"`
 		Scope                   string   `json:"scope,omitempty"`
 		TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
-		SoftwareID              string   `json:"software_id,omitempty"`
-		SoftwareVersion         string   `json:"software_version,omitempty"`
-		Contacts                []string `json:"contacts,omitempty"`
-		RedirectURIs            []string `json:"redirect_uris,omitempty"`
+		// RFC 7592 §3 PUT is a FULL replacement, so key material must be
+		// re-sent to be retained. Omitting jwks/jwks_uri on an update to a
+		// private_key_jwt client is therefore a request to remove its keys,
+		// and is refused by the same validation the register path runs.
+		JWKS            json.RawMessage `json:"jwks,omitempty"`
+		JWKSURI         string          `json:"jwks_uri,omitempty"`
+		SoftwareID      string          `json:"software_id,omitempty"`
+		SoftwareVersion string          `json:"software_version,omitempty"`
+		Contacts        []string        `json:"contacts,omitempty"`
+		RedirectURIs    []string        `json:"redirect_uris,omitempty"`
 	}
 }
 
@@ -150,7 +163,7 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 		return a.dcrErr(err), nil
 	}
 
-	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
+	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes, input.Body.JWKS, input.Body.JWKSURI)
 	if err != nil {
 		return a.dcrErr(err), nil
 	}
@@ -160,6 +173,8 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 		GrantTypes:              v.GrantTypes,
 		Scopes:                  v.Scopes,
 		TokenEndpointAuthMethod: v.AuthMethod,
+		JWKS:                    input.Body.JWKS,
+		JWKSURI:                 input.Body.JWKSURI,
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
@@ -168,6 +183,12 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 	if regErr != nil {
 		if errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
 			return a.dcrErr(&dcrError{status: http.StatusConflict, code: oautherror.InvalidClientMetadata, desc: "client already exists"}), nil
+		}
+		// Service-layer metadata validation (defense-in-depth behind
+		// validateDCRClientMetadata) is the registrant's error, not ours —
+		// RFC 7591 §3.2.2 invalid_client_metadata, 400.
+		if errors.Is(regErr, service.ErrInvalidClientMetadata) {
+			return a.dcrErr(&dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: regErr.Error()}), nil
 		}
 		log.Error().Err(regErr).Msg("dynamic client registration failed")
 		return a.dcrErr(&dcrError{status: http.StatusInternalServerError, code: oautherror.ServerError, desc: "failed to register client"}), nil
@@ -186,7 +207,12 @@ func (a *API) dcrRegisterOp(ctx context.Context, input *DCRRegisterInput) (*DCRO
 	// Register response = the standard GET/PUT shape (dcrClientResponse) plus
 	// the two values that are shown exactly once and never re-revealed.
 	body := a.dcrClientResponse(client)
-	body["client_secret"] = plainSecret
+	// A private_key_jwt client has no secret. RFC 7591 §3.2.1 makes
+	// client_secret OPTIONAL in the response; emitting an empty string would
+	// tell the registrant they hold a credential they do not.
+	if plainSecret != "" {
+		body["client_secret"] = plainSecret
+	}
 	body["registration_access_token"] = plainRegToken
 	return &DCROutput{Status: http.StatusCreated, Body: body}, nil
 }
@@ -200,11 +226,35 @@ func (a *API) dcrGetOp(ctx context.Context, input *DCRGetInput) (*DCROutput, err
 }
 
 func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutput, error) {
-	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
+	existing, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID)
+	if err != nil {
 		return a.dcrErr(err), nil
 	}
 
-	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes)
+	// RFC 7592 §3 PUT is a full replacement, and an omitted
+	// token_endpoint_auth_method falls back to the RFC 7591 §2 default. For a
+	// private_key_jwt client that combination is destructive and silent: a PUT
+	// changing only client_name would flip the method to client_secret_basic,
+	// wipe the registered key material, and leave the client with no credential
+	// at all — no secret was ever issued to a key-based client, and DCR has no
+	// endpoint to obtain one. The registrant could not recover it.
+	//
+	// Refusing beats silently retaining the stored method: retaining would make
+	// PUT no longer a full replacement, breaking §3 in the other direction. This
+	// says exactly what to resend, and dcrClientResponse now echoes jwks /
+	// jwks_uri on GET so the client can read the values it must restate.
+	if existing.TokenEndpointAuthMethod == "private_key_jwt" &&
+		input.Body.TokenEndpointAuthMethod != "private_key_jwt" {
+		return a.dcrErr(&dcrError{
+			status: http.StatusBadRequest,
+			code:   oautherror.InvalidClientMetadata,
+			desc: "this client is registered for private_key_jwt; an RFC 7592 PUT is a full replacement, so it must " +
+				"restate token_endpoint_auth_method=private_key_jwt together with its jwks or jwks_uri. Omitting them " +
+				"would leave the client with no usable credential",
+		}), nil
+	}
+
+	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes, input.Body.JWKS, input.Body.JWKSURI)
 	if err != nil {
 		return a.dcrErr(err), nil
 	}
@@ -214,6 +264,8 @@ func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutpu
 		GrantTypes:              v.GrantTypes,
 		Scopes:                  v.Scopes,
 		TokenEndpointAuthMethod: v.AuthMethod,
+		JWKS:                    input.Body.JWKS,
+		JWKSURI:                 input.Body.JWKSURI,
 		SoftwareID:              input.Body.SoftwareID,
 		SoftwareVersion:         input.Body.SoftwareVersion,
 		Contacts:                input.Body.Contacts,
@@ -260,7 +312,7 @@ type dcrValidatedFields struct {
 // required, grant_types subset of allowedDCRGrantTypes, token_endpoint_auth_method
 // constrained to client_secret_post / client_secret_basic. Defaults are filled
 // in. Returns the normalised fields or a *dcrError ready for dcrErr().
-func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantTypesIn []string) (*dcrValidatedFields, *dcrError) {
+func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantTypesIn []string, jwks json.RawMessage, jwksURI string) (*dcrValidatedFields, *dcrError) {
 	if clientName == "" {
 		return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "client_name is required"}
 	}
@@ -283,6 +335,18 @@ func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantT
 		authMethod = "client_secret_basic"
 	case "client_secret_post", "client_secret_basic":
 		// accepted
+	case "private_key_jwt":
+		// Accepted as of zeroid#206. The key material is validated at the
+		// service layer (validateDCRSubmittedFields → validateClientAuthMethod)
+		// so the admin and DCR registration paths share one rule; here we only
+		// need the shape check that lets us return a proper RFC 7591
+		// invalid_client_metadata instead of a generic 500.
+		if !service.HasInlineJWKS(jwks) && jwksURI == "" {
+			return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "token_endpoint_auth_method private_key_jwt requires jwks or jwks_uri"}
+		}
+		if service.HasInlineJWKS(jwks) && jwksURI != "" {
+			return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "jwks and jwks_uri must not both be present (RFC 7591 §2)"}
+		}
 	case "none":
 		return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "token_endpoint_auth_method 'none' is not supported; this server requires client authentication"}
 	default:
@@ -436,7 +500,7 @@ func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID s
 // registered client. Used for GET/PUT responses (secrets are not re-revealed
 // after the initial registration).
 func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
-	return map[string]any{
+	body := map[string]any{
 		"client_id":                  cl.ClientID,
 		"client_id_issued_at":        cl.CreatedAt.Unix(),
 		"client_secret_expires_at":   0,
@@ -446,4 +510,18 @@ func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
 		"token_endpoint_auth_method": cl.TokenEndpointAuthMethod,
 		"registration_client_uri":    a.issuer + "/oauth2/register/" + cl.ClientID,
 	}
+	// Echo the client's registered key material, on the same
+	// metadata-roundtrip-fidelity grounds redirect_uris is echoed. Without it a
+	// private_key_jwt client cannot read back what it registered, and therefore
+	// cannot restate it on the RFC 7592 PUT that a full replacement requires —
+	// leaving every PUT on a key client a choice between a 400 and losing its
+	// keys. Both values are public by construction (a JWK Set of public keys, or
+	// a URL that serves one), so echoing them exposes nothing.
+	if service.HasInlineJWKS(cl.JWKS) {
+		body["jwks"] = json.RawMessage(cl.JWKS)
+	}
+	if cl.JWKSURI != "" {
+		body["jwks_uri"] = cl.JWKSURI
+	}
+	return body
 }

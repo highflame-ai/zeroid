@@ -21,7 +21,7 @@ import (
 func TestRejectUnimplementedClientAuth(t *testing.T) {
 	t.Parallel()
 
-	allowed := []string{"", "none", "client_secret_post", "client_secret_basic"}
+	allowed := []string{"", "none", "client_secret_post", "client_secret_basic", "private_key_jwt"}
 	for _, method := range allowed {
 		t.Run("allows "+orUnset(method), func(t *testing.T) {
 			err := rejectUnimplementedClientAuth(&domain.OAuthClient{TokenEndpointAuthMethod: method})
@@ -43,8 +43,13 @@ func TestRejectUnimplementedClientAuth(t *testing.T) {
 		}
 	})
 
+	// private_key_jwt moved from `refused` to `allowed` above when
+	// verifyClientAssertion landed (zeroid#206 scope item 1). The guard's job
+	// never changed: refuse what this server cannot ENFORCE. The set of
+	// enforceable methods grew, so the answer for this one method flipped.
+	// Enforcement of private_key_jwt is covered by the client-assertion tests;
+	// what matters here is only that the guard no longer blocks it.
 	refused := map[string]string{
-		"private_key_jwt":             "the live gap — registration accepts it and stores keys, nothing validates them",
 		"client_secret_jwt":           "dropped in OAuth 2.1, will not be implemented",
 		"tls_client_auth":             "deferred pending an mTLS termination story",
 		"self_signed_tls_client_auth": "same family as tls_client_auth",

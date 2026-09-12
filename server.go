@@ -146,6 +146,12 @@ type Server struct {
 	// configured.
 	externalIssuerRegistry *service.ExternalIssuerRegistry
 
+	// clientJWKSCache holds a live JWKS client per registered client `jwks_uri`
+	// (RFC 7523 §2.2 private_key_jwt). Each cached entry owns a background
+	// refresh goroutine, so it must be closed on shutdown or those goroutines
+	// outlive the HTTP listener.
+	clientJWKSCache *service.ClientJWKSCache
+
 	// revocationDispatcher fans out RevocationEvents
 	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
 	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
@@ -419,6 +425,29 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// path: a failure here is logged and the token is still issued.
 	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
+	// RFC 7523 §2.2 private_key_jwt client authentication (zeroid#206).
+	//
+	// Both stores are wired UNCONDITIONALLY, for the same reason the ID-JAG
+	// replay store is: verifyClientAssertion fails closed on a nil replay store,
+	// so a deployment that conditionally skipped this wiring would reject every
+	// key-based client rather than degrade quietly — but the better outcome is
+	// simply never to be in that state.
+	//
+	// The jti ledger is the shared DPoP replay table; client-assertion jtis are
+	// namespaced "cla:" before insertion so they cannot collide with DPoP or
+	// actor-key-proof jtis living in the same table.
+	oauthSvc.SetClientAssertionReplayStore(postgres.NewDPoPReplayStore(db))
+	// The JWKS cache fetches from client-supplied `jwks_uri` values, which are
+	// attacker-controlled input wherever registration is open. It therefore gets
+	// the SAME SSRF-guarded HTTP client the external-issuer registry and the
+	// attestation OIDC verifier use — without it, a registered jwks_uri is a
+	// server-side request forgery primitive pointed at cloud metadata endpoints
+	// and internal services.
+	clientJWKSCache := service.NewClientJWKSCache(cfg.ClientAuth.JWKSCacheSize,
+		authjwt.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
+	)
+	oauthSvc.SetClientJWKSCache(clientJWKSCache)
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -438,6 +467,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
+	// Same flag that relaxes the SSRF guard on the jwks_uri fetch also relaxes
+	// the https requirement at registration — an http loopback URL would be
+	// useless if the dialer refused loopback, so the two move together.
+	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -609,6 +642,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		jwksSvc:                jwksSvc,
 		refreshTokenSvc:        refreshTokenSvc,
 		externalIssuerRegistry: externalIssuerRegistry,
+		clientJWKSCache:        clientJWKSCache,
 		revocationDispatcher:   revocationDispatcher,
 		cleanupWorker:          worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
 		adminAuthState:         authState,
@@ -733,6 +767,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri)
+	// AFTER the listener has drained. Closing before http.Shutdown lets an
+	// in-flight private_key_jwt verification repopulate the cache on its way
+	// out and spawn a refresh goroutine that nothing will ever close.
+	if s.clientJWKSCache != nil {
+		s.clientJWKSCache.Close()
 	}
 	if err := s.db.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -1446,6 +1487,31 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	}
 	if cfg.RefreshTokenTTL > 0 && cfg.RefreshTokenTTL != existing.RefreshTokenTTL {
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
+		updated = true
+	}
+	// token_endpoint_auth_method and its key material are reconciled like any
+	// other config-declared field. They were previously omitted, which was
+	// harmless while the method was decorative — it is now the field that
+	// decides which credential authenticates the client, so leaving it
+	// unreconciled meant a deployer could set private_key_jwt + jwks_uri in
+	// config, restart, get no error and no log line, and still be running a
+	// client_secret_basic client whose old secret authenticates on every grant.
+	// That is the same advertised-but-silently-inert failure this change exists
+	// to remove, reproduced on the programmatic registration surface.
+	//
+	// UpdateClient validates the resulting combination, so an incoherent config
+	// (private_key_jwt with no keys, or alongside a stored secret) surfaces as
+	// an error here rather than persisting.
+	if cfg.TokenEndpointAuthMethod != "" && cfg.TokenEndpointAuthMethod != existing.TokenEndpointAuthMethod {
+		existing.TokenEndpointAuthMethod = cfg.TokenEndpointAuthMethod
+		updated = true
+	}
+	if len(cfg.JWKS) > 0 && !bytes.Equal(cfg.JWKS, existing.JWKS) {
+		existing.JWKS = cfg.JWKS
+		updated = true
+	}
+	if cfg.JWKSURI != "" && cfg.JWKSURI != existing.JWKSURI {
+		existing.JWKSURI = cfg.JWKSURI
 		updated = true
 	}
 	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
