@@ -152,6 +152,80 @@ type OAuthClient struct {
 	UpdatedAt time.Time `bun:"updated_at"  json:"updated_at"`
 }
 
+// ── Client-authentication predicates ─────────────────────────────────────────
+//
+// `client_type` used to carry a usable implication: a "public" client holds no
+// credential. RFC 7523 §2.2 private_key_jwt broke it (zeroid#206) — such a
+// client holds a real credential, its signing key, while being neither
+// confidential nor secret-bearing. Worse, the value it lands on depends on which
+// path registered it, so it is not even consistently wrong.
+//
+// These predicates exist so that no security decision keys off the raw column
+// again. Each names the question it answers, derives it from the REGISTERED
+// authentication method, and keeps the old column only as a fallback for rows
+// that predate the method being meaningful. Adding a bare `ClientType ==` check
+// on an auth path is what zeroid#348 exists to prevent; a ratchet test enforces
+// it.
+
+// authMethodPrivateKeyJWT is the RFC 7591 token_endpoint_auth_method value for
+// key-based client authentication. Declared here, not in internal/service, so
+// the predicates below can be a property of the type rather than of one package.
+const authMethodPrivateKeyJWT = "private_key_jwt"
+
+// UsesPrivateKeyJWT reports whether this client authenticates with an RFC 7523
+// §2.2 client assertion rather than a shared secret.
+func (c *OAuthClient) UsesPrivateKeyJWT() bool {
+	return c != nil && c.TokenEndpointAuthMethod == authMethodPrivateKeyJWT
+}
+
+// RequiresClientAuthentication reports whether this client MUST prove a
+// credential before a grant proceeds — the question the old
+// `ClientType == "confidential" || ClientSecret != ""` test was reaching for,
+// asked correctly.
+//
+// Derived from the registered method first, because that is the authoritative
+// statement of how the client authenticates. The ClientType/ClientSecret
+// fallback covers rows written before the method column was enforced (it is
+// unset on those), and is belt-and-braces against an inconsistent row carrying a
+// secret with a non-confidential type — which would otherwise skip verification.
+func (c *OAuthClient) RequiresClientAuthentication() bool {
+	if c == nil {
+		return false
+	}
+	switch c.TokenEndpointAuthMethod {
+	case authMethodPrivateKeyJWT, "client_secret_post", "client_secret_basic":
+		return true
+	case "none":
+		// Explicitly credential-less: PKCE is the proof of possession. Fall
+		// through to the fallback anyway — a "none" client that somehow carries
+		// a stored secret is an inconsistent row, and treating it as
+		// credential-less is the unsafe direction.
+	}
+	return c.ClientType == "confidential" || c.ClientSecret != ""
+}
+
+// MayUseInteractiveFlows reports whether this client may obtain an authorization
+// code at /oauth2/authorize.
+//
+// The rule it replaces was `ClientType == "public"`, described in its own
+// comment as the inherited pre-CIMD GetPublicClient contract rather than a
+// reasoned property. That is preserved: a secret-based confidential client still
+// cannot obtain a code here, and widening that is deliberately NOT part of
+// zeroid#348.
+//
+// What changes is that a key-based client qualifies regardless of the
+// client_type its registration path happened to assign. A private_key_jwt client
+// running authorization_code is ordinary OAuth — it authenticates at the token
+// endpoint with its key — and gating it on a column whose value differs between
+// the admin and DCR paths made the same client legal or illegal depending on how
+// it was created.
+func (c *OAuthClient) MayUseInteractiveFlows() bool {
+	if c == nil {
+		return false
+	}
+	return c.ClientType == "public" || c.UsesPrivateKeyJWT()
+}
+
 // ProofToken represents a persisted WIMSE Proof Token (WPT).
 // WPTs are single-use; the nonce column has a DB UNIQUE constraint that provides
 // atomic replay prevention without a separate pre-check query.

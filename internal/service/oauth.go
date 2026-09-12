@@ -1818,7 +1818,7 @@ func checkAuthorizeClientPolicy(
 	// and deactivation stays a kill switch. CIMD-synthesized clients are always
 	// active and public (see synthesizeCIMDClient), so this is not a carve-out
 	// they need — it applies to every path.
-	if !client.IsActive || client.ClientType != "public" {
+	if !client.IsActive || !client.MayUseInteractiveFlows() {
 		return false, oauthUnauthorized("unknown or inactive client_id", nil)
 	}
 
@@ -3002,12 +3002,13 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
 		return nil
 	}
-	// A client is confidential if it declares so OR carries a stored secret
-	// hash. The second clause is belt-and-suspenders against an inconsistent
-	// row (secret set but client_type != "confidential"), which would
-	// otherwise skip secret verification and allow an unintended bypass. Same
-	// test the CIBA bc-authorize/redeem paths use.
-	if client.ClientType != "confidential" && client.ClientSecret == "" {
+	// Credential-less (public PKCE) clients pass through — they prove
+	// possession by other means: PKCE on authorization_code, the refresh-token
+	// string itself on refresh_token. The predicate derives this from the
+	// registered method, with the old client_type/secret test surviving inside
+	// it as the fallback for rows predating that column. Same question the CIBA
+	// bc-authorize/redeem paths ask.
+	if !client.RequiresClientAuthentication() {
 		return nil
 	}
 	if clientSecret == "" {

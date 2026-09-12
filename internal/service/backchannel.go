@@ -402,7 +402,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	if err := requireNonAssertionClientAuth(client); err != nil {
 		return nil, err
 	}
-	if client.ClientType == "confidential" || client.ClientSecret != "" {
+	if client.RequiresClientAuthentication() {
 		if in.ClientSecret == "" {
 			return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 		}
@@ -720,7 +720,7 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		if err := requireNonAssertionClientAuth(client); err != nil {
 			return nil, err
 		}
-		if client.ClientType == "confidential" || client.ClientSecret != "" {
+		if client.RequiresClientAuthentication() {
 			if in.ClientSecret == "" {
 				return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 			}
