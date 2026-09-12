@@ -187,7 +187,7 @@ func TestRequireNonAssertionClientAuth(t *testing.T) {
 	})
 }
 
-// hasInlineJWKS distinguishes "no inline key set" from "an inline key set",
+// HasInlineJWKS distinguishes "no inline key set" from "an inline key set",
 // against the shape real stored data actually has.
 //
 // This is not a theoretical edge. `jwks` is a nullable jsonb column and bun
@@ -205,14 +205,14 @@ func TestHasInlineJWKS(t *testing.T) {
 
 	absent := []string{"", "null", " null ", "\n", "  "}
 	for _, raw := range absent {
-		require.False(t, hasInlineJWKS(json.RawMessage(raw)),
+		require.False(t, HasInlineJWKS(json.RawMessage(raw)),
 			"%q must read as ABSENT — this is what a jwks-less client round-trips to", raw)
 	}
-	require.False(t, hasInlineJWKS(nil))
+	require.False(t, HasInlineJWKS(nil))
 
 	present := []string{`{"keys":[]}`, `{"keys":[{"kty":"EC"}]}`, `{}`}
 	for _, raw := range present {
-		require.True(t, hasInlineJWKS(json.RawMessage(raw)),
+		require.True(t, HasInlineJWKS(json.RawMessage(raw)),
 			"%q must read as PRESENT (validity is a separate question)", raw)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -411,4 +412,71 @@ func TestVerifyClientAssertion_RejectsSymmetricAlgorithm(t *testing.T) {
 	err = svc.verifyClientAssertion(context.Background(), client, "client-alg",
 		string(signed), clientAssertionTypeJWTBearer)
 	wantOAuthError(t, err, oautherror.InvalidClient)
+}
+
+// The single-use ledger is keyed per CLIENT, not globally on the bare jti.
+//
+// RFC 7519 §4.1.7 makes jti uniqueness the ISSUER's responsibility, and for
+// client authentication the issuer is the client — so two clients may
+// legitimately choose the same value. Keying the shared table on the bare jti
+// made one client's assertion lock out another's, surfacing to the victim as
+// "client_assertion has already been used (replay)": an error that reads as an
+// attack on them. No adversary needed — two clients deriving jti from a
+// timestamp collide whenever they authenticate in the same second.
+func TestVerifyClientAssertion_JTIIsScopedPerClient(t *testing.T) {
+	t.Parallel()
+	replay := newFakeReplay()
+	svc := clientAssertionSvc(replay)
+
+	keyA, keyB := newECKey(t), newECKey(t)
+	clientA := privateKeyJWTClient(t, "client-a", keyA)
+	clientB := privateKeyJWTClient(t, "client-b", keyB)
+
+	// Both clients pick the same, entirely ordinary, jti.
+	require.NoError(t, svc.verifyClientAssertion(context.Background(), clientA, "client-a",
+		mintAssertion(t, keyA, "client-a", assertionOpts{jti: "1"}), clientAssertionTypeJWTBearer))
+
+	require.NoError(t, svc.verifyClientAssertion(context.Background(), clientB, "client-b",
+		mintAssertion(t, keyB, "client-b", assertionOpts{jti: "1"}),
+		clientAssertionTypeJWTBearer),
+		"client B must not be locked out by client A's unrelated choice of jti")
+
+	// Single-use still binds WITHIN a client.
+	err := svc.verifyClientAssertion(context.Background(), clientA, "client-a",
+		mintAssertion(t, keyA, "client-a", assertionOpts{jti: "1"}), clientAssertionTypeJWTBearer)
+	wantOAuthError(t, err, oautherror.InvalidClient)
+}
+
+// The ledger key must be fixed-length whatever the client sends. The storage
+// column is VARCHAR(512), and an over-long key failed the insert with SQLSTATE
+// 22001 — not the duplicate-key sentinel — so caller-controlled input produced a
+// 500 on the public token endpoint.
+func TestClientAssertionReplayKey_IsBoundedAndPerClient(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("x", 4096)
+	require.LessOrEqual(t, len(clientAssertionReplayKey(long, long)), 64,
+		"the ledger key must not grow with caller input — the column is VARCHAR(512)")
+
+	// Distinctness across both components.
+	require.NotEqual(t, clientAssertionReplayKey("a", "j"), clientAssertionReplayKey("b", "j"))
+	require.NotEqual(t, clientAssertionReplayKey("a", "j1"), clientAssertionReplayKey("a", "j2"))
+
+	// No delimiter ambiguity: client_id is operator-supplied and may contain the
+	// separator a naive join would use.
+	require.NotEqual(t, clientAssertionReplayKey("a", "b:c"), clientAssertionReplayKey("a:b", "c"))
+}
+
+// An absurd jti is refused as invalid_client rather than doing work on it.
+func TestVerifyClientAssertion_RejectsOverlongJTI(t *testing.T) {
+	t.Parallel()
+	key := newECKey(t)
+	svc := clientAssertionSvc(newFakeReplay())
+	client := privateKeyJWTClient(t, "client-longjti", key)
+
+	err := svc.verifyClientAssertion(context.Background(), client, "client-longjti",
+		mintAssertion(t, key, "client-longjti", assertionOpts{jti: strings.Repeat("x", 600)}),
+		clientAssertionTypeJWTBearer)
+	oe := wantOAuthError(t, err, oautherror.InvalidClient)
+	require.Equal(t, 401, oe.HTTPStatus, "caller-controlled input must not produce a 5xx")
 }

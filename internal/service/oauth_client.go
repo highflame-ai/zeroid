@@ -432,7 +432,7 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 		return fmt.Errorf("%w: token_endpoint_auth_method %q is not supported", ErrInvalidClientMetadata, authMethod)
 	}
 
-	hasInline := hasInlineJWKS(jwks)
+	hasInline := HasInlineJWKS(jwks)
 	hasURI := jwksURI != ""
 
 	// RFC 7591 §2: "The jwks parameter and the jwks_uri parameter MUST NOT

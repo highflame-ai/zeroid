@@ -475,3 +475,83 @@ func TestPrivateKeyJWT_JWKSURIMustNotBePlaintextRemote(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 }
+
+// A private_key_jwt client registered via DCR must survive RFC 7592 management,
+// and must be able to read back the key material it has to restate.
+//
+// Before this, a PUT changing only client_name returned 200 and silently: flipped
+// token_endpoint_auth_method to the RFC 7591 §2 default (client_secret_basic),
+// wiped the registered key material, and left the client with NO credential at
+// all — a key-based client is never issued a secret, and DCR has no endpoint to
+// obtain one. The registrant could not recover; only an admin rotate-secret
+// revived it. That was newly reachable, because DCR could not produce a
+// key-based client until this PR.
+func TestPrivateKeyJWT_DCRManagementDoesNotBrickTheClient(t *testing.T) {
+	iat := issueClientRegisterToken(t)
+	key := generateKey(t)
+
+	reg := post(t, "/oauth2/register", map[string]any{
+		"client_name":                "dcr-key-client",
+		"grant_types":                []string{"client_credentials"},
+		"scope":                      "data:read",
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, key),
+	}, map[string]string{"Authorization": "Bearer " + iat})
+	require.Equal(t, http.StatusCreated, reg.StatusCode)
+	body := decode(t, reg)
+	_ = reg.Body.Close()
+
+	clientID, _ := body["client_id"].(string)
+	regToken, _ := body["registration_access_token"].(string)
+	require.NotEmpty(t, clientID)
+	assert.Empty(t, body["client_secret"], "a key-based DCR client gets no secret")
+
+	mgmt := map[string]string{"Authorization": "Bearer " + regToken}
+
+	t.Run("GET echoes the registered key material", func(t *testing.T) {
+		// Without this the client cannot discover what it must restate on PUT,
+		// making every PUT a choice between a 400 and losing its keys.
+		resp := get(t, "/oauth2/register/"+clientID, mgmt)
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		got := decode(t, resp)
+		assert.NotNil(t, got["jwks"], "GET must echo jwks for metadata-roundtrip fidelity")
+		assert.Equal(t, "private_key_jwt", got["token_endpoint_auth_method"])
+	})
+
+	t.Run("a name-only PUT is refused, not silently destructive", func(t *testing.T) {
+		resp := doRequest(t, http.MethodPut, "/oauth2/register/"+clientID, map[string]any{
+			"client_name": "renamed",
+		}, mgmt)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+			"a PUT omitting the auth method would strip this client's only credential")
+		assert.Equal(t, "invalid_client_metadata", decode(t, resp)["error"])
+	})
+
+	t.Run("the client still authenticates after the refused PUT", func(t *testing.T) {
+		resp := post(t, "/oauth2/token/introspect", map[string]any{
+			"token":                 "zid_at_whatever",
+			"client_id":             clientID,
+			"client_assertion":      clientAssertionFor(t, key, clientID),
+			"client_assertion_type": clientAssertionType,
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"the refused PUT must have left the client's key material intact")
+	})
+
+	t.Run("a PUT that restates the method and keys succeeds", func(t *testing.T) {
+		resp := doRequest(t, http.MethodPut, "/oauth2/register/"+clientID, map[string]any{
+			"client_name":                "renamed-properly",
+			"grant_types":                []string{"client_credentials"},
+			"scope":                      "data:read",
+			"token_endpoint_auth_method": "private_key_jwt",
+			"jwks":                       clientJWKS(t, key),
+		}, mgmt)
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "renamed-properly", decode(t, resp)["client_name"])
+	})
+}

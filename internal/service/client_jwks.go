@@ -137,7 +137,7 @@ func (c *ClientJWKSCache) Close() {
 	c.lru.Init()
 }
 
-// hasInlineJWKS reports whether raw carries an actual inline JWK Set, as
+// HasInlineJWKS reports whether raw carries an actual inline JWK Set, as
 // opposed to being absent.
 //
 // The length check this replaces (`len(raw) > 0`) is wrong against real stored
@@ -151,7 +151,7 @@ func (c *ClientJWKSCache) Close() {
 // registration, and never authenticate at all — a failure no in-memory unit test
 // would surface, because a hand-built domain.OAuthClient has a genuinely nil
 // JWKS while a database round trip does not.
-func hasInlineJWKS(raw json.RawMessage) bool {
+func HasInlineJWKS(raw json.RawMessage) bool {
 	trimmed := bytes.TrimSpace(raw)
 	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
@@ -166,7 +166,7 @@ func hasInlineJWKS(raw json.RawMessage) bool {
 // unloadable issuer JWKS. A client cannot distinguish the two from the response,
 // but the server's own metrics can.
 func (s *OAuthService) clientVerificationKeys(ctx context.Context, client *domain.OAuthClient) (jwk.Set, error) {
-	hasInline := hasInlineJWKS(client.JWKS)
+	hasInline := HasInlineJWKS(client.JWKS)
 	hasURI := client.JWKSURI != ""
 
 	switch {

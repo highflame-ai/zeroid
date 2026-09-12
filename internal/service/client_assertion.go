@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -40,6 +42,37 @@ const maxClientAssertionLifetime = 5 * time.Minute
 // deliberately small because client assertions are machine-minted seconds
 // before use, not carried across a user session.
 const clientAssertionClockSkew = 60 * time.Second
+
+// maxClientAssertionJTILength bounds the client-supplied jti. 255 is far above
+// any real value (a UUID is 36) and far below the ledger column's capacity.
+const maxClientAssertionJTILength = 255
+
+// clientAssertionReplayKey derives the single-use ledger key for one client's
+// assertion. Two properties matter, and the obvious `"cla:" + jti` had neither.
+//
+// SCOPED PER CLIENT. RFC 7519 §4.1.7 makes jti uniqueness the ISSUER's
+// responsibility, and for client authentication the issuer is the client — so
+// two clients may legitimately pick the same value. Keying the shared ledger on
+// the bare jti made one client's assertion lock out another's: a client with its
+// own key and its own validly-signed assertion would be refused with
+// "client_assertion has already been used (replay)", an error that reads as an
+// attack on the victim. It does not take an adversary — two clients whose
+// libraries derive jti from a timestamp collide whenever they authenticate in
+// the same second. (An attacker holding any registration could also pre-burn
+// common values to deny service, though only by spending a fully valid
+// assertion per value and re-spending it every lifetime, since the insert runs
+// after verification.)
+//
+// FIXED LENGTH. The ledger column is VARCHAR(512); a longer key fails the insert
+// with SQLSTATE 22001, which is not the duplicate-key sentinel and so surfaced
+// as a 500 on the public token endpoint from caller-controlled input. Hashing
+// also removes the delimiter ambiguity a plain `clientID + ":" + jti` join would
+// introduce — client_id is operator-supplied and may itself contain the
+// separator, so ("a", "b:c") and ("a:b", "c") must not fold together.
+func clientAssertionReplayKey(clientID, jti string) string {
+	sum := sha256.Sum256([]byte(clientID + "\x00" + jti))
+	return "cla:" + base64.RawURLEncoding.EncodeToString(sum[:])
+}
 
 // clientAssertionReplayGuard records single-use client-assertion jti values so
 // a captured assertion cannot be redeemed twice inside its (already bounded)
@@ -355,6 +388,14 @@ func (s *OAuthService) verifyClientAssertion(
 	if !ok || jti == "" {
 		return oauthUnauthorized("client_assertion missing required jti claim", nil)
 	}
+	// Bound the client-supplied jti before it reaches the ledger. The value is
+	// hashed below so an over-long one can no longer overflow the storage
+	// column, but an explicit ceiling turns absurd input into a clear
+	// invalid_client instead of quietly doing work on it.
+	if len(jti) > maxClientAssertionJTILength {
+		return oauthUnauthorized(fmt.Sprintf(
+			"client_assertion jti exceeds %d characters", maxClientAssertionJTILength), nil)
+	}
 
 	// Single-use enforcement, LAST — after every other check has passed, so a
 	// malformed or unverifiable assertion cannot burn a jti and thereby lock out
@@ -367,7 +408,7 @@ func (s *OAuthService) verifyClientAssertion(
 	if s.clientAssertionReplay == nil {
 		return oauthServerError("client assertion replay store is not configured", nil)
 	}
-	if err := s.clientAssertionReplay.Insert(ctx, "cla:"+jti, exp); err != nil {
+	if err := s.clientAssertionReplay.Insert(ctx, clientAssertionReplayKey(clientID, jti), exp); err != nil {
 		if errors.Is(err, dpop.ErrReplay) {
 			return oauthUnauthorized("client_assertion has already been used (replay)", nil)
 		}

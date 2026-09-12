@@ -226,8 +226,32 @@ func (a *API) dcrGetOp(ctx context.Context, input *DCRGetInput) (*DCROutput, err
 }
 
 func (a *API) dcrUpdateOp(ctx context.Context, input *DCRUpdateInput) (*DCROutput, error) {
-	if _, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID); err != nil {
+	existing, err := a.authorizeDCRManagement(ctx, input.Authorization, input.ClientID)
+	if err != nil {
 		return a.dcrErr(err), nil
+	}
+
+	// RFC 7592 §3 PUT is a full replacement, and an omitted
+	// token_endpoint_auth_method falls back to the RFC 7591 §2 default. For a
+	// private_key_jwt client that combination is destructive and silent: a PUT
+	// changing only client_name would flip the method to client_secret_basic,
+	// wipe the registered key material, and leave the client with no credential
+	// at all — no secret was ever issued to a key-based client, and DCR has no
+	// endpoint to obtain one. The registrant could not recover it.
+	//
+	// Refusing beats silently retaining the stored method: retaining would make
+	// PUT no longer a full replacement, breaking §3 in the other direction. This
+	// says exactly what to resend, and dcrClientResponse now echoes jwks /
+	// jwks_uri on GET so the client can read the values it must restate.
+	if existing.TokenEndpointAuthMethod == "private_key_jwt" &&
+		input.Body.TokenEndpointAuthMethod != "private_key_jwt" {
+		return a.dcrErr(&dcrError{
+			status: http.StatusBadRequest,
+			code:   oautherror.InvalidClientMetadata,
+			desc: "this client is registered for private_key_jwt; an RFC 7592 PUT is a full replacement, so it must " +
+				"restate token_endpoint_auth_method=private_key_jwt together with its jwks or jwks_uri. Omitting them " +
+				"would leave the client with no usable credential",
+		}), nil
 	}
 
 	v, err := validateDCRClientMetadata(input.Body.ClientName, input.Body.Scope, input.Body.TokenEndpointAuthMethod, input.Body.GrantTypes, input.Body.JWKS, input.Body.JWKSURI)
@@ -317,10 +341,10 @@ func validateDCRClientMetadata(clientName, scopeStr, authMethodIn string, grantT
 		// so the admin and DCR registration paths share one rule; here we only
 		// need the shape check that lets us return a proper RFC 7591
 		// invalid_client_metadata instead of a generic 500.
-		if len(jwks) == 0 && jwksURI == "" {
+		if !service.HasInlineJWKS(jwks) && jwksURI == "" {
 			return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "token_endpoint_auth_method private_key_jwt requires jwks or jwks_uri"}
 		}
-		if len(jwks) > 0 && jwksURI != "" {
+		if service.HasInlineJWKS(jwks) && jwksURI != "" {
 			return nil, &dcrError{status: http.StatusBadRequest, code: oautherror.InvalidClientMetadata, desc: "jwks and jwks_uri must not both be present (RFC 7591 §2)"}
 		}
 	case "none":
@@ -476,7 +500,7 @@ func (a *API) authorizeDCRManagement(ctx context.Context, authHeader, clientID s
 // registered client. Used for GET/PUT responses (secrets are not re-revealed
 // after the initial registration).
 func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
-	return map[string]any{
+	body := map[string]any{
 		"client_id":                  cl.ClientID,
 		"client_id_issued_at":        cl.CreatedAt.Unix(),
 		"client_secret_expires_at":   0,
@@ -486,4 +510,18 @@ func (a *API) dcrClientResponse(cl *domain.OAuthClient) map[string]any {
 		"token_endpoint_auth_method": cl.TokenEndpointAuthMethod,
 		"registration_client_uri":    a.issuer + "/oauth2/register/" + cl.ClientID,
 	}
+	// Echo the client's registered key material, on the same
+	// metadata-roundtrip-fidelity grounds redirect_uris is echoed. Without it a
+	// private_key_jwt client cannot read back what it registered, and therefore
+	// cannot restate it on the RFC 7592 PUT that a full replacement requires —
+	// leaving every PUT on a key client a choice between a 400 and losing its
+	// keys. Both values are public by construction (a JWK Set of public keys, or
+	// a URL that serves one), so echoing them exposes nothing.
+	if service.HasInlineJWKS(cl.JWKS) {
+		body["jwks"] = json.RawMessage(cl.JWKS)
+	}
+	if cl.JWKSURI != "" {
+		body["jwks_uri"] = cl.JWKSURI
+	}
+	return body
 }

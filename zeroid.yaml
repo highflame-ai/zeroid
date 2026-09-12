@@ -124,12 +124,6 @@ backchannel:
   # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
   allow_private_notification_endpoints: false
 
-# CIMD — Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document).
-# Lets an OAuth client onboard with ZERO pre-registration by using a stable
-# https:// URL as its client_id. On the authorization_code flow, ZeroID fetches
-# and validates the JSON metadata document published at that URL and treats it as
-# an ephemeral public PKCE client. This is the MCP Authorization 2025-11-25
-# preferred default for open agent ecosystems. See docs/cimd.md.
 # OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
 # proves its identity with a JWT signed by a key it published rather than with a
 # shared secret.
@@ -154,6 +148,13 @@ client_auth:
   # Env: ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE
   jwks_cache_size: 0
 
+
+# CIMD — Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document).
+# Lets an OAuth client onboard with ZERO pre-registration by using a stable
+# https:// URL as its client_id. On the authorization_code flow, ZeroID fetches
+# and validates the JSON metadata document published at that URL and treats it as
+# an ephemeral public PKCE client. This is the MCP Authorization 2025-11-25
+# preferred default for open agent ecosystems. See docs/cimd.md.
 cimd:
   # On by default so agents can onboard against this AS without registration.
   # Env: ZEROID_CIMD_ENABLED
