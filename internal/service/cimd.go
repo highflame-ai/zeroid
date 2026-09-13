@@ -152,12 +152,31 @@ type cimdMetadataDocument struct {
 //
 // It is applied as an INTERSECTION over the document's list, not as a gate on
 // it. The distinction is the whole of zeroid#344: the invariant worth keeping is
-// that a zero-registration client cannot OBTAIN an M2M or delegation grant, and
-// that is enforced by what lands in the synthesized client's GrantTypes — which
-// the token endpoint checks (oauth.go client_credentials / authorization_code /
-// refresh_token gates all read it). Refusing to PARSE a document that merely
-// mentions such a grant enforced nothing extra, and broke every client whose
-// published document listed a grant we simply do not implement.
+// that a zero-registration client cannot OBTAIN an M2M or delegation grant.
+// Refusing to PARSE a document that merely mentions such a grant enforced
+// nothing extra, and broke every client whose published document listed a grant
+// we simply do not implement.
+//
+// Two things carry that invariant, and it is worth being exact about which,
+// because only the first is unconditional:
+//
+//  1. effectiveCIMDGrantTypes filters through this map by exact string match, so
+//     a synthesized client's GrantTypes is PROVABLY a subset of these two
+//     values. No document can put a third string there. This holds regardless of
+//     what any consumer does with it.
+//  2. Reachability. Only three call sites can ever yield a CIMD-synthesized
+//     client — resolveClientRegistryOrCIMD is called from IssueAuthCode, the
+//     authorization_code exchange, and the refresh_token rotation, and nowhere
+//     else. The other six token-endpoint dispatch arms (jwt-bearer,
+//     token-exchange, api_key, CIBA, ID-JAG, custom grants via RegisterGrant)
+//     either resolve registry-only or never read a client at all, so a CIMD
+//     client_id buys nothing on them.
+//
+// (2) is the contingent half: a future grant that BOTH resolves through
+// resolveClientRegistryOrCIMD AND derives authority from the client would not be
+// covered by any grant-type check, because most arms have none. A ratchet test
+// (TestCIMDClientReachabilityIsBounded) fails if a fourth call site appears, so
+// that assumption cannot rot silently.
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
@@ -589,9 +608,35 @@ func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
 	return ttl
 }
 
-// synthesizeCIMDClient validates the document against the fetch URL and turns it
-// into an ephemeral public OAuth client. Pure (no I/O) so it is unit-testable in
-// isolation. `now` timestamps the synthesized record.
+// maxLoggedDroppedGrantTypes and maxLoggedGrantTypeLen bound what a CIMD
+// document can write into the log. Both the number of entries and their contents
+// are attacker-chosen — the document is unauthenticated, unregistered, and
+// capped only by defaultCIMDMaxDocumentBytes — so an unbounded log line lets one
+// resolution emit most of a 5 KiB document as log text, and distinct URLs
+// sidestep the resolution cache. internal/handler applies the same
+// countermeasure to the attacker-supplied grant_type on the token endpoint.
+const (
+	maxLoggedDroppedGrantTypes = 8
+	maxLoggedGrantTypeLen      = 64
+)
+
+// truncateGrantTypesForLog caps the slice length and each entry's length,
+// appending a marker when either bound trims something so the log does not
+// silently understate what the document declared.
+func truncateGrantTypesForLog(gts []string) []string {
+	out := make([]string, 0, min(len(gts), maxLoggedDroppedGrantTypes)+1)
+	for _, gt := range gts[:min(len(gts), maxLoggedDroppedGrantTypes)] {
+		if len(gt) > maxLoggedGrantTypeLen {
+			gt = gt[:maxLoggedGrantTypeLen] + "…"
+		}
+		out = append(out, gt)
+	}
+	if len(gts) > maxLoggedDroppedGrantTypes {
+		out = append(out, fmt.Sprintf("…and %d more", len(gts)-maxLoggedDroppedGrantTypes))
+	}
+	return out
+}
+
 // effectiveCIMDGrantTypes narrows a document's grant_types to the set this
 // server will actually offer a CIMD client, returning the kept set and the
 // dropped entries (in document order, de-duplicated).
@@ -607,11 +652,10 @@ func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
 // dropping that grant for every other server it works with.
 //
 // The kept set is what gets stored on the synthesized client, and that is what
-// carries the security property: the token endpoint gates client_credentials,
-// authorization_code and refresh_token on the client's own GrantTypes, so a
-// grant absent from this result cannot be obtained. Returning the raw document
-// list instead would hand a zero-registration client whatever it asked for,
-// which is precisely the hole the old allow-list existed to close.
+// carries the security property — see cimdAllowedGrantTypes for exactly how.
+// Returning the raw document list instead would hand a zero-registration client
+// whatever it asked for, which is precisely the hole the old allow-list existed
+// to close.
 //
 // An empty or absent list defaults to [authorization_code] (draft §2). The
 // caller decides what a missing authorization_code means — this narrows only.
@@ -635,6 +679,11 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 	return kept, dropped
 }
 
+// synthesizeCIMDClient validates the document against the fetch URL and turns it
+// into an ephemeral public OAuth client. No network or storage I/O, so it is
+// unit-testable in isolation; it does emit one log line when a document declares
+// grant types this server will not offer. `now` timestamps the synthesized
+// record.
 func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (*domain.OAuthClient, error) {
 	// Self-reference (draft §4): the document's own client_id MUST equal the URL
 	// it was fetched from. This is what stops an attacker from hosting a document
@@ -687,7 +736,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		// server log is the only place the narrowing is visible.
 		log.Info().
 			Str("client_id", clientID).
-			Strs("dropped_grant_types", dropped).
+			Strs("dropped_grant_types", truncateGrantTypesForLog(dropped)).
 			Strs("effective_grant_types", grantTypes).
 			Msg("CIMD: ignored grant types this server does not offer CIMD clients")
 	}

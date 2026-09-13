@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -1010,4 +1013,133 @@ func TestSynthesizeCIMDClient_StillRejectsWhenNoSupportedGrantRemains(t *testing
 			t.Errorf("grant_types %v leaves no authorization_code; want ErrCIMDInvalidDocument, got %v", declared, err)
 		}
 	}
+}
+
+// RATCHET: only the interactive legs may yield a CIMD-synthesized client.
+//
+// zeroid#344 made a CIMD document's grant_types advisory-with-narrowing rather
+// than fatal, and the safety of that rests on two things. The first is
+// unconditional: effectiveCIMDGrantTypes filters by exact match, so a CIMD
+// client's GrantTypes is provably a subset of cimdAllowedGrantTypes.
+//
+// The second is REACHABILITY, and it is contingent. Most token-endpoint dispatch
+// arms do not check client.GrantTypes at all — jwt-bearer, token-exchange,
+// api_key, CIBA, ID-JAG and custom grants registered via Server.RegisterGrant
+// have no such gate. They are safe today only because a CIMD client cannot reach
+// them: resolveClientRegistryOrCIMD is called from exactly three places, all on
+// the authorization_code / refresh_token legs.
+//
+// A future grant that BOTH resolves through resolveClientRegistryOrCIMD AND
+// derives authority from the resolved client would bypass every grant-type check
+// silently. This test fails when a fourth call site appears, so that assumption
+// has to be re-examined deliberately rather than eroding unnoticed.
+func TestCIMDClientReachabilityIsBounded(t *testing.T) {
+	// Enclosing functions permitted to resolve a client that may be CIMD.
+	allowed := map[string]bool{
+		// The authorize leg. Gates on client.GrantTypes via
+		// checkAuthorizeClientPolicy -> oauth.go:1840.
+		"ResolveAuthorizeClient": true,
+		// The code->token exchange. Gates at oauth.go:2145.
+		"authorizationCode": true,
+		// Rotation, which re-resolves the document so a republished one acts as
+		// the revocation lever. Gates the CIMD branch at oauth.go:2521.
+		"refreshToken": true,
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	funcDecl := regexp.MustCompile(`^func (?:\([^)]*\) )?(\w+)`)
+	var offenders []string
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		enclosing := "<file scope>"
+		for i, line := range strings.Split(string(body), "\n") {
+			if m := funcDecl.FindStringSubmatch(line); m != nil {
+				enclosing = m[1]
+			}
+			if !strings.Contains(line, "resolveClientRegistryOrCIMD(") {
+				continue
+			}
+			if strings.Contains(line, "func (s *OAuthService) resolveClientRegistryOrCIMD") {
+				continue // the definition itself
+			}
+			if !allowed[enclosing] {
+				offenders = append(offenders, fmt.Sprintf("%s:%d in %s()", f, i+1, enclosing))
+			}
+		}
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("resolveClientRegistryOrCIMD reached from an unexpected function:\n  %s\n\n"+
+			"A CIMD client can now flow there. Most grant paths do NOT check client.GrantTypes, "+
+			"so confirm the new caller either gates on it or derives no authority from the client, "+
+			"then add the function to `allowed` with a note saying which.",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// A CIMD document is unauthenticated, unregistered, attacker-authored input
+// bounded only by defaultCIMDMaxDocumentBytes. Logging its rejected grant_types
+// verbatim would let one resolution write most of a 5 KiB document into the log,
+// and distinct URLs sidestep the resolution cache. Both the entry count and each
+// entry's length are capped, and the cap is visible in the output rather than
+// silently understating what the document declared.
+func TestTruncateGrantTypesForLog(t *testing.T) {
+	t.Run("short lists pass through unchanged", func(t *testing.T) {
+		in := []string{"client_credentials", "device_code"}
+		if got := truncateGrantTypesForLog(in); !slices.Equal(got, in) {
+			t.Errorf("got %v, want %v", got, in)
+		}
+	})
+
+	t.Run("an over-long entry is truncated with a marker", func(t *testing.T) {
+		got := truncateGrantTypesForLog([]string{strings.Repeat("x", 500)})
+		if len(got) != 1 {
+			t.Fatalf("got %d entries, want 1", len(got))
+		}
+		if len([]rune(got[0])) > maxLoggedGrantTypeLen+1 {
+			t.Errorf("entry not truncated: %d runes", len([]rune(got[0])))
+		}
+		if !strings.HasSuffix(got[0], "…") {
+			t.Error("truncation must be visible in the output")
+		}
+	})
+
+	t.Run("too many entries are capped and counted", func(t *testing.T) {
+		in := make([]string, 50)
+		for i := range in {
+			in[i] = fmt.Sprintf("grant-%d", i)
+		}
+		got := truncateGrantTypesForLog(in)
+		if len(got) != maxLoggedDroppedGrantTypes+1 {
+			t.Fatalf("got %d entries, want %d plus the overflow marker", len(got), maxLoggedDroppedGrantTypes)
+		}
+		if !strings.Contains(got[len(got)-1], "42 more") {
+			t.Errorf("overflow marker must say how many were elided, got %q", got[len(got)-1])
+		}
+	})
+
+	t.Run("the whole line stays bounded for a maximal document", func(t *testing.T) {
+		// 5 KiB of distinct 200-char grant types, the worst a document can do.
+		in := make([]string, 200)
+		for i := range in {
+			in[i] = fmt.Sprintf("%0200d", i)
+		}
+		total := 0
+		for _, s := range truncateGrantTypesForLog(in) {
+			total += len(s)
+		}
+		if total > (maxLoggedDroppedGrantTypes+1)*(maxLoggedGrantTypeLen+16) {
+			t.Errorf("logged payload is %d bytes — the cap is not bounding it", total)
+		}
+	})
 }
