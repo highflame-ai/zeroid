@@ -456,7 +456,7 @@ func (s *CIMDService) resolveUncached(
 		s.storeResult(clientID, cimdCacheEntry{err: err}, ttl)
 		return nil, err
 	}
-	client, err := synthesizeCIMDClient(clientID, doc, s.now())
+	client, droppedGrants, err := synthesizeCIMDClient(clientID, doc, s.now())
 	if err != nil {
 		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
 		return nil, err
@@ -467,11 +467,21 @@ func (s *CIMDService) resolveUncached(
 	}
 
 	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
-	log.Info().
+	resolved := log.Info().
 		Str("client_id", clientID).
 		Str("client_name", client.Name).
-		Int("redirect_uris", len(client.RedirectURIs)).
-		Msg("CIMD: resolved client from metadata document")
+		Int("redirect_uris", len(client.RedirectURIs))
+	if len(droppedGrants) > 0 {
+		// info, not warn: for a conformant document this is the designed
+		// outcome, not a fault. Reported at all because the client is told
+		// nothing — cimdOAuthError deliberately withholds the cause — so the
+		// server log is the only place the narrowing is visible. Truncated
+		// because the values are attacker-chosen (see truncateGrantTypesForLog).
+		resolved = resolved.
+			Strs("dropped_grant_types", truncateGrantTypesForLog(droppedGrants)).
+			Strs("effective_grant_types", client.GrantTypes)
+	}
+	resolved.Msg("CIMD: resolved client from metadata document")
 	return client, nil
 }
 
@@ -670,6 +680,11 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 			continue
 		}
 		seen[gt] = true
+		if gt == "" {
+			// A stray empty entry declares nothing; reporting it as "dropped"
+			// would just put `[""]` in the log.
+			continue
+		}
 		if cimdAllowedGrantTypes[gt] {
 			kept = append(kept, gt)
 		} else {
@@ -680,16 +695,19 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 }
 
 // synthesizeCIMDClient validates the document against the fetch URL and turns it
-// into an ephemeral public OAuth client. No network or storage I/O, so it is
-// unit-testable in isolation; it does emit one log line when a document declares
-// grant types this server will not offer. `now` timestamps the synthesized
-// record.
-func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (*domain.OAuthClient, error) {
+// into an ephemeral public OAuth client. Pure (no I/O, no logging) so it is
+// unit-testable in isolation. `now` timestamps the synthesized record.
+//
+// The second return is the grant types the document declared that this server
+// does not offer CIMD clients — reported rather than logged here so the
+// synthesizer stays pure and one resolution produces one log line. See
+// effectiveCIMDGrantTypes.
+func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (client *domain.OAuthClient, droppedGrantTypes []string, err error) {
 	// Self-reference (draft §4): the document's own client_id MUST equal the URL
 	// it was fetched from. This is what stops an attacker from hosting a document
 	// that claims someone else's client_id.
 	if doc.ClientID != clientID {
-		return nil, fmt.Errorf("%w: document client_id %q does not match its URL", ErrCIMDInvalidDocument, doc.ClientID)
+		return nil, nil, fmt.Errorf("%w: document client_id %q does not match its URL", ErrCIMDInvalidDocument, doc.ClientID)
 	}
 
 	// redirect_uris is required and must be non-empty for the authorization_code
@@ -698,11 +716,11 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// private-use scheme) so a document cannot allow-list a plaintext
 	// non-loopback callback for its own codes.
 	if len(doc.RedirectURIs) == 0 {
-		return nil, fmt.Errorf("%w: redirect_uris is required and must be non-empty", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: redirect_uris is required and must be non-empty", ErrCIMDInvalidDocument)
 	}
 	for _, ru := range doc.RedirectURIs {
 		if err := validateCIMDRedirectURI(ru); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
+			return nil, nil, fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
 		}
 	}
 
@@ -717,7 +735,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		authMethod = "none"
 	}
 	if authMethod != "none" {
-		return nil, fmt.Errorf("%w: token_endpoint_auth_method must be \"none\" (public PKCE); %q is not supported",
+		return nil, nil, fmt.Errorf("%w: token_endpoint_auth_method must be \"none\" (public PKCE); %q is not supported",
 			ErrCIMDInvalidDocument, doc.TokenEndpointAuthMethod)
 	}
 
@@ -727,24 +745,13 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// fatal. See effectiveCIMDGrantTypes for why.
 	grantTypes, dropped := effectiveCIMDGrantTypes(doc.GrantTypes)
 	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
-		return nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
-	}
-	if len(dropped) > 0 {
-		// info, not warn: this is the designed outcome for a conformant
-		// document, not a fault. It is logged at all because the client is told
-		// nothing (cimdOAuthError deliberately withholds the cause), so the
-		// server log is the only place the narrowing is visible.
-		log.Info().
-			Str("client_id", clientID).
-			Strs("dropped_grant_types", truncateGrantTypesForLog(dropped)).
-			Strs("effective_grant_types", grantTypes).
-			Msg("CIMD: ignored grant types this server does not offer CIMD clients")
+		return nil, nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
 	}
 
 	// response_types, when present, must contain "code" (the only response type
 	// the authorization_code flow supports).
 	if len(doc.ResponseTypes) > 0 && !slices.Contains(doc.ResponseTypes, "code") {
-		return nil, fmt.Errorf("%w: response_types must include \"code\"", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: response_types must include \"code\"", ErrCIMDInvalidDocument)
 	}
 
 	// client_name is REQUIRED here, though the draft only RECOMMENDS it.
@@ -762,7 +769,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// whoever picked the URL.
 	name := strings.TrimSpace(doc.ClientName)
 	if name == "" {
-		return nil, fmt.Errorf("%w: client_name is required and must be non-empty", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: client_name is required and must be non-empty", ErrCIMDInvalidDocument)
 	}
 
 	// An empty scope means "no client-side scope ceiling": the principal
@@ -783,7 +790,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		IsActive:                true,
 		CreatedAt:               now,
 		UpdatedAt:               now,
-	}, nil
+	}, dropped, nil
 }
 
 // RedirectDeliversLocally reports whether a redirect destination can only reach

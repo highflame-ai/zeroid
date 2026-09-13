@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -143,10 +144,19 @@ func TestCIMD_AddingAGrantToAPublishedDocumentKeepsRefreshUsable(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// CacheTTL 0 would use the default hour; these assertions are about what a
-	// fresh resolution yields, so each step builds its own service.
+	// ONE long-lived service, so this drives the real mechanism: rotation
+	// re-resolves through the CIMD cache, and a republished document only takes
+	// effect once that entry expires. A fresh service per step would skip the
+	// cache entirely and test something weaker than the comment above claims.
+	// A 1ms TTL is honoured as configured — NewCIMDService only substitutes the
+	// default for <= 0 and caps at maxCIMDCacheTTL, with no lower floor.
+	svc := service.NewCIMDService(service.CIMDConfig{
+		Enabled:    true,
+		HTTPClient: ts.Client(),
+		CacheTTL:   time.Millisecond,
+	})
 	resolve := func() (grantTypes []string, err error) {
-		svc := service.NewCIMDService(service.CIMDConfig{Enabled: true, HTTPClient: ts.Client()})
+		time.Sleep(2 * time.Millisecond) // let the previous entry age out
 		c, err := svc.ResolveClient(ctx, ts.URL+"/client.json")
 		if err != nil {
 			return nil, err

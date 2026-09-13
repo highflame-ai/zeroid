@@ -55,7 +55,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 			ClientName:   "Example MCP Client",
 			RedirectURIs: []string{"http://127.0.0.1:3000/callback"},
 		}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -85,21 +85,21 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 	// URL choose what the user reads.
 	t.Run("missing client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}}
-		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 			t.Errorf("expected ErrCIMDInvalidDocument for absent client_name, got %v", err)
 		}
 	})
 
 	t.Run("whitespace-only client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "   \t ", RedirectURIs: []string{"https://x/cb"}}
-		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 			t.Errorf("expected ErrCIMDInvalidDocument for whitespace-only client_name, got %v", err)
 		}
 	})
 
 	t.Run("client_name is carried through verbatim", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "Example MCP Client", RedirectURIs: []string{"https://x/cb"}}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -110,7 +110,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 
 	t.Run("scope parsed into slice", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, Scope: "read write"}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -126,7 +126,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 			RedirectURIs: []string{"https://x/cb"},
 			GrantTypes:   []string{"authorization_code", "refresh_token"},
 		}
-		if _, err := synthesizeCIMDClient(url, doc, now); err != nil {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -152,7 +152,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := synthesizeCIMDClient(url, tc.doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			if _, _, err := synthesizeCIMDClient(url, tc.doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 				t.Errorf("expected ErrCIMDInvalidDocument, got %v", err)
 			}
 		})
@@ -941,7 +941,7 @@ func TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected(t *testing.
 	url := "https://app.example.com/client.json"
 	now := time.Now()
 
-	client, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+	client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
 		ClientID:     url,
 		ClientName:   "MCPJam",
 		RedirectURIs: []string{"https://app.example.com/cb"},
@@ -970,7 +970,7 @@ func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
 		"api_key",
 	} {
 		t.Run(forbidden, func(t *testing.T) {
-			client, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+			client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
 				ClientID:     url,
 				ClientName:   "N",
 				RedirectURIs: []string{"https://app.example.com/cb"},
@@ -1003,7 +1003,7 @@ func TestSynthesizeCIMDClient_StillRejectsWhenNoSupportedGrantRemains(t *testing
 		{"refresh_token"},
 		{"urn:ietf:params:oauth:grant-type:device_code"},
 	} {
-		_, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+		_, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
 			ClientID:     url,
 			ClientName:   "N",
 			RedirectURIs: []string{"https://app.example.com/cb"},
