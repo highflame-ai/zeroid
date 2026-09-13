@@ -149,6 +149,15 @@ type cimdMetadataDocument struct {
 // the interactive-onboarding path, so authorization_code (and its refresh
 // companion) are the only sensible grants — client_credentials / token-exchange
 // clients register through the admin or RFC 7591 path instead.
+//
+// It is applied as an INTERSECTION over the document's list, not as a gate on
+// it. The distinction is the whole of zeroid#344: the invariant worth keeping is
+// that a zero-registration client cannot OBTAIN an M2M or delegation grant, and
+// that is enforced by what lands in the synthesized client's GrantTypes — which
+// the token endpoint checks (oauth.go client_credentials / authorization_code /
+// refresh_token gates all read it). Refusing to PARSE a document that merely
+// mentions such a grant enforced nothing extra, and broke every client whose
+// published document listed a grant we simply do not implement.
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
@@ -583,6 +592,49 @@ func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
 // synthesizeCIMDClient validates the document against the fetch URL and turns it
 // into an ephemeral public OAuth client. Pure (no I/O) so it is unit-testable in
 // isolation. `now` timestamps the synthesized record.
+// effectiveCIMDGrantTypes narrows a document's grant_types to the set this
+// server will actually offer a CIMD client, returning the kept set and the
+// dropped entries (in document order, de-duplicated).
+//
+// A CIMD document is a single declaration the client publishes to EVERY
+// authorization server it talks to; there is no registration response and no way
+// to tailor it per server. RFC 7591 §2 lets an AS ignore metadata it does not
+// understand, and §3.2.1 lets it substitute the grant types it supports — so
+// honouring the supported subset is the only behaviour available to a protocol
+// with no registration round trip. Rejecting the document instead meant a client
+// that listed, say, device_code — a grant ZeroID does not implement and could
+// therefore never issue — could not log in at all, and could not fix it without
+// dropping that grant for every other server it works with.
+//
+// The kept set is what gets stored on the synthesized client, and that is what
+// carries the security property: the token endpoint gates client_credentials,
+// authorization_code and refresh_token on the client's own GrantTypes, so a
+// grant absent from this result cannot be obtained. Returning the raw document
+// list instead would hand a zero-registration client whatever it asked for,
+// which is precisely the hole the old allow-list existed to close.
+//
+// An empty or absent list defaults to [authorization_code] (draft §2). The
+// caller decides what a missing authorization_code means — this narrows only.
+func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
+	if len(declared) == 0 {
+		return []string{string(domain.GrantTypeAuthorizationCode)}, nil
+	}
+	seen := make(map[string]bool, len(declared))
+	for _, gt := range declared {
+		if seen[gt] {
+			// A document may repeat a value; the synthesized client should not.
+			continue
+		}
+		seen[gt] = true
+		if cimdAllowedGrantTypes[gt] {
+			kept = append(kept, gt)
+		} else {
+			dropped = append(dropped, gt)
+		}
+	}
+	return kept, dropped
+}
+
 func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (*domain.OAuthClient, error) {
 	// Self-reference (draft §4): the document's own client_id MUST equal the URL
 	// it was fetched from. This is what stops an attacker from hosting a document
@@ -620,19 +672,24 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 			ErrCIMDInvalidDocument, doc.TokenEndpointAuthMethod)
 	}
 
-	// grant_types default to [authorization_code]; must include it and stay
-	// inside the CIMD allow-list.
-	grantTypes := doc.GrantTypes
-	if len(grantTypes) == 0 {
-		grantTypes = []string{string(domain.GrantTypeAuthorizationCode)}
-	}
+	// grant_types default to [authorization_code]. The document's list is
+	// INTERSECTED with the CIMD allow-list rather than validated against it:
+	// unsupported entries are dropped, and only a missing authorization_code is
+	// fatal. See effectiveCIMDGrantTypes for why.
+	grantTypes, dropped := effectiveCIMDGrantTypes(doc.GrantTypes)
 	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
 		return nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
 	}
-	for _, gt := range grantTypes {
-		if !cimdAllowedGrantTypes[gt] {
-			return nil, fmt.Errorf("%w: grant_type %q is not permitted for a CIMD client", ErrCIMDInvalidDocument, gt)
-		}
+	if len(dropped) > 0 {
+		// info, not warn: this is the designed outcome for a conformant
+		// document, not a fault. It is logged at all because the client is told
+		// nothing (cimdOAuthError deliberately withholds the cause), so the
+		// server log is the only place the narrowing is visible.
+		log.Info().
+			Str("client_id", clientID).
+			Strs("dropped_grant_types", dropped).
+			Strs("effective_grant_types", grantTypes).
+			Msg("CIMD: ignored grant types this server does not offer CIMD clients")
 	}
 
 	// response_types, when present, must contain "code" (the only response type

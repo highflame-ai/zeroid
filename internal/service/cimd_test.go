@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -138,7 +139,11 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		{"confidential auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
 		{"private_key_jwt auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
 		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
-		{"disallowed grant type", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"authorization_code", "client_credentials"}}},
+		// NOTE: a document listing a grant outside the allow-list is NO LONGER
+		// rejected (zeroid#344) — the extra entry is dropped and the client is
+		// synthesized with the intersection. That the DROPPED grant cannot then
+		// be obtained is asserted in TestEffectiveCIMDGrantTypes and
+		// TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected.
 		{"response_types without code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, ResponseTypes: []string{"token"}}},
 		{"plaintext non-loopback redirect_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"http://app.example.com/cb"}}},
 	}
@@ -841,6 +846,168 @@ func TestRedirectDeliversLocally(t *testing.T) {
 	for _, u := range remote {
 		if RedirectDeliversLocally(u) {
 			t.Errorf("%s must NOT count as local delivery", u)
+		}
+	}
+}
+
+// effectiveCIMDGrantTypes narrows rather than rejects (zeroid#344).
+//
+// A CIMD document is one declaration published to EVERY authorization server the
+// client talks to — there is no registration response and no way to tailor it
+// per server. Rejecting the whole document because it mentions a grant this
+// server does not implement made such a client unable to log in at all, with an
+// error it could not act on and could not fix without breaking its other
+// servers.
+func TestEffectiveCIMDGrantTypes(t *testing.T) {
+	cases := []struct {
+		name        string
+		declared    []string
+		wantKept    []string
+		wantDropped []string
+	}{
+		{
+			name:     "absent defaults to authorization_code",
+			declared: nil,
+			wantKept: []string{"authorization_code"},
+		},
+		{
+			name:     "empty defaults to authorization_code",
+			declared: []string{},
+			wantKept: []string{"authorization_code"},
+		},
+		{
+			// The exact document from the issue: MCPJam publishes device_code
+			// alongside the two grants ZeroID does offer.
+			name:        "device_code is dropped, the rest kept",
+			declared:    []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
+			wantKept:    []string{"authorization_code", "refresh_token"},
+			wantDropped: []string{"urn:ietf:params:oauth:grant-type:device_code"},
+		},
+		{
+			// The security-relevant case: an M2M grant must not survive into
+			// the synthesized client, because the token endpoint reads exactly
+			// this list when deciding whether to honour client_credentials.
+			name:        "client_credentials is dropped",
+			declared:    []string{"authorization_code", "client_credentials"},
+			wantKept:    []string{"authorization_code"},
+			wantDropped: []string{"client_credentials"},
+		},
+		{
+			name:        "delegation grants are dropped in both spellings",
+			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			wantKept:    []string{"authorization_code"},
+			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+		},
+		{
+			name:        "duplicates collapse",
+			declared:    []string{"authorization_code", "authorization_code", "refresh_token", "client_credentials", "client_credentials"},
+			wantKept:    []string{"authorization_code", "refresh_token"},
+			wantDropped: []string{"client_credentials"},
+		},
+		{
+			// Order is preserved so the synthesized client (and therefore the
+			// resolution cache) is deterministic for a given document.
+			name:        "document order is preserved",
+			declared:    []string{"refresh_token", "device_code", "authorization_code"},
+			wantKept:    []string{"refresh_token", "authorization_code"},
+			wantDropped: []string{"device_code"},
+		},
+		{
+			name:        "everything unsupported keeps nothing",
+			declared:    []string{"client_credentials", "device_code"},
+			wantKept:    nil,
+			wantDropped: []string{"client_credentials", "device_code"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kept, dropped := effectiveCIMDGrantTypes(tc.declared)
+			if !slices.Equal(kept, tc.wantKept) {
+				t.Errorf("kept = %v, want %v", kept, tc.wantKept)
+			}
+			if !slices.Equal(dropped, tc.wantDropped) {
+				t.Errorf("dropped = %v, want %v", dropped, tc.wantDropped)
+			}
+		})
+	}
+}
+
+// The issue's reproduction, end to end through the synthesizer.
+func TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	client, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+		ClientID:     url,
+		ClientName:   "MCPJam",
+		RedirectURIs: []string{"https://app.example.com/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
+	}, now)
+	if err != nil {
+		t.Fatalf("a document listing an unimplemented grant must still resolve: %v", err)
+	}
+	if !slices.Equal(client.GrantTypes, []string{"authorization_code", "refresh_token"}) {
+		t.Errorf("GrantTypes = %v, want the supported intersection", client.GrantTypes)
+	}
+}
+
+// The invariant the old rejection was actually protecting: a zero-registration
+// client must not be able to OBTAIN an M2M or delegation grant. That is carried
+// by what lands in GrantTypes, which the token endpoint gates on — not by
+// refusing to parse a document that merely mentions one.
+func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	for _, forbidden := range []string{
+		"client_credentials",
+		"urn:ietf:params:oauth:grant-type:token-exchange",
+		"urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"api_key",
+	} {
+		t.Run(forbidden, func(t *testing.T) {
+			client, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+				ClientID:     url,
+				ClientName:   "N",
+				RedirectURIs: []string{"https://app.example.com/cb"},
+				GrantTypes:   []string{"authorization_code", forbidden},
+			}, now)
+			if err != nil {
+				t.Fatalf("document should resolve, not be rejected: %v", err)
+			}
+			if slices.Contains(client.GrantTypes, forbidden) {
+				t.Fatalf("%q reached the synthesized client — the token endpoint reads this "+
+					"list to decide whether to honour that grant", forbidden)
+			}
+			// Also pin the normalized spelling, since the token endpoint's
+			// client_credentials gate compares against the short form.
+			if slices.Contains(client.GrantTypes, string(domain.NormalizeGrantType(forbidden))) {
+				t.Fatalf("normalized form of %q reached the synthesized client", forbidden)
+			}
+		})
+	}
+}
+
+// A document whose only grants are unsupported still fails — authorization_code
+// is the one flow CIMD exists for, so its absence leaves nothing to synthesize.
+func TestSynthesizeCIMDClient_StillRejectsWhenNoSupportedGrantRemains(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	for _, declared := range [][]string{
+		{"client_credentials"},
+		{"refresh_token"},
+		{"urn:ietf:params:oauth:grant-type:device_code"},
+	} {
+		_, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+			ClientID:     url,
+			ClientName:   "N",
+			RedirectURIs: []string{"https://app.example.com/cb"},
+			GrantTypes:   declared,
+		}, now)
+		if !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Errorf("grant_types %v leaves no authorization_code; want ErrCIMDInvalidDocument, got %v", declared, err)
 		}
 	}
 }
