@@ -1740,9 +1740,10 @@ type IssueAuthCodeRequest struct {
 //  1. Client lookup — registry first, CIMD fallback (resolveClientRegistryOrCIMD,
 //     one shared policy). A registry row wins whether active or not, so
 //     deactivation stays a kill switch and cannot fall through to CIMD.
-//  2. Client state — issuance is restricted to ACTIVE PUBLIC clients (the
-//     pre-CIMD GetPublicClient contract): 401 invalid_client. A confidential
-//     client cannot obtain a code here.
+//  2. Client state — issuance is restricted to ACTIVE clients that may obtain a
+//     code (MayObtainAuthorizationCode): 401 invalid_client. A SECRET-based
+//     confidential client cannot obtain a code here; a key-based one can, since
+//     it authenticates with its key at the token endpoint.
 //  3. Grant-type allow-list — 400 unauthorized_client.
 //  4. Redirect-URI allow-list — 400 invalid_request. normalizeLoopback handles
 //     the 127.0.0.1 ↔ localhost equivalence (RFC 8252 §7.3) so native-app CLI
@@ -1813,12 +1814,13 @@ func (s *OAuthService) ResolveAuthorizeClient(
 func checkAuthorizeClientPolicy(
 	client *domain.OAuthClient, redirectURI string,
 ) (redirectURIValidated bool, err error) {
-	// Issuance is restricted to ACTIVE PUBLIC clients (the pre-CIMD
-	// GetPublicClient contract): a confidential client cannot obtain a code here,
-	// and deactivation stays a kill switch. CIMD-synthesized clients are always
+	// Issuance is restricted to ACTIVE clients that may obtain a code (the
+	// pre-CIMD GetPublicClient contract, widened only to key-based clients):
+	// a SECRET-based confidential client cannot obtain a code here, and
+	// deactivation stays a kill switch. CIMD-synthesized clients are always
 	// active and public (see synthesizeCIMDClient), so this is not a carve-out
 	// they need — it applies to every path.
-	if !client.IsActive || client.ClientType != "public" {
+	if !client.IsActive || !client.MayObtainAuthorizationCode() {
 		return false, oauthUnauthorized("unknown or inactive client_id", nil)
 	}
 
@@ -3002,12 +3004,13 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
 		return nil
 	}
-	// A client is confidential if it declares so OR carries a stored secret
-	// hash. The second clause is belt-and-suspenders against an inconsistent
-	// row (secret set but client_type != "confidential"), which would
-	// otherwise skip secret verification and allow an unintended bypass. Same
-	// test the CIBA bc-authorize/redeem paths use.
-	if client.ClientType != "confidential" && client.ClientSecret == "" {
+	// Credential-less (public PKCE) clients pass through — they prove
+	// possession by other means: PKCE on authorization_code, the refresh-token
+	// string itself on refresh_token. The predicate derives this from the
+	// registered method, with the old client_type/secret test surviving inside
+	// it as the fallback for rows predating that column. Same question the CIBA
+	// bc-authorize/redeem paths ask.
+	if !client.RequiresClientAuthentication() {
 		return nil
 	}
 	if clientSecret == "" {

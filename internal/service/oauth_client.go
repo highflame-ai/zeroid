@@ -189,6 +189,24 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	if err := validateClientAuthMethod(authMethod, req.JWKS, req.JWKSURI, s.allowPrivateJWKSEndpoints); err != nil {
 		return nil, "", err
 	}
+	// A key-based client is CONFIDENTIAL, whichever path registered it
+	// (zeroid#348). client_type was being derived from the separate
+	// `confidential` flag, which for a key client is always false — so the admin
+	// path typed them "public" while DCR hard-coded "confidential", and the same
+	// logical client got a different value depending on how it was created.
+	//
+	// RFC 6749 §2.1 settles which is right: a confidential client is one
+	// "capable of maintaining the confidentiality of their credentials", and a
+	// client holding a private key is exactly that. The read paths no longer key
+	// off this column directly, so it is no longer load-bearing — but leaving it
+	// inconsistent would keep the trap baited for the next reader.
+	//
+	// No migration accompanies this: a census of dev1 and prod at the time of
+	// zeroid#206 found every client registered token_endpoint_auth_method=none,
+	// so no key-based row exists to backfill.
+	if authMethod == clientAuthMethodPrivateKeyJWT {
+		clientType = "confidential"
+	}
 	// A key-based client must NOT also carry a secret. `confidential` and
 	// `token_endpoint_auth_method` are independent inputs, and the block above
 	// mints a secret off the former before the latter is even read — so
@@ -398,6 +416,18 @@ func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OA
 	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT && client.ClientSecret != "" {
 		return fmt.Errorf(
 			"%w: a private_key_jwt client cannot also carry a client_secret", ErrInvalidClientMetadata)
+	}
+	// Same convergence RegisterClient applies, for the same reason (RFC 6749
+	// §2.1: a key holder maintains the confidentiality of its credentials).
+	// Normalising only at registration would let the column drift straight back
+	// apart on the very migration an operator is most likely to perform:
+	// EnsureClient reconciles token_endpoint_auth_method from config on every
+	// start (see server.go), so flipping an existing client to private_key_jwt
+	// in zeroid.yaml would rewrite the method and leave client_type="public"
+	// behind it. The read paths no longer consult the column, so this is not
+	// load-bearing — it is what stops the trap being re-baited.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		client.ClientType = "confidential"
 	}
 	return s.repo.Update(ctx, client)
 }

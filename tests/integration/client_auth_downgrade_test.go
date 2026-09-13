@@ -1,6 +1,7 @@
 package integration_test
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"encoding/json"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 const clientAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
@@ -553,5 +557,120 @@ func TestPrivateKeyJWT_DCRManagementDoesNotBrickTheClient(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		assert.Equal(t, "renamed-properly", decode(t, resp)["client_name"])
+	})
+}
+
+// A client registered for a SECRET-based method but never ISSUED a secret
+// authenticated with nothing at all — the same downgrade as the private_key_jwt
+// case, in a shape both earlier fixes walked past.
+//
+// The admin API accepts {confidential: false, token_endpoint_auth_method:
+// "client_secret_basic"}: `confidential` is what mints the secret, and the
+// method column is applied afterwards and independently (RegisterClient), so the
+// row lands client_type=public with an EMPTY secret hash. That is precisely the
+// shape verifyConfidentialClientAuth's public-client pass-through waves through.
+//
+// Neither #346 nor #347 caught it. rejectUnimplementedClientAuth passes the
+// client — the server genuinely implements client_secret_basic — and
+// enforceRegisteredClientAuthMethod returns nil for a secret-based client that
+// presents nothing, because it only refuses ASSERTIONS. The old test
+// `ClientType != "confidential" && ClientSecret == ""` was then true on both
+// halves, and the grant proceeded unauthenticated.
+//
+// Asking the REGISTERED METHOD instead closes it: the method says this client
+// authenticates with a secret, so one is demanded, and bcrypt against an empty
+// stored hash refuses whatever is offered.
+//
+// This is a real behaviour change for such rows — before, they were issued
+// tokens for free. Pinned here because nothing else fails if
+// RequiresClientAuthentication is ever "simplified" back to the client_type /
+// client_secret test it replaced.
+func TestClientAuthDowngrade_SecretMethodWithoutASecret(t *testing.T) {
+	clientID := uid("nosecret")
+
+	reg := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id": clientID,
+		"name":      clientID + "-client",
+		// The contradiction: a secret-based method, but no secret minted.
+		"confidential":               false,
+		"token_endpoint_auth_method": "client_secret_basic",
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"redirect_uris":              []string{testRedirectURI},
+		"scopes":                     []string{"data:read"},
+	}, nil)
+	require.Equal(t, http.StatusCreated, reg.StatusCode,
+		"the shape must remain registrable for this test to pin anything — "+
+			"if registration starts refusing it, assert THAT here instead")
+	body := decode(t, reg)
+	_ = reg.Body.Close()
+	require.Empty(t, body["client_secret"], "confidential=false mints no secret")
+
+	t.Run("authorization_code is refused without a secret", func(t *testing.T) {
+		verifier, challenge := buildPKCEPair(t)
+		code := buildAuthCode(t, clientID, uid("nosecret-user"), testRedirectURI,
+			challenge, []string{"data:read"})
+
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "authorization_code",
+			"client_id":     clientID,
+			"code":          code,
+			"code_verifier": verifier,
+			"redirect_uri":  testRedirectURI,
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		// Pre-fix this returned 200 with an access_token AND a refresh_token,
+		// for a caller holding only a stolen code and a client_id.
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+			"a client registered for client_secret_basic must not authenticate with nothing")
+		assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+	})
+
+	t.Run("a wrong secret is refused too, not just an absent one", func(t *testing.T) {
+		// Guards the lazy fix: demanding a non-empty client_secret but never
+		// verifying it would pass this client on any string at all, since its
+		// stored hash is empty.
+		verifier, challenge := buildPKCEPair(t)
+		code := buildAuthCode(t, clientID, uid("nosecret-wrong"), testRedirectURI,
+			challenge, []string{"data:read"})
+
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "authorization_code",
+			"client_id":     clientID,
+			"code":          code,
+			"code_verifier": verifier,
+			"redirect_uri":  testRedirectURI,
+			"client_secret": "anything-at-all",
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+			"bcrypt against an empty stored hash must fail closed")
+		assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+	})
+
+	t.Run("CIBA bc-authorize is refused without a secret", func(t *testing.T) {
+		// The other call site the predicate replaced (backchannel.go). Driven at
+		// the service layer for the same reason TestCIBAHardening is: it is the
+		// tighter loop, and it pins the SITE rather than one grant's routing.
+		//
+		// Not merely a token downgrade here — bc-authorize fires the deployer's
+		// notifier, so an unauthenticated initiator could spam real approval
+		// prompts at real users under this client's identity.
+		bcSvc := service.NewBackchannelService(
+			postgres.NewBackchannelRequestRepository(testDB),
+			service.NewOAuthClientService(postgres.NewOAuthClientRepository(testDB)),
+			nil, nil, service.DefaultBackchannelConfig(),
+		)
+
+		_, err := bcSvc.CreateAuthRequest(context.Background(), service.CreateAuthRequestInput{
+			ClientID:  clientID,
+			AccountID: testAccountID,
+			ProjectID: testProjectID,
+			GroupHint: "finance_lead",
+			Scope:     "openid",
+		})
+		require.Error(t, err, "bc-authorize must not accept an unauthenticated secret-based client")
+		assert.Contains(t, err.Error(), "client_secret is required")
 	})
 }
