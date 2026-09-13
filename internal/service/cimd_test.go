@@ -1143,3 +1143,43 @@ func TestTruncateGrantTypesForLog(t *testing.T) {
 		}
 	})
 }
+
+// client_name is attacker-chosen and never length-limited — synthesizeCIMDClient
+// only trims it and checks it is non-empty — so the resolution log line must
+// bound it, exactly as it bounds the dropped grant types beside it. The stored
+// value is deliberately NOT truncated: it is what a consent screen shows the
+// user, and shortening that would change what they are asked to trust.
+func TestClientNameIsBoundedInLogsButNotAtRest(t *testing.T) {
+	long := strings.Repeat("A", 5000)
+
+	logged := truncateForLog(long, maxLoggedClientNameLen)
+	if len([]rune(logged)) > maxLoggedClientNameLen+1 {
+		t.Errorf("logged client_name is %d runes — the cap is not bounding it", len([]rune(logged)))
+	}
+	if !strings.HasSuffix(logged, "…") {
+		t.Error("truncation must be visible in the output")
+	}
+
+	// The synthesized client keeps the full name.
+	client, _, err := synthesizeCIMDClient("https://app.example.com/c.json", &cimdMetadataDocument{
+		ClientID:     "https://app.example.com/c.json",
+		ClientName:   long,
+		RedirectURIs: []string{"https://app.example.com/cb"},
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("synthesize: %v", err)
+	}
+	if client.Name != long {
+		t.Errorf("the STORED client_name must not be truncated — it is what consent displays (got %d chars, want %d)",
+			len(client.Name), len(long))
+	}
+}
+
+func TestTruncateForLog(t *testing.T) {
+	if got := truncateForLog("short", 64); got != "short" {
+		t.Errorf("a value under the cap must pass through unchanged, got %q", got)
+	}
+	if got := truncateForLog(strings.Repeat("x", 100), 10); got != strings.Repeat("x", 10)+"…" {
+		t.Errorf("unexpected truncation: %q", got)
+	}
+}

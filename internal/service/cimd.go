@@ -469,7 +469,7 @@ func (s *CIMDService) resolveUncached(
 	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
 	resolved := log.Info().
 		Str("client_id", clientID).
-		Str("client_name", client.Name).
+		Str("client_name", truncateForLog(client.Name, maxLoggedClientNameLen)).
 		Int("redirect_uris", len(client.RedirectURIs))
 	if len(droppedGrants) > 0 {
 		// info, not warn: for a conformant document this is the designed
@@ -628,7 +628,25 @@ func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
 const (
 	maxLoggedDroppedGrantTypes = 8
 	maxLoggedGrantTypeLen      = 64
+	// maxLoggedClientNameLen bounds client_name on the resolution log line. The
+	// same reasoning applies to it as to the grant types: client_name is only
+	// trimmed and checked non-empty (synthesizeCIMDClient), never
+	// length-limited, so it can carry most of a 5 KiB document. It is NOT
+	// truncated at the source — the stored value is what a consent screen shows
+	// the user, and shortening that would change what they are asked to trust.
+	// Only the log copy is bounded. client_id needs no equivalent: it is already
+	// capped at maxCIMDClientIDLength.
+	maxLoggedClientNameLen = 128
 )
+
+// truncateForLog bounds one attacker-supplied value written to the log, marking
+// the elision so the output does not silently understate the input.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
+}
 
 // truncateGrantTypesForLog caps the slice length and each entry's length,
 // appending a marker when either bound trims something so the log does not
@@ -636,10 +654,7 @@ const (
 func truncateGrantTypesForLog(gts []string) []string {
 	out := make([]string, 0, min(len(gts), maxLoggedDroppedGrantTypes)+1)
 	for _, gt := range gts[:min(len(gts), maxLoggedDroppedGrantTypes)] {
-		if len(gt) > maxLoggedGrantTypeLen {
-			gt = gt[:maxLoggedGrantTypeLen] + "…"
-		}
-		out = append(out, gt)
+		out = append(out, truncateForLog(gt, maxLoggedGrantTypeLen))
 	}
 	if len(gts) > maxLoggedDroppedGrantTypes {
 		out = append(out, fmt.Sprintf("…and %d more", len(gts)-maxLoggedDroppedGrantTypes))
