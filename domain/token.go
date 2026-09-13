@@ -204,8 +204,16 @@ func (c *OAuthClient) RequiresClientAuthentication() bool {
 	return c.ClientType == "confidential" || c.ClientSecret != ""
 }
 
-// MayUseInteractiveFlows reports whether this client may obtain an authorization
-// code at /oauth2/authorize.
+// MayObtainAuthorizationCode reports whether this client may obtain an
+// authorization code at /oauth2/authorize.
+//
+// NAMED FOR THE ONE ENDPOINT IT GOVERNS, deliberately. It is tempting to read a
+// broader "may this client run interactive flows" into it, and that reading is
+// wrong: CIBA is interactive too, does NOT consult this, and would get the
+// opposite answer from it — bc-authorize admits a secret-based confidential
+// client (authenticated, CIBA Core §7.1) and this refuses one. A predicate whose
+// name is wider than its meaning is the same defect zeroid#348 exists to remove,
+// one level up.
 //
 // The rule it replaces was `ClientType == "public"`, described in its own
 // comment as the inherited pre-CIMD GetPublicClient contract rather than a
@@ -219,7 +227,7 @@ func (c *OAuthClient) RequiresClientAuthentication() bool {
 // endpoint with its key — and gating it on a column whose value differs between
 // the admin and DCR paths made the same client legal or illegal depending on how
 // it was created.
-func (c *OAuthClient) MayUseInteractiveFlows() bool {
+func (c *OAuthClient) MayObtainAuthorizationCode() bool {
 	if c == nil {
 		return false
 	}

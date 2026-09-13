@@ -102,7 +102,7 @@ func TestKeyClientBehavesTheSameFromEitherRegistrationPath(t *testing.T) {
 		fn   func(*OAuthClient) bool
 	}{
 		{"RequiresClientAuthentication", (*OAuthClient).RequiresClientAuthentication},
-		{"MayUseInteractiveFlows", (*OAuthClient).MayUseInteractiveFlows},
+		{"MayObtainAuthorizationCode", (*OAuthClient).MayObtainAuthorizationCode},
 		{"UsesPrivateKeyJWT", (*OAuthClient).UsesPrivateKeyJWT},
 	} {
 		if probe.fn(adminShape) != probe.fn(dcrShape) {
@@ -111,7 +111,7 @@ func TestKeyClientBehavesTheSameFromEitherRegistrationPath(t *testing.T) {
 	}
 }
 
-func TestMayUseInteractiveFlows(t *testing.T) {
+func TestMayObtainAuthorizationCode(t *testing.T) {
 	t.Parallel()
 
 	// Preserved: the inherited pre-CIMD contract still excludes secret-based
@@ -119,7 +119,7 @@ func TestMayUseInteractiveFlows(t *testing.T) {
 	// deliberately out of scope for zeroid#348 — this test pins it so a future
 	// change to the predicate has to be a deliberate one.
 	secretBased := &OAuthClient{TokenEndpointAuthMethod: "client_secret_basic", ClientType: "confidential"}
-	if secretBased.MayUseInteractiveFlows() {
+	if secretBased.MayObtainAuthorizationCode() {
 		t.Error("a secret-based confidential client must still be refused at /oauth2/authorize")
 	}
 
@@ -128,7 +128,7 @@ func TestMayUseInteractiveFlows(t *testing.T) {
 		{ClientType: "public", TokenEndpointAuthMethod: "private_key_jwt"},
 		{ClientType: "confidential", TokenEndpointAuthMethod: "private_key_jwt"},
 	} {
-		if !c.MayUseInteractiveFlows() {
+		if !c.MayObtainAuthorizationCode() {
 			t.Errorf("client %+v must be able to obtain an authorization code", c)
 		}
 	}
@@ -188,7 +188,7 @@ func TestNoBareClientTypeComparisonsOutsideDomain(t *testing.T) {
 
 	if len(offenders) > 0 {
 		t.Errorf("bare ClientType comparison(s) outside domain/ — ask a predicate "+
-			"(RequiresClientAuthentication / MayUseInteractiveFlows / UsesPrivateKeyJWT) instead:\n  %s",
+			"(RequiresClientAuthentication / MayObtainAuthorizationCode / UsesPrivateKeyJWT) instead:\n  %s",
 			strings.Join(offenders, "\n  "))
 	}
 }

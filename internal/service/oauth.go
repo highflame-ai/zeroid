@@ -1740,9 +1740,10 @@ type IssueAuthCodeRequest struct {
 //  1. Client lookup — registry first, CIMD fallback (resolveClientRegistryOrCIMD,
 //     one shared policy). A registry row wins whether active or not, so
 //     deactivation stays a kill switch and cannot fall through to CIMD.
-//  2. Client state — issuance is restricted to ACTIVE PUBLIC clients (the
-//     pre-CIMD GetPublicClient contract): 401 invalid_client. A confidential
-//     client cannot obtain a code here.
+//  2. Client state — issuance is restricted to ACTIVE clients that may obtain a
+//     code (MayObtainAuthorizationCode): 401 invalid_client. A SECRET-based
+//     confidential client cannot obtain a code here; a key-based one can, since
+//     it authenticates with its key at the token endpoint.
 //  3. Grant-type allow-list — 400 unauthorized_client.
 //  4. Redirect-URI allow-list — 400 invalid_request. normalizeLoopback handles
 //     the 127.0.0.1 ↔ localhost equivalence (RFC 8252 §7.3) so native-app CLI
@@ -1813,12 +1814,13 @@ func (s *OAuthService) ResolveAuthorizeClient(
 func checkAuthorizeClientPolicy(
 	client *domain.OAuthClient, redirectURI string,
 ) (redirectURIValidated bool, err error) {
-	// Issuance is restricted to ACTIVE PUBLIC clients (the pre-CIMD
-	// GetPublicClient contract): a confidential client cannot obtain a code here,
-	// and deactivation stays a kill switch. CIMD-synthesized clients are always
+	// Issuance is restricted to ACTIVE clients that may obtain a code (the
+	// pre-CIMD GetPublicClient contract, widened only to key-based clients):
+	// a SECRET-based confidential client cannot obtain a code here, and
+	// deactivation stays a kill switch. CIMD-synthesized clients are always
 	// active and public (see synthesizeCIMDClient), so this is not a carve-out
 	// they need — it applies to every path.
-	if !client.IsActive || !client.MayUseInteractiveFlows() {
+	if !client.IsActive || !client.MayObtainAuthorizationCode() {
 		return false, oauthUnauthorized("unknown or inactive client_id", nil)
 	}
 
