@@ -417,6 +417,18 @@ func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OA
 		return fmt.Errorf(
 			"%w: a private_key_jwt client cannot also carry a client_secret", ErrInvalidClientMetadata)
 	}
+	// Same convergence RegisterClient applies, for the same reason (RFC 6749
+	// §2.1: a key holder maintains the confidentiality of its credentials).
+	// Normalising only at registration would let the column drift straight back
+	// apart on the very migration an operator is most likely to perform:
+	// EnsureClient reconciles token_endpoint_auth_method from config on every
+	// start (see server.go), so flipping an existing client to private_key_jwt
+	// in zeroid.yaml would rewrite the method and leave client_type="public"
+	// behind it. The read paths no longer consult the column, so this is not
+	// load-bearing — it is what stops the trap being re-baited.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		client.ClientType = "confidential"
+	}
 	return s.repo.Update(ctx, client)
 }
 
