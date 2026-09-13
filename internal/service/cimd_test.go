@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,6 +19,10 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 )
+
+// cimdTestJWKS is a one-key P-256 JWK Set — the shape a CIMD document publishes
+// in its `jwks` member for token_endpoint_auth_method=private_key_jwt.
+const cimdTestJWKS = `{"keys":[{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}`
 
 func TestIsCIMDClientID(t *testing.T) {
 	cases := []struct {
@@ -139,8 +144,25 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		{"self-reference mismatch", &cimdMetadataDocument{ClientID: "https://evil.example/other.json", ClientName: "N", RedirectURIs: []string{"https://x/cb"}}},
 		{"missing redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N"}},
 		{"empty redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{}}},
-		{"confidential auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
-		{"private_key_jwt auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
+		// Secret-based methods stay refused, and structurally always will: there
+		// is no registration response in which a CIMD client could be handed a
+		// secret. This is NOT the zeroid#264 case.
+		{"secret-based auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
+		{"secret-based auth method (post)", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_post"}},
+		{"unknown auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "tls_client_auth"}},
+		// private_key_jwt is ACCEPTED as of zeroid#264 — but only with usable key
+		// material. This row previously asserted the METHOD was refused; it is kept
+		// and renamed to the reason that now applies, so the table cannot go on
+		// passing for a different reason than it reads.
+		{"private_key_jwt without key material", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
+		{"private_key_jwt with both jwks and jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(cimdTestJWKS), JWKSURI: "https://app.example.com/jwks.json"}},
+		{"private_key_jwt with an unparseable jwks", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(`{"not":"a jwks"}`)}},
+		{"private_key_jwt with an empty jwks", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(`{"keys":[]}`)}},
+		// An anonymous document's jwks_uri gets NO private-endpoint hatch — the
+		// registered path has one only because an operator controls what they
+		// register.
+		{"private_key_jwt with a plaintext jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "http://app.example.com/jwks.json"}},
+		{"private_key_jwt with a relative jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "/jwks.json"}},
 		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
 		// NOTE: a document listing a grant outside the allow-list is NO LONGER
 		// rejected (zeroid#344) — the extra entry is dropped and the client is
@@ -1182,4 +1204,139 @@ func TestTruncateForLog(t *testing.T) {
 	if got := truncateForLog(strings.Repeat("x", 100), 10); got != strings.Repeat("x", 10)+"…" {
 		t.Errorf("unexpected truncation: %q", got)
 	}
+}
+
+// A key-based CIMD client is synthesized correctly, and — the part that matters
+// — is more AUTHENTICATED without being more AUTHORIZED (zeroid#264).
+//
+// The rationale this replaced claimed that honouring private_key_jwt from a
+// self-published document "would let any party on the internet assert a
+// confidential client identity with no registration step". The self-reference
+// check is why that does not follow: a CIMD client_id IS the URL its document
+// was fetched from, so the only identity assertable is one for a URL the caller
+// already controls — and already asserts today as a public client.
+//
+// So the assertions below are split deliberately. The first group is the new
+// capability; the second is every bound that must NOT have moved with it.
+func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
+	const url = "https://app.example.com/oauth/client.json"
+	now := time.Unix(1_700_000_000, 0)
+
+	base := func() *cimdMetadataDocument {
+		return &cimdMetadataDocument{
+			ClientID:                url,
+			ClientName:              "Example MCP Client",
+			RedirectURIs:            []string{"http://127.0.0.1:3000/callback"},
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JWKS:                    json.RawMessage(cimdTestJWKS),
+		}
+	}
+
+	t.Run("inline jwks is carried onto the synthesized client", func(t *testing.T) {
+		c, _, err := synthesizeCIMDClient(url, base(), now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !c.UsesPrivateKeyJWT() {
+			t.Error("a private_key_jwt document must synthesize a key-based client")
+		}
+		if !HasInlineJWKS(c.JWKS) {
+			t.Error("the document's jwks must reach the client, or the assertion has nothing to verify against")
+		}
+		// zeroid#348 convergence: a key holder is confidential whichever route
+		// produced it. Safe to assert only because no consumer reads the raw
+		// column any more — both predicates below answer correctly regardless.
+		if c.ClientType != "confidential" {
+			t.Errorf("ClientType = %q, want confidential", c.ClientType)
+		}
+		if !c.RequiresClientAuthentication() {
+			t.Error("a key-based CIMD client must be required to prove its key")
+		}
+		if !c.MayObtainAuthorizationCode() {
+			t.Error("a key-based CIMD client must still be able to obtain a code")
+		}
+	})
+
+	t.Run("jwks_uri is carried instead when that is what was published", func(t *testing.T) {
+		doc := base()
+		doc.JWKS = nil
+		doc.JWKSURI = "https://app.example.com/jwks.json"
+		c, _, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.JWKSURI != doc.JWKSURI {
+			t.Errorf("JWKSURI = %q, want %q", c.JWKSURI, doc.JWKSURI)
+		}
+		if HasInlineJWKS(c.JWKS) {
+			t.Error("no inline jwks was published; none should be set")
+		}
+	})
+
+	// ── Bounds that must NOT have moved ──────────────────────────────────────
+
+	t.Run("authority is still bounded to the CIMD grant set", func(t *testing.T) {
+		// The bound that actually constrains a CIMD client. Key-based auth must
+		// not widen it: client_credentials for a self-asserted client removes the
+		// user from the loop and is zeroid#266, a separate decision.
+		doc := base()
+		doc.GrantTypes = []string{"authorization_code", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"}
+		c, dropped, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, gt := range c.GrantTypes {
+			if !cimdAllowedGrantTypes[gt] {
+				t.Errorf("grant %q escaped the CIMD allow-list onto a key-based client", gt)
+			}
+		}
+		if slices.Contains(c.GrantTypes, "client_credentials") {
+			t.Error("client_credentials must NOT become available by holding a key (zeroid#266)")
+		}
+		if !slices.Contains(dropped, "client_credentials") {
+			t.Errorf("client_credentials should be reported dropped, got %v", dropped)
+		}
+	})
+
+	t.Run("self-reference is still what binds the identity", func(t *testing.T) {
+		// The check the whole argument rests on. A key does not let a document
+		// claim a client_id it was not served from — otherwise the old rationale
+		// would have been right.
+		doc := base()
+		doc.ClientID = "https://evil.example/other.json"
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Fatal("a key-based document must NOT be able to claim another URL's client_id")
+		}
+	})
+
+	t.Run("redirect_uris are still validated", func(t *testing.T) {
+		doc := base()
+		doc.RedirectURIs = []string{"http://app.example.com/cb"}
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Error("holding a key must not exempt a document from the redirect_uri scheme rules")
+		}
+	})
+
+	t.Run("a public CIMD client is unchanged and never carries key material", func(t *testing.T) {
+		// A document is published to EVERY authorization server at once, so it
+		// may carry keys for a purpose this server has no part in. Narrow, do
+		// not reject (the zeroid#344 precedent) — but the keys must not be
+		// copied onto a client whose declared method is "none", or a public
+		// client would have something for an assertion to verify against.
+		doc := base()
+		doc.TokenEndpointAuthMethod = "none"
+		c, _, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("a public document carrying jwks must not be rejected: %v", err)
+		}
+		if c.UsesPrivateKeyJWT() {
+			t.Error(`a document declaring "none" must not become key-based`)
+		}
+		if HasInlineJWKS(c.JWKS) || c.JWKSURI != "" {
+			t.Error("key material must not be copied onto a public client")
+		}
+		if c.ClientType != "public" || c.RequiresClientAuthentication() {
+			t.Error("a public CIMD client must be entirely unchanged by zeroid#264")
+		}
+	})
 }

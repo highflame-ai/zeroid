@@ -187,3 +187,52 @@ func TestCIMD_AddingAGrantToAPublishedDocumentKeepsRefreshUsable(t *testing.T) {
 		"republishing without refresh_token must still withdraw rotation — that is "+
 			"the only revocation mechanism a zero-registration client has")
 }
+
+// Introspection and revocation stay REGISTRY-ONLY for CIMD clients, key or no
+// key (zeroid#264).
+//
+// This is the regression that becomes newly tempting once CIMD documents carry
+// verifiable keys. VerifyPresentedClientAuth resolves the client through
+// GetClientByClientID — registry-only — precisely because introspection has no
+// redirect_uri binding to protect it: a self-published document must not be able
+// to satisfy the gate and turn introspection into a token oracle for any party
+// on the internet. "The document has a real key now, so just resolve CIMD here
+// too" is a reasonable-sounding change that would reopen exactly that.
+//
+// Asserted end to end over HTTP against the real endpoint, because the property
+// is about which RESOLVER the endpoint reaches for, and only the wired-up server
+// can answer that.
+func TestCIMD_KeyBasedClientCannotAuthenticateForIntrospection(t *testing.T) {
+	// A CIMD-shaped client_id that is genuinely not in the registry. No document
+	// origin is needed: the point is that no fetch is ever attempted, so an
+	// unreachable URL is the strongest possible form of the fixture.
+	const cimdClientID = "https://never-registered.example.com/.well-known/oauth/client-metadata.json"
+
+	t.Run("with a client_assertion", func(t *testing.T) {
+		resp := post(t, "/oauth2/token/introspect", map[string]any{
+			"token":                 "zid_at_whatever",
+			"client_id":             cimdClientID,
+			"client_assertion":      "eyJhbGciOiJFUzI1NiJ9.e30.sig",
+			"client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+			"a self-published client must not be able to authenticate for introspection")
+		assert.Equal(t, "invalid_client", decode(t, resp)["error"])
+	})
+
+	t.Run("with client_id alone", func(t *testing.T) {
+		// The no-secret branch is registry-only for the same reason. A CIMD
+		// client_id presenting nothing must not be read as "a registered public
+		// client presenting just its client_id".
+		resp := post(t, "/oauth2/token/introspect", map[string]any{
+			"token":     "zid_at_whatever",
+			"client_id": cimdClientID,
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+			"CIMD client_ids are deliberately not accepted on the introspection gate")
+	})
+}
