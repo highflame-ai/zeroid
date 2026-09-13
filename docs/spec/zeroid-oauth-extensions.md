@@ -1014,9 +1014,21 @@ overrides the document.
   party on the internet claim a confidential client identity without
   registering. Every CIMD client is therefore public and PKCE is the sole proof
   of possession. Tracked in zeroid#264.
-- `grant_types` defaults to `["authorization_code"]`, **MUST** include
-  `authorization_code`, and may contain only `authorization_code` and
-  `refresh_token`.
+- `grant_types` defaults to `["authorization_code"]` and **MUST** include
+  `authorization_code`. Values outside `{authorization_code, refresh_token}` are
+  **ignored**: the effective grant set is the intersection of the document's
+  list with that pair, and the synthesized client carries only the
+  intersection. A document is refused only when the intersection is empty of
+  `authorization_code`.
+
+  This follows RFC 7591 §2 (an AS MAY ignore metadata it does not understand)
+  and §3.2.1 (an AS MAY substitute the grant types it supports). A CIMD document
+  is published once to every authorization server the client uses and there is
+  no registration response to negotiate with, so rejecting it over a grant this
+  server does not implement would force the publisher to choose between servers.
+  The security property is preserved by the intersection, not by the rejection:
+  a grant absent from the synthesized client's `grant_types` cannot be obtained.
+  Changed in zeroid#344.
 - When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
   entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
   is a deviation**, and it is what makes the allow-list load-bearing for Section
