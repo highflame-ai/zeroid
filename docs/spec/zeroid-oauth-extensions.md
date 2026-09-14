@@ -924,8 +924,9 @@ ZeroID implements
 (revision **-02**, July 2026), the client-onboarding model the MCP Authorization
 specification names as its preferred default. A client presents an `https://`
 URL as its `client_id`; ZeroID fetches and validates the metadata document
-published there and synthesises an **ephemeral** public PKCE client from it. No
-row is written to the client registry.
+published there and synthesises an **ephemeral** client from it — a public PKCE
+client by default, or a key-authenticated one when the document publishes a key
+set (zeroid#264). No row is written to the client registry.
 
 This section specifies ZeroID's deviations from the draft and the deployment
 controls around it. `docs/cimd.md` carries the worked examples.
@@ -1005,15 +1006,38 @@ overrides the document.
   consent has to go on. ZeroID previously fell back to the `client_id`, which made
   a document that declined to name itself indistinguishable from a well-formed one
   and let whoever chose the URL choose what the user reads.
-- `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
-  `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
-  establish itself as confidential via `token_endpoint_auth_method` and
-  `jwks_uri`. ZeroID implements `private_key_jwt` for REGISTERED clients as of
-  zeroid#206, but still refuses it for CIMD: a CIMD registration is a
-  self-published document, so accepting key-based auth from one would let any
-  party on the internet claim a confidential client identity without
-  registering. Every CIMD client is therefore public and PKCE is the sole proof
-  of possession. Tracked in zeroid#264.
+- `token_endpoint_auth_method` **MUST** be `none` (an omitted value defaults to
+  `none`) or `private_key_jwt`. Draft-02 §8.2 *recommends* that a client be able
+  to establish itself as confidential via `token_endpoint_auth_method` and
+  `jwks_uri`; ZeroID supports that as of zeroid#264. The secret-based methods are
+  refused, and this is **not** a deviation so much as a structural fact: there is
+  no registration response in which a self-published client could be handed a
+  secret.
+
+  A `private_key_jwt` document **MUST** publish exactly one of `jwks` or
+  `jwks_uri` (RFC 7591 §2); declaring the method with no key material is refused
+  at resolution, because it describes a client that could never authenticate.
+
+  **Deviation — `jwks_uri` MUST be on the `client_id`'s own host**, and gets no
+  private-endpoint relaxation. The draft does not require this. Two reasons, and
+  the first is the principled one: CIMD's entire trust anchor is that the
+  document's *host* vouches for the identity, so honouring keys served by some
+  other host would trust B to speak for A with nothing establishing that it may.
+  The second is concrete — key resolution runs *before* signature verification,
+  so without the rule any anonymous document becomes an unauthenticated
+  outbound-fetch primitive aimed at a third party, and each distinct URL consumes
+  a bounded cache slot that owns a background refresh, evicting legitimate
+  clients' key sets. Inline `jwks` is the escape hatch for a publisher who keeps
+  keys elsewhere.
+
+  Earlier revisions of this document stated that accepting key-based auth "would
+  let any party on the internet claim a confidential client identity without
+  registering". That was wrong and is retracted: the §4 self-reference check
+  means a CIMD `client_id` **is** the URL its document was fetched from, so the
+  only identity assertable is one for a URL the caller already controls — which
+  a public CIMD client already asserts. A key is an added proof obligation, not a
+  new identity. What bounds a CIMD client's authority is the grant-type
+  intersection below, which key-based auth does not widen.
 - `grant_types` defaults to `["authorization_code"]` and **MUST** include
   `authorization_code`. Values outside `{authorization_code, refresh_token}` are
   **ignored**: the effective grant set is the intersection of the document's

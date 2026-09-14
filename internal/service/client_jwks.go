@@ -201,6 +201,25 @@ func (s *OAuthService) clientVerificationKeys(ctx context.Context, client *domai
 		// failed warm-up) must not fail merely because the fetch has not
 		// happened yet.
 		if err := jwksClient.EnsureLoaded(ctx); err != nil {
+			// WHOSE fault the unreachable endpoint is decides the status, and it
+			// differs by how the client got here.
+			//
+			// For a REGISTERED client an operator vetted the jwks_uri, so a
+			// failed load is an operational fault on our side of the fetch — 500,
+			// matching how the external-IdP path treats an unloadable issuer JWKS.
+			//
+			// For a self-published CIMD client it is the PUBLISHER's fault, and
+			// calling it a server error would be wrong twice over: a document is
+			// accepted and positively cached on scheme + host alone, so any
+			// anonymous party could publish a jwks_uri that 404s — or that the
+			// SSRF guard refuses at dial time — and mint a deterministic,
+			// repeatable 500 on every authentication attempt. That is
+			// unauthenticated noise landing squarely in server-error alerting,
+			// for what is in fact a client-authentication failure.
+			if client.RegistrationSource == cimdRegistrationSource {
+				return nil, oauthUnauthorized("the client's published jwks_uri could not be loaded", err)
+			}
+
 			return nil, oauthServerError("failed to load the client's jwks_uri", err)
 		}
 		set := jwksClient.KeySet()

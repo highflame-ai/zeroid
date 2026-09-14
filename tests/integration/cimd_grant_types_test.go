@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // End-to-end coverage for zeroid#344: a CIMD document that lists a grant this
@@ -186,4 +189,73 @@ func TestCIMD_AddingAGrantToAPublishedDocumentKeepsRefreshUsable(t *testing.T) {
 	assert.NotContains(t, revoked, "refresh_token",
 		"republishing without refresh_token must still withdraw rotation — that is "+
 			"the only revocation mechanism a zero-registration client has")
+}
+
+// Introspection and revocation stay REGISTRY-ONLY for CIMD clients, key or no
+// key (zeroid#264).
+//
+// This is the regression that becomes tempting once CIMD documents carry
+// verifiable keys. VerifyPresentedClientAuth resolves the client through
+// GetClientByClientID — registry-only — precisely because introspection has no
+// redirect_uri binding to protect it: a self-published document must not be able
+// to satisfy the gate and turn introspection into a token oracle for any party
+// on the internet. "The document has a real key now, so just resolve CIMD here
+// too" is a reasonable-sounding change that would reopen exactly that.
+//
+// THE FIXTURE HAS TO BE A WORKING ONE. An earlier version of this test used an
+// unreachable client_id against a server with CIMD switched off, and called that
+// "the strongest possible form of the fixture". It was the weakest: with CIMD
+// disabled, resolveClientRegistryOrCIMD short-circuits and returns
+// ErrOAuthClientNotFound, so the 401 arrives no matter which resolver the
+// endpoint calls. Mutation-testing it — swapping in resolveClientRegistryOrCIMD,
+// the exact regression — left it passing.
+//
+// So this builds the case that WOULD succeed if the resolver were swapped: CIMD
+// enabled, a reachable document, a real published key, and a correctly signed
+// assertion. Everything is in place except permission. Swap the resolver and
+// this goes green; that is what makes it a guard.
+func TestCIMD_KeyBasedClientCannotAuthenticateForIntrospection(t *testing.T) {
+	ctx := context.Background()
+	key := generateKey(t)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID := "https://" + r.Host + r.URL.Path
+		jwks, err := json.Marshal(clientJWKS(t, key))
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Oracle Probe",`+
+			`"redirect_uris":["http://127.0.0.1:9000/cb"],`+
+			`"token_endpoint_auth_method":"private_key_jwt","jwks":%s}`, clientID, jwks)
+	}))
+	t.Cleanup(ts.Close)
+
+	clientID := ts.URL + "/client.json"
+	cimdSvc := service.NewCIMDService(service.CIMDConfig{Enabled: true, HTTPClient: ts.Client()})
+
+	// Sanity: the document really does resolve into a key-based client. Without
+	// this the test could pass because the fixture is broken rather than because
+	// the gate holds — the failure mode it exists to avoid.
+	resolved, err := cimdSvc.ResolveClient(ctx, clientID)
+	require.NoError(t, err, "the fixture must be a WORKING key-based CIMD client")
+	require.True(t, resolved.UsesPrivateKeyJWT())
+
+	oauthSvc := service.NewOAuthService(nil, nil,
+		service.NewOAuthClientService(postgres.NewOAuthClientRepository(testDB)),
+		nil, nil, nil, nil,
+		service.OAuthServiceConfig{Issuer: testIssuer, AuthCodeIssuer: testIssuer},
+	)
+	oauthSvc.SetCIMDService(cimdSvc)
+	oauthSvc.SetClientAssertionReplayStore(dpop.NewMemoryStore())
+
+	// A correctly signed assertion for a client that genuinely exists and
+	// genuinely holds this key. The ONLY thing standing between it and success
+	// is that introspection refuses to resolve CIMD.
+	assertion := clientAssertionFor(t, key, clientID)
+	err = oauthSvc.VerifyPresentedClientAuth(ctx, clientID, "", assertion, clientAssertionType)
+
+	require.Error(t, err,
+		"a self-published client must not authenticate for introspection, however well it signs — "+
+			"introspection has no redirect_uri binding, so honouring CIMD here makes it a token oracle")
+	assert.Contains(t, err.Error(), "client authentication required",
+		"it must fail at RESOLUTION (registry miss), not at signature verification")
 }
