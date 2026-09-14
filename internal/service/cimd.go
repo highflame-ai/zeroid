@@ -440,7 +440,20 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 			return client, nil
 		}
 
-		return s.resolveUncached(ctx, clientID, u.Hostname())
+		// context.WithoutCancel: the flight must not be hostage to whichever
+		// caller happened to arrive first. singleflight hands ONE execution to
+		// every waiter, so with the raw ctx a caller who disconnects mid-fetch
+		// cancels the fetch for everyone waiting on it — and, before the guard in
+		// resolveUncached, negative-cached that cancellation, denying the
+		// client_id to every later caller for cimdTransientNegativeCacheTTL.
+		//
+		// That was an unauthenticated, targeted denial of service: resolution
+		// runs before the principal chain, so an attacker needed only to open a
+		// request for a victim's client_id and abort it, once per 10 seconds, to
+		// keep that client unable to log anyone in. Detaching cancellation costs
+		// nothing — the fetch is independently bounded by cimdFetchTimeout, and
+		// completing it populates the cache for the waiters who are still there.
+		return s.resolveUncached(context.WithoutCancel(ctx), clientID, u.Hostname())
 	})
 	if err != nil {
 		return nil, err
@@ -473,6 +486,20 @@ func (s *CIMDService) resolveUncached(
 ) (*domain.OAuthClient, error) {
 	doc, docTTL, err := s.fetch(ctx, clientID)
 	if err != nil {
+		// A CANCELLED fetch says nothing about the origin, so it must never be
+		// cached. It is not evidence the document is unreachable — only that
+		// somebody stopped waiting for it — and caching it turns one abandoned
+		// request into a denial for every later caller. Defence in depth behind
+		// the context.WithoutCancel in ResolveClient, which stops the caller's
+		// cancellation reaching here at all; both are cheap and the failure mode
+		// is bad enough to want either one alone to be sufficient.
+		//
+		// A genuine timeout is NOT exempt: exceeding cimdFetchTimeout is real
+		// evidence about the origin, and the transient TTL is the right response.
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+
 		// Negative-cache the failure so replaying a dead URL can't force a
 		// fresh timeout-bounded outbound fetch per request. Fetch errors are
 		// transient (origin blip) and get the short TTL; validation errors are
@@ -910,7 +937,7 @@ func validateCIMDKeyMaterial(clientID string, doc *cimdMetadataDocument) error {
 	if err != nil || u.Host == "" {
 		return fmt.Errorf("%w: client_id is not a usable URL", ErrCIMDInvalidDocument)
 	}
-	if err := validateKeyMaterial(doc.JWKS, doc.JWKSURI, true, keyMaterialRules{sameHostAs: u.Host}); err != nil {
+	if err := validateKeyMaterial(doc.JWKS, doc.JWKSURI, true, keyMaterialRules{sameHostAs: u.Hostname()}); err != nil {
 		return fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
 	}
 
@@ -1025,15 +1052,31 @@ func (s *CIMDService) cachedResult(clientID string) (*domain.OAuthClient, error,
 }
 
 // cloneCIMDClient copies c so the result shares no slice backing storage with
-// c. A plain `*c` struct copy leaves the slice fields (GrantTypes/RedirectURIs/
-// Scopes/Contacts) aliasing the original — a caller appending to or mutating
-// one of those slices would corrupt the cached entry (and race other callers).
+// c. A plain `*c` struct copy leaves the slice fields aliasing the original — a
+// caller appending to or mutating one of them would corrupt the cached entry and
+// race every other caller holding a copy.
+//
+// This list WAS an enumeration that went stale the moment a slice field was
+// added: zeroid#264 put `jwks` on the synthesized client and did not add it
+// here, so every caller resolving a key-based CIMD client shared one backing
+// array for its VERIFICATION KEY MATERIAL — with the cache and with each other.
+// Nothing mutated it, so nothing broke and -race stayed silent, which is exactly
+// how the next one would land too. `metadata` was missing for the same reason
+// and had simply never been populated.
+//
+// TestCloneCIMDClientCoversEveryReferenceField walks the struct by reflection
+// and fails if any slice-kinded field is left aliasing, so adding a field to
+// domain.OAuthClient cannot quietly reintroduce this. The enumeration below is
+// still explicit — it is fast and readable — but it is now checked rather than
+// trusted.
 func cloneCIMDClient(c *domain.OAuthClient) *domain.OAuthClient {
 	cp := *c
 	cp.GrantTypes = slices.Clone(c.GrantTypes)
 	cp.RedirectURIs = slices.Clone(c.RedirectURIs)
 	cp.Scopes = slices.Clone(c.Scopes)
 	cp.Contacts = slices.Clone(c.Contacts)
+	cp.JWKS = slices.Clone(c.JWKS)
+	cp.Metadata = slices.Clone(c.Metadata)
 	return &cp
 }
 

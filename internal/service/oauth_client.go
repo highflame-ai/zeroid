@@ -558,11 +558,17 @@ func validateKeyMaterial(jwks json.RawMessage, jwksURI string, requireKeys bool,
 		if u.Host == "" || (u.Scheme != "https" && (!rules.allowPrivateEndpoints || u.Scheme != "http")) {
 			return fmt.Errorf("jwks_uri must be an absolute https:// URL (got %q)", jwksURI)
 		}
-		if rules.sameHostAs != "" && !strings.EqualFold(u.Host, rules.sameHostAs) {
+		// Hostname(), not Host: the comparison is about WHO controls the name,
+		// and a port does not change that. Comparing Host would also reject the
+		// same origin spelled with its default port — https://app.example.com
+		// versus https://app.example.com:443 — which a document generator may
+		// well emit. Hostname() is also what domainAllowed already compares, so
+		// the two host checks in this feature agree on what "same host" means.
+		if rules.sameHostAs != "" && !strings.EqualFold(u.Hostname(), rules.sameHostAs) {
 			return fmt.Errorf(
 				"jwks_uri host %q must equal the client_id host %q — a self-published document may only "+
 					"publish keys on its own host; use an inline jwks to serve them from elsewhere",
-				u.Host, rules.sameHostAs)
+				u.Hostname(), rules.sameHostAs)
 		}
 	}
 

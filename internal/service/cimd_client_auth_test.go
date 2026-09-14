@@ -214,33 +214,39 @@ func TestCIMDKeyMaterialMustBeOnTheClientsOwnHost(t *testing.T) {
 	ctx := context.Background()
 	key := newTestKey(t)
 
-	// The third party. It must never be contacted.
-	var thirdPartyHits int32
-	thirdParty := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		atomic.AddInt32(&thirdPartyHits, 1)
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"keys":[]}`)
-	}))
-	t.Cleanup(thirdParty.Close)
-
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var docFetches int32
+	// The document origin serves a jwks_uri on a DIFFERENT HOSTNAME. It must be
+	// refused at validation — before any attempt to contact that host — which is
+	// what the error KIND proves: ErrCIMDInvalidDocument, not ErrCIMDFetch.
+	//
+	// The hostname has to genuinely differ, and that is the trap this test fell
+	// into first time round: two httptest servers both bind 127.0.0.1 and differ
+	// only by PORT, so an earlier version of this test passed against a
+	// port-sensitive comparison and proved nothing about hosts. A port is not a
+	// host — the trust anchor is the DNS name and the TLS identity, neither of
+	// which a port changes — so the rule compares Hostname(), and the fixture
+	// must too.
+	crossHost := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&docFetches, 1)
 		clientID := "https://" + r.Host + r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Cross-Host Probe",`+
 			`"redirect_uris":["http://127.0.0.1:9000/cb"],`+
-			`"token_endpoint_auth_method":"private_key_jwt","jwks_uri":%q}`,
-			clientID, thirdParty.URL+"/jwks")
+			`"token_endpoint_auth_method":"private_key_jwt",`+
+			`"jwks_uri":"https://keys.elsewhere.example/jwks"}`, clientID)
 	}))
-	t.Cleanup(origin.Close)
+	t.Cleanup(crossHost.Close)
 
-	cimdSvc := NewCIMDService(CIMDConfig{Enabled: true, HTTPClient: origin.Client()})
-	_, err := cimdSvc.ResolveClient(ctx, origin.URL+"/client.json")
+	cimdSvc := NewCIMDService(CIMDConfig{Enabled: true, HTTPClient: crossHost.Client()})
+	_, err := cimdSvc.ResolveClient(ctx, crossHost.URL+"/client.json")
 
 	require.Error(t, err, "a document must not be able to point jwks_uri at an unrelated host")
-	require.ErrorIs(t, err, ErrCIMDInvalidDocument)
-	assert.Zero(t, atomic.LoadInt32(&thirdPartyHits),
-		"refusal must happen at RESOLUTION — if the third party was contacted at all, "+
-			"the unauthenticated fetch primitive still exists")
+	require.ErrorIs(t, err, ErrCIMDInvalidDocument,
+		"refusal must come from VALIDATION, not from failing to reach the third-party host — "+
+			"if it were a fetch error the unauthenticated outbound-request primitive would still exist")
+	require.NotErrorIs(t, err, ErrCIMDFetch)
+	assert.Positive(t, atomic.LoadInt32(&docFetches),
+		"the document itself must have been fetched, or the test never reached the rule it is testing")
 
 	// The legitimate shape still works: keys on the document's own host.
 	sameHost := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
