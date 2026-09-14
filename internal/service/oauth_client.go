@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -479,7 +480,54 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 	if !registrableClientAuthMethods[authMethod] {
 		return fmt.Errorf("%w: token_endpoint_auth_method %q is not supported", ErrInvalidClientMetadata, authMethod)
 	}
+	if err := validateKeyMaterial(jwks, jwksURI,
+		authMethod == clientAuthMethodPrivateKeyJWT,
+		keyMaterialRules{allowPrivateEndpoints: allowPrivateJWKS},
+	); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidClientMetadata, err)
+	}
 
+	return nil
+}
+
+// keyMaterialRules parameterises the policy differences between the paths that
+// accept client key material. The RULES differ; the CHECKS must not, which is
+// why they live in validateKeyMaterial rather than being written out twice. Any
+// future hardening — a key-algorithm restriction, a minimum key size, a `kid`
+// requirement — then covers every path by construction, instead of by whoever
+// adds it remembering there is a second one.
+type keyMaterialRules struct {
+	// allowPrivateEndpoints permits a plaintext http:// jwks_uri. The registered
+	// path offers this hatch for loopback test fixtures because an OPERATOR
+	// controls what they register. A self-published CIMD document has no
+	// operator, so it never gets the hatch.
+	allowPrivateEndpoints bool
+
+	// sameHostAs, when non-empty, requires the jwks_uri host to equal it.
+	//
+	// Set for CIMD and only for CIMD. Without it an anonymous document can
+	// direct this server to fetch from an arbitrary UNRELATED https host with no
+	// credential of any kind: verifyClientAssertion resolves the key set BEFORE
+	// it checks the signature, so a garbage assertion drives the fetch exactly
+	// as well as a real one (measured: 6 outbound requests to a third-party host
+	// from 5 unauthenticated calls). Worse, each distinct URL takes a
+	// ClientJWKSCache slot that owns a background refresh goroutine, so it also
+	// evicts legitimate clients' entries and makes them re-fetch.
+	//
+	// Same-host is not merely a mitigation, it is the correct posture. CIMD's
+	// whole trust anchor is that the document's HOST vouches for the identity;
+	// honouring keys served by a different host would trust B to speak for A
+	// with nothing establishing that it may. Inline `jwks` is the escape hatch
+	// for a publisher who genuinely keeps keys elsewhere, and the 5 KiB document
+	// cap fits EC keys comfortably. It also matches how redirect_uris already
+	// treat the client_id's own host as the privileged one.
+	sameHostAs string
+}
+
+// validateKeyMaterial enforces the jwks / jwks_uri contract shared by every path
+// that accepts client key material. Pure. Returns a bare error describing the
+// problem; callers wrap it with their own sentinel.
+func validateKeyMaterial(jwks json.RawMessage, jwksURI string, requireKeys bool, rules keyMaterialRules) error {
 	hasInline := HasInlineJWKS(jwks)
 	hasURI := jwksURI != ""
 
@@ -488,11 +536,11 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 	// just private_key_jwt — an ambiguous key set is a problem whenever it is
 	// stored, and a client can change its auth method later.
 	if hasInline && hasURI {
-		return fmt.Errorf("%w: jwks and jwks_uri must not both be present (RFC 7591 §2)", ErrInvalidClientMetadata)
+		return errors.New("jwks and jwks_uri must not both be present (RFC 7591 §2)")
 	}
 
-	if authMethod == clientAuthMethodPrivateKeyJWT && !hasInline && !hasURI {
-		return fmt.Errorf("%w: token_endpoint_auth_method private_key_jwt requires jwks or jwks_uri", ErrInvalidClientMetadata)
+	if requireKeys && !hasInline && !hasURI {
+		return fmt.Errorf("token_endpoint_auth_method %s requires jwks or jwks_uri", clientAuthMethodPrivateKeyJWT)
 	}
 
 	// jwks_uri MUST be absolute HTTPS (RFC 7591 §2, OIDC Core §10). This server
@@ -505,10 +553,16 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 	if hasURI {
 		u, err := url.Parse(jwksURI)
 		if err != nil {
-			return fmt.Errorf("%w: jwks_uri is not a valid URL: %v", ErrInvalidClientMetadata, err)
+			return fmt.Errorf("jwks_uri is not a valid URL: %v", err)
 		}
-		if u.Host == "" || (u.Scheme != "https" && (!allowPrivateJWKS || u.Scheme != "http")) {
-			return fmt.Errorf("%w: jwks_uri must be an absolute https:// URL (got %q)", ErrInvalidClientMetadata, jwksURI)
+		if u.Host == "" || (u.Scheme != "https" && (!rules.allowPrivateEndpoints || u.Scheme != "http")) {
+			return fmt.Errorf("jwks_uri must be an absolute https:// URL (got %q)", jwksURI)
+		}
+		if rules.sameHostAs != "" && !strings.EqualFold(u.Host, rules.sameHostAs) {
+			return fmt.Errorf(
+				"jwks_uri host %q must equal the client_id host %q — a self-published document may only "+
+					"publish keys on its own host; use an inline jwks to serve them from elsewhere",
+				u.Host, rules.sameHostAs)
 		}
 	}
 
@@ -518,10 +572,10 @@ func validateClientAuthMethod(authMethod string, jwks json.RawMessage, jwksURI s
 	if hasInline {
 		set, err := jwk.Parse(jwks)
 		if err != nil {
-			return fmt.Errorf("%w: jwks is not a valid JWK Set: %v", ErrInvalidClientMetadata, err)
+			return fmt.Errorf("jwks is not a valid JWK Set: %v", err)
 		}
 		if set.Len() == 0 {
-			return fmt.Errorf("%w: jwks contains no keys", ErrInvalidClientMetadata)
+			return errors.New("jwks contains no keys")
 		}
 	}
 

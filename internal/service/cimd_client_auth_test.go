@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/highflame-ai/zeroid/pkg/authjwt"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
@@ -184,4 +186,125 @@ func TestCIMDKeyBasedClientIsNotPersisted(t *testing.T) {
 		"the source tag is what marks it self-asserted everywhere downstream")
 	assert.Empty(t, client.ID, "a synthesized client has no registry row identity")
 	assert.True(t, client.CreatedAt.Before(time.Now().Add(time.Minute)))
+}
+
+// A CIMD document may only publish keys on its OWN host.
+//
+// Without this, validateCIMDKeyMaterial accepted any absolute https jwks_uri,
+// which made an anonymous document an unauthenticated outbound-fetch primitive
+// aimed at a third party. verifyClientAssertion resolves the key set BEFORE it
+// verifies the signature (clientVerificationKeys, then jwt.Parse), so no valid
+// credential is needed to drive it: measured at 6 outbound requests to an
+// unrelated host from 5 garbage-assertion calls, since the JWKS client both
+// warms up and loads.
+//
+// The amplification is the smaller half. Each distinct jwks_uri takes a
+// ClientJWKSCache slot — keyed clientID‖jwksURI — and every slot owns a
+// background goroutine re-fetching on an interval. N attacker URLs therefore
+// evict N legitimate clients' cached key sets, and those clients then pay fresh
+// fetches on their next authentication. The 256-entry cap bounds memory and
+// goroutines; it does not bound fetch RATE, and the eviction churn IS the harm.
+//
+// Same-host is also simply the right rule. CIMD's trust anchor is that the
+// document's host vouches for the identity; honouring keys served by a different
+// host would trust B to speak for A with nothing establishing that it may.
+// Inline `jwks` remains the escape hatch for a publisher who keeps keys
+// elsewhere, and the 5 KiB document cap fits EC keys comfortably.
+func TestCIMDKeyMaterialMustBeOnTheClientsOwnHost(t *testing.T) {
+	ctx := context.Background()
+	key := newTestKey(t)
+
+	// The third party. It must never be contacted.
+	var thirdPartyHits int32
+	thirdParty := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&thirdPartyHits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"keys":[]}`)
+	}))
+	t.Cleanup(thirdParty.Close)
+
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID := "https://" + r.Host + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Cross-Host Probe",`+
+			`"redirect_uris":["http://127.0.0.1:9000/cb"],`+
+			`"token_endpoint_auth_method":"private_key_jwt","jwks_uri":%q}`,
+			clientID, thirdParty.URL+"/jwks")
+	}))
+	t.Cleanup(origin.Close)
+
+	cimdSvc := NewCIMDService(CIMDConfig{Enabled: true, HTTPClient: origin.Client()})
+	_, err := cimdSvc.ResolveClient(ctx, origin.URL+"/client.json")
+
+	require.Error(t, err, "a document must not be able to point jwks_uri at an unrelated host")
+	require.ErrorIs(t, err, ErrCIMDInvalidDocument)
+	assert.Zero(t, atomic.LoadInt32(&thirdPartyHits),
+		"refusal must happen at RESOLUTION — if the third party was contacted at all, "+
+			"the unauthenticated fetch primitive still exists")
+
+	// The legitimate shape still works: keys on the document's own host.
+	sameHost := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/jwks" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(inlineJWKS(t, key))
+
+			return
+		}
+		clientID := "https://" + r.Host + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Same Host",`+
+			`"redirect_uris":["http://127.0.0.1:9000/cb"],`+
+			`"token_endpoint_auth_method":"private_key_jwt","jwks_uri":"https://%s/jwks"}`,
+			clientID, r.Host)
+	}))
+	t.Cleanup(sameHost.Close)
+
+	okSvc := NewCIMDService(CIMDConfig{Enabled: true, HTTPClient: sameHost.Client()})
+	client, err := okSvc.ResolveClient(ctx, sameHost.URL+"/client.json")
+	require.NoError(t, err, "keys on the document's own host are the supported shape and must still work")
+	assert.True(t, client.UsesPrivateKeyJWT())
+}
+
+// A CIMD client whose published jwks_uri cannot be loaded is a CLIENT
+// authentication failure (401), not a server error (500).
+//
+// The document is accepted and positively cached on scheme + host alone, so
+// without this any anonymous party could publish a jwks_uri that 404s and mint a
+// deterministic, repeatable 500 on every authentication attempt — unauthenticated
+// noise aimed straight at server-error alerting. A REGISTERED client keeps the
+// 500: an operator vetted that URL, so a failed load really is our fault.
+func TestCIMDUnloadableJWKSURIIsAClientErrorNotAServerError(t *testing.T) {
+	ctx := context.Background()
+
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/jwks" {
+			http.NotFound(w, r) // the publisher's own endpoint is broken
+
+			return
+		}
+		clientID := "https://" + r.Host + r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"client_id":%q,"client_name":"Broken Keys",`+
+			`"redirect_uris":["http://127.0.0.1:9000/cb"],`+
+			`"token_endpoint_auth_method":"private_key_jwt","jwks_uri":"https://%s/jwks"}`,
+			clientID, r.Host)
+	}))
+	t.Cleanup(origin.Close)
+
+	cimdSvc := NewCIMDService(CIMDConfig{Enabled: true, HTTPClient: origin.Client()})
+	clientID := origin.URL + "/client.json"
+	client, err := cimdSvc.ResolveClient(ctx, clientID)
+	require.NoError(t, err, "the document itself is valid — only its key endpoint is broken")
+
+	svc := clientAssertionSvc(dpop.NewMemoryStore())
+	svc.clientJWKS = NewClientJWKSCache(8, authjwt.WithHTTPClient(origin.Client()))
+
+	err = svc.verifyConfidentialClientAuth(ctx, client, clientID, "",
+		mintAssertion(t, newTestKey(t), clientID, assertionOpts{}), clientAssertionTypeJWTBearer)
+	require.Error(t, err)
+
+	var oerr *OAuthError
+	require.ErrorAs(t, err, &oerr)
+	assert.Equal(t, http.StatusUnauthorized, oerr.HTTPStatus,
+		"an anonymous publisher must not be able to mint 500s on demand")
 }

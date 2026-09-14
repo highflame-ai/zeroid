@@ -63,7 +63,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v4/jwk"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/rs/zerolog/log"
@@ -809,7 +808,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	var jwks json.RawMessage
 	var jwksURI string
 	if authMethod == clientAuthMethodPrivateKeyJWT {
-		if err := validateCIMDKeyMaterial(doc); err != nil {
+		if err := validateCIMDKeyMaterial(clientID, doc); err != nil {
 			return nil, nil, err
 		}
 		jwks, jwksURI = doc.JWKS, doc.JWKSURI
@@ -882,56 +881,40 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	}, dropped, nil
 }
 
-// validateCIMDKeyMaterial enforces the registration-time key contract for a
-// private_key_jwt CIMD document. Pure, so synthesizeCIMDClient stays pure.
+// validateCIMDKeyMaterial enforces the key contract for a private_key_jwt CIMD
+// document. Pure, so synthesizeCIMDClient stays pure.
 //
-// Deliberately stricter than validateClientAuthMethod's equivalent on the
-// registered path, in one respect: `jwks_uri` must be absolute https with NO
-// private-endpoint relaxation. The registered path has a documented hatch for
-// loopback test fixtures because an operator controls what they register; a CIMD
-// jwks_uri arrives from an anonymous document, so the hatch would be a hole —
-// and it would be reachable by anyone on the internet rather than by anyone with
-// registration access.
+// Shares validateKeyMaterial with the registered path so the two cannot drift;
+// the two policy differences are declared, not reimplemented:
+//
+//   - NO private-endpoint hatch. The registered path has one because an operator
+//     controls what they register; an anonymous document has no operator.
+//   - jwks_uri must be on the client_id's OWN host. Without that, a document can
+//     point this server at an arbitrary third-party https host and drive fetches
+//     to it with no credential — verifyClientAssertion resolves the key set
+//     before it verifies the signature, so a garbage assertion works just as
+//     well. See keyMaterialRules.sameHostAs for why same-host is the correct
+//     posture rather than merely a mitigation.
 //
 // Failing here rather than at first authentication is the same trade the
 // registered path makes: a document declaring private_key_jwt with no usable key
-// is a client that could never authenticate, and saying so at resolution time is
-// an actionable error instead of a 401 the publisher debugs later.
-func validateCIMDKeyMaterial(doc *cimdMetadataDocument) error {
-	hasInline := HasInlineJWKS(doc.JWKS)
-	hasURI := doc.JWKSURI != ""
-
-	switch {
-	case hasInline && hasURI:
-		// RFC 7591 §2. Refusing beats picking one: the publisher cannot
-		// otherwise tell which key set is actually authenticating them.
-		return fmt.Errorf("%w: jwks and jwks_uri must not both be present (RFC 7591 §2)", ErrCIMDInvalidDocument)
-
-	case !hasInline && !hasURI:
-		return fmt.Errorf("%w: token_endpoint_auth_method %q requires jwks or jwks_uri",
-			ErrCIMDInvalidDocument, clientAuthMethodPrivateKeyJWT)
-
-	case hasInline:
-		set, err := jwk.Parse(doc.JWKS)
-		if err != nil {
-			return fmt.Errorf("%w: jwks is not a valid JWK Set: %v", ErrCIMDInvalidDocument, err)
-		}
-		if set.Len() == 0 {
-			return fmt.Errorf("%w: jwks contains no keys", ErrCIMDInvalidDocument)
-		}
-		return nil
-
-	default:
-		u, err := url.Parse(doc.JWKSURI)
-		if err != nil {
-			return fmt.Errorf("%w: jwks_uri is not a valid URL: %v", ErrCIMDInvalidDocument, err)
-		}
-		if u.Scheme != "https" || u.Host == "" {
-			return fmt.Errorf("%w: jwks_uri must be an absolute https:// URL (got %q)",
-				ErrCIMDInvalidDocument, doc.JWKSURI)
-		}
-		return nil
+// describes a client that could never authenticate, and saying so at resolution
+// time is an actionable error instead of a 401 the publisher debugs later.
+func validateCIMDKeyMaterial(clientID string, doc *cimdMetadataDocument) error {
+	// The client_id is already known to parse as an absolute https URL with a
+	// non-empty host — IsCIMDClientID gates that before any fetch happens — so
+	// a parse failure here is not reachable in practice. Treat it as a refusal
+	// rather than ignoring the error: silently skipping the host comparison is
+	// the one outcome that must not happen.
+	u, err := url.Parse(clientID)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%w: client_id is not a usable URL", ErrCIMDInvalidDocument)
 	}
+	if err := validateKeyMaterial(doc.JWKS, doc.JWKSURI, true, keyMaterialRules{sameHostAs: u.Host}); err != nil {
+		return fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
+	}
+
+	return nil
 }
 
 // RedirectDeliversLocally reports whether a redirect destination can only reach

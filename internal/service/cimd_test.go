@@ -163,6 +163,14 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		// register.
 		{"private_key_jwt with a plaintext jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "http://app.example.com/jwks.json"}},
 		{"private_key_jwt with a relative jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "/jwks.json"}},
+		// A jwks_uri on an UNRELATED host is refused — see
+		// TestCIMDKeyMaterialMustBeOnTheClientsOwnHost for why this is the
+		// correct posture and not merely a DoS mitigation. The subdomain case is
+		// listed explicitly because "close enough" is the tempting relaxation:
+		// keys.app.example.com is a different host, and nothing establishes that
+		// it speaks for app.example.com.
+		{"private_key_jwt with a jwks_uri on another host", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "https://keys.elsewhere.example/jwks.json"}},
+		{"private_key_jwt with a jwks_uri on a subdomain", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "https://keys.app.example.com/jwks.json"}},
 		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
 		// NOTE: a document listing a grant outside the allow-list is NO LONGER
 		// rejected (zeroid#344) — the extra entry is dropped and the client is
