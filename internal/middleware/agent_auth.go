@@ -2,12 +2,11 @@ package middleware
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"net/http"
 	"strings"
 
-	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -31,8 +30,22 @@ type agentClaimsKey struct{}
 
 // AgentAuthConfig configures the AgentAuthMiddleware.
 type AgentAuthConfig struct {
-	// PublicKey is the ECDSA P-256 public key used to verify ES256 tokens.
-	PublicKey *ecdsa.PublicKey
+	// KeySet is the server's JWKS — every public key the issuer signs with,
+	// each carrying its own kid and alg.
+	//
+	// This must be the key SET, not a single key. Every OAuth grant path
+	// asks IssueCredential for RS256 (UseRS256: true), and credential.go
+	// honours that whenever RSA keys are loaded, which `make setup-keys`
+	// always produces. Pinning one algorithm and one key here therefore
+	// rejected every token the grants issued — see #357. Selecting by kid
+	// also keeps verification correct across a key rotation, where two keys
+	// of the same algorithm are live at once.
+	//
+	// Widening the algorithm set does NOT widen key trust: jwx resolves the
+	// header's kid against this set only, so a token signed by any other key
+	// is still refused. jwtalg.Validate runs first and rejects alg=none and
+	// HS* before the key lookup, so the asymmetric-only guard stands.
+	KeySet jwk.Set
 	// Issuer is the expected iss claim value.
 	Issuer string
 	// ResourceMetadataURL is the absolute URL of this server's RFC 9728
@@ -93,7 +106,7 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 			}
 
 			parsed, err := jwt.Parse([]byte(tokenStr),
-				jwt.WithKey(jwa.ES256(), cfg.PublicKey),
+				jwt.WithKeySet(cfg.KeySet),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(cfg.Issuer),
 			)
