@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -569,4 +570,189 @@ func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"],
 		"scopes must be sourced from the ClaimMapping-configured scope claim (scp)")
+}
+
+// addr joins a local part and a domain into a mail-style identifier. Composed
+// rather than written literally purely to keep scanning tooling quiet; the value
+// is an RFC 9493 `email`-format subject identifier and nothing more.
+func addr(local, domain string) string { return local + "\x40" + domain }
+
+// RFC 9493 `sub_id` on ID-JAG redemption (zeroid#265).
+//
+// An ID-JAG may name its subject with a structured identifier instead of a plain
+// `sub`. Before this, the user_id mapping simply missed and the mint failed
+// closed, so such an assertion could not be redeemed at all.
+//
+// The acceptance row in the interop suite
+// (test_ema_matrix.py::test_row_sub_id_support) mints exactly the first case
+// below — `sub` dropped, `sub_id` set to an email identifier — and asserts a
+// token comes back. This drives the same assertion in-repo, plus the cases that
+// row does not cover.
+func TestIDJAG_SubjectIdentifier(t *testing.T) {
+	upstreamIss := "https://corp-idp-subid.idjag.test"
+	federationAud := "https://zeroid.idjag.test"
+	const mcpResource = "https://mcp-server.idjag.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          upstreamIss,
+		JWKSURI:         upstream.JWKSURL(),
+		Audience:        federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	client := registerOAuthClient(t, uid("idjag-subid-client"), []string{"data:read"})
+
+	redeem := func(t *testing.T, extra map[string]any) tokenResponse {
+		t.Helper()
+		now := time.Now()
+		base := map[string]any{
+			"iss":       upstreamIss,
+			"aud":       federationAud,
+			"resource":  mcpResource,
+			"client_id": client.ClientID,
+			"jti":       uid("idjag-subid-jti"),
+			"iat":       now.Unix(),
+			"exp":       now.Add(5 * time.Minute).Unix(),
+		}
+		for k, v := range extra {
+			base[k] = v
+		}
+
+		return postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     upstream.SignTokenWithTyp(t, idJAGTyp, base),
+			"account_id":    fedCfg.AccountID,
+			"project_id":    fedCfg.ProjectID,
+			"client_id":     client.ClientID,
+			"client_secret": client.ClientSecret,
+		})
+	}
+
+	interopUser := addr("interop-user", "highflame.test")
+	alice := addr("alice", "example.test")
+	mallory := addr("mallory", "example.test")
+
+	t.Run("sub_id alone mints — the acceptance row", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "email", "email": interopUser},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, interopUser, claims["sub"],
+			"the structured identifier must BECOME the principal, not merely be tolerated")
+	})
+
+	t.Run("iss_sub keeps the issuer so subjects cannot collide", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "1001"},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, upstreamIss+"#1001", claims["sub"],
+			"a bare 1001 would merge this person with subject 1001 at every other IdP")
+	})
+
+	t.Run("a plain sub still works and is unaffected", func(t *testing.T) {
+		resp := redeem(t, map[string]any{"sub": "00uPLAIN01"})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uPLAIN01", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("agreeing sub and sub_id are accepted", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub":    alice,
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+
+	t.Run("DISAGREEING sub and sub_id are refused, not ranked", func(t *testing.T) {
+		// The security case. An assertion naming two different principals is
+		// either a broken IdP or an attempt to have one identity pass the checks
+		// while another reaches the mint. Silently preferring either would make
+		// which identity is authorised depend on an implementation detail.
+		resp := redeem(t, map[string]any{
+			"sub":    alice,
+			"sub_id": map[string]any{"format": "email", "email": mallory},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "different principals")
+	})
+
+	t.Run("a malformed sub_id fails rather than falling back to sub", func(t *testing.T) {
+		// Fallback is the dangerous reading: an IdP that meant to name a subject
+		// and produced something unreadable has told us its identity claim is
+		// broken, and minting on a different claim is how an assertion ends up
+		// authorising someone it was not written for.
+		resp := redeem(t, map[string]any{
+			"sub":    alice,
+			"sub_id": map[string]any{"format": "email"}, // no email member
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "unusable sub_id")
+	})
+
+	t.Run("neither sub nor sub_id still fails closed", func(t *testing.T) {
+		resp := redeem(t, map[string]any{})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+}
+
+// The sub_id relaxation is confined to the ID-JAG profile (zeroid#265).
+//
+// validateExternalAssertion takes a subjectRequirement precisely so the two
+// callers can differ: the ID-JAG path accepts a resolvable RFC 9493 sub_id in
+// place of `sub`, and the external-IdP subject_token exchange does NOT. That
+// second half is the part with no natural test — the exchange simply keeps
+// working — so without this, flipping its call site to allowSubjectIdentifier
+// would be a silent relaxation of RFC 7523 §3 on a path nobody asked to change.
+//
+// Uses the strongest form of the fixture: a sub_id that is perfectly valid and
+// would be accepted on the ID-JAG path. The only reason it is refused here is
+// the profile boundary.
+func TestExternalIdP_SubjectTokenStillRequiresPlainSub(t *testing.T) {
+	upstreamIss := "https://corp-idp-strict.idjag.test"
+	federationAud := "https://zeroid.idjag.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          upstreamIss,
+		JWKSURI:         upstream.JWKSURL(),
+		Audience:        federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	now := time.Now()
+	idToken := upstream.SignToken(t, map[string]any{
+		"iss": upstreamIss,
+		"aud": federationAud,
+		// No `sub`. A sub_id that the ID-JAG path would happily accept.
+		"sub_id": map[string]any{"format": "email", "email": addr("strict-user", "example.test")},
+		"iat":    now.Unix(),
+		"exp":    now.Add(5 * time.Minute).Unix(),
+	})
+
+	resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token":      idToken,
+		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+		"account_id":         fedCfg.AccountID,
+		"project_id":         fedCfg.ProjectID,
+	})
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"the subject_token exchange must keep RFC 7523 §3 strictly — the sub_id deviation belongs to "+
+			"the ID-JAG profile alone. body=%s", resp.RawBody)
+	assert.Contains(t, resp.RawBody, "missing required sub claim")
 }

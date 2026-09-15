@@ -189,7 +189,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
 	// the wire field for ID-JAG callers.
-	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion")
+	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier)
 	if err != nil {
 		return nil, err
 	}
@@ -212,9 +212,36 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// resolve the external subject through ClaimMapping. Fail closed when it is
 	// absent or empty — an unmappable identity must never mint a token (an
 	// admitted-but-unidentifiable agent matches no Cedar policy).
-	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
-	if !ok || userID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
+	userID, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
+
+	// RFC 9493 `sub_id` (zeroid#265). An IdP may name the subject with a
+	// structured identifier instead of, or as well as, the plain mapped claim.
+	// Resolved here rather than inside the mapping helper because it is a
+	// spec-named claim with its own shape, not another path ClaimMapping could
+	// point at.
+	subIDPrincipal, haveSubID, err := resolveSubjectIdentifier(rawClaims)
+	if err != nil {
+		// A present-but-unreadable sub_id fails the redemption outright. It must
+		// NOT fall back to the plain subject: an IdP that meant to name a subject
+		// and produced something we cannot read has told us its identity claim is
+		// broken, and quietly minting on a different claim is how an assertion
+		// ends up authorising someone other than whoever it was written for.
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG has an unusable sub_id: %v", err))
+	}
+	if haveSubID {
+		// Both present and disagreeing is refused, never merged and never
+		// ranked. Two different principals in one assertion is either a broken
+		// IdP or an attempt to have one identity pass the checks while another
+		// reaches the mint; there is no reading of it safe to act on.
+		if subjectIdentifierConflicts(userID, subIDPrincipal) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant,
+				"ID-JAG sub_id and the mapped user_id claim name different principals")
+		}
+		userID = subIDPrincipal
+	}
+
+	if userID == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) and has no usable sub_id — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
 	}
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
