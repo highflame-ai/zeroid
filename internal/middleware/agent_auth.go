@@ -9,6 +9,8 @@ import (
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/lestrrat-go/jwx/v4/jwt"
+
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
@@ -25,6 +27,9 @@ type AgentClaims struct {
 	Scopes     []string
 	JTI        string
 	IdentityID string
+	// DPoPJKT is the cnf.jkt thumbprint the token was bound to at issuance,
+	// empty for unbound tokens.
+	DPoPJKT string
 }
 
 type agentClaimsKey struct{}
@@ -42,6 +47,13 @@ type AgentAuthConfig struct {
 	// for legacy deployments that haven't migrated to issuer-anchored
 	// discovery).
 	ResourceMetadataURL string
+
+	// DPoPVerifier enforces sender-constraint when a token carries cnf.jkt.
+	// ZeroID mints cnf.jkt whenever a DPoP proof accompanies the token
+	// request (credential.go), so a bound token presented as a bare Bearer
+	// header is a stolen-token replay: accept it and the binding minted at
+	// issuance is never enforced. Nil disables enforcement.
+	DPoPVerifier *dpop.Verifier
 }
 
 // AgentAuthMiddleware validates ES256 Bearer tokens issued by ZeroID and injects agent claims into context.
@@ -110,6 +122,27 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 				return
 			}
 
+			// Sender-constraint: a token bound to a DPoP key at issuance must
+			// arrive with a matching proof, or any bearer of a leaked token
+			// replays it. Unbound tokens are unaffected.
+			if claims.DPoPJKT != "" && cfg.DPoPVerifier != nil {
+				proofJWT := r.Header.Get("DPoP")
+				if proofJWT == "" {
+					writeAgentAuthError(w, "invalid_token", "token is DPoP-bound; DPoP proof header is required", "token is DPoP-bound; DPoP proof header is required", cfg.ResourceMetadataURL)
+					return
+				}
+				if _, err := cfg.DPoPVerifier.ValidateBoundToToken(r.Context(), dpop.ValidateRequest{
+					ProofJWT:    proofJWT,
+					Method:      r.Method,
+					URL:         EffectiveRequestURL(r.Context()),
+					AccessToken: tokenStr,
+				}, claims.DPoPJKT); err != nil {
+					log.Warn().Err(err).Str("path", r.URL.Path).Msg("Agent DPoP proof rejected")
+					writeAgentAuthError(w, "invalid_token", "invalid DPoP proof", "invalid DPoP proof", cfg.ResourceMetadataURL)
+					return
+				}
+			}
+
 			ctx := r.Context()
 			ctx = SetTenant(ctx, claims.AccountID, claims.ProjectID)
 			ctx = context.WithValue(ctx, agentClaimsKey{}, claims)
@@ -153,6 +186,13 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v
+	}
+	if v, err := jwt.Get[map[string]string](token, "cnf"); err == nil {
+		claims.DPoPJKT = v["jkt"]
+	} else if v, err := jwt.Get[map[string]any](token, "cnf"); err == nil {
+		if jkt, ok := v["jkt"].(string); ok {
+			claims.DPoPJKT = jkt
+		}
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {
