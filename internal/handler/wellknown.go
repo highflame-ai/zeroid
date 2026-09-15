@@ -348,7 +348,16 @@ func (a *API) buildASMetadata() map[string]any {
 		body["client_id_metadata_document_supported"] = true
 	}
 
-	return body
+	// Swept here so the BASE document is conformant for whoever calls this, not
+	// only for the two ops that serve it today. Both callers also sweep, and
+	// that is not redundancy to be tidied away later: openidConfigurationOp adds
+	// two OIDC-only members AFTER this returns, and one of them
+	// (id_token_signing_alg_values_supported) can itself come back empty, so its
+	// sweep has to run after the addition. This one cannot cover that, and that
+	// one cannot cover a future caller who forgets. pruneEmptyClaims is
+	// idempotent, so running both costs a map walk and removes the requirement
+	// that anyone remember the rule.
+	return pruneEmptyClaims(body)
 }
 
 // openidConfigurationOp serves OpenID Connect Discovery 1.0 metadata at

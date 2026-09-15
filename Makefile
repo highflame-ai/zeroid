@@ -22,6 +22,15 @@ run: build ## Build and run zeroid locally
 # teaches people to stop running it, and the gap it hid is the one that matters
 # — CI splits these two jobs and gives them 300s and 600s respectively.
 
+# NOTE: the exclusion below is a substring match, so it would also drop a
+# nested helper package such as internal/foo/tests. Deliberately left matching
+# CI byte-for-byte anyway. The obvious tightening — anchoring to $(go list -m)
+# — does NOT work here: this is a multi-module repo (go list -m prints three
+# modules), make's $(shell) joins them with spaces, and the resulting regex
+# matches nothing, silently un-excluding tests/integration so `make test` runs
+# the integration suite and dies on its own timeout. Ask for the main module
+# path explicitly if you tighten this, and re-run `make -n test` to check what
+# the recipe actually expands to.
 test: ## Run unit tests (mirrors the CI unit job; excludes ./tests)
 	go test $$(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
 
