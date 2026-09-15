@@ -1038,7 +1038,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// what can be delegated — a sub-agent can never receive more than its
 	// principal currently holds, per RFC 8693 intent.
 	requestedScopes := parseScopeString(req.Scope)
-	actorAllowed := effectiveAllowedScopes(actorPolicy, actorIdentity)
+	actorAllowed, actorCeilingFrom := effectiveAllowedScopesWithSource(actorPolicy, actorIdentity)
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
@@ -1063,7 +1063,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed)
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed, actorCeilingFrom)
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
@@ -3198,13 +3198,37 @@ func parseScopeString(scope string) []string {
 // keep working. Callers should migrate restrictions onto the policy's
 // allowed_scopes and drop reliance on this fallback.
 func effectiveAllowedScopes(policy *domain.CredentialPolicy, identity *domain.Identity) []string {
+	scopes, _ := effectiveAllowedScopesWithSource(policy, identity)
+	return scopes
+}
+
+// scopeCeilingSource names where effectiveAllowedScopes drew a ceiling from.
+// A denial has to point at the thing the caller must actually edit, and the
+// two sources need different repairs: widen the credential policy, or widen
+// the identity's registration.
+type scopeCeilingSource int
+
+const (
+	// ceilingUnset means no layer restricted scopes.
+	ceilingUnset scopeCeilingSource = iota
+	// ceilingFromPolicy means the credential policy supplied the ceiling.
+	ceilingFromPolicy
+	// ceilingFromIdentity means the deprecated identity.AllowedScopes did.
+	ceilingFromIdentity
+)
+
+// effectiveAllowedScopesWithSource is effectiveAllowedScopes plus the source
+// of the ceiling it returned. Both live here so the "which layer won" rule has
+// exactly one definition: a caller that re-derived the source separately would
+// silently go stale the moment this precedence changes.
+func effectiveAllowedScopesWithSource(policy *domain.CredentialPolicy, identity *domain.Identity) ([]string, scopeCeilingSource) {
 	if policy != nil && len(policy.AllowedScopes) > 0 {
-		return policy.AllowedScopes
+		return policy.AllowedScopes, ceilingFromPolicy
 	}
-	if identity != nil {
-		return identity.AllowedScopes
+	if identity != nil && len(identity.AllowedScopes) > 0 {
+		return identity.AllowedScopes, ceilingFromIdentity
 	}
-	return nil
+	return nil, ceilingUnset
 }
 
 // requireGrantableScope closes the gap between intersectScopes' silent
@@ -3255,8 +3279,11 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 //
 // subjectHolds is the subject token's granted scopes as a set. actorCeiling
 // is the actor's effective allowed scopes; empty means "no restriction from
-// this layer", so an unrestricted actor is never blamed.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorCeiling []string) error {
+// this layer", so an unrestricted actor is never blamed. ceilingFrom says
+// which layer supplied that ceiling, because widening a credential policy and
+// widening a registration are different repairs — naming the wrong one is the
+// mistake this whole function exists to prevent.
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorCeiling []string, ceilingFrom scopeCeilingSource) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -3290,7 +3317,15 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
 	}
 	if len(notPermitted) > 0 {
-		reasons = append(reasons, "the actor identity is not registered for ["+strings.Join(notPermitted, " ")+"]")
+		// effectiveAllowedScopes is either/or, not layered: when the policy
+		// sets scopes, the identity's own list is never read. Blaming the
+		// registration in that case sends the caller to edit a field the
+		// ceiling did not come from.
+		actorTerm := "the actor identity is not registered for ["
+		if ceilingFrom == ceilingFromPolicy {
+			actorTerm = "the actor's credential policy does not permit ["
+		}
+		reasons = append(reasons, actorTerm+strings.Join(notPermitted, " ")+"]")
 	}
 	if len(reasons) == 0 {
 		// Unreachable by construction: the caller only invokes this when the

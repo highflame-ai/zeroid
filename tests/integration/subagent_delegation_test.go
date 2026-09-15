@@ -215,8 +215,11 @@ func TestSubagentDelegation_DenialNamesTheEmptyTerm(t *testing.T) {
 			"the child ceiling permits it, so the child is not the constraint")
 	})
 
-	t.Run("the child was not registered for it", func(t *testing.T) {
-		// The parent holds tools:read; this child was registered without it.
+	t.Run("the child's credential policy excludes it", func(t *testing.T) {
+		// The parent holds tools:read; the child's POLICY caps it at
+		// tools:write. effectiveAllowedScopes is either/or, so the policy is
+		// the ceiling here and the registration is never read — the denial
+		// must send the caller to the policy, not to the registration.
 		childPolicy := delegationPolicy(t, uid("s9-blame-child-cp"), []string{"tools:write"})
 		resp := attemptSubagentExchange(t, childPolicy, "s9-blame-child",
 			[]string{"tools:write"},
@@ -228,9 +231,35 @@ func TestSubagentDelegation_DenialNamesTheEmptyTerm(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		body := decode(t, resp)
 		assert.Equal(t, "invalid_scope", body["error"])
-		assert.Contains(t, body["error_description"], "the actor identity is not registered for [tools:read]")
+		assert.Contains(t, body["error_description"], "the actor's credential policy does not permit [tools:read]")
 		assert.NotContains(t, body["error_description"], "does not hold",
 			"the parent holds it, so the parent is not the constraint")
+	})
+
+	t.Run("the child was not registered for it", func(t *testing.T) {
+		// Same denial, other source: a policy that sets NO scope ceiling, so
+		// the deprecated identity.allowed_scopes supplies it. Here the
+		// registration IS the thing to widen.
+		childPolicy := createRichCredentialPolicy(t, map[string]any{
+			"name":                 uid("s9-blame-reg-cp"),
+			"allowed_grant_types":  []string{"client_credentials", "token_exchange"},
+			"max_delegation_depth": 5,
+			"max_ttl_seconds":      3600,
+			// no allowed_scopes: the ceiling falls back to the identity row
+		}, adminHeaders())
+		resp := attemptSubagentExchange(t, childPolicy, "s9-blame-reg",
+			[]string{"tools:write"},
+			[]string{"tools:read"},
+			rootTok)
+		require.NotNil(t, resp)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		body := decode(t, resp)
+		assert.Equal(t, "invalid_scope", body["error"])
+		assert.Contains(t, body["error_description"], "the actor identity is not registered for [tools:read]")
+		assert.NotContains(t, body["error_description"], "credential policy",
+			"this policy sets no scope ceiling, so the policy is not the constraint")
 	})
 }
 
