@@ -8,8 +8,8 @@ require (
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
-	github.com/highflame-ai/zeroid/pkg/authjwt v0.0.0
-	github.com/highflame-ai/zeroid/pkg/dpop v1.6.2
+	github.com/highflame-ai/zeroid/pkg/authjwt v1.9.2
+	github.com/highflame-ai/zeroid/pkg/dpop v1.6.3
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
@@ -112,9 +112,20 @@ require (
 //
 // Local replaces keep in-repo builds working when GOWORK=off (Docker
 // `go mod download`, some CI paths). Downstream consumers ignore
-// replace directives, so the require pins above remain what the proxy
-// serves. pkg/dpop's pin is still a real published tag (release-dpop
-// cadence + release.yml drift guard). See RELEASING.md.
+// replace directives, so the require pins above are what the proxy
+// actually serves — which is why BOTH must name real published tags.
+//
+// pkg/authjwt used to be pinned v0.0.0, on the documented grounds that
+// it was imported only from tests/integration/ and Go does not follow
+// test imports across module boundaries, so the pin was invisible
+// downstream. That stopped being true: server.go,
+// internal/service/client_jwks.go and
+// internal/service/external_issuer_registry.go all import it from
+// NON-test code (client_jwks.go arrived with private_key_jwt, #347).
+// The placeholder then made zeroid unresolvable from the proxy —
+// `go get github.com/highflame-ai/zeroid@v1.9.3` in a fresh module
+// fails with "unknown revision pkg/authjwt/v0.0.0". Both pins are now
+// real tags, and release.yml's drift guard covers both. See RELEASING.md.
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 
 replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop
