@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-dpop
+.PHONY: help build run test test-integration test-all lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-dpop
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -14,11 +14,21 @@ build: ## Build the zeroid binary
 run: build ## Build and run zeroid locally
 	./$(BINARY) -config zeroid.yaml
 
-test: ## Run all tests (unit + integration)
-	go test ./... -v -race -count=1 -timeout=120s
+# The test targets below mirror .github/workflows/pr-check.yml exactly — same
+# package split, same flags, same timeouts. They had drifted into a single
+# `go test ./... -v -race -count=1 -timeout=120s`, which could not pass on ANY
+# checkout: the integration suite alone takes ~127s under -race, so the 120s Go
+# timeout panicked the binary before it finished. A target that always fails
+# teaches people to stop running it, and the gap it hid is the one that matters
+# — CI splits these two jobs and gives them 300s and 600s respectively.
 
-test-integration: ## Run integration tests only (requires Docker)
-	go test ./tests/integration/ -v -count=1 -timeout=120s
+test: ## Run unit tests (mirrors the CI unit job; excludes ./tests)
+	go test $$(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
+
+test-integration: ## Run integration tests only, requires Docker (mirrors the CI integration job)
+	go test ./tests/... -v -race -count=1 -timeout=600s
+
+test-all: test test-integration ## Run both suites, the way CI does
 
 lint: ## Run go vet
 	go vet ./...
