@@ -866,8 +866,18 @@ baseline:
 | `backchannel_authentication_endpoint` | `<issuer>/oauth2/bc-authorize` | CIBA Core |
 | `backchannel_token_delivery_modes_supported` | `["poll","ping","push"]` | CIBA Core |
 | `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
-| `backchannel_authentication_request_signing_alg_values_supported` | `[]` (signed bc-authorize requests unsupported) | CIBA Core |
+| `backchannel_authentication_request_signing_alg_values_supported` | *omitted* (signed bc-authorize requests unsupported) | CIBA Core |
 | `client_id_metadata_document_supported` | `true` (gated — see Section 12.8) | CIMD draft-02 |
+
+**Zero-element claims are omitted, not emitted as `[]`.** RFC 8414 §2 and
+OpenID Connect Discovery 1.0 §3 both require it: *"Claims with zero elements
+MUST be omitted from the response."* Every discovery document ZeroID publishes
+is swept for this before it is served, so a member with nothing to list is
+absent rather than empty — `backchannel_authentication_request_signing_alg_values_supported`
+always, `response_types_supported` when the `authorization_code` flow is
+unservable (Section 12.8), `id_token_signing_alg_values_supported` if no
+published key carries an `alg`. Read an absent array-valued member as "none",
+never as "unknown" (zeroid#316).
 
 ### 11.2 Protected Resource Metadata (RFC 9728)
 
@@ -911,10 +921,21 @@ that pin a literal `sub` value.
 
 **ZeroID is not an OpenID Provider.** It issues no `id_token`, and this document
 **MUST NOT** be read as advertising one. `response_types_supported` is inherited
-from Section 11.1 and carries at most `"code"` — never `"id_token"` or
-`"id_token token"` — so no relying party can request an ID Token from this
-authorization server. `scopes_supported` is not advertised, so `openid` is not
-offered either. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
+from Section 11.1 and is either absent or carries at most `"code"` — never
+`"id_token"` or `"id_token token"` — so no relying party can request an ID Token
+from this authorization server. `scopes_supported` is not advertised, so
+`openid` is not offered either.
+
+The absent case deserves stating plainly, because it is the weaker half of that
+guarantee. When the `authorization_code` flow is unservable the member is
+omitted (see Section 11.1), and a client library that supplies its own default
+then supplies it unchecked — the MCP Python SDK's `OAuthMetadata` model, for
+instance, defaults `response_types_supported` to `["code"]`. That default is
+still not `"id_token"`, so the no-ID-Token guarantee holds on both paths. What
+it costs is the *`code`* half: such a client believes an authorization flow is
+available that this deployment will answer with `503` at `/oauth2/authorize`.
+That is a failed flow rather than a security boundary, and it is the accepted
+price of publishing a conformant document. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
 discovery, and every ID Token clause are out of scope.
 
 ## 12. Client ID Metadata Documents (CIMD)
