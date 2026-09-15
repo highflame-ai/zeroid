@@ -89,56 +89,72 @@ jobs:
             echo "Release tag matches svu recommendation."
           fi
 
-      # pkg/dpop drift guard. zeroid is a Go module that contains a
-      # nested published module at pkg/dpop, and zeroid's non-test
-      # code imports it — downstream consumers pull pkg/dpop
-      # transitively. The release cadences are intentionally
-      # DECOUPLED: zeroid/go.mod pins pkg/dpop to a specific released
-      # version (not the zeroid release tag). When pkg/dpop/ source
-      # changes, the maintainer runs release-dpop.yml to cut a new
-      # pkg/dpop release and open a PR bumping zeroid's reference.
-      # See RELEASING.md.
+      # Submodule drift guard. zeroid is a Go module containing nested
+      # published modules at pkg/dpop and pkg/authjwt, and zeroid's
+      # NON-test code imports both — so downstream consumers pull them
+      # transitively and the require pins in go.mod are what the proxy
+      # actually serves. Local `replace` directives do NOT reach
+      # consumers. See RELEASING.md.
       #
-      # This guard catches the foot-gun: if pkg/dpop/ source on main
-      # has diverged from the version zeroid/go.mod references, that
-      # means pkg/dpop changed but the release-dpop dance was never
-      # run. Releasing zeroid in that state ships a binary that
-      # references the OLD pkg/dpop (whatever the proxy serves for
-      # the pinned tag) while in-repo tests passed against the NEW
-      # local source — a silent regression. Fail loudly instead.
+      # This catches two foot-guns:
       #
-      # pkg/authjwt is NOT checked because it's imported only from
-      # tests/integration. Go does not follow test imports across
-      # module boundaries, so its version reference (currently
-      # v0.0.0 placeholder) is invisible to downstream consumers
-      # and cannot break anything. The pkg/authjwt tag is still
-      # created by tag-submodules at every zeroid release for
-      # convenience.
-      - name: Verify pkg/dpop/ source matches the version in go.mod
+      #   1. Source drift. If a submodule's source on main has diverged
+      #      from the version go.mod references, releasing zeroid ships
+      #      a binary against the OLD published module while in-repo
+      #      tests passed against the NEW local source — a silent
+      #      regression, because the replace hides it locally.
+      #
+      #   2. Placeholder pins. A v0.0.0 (or any unpublished) reference
+      #      makes zeroid UNRESOLVABLE from the proxy: a fresh module
+      #      running `go get github.com/highflame-ai/zeroid@vX.Y.Z`
+      #      fails with "unknown revision". In-repo builds never notice,
+      #      again because of the replace.
+      #
+      # pkg/authjwt was exempted here until it was found to have been
+      # imported from non-test code since private_key_jwt (#347) added
+      # internal/service/client_jwks.go — while still pinned v0.0.0.
+      # The exemption rested on "test-only imports are invisible
+      # downstream", which was true when written and silently stopped
+      # being true. Checking both removes the need for anyone to notice
+      # that transition again.
+      - name: Verify submodule source matches the versions in go.mod
         shell: bash
         run: |-
-          MODPATH="github.com/highflame-ai/zeroid/pkg/dpop"
-          REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
-          if [[ -z "${REF}" ]]; then
-            echo "::error::go.mod has no require directive for ${MODPATH}"
-            exit 1
-          fi
-          TAG="pkg/dpop/${REF}"
-          if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "::error::go.mod references ${MODPATH} ${REF} but tag ${TAG} does not exist."
-            echo "::error::This usually means the pkg/dpop release-dpop dance was started but not completed."
-            echo "::error::Either fix go.mod to reference an existing pkg/dpop tag, or run release-dpop.yml."
-            exit 1
-          fi
-          if ! git diff --quiet "${TAG}" -- pkg/dpop/; then
-            echo "::error::pkg/dpop/ source has drifted from ${TAG} but go.mod still references it."
-            echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
-            echo "::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update zeroid/go.mod's reference:"
-            echo "::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>"
-            echo "::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release."
-            exit 1
-          fi
-          echo "✓ pkg/dpop/ source matches ${TAG} — safe to release"
+          FAILED=0
+          for MOD in dpop authjwt; do
+            MODPATH="github.com/highflame-ai/zeroid/pkg/${MOD}"
+            REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
+            if [[ -z "${REF}" ]]; then
+              echo "::error::go.mod has no require directive for ${MODPATH}"
+              FAILED=1
+              continue
+            fi
+            if [[ "${REF}" == "v0.0.0" ]]; then
+              echo "::error::go.mod pins ${MODPATH} to the v0.0.0 placeholder."
+              echo "::error::zeroid's non-test code imports it, so consumers resolve this pin and will fail with 'unknown revision pkg/${MOD}/v0.0.0'."
+              echo "::error::Point it at a real published tag."
+              FAILED=1
+              continue
+            fi
+            TAG="pkg/${MOD}/${REF}"
+            if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
+              echo "::error::go.mod references ${MODPATH} ${REF} but tag ${TAG} does not exist."
+              echo "::error::Either fix go.mod to reference an existing tag, or cut that submodule release first."
+              FAILED=1
+              continue
+            fi
+            if ! git diff --quiet "${TAG}" -- "pkg/${MOD}/"; then
+              echo "::error::pkg/${MOD}/ source has drifted from ${TAG} but go.mod still references it."
+              echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/${MOD} ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
+              echo "::error::Fix by cutting a new pkg/${MOD} release first and updating zeroid/go.mod's reference:"
+              echo "::error::  gh workflow run release-dpop.yml --field version=<next-pkg/${MOD}-vX.Y.Z>"
+              FAILED=1
+              continue
+            fi
+            echo "✓ pkg/${MOD}/ source matches ${TAG}"
+          done
+          [[ "${FAILED}" -eq 0 ]] || exit 1
+          echo "✓ all submodule pins are real, published, and match local source — safe to release"
 
   tag-submodules:
     needs:

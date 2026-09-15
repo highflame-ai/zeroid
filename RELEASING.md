@@ -8,10 +8,16 @@ ZeroID is published as **three Go modules** from this one repository:
 | `github.com/highflame-ai/zeroid/pkg/authjwt` | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` | **Clubbed with zeroid** — same vX.Y.Z |
 | `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Decoupled** — released independently when its source changes |
 
-The asymmetry between pkg/authjwt and pkg/dpop is deliberate:
+**Both submodules are imported by zeroid's NON-test code, so `zeroid/go.mod` must reference a real published tag for each.** Local `replace` directives do not reach consumers — Go ignores `replace` in dependency modules — so the `require` pins are exactly what the proxy serves.
 
-- **pkg/dpop** is imported in zeroid's non-test code (the DPoP RFC 9449 verifier in `/oauth2/token`). That makes it a transitive dep for everyone who consumes zeroid — `go get zeroid@vX.Y.Z` causes Go to also fetch pkg/dpop's source. So zeroid/go.mod must reference a real published pkg/dpop tag, and it gets a decoupled release cadence so we only bump it when pkg/dpop actually changes.
-- **pkg/authjwt** is imported only from `tests/integration/`. Go doesn't follow test imports across module boundaries, so its version reference in zeroid/go.mod is invisible to downstream consumers and never needs to be a real version. The pkg/authjwt tag is created at every zeroid release (clubbed) for convenience of direct consumers.
+- **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`. Decoupled cadence: released independently, only when its source changes.
+- **pkg/authjwt** — used by `server.go`, `internal/service/client_jwks.go` and `internal/service/external_issuer_registry.go`. Clubbed cadence: tagged at every zeroid release.
+
+> **This section used to describe an asymmetry that no longer exists, and the drift was expensive.** It said pkg/authjwt was imported "only from `tests/integration/`", that Go doesn't follow test imports across module boundaries, and that its version reference was therefore "invisible to downstream consumers and never needs to be a real version" — so it was pinned `v0.0.0`. That was true when written. It stopped being true when `private_key_jwt` (#347) added `internal/service/client_jwks.go`, which imports pkg/authjwt from non-test code, and nobody revisited the pin.
+>
+> The effect was that **zeroid could not be resolved from the proxy at all**: `go get github.com/highflame-ai/zeroid@v1.9.3` in a fresh module fails with `unknown revision pkg/authjwt/v0.0.0`. In-repo builds never noticed, because the local `replace` hides it. Only consumers who already pinned pkg/authjwt explicitly (as highflame-authn does) were unaffected.
+>
+> The release drift guard now checks BOTH submodules and rejects a `v0.0.0` placeholder outright, so this particular transition cannot go unnoticed again.
 
 ---
 
@@ -142,11 +148,13 @@ To add a new decoupled nested module (e.g. `pkg/dcr/`):
 4. **Add `.github/workflows/release-dcr.yml`** — copy `release-dpop.yml` and adjust paths.
 5. **`Makefile`** — add `make release-dcr` target.
 
-To add a test-only nested module that stays clubbed (like pkg/authjwt):
+To add a test-only nested module that stays clubbed:
 
 1. **`go.work`** — add it to the `use (...)` list.
-2. **`zeroid/go.mod`** — leave at `v0.0.0`.
-3. **`.github/workflows/release.yml`** — extend the tag-submodules step to also tag pkg/<new>/vX.Y.Z at release commit.
+2. **`zeroid/go.mod`** — reference a real published tag. **Do NOT use a `v0.0.0` placeholder**, even though a genuinely test-only module can technically get away with one.
+3. **`.github/workflows/release.yml`** — extend the drift guard and the tag-submodules step to cover it.
+
+> Why not the placeholder, when it "works": a module's test-only status is not a property anyone maintains. pkg/authjwt was test-only when its `v0.0.0` pin was chosen, then a later feature imported it from non-test code and the pin silently became a release-blocking bug — see the note at the top of this file. Nothing fails at the moment the import is added; it surfaces only when an outside consumer tries to resolve the module, which is the worst place to find out. A real tag costs nothing and does not depend on that status holding.
 
 ---
 
