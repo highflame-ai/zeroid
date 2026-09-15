@@ -103,6 +103,21 @@ type IssueRequest struct {
 	UseRS256 bool
 	// ApplicationID is the optional application scope (set when API key is linked to an application).
 	ApplicationID string
+	// ClientID is the OAuth client that requested this token, emitted as the
+	// RFC 9068 §2.2 `client_id` claim.
+	//
+	// Deliberately separate from ApplicationID even though the
+	// authorization_code path passes the same value to both today. They mean
+	// different things: ApplicationID is a Highflame application scope an API
+	// key may be linked to, and widening it to also mean "OAuth client" would
+	// stamp `client_id` onto api_key tokens that have no OAuth client at all.
+	// Set only on grants where an OAuth client authenticated or was resolved.
+	//
+	// This is the claim a resource server looks for to attribute a call to a
+	// client — including a partner's, in the MCP interop work. For a CIMD
+	// client it is the metadata-document URL, which is the whole of that
+	// client's identity, since there is no registration row (issue #325).
+	ClientID string
 	// SubjectOverride, when non-empty, replaces the default WIMSE URI as the JWT "sub" claim.
 	// Used for external principal exchange (sub = external user ID) and authorization_code
 	// (sub = authenticated user ID). For NHI grants, leave empty to use the WIMSE URI.
@@ -453,6 +468,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Generic claims for RS256 tokens (api_key grant).
 	if req.ApplicationID != "" {
 		_ = token.Set("application_id", req.ApplicationID)
+	}
+	// RFC 9068 §2.2. Emitted alongside `application_id` rather than replacing
+	// it: the authorization_code path has been setting `application_id` to the
+	// client_id since long before this claim existed, so anything already
+	// keying on that keeps working. New consumers should read `client_id` —
+	// the registered name, and the one a resource server that has never seen
+	// our stack will look for.
+	if req.ClientID != "" {
+		_ = token.Set("client_id", req.ClientID)
 	}
 	if req.UserEmail != "" {
 		_ = token.Set("user_email", req.UserEmail)

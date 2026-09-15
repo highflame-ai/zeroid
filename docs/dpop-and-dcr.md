@@ -202,6 +202,8 @@ curl -s -X POST https://auth.example/oauth2/register \
 
 The response contains the new `client_id` + `client_secret` (the plaintext secret is shown once and **never** persisted in plain form) and a `registration_access_token` that authenticates subsequent management calls.
 
+`client_secret` is **omitted entirely** when the client registered with `token_endpoint_auth_method: private_key_jwt` — no secret is minted for a key-based client. RFC 7591 §3.2.1 makes the member OPTIONAL; emitting an empty string would tell the registrant they hold a credential they do not.
+
 ```json
 {
   "client_id":                  "9f43b1c2...",
@@ -290,9 +292,15 @@ curl -s -X POST https://auth.example/oauth2/token \
 
 …the client authenticates **to the token endpoint** with HTTP Basic (its `client_secret`), and the `assertion` JWT is verified against the JWKS uploaded at registration. The two checks are independent: `token_endpoint_auth_method` governs how the client identifies itself to the endpoint; the `jwks` governs how its assertion signature is verified.
 
-**Why inline `jwks` rather than `jwks_uri`**: RFC 7591 §2 accepts both. Inline `jwks` uploads the keys to the broker once at registration time, the broker stores them, and verification is local. `jwks_uri` requires the broker to fetch keys from a URL the client publishes, which means the client must run an internet-reachable HTTPS endpoint solely for key publication — workable when client and broker live in different security domains, but unnecessary friction for self-hosted ZeroID deployments. For key rotation, use an RFC 7592 `PUT` to swap the inline JWKS (single round-trip, no DNS or TLS dependency).
+**Why prefer inline `jwks` over `jwks_uri`**: RFC 7591 §2 accepts both, and so does ZeroID — but inline is the lower-risk default. Inline `jwks` uploads the keys to the broker once at registration time, the broker stores them, and verification is local. `jwks_uri` requires the broker to fetch keys from a URL the client publishes, which means the client must run an internet-reachable HTTPS endpoint solely for key publication — workable when client and broker live in different security domains, but unnecessary friction for self-hosted ZeroID deployments. For key rotation, use an RFC 7592 `PUT` to swap the inline JWKS (single round-trip, no DNS or TLS dependency). Note that RFC 7592 `PUT` is a FULL replacement: key material must be re-sent or it is removed.
 
-> **`private_key_jwt` is not currently accepted** as `token_endpoint_auth_method` for DCR-registered clients (see "What ZeroID enforces" below). DCR clients authenticate to the token endpoint with their client secret; the jwt-bearer **grant** is the path where signed assertions and JWKS come into play.
+A registered `jwks_uri` is also a URL this server makes outbound requests to, on every cold cache. It is fetched through the same SSRF-guarded client the external-issuer registry uses, and private/loopback/link-local destinations are refused unless `client_auth.allow_private_jwks_endpoints` is set (dev only). Cached key sets are bounded and LRU-evicted via `client_auth.jwks_cache_size`, because each cached endpoint owns a background refresh goroutine.
+
+**Switching a DCR client off `private_key_jwt` is a one-way door.** An RFC 7592 `PUT` that does not restate `private_key_jwt` is refused, because DCR has no secret-issuance endpoint — allowing the switch would leave the client with no usable credential at all. If a key-based client's signing key is compromised, the recovery is to rotate the key material with a `PUT` that restates `private_key_jwt` plus the new `jwks`/`jwks_uri`. Genuinely moving to `client_secret_basic` requires `DELETE /oauth2/register/{client_id}` and a fresh registration, which yields a **new `client_id`** — so re-key rather than re-register unless the client identifier can change.
+
+**Key-revocation window**: a cached `jwks_uri` refreshes every 5 minutes, so a key removed from the client's published set keeps authenticating for up to that long. Inline `jwks` has no such window — an RFC 7592 `PUT` takes effect immediately. If prompt revocation matters, prefer inline.
+
+> **`private_key_jwt` IS accepted** as `token_endpoint_auth_method` for DCR-registered clients as of zeroid#206. Such a client supplies `jwks` or `jwks_uri` at registration and receives **no `client_secret`** — the key is the credential, and a secret that cannot be used but can still leak is worse than no secret. Keep the two mechanisms distinct: `token_endpoint_auth_method` governs how the client authenticates *itself* (RFC 7523 §2.2), while the jwt-bearer **grant** is about on whose authority a token is issued (§2.1). One request may legitimately carry both.
 
 ### What ZeroID enforces
 
@@ -318,7 +326,7 @@ Validated by `validateDCRClientMetadata`:
 - `grant_types` defaults to `["client_credentials"]`. The allow-list for DCR-registered clients is **`client_credentials`** and **`urn:ietf:params:oauth:grant-type:jwt-bearer`** only. Notably absent:
   - `authorization_code` — no interactive consent flow exists for self-registered clients.
   - `urn:ietf:params:oauth:grant-type:token-exchange` — DCR clients have no `IdentityID` binding and so cannot legitimately act as a delegation actor. Re-enable once that binding exists.
-- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, or empty (defaults to `client_secret_basic` per RFC 7591 §2). `"none"` is explicitly rejected — this server requires client authentication.
+- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, `private_key_jwt`, or empty (defaults to `client_secret_basic` per RFC 7591 §2). `"none"` is explicitly rejected — this server requires client authentication. `private_key_jwt` additionally requires exactly one of `jwks` / `jwks_uri` (RFC 7591 §2 forbids both), and suppresses `client_secret` in the registration response.
 - `redirect_uris` is accepted for spec compliance but ignored.
 
 #### On the registration_access_token

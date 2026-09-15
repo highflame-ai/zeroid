@@ -2,10 +2,15 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +19,10 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 )
+
+// cimdTestJWKS is a one-key P-256 JWK Set — the shape a CIMD document publishes
+// in its `jwks` member for token_endpoint_auth_method=private_key_jwt.
+const cimdTestJWKS = `{"keys":[{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}`
 
 func TestIsCIMDClientID(t *testing.T) {
 	cases := []struct {
@@ -51,7 +60,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 			ClientName:   "Example MCP Client",
 			RedirectURIs: []string{"http://127.0.0.1:3000/callback"},
 		}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -81,21 +90,21 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 	// URL choose what the user reads.
 	t.Run("missing client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, RedirectURIs: []string{"https://x/cb"}}
-		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 			t.Errorf("expected ErrCIMDInvalidDocument for absent client_name, got %v", err)
 		}
 	})
 
 	t.Run("whitespace-only client_name is rejected", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "   \t ", RedirectURIs: []string{"https://x/cb"}}
-		if _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 			t.Errorf("expected ErrCIMDInvalidDocument for whitespace-only client_name, got %v", err)
 		}
 	})
 
 	t.Run("client_name is carried through verbatim", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "Example MCP Client", RedirectURIs: []string{"https://x/cb"}}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -106,7 +115,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 
 	t.Run("scope parsed into slice", func(t *testing.T) {
 		doc := &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, Scope: "read write"}
-		c, err := synthesizeCIMDClient(url, doc, now)
+		c, _, err := synthesizeCIMDClient(url, doc, now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -122,7 +131,7 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 			RedirectURIs: []string{"https://x/cb"},
 			GrantTypes:   []string{"authorization_code", "refresh_token"},
 		}
-		if _, err := synthesizeCIMDClient(url, doc, now); err != nil {
+		if _, _, err := synthesizeCIMDClient(url, doc, now); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -135,16 +144,45 @@ func TestSynthesizeCIMDClient(t *testing.T) {
 		{"self-reference mismatch", &cimdMetadataDocument{ClientID: "https://evil.example/other.json", ClientName: "N", RedirectURIs: []string{"https://x/cb"}}},
 		{"missing redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N"}},
 		{"empty redirect_uris", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{}}},
-		{"confidential auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
-		{"private_key_jwt auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
+		// Secret-based methods stay refused, and structurally always will: there
+		// is no registration response in which a CIMD client could be handed a
+		// secret. This is NOT the zeroid#264 case.
+		{"secret-based auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_basic"}},
+		{"secret-based auth method (post)", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "client_secret_post"}},
+		{"unknown auth method", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "tls_client_auth"}},
+		// private_key_jwt is ACCEPTED as of zeroid#264 — but only with usable key
+		// material. This row previously asserted the METHOD was refused; it is kept
+		// and renamed to the reason that now applies, so the table cannot go on
+		// passing for a different reason than it reads.
+		{"private_key_jwt without key material", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt"}},
+		{"private_key_jwt with both jwks and jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(cimdTestJWKS), JWKSURI: "https://app.example.com/jwks.json"}},
+		{"private_key_jwt with an unparseable jwks", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(`{"not":"a jwks"}`)}},
+		{"private_key_jwt with an empty jwks", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKS: json.RawMessage(`{"keys":[]}`)}},
+		// An anonymous document's jwks_uri gets NO private-endpoint hatch — the
+		// registered path has one only because an operator controls what they
+		// register.
+		{"private_key_jwt with a plaintext jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "http://app.example.com/jwks.json"}},
+		{"private_key_jwt with a relative jwks_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "/jwks.json"}},
+		// A jwks_uri on an UNRELATED host is refused — see
+		// TestCIMDKeyMaterialMustBeOnTheClientsOwnHost for why this is the
+		// correct posture and not merely a DoS mitigation. The subdomain case is
+		// listed explicitly because "close enough" is the tempting relaxation:
+		// keys.app.example.com is a different host, and nothing establishes that
+		// it speaks for app.example.com.
+		{"private_key_jwt with a jwks_uri on another host", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "https://keys.elsewhere.example/jwks.json"}},
+		{"private_key_jwt with a jwks_uri on a subdomain", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, TokenEndpointAuthMethod: "private_key_jwt", JWKSURI: "https://keys.app.example.com/jwks.json"}},
 		{"grant_types missing authorization_code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"refresh_token"}}},
-		{"disallowed grant type", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, GrantTypes: []string{"authorization_code", "client_credentials"}}},
+		// NOTE: a document listing a grant outside the allow-list is NO LONGER
+		// rejected (zeroid#344) — the extra entry is dropped and the client is
+		// synthesized with the intersection. That the DROPPED grant cannot then
+		// be obtained is asserted in TestEffectiveCIMDGrantTypes and
+		// TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected.
 		{"response_types without code", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"https://x/cb"}, ResponseTypes: []string{"token"}}},
 		{"plaintext non-loopback redirect_uri", &cimdMetadataDocument{ClientID: url, ClientName: "N", RedirectURIs: []string{"http://app.example.com/cb"}}},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := synthesizeCIMDClient(url, tc.doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			if _, _, err := synthesizeCIMDClient(url, tc.doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
 				t.Errorf("expected ErrCIMDInvalidDocument, got %v", err)
 			}
 		})
@@ -843,4 +881,470 @@ func TestRedirectDeliversLocally(t *testing.T) {
 			t.Errorf("%s must NOT count as local delivery", u)
 		}
 	}
+}
+
+// effectiveCIMDGrantTypes narrows rather than rejects (zeroid#344).
+//
+// A CIMD document is one declaration published to EVERY authorization server the
+// client talks to — there is no registration response and no way to tailor it
+// per server. Rejecting the whole document because it mentions a grant this
+// server does not implement made such a client unable to log in at all, with an
+// error it could not act on and could not fix without breaking its other
+// servers.
+func TestEffectiveCIMDGrantTypes(t *testing.T) {
+	cases := []struct {
+		name        string
+		declared    []string
+		wantKept    []string
+		wantDropped []string
+	}{
+		{
+			name:     "absent defaults to authorization_code",
+			declared: nil,
+			wantKept: []string{"authorization_code"},
+		},
+		{
+			name:     "empty defaults to authorization_code",
+			declared: []string{},
+			wantKept: []string{"authorization_code"},
+		},
+		{
+			// The exact document from the issue: MCPJam publishes device_code
+			// alongside the two grants ZeroID does offer.
+			name:        "device_code is dropped, the rest kept",
+			declared:    []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
+			wantKept:    []string{"authorization_code", "refresh_token"},
+			wantDropped: []string{"urn:ietf:params:oauth:grant-type:device_code"},
+		},
+		{
+			// The security-relevant case: an M2M grant must not survive into
+			// the synthesized client, because the token endpoint reads exactly
+			// this list when deciding whether to honour client_credentials.
+			name:        "client_credentials is dropped",
+			declared:    []string{"authorization_code", "client_credentials"},
+			wantKept:    []string{"authorization_code"},
+			wantDropped: []string{"client_credentials"},
+		},
+		{
+			name:        "delegation grants are dropped in both spellings",
+			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			wantKept:    []string{"authorization_code"},
+			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+		},
+		{
+			name:        "duplicates collapse",
+			declared:    []string{"authorization_code", "authorization_code", "refresh_token", "client_credentials", "client_credentials"},
+			wantKept:    []string{"authorization_code", "refresh_token"},
+			wantDropped: []string{"client_credentials"},
+		},
+		{
+			// Order is preserved so the synthesized client (and therefore the
+			// resolution cache) is deterministic for a given document.
+			name:        "document order is preserved",
+			declared:    []string{"refresh_token", "device_code", "authorization_code"},
+			wantKept:    []string{"refresh_token", "authorization_code"},
+			wantDropped: []string{"device_code"},
+		},
+		{
+			name:        "everything unsupported keeps nothing",
+			declared:    []string{"client_credentials", "device_code"},
+			wantKept:    nil,
+			wantDropped: []string{"client_credentials", "device_code"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			kept, dropped := effectiveCIMDGrantTypes(tc.declared)
+			if !slices.Equal(kept, tc.wantKept) {
+				t.Errorf("kept = %v, want %v", kept, tc.wantKept)
+			}
+			if !slices.Equal(dropped, tc.wantDropped) {
+				t.Errorf("dropped = %v, want %v", dropped, tc.wantDropped)
+			}
+		})
+	}
+}
+
+// The issue's reproduction, end to end through the synthesizer.
+func TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+		ClientID:     url,
+		ClientName:   "MCPJam",
+		RedirectURIs: []string{"https://app.example.com/cb"},
+		GrantTypes:   []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"},
+	}, now)
+	if err != nil {
+		t.Fatalf("a document listing an unimplemented grant must still resolve: %v", err)
+	}
+	if !slices.Equal(client.GrantTypes, []string{"authorization_code", "refresh_token"}) {
+		t.Errorf("GrantTypes = %v, want the supported intersection", client.GrantTypes)
+	}
+}
+
+// The invariant the old rejection was actually protecting: a zero-registration
+// client must not be able to OBTAIN an M2M or delegation grant. That is carried
+// by what lands in GrantTypes, which the token endpoint gates on — not by
+// refusing to parse a document that merely mentions one.
+func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	for _, forbidden := range []string{
+		"client_credentials",
+		"urn:ietf:params:oauth:grant-type:token-exchange",
+		"urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"api_key",
+	} {
+		t.Run(forbidden, func(t *testing.T) {
+			client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+				ClientID:     url,
+				ClientName:   "N",
+				RedirectURIs: []string{"https://app.example.com/cb"},
+				GrantTypes:   []string{"authorization_code", forbidden},
+			}, now)
+			if err != nil {
+				t.Fatalf("document should resolve, not be rejected: %v", err)
+			}
+			if slices.Contains(client.GrantTypes, forbidden) {
+				t.Fatalf("%q reached the synthesized client — the token endpoint reads this "+
+					"list to decide whether to honour that grant", forbidden)
+			}
+			// Also pin the normalized spelling, since the token endpoint's
+			// client_credentials gate compares against the short form.
+			if slices.Contains(client.GrantTypes, string(domain.NormalizeGrantType(forbidden))) {
+				t.Fatalf("normalized form of %q reached the synthesized client", forbidden)
+			}
+		})
+	}
+}
+
+// A document whose only grants are unsupported still fails — authorization_code
+// is the one flow CIMD exists for, so its absence leaves nothing to synthesize.
+func TestSynthesizeCIMDClient_StillRejectsWhenNoSupportedGrantRemains(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	for _, declared := range [][]string{
+		{"client_credentials"},
+		{"refresh_token"},
+		{"urn:ietf:params:oauth:grant-type:device_code"},
+	} {
+		_, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+			ClientID:     url,
+			ClientName:   "N",
+			RedirectURIs: []string{"https://app.example.com/cb"},
+			GrantTypes:   declared,
+		}, now)
+		if !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Errorf("grant_types %v leaves no authorization_code; want ErrCIMDInvalidDocument, got %v", declared, err)
+		}
+	}
+}
+
+// RATCHET: only the interactive legs may yield a CIMD-synthesized client.
+//
+// zeroid#344 made a CIMD document's grant_types advisory-with-narrowing rather
+// than fatal, and the safety of that rests on two things. The first is
+// unconditional: effectiveCIMDGrantTypes filters by exact match, so a CIMD
+// client's GrantTypes is provably a subset of cimdAllowedGrantTypes.
+//
+// The second is REACHABILITY, and it is contingent. Most token-endpoint dispatch
+// arms do not check client.GrantTypes at all — jwt-bearer, token-exchange,
+// api_key, CIBA, ID-JAG and custom grants registered via Server.RegisterGrant
+// have no such gate. They are safe today only because a CIMD client cannot reach
+// them: resolveClientRegistryOrCIMD is called from exactly three places, all on
+// the authorization_code / refresh_token legs.
+//
+// A future grant that BOTH resolves through resolveClientRegistryOrCIMD AND
+// derives authority from the resolved client would bypass every grant-type check
+// silently. This test fails when a fourth call site appears, so that assumption
+// has to be re-examined deliberately rather than eroding unnoticed.
+func TestCIMDClientReachabilityIsBounded(t *testing.T) {
+	// Enclosing functions permitted to resolve a client that may be CIMD.
+	allowed := map[string]bool{
+		// The authorize leg. Gates on client.GrantTypes via
+		// checkAuthorizeClientPolicy -> oauth.go:1840.
+		"ResolveAuthorizeClient": true,
+		// The code->token exchange. Gates at oauth.go:2145.
+		"authorizationCode": true,
+		// Rotation, which re-resolves the document so a republished one acts as
+		// the revocation lever. Gates the CIMD branch at oauth.go:2521.
+		"refreshToken": true,
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	funcDecl := regexp.MustCompile(`^func (?:\([^)]*\) )?(\w+)`)
+	var offenders []string
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		enclosing := "<file scope>"
+		for i, line := range strings.Split(string(body), "\n") {
+			if m := funcDecl.FindStringSubmatch(line); m != nil {
+				enclosing = m[1]
+			}
+			if !strings.Contains(line, "resolveClientRegistryOrCIMD(") {
+				continue
+			}
+			if strings.Contains(line, "func (s *OAuthService) resolveClientRegistryOrCIMD") {
+				continue // the definition itself
+			}
+			if !allowed[enclosing] {
+				offenders = append(offenders, fmt.Sprintf("%s:%d in %s()", f, i+1, enclosing))
+			}
+		}
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("resolveClientRegistryOrCIMD reached from an unexpected function:\n  %s\n\n"+
+			"A CIMD client can now flow there. Most grant paths do NOT check client.GrantTypes, "+
+			"so confirm the new caller either gates on it or derives no authority from the client, "+
+			"then add the function to `allowed` with a note saying which.",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// A CIMD document is unauthenticated, unregistered, attacker-authored input
+// bounded only by defaultCIMDMaxDocumentBytes. Logging its rejected grant_types
+// verbatim would let one resolution write most of a 5 KiB document into the log,
+// and distinct URLs sidestep the resolution cache. Both the entry count and each
+// entry's length are capped, and the cap is visible in the output rather than
+// silently understating what the document declared.
+func TestTruncateGrantTypesForLog(t *testing.T) {
+	t.Run("short lists pass through unchanged", func(t *testing.T) {
+		in := []string{"client_credentials", "device_code"}
+		if got := truncateGrantTypesForLog(in); !slices.Equal(got, in) {
+			t.Errorf("got %v, want %v", got, in)
+		}
+	})
+
+	t.Run("an over-long entry is truncated with a marker", func(t *testing.T) {
+		got := truncateGrantTypesForLog([]string{strings.Repeat("x", 500)})
+		if len(got) != 1 {
+			t.Fatalf("got %d entries, want 1", len(got))
+		}
+		if len([]rune(got[0])) > maxLoggedGrantTypeLen+1 {
+			t.Errorf("entry not truncated: %d runes", len([]rune(got[0])))
+		}
+		if !strings.HasSuffix(got[0], "…") {
+			t.Error("truncation must be visible in the output")
+		}
+	})
+
+	t.Run("too many entries are capped and counted", func(t *testing.T) {
+		in := make([]string, 50)
+		for i := range in {
+			in[i] = fmt.Sprintf("grant-%d", i)
+		}
+		got := truncateGrantTypesForLog(in)
+		if len(got) != maxLoggedDroppedGrantTypes+1 {
+			t.Fatalf("got %d entries, want %d plus the overflow marker", len(got), maxLoggedDroppedGrantTypes)
+		}
+		if !strings.Contains(got[len(got)-1], "42 more") {
+			t.Errorf("overflow marker must say how many were elided, got %q", got[len(got)-1])
+		}
+	})
+
+	t.Run("the whole line stays bounded for a maximal document", func(t *testing.T) {
+		// 5 KiB of distinct 200-char grant types, the worst a document can do.
+		in := make([]string, 200)
+		for i := range in {
+			in[i] = fmt.Sprintf("%0200d", i)
+		}
+		total := 0
+		for _, s := range truncateGrantTypesForLog(in) {
+			total += len(s)
+		}
+		if total > (maxLoggedDroppedGrantTypes+1)*(maxLoggedGrantTypeLen+16) {
+			t.Errorf("logged payload is %d bytes — the cap is not bounding it", total)
+		}
+	})
+}
+
+// client_name is attacker-chosen and never length-limited — synthesizeCIMDClient
+// only trims it and checks it is non-empty — so the resolution log line must
+// bound it, exactly as it bounds the dropped grant types beside it. The stored
+// value is deliberately NOT truncated: it is what a consent screen shows the
+// user, and shortening that would change what they are asked to trust.
+func TestClientNameIsBoundedInLogsButNotAtRest(t *testing.T) {
+	long := strings.Repeat("A", 5000)
+
+	logged := truncateForLog(long, maxLoggedClientNameLen)
+	if len([]rune(logged)) > maxLoggedClientNameLen+1 {
+		t.Errorf("logged client_name is %d runes — the cap is not bounding it", len([]rune(logged)))
+	}
+	if !strings.HasSuffix(logged, "…") {
+		t.Error("truncation must be visible in the output")
+	}
+
+	// The synthesized client keeps the full name.
+	client, _, err := synthesizeCIMDClient("https://app.example.com/c.json", &cimdMetadataDocument{
+		ClientID:     "https://app.example.com/c.json",
+		ClientName:   long,
+		RedirectURIs: []string{"https://app.example.com/cb"},
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("synthesize: %v", err)
+	}
+	if client.Name != long {
+		t.Errorf("the STORED client_name must not be truncated — it is what consent displays (got %d chars, want %d)",
+			len(client.Name), len(long))
+	}
+}
+
+func TestTruncateForLog(t *testing.T) {
+	if got := truncateForLog("short", 64); got != "short" {
+		t.Errorf("a value under the cap must pass through unchanged, got %q", got)
+	}
+	if got := truncateForLog(strings.Repeat("x", 100), 10); got != strings.Repeat("x", 10)+"…" {
+		t.Errorf("unexpected truncation: %q", got)
+	}
+}
+
+// A key-based CIMD client is synthesized correctly, and — the part that matters
+// — is more AUTHENTICATED without being more AUTHORIZED (zeroid#264).
+//
+// The rationale this replaced claimed that honouring private_key_jwt from a
+// self-published document "would let any party on the internet assert a
+// confidential client identity with no registration step". The self-reference
+// check is why that does not follow: a CIMD client_id IS the URL its document
+// was fetched from, so the only identity assertable is one for a URL the caller
+// already controls — and already asserts today as a public client.
+//
+// So the assertions below are split deliberately. The first group is the new
+// capability; the second is every bound that must NOT have moved with it.
+func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
+	const url = "https://app.example.com/oauth/client.json"
+	now := time.Unix(1_700_000_000, 0)
+
+	base := func() *cimdMetadataDocument {
+		return &cimdMetadataDocument{
+			ClientID:                url,
+			ClientName:              "Example MCP Client",
+			RedirectURIs:            []string{"http://127.0.0.1:3000/callback"},
+			TokenEndpointAuthMethod: "private_key_jwt",
+			JWKS:                    json.RawMessage(cimdTestJWKS),
+		}
+	}
+
+	t.Run("inline jwks is carried onto the synthesized client", func(t *testing.T) {
+		c, _, err := synthesizeCIMDClient(url, base(), now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !c.UsesPrivateKeyJWT() {
+			t.Error("a private_key_jwt document must synthesize a key-based client")
+		}
+		if !HasInlineJWKS(c.JWKS) {
+			t.Error("the document's jwks must reach the client, or the assertion has nothing to verify against")
+		}
+		// zeroid#348 convergence: a key holder is confidential whichever route
+		// produced it. Safe to assert only because no consumer reads the raw
+		// column any more — both predicates below answer correctly regardless.
+		if c.ClientType != "confidential" {
+			t.Errorf("ClientType = %q, want confidential", c.ClientType)
+		}
+		if !c.RequiresClientAuthentication() {
+			t.Error("a key-based CIMD client must be required to prove its key")
+		}
+		if !c.MayObtainAuthorizationCode() {
+			t.Error("a key-based CIMD client must still be able to obtain a code")
+		}
+	})
+
+	t.Run("jwks_uri is carried instead when that is what was published", func(t *testing.T) {
+		doc := base()
+		doc.JWKS = nil
+		doc.JWKSURI = "https://app.example.com/jwks.json"
+		c, _, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.JWKSURI != doc.JWKSURI {
+			t.Errorf("JWKSURI = %q, want %q", c.JWKSURI, doc.JWKSURI)
+		}
+		if HasInlineJWKS(c.JWKS) {
+			t.Error("no inline jwks was published; none should be set")
+		}
+	})
+
+	// ── Bounds that must NOT have moved ──────────────────────────────────────
+
+	t.Run("authority is still bounded to the CIMD grant set", func(t *testing.T) {
+		// The bound that actually constrains a CIMD client. Key-based auth must
+		// not widen it: client_credentials for a self-asserted client removes the
+		// user from the loop and is zeroid#266, a separate decision.
+		doc := base()
+		doc.GrantTypes = []string{"authorization_code", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"}
+		c, dropped, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, gt := range c.GrantTypes {
+			if !cimdAllowedGrantTypes[gt] {
+				t.Errorf("grant %q escaped the CIMD allow-list onto a key-based client", gt)
+			}
+		}
+		if slices.Contains(c.GrantTypes, "client_credentials") {
+			t.Error("client_credentials must NOT become available by holding a key (zeroid#266)")
+		}
+		if !slices.Contains(dropped, "client_credentials") {
+			t.Errorf("client_credentials should be reported dropped, got %v", dropped)
+		}
+	})
+
+	t.Run("self-reference is still what binds the identity", func(t *testing.T) {
+		// The check the whole argument rests on. A key does not let a document
+		// claim a client_id it was not served from — otherwise the old rationale
+		// would have been right.
+		doc := base()
+		doc.ClientID = "https://evil.example/other.json"
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Fatal("a key-based document must NOT be able to claim another URL's client_id")
+		}
+	})
+
+	t.Run("redirect_uris are still validated", func(t *testing.T) {
+		doc := base()
+		doc.RedirectURIs = []string{"http://app.example.com/cb"}
+		if _, _, err := synthesizeCIMDClient(url, doc, now); !errors.Is(err, ErrCIMDInvalidDocument) {
+			t.Error("holding a key must not exempt a document from the redirect_uri scheme rules")
+		}
+	})
+
+	t.Run("a public CIMD client is unchanged and never carries key material", func(t *testing.T) {
+		// A document is published to EVERY authorization server at once, so it
+		// may carry keys for a purpose this server has no part in. Narrow, do
+		// not reject (the zeroid#344 precedent) — but the keys must not be
+		// copied onto a client whose declared method is "none", or a public
+		// client would have something for an assertion to verify against.
+		doc := base()
+		doc.TokenEndpointAuthMethod = "none"
+		c, _, err := synthesizeCIMDClient(url, doc, now)
+		if err != nil {
+			t.Fatalf("a public document carrying jwks must not be rejected: %v", err)
+		}
+		if c.UsesPrivateKeyJWT() {
+			t.Error(`a document declaring "none" must not become key-based`)
+		}
+		if HasInlineJWKS(c.JWKS) || c.JWKSURI != "" {
+			t.Error("key material must not be copied onto a public client")
+		}
+		if c.ClientType != "public" || c.RequiresClientAuthentication() {
+			t.Error("a public CIMD client must be entirely unchanged by zeroid#264")
+		}
+	})
 }

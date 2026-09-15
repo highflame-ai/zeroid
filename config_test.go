@@ -3,6 +3,7 @@ package zeroid
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -355,5 +356,79 @@ func TestValidateWIMSEDomain(t *testing.T) {
 				t.Fatalf("error %q must mention %q so operators can act on it", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+// The client_auth knobs must actually reach the config. They were documented in
+// zeroid.yaml with `# Env:` lines before they existed in envMapping, so both
+// resolved to their zero values however they were set — a security lever that
+// failed silently in BOTH directions: an operator pinning it false in prod got
+// no confirmation, and one setting it true in dev got a non-working localhost
+// jwks_uri with no error.
+//
+// Note this needs the type-suffix entries as well as the envMapping rows.
+// Without the bool suffix the value lands as the string "false", which is
+// truthy-shaped and mis-unmarshals; asserting the resolved TYPED field is what
+// makes that visible.
+func TestLoadEnvVarsClientAuth(t *testing.T) {
+	t.Setenv("ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS", "true")
+	t.Setenv("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE", "64")
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.ClientAuth.AllowPrivateJWKSEndpoints {
+		t.Error("ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS=true did not reach client_auth")
+	}
+	if cfg.ClientAuth.JWKSCacheSize != 64 {
+		t.Errorf("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE=64 did not reach client_auth, got %d", cfg.ClientAuth.JWKSCacheSize)
+	}
+}
+
+// Production-safe defaults: both zero values must survive a bare load.
+func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.ClientAuth.AllowPrivateJWKSEndpoints {
+		t.Error("allow_private_jwks_endpoints must default to false — it governs an outbound fetch of attacker-supplied URLs")
+	}
+	if cfg.ClientAuth.JWKSCacheSize != 0 {
+		t.Errorf("jwks_cache_size must default to 0 (meaning the built-in cap), got %d", cfg.ClientAuth.JWKSCacheSize)
+	}
+}
+
+// Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
+// variable the loader actually reads.
+//
+// zeroid.yaml is the discovery surface operators work from, and there is no
+// generic ZEROID_ prefix loader behind it — envMapping is an explicit table, so
+// documenting a variable and wiring it are separate acts that silently drift.
+// That is exactly how the two client_auth knobs shipped documented-but-dead.
+func TestSampleConfigEnvVarsAreAllWired(t *testing.T) {
+	raw, err := os.ReadFile("zeroid.yaml")
+	if err != nil {
+		t.Skipf("zeroid.yaml not readable: %v", err)
+	}
+	envRef := regexp.MustCompile(`ZEROID_[A-Z0-9_]+`)
+	documented := map[string]bool{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(line, "# Env:") {
+			continue
+		}
+		for _, name := range envRef.FindAllString(line, -1) {
+			documented[name] = true
+		}
+	}
+	if len(documented) == 0 {
+		t.Fatal("found no `# Env:` lines in zeroid.yaml — the ratchet is not actually checking anything")
+	}
+
+	for name := range documented {
+		if _, ok := envMapping[name]; !ok {
+			t.Errorf("zeroid.yaml documents %s but envMapping never reads it — it is dead config", name)
+		}
 	}
 }

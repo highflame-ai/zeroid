@@ -20,12 +20,26 @@ package service
 // redirect_uris). This is the MCP Authorization 2025-11-25 preferred default
 // for open agent ecosystems.
 //
-// Scope of this implementation (v1):
-//   - PUBLIC clients only: token_endpoint_auth_method MUST be "none" (PKCE is
-//     the proof of possession). Confidential CIMD clients (private_key_jwt with
-//     a published jwks_uri) are future work — ZeroID does not yet accept
-//     private_key_jwt token-endpoint auth for any client.
-//   - authorization_code (+ optional refresh_token) grants only.
+// Scope of this implementation:
+//   - token_endpoint_auth_method is "none" (public PKCE, the default) or
+//     private_key_jwt against a key set the document publishes in `jwks` or
+//     `jwks_uri` (zeroid#264). The secret-based methods are structurally
+//     impossible here — there is no registration response to deliver a secret
+//     in — so cimdAllowedAuthMethods is a closed set of exactly those two.
+//
+//     This file previously refused private_key_jwt on the grounds that
+//     honouring it "would let any party on the internet assert a confidential
+//     client identity with no registration step". That was wrong, and the
+//     self-reference check in synthesizeCIMDClient is why: a CIMD client_id IS
+//     the URL its document was fetched from, so the only identity anyone can
+//     assert is one for a URL they already control — which a public CIMD client
+//     already asserts today. The assertion is an ADDED proof obligation, not a
+//     new identity. See synthesizeCIMDClient for the full argument and for what
+//     genuinely does bound a CIMD client's authority.
+//   - authorization_code (+ optional refresh_token) grants only. This is the
+//     bound that actually matters, and key-based auth does not widen it:
+//     client_credentials for a CIMD client removes the user from the loop and
+//     is tracked separately as zeroid#266.
 //   - Synthesized clients are NEVER persisted — they live only for the request
 //     that resolves them, plus a short in-memory cache.
 //
@@ -139,12 +153,58 @@ type cimdMetadataDocument struct {
 	ResponseTypes           []string `json:"response_types"`
 	Scope                   string   `json:"scope"`
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	// Key material for token_endpoint_auth_method=private_key_jwt (zeroid#264).
+	// RFC 7591 §2 permits exactly one of the two.
+	JWKS    json.RawMessage `json:"jwks"`
+	JWKSURI string          `json:"jwks_uri"`
+}
+
+// cimdAllowedAuthMethods are the token_endpoint_auth_method values a CIMD
+// document may declare.
+//
+// The secret-based methods are absent and always will be: a shared secret has
+// no meaning for a client that never registered, because there is no
+// registration response in which one could be delivered. `none` and
+// `private_key_jwt` are the only two a self-published client can actually
+// satisfy, which is why this is a closed set rather than a subset of the
+// registered-client allow-list.
+var cimdAllowedAuthMethods = map[string]bool{
+	"none":                        true,
+	clientAuthMethodPrivateKeyJWT: true,
 }
 
 // cimdAllowedGrantTypes is the grant-type allow-list for CIMD clients. CIMD is
 // the interactive-onboarding path, so authorization_code (and its refresh
 // companion) are the only sensible grants — client_credentials / token-exchange
 // clients register through the admin or RFC 7591 path instead.
+//
+// It is applied as an INTERSECTION over the document's list, not as a gate on
+// it. The distinction is the whole of zeroid#344: the invariant worth keeping is
+// that a zero-registration client cannot OBTAIN an M2M or delegation grant.
+// Refusing to PARSE a document that merely mentions such a grant enforced
+// nothing extra, and broke every client whose published document listed a grant
+// we simply do not implement.
+//
+// Two things carry that invariant, and it is worth being exact about which,
+// because only the first is unconditional:
+//
+//  1. effectiveCIMDGrantTypes filters through this map by exact string match, so
+//     a synthesized client's GrantTypes is PROVABLY a subset of these two
+//     values. No document can put a third string there. This holds regardless of
+//     what any consumer does with it.
+//  2. Reachability. Only three call sites can ever yield a CIMD-synthesized
+//     client — resolveClientRegistryOrCIMD is called from IssueAuthCode, the
+//     authorization_code exchange, and the refresh_token rotation, and nowhere
+//     else. The other six token-endpoint dispatch arms (jwt-bearer,
+//     token-exchange, api_key, CIBA, ID-JAG, custom grants via RegisterGrant)
+//     either resolve registry-only or never read a client at all, so a CIMD
+//     client_id buys nothing on them.
+//
+// (2) is the contingent half: a future grant that BOTH resolves through
+// resolveClientRegistryOrCIMD AND derives authority from the client would not be
+// covered by any grant-type check, because most arms have none. A ratchet test
+// (TestCIMDClientReachabilityIsBounded) fails if a fourth call site appears, so
+// that assumption cannot rot silently.
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
@@ -380,7 +440,20 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 			return client, nil
 		}
 
-		return s.resolveUncached(ctx, clientID, u.Hostname())
+		// context.WithoutCancel: the flight must not be hostage to whichever
+		// caller happened to arrive first. singleflight hands ONE execution to
+		// every waiter, so with the raw ctx a caller who disconnects mid-fetch
+		// cancels the fetch for everyone waiting on it — and, before the guard in
+		// resolveUncached, negative-cached that cancellation, denying the
+		// client_id to every later caller for cimdTransientNegativeCacheTTL.
+		//
+		// That was an unauthenticated, targeted denial of service: resolution
+		// runs before the principal chain, so an attacker needed only to open a
+		// request for a victim's client_id and abort it, once per 10 seconds, to
+		// keep that client unable to log anyone in. Detaching cancellation costs
+		// nothing — the fetch is independently bounded by cimdFetchTimeout, and
+		// completing it populates the cache for the waiters who are still there.
+		return s.resolveUncached(context.WithoutCancel(ctx), clientID, u.Hostname())
 	})
 	if err != nil {
 		return nil, err
@@ -413,6 +486,20 @@ func (s *CIMDService) resolveUncached(
 ) (*domain.OAuthClient, error) {
 	doc, docTTL, err := s.fetch(ctx, clientID)
 	if err != nil {
+		// A CANCELLED fetch says nothing about the origin, so it must never be
+		// cached. It is not evidence the document is unreachable — only that
+		// somebody stopped waiting for it — and caching it turns one abandoned
+		// request into a denial for every later caller. Defence in depth behind
+		// the context.WithoutCancel in ResolveClient, which stops the caller's
+		// cancellation reaching here at all; both are cheap and the failure mode
+		// is bad enough to want either one alone to be sufficient.
+		//
+		// A genuine timeout is NOT exempt: exceeding cimdFetchTimeout is real
+		// evidence about the origin, and the transient TTL is the right response.
+		if errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+
 		// Negative-cache the failure so replaying a dead URL can't force a
 		// fresh timeout-bounded outbound fetch per request. Fetch errors are
 		// transient (origin blip) and get the short TTL; validation errors are
@@ -424,7 +511,7 @@ func (s *CIMDService) resolveUncached(
 		s.storeResult(clientID, cimdCacheEntry{err: err}, ttl)
 		return nil, err
 	}
-	client, err := synthesizeCIMDClient(clientID, doc, s.now())
+	client, droppedGrants, err := synthesizeCIMDClient(clientID, doc, s.now())
 	if err != nil {
 		s.storeResult(clientID, cimdCacheEntry{err: err}, cimdNegativeCacheTTL)
 		return nil, err
@@ -435,11 +522,21 @@ func (s *CIMDService) resolveUncached(
 	}
 
 	s.storeResult(clientID, cimdCacheEntry{client: client}, docTTL)
-	log.Info().
+	resolved := log.Info().
 		Str("client_id", clientID).
-		Str("client_name", client.Name).
-		Int("redirect_uris", len(client.RedirectURIs)).
-		Msg("CIMD: resolved client from metadata document")
+		Str("client_name", truncateForLog(client.Name, maxLoggedClientNameLen)).
+		Int("redirect_uris", len(client.RedirectURIs))
+	if len(droppedGrants) > 0 {
+		// info, not warn: for a conformant document this is the designed
+		// outcome, not a fault. Reported at all because the client is told
+		// nothing — cimdOAuthError deliberately withholds the cause — so the
+		// server log is the only place the narrowing is visible. Truncated
+		// because the values are attacker-chosen (see truncateGrantTypesForLog).
+		resolved = resolved.
+			Strs("dropped_grant_types", truncateGrantTypesForLog(droppedGrants)).
+			Strs("effective_grant_types", client.GrantTypes)
+	}
+	resolved.Msg("CIMD: resolved client from metadata document")
 	return client, nil
 }
 
@@ -576,15 +673,111 @@ func (s *CIMDService) positiveCacheTTL(cacheControl string) time.Duration {
 	return ttl
 }
 
+// maxLoggedDroppedGrantTypes and maxLoggedGrantTypeLen bound what a CIMD
+// document can write into the log. Both the number of entries and their contents
+// are attacker-chosen — the document is unauthenticated, unregistered, and
+// capped only by defaultCIMDMaxDocumentBytes — so an unbounded log line lets one
+// resolution emit most of a 5 KiB document as log text, and distinct URLs
+// sidestep the resolution cache. internal/handler applies the same
+// countermeasure to the attacker-supplied grant_type on the token endpoint.
+const (
+	maxLoggedDroppedGrantTypes = 8
+	maxLoggedGrantTypeLen      = 64
+	// maxLoggedClientNameLen bounds client_name on the resolution log line. The
+	// same reasoning applies to it as to the grant types: client_name is only
+	// trimmed and checked non-empty (synthesizeCIMDClient), never
+	// length-limited, so it can carry most of a 5 KiB document. It is NOT
+	// truncated at the source — the stored value is what a consent screen shows
+	// the user, and shortening that would change what they are asked to trust.
+	// Only the log copy is bounded. client_id needs no equivalent: it is already
+	// capped at maxCIMDClientIDLength.
+	maxLoggedClientNameLen = 128
+)
+
+// truncateForLog bounds one attacker-supplied value written to the log, marking
+// the elision so the output does not silently understate the input.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "…"
+}
+
+// truncateGrantTypesForLog caps the slice length and each entry's length,
+// appending a marker when either bound trims something so the log does not
+// silently understate what the document declared.
+func truncateGrantTypesForLog(gts []string) []string {
+	out := make([]string, 0, min(len(gts), maxLoggedDroppedGrantTypes)+1)
+	for _, gt := range gts[:min(len(gts), maxLoggedDroppedGrantTypes)] {
+		out = append(out, truncateForLog(gt, maxLoggedGrantTypeLen))
+	}
+	if len(gts) > maxLoggedDroppedGrantTypes {
+		out = append(out, fmt.Sprintf("…and %d more", len(gts)-maxLoggedDroppedGrantTypes))
+	}
+	return out
+}
+
+// effectiveCIMDGrantTypes narrows a document's grant_types to the set this
+// server will actually offer a CIMD client, returning the kept set and the
+// dropped entries (in document order, de-duplicated).
+//
+// A CIMD document is a single declaration the client publishes to EVERY
+// authorization server it talks to; there is no registration response and no way
+// to tailor it per server. RFC 7591 §2 lets an AS ignore metadata it does not
+// understand, and §3.2.1 lets it substitute the grant types it supports — so
+// honouring the supported subset is the only behaviour available to a protocol
+// with no registration round trip. Rejecting the document instead meant a client
+// that listed, say, device_code — a grant ZeroID does not implement and could
+// therefore never issue — could not log in at all, and could not fix it without
+// dropping that grant for every other server it works with.
+//
+// The kept set is what gets stored on the synthesized client, and that is what
+// carries the security property — see cimdAllowedGrantTypes for exactly how.
+// Returning the raw document list instead would hand a zero-registration client
+// whatever it asked for, which is precisely the hole the old allow-list existed
+// to close.
+//
+// An empty or absent list defaults to [authorization_code] (draft §2). The
+// caller decides what a missing authorization_code means — this narrows only.
+func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
+	if len(declared) == 0 {
+		return []string{string(domain.GrantTypeAuthorizationCode)}, nil
+	}
+	seen := make(map[string]bool, len(declared))
+	for _, gt := range declared {
+		if seen[gt] {
+			// A document may repeat a value; the synthesized client should not.
+			continue
+		}
+		seen[gt] = true
+		if gt == "" {
+			// A stray empty entry declares nothing; reporting it as "dropped"
+			// would just put `[""]` in the log.
+			continue
+		}
+		if cimdAllowedGrantTypes[gt] {
+			kept = append(kept, gt)
+		} else {
+			dropped = append(dropped, gt)
+		}
+	}
+	return kept, dropped
+}
+
 // synthesizeCIMDClient validates the document against the fetch URL and turns it
-// into an ephemeral public OAuth client. Pure (no I/O) so it is unit-testable in
-// isolation. `now` timestamps the synthesized record.
-func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (*domain.OAuthClient, error) {
+// into an ephemeral public OAuth client. Pure (no I/O, no logging) so it is
+// unit-testable in isolation. `now` timestamps the synthesized record.
+//
+// The second return is the grant types the document declared that this server
+// does not offer CIMD clients — reported rather than logged here so the
+// synthesizer stays pure and one resolution produces one log line. See
+// effectiveCIMDGrantTypes.
+func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.Time) (client *domain.OAuthClient, droppedGrantTypes []string, err error) {
 	// Self-reference (draft §4): the document's own client_id MUST equal the URL
 	// it was fetched from. This is what stops an attacker from hosting a document
 	// that claims someone else's client_id.
 	if doc.ClientID != clientID {
-		return nil, fmt.Errorf("%w: document client_id %q does not match its URL", ErrCIMDInvalidDocument, doc.ClientID)
+		return nil, nil, fmt.Errorf("%w: document client_id %q does not match its URL", ErrCIMDInvalidDocument, doc.ClientID)
 	}
 
 	// redirect_uris is required and must be non-empty for the authorization_code
@@ -593,45 +786,74 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// private-use scheme) so a document cannot allow-list a plaintext
 	// non-loopback callback for its own codes.
 	if len(doc.RedirectURIs) == 0 {
-		return nil, fmt.Errorf("%w: redirect_uris is required and must be non-empty", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: redirect_uris is required and must be non-empty", ErrCIMDInvalidDocument)
 	}
 	for _, ru := range doc.RedirectURIs {
 		if err := validateCIMDRedirectURI(ru); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
+			return nil, nil, fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
 		}
 	}
 
-	// Public client only in v1. An omitted token_endpoint_auth_method defaults to
-	// "none" for a CIMD (public) client; any explicit confidential method is
-	// rejected — ZeroID does not accept private_key_jwt token-endpoint auth yet.
+	// token_endpoint_auth_method: "none" (the default) or private_key_jwt.
+	//
+	// This used to refuse everything but "none", on the reasoning that honouring
+	// key-based auth from a self-published document "would let any party on the
+	// internet assert a confidential client identity with no registration step".
+	// That reasoning does not survive the self-reference check twelve lines
+	// above (zeroid#264). A CIMD client_id IS the URL its document was fetched
+	// from, so the only identity anyone can assert is one for a URL they already
+	// control — which they can assert TODAY as a public client. Requiring a
+	// signed assertion on top does not hand out a new identity; it adds a proof
+	// obligation to an existing one.
+	//
+	// The distinction that matters, and the one this preserves: a key-based CIMD
+	// client is more AUTHENTICATED, not more AUTHORIZED. Its authority is
+	// bounded by exactly the two things that bounded it before, neither of which
+	// this touches — cimdAllowedGrantTypes (a provable subset of
+	// {authorization_code, refresh_token}) and the three-call-site reachability
+	// bound that TestCIMDClientReachabilityIsBounded pins. In particular
+	// client_credentials stays refused; granting it to a self-asserted client is
+	// zeroid#266 and is a genuinely different question, because it removes the
+	// user from the loop.
 	authMethod := doc.TokenEndpointAuthMethod
 	if authMethod == "" {
 		authMethod = "none"
 	}
-	if authMethod != "none" {
-		return nil, fmt.Errorf("%w: token_endpoint_auth_method must be \"none\" (public PKCE); %q is not supported",
-			ErrCIMDInvalidDocument, doc.TokenEndpointAuthMethod)
+	if !cimdAllowedAuthMethods[authMethod] {
+		return nil, nil, fmt.Errorf(
+			"%w: token_endpoint_auth_method must be \"none\" or %q; %q is not supported for a self-published client",
+			ErrCIMDInvalidDocument, clientAuthMethodPrivateKeyJWT, doc.TokenEndpointAuthMethod)
 	}
 
-	// grant_types default to [authorization_code]; must include it and stay
-	// inside the CIMD allow-list.
-	grantTypes := doc.GrantTypes
-	if len(grantTypes) == 0 {
-		grantTypes = []string{string(domain.GrantTypeAuthorizationCode)}
-	}
-	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
-		return nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
-	}
-	for _, gt := range grantTypes {
-		if !cimdAllowedGrantTypes[gt] {
-			return nil, fmt.Errorf("%w: grant_type %q is not permitted for a CIMD client", ErrCIMDInvalidDocument, gt)
+	// Key material is read ONLY for private_key_jwt. A document that publishes
+	// `jwks` while declaring "none" is not refused — a CIMD document is one
+	// declaration published to every AS at once, so it may carry keys for a
+	// purpose this server has no part in. It is simply not copied onto the
+	// synthesized client, so there is no path by which a public client's
+	// assertion could ever be checked against it. Same reasoning as the
+	// grant-type intersection in zeroid#344: narrow, do not reject.
+	var jwks json.RawMessage
+	var jwksURI string
+	if authMethod == clientAuthMethodPrivateKeyJWT {
+		if err := validateCIMDKeyMaterial(clientID, doc); err != nil {
+			return nil, nil, err
 		}
+		jwks, jwksURI = doc.JWKS, doc.JWKSURI
+	}
+
+	// grant_types default to [authorization_code]. The document's list is
+	// INTERSECTED with the CIMD allow-list rather than validated against it:
+	// unsupported entries are dropped, and only a missing authorization_code is
+	// fatal. See effectiveCIMDGrantTypes for why.
+	grantTypes, dropped := effectiveCIMDGrantTypes(doc.GrantTypes)
+	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
+		return nil, nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
 	}
 
 	// response_types, when present, must contain "code" (the only response type
 	// the authorization_code flow supports).
 	if len(doc.ResponseTypes) > 0 && !slices.Contains(doc.ResponseTypes, "code") {
-		return nil, fmt.Errorf("%w: response_types must include \"code\"", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: response_types must include \"code\"", ErrCIMDInvalidDocument)
 	}
 
 	// client_name is REQUIRED here, though the draft only RECOMMENDS it.
@@ -649,7 +871,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// whoever picked the URL.
 	name := strings.TrimSpace(doc.ClientName)
 	if name == "" {
-		return nil, fmt.Errorf("%w: client_name is required and must be non-empty", ErrCIMDInvalidDocument)
+		return nil, nil, fmt.Errorf("%w: client_name is required and must be non-empty", ErrCIMDInvalidDocument)
 	}
 
 	// An empty scope means "no client-side scope ceiling": the principal
@@ -658,11 +880,24 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// strings.Fields never returns nil, so no empty-slice normalization needed.
 	scopes := strings.Fields(doc.Scope)
 
+	// client_type follows the same convergence the registered paths adopted in
+	// zeroid#348: a key holder is confidential (RFC 6749 §2.1), whichever route
+	// produced it. Safe to vary here only because that change removed every read
+	// of the raw column outside domain/ and left a ratchet test enforcing it —
+	// consumers ask MayObtainAuthorizationCode / RequiresClientAuthentication,
+	// both of which answer correctly for either value.
+	clientType := "public"
+	if authMethod == clientAuthMethodPrivateKeyJWT {
+		clientType = "confidential"
+	}
+
 	return &domain.OAuthClient{
 		ClientID:                clientID,
 		Name:                    name,
-		ClientType:              "public",
-		TokenEndpointAuthMethod: "none",
+		ClientType:              clientType,
+		TokenEndpointAuthMethod: authMethod,
+		JWKS:                    jwks,
+		JWKSURI:                 jwksURI,
 		GrantTypes:              grantTypes,
 		RedirectURIs:            doc.RedirectURIs,
 		Scopes:                  scopes,
@@ -670,7 +905,43 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 		IsActive:                true,
 		CreatedAt:               now,
 		UpdatedAt:               now,
-	}, nil
+	}, dropped, nil
+}
+
+// validateCIMDKeyMaterial enforces the key contract for a private_key_jwt CIMD
+// document. Pure, so synthesizeCIMDClient stays pure.
+//
+// Shares validateKeyMaterial with the registered path so the two cannot drift;
+// the two policy differences are declared, not reimplemented:
+//
+//   - NO private-endpoint hatch. The registered path has one because an operator
+//     controls what they register; an anonymous document has no operator.
+//   - jwks_uri must be on the client_id's OWN host. Without that, a document can
+//     point this server at an arbitrary third-party https host and drive fetches
+//     to it with no credential — verifyClientAssertion resolves the key set
+//     before it verifies the signature, so a garbage assertion works just as
+//     well. See keyMaterialRules.sameHostAs for why same-host is the correct
+//     posture rather than merely a mitigation.
+//
+// Failing here rather than at first authentication is the same trade the
+// registered path makes: a document declaring private_key_jwt with no usable key
+// describes a client that could never authenticate, and saying so at resolution
+// time is an actionable error instead of a 401 the publisher debugs later.
+func validateCIMDKeyMaterial(clientID string, doc *cimdMetadataDocument) error {
+	// The client_id is already known to parse as an absolute https URL with a
+	// non-empty host — IsCIMDClientID gates that before any fetch happens — so
+	// a parse failure here is not reachable in practice. Treat it as a refusal
+	// rather than ignoring the error: silently skipping the host comparison is
+	// the one outcome that must not happen.
+	u, err := url.Parse(clientID)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%w: client_id is not a usable URL", ErrCIMDInvalidDocument)
+	}
+	if err := validateKeyMaterial(doc.JWKS, doc.JWKSURI, true, keyMaterialRules{sameHostAs: u.Hostname()}); err != nil {
+		return fmt.Errorf("%w: %v", ErrCIMDInvalidDocument, err)
+	}
+
+	return nil
 }
 
 // RedirectDeliversLocally reports whether a redirect destination can only reach
@@ -764,32 +1035,57 @@ func validateCIMDRedirectURI(raw string) error {
 // access. Positive hits return a COPY so a caller cannot mutate the cached
 // instance.
 func (s *CIMDService) cachedResult(clientID string) (*domain.OAuthClient, error, bool) {
+	// The clone happens OUTSIDE the lock. It is six slice allocations, and this
+	// runs on every cache hit for every CIMD request — /oauth2/authorize, the
+	// code exchange and every refresh rotation — against one service-wide mutex.
+	// Copying the pointer under the lock and cloning after it keeps the critical
+	// section to a map lookup and a time comparison. Safe because cached entries
+	// are never mutated in place: storeResult always writes a fresh clone, so the
+	// instance this pointer names cannot change under us.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, ok := s.cache[clientID]
-	if !ok {
-		return nil, nil, false
-	}
-	if s.now().After(e.expiresAt) {
+	if ok && s.now().After(e.expiresAt) {
 		delete(s.cache, clientID)
+		ok = false
+	}
+	s.mu.Unlock()
+
+	if !ok {
 		return nil, nil, false
 	}
 	if e.err != nil {
 		return nil, e.err, true
 	}
+
 	return cloneCIMDClient(e.client), nil, true
 }
 
 // cloneCIMDClient copies c so the result shares no slice backing storage with
-// c. A plain `*c` struct copy leaves the slice fields (GrantTypes/RedirectURIs/
-// Scopes/Contacts) aliasing the original — a caller appending to or mutating
-// one of those slices would corrupt the cached entry (and race other callers).
+// c. A plain `*c` struct copy leaves the slice fields aliasing the original — a
+// caller appending to or mutating one of them would corrupt the cached entry and
+// race every other caller holding a copy.
+//
+// This list WAS an enumeration that went stale the moment a slice field was
+// added: zeroid#264 put `jwks` on the synthesized client and did not add it
+// here, so every caller resolving a key-based CIMD client shared one backing
+// array for its VERIFICATION KEY MATERIAL — with the cache and with each other.
+// Nothing mutated it, so nothing broke and -race stayed silent, which is exactly
+// how the next one would land too. `metadata` was missing for the same reason
+// and had simply never been populated.
+//
+// TestCloneCIMDClientCoversEveryReferenceField walks the struct by reflection
+// and fails if any slice-kinded field is left aliasing, so adding a field to
+// domain.OAuthClient cannot quietly reintroduce this. The enumeration below is
+// still explicit — it is fast and readable — but it is now checked rather than
+// trusted.
 func cloneCIMDClient(c *domain.OAuthClient) *domain.OAuthClient {
 	cp := *c
 	cp.GrantTypes = slices.Clone(c.GrantTypes)
 	cp.RedirectURIs = slices.Clone(c.RedirectURIs)
 	cp.Scopes = slices.Clone(c.Scopes)
 	cp.Contacts = slices.Clone(c.Contacts)
+	cp.JWKS = slices.Clone(c.JWKS)
+	cp.Metadata = slices.Clone(c.Metadata)
 	return &cp
 }
 

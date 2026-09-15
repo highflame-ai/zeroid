@@ -838,11 +838,20 @@ ZeroID-issued token as a federated workload credential — granting Anthropic AP
 access without a static Anthropic API key. GCP Workload Identity Federation,
 AWS, and Azure follow the same configuration shape.
 
-> **Audience note.** The public `/oauth2/token` endpoint does not expose an
-> `audience` / `resource` parameter; issued tokens default `aud` to the ZeroID
-> issuer URL. A relying party that enforces a specific audience **MUST**
-> therefore be configured to accept the ZeroID issuer URL as the expected
-> audience (rather than expecting ZeroID to mint a caller-chosen `aud`).
+> **Audience note.** A token issued with no resource indicator defaults `aud` to
+> the ZeroID issuer URL, so a relying party on this federation path **MUST** be
+> configured to accept the issuer URL as the expected audience rather than
+> expecting a caller-chosen `aud`.
+>
+> `/oauth2/token` *does* accept an RFC 8707 `resource` parameter, and
+> `/oauth2/authorize` accepts one that becomes the authorization code's consented
+> ceiling. Both only ever NARROW where a token is honoured, which is why `aud`
+> still cannot be used as an authorization signal: any tenant principal may
+> request any value, so a relying party **MUST NOT** treat a matching `aud` as
+> evidence that the token was minted for it. Authorize on the `resource` claim,
+> the scopes, and the principal. The `audience` parameter is a separate
+> scope-profile mechanism, exposed only on the trusted external-principal
+> exchange and mutually exclusive with `resource`.
 
 ## 11. Discovery Metadata Extensions
 
@@ -857,8 +866,35 @@ baseline:
 | `backchannel_authentication_endpoint` | `<issuer>/oauth2/bc-authorize` | CIBA Core |
 | `backchannel_token_delivery_modes_supported` | `["poll","ping","push"]` | CIBA Core |
 | `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
-| `backchannel_authentication_request_signing_alg_values_supported` | `[]` (signed bc-authorize requests unsupported) | CIBA Core |
+| `backchannel_authentication_request_signing_alg_values_supported` | *omitted* (signed bc-authorize requests unsupported) | CIBA Core |
 | `client_id_metadata_document_supported` | `true` (gated — see Section 12.8) | CIMD draft-02 |
+
+**Zero-element claims are omitted, not emitted as `[]`.** RFC 8414 §2 and
+OpenID Connect Discovery 1.0 §3 both require it: *"Claims with zero elements
+MUST be omitted from the response."* Every discovery document ZeroID publishes
+is swept for this before it is served, so a member with nothing to list is
+absent rather than empty — `backchannel_authentication_request_signing_alg_values_supported`
+always, `response_types_supported` when the `authorization_code` flow is
+unservable (Section 12.8), `id_token_signing_alg_values_supported` if no
+published key carries an `alg`. For **those three members**, read an absent
+value as "none" rather than "unknown" (zeroid#316).
+
+That reading does **not** generalise to every absent array-valued member, and
+assuming it does is the more dangerous mistake of the two. Where a spec defines
+a default for the omitted case, absence means the default — which can be *wider*
+than an empty list, not narrower:
+
+| Member | Meaning of absence |
+|---|---|
+| `grant_types_supported` | RFC 8414 §2 → `["authorization_code", "implicit"]`, including the implicit flow OAuth 2.1 removes |
+| `token_endpoint_auth_methods_supported` | RFC 8414 §2 → `client_secret_basic` |
+| `bearer_methods_supported` (RFC 9728) | RFC 9728 §2 → re-opens `query`, i.e. bearer tokens in URLs and therefore in access logs |
+
+ZeroID publishes all three as non-empty literals, so none is ever omitted and
+the distinction is latent rather than live. It is stated because the sweep is
+unconditional: a member later made *computed* must be given an explicit
+non-empty floor where it is built, rather than left to the sweep. Section 11.4
+works through the one case where omission carries a real client-visible cost.
 
 ### 11.2 Protected Resource Metadata (RFC 9728)
 
@@ -902,10 +938,21 @@ that pin a literal `sub` value.
 
 **ZeroID is not an OpenID Provider.** It issues no `id_token`, and this document
 **MUST NOT** be read as advertising one. `response_types_supported` is inherited
-from Section 11.1 and carries at most `"code"` — never `"id_token"` or
-`"id_token token"` — so no relying party can request an ID Token from this
-authorization server. `scopes_supported` is not advertised, so `openid` is not
-offered either. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
+from Section 11.1 and is either absent or carries at most `"code"` — never
+`"id_token"` or `"id_token token"` — so no relying party can request an ID Token
+from this authorization server. `scopes_supported` is not advertised, so
+`openid` is not offered either.
+
+The absent case deserves stating plainly, because it is the weaker half of that
+guarantee. When the `authorization_code` flow is unservable the member is
+omitted (see Section 11.1), and a client library that supplies its own default
+then supplies it unchecked — the MCP Python SDK's `OAuthMetadata` model, for
+instance, defaults `response_types_supported` to `["code"]`. That default is
+still not `"id_token"`, so the no-ID-Token guarantee holds on both paths. What
+it costs is the *`code`* half: such a client believes an authorization flow is
+available that this deployment will answer with `503` at `/oauth2/authorize`.
+That is a failed flow rather than a security boundary, and it is the accepted
+price of publishing a conformant document. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
 discovery, and every ID Token clause are out of scope.
 
 ## 12. Client ID Metadata Documents (CIMD)
@@ -915,8 +962,9 @@ ZeroID implements
 (revision **-02**, July 2026), the client-onboarding model the MCP Authorization
 specification names as its preferred default. A client presents an `https://`
 URL as its `client_id`; ZeroID fetches and validates the metadata document
-published there and synthesises an **ephemeral** public PKCE client from it. No
-row is written to the client registry.
+published there and synthesises an **ephemeral** client from it — a public PKCE
+client by default, or a key-authenticated one when the document publishes a key
+set (zeroid#264). No row is written to the client registry.
 
 This section specifies ZeroID's deviations from the draft and the deployment
 controls around it. `docs/cimd.md` carries the worked examples.
@@ -996,15 +1044,53 @@ overrides the document.
   consent has to go on. ZeroID previously fell back to the `client_id`, which made
   a document that declined to name itself indistinguishable from a well-formed one
   and let whoever chose the URL choose what the user reads.
-- `token_endpoint_auth_method` **MUST** be `none`; an omitted value defaults to
-  `none`. **This is a deviation.** Draft-02 §8.2 *recommends* that a client
-  establish itself as confidential via `token_endpoint_auth_method` and
-  `jwks_uri`; ZeroID accepts no `private_key_jwt` anywhere yet, so every CIMD
-  client is public and PKCE is the sole proof of possession. Tracked in
-  zeroid#264.
-- `grant_types` defaults to `["authorization_code"]`, **MUST** include
-  `authorization_code`, and may contain only `authorization_code` and
-  `refresh_token`.
+- `token_endpoint_auth_method` **MUST** be `none` (an omitted value defaults to
+  `none`) or `private_key_jwt`. Draft-02 §8.2 *recommends* that a client be able
+  to establish itself as confidential via `token_endpoint_auth_method` and
+  `jwks_uri`; ZeroID supports that as of zeroid#264. The secret-based methods are
+  refused, and this is **not** a deviation so much as a structural fact: there is
+  no registration response in which a self-published client could be handed a
+  secret.
+
+  A `private_key_jwt` document **MUST** publish exactly one of `jwks` or
+  `jwks_uri` (RFC 7591 §2); declaring the method with no key material is refused
+  at resolution, because it describes a client that could never authenticate.
+
+  **Deviation — `jwks_uri` MUST be on the `client_id`'s own host**, and gets no
+  private-endpoint relaxation. The draft does not require this. Two reasons, and
+  the first is the principled one: CIMD's entire trust anchor is that the
+  document's *host* vouches for the identity, so honouring keys served by some
+  other host would trust B to speak for A with nothing establishing that it may.
+  The second is concrete — key resolution runs *before* signature verification,
+  so without the rule any anonymous document becomes an unauthenticated
+  outbound-fetch primitive aimed at a third party, and each distinct URL consumes
+  a bounded cache slot that owns a background refresh, evicting legitimate
+  clients' key sets. Inline `jwks` is the escape hatch for a publisher who keeps
+  keys elsewhere.
+
+  Earlier revisions of this document stated that accepting key-based auth "would
+  let any party on the internet claim a confidential client identity without
+  registering". That was wrong and is retracted: the §4 self-reference check
+  means a CIMD `client_id` **is** the URL its document was fetched from, so the
+  only identity assertable is one for a URL the caller already controls — which
+  a public CIMD client already asserts. A key is an added proof obligation, not a
+  new identity. What bounds a CIMD client's authority is the grant-type
+  intersection below, which key-based auth does not widen.
+- `grant_types` defaults to `["authorization_code"]` and **MUST** include
+  `authorization_code`. Values outside `{authorization_code, refresh_token}` are
+  **ignored**: the effective grant set is the intersection of the document's
+  list with that pair, and the synthesized client carries only the
+  intersection. A document is refused only when the intersection is empty of
+  `authorization_code`.
+
+  This follows RFC 7591 §2 (an AS MAY ignore metadata it does not understand)
+  and §3.2.1 (an AS MAY substitute the grant types it supports). A CIMD document
+  is published once to every authorization server the client uses and there is
+  no registration response to negotiate with, so rejecting it over a grant this
+  server does not implement would force the publisher to choose between servers.
+  The security property is preserved by the intersection, not by the rejection:
+  a grant absent from the synthesized client's `grant_types` cannot be obtained.
+  Changed in zeroid#344.
 - When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
   entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
   is a deviation**, and it is what makes the allow-list load-bearing for Section

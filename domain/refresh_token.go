@@ -61,4 +61,36 @@ type RefreshToken struct {
 	// Empty (nullzero ⇒ SQL NULL) ⇒ a normal refresh token (authorization_code
 	// flow, or any pre-migration family): rotation is unchanged, no `aud`.
 	Audience string `bun:"audience,nullzero" json:"audience,omitempty"`
+	// Resources is the RFC 8707 resource CEILING this refresh family was issued
+	// for (CAP-IDN-027). Copied verbatim onto every successor row on rotation
+	// and read back when the refresh grant mints a new access token, so the
+	// binding survives rotation instead of silently vanishing — which is what
+	// made suppressing the refresh token necessary before this existed.
+	//
+	// A refresh that names `resource` must select a subset of this. One that
+	// omits it re-stamps the ceiling when the ceiling holds exactly one value,
+	// and is refused when it holds more.
+	//
+	// That refusal covers the REFRESH leg only. The initial mint does not
+	// refuse it: narrowResourcesTo returns the full authorized set for an
+	// omitted request, so an authorization_code exchange against a
+	// multi-valued ceiling would stamp every value into `aud`. So raising
+	// maxAuthorizeResourceIndicators is NOT purely a one-line change — it also
+	// needs a decision about the mint, or it begins issuing multi-audience
+	// access tokens by default. Only the long-lived half is guarded today.
+	//
+	// NIL (⇒ SQL NULL via nullzero) means no binding on this family: the
+	// ordinary authorization_code flow and every pre-migration row, whose
+	// rotation is unchanged and whose successors carry no `resource` claim.
+	//
+	// Note nullzero collapses only a NIL slice. A non-nil empty slice writes
+	// '{}', not NULL — bun's zeroChecker maps reflect.Slice to isNil rather
+	// than isZeroLen. Since every consumer keys on len(...) == 0, '{}' would
+	// read as "no ceiling" and so widen what the family permits. No code path
+	// produces it, and migration 044 adds a CHECK constraint so the database
+	// refuses it outright; set nil, never []string{}.
+	//
+	// TEXT[] though the ceiling is single-valued today: cardinality is a
+	// constant, not a shape (ADR 0037 D2).
+	Resources []string `bun:"resource,array,nullzero" json:"resource,omitempty"`
 }

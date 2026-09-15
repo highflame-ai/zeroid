@@ -77,6 +77,16 @@ type AuthorizeRequest struct {
 	State               string
 	Scope               string
 
+	// Resource carries every occurrence of the RFC 8707 `resource`
+	// parameter (CAP-IDN-027). A slice because §2 permits the parameter to
+	// repeat, and reading only the first occurrence would silently drop a
+	// resource the client asked to be bound to.
+	//
+	// Read from a single source per method — the query string on GET, the
+	// body on POST — never a merge of both, for the same parameter-
+	// smuggling reason the scalar fields above are.
+	Resource []string
+
 	// Form returns a body form value parsed by zeroid, or "" if absent.
 	// Resolvers use this to read principal-credential fields they own
 	// (e.g. "api_key" for the api_key resolver, "session_id" for a
