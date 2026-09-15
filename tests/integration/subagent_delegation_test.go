@@ -182,6 +182,56 @@ func TestSubagentDelegation_EmptyRequestGrantsNothing(t *testing.T) {
 	body := decode(t, resp)
 	assert.Equal(t, "invalid_scope", body["error"],
 		"empty scope request yields invalid_scope — least privilege by construction")
+	assert.Contains(t, body["error_description"], "no scopes were requested",
+		"token-exchange is the one grant with no RFC 6749 §3.3 default; the denial must say so")
+}
+
+// TestSubagentDelegation_DenialNamesTheEmptyTerm pins that the three-way
+// intersection reports WHICH term was empty, end to end. The unit tests cover
+// delegationScopeDenial in isolation; this covers that tokenExchange hands it
+// the right three sets. The two causes below need opposite repairs — widen the
+// delegator, or widen the subagent — and one message for both is what sent
+// callers to the wrong identity.
+func TestSubagentDelegation_DenialNamesTheEmptyTerm(t *testing.T) {
+	rootPolicy := delegationPolicy(t, uid("s9-blame-root-cp"), []string{"tools:read"})
+	_, _, rootTok := issueRootCredential(t, rootPolicy, "s9-blame-root", []string{"tools:read"})
+
+	t.Run("the parent does not hold it", func(t *testing.T) {
+		// The child ceiling permits tools:execute, but the parent never held
+		// it — widening the child would not help.
+		childPolicy := delegationPolicy(t, uid("s9-blame-parent-cp"), []string{"tools:read", "tools:execute"})
+		resp := attemptSubagentExchange(t, childPolicy, "s9-blame-parent",
+			[]string{"tools:read", "tools:execute"},
+			[]string{"tools:execute"},
+			rootTok)
+		require.NotNil(t, resp)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		body := decode(t, resp)
+		assert.Equal(t, "invalid_scope", body["error"])
+		assert.Contains(t, body["error_description"], "the subject token does not hold [tools:execute]")
+		assert.NotContains(t, body["error_description"], "not registered for",
+			"the child ceiling permits it, so the child is not the constraint")
+	})
+
+	t.Run("the child was not registered for it", func(t *testing.T) {
+		// The parent holds tools:read; this child was registered without it.
+		childPolicy := delegationPolicy(t, uid("s9-blame-child-cp"), []string{"tools:write"})
+		resp := attemptSubagentExchange(t, childPolicy, "s9-blame-child",
+			[]string{"tools:write"},
+			[]string{"tools:read"},
+			rootTok)
+		require.NotNil(t, resp)
+		defer func() { _ = resp.Body.Close() }()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		body := decode(t, resp)
+		assert.Equal(t, "invalid_scope", body["error"])
+		assert.Contains(t, body["error_description"], "the actor identity is not registered for [tools:read]")
+		assert.NotContains(t, body["error_description"], "does not hold",
+			"the parent holds it, so the parent is not the constraint")
+	})
 }
 
 // TestSubagentDelegation_DepthCapRejected proves the child credential policy's

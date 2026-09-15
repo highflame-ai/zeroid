@@ -1063,7 +1063,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	if len(scopes) == 0 {
-		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not available for delegation")
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed)
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
@@ -3236,6 +3236,71 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 		return nil
 	}
 	return oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+}
+
+// delegationScopeDenial explains WHICH term of the three-way delegation
+// intersection came out empty:
+//
+//	requested ∩ the subject token's own scopes ∩ the actor's ceiling
+//
+// One message used to serve all three causes, and they need OPPOSITE repairs:
+// name the scopes, widen the DELEGATOR, or widen the SUB-AGENT. A caller who
+// guesses wrong widens the party that was never the constraint.
+//
+// All three sets are already in hand at the call site, so naming the empty
+// term costs no extra lookup.
+//
+// The error code stays invalid_scope and the original sentence stays as a
+// prefix, so neither the wire contract nor an existing log grep changes.
+//
+// subjectHolds is the subject token's granted scopes as a set. actorCeiling
+// is the actor's effective allowed scopes; empty means "no restriction from
+// this layer", so an unrestricted actor is never blamed.
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorCeiling []string) error {
+	const base = "requested scopes are not available for delegation"
+
+	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
+	// omitted scope is a hard failure rather than "grant the full ceiling".
+	// Say so, because every other grant taught the caller the opposite.
+	if len(requested) == 0 {
+		return oauthBadRequest(oautherror.InvalidScope, base+
+			": no scopes were requested, and this grant has no default — name the scopes to delegate")
+	}
+
+	actorSet := make(map[string]bool, len(actorCeiling))
+	for _, s := range actorCeiling {
+		actorSet[s] = true
+	}
+
+	// Each scope is blamed once. A scope the subject cannot delegate is the
+	// subject's problem even when the actor also lacks it — reporting it
+	// under both terms would read as two separate repairs.
+	var notHeld, notPermitted []string
+	for _, s := range requested {
+		switch {
+		case !subjectHolds[s]:
+			notHeld = append(notHeld, s)
+		case len(actorCeiling) > 0 && !actorSet[s]:
+			notPermitted = append(notPermitted, s)
+		}
+	}
+
+	var reasons []string
+	if len(notHeld) > 0 {
+		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
+	}
+	if len(notPermitted) > 0 {
+		reasons = append(reasons, "the actor identity is not registered for ["+strings.Join(notPermitted, " ")+"]")
+	}
+	if len(reasons) == 0 {
+		// Unreachable by construction: the caller only invokes this when the
+		// grant is empty, which means every requested scope failed a term.
+		// Kept so a future change to the intersection cannot produce a
+		// dangling colon.
+		return oauthBadRequest(oautherror.InvalidScope, base)
+	}
+
+	return oauthBadRequest(oautherror.InvalidScope, base+": "+strings.Join(reasons, "; "))
 }
 
 // narrowScopes filters `granted` — a scope set already known to reflect a
