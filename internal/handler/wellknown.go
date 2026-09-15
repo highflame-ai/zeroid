@@ -157,17 +157,60 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 // bug, since two of the three offenders were written by someone who had read the
 // RFC.
 //
-// Only arrays are pruned. `false` is a meaningful value for a boolean claim
-// (backchannel_user_code_parameter_supported, dpop_bound_access_tokens_required)
-// and dropping it would silently flip the claim's meaning to "unspecified" —
-// a different bug in the same family as the one being fixed. Reflection covers
-// []string, []any and any other slice type a future member might carry; the
-// kind check means a bare `nil` any-value is left alone rather than panicking.
+// Only empty arrays and nils are pruned. `false` is a meaningful value for a
+// boolean claim (backchannel_user_code_parameter_supported,
+// dpop_bound_access_tokens_required) and dropping it would silently flip the
+// claim's meaning to "unspecified" — a different bug in the same family as the
+// one being fixed. Likewise an empty STRING is left alone: it is a legal value
+// for a string-valued member, and the RFC clause is about elements, not bytes.
+//
+// Three kinds reach the "omit" decision, for one reason each:
+//
+//   - Slice — the live case. Covers []string, []any and whatever slice type a
+//     future member carries.
+//   - Array — a fixed-size [0]T also serialises to `[]`, so a member declared
+//     that way would be non-conformant in exactly the way this function exists
+//     to prevent, while slipping a slice-only check.
+//   - Invalid — a bare `nil` stored in the map serialises to `"member": null`,
+//     which is not a legal value for an array-valued member either. Omission is
+//     what the RFC asks for; emitting null just moves the non-conformance.
+//
+// Neither Array nor Invalid is reachable from any member built today. They are
+// here because the promise this function makes is about the SHAPE of a value,
+// and a promise with two uncovered shapes is the kind that gets relied on and
+// then quietly broken.
+//
+// ── One thing this sweep cannot decide, and a future member must ─────────────
+//
+// Omitting a member is only equivalent to "none" when the spec defines no
+// default for its absence. Three members here have RFC-defined defaults, so
+// dropping them would advertise MORE than an empty list, not less:
+//
+//	grant_types_supported                 RFC 8414 §2 → ["authorization_code",
+//	                                      "implicit"] — the implicit flow that
+//	                                      OAuth 2.1 removes
+//	token_endpoint_auth_methods_supported RFC 8414 §2 → client_secret_basic
+//	bearer_methods_supported              RFC 9728 §2 → re-opens `query`, i.e.
+//	                                      tokens in URLs and therefore in access
+//	                                      logs — the case prm_compliance_test.go
+//	                                      asserts against
+//
+// All three are non-empty literals today, so the sweep never sees them and the
+// hazard is latent. If one is ever made computed, give it an explicit non-empty
+// floor at its construction site rather than letting it reach this function —
+// "the sweep will handle it" is correct about conformance and wrong about
+// meaning.
 func pruneEmptyClaims(body map[string]any) map[string]any {
 	for name, value := range body {
-		rv := reflect.ValueOf(value)
-		if rv.Kind() == reflect.Slice && rv.Len() == 0 {
+		switch rv := reflect.ValueOf(value); rv.Kind() {
+		case reflect.Invalid:
+			// value == nil; reflect.ValueOf yields the zero Value, whose Len
+			// would panic. Checked first so the length test below is safe.
 			delete(body, name)
+		case reflect.Slice, reflect.Array:
+			if rv.Len() == 0 {
+				delete(body, name)
+			}
 		}
 	}
 
@@ -430,8 +473,15 @@ func (a *API) openidConfigurationOp(_ context.Context, _ *struct{}) (*OpenIDConf
 func (a *API) signingAlgValues() []string {
 	set := a.jwksSvc.KeySet()
 
-	// Non-nil zero-length start: this member is REQUIRED, and a nil slice
-	// marshals to `null`, which is not the "no algorithms" the empty array is.
+	// Non-nil zero-length start, but no longer for the reason this comment used
+	// to give. It argued that a nil slice marshals to `null` while `[]string{}`
+	// marshals to `[]`, and that the difference mattered. Since zeroid#316 it
+	// does not: pruneEmptyClaims deletes the member for BOTH — a typed nil slice
+	// and an empty one are alike Kind() == Slice with Len() == 0 — so each
+	// resolves to the same absence on the wire, which is what the RFC asks for.
+	//
+	// Kept because appending to a non-nil empty slice needs no nil check at any
+	// future call site, not because the two encode differently.
 	algs := []string{}
 	seen := map[string]struct{}{}
 

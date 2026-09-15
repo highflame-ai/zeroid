@@ -876,8 +876,25 @@ is swept for this before it is served, so a member with nothing to list is
 absent rather than empty — `backchannel_authentication_request_signing_alg_values_supported`
 always, `response_types_supported` when the `authorization_code` flow is
 unservable (Section 12.8), `id_token_signing_alg_values_supported` if no
-published key carries an `alg`. Read an absent array-valued member as "none",
-never as "unknown" (zeroid#316).
+published key carries an `alg`. For **those three members**, read an absent
+value as "none" rather than "unknown" (zeroid#316).
+
+That reading does **not** generalise to every absent array-valued member, and
+assuming it does is the more dangerous mistake of the two. Where a spec defines
+a default for the omitted case, absence means the default — which can be *wider*
+than an empty list, not narrower:
+
+| Member | Meaning of absence |
+|---|---|
+| `grant_types_supported` | RFC 8414 §2 → `["authorization_code", "implicit"]`, including the implicit flow OAuth 2.1 removes |
+| `token_endpoint_auth_methods_supported` | RFC 8414 §2 → `client_secret_basic` |
+| `bearer_methods_supported` (RFC 9728) | RFC 9728 §2 → re-opens `query`, i.e. bearer tokens in URLs and therefore in access logs |
+
+ZeroID publishes all three as non-empty literals, so none is ever omitted and
+the distinction is latent rather than live. It is stated because the sweep is
+unconditional: a member later made *computed* must be given an explicit
+non-empty floor where it is built, rather than left to the sweep. Section 11.4
+works through the one case where omission carries a real client-visible cost.
 
 ### 11.2 Protected Resource Metadata (RFC 9728)
 
