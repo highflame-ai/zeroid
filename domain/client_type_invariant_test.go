@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -132,6 +133,36 @@ func TestMayObtainAuthorizationCode(t *testing.T) {
 			t.Errorf("client %+v must be able to obtain an authorization code", c)
 		}
 	}
+
+	// The hole in the property above, stated rather than left implicit.
+	//
+	// "A secret-based confidential client is still refused" holds for every
+	// client that can be REGISTERED today, because a key-based one is issued no
+	// secret and RotateSecret refuses to mint one. It does not hold for a legacy
+	// row carrying BOTH a private_key_jwt method and a stored secret — a state
+	// that predates zeroid#206 and that client_assertion.go explicitly says may
+	// still exist. Such a row was refused here before zeroid#348 and is admitted
+	// now.
+	//
+	// That is the right answer, not a regression to fix: the method is what
+	// decides how the client authenticates, so it is key-based, and it must
+	// present an assertion at the token endpoint regardless of the stale secret
+	// sitting beside it. Asserted so the widening is a recorded decision rather
+	// than something a future reader discovers by surprise.
+	legacyBoth := &OAuthClient{
+		ClientType:              "confidential",
+		TokenEndpointAuthMethod: "private_key_jwt",
+		ClientSecret:            "$2a$10$hash",
+	}
+	if !legacyBoth.MayObtainAuthorizationCode() {
+		t.Error("a legacy key-based row that also carries a secret is still key-based, and may obtain a code")
+	}
+	if !legacyBoth.RequiresClientAuthentication() {
+		t.Error("it must still be made to authenticate")
+	}
+	if !legacyBoth.UsesPrivateKeyJWT() {
+		t.Error("the registered METHOD decides, not the leftover secret — it must present an assertion")
+	}
 }
 
 // RATCHET. A bare `ClientType ==` / `!=` comparison outside this package is what
@@ -142,12 +173,28 @@ func TestMayObtainAuthorizationCode(t *testing.T) {
 //
 // Ask the predicates instead. If a genuinely new question needs the raw column,
 // add a named predicate here rather than widening this allowance.
+//
+// Three things this got wrong first time round, all of one kind — a ratchet that
+// quietly covers less than it claims is worse than none, because it is believed:
+//
+//   - The root was `..`, i.e. "whatever is one level above this package", which
+//     is the repo root only by coincidence of where domain/ happens to sit. Move
+//     the package and the walk silently stops covering cmd/, server.go and
+//     tests/ while still passing. It now finds the module root via go.mod.
+//   - Nothing asserted the walk had scanned anything. An unreadable root or a
+//     future refactor yields zero offenders, which reads identically to success.
+//     There is now a floor on files scanned.
+//   - The regex caught `==` and `!=` but not `switch c.ClientType`, which
+//     branches on the column just as surely and is the natural shape once there
+//     are three cases to handle.
 func TestNoBareClientTypeComparisonsOutsideDomain(t *testing.T) {
 	t.Parallel()
 
-	root := ".."
-	comparison := regexp.MustCompile(`ClientType\s*(==|!=)`)
+	root := moduleRoot(t)
+	comparison := regexp.MustCompile(`ClientType\s*(==|!=)|switch\s+[\w.]*ClientType\s*\{`)
 
+	domainDir := filepath.Join(root, "domain")
+	var scanned int
 	var offenders []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -164,26 +211,36 @@ func TestNoBareClientTypeComparisonsOutsideDomain(t *testing.T) {
 			return nil
 		}
 		// This package is where the predicates live — the comparisons belong here.
-		if filepath.Dir(path) == root+"/domain" || filepath.Dir(path) == "." {
+		if filepath.Dir(path) == domainDir {
 			return nil
 		}
 		body, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return nil
 		}
+		scanned++
 		for i, line := range strings.Split(string(body), "\n") {
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "//") {
 				continue // prose about the column is fine; a branch on it is not
 			}
 			if comparison.MatchString(line) {
-				offenders = append(offenders, filepath.ToSlash(path)+":"+itoa(i+1)+"  "+trimmed)
+				offenders = append(offenders, filepath.ToSlash(path)+":"+strconv.Itoa(i+1)+"  "+trimmed)
 			}
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walk: %v", err)
+	}
+
+	// The floor is the difference between "found nothing" and "looked nowhere".
+	// Deliberately far below the real count so ordinary deletions never trip it;
+	// it exists to catch a walk that has stopped walking.
+	const minFilesScanned = 50
+	if scanned < minFilesScanned {
+		t.Fatalf("scanned only %d .go files under %s — the ratchet is not covering the tree it claims to, "+
+			"so a clean result here means nothing", scanned, root)
 	}
 
 	if len(offenders) > 0 {
@@ -193,14 +250,22 @@ func TestNoBareClientTypeComparisonsOutsideDomain(t *testing.T) {
 	}
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+// moduleRoot returns the directory holding go.mod, so the ratchet's coverage is
+// anchored to the module rather than to this package's position within it.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
 	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod found walking up from the test directory — cannot anchor the ratchet")
+		}
+		dir = parent
 	}
-	return string(b)
 }

@@ -1035,19 +1035,28 @@ func validateCIMDRedirectURI(raw string) error {
 // access. Positive hits return a COPY so a caller cannot mutate the cached
 // instance.
 func (s *CIMDService) cachedResult(clientID string) (*domain.OAuthClient, error, bool) {
+	// The clone happens OUTSIDE the lock. It is six slice allocations, and this
+	// runs on every cache hit for every CIMD request — /oauth2/authorize, the
+	// code exchange and every refresh rotation — against one service-wide mutex.
+	// Copying the pointer under the lock and cloning after it keeps the critical
+	// section to a map lookup and a time comparison. Safe because cached entries
+	// are never mutated in place: storeResult always writes a fresh clone, so the
+	// instance this pointer names cannot change under us.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, ok := s.cache[clientID]
-	if !ok {
-		return nil, nil, false
-	}
-	if s.now().After(e.expiresAt) {
+	if ok && s.now().After(e.expiresAt) {
 		delete(s.cache, clientID)
+		ok = false
+	}
+	s.mu.Unlock()
+
+	if !ok {
 		return nil, nil, false
 	}
 	if e.err != nil {
 		return nil, e.err, true
 	}
+
 	return cloneCIMDClient(e.client), nil, true
 }
 

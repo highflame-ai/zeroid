@@ -227,6 +227,32 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 				"a key-based client authenticates with its key and is issued no client_secret",
 			ErrInvalidClientMetadata)
 	}
+	// The mirror image, and the one that actually shipped a live fail-open:
+	// {confidential: false, token_endpoint_auth_method: client_secret_basic}.
+	// `confidential` is what mints the secret, and the method is applied after it
+	// and independently — so this combination produced a client REGISTERED to
+	// authenticate with a secret it was never issued.
+	//
+	// Until zeroid#348's predicates landed, such a client authenticated with
+	// NOTHING: the old `ClientType != "confidential" && ClientSecret == ""` test
+	// was true on both halves and waved it through on authorization_code,
+	// refresh_token and CIBA. Measured against the commit before that change, the
+	// token endpoint answered 200 with an access token AND a refresh token to a
+	// caller holding only a stolen code and a client_id.
+	//
+	// The predicates closed that by deriving the question from the registered
+	// method, which is right — but it leaves such a client unable to authenticate
+	// anywhere, because bcrypt against an empty stored hash refuses every secret
+	// it could present. Refusing the registration turns a 401 the operator debugs
+	// later, against a client they believe is correct, into an error at the one
+	// moment they can still fix it. Same reasoning and same shape as the refusal
+	// above.
+	if !req.Confidential && (authMethod == "client_secret_basic" || authMethod == "client_secret_post") {
+		return nil, "", fmt.Errorf(
+			"%w: token_endpoint_auth_method %s requires confidential=true; without it no client_secret is "+
+				"issued and the client could never authenticate",
+			ErrInvalidClientMetadata, authMethod)
+	}
 
 	grantTypes := req.GrantTypes
 	if len(grantTypes) == 0 {
