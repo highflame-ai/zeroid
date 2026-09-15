@@ -15,7 +15,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/google/uuid"
 	"github.com/highflame-ai/zeroid/internal/service"
+
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -598,12 +601,24 @@ func TestClientAuthDowngrade_SecretMethodWithoutASecret(t *testing.T) {
 		"redirect_uris":              []string{testRedirectURI},
 		"scopes":                     []string{"data:read"},
 	}, nil)
-	require.Equal(t, http.StatusCreated, reg.StatusCode,
-		"the shape must remain registrable for this test to pin anything — "+
-			"if registration starts refusing it, assert THAT here instead")
-	body := decode(t, reg)
+	// REGISTRATION NOW REFUSES THE SHAPE. An earlier revision of this test
+	// asserted 201 here and told whoever added the guard to invert it; this is
+	// that inversion.
+	//
+	// Both halves still matter and both are still asserted. Refusing at
+	// registration is what stops a NEW client being created that can authenticate
+	// nowhere. The subtests below still pin the authentication behaviour, because
+	// rows in this shape may already exist — nothing refused them until now — and
+	// the fail-open they used to get is the actual defect.
+	require.Equal(t, http.StatusBadRequest, reg.StatusCode,
+		"a secret-based method with confidential=false describes a client that could never "+
+			"authenticate; registration must say so rather than create it")
 	_ = reg.Body.Close()
-	require.Empty(t, body["client_secret"], "confidential=false mints no secret")
+
+	// Reproduce the legacy row directly, which is the only way to exercise the
+	// authentication path now that the front door is shut: this is exactly what
+	// RegisterClient used to write for the request above.
+	seedLegacyUnauthenticatableClient(t, clientID)
 
 	t.Run("authorization_code is refused without a secret", func(t *testing.T) {
 		verifier, challenge := buildPKCEPair(t)
@@ -672,5 +687,36 @@ func TestClientAuthDowngrade_SecretMethodWithoutASecret(t *testing.T) {
 		})
 		require.Error(t, err, "bc-authorize must not accept an unauthenticated secret-based client")
 		assert.Contains(t, err.Error(), "client_secret is required")
+	})
+}
+
+// seedLegacyUnauthenticatableClient writes the row RegisterClient produced for
+// {confidential: false, token_endpoint_auth_method: client_secret_basic} before
+// that combination was refused: registered for secret-based authentication, with
+// an EMPTY secret hash.
+//
+// Written through the repository rather than the API on purpose. The API is now
+// closed, and the point of the subtests is that rows already in this shape must
+// not authenticate with nothing — closing the front door does not retire the
+// question for rows that predate it.
+func seedLegacyUnauthenticatableClient(t *testing.T, clientID string) {
+	t.Helper()
+	ctx := context.Background()
+	require.NoError(t, postgres.NewOAuthClientRepository(testDB).Create(ctx, &domain.OAuthClient{
+		ID:                           uuid.New().String(),
+		ClientID:                     clientID,
+		Name:                         clientID + "-legacy",
+		ClientType:                   "public",
+		TokenEndpointAuthMethod:      "client_secret_basic",
+		ClientSecret:                 "", // the whole defect: none was ever minted
+		BackchannelTokenDeliveryMode: "poll",
+		GrantTypes:                   []string{"authorization_code", "refresh_token"},
+		RedirectURIs:                 []string{testRedirectURI},
+		Scopes:                       []string{"data:read"},
+		IsActive:                     true,
+	}))
+	t.Cleanup(func() {
+		_, _ = testDB.NewDelete().Model((*domain.OAuthClient)(nil)).
+			Where("client_id = ?", clientID).Exec(context.Background())
 	})
 }

@@ -3144,13 +3144,24 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 		if err := rejectUnimplementedClientAuth(publicClient); err != nil {
 			return err
 		}
-		// A private_key_jwt client ALSO lands client_type=public with no secret
-		// (registration derives client_type from the separate `confidential`
-		// flag), so it reaches this branch too — and rejectUnimplementedClientAuth
+		// A private_key_jwt client USED TO land client_type=public with no secret
+		// (registration derived client_type from the separate `confidential`
+		// flag), so it reached this branch too — and rejectUnimplementedClientAuth
 		// no longer stops it, because the method became implemented. Without this
 		// check, making private_key_jwt work would silently REOPEN the exact
 		// introspection downgrade #346 closed: the client would authenticate by
 		// presenting its client_id and nothing else.
+		//
+		// NOT DEAD CODE, though coverage tooling will now suggest otherwise.
+		// Since zeroid#348 a key-based client registers as
+		// client_type=confidential, and GetPublicClient filters
+		// client_type='public' in SQL — so this branch is unreachable for any
+		// client registered after that change. It stays reachable, and
+		// load-bearing, for rows written BEFORE it. Those were deliberately not
+		// migrated: the #206 census found no key-based rows in dev1 or prod, so
+		// there was nothing to backfill, but that census cannot speak for other
+		// deployments. Deleting this re-opens #346's downgrade for exactly the
+		// installs whose rows predate the convergence.
 		//
 		// Key-based clients authenticate here through the client_assertion branch
 		// at the top of this function, never through this one.
