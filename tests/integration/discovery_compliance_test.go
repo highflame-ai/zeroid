@@ -264,12 +264,9 @@ func requireAuthorizationCodeAdvertised(t *testing.T, meta map[string]any, want 
 	t.Helper()
 
 	grants, _ := meta["grant_types_supported"].([]any)
-	require.Contains(t, meta, "response_types_supported",
-		"RFC 8414 §2: response_types_supported is REQUIRED unconditionally — "+
-			"omitting it makes the document invalid, which is the failure this "+
-			"PR exists to fix")
 	require.NotEmpty(t, meta["authorization_endpoint"],
-		"authorization_endpoint is never gated: omitting it breaks strict parsers")
+		"authorization_endpoint is never gated: omitting it breaks strict parsers "+
+			"(its MCP Python SDK field has no default, unlike response_types_supported)")
 
 	responseTypes, _ := meta["response_types_supported"].([]any)
 	_, hasPKCEMethods := meta["code_challenge_methods_supported"]
@@ -277,6 +274,8 @@ func requireAuthorizationCodeAdvertised(t *testing.T, meta map[string]any, want 
 
 	if want {
 		require.Contains(t, grants, "authorization_code")
+		require.Contains(t, meta, "response_types_supported",
+			"the flow is servable, so the member has a value and must be present")
 		require.Equal(t, []any{"code"}, responseTypes)
 		require.True(t, hasPKCEMethods,
 			"code_challenge_methods_supported must accompany the advertised grant")
@@ -285,10 +284,17 @@ func requireAuthorizationCodeAdvertised(t *testing.T, meta map[string]any, want 
 	}
 
 	require.NotContains(t, grants, "authorization_code")
-	require.Empty(t, responseTypes,
-		"the member stays present (RFC 8414 requires it) but must be empty — "+
-			"advertising \"code\" on an AS that cannot serve it is the same lie "+
-			"as advertising the grant")
+	// Asserted as ABSENT, not as empty. RFC 8414 §2: "Claims with zero elements
+	// MUST be omitted from the response" (zeroid#316).
+	//
+	// require.Empty on the extracted value is what this used to say, and it
+	// would still pass today — an absent key type-asserts to a nil []any, which
+	// is Empty. That made the assertion vacuous the moment the behaviour
+	// changed, so it checks the map for the key instead.
+	require.NotContains(t, meta, "response_types_supported",
+		"an AS that cannot serve the authorization_code flow supports zero "+
+			"response types, and a zero-element claim MUST be omitted rather "+
+			"than emitted as []")
 	require.False(t, hasPKCEMethods,
 		"code_challenge_methods_supported is OPTIONAL, so it is omitted rather "+
 			"than emptied when the flow is unavailable")
