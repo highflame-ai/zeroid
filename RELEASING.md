@@ -171,6 +171,13 @@ To add one (e.g. `pkg/dcr/`):
 3. **`.github/workflows/release.yml`** — add `dcr` to the `for MOD in ...` loops in
    BOTH the lockstep check and the tag-nested-modules step.
 4. **`Makefile`** — extend the `release-prep` sed to cover the new module path.
+5. **`Dockerfile`** — add `COPY pkg/<new>/go.mod pkg/<new>/go.sum ./pkg/<new>/`
+   before `RUN go mod download`. Missing this fails the Docker build outright:
+   zeroid's `replace` points at a directory that is not in the build context, and
+   the lockstep pin names a tag the proxy has not indexed yet, so there is no
+   network fallback. This step was missed when `pkg/jwks` was added and broke both
+   `highflame-docker-check` and `highflame-notebook-check`, which builds the same
+   image.
 
 > Whether a module is imported from test-only or non-test code makes **no difference**
 > to any of this, and deliberately so. `pkg/authjwt` was pinned `v0.0.0` on the

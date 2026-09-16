@@ -6,13 +6,19 @@ ENV GOOS=linux
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
-# go.mod replaces point nested modules at ./pkg/{authjwt,dpop}; copy
-# their go.mod/go.sum so `go mod download` does not try to fetch the
-# pinned pkg/dpop tag from the network (needed on release-dpop PRs and
-# whenever the proxy has not indexed a brand-new tag yet).
+# go.mod's replace directives point every nested module at ./pkg/<name>,
+# so `go mod download` resolves them from disk rather than the network.
+# EVERY nested module must be copied here: a replace target that is not
+# present fails the download outright, and because lockstep pins name the
+# version being released NEXT, the proxy has not indexed those tags yet
+# and cannot serve as a fallback.
+#
+# Adding a nested module? This COPY is one of the five places that need
+# it — see "Adding a new nested module" in RELEASING.md.
 COPY go.mod go.sum ./
 COPY pkg/authjwt/go.mod pkg/authjwt/go.sum ./pkg/authjwt/
 COPY pkg/dpop/go.mod pkg/dpop/go.sum ./pkg/dpop/
+COPY pkg/jwks/go.mod pkg/jwks/go.sum ./pkg/jwks/
 RUN go mod download
 
 COPY . .
