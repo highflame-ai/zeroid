@@ -20,7 +20,6 @@ package integration_test
 
 import (
 	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -199,8 +198,11 @@ func signWithServerECKey(t *testing.T, kid, issuer string) string {
 // compute the same MAC and accept it.
 func signHS256WithPublicKeyBytes(t *testing.T) string {
 	t.Helper()
-	pub := elliptic.Marshal(testServerPrivKey.PublicKey.Curve, //nolint:staticcheck // the attack uses exactly these bytes
-		testServerPrivKey.PublicKey.X, testServerPrivKey.PublicKey.Y)
+	// Bytes() is the uncompressed SEC 1 encoding — the same material a
+	// verifier would hand to an HMAC if it trusted the header's alg, and the
+	// same bytes the deprecated elliptic.Marshal used to produce.
+	pub, err := testServerPrivKey.PublicKey.Bytes()
+	require.NoError(t, err)
 
 	enc := base64.RawURLEncoding.EncodeToString
 	header := enc([]byte(`{"alg":"HS256","kid":"` + testKeyID + `","typ":"JWT"}`))
