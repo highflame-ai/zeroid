@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration test-all lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-dpop
+.PHONY: help build run test test-integration test-all lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-prep
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -82,29 +82,31 @@ next-version: ## Print svu-computed next semver from commits since last v* tag
 	@echo "Cut a zeroid release: draft a new release in the GitHub UI with tag = svu's recommendation"
 	@echo "(or higher). See RELEASING.md."
 	@echo
-	@echo "If you changed pkg/dpop/ source: run 'make release-dpop VERSION=vX.Y.Z' FIRST to cut"
-	@echo "a new pkg/dpop release + bump zeroid's reference. Otherwise the zeroid release will"
-	@echo "fail the drift guard."
+	@echo "LOCKSTEP: zeroid, pkg/authjwt and pkg/dpop all release at the SAME version,"
+	@echo "tagged at the same commit. Run 'make release-prep VERSION=vX.Y.Z' first so"
+	@echo "go.mod names the version being released — release.yml refuses otherwise."
 
-release-dpop: ## Cut a new pkg/dpop release (tag + open PR bumping zeroid's reference). Requires VERSION=vX.Y.Z.
-	@command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI is required (https://cli.github.com/)"; exit 1; }
+release-prep: ## Bump go.mod's nested-module pins to the next release version (lockstep). Requires VERSION=vX.Y.Z.
 	@if [ -z "$(VERSION)" ]; then \
-		echo "::error::VERSION is required, e.g. make release-dpop VERSION=v1.6.1"; \
+		echo "::error::VERSION is required, e.g. make release-prep VERSION=v1.9.4"; \
 		exit 1; \
 	fi
 	@if ! printf '%s' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
 		exit 1; \
 	fi
-	@echo "Triggering release-dpop.yml with version=$(VERSION)..."
-	gh workflow run release-dpop.yml \
-		--repo highflame-ai/zeroid \
-		--field version=$(VERSION)
+	@# LOCKSTEP: zeroid, pkg/authjwt and pkg/dpop all carry the same version and
+	@# are tagged at the same commit. go.mod must therefore name the version being
+	@# released BEFORE the release is cut — release.yml refuses to proceed
+	@# otherwise. This target makes that a one-liner instead of a hand edit.
+	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/(authjwt\|dpop)) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' go.mod
+	@rm -f go.mod.bak
+	@go build ./... >/dev/null
+	@echo "go.mod pins bumped to $(VERSION):"
+	@grep -E 'zeroid/pkg/(authjwt|dpop)' go.mod
 	@echo
-	@echo "Watch progress:"
-	@echo "  gh run watch --repo highflame-ai/zeroid"
-	@echo "Then review + merge the auto-opened PR. After merge, your next zeroid release"
-	@echo "(cut normally via GitHub UI) will ship with pkg/dpop $(VERSION)."
+	@echo "Commit this, merge it, then cut the $(VERSION) release normally."
+
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)

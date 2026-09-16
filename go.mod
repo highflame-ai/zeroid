@@ -8,8 +8,8 @@ require (
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/google/uuid v1.6.0
-	github.com/highflame-ai/zeroid/pkg/authjwt v1.9.2
-	github.com/highflame-ai/zeroid/pkg/dpop v1.6.3
+	github.com/highflame-ai/zeroid/pkg/authjwt v1.9.4
+	github.com/highflame-ai/zeroid/pkg/dpop v1.9.4
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
@@ -110,27 +110,30 @@ require (
 // require directive above is invisible to downstream consumers — they
 // never try to resolve it.
 //
+// LOCKSTEP VERSIONING. zeroid and its nested modules (pkg/authjwt,
+// pkg/dpop) all carry the SAME version, tagged at the same commit on
+// every release. The pins above therefore name the version being
+// released NEXT, not the last one — release.yml verifies they equal
+// the release tag, and tags all three modules at that commit.
+//
+// This is what makes drift impossible rather than merely detected. A
+// nested module's tag points at the commit whose go.mod names it, so
+// "go.mod references a stale submodule" has no representable state.
+// The previous scheme gave pkg/dpop a decoupled cadence and caught
+// drift with a guard at release time — but for a Go module PUBLISHING
+// IS PUSHING THE TAG, so the guard could only report a bad release
+// after it was already consumable. v1.9.3 shipped exactly that way.
+//
+// The cost is version numbers advancing without changes, and one
+// forward jump (pkg/dpop v1.9.4 -> v1.9.4) to join the shared line.
+// Both are cheap next to a release that cannot be un-published.
+//
 // Local replaces keep in-repo builds working when GOWORK=off (Docker
 // `go mod download`, some CI paths). Downstream consumers ignore
 // replace directives, so the require pins above are what the proxy
-// actually serves — which is why BOTH must name real published tags.
-//
-// pkg/authjwt used to be pinned v0.0.0, on the documented grounds that
-// it was imported only from tests/integration/ and Go does not follow
-// test imports across module boundaries, so the pin was invisible
-// downstream. That stopped being true: server.go,
-// internal/service/client_jwks.go and
-// internal/service/external_issuer_registry.go all import it from
-// NON-test code. This dates to #211 (direct OIDC IdP federation,
-// 2026-06-19), which added external_issuer_registry.go and the
-// server.go plumbing; client_jwks.go joined later with
-// private_key_jwt (#347).
-// The placeholder then made zeroid unresolvable from the proxy —
-// `go get github.com/highflame-ai/zeroid@vX.Y.Z` in a fresh module
-// fails with "unknown revision pkg/authjwt/v0.0.0" — verified on
-// v1.7.1 as well as v1.9.3, so EVERY release from v1.7.1 onward is
-// affected, not just the latest. Both pins are now
-// real tags, and release.yml's drift guard covers both. See RELEASING.md.
+// actually serves — which is why they must name real tags, and why
+// pkg/authjwt's old v0.0.0 placeholder made every release from v1.7.1
+// unresolvable. See RELEASING.md.
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 
 replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop
