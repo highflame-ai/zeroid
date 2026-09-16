@@ -121,10 +121,15 @@ require (
 // downstream. That stopped being true: server.go,
 // internal/service/client_jwks.go and
 // internal/service/external_issuer_registry.go all import it from
-// NON-test code (client_jwks.go arrived with private_key_jwt, #347).
+// NON-test code. This dates to #211 (direct OIDC IdP federation,
+// 2026-06-19), which added external_issuer_registry.go and the
+// server.go plumbing; client_jwks.go joined later with
+// private_key_jwt (#347).
 // The placeholder then made zeroid unresolvable from the proxy —
-// `go get github.com/highflame-ai/zeroid@v1.9.3` in a fresh module
-// fails with "unknown revision pkg/authjwt/v0.0.0". Both pins are now
+// `go get github.com/highflame-ai/zeroid@vX.Y.Z` in a fresh module
+// fails with "unknown revision pkg/authjwt/v0.0.0" — verified on
+// v1.7.1 as well as v1.9.3, so EVERY release from v1.7.1 onward is
+// affected, not just the latest. Both pins are now
 // real tags, and release.yml's drift guard covers both. See RELEASING.md.
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 

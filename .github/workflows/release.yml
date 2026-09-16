@@ -111,8 +111,9 @@ jobs:
       #      again because of the replace.
       #
       # pkg/authjwt was exempted here until it was found to have been
-      # imported from non-test code since private_key_jwt (#347) added
-      # internal/service/client_jwks.go — while still pinned v0.0.0.
+      # imported from non-test code since #211 (direct OIDC IdP
+      # federation, 2026-06-19) — while still pinned v0.0.0, which made
+      # every release from v1.7.1 onward unresolvable from the proxy.
       # The exemption rested on "test-only imports are invisible
       # downstream", which was true when written and silently stopped
       # being true. Checking both removes the need for anyone to notice
