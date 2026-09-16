@@ -31,6 +31,7 @@ Add one when introducing a feature that implements a spec the project advertises
 |---|---|---|
 | RFC 6749 (OAuth 2.0 core) | `oauth2_compliance_test.go` | Covered |
 | RFC 7009 (Token Revocation) | `token_revocation_compliance_test.go` | Covered |
+| RFC 7515 §4.1.4 (JWS `kid`) | `jws_compliance_test.go` | Covered |
 | RFC 7517 (JWKS) | `jwks_compliance_test.go` | Covered |
 | RFC 7519 (JWT) | `jwt_compliance_test.go` | Covered |
 | RFC 7523 (JWT Bearer grant) | `jwt_bearer_compliance_test.go` | Covered |
@@ -40,12 +41,21 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 7662 (Introspection) | `introspection_compliance_test.go` | Covered |
 | RFC 8414 (AS Metadata) | `discovery_compliance_test.go` | Covered |
 | RFC 8693 (Token Exchange) | `token_exchange_compliance_test.go` | Covered |
+| RFC 8725 / BCP 225 (JWT Best Current Practices) | `jws_compliance_test.go` | Partial — §3.1 only, see note |
 | RFC 9396 (Rich Authorization Requests) | `rar_compliance_test.go` | Covered |
 | RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
 | OpenID CIBA Core 1.0 | `ciba_compliance_test.go` | Covered |
 | OpenID Connect Discovery 1.0 | `oidc_discovery_compliance_test.go` | Partial — metadata only, see note |
 | SPIFFE ID + JWT-SVID | `spiffe_compliance_test.go` | Covered |
 | OpenID SSF / CAEP | `cae_test.go` (behavioral) | Partial — see note |
+
+### RFC 8725 / BCP 225 scope note
+
+RFC 8725 is a Best Current Practice, not a protocol ZeroID implements, so it has no README standards-table row and no endpoint of its own. It earns a suite because its §3.1 clauses are the ones that decide whether a signature is worth anything: resolve the key, then constrain the algorithm to what that key supports, and never let the JOSE header make either decision.
+
+Only §3.1 is covered, and only on the agent-auth middleware path. `jwt_alg_test.go` already pins `alg=none` and HS\* at `/oauth2/token/introspect` and `/oauth2/token/verify`; those are separate verifiers, and the middleware had no coverage at all until issue #357 — which is how it went unnoticed that the middleware pinned one algorithm and one key, refused every RS256 token the grants issue, and ignored `kid` entirely.
+
+The remaining sections are either enforced elsewhere (§3.2 asymmetric-only, in `spiffe_compliance_test.go` under JWT-SVID §3) or advisory for a deployer rather than for ZeroID.
 
 ### OpenID Connect Discovery 1.0 scope note
 
