@@ -5,10 +5,17 @@ ZeroID is published as **three Go modules** from this one repository:
 | Module path | Source tree | Tag prefix | Release cadence |
 |----|----|----|----|
 | `github.com/highflame-ai/zeroid` (the root OAuth/OIDC server library) | `./` | `vX.Y.Z` | Whenever zeroid features/fixes ship |
-| `github.com/highflame-ai/zeroid/pkg/authjwt` | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` | **Clubbed with zeroid** — same vX.Y.Z |
-| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Decoupled** — released independently when its source changes |
+| `github.com/highflame-ai/zeroid/pkg/authjwt` (token verification for resource servers) | `./pkg/authjwt/` | `pkg/authjwt/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
+| `github.com/highflame-ai/zeroid/pkg/dpop` (RFC 9449 DPoP primitive — also consumed by Cerberus, Shield, Firehog directly) | `./pkg/dpop/` | `pkg/dpop/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
+| `github.com/highflame-ai/zeroid/pkg/jwks` (remote JWKS fetch/cache/rotate — shared by the server and by pkg/authjwt) | `./pkg/jwks/` | `pkg/jwks/vX.Y.Z` | **Lockstep** — same vX.Y.Z |
 
-**Both submodules are imported by zeroid's NON-test code, so `zeroid/go.mod` must reference a real published tag for each.** Local `replace` directives do not reach consumers — Go ignores `replace` in dependency modules — so the `require` pins are exactly what the proxy serves.
+**Layering.** `pkg/jwks` is a primitive both sides may import. `pkg/authjwt` is the
+verification library resource servers use, and **zeroid's non-test code must never
+import it** — that would put a consumer-facing API in the authorization server's
+graph. `TestNonTestSourceDoesNotImportAuthjwt` enforces this; RELEASING.md saying so
+was not enough last time.
+
+**Every nested module is referenced by a real published tag in `zeroid/go.mod`.** Local `replace` directives do not reach consumers — Go ignores `replace` in dependency modules — so the `require` pins are exactly what the proxy serves.
 
 - **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`. Decoupled cadence: released independently, only when its source changes.
 - **pkg/authjwt** — used by `server.go`, `internal/service/client_jwks.go` and `internal/service/external_issuer_registry.go`. Clubbed cadence: tagged at every zeroid release.

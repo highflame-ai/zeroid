@@ -10,6 +10,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/highflame-ai/zeroid/pkg/authjwt v1.9.4
 	github.com/highflame-ai/zeroid/pkg/dpop v1.9.4
+	github.com/highflame-ai/zeroid/pkg/jwks v1.9.4
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
@@ -137,3 +138,5 @@ require (
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 
 replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop
+
+replace github.com/highflame-ai/zeroid/pkg/jwks => ./pkg/jwks

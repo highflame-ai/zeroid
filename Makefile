@@ -99,11 +99,11 @@ release-prep: ## Bump go.mod's nested-module pins to the next release version (l
 	@# are tagged at the same commit. go.mod must therefore name the version being
 	@# released BEFORE the release is cut — release.yml refuses to proceed
 	@# otherwise. This target makes that a one-liner instead of a hand edit.
-	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/(authjwt\|dpop)) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' go.mod
+	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/(authjwt\|dpop\|jwks)) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' go.mod
 	@rm -f go.mod.bak
 	@go build ./... >/dev/null
 	@echo "go.mod pins bumped to $(VERSION):"
-	@grep -E 'zeroid/pkg/(authjwt|dpop)' go.mod
+	@grep -E 'zeroid/pkg/(authjwt|dpop|jwks)' go.mod
 	@echo
 	@echo "Commit this, merge it, then cut the $(VERSION) release normally."
 

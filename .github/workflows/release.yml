@@ -108,7 +108,7 @@ jobs:
         run: |-
           VERSION="${{ env.RELEASE_TAG }}"
           FAILED=0
-          for MOD in dpop authjwt; do
+          for MOD in dpop authjwt jwks; do
             MODPATH="github.com/highflame-ai/zeroid/pkg/${MOD}"
             REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
             if [[ -z "${REF}" ]]; then
@@ -155,7 +155,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ env.RELEASE_TAG }}"
-          for MOD in authjwt dpop; do
+          for MOD in authjwt dpop jwks; do
             SUBTAG="pkg/${MOD}/${VERSION}"
             if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
               echo "Tag ${SUBTAG} already exists, skipping"
