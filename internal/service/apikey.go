@@ -82,7 +82,9 @@ type CreateAPIKeyResponse struct {
 // If IdentityID is empty and Product is set, a service identity is auto-provisioned
 // (or reused if one already exists for this account+project+product).
 // If both are empty the request is rejected with ErrIdentityLinkRequired.
-// If CredentialPolicyID is empty, the tenant's default policy is auto-created and assigned.
+// If CredentialPolicyID is empty, the key inherits the identity's credential
+// policy; the tenant's default policy is auto-created and assigned only when the
+// identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
 	// Every key has an identity link, and the caller supplies one of the two
 	// ways to establish it. Reject the empty case here rather than letting an
@@ -100,6 +102,14 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 			return nil, fmt.Errorf("failed to ensure service identity for product %s: %w", req.Product, err)
 		}
 		req.IdentityID = identity.ID
+	}
+
+	// The identity owns the authority ceiling this key is bound by, so it is
+	// loaded before the policy is chosen — an unset CredentialPolicyID
+	// inherits from it (#362).
+	identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load identity %s: %w", req.IdentityID, err)
 	}
 
 	// Ensure the key has a credential policy.
@@ -122,19 +132,38 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	//      opaque invalid_scope at token issuance.
 	var keyPolicy *domain.CredentialPolicy
 	policyID := req.CredentialPolicyID
-	if policyID == "" {
+
+	switch {
+	case policyID != "":
+		p, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
+		}
+		keyPolicy = p
+
+	case identity.CredentialPolicyID != "":
+		// Inherit the identity's own policy. Using the tenant default here
+		// instead would hand the key a policy broader than the ceiling it is
+		// about to be checked against, so every identity with a policy
+		// stricter than default could never be issued a second key — its
+		// first one works only because registration assigns the identity
+		// policy directly (#362).
+		p, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load identity policy %s: %w", identity.CredentialPolicyID, err)
+		}
+		policyID = p.ID
+		keyPolicy = p
+
+	default:
+		// The identity has no policy of its own, so the tenant default is the
+		// only ceiling there is.
 		defaultPolicy, err := s.credentialPolicySvc.EnsureDefaultPolicy(ctx, req.AccountID, req.ProjectID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure default credential policy: %w", err)
 		}
 		policyID = defaultPolicy.ID
 		keyPolicy = defaultPolicy
-	} else {
-		p, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
-		if err != nil {
-			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
-		}
-		keyPolicy = p
 	}
 
 	// Enforce the subset invariant against the identity that will own this
@@ -142,19 +171,13 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	// common case — EnsureServiceIdentity-provisioned keys, or callers who
 	// don't override CredentialPolicyID), because a policy is trivially a
 	// subset of itself.
-	if req.IdentityID != "" {
-		identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
+	if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
+		identityPolicy, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load identity %s for subset check: %w", req.IdentityID, err)
+			return nil, fmt.Errorf("failed to load identity policy %s for subset check: %w", identity.CredentialPolicyID, err)
 		}
-		if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
-			identityPolicy, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load identity policy %s for subset check: %w", identity.CredentialPolicyID, err)
-			}
-			if err := s.credentialPolicySvc.EnforceSubset(keyPolicy, identityPolicy); err != nil {
-				return nil, err
-			}
+		if err := s.credentialPolicySvc.EnforceSubset(keyPolicy, identityPolicy); err != nil {
+			return nil, err
 		}
 	}
 

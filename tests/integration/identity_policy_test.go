@@ -425,20 +425,28 @@ func TestAPIKeyCreate_InheritsIdentityPolicyPasses(t *testing.T) {
 	headers := adminHeaders()
 	headers["X-User-ID"] = "test-user"
 
-	// Path 1: omit credential_policy_id — service auto-assigns tenant
-	// default. Since identity has a different (stricter) policy, this
-	// could trigger the subset check against the default. But the
-	// default is as permissive as possible and the identity policy is
-	// narrower — key(default) is broader than identity(stricter) so
-	// this SHOULD be rejected.
+	// Path 1: omit credential_policy_id — the key inherits the identity's own
+	// policy, so the subset check is trivially satisfied and the key is
+	// created. This previously assigned the tenant default, which is broader
+	// than a stricter identity policy and so was rejected: an identity could
+	// never be issued a second key, its first one surviving only because
+	// registration assigns the identity policy directly (#362).
 	respDefault := post(t, adminPath("/api-keys"), map[string]any{
 		"name":        "inherit-default-key",
 		"identity_id": identityID,
 	}, headers)
-	// Default policy (permissive) is broader than identityPolicy
-	// (allowed_scopes=[data:read]) — must be rejected.
-	assert.Equal(t, http.StatusBadRequest, respDefault.StatusCode,
-		"omitting credential_policy_id defaults to tenant default policy which is broader than the identity's stricter policy — must be rejected")
+	require.Equal(t, http.StatusCreated, respDefault.StatusCode,
+		"omitting credential_policy_id must inherit the identity's policy, not the broader tenant default")
+
+	// The create response doesn't echo the policy, so read the stored key back:
+	// inheriting is only the fix if the key is actually bound to the identity's
+	// policy, not merely allowed through the subset check.
+	createdID, ok := decode(t, respDefault)["id"].(string)
+	require.True(t, ok, "create response missing id")
+
+	stored := decode(t, get(t, adminPath("/api-keys/"+createdID), headers))
+	assert.Equal(t, identityPolicyID, stored["credential_policy_id"],
+		"the inherited key must be bound to the identity's policy, not the tenant default")
 
 	// Path 2: explicitly pass the identity's policy ID → trivially a
 	// subset of itself → must pass.
