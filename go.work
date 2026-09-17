@@ -1,21 +1,21 @@
-// Go workspace for in-repo development across zeroid's three published
+// Go workspace for in-repo development across zeroid's published
 // modules. When you run `go build` or `go test` from anywhere inside the
-// repo, Go reads this file and treats the three modules as one workspace
-// — local code in ./pkg/authjwt and ./pkg/dpop is used directly,
+// repo, Go reads this file and treats all modules as one workspace
+// — local code in ./pkg/authjwt, ./pkg/dpop and ./pkg/jwks is used directly,
 // regardless of what versions zeroid/go.mod's require directives
 // declare. This lets zeroid/go.mod reference real published subpackage
 // versions (required for downstream `go get` resolution) without
 // breaking the in-repo dev loop.
 //
-// Both nested modules also have `replace => ./pkg/...` in zeroid/go.mod
+// Each nested module also has `replace => ./pkg/...` in zeroid/go.mod
 // so GOWORK=off paths (Docker layer cache `go mod download`, some CI)
-// use local source. Downstream consumers ignore those replaces; the
-// require pins remain the published versions (pkg/dpop via release-dpop).
+// use local source. Downstream consumers IGNORE those replaces — Go
+// does not apply replace directives from dependency modules — so the
+// require pins are what the proxy serves and must be real tags.
 //
-// Releases: see RELEASING.md. Normal zeroid release is just "click
-// Publish in UI" — no version-bumping ceremony required because
-// zeroid/go.mod pins pkg/dpop to a specific released version that
-// stays static across most zeroid releases.
+// Releases: see RELEASING.md. All modules release in LOCKSTEP at one
+// version, tagged at one commit, so `make release-prep VERSION=vX.Y.Z`
+// is the only version ceremony.
 
 go 1.27.0
 
@@ -23,4 +23,5 @@ use (
 	.
 	./pkg/authjwt
 	./pkg/dpop
+	./pkg/jwks
 )
