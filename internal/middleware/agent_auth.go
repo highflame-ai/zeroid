@@ -5,7 +5,6 @@ import (
 	"crypto/ecdsa"
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -67,21 +66,35 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 				writeAgentAuthError(w, "", "", "Authorization header is required", cfg.ResourceMetadataURL)
 				return
 			}
-			if !strings.HasPrefix(authHeader, "Bearer ") {
+			// RFC 9110 §11.1: the scheme is case-insensitive. RFC 9449
+			// §7.1: a DPoP-bound access token is presented under the DPoP
+			// scheme, not Bearer — ZeroID issues such tokens, so refusing
+			// the scheme locks out its own spec-compliant clients.
+			tokenStr, scheme, ok := ExtractAuthToken(authHeader, SchemeBearer, SchemeDPoP)
+			if !ok {
 				// Credentials WERE sent, just not in a recognized scheme —
 				// RFC 6750 §3.1 error_code applies here.
-				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer scheme", "Authorization header must use the Bearer scheme", cfg.ResourceMetadataURL)
+				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer or DPoP scheme", "Authorization header must use the Bearer or DPoP scheme", cfg.ResourceMetadataURL)
 				return
 			}
-			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
-			// `Bearer ` with no token after the prefix is a malformed
-			// request, not a token-validation failure — there is no token
-			// to validate. RFC 6750 §3.1 invalid_request applies; short-
-			// circuiting before jwtalg.Validate also avoids an unnecessary
-			// JWS parse on input that can never succeed.
+			// A scheme with no token after it is a malformed request, not a
+			// token-validation failure — there is no token to validate. RFC
+			// 6750 §3.1 invalid_request applies; short-circuiting before
+			// jwtalg.Validate also avoids an unnecessary JWS parse on input
+			// that can never succeed.
 			if tokenStr == "" {
-				writeAgentAuthError(w, "invalid_request", "Authorization header carries an empty Bearer token", "Authorization header carries an empty Bearer token", cfg.ResourceMetadataURL)
+				writeAgentAuthError(w, "invalid_request", "Authorization header carries an empty "+scheme+" token", "Authorization header carries an empty "+scheme+" token", cfg.ResourceMetadataURL)
+				return
+			}
+
+			// RFC 9449 §7.1: the DPoP scheme asserts a proof accompanies the
+			// token. Refuse the request when it does not, so the scheme can
+			// never be used to present a token under weaker terms than
+			// Bearer. This is a syntactic check only — the proof is verified
+			// against cnf.jkt further down, once the claims are parsed.
+			if scheme == SchemeDPoP && r.Header.Get("DPoP") == "" {
+				writeAgentAuthError(w, "invalid_request", "DPoP scheme requires a DPoP proof header", "DPoP scheme requires a DPoP proof header", cfg.ResourceMetadataURL)
 				return
 			}
 
