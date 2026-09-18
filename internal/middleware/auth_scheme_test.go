@@ -7,10 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
-	"github.com/lestrrat-go/jwx/v4/jwt"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -67,35 +66,25 @@ func TestExtractAuthToken(t *testing.T) {
 	}
 }
 
-// mintSchemeToken builds a minimal valid agent token for the scheme tests.
-// It is deliberately named apart from the DPoP-binding tests' own helper so
-// the two test files can coexist in this package.
-func mintSchemeToken(t *testing.T, key *ecdsa.PrivateKey, issuer string) string {
-	t.Helper()
-	tok := jwt.New()
-	require.NoError(t, tok.Set(jwt.IssuerKey, issuer))
-	require.NoError(t, tok.Set(jwt.ExpirationKey, time.Now().Add(time.Hour)))
-	require.NoError(t, tok.Set("account_id", "acct-1"))
-	require.NoError(t, tok.Set("project_id", "proj-1"))
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), key))
-	require.NoError(t, err)
-	return string(signed)
-}
-
 func TestAgentAuthMiddleware_SchemeHandling(t *testing.T) {
 	const issuer = "https://issuer.test"
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
+	// The middleware resolves the verification key by kid from the JWKS
+	// (#357), so the scheme tests publish a key set rather than one key.
+	set := jwk.NewSet()
+	addTestKey(t, set, &key.PublicKey, "ec-scheme", jwa.ES256())
+
 	handler := AgentAuthMiddleware(AgentAuthConfig{
-		PublicKey: &key.PublicKey,
-		Issuer:    issuer,
+		KeySet: set,
+		Issuer: issuer,
 	})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	token := mintSchemeToken(t, key, issuer)
+	token := mintKeySetToken(t, jwa.ES256(), key, "ec-scheme", issuer)
 
 	cases := []struct {
 		name       string

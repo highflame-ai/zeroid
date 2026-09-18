@@ -32,6 +32,7 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 6749 (OAuth 2.0 core) | `oauth2_compliance_test.go` | Covered |
 | RFC 6750 (Bearer Token Usage) | `bearer_compliance_test.go` — §3 challenge shape in `www_authenticate_compliance_test.go` | Covered |
 | RFC 7009 (Token Revocation) | `token_revocation_compliance_test.go` | Covered |
+| RFC 7515 §4.1.4 (JWS `kid`) | `jws_compliance_test.go` | Covered |
 | RFC 7517 (JWKS) | `jwks_compliance_test.go` | Covered |
 | RFC 7519 (JWT) | `jwt_compliance_test.go` | Covered |
 | RFC 7523 (JWT Bearer grant) | `jwt_bearer_compliance_test.go` | Covered |
@@ -41,6 +42,7 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 7662 (Introspection) | `introspection_compliance_test.go` | Covered |
 | RFC 8414 (AS Metadata) | `discovery_compliance_test.go` | Covered |
 | RFC 8693 (Token Exchange) | `token_exchange_compliance_test.go` | Covered |
+| RFC 8725 / BCP 225 (JWT Best Current Practices) | `jws_compliance_test.go` | Partial — §3.1 only, see note |
 | RFC 9110 §11 (HTTP Authentication) | `bearer_compliance_test.go` | Covered — see note |
 | RFC 9396 (Rich Authorization Requests) | `rar_compliance_test.go` | Covered |
 | RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
@@ -50,6 +52,13 @@ Add one when introducing a feature that implements a spec the project advertises
 | SPIFFE ID + JWT-SVID | `spiffe_compliance_test.go` | Covered |
 | OpenID SSF / CAEP | `cae_test.go` (behavioral) | Partial — see note |
 
+### RFC 8725 / BCP 225 scope note
+
+RFC 8725 is a Best Current Practice, not a protocol ZeroID implements, so it has no README standards-table row and no endpoint of its own. It earns a suite because its §3.1 clauses are the ones that decide whether a signature is worth anything: resolve the key, then constrain the algorithm to what that key supports, and never let the JOSE header make either decision.
+
+Only §3.1 is covered, and only on the agent-auth middleware path. `jwt_alg_test.go` already pins `alg=none` and HS\* at `/oauth2/token/introspect` and `/oauth2/token/verify`; those are separate verifiers, and the middleware had no coverage at all until issue #357 — which is how it went unnoticed that the middleware pinned one algorithm and one key, refused every RS256 token the grants issue, and ignored `kid` entirely.
+
+The remaining sections are either enforced elsewhere (§3.2 asymmetric-only, in `spiffe_compliance_test.go` under JWT-SVID §3) or advisory for a deployer rather than for ZeroID.
 ### RFC 9110 §11 scope note
 
 RFC 9110 is HTTP core, not an OAuth spec, so it is not in the README's standards table and would not normally earn a suite. It is here because §11.1 governs the framing of *every* credential ZeroID accepts — it sits underneath RFC 6750 (Bearer), RFC 9449 §7.1 (DPoP) and RFC 7591/7592 (DCR) alike, and a defect in it reaches all of them at once. Issue #256 was exactly that: four call sites matched the scheme with `strings.HasPrefix` against the literal `"Bearer "`, so three of the four legal spellings were refused on every one of those paths.
