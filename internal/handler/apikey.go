@@ -21,7 +21,7 @@ type CreateAPIKeyInput struct {
 		Name               string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
 		Description        string          `json:"description,omitempty" doc:"Key description"`
 		IdentityID         string          `json:"identity_id,omitempty" doc:"Identity to link this key to. Required unless product is supplied"`
-		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: tenant default policy)"`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: the identity's own policy, or the tenant default when the identity has none)"`
 		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping. Required unless identity_id is supplied — a service identity is provisioned for the product"`
 		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
 		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`

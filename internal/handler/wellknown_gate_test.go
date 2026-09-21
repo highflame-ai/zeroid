@@ -65,10 +65,17 @@ func TestOAuthMetadata_GateEvaluatedOncePerRequest(t *testing.T) {
 				"grant it applies to", i)
 		}
 
-		// RFC 8414 §2 requires the member unconditionally, whatever the gate says.
-		if _, ok := out.Body["response_types_supported"]; !ok {
-			t.Errorf("request %d: response_types_supported is REQUIRED by RFC 8414 §2 "+
-				"even when the flow is unavailable", i)
+		// The member is PRESENT exactly when it has a value, and absent
+		// otherwise — RFC 8414 §2 requires it, but its "claims with zero
+		// elements MUST be omitted" wins when the flow is unservable and the
+		// list would be empty (zeroid#316). This assertion used to demand the
+		// member unconditionally; it now pins the omission, because an empty
+		// array reappearing here is precisely the regression.
+		_, present := out.Body["response_types_supported"]
+		if present != advertisesGrant {
+			t.Errorf("request %d: response_types_supported present=%v but grant "+
+				"advertised=%v — the member must appear exactly when it is non-empty",
+				i, present, advertisesGrant)
 		}
 	}
 }
