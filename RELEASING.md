@@ -1,6 +1,6 @@
 # Releasing ZeroID
 
-ZeroID is published as **three Go modules** from this one repository:
+ZeroID is published as **four Go modules** from this one repository:
 
 | Module path | Source tree | Tag prefix | Release cadence |
 |----|----|----|----|
@@ -17,20 +17,22 @@ was not enough last time.
 
 **Every nested module is referenced by a real published tag in `zeroid/go.mod`.** Local `replace` directives do not reach consumers — Go ignores `replace` in dependency modules — so the `require` pins are exactly what the proxy serves.
 
-- **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`. Decoupled cadence: released independently, only when its source changes.
-- **pkg/authjwt** — used by `server.go`, `internal/service/client_jwks.go` and `internal/service/external_issuer_registry.go`. Clubbed cadence: tagged at every zeroid release.
+- **pkg/dpop** — the RFC 9449 DPoP verifier used by `/oauth2/token`, also consumed directly by cerberus, shield and firehog. Lockstep cadence, as of this change: it previously had a decoupled one, and the section below records why that was abandoned.
+- **pkg/authjwt** — token verification for resource servers. Consumed directly by cerberus, shield and authn; inside this repo it is now reached **only from tests**, because extracting `pkg/jwks` moved the non-test importers (`server.go`, `internal/service/client_jwks.go`, `internal/service/external_issuer_registry.go`) onto the primitive instead. Lockstep cadence: tagged at every zeroid release.
+
+  **Its pin must stay a real tag anyway**, and the reason matters more than the status: a `require` puts a module in the consumer's graph whether or not any imported package reaches it, so `go get zeroid@vX.Y.Z` resolves this pin regardless. Verified — a fresh module with no `replace` lists all four modules in `go list -m all`. The old `v0.0.0` pin broke consumers during the window when non-test code did import it — but "test-only" was never the property that made a real tag optional, so restoring that status does not make the placeholder safe again. The status itself is now enforced by `TestNonTestSourceDoesNotImportAuthjwt` rather than left to memory, which is what changed since the note below.
 
 > **This section used to describe an asymmetry that no longer exists, and the drift was expensive.** It said pkg/authjwt was imported "only from `tests/integration/`", that Go doesn't follow test imports across module boundaries, and that its version reference was therefore "invisible to downstream consumers and never needs to be a real version" — so it was pinned `v0.0.0`. That was true when written. It stopped being true on **2026-06-19**, when #211 (direct OIDC IdP federation) added `internal/service/external_issuer_registry.go` and the `server.go` option plumbing — both importing pkg/authjwt from non-test code. `internal/service/client_jwks.go` joined later with `private_key_jwt` (#347). Nobody revisited the pin either time.
 >
 > The effect was that **zeroid could not be resolved from the proxy at all**, for every release from **v1.7.1** onward: `go get github.com/highflame-ai/zeroid@vX.Y.Z` in a fresh module fails with `unknown revision pkg/authjwt/v0.0.0` (verified on both v1.7.1 and v1.9.3). In-repo builds never noticed, because the local `replace` hides it. Only consumers who already pinned pkg/authjwt explicitly (as highflame-authn does) were unaffected.
 >
-> The release drift guard now checks BOTH submodules and rejects a `v0.0.0` placeholder outright, so this particular transition cannot go unnoticed again.
+> Two things now make that transition unrepeatable, rather than merely noticed. `TestNonTestSourceDoesNotImportAuthjwt` fails the build if non-test code imports pkg/authjwt at all, and the release check covers every nested module — comparing each pin against the version being released, which is strictly stronger than rejecting `v0.0.0`, since it also catches a pin left at any stale real tag.
 
 ---
 
 ## How to cut a zeroid release
 
-All modules release in **lockstep**: `zeroid`, `pkg/authjwt` and `pkg/dpop` carry the
+All modules release in **lockstep**: `zeroid`, `pkg/authjwt`, `pkg/dpop` and `pkg/jwks` carry the
 SAME version and are tagged at the SAME commit, every time.
 
 ```bash
@@ -44,7 +46,7 @@ make release-prep VERSION=v1.9.4
 
 `release.yml` then validates the tag format, runs svu against commit history,
 **verifies go.mod's nested-module pins equal the release version**, tags
-`pkg/authjwt/vX.Y.Z` and `pkg/dpop/vX.Y.Z` at the release commit, runs integration
+`pkg/authjwt/vX.Y.Z`, `pkg/dpop/vX.Y.Z` and `pkg/jwks/vX.Y.Z` at the release commit, runs integration
 tests, builds goreleaser binaries and pushes the Docker image.
 
 To preview what svu would recommend:
@@ -96,10 +98,11 @@ The costs are real but small: version numbers advance without changes, and
 require (
 	github.com/highflame-ai/zeroid/pkg/authjwt v1.9.4
 	github.com/highflame-ai/zeroid/pkg/dpop    v1.9.4
+	github.com/highflame-ai/zeroid/pkg/jwks    v1.9.4
 )
 ```
 
-At release time `pkg/authjwt/v1.9.4` and `pkg/dpop/v1.9.4` are tagged **at the commit
+At release time `pkg/authjwt/v1.9.4`, `pkg/dpop/v1.9.4` and `pkg/jwks/v1.9.4` are tagged **at the commit
 whose go.mod says that**, so the tree is self-consistent: a consumer resolving
 `zeroid@v1.9.4` gets exactly the nested-module source that shipped with it.
 
@@ -153,6 +156,7 @@ Run `make next-version` to preview.
 | `Invalid version format` | Tag doesn't match `vMAJOR.MINOR.PATCH` | Use a semver tag |
 | `Release tag X is below svu's computed next version Y` | A `feat:` commit since the last tag implies a minor bump | Re-create the release at Y or higher |
 | `go.mod pins ... to X, but this release is Y` | You skipped `make release-prep` | `make release-prep VERSION=Y`, merge, then re-publish |
+| Both at once: go.mod pins `vA.B.C`, and svu demands `vA.B+1.0` | A `feat:` landed on `main` **after** you ran `release-prep`. The gates now disagree — the pin names the version you prepared, svu names a higher floor — and satisfying one violates the other. | `make release-prep VERSION=<svu's version>`, merge, then publish at that version. To avoid it: run `release-prep` **last**, after the final merge to `main`. Any `feat:` merged in between silently invalidates the pins. |
 | The release tag exists but the run failed | **Expected, and not recoverable in place.** Pushing the tag publishes the Go module; the workflow runs afterwards. Cut the next patch version — do not force-push the tag, since the proxy may already have cached it. |
 
 ---
