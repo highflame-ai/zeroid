@@ -553,8 +553,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// the self-service group below (public) and the proof-generation group on the
 	// admin router further down.
 	agentAuthCfg := internalMiddleware.AgentAuthConfig{
-		PublicKey: jwksSvc.PublicKey(),
-		Issuer:    cfg.Token.Issuer,
+		// The whole JWKS, not jwksSvc.PublicKey(): the grants sign RS256
+		// whenever RSA keys are loaded, so a single EC key verified none of
+		// the tokens this server issues (#357).
+		KeySet: jwksSvc.KeySet(),
+		Issuer: cfg.Token.Issuer,
 		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
 		// document so they can chain resource → PRM → AS metadata.
 		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
