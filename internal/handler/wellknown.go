@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/lestrrat-go/jwx/v4/jwk"
@@ -140,8 +141,84 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 	return &SPIFFETrustBundleOutput{Body: body}, nil
 }
 
+// pruneEmptyClaims deletes every member whose value is a zero-length array.
+//
+// RFC 8414 §2 and OpenID Connect Discovery 1.0 §3 both say, in the same words:
+// "Claims with zero elements MUST be omitted from the response." An empty array
+// is not a weaker way of saying "none" — to a conformant consumer it is not a
+// legal value at all, so emitting one makes the whole document non-conformant
+// (zeroid#316).
+//
+// This is a sweep over the finished document rather than three careful
+// decisions at three literal sites, because the rule is about the SHAPE of any
+// member, not about the three members that happen to be empty today. A member
+// added later that turns out empty on some deployment is covered without anyone
+// remembering this clause exists — which is the failure mode that produced the
+// bug, since two of the three offenders were written by someone who had read the
+// RFC.
+//
+// Only empty arrays and nils are pruned. `false` is a meaningful value for a
+// boolean claim (backchannel_user_code_parameter_supported,
+// dpop_bound_access_tokens_required) and dropping it would silently flip the
+// claim's meaning to "unspecified" — a different bug in the same family as the
+// one being fixed. Likewise an empty STRING is left alone: it is a legal value
+// for a string-valued member, and the RFC clause is about elements, not bytes.
+//
+// Three kinds reach the "omit" decision, for one reason each:
+//
+//   - Slice — the live case. Covers []string, []any and whatever slice type a
+//     future member carries.
+//   - Array — a fixed-size [0]T also serialises to `[]`, so a member declared
+//     that way would be non-conformant in exactly the way this function exists
+//     to prevent, while slipping a slice-only check.
+//   - Invalid — a bare `nil` stored in the map serialises to `"member": null`,
+//     which is not a legal value for an array-valued member either. Omission is
+//     what the RFC asks for; emitting null just moves the non-conformance.
+//
+// Neither Array nor Invalid is reachable from any member built today. They are
+// here because the promise this function makes is about the SHAPE of a value,
+// and a promise with two uncovered shapes is the kind that gets relied on and
+// then quietly broken.
+//
+// ── One thing this sweep cannot decide, and a future member must ─────────────
+//
+// Omitting a member is only equivalent to "none" when the spec defines no
+// default for its absence. Three members here have RFC-defined defaults, so
+// dropping them would advertise MORE than an empty list, not less:
+//
+//	grant_types_supported                 RFC 8414 §2 → ["authorization_code",
+//	                                      "implicit"] — the implicit flow that
+//	                                      OAuth 2.1 removes
+//	token_endpoint_auth_methods_supported RFC 8414 §2 → client_secret_basic
+//	bearer_methods_supported              RFC 9728 §2 → re-opens `query`, i.e.
+//	                                      tokens in URLs and therefore in access
+//	                                      logs — the case prm_compliance_test.go
+//	                                      asserts against
+//
+// All three are non-empty literals today, so the sweep never sees them and the
+// hazard is latent. If one is ever made computed, give it an explicit non-empty
+// floor at its construction site rather than letting it reach this function —
+// "the sweep will handle it" is correct about conformance and wrong about
+// meaning.
+func pruneEmptyClaims(body map[string]any) map[string]any {
+	for name, value := range body {
+		switch rv := reflect.ValueOf(value); rv.Kind() {
+		case reflect.Invalid:
+			// value == nil; reflect.ValueOf yields the zero Value, whose Len
+			// would panic. Checked first so the length test below is safe.
+			delete(body, name)
+		case reflect.Slice, reflect.Array:
+			if rv.Len() == 0 {
+				delete(body, name)
+			}
+		}
+	}
+
+	return body
+}
+
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
-	return &OAuthMetadataOutput{Body: a.buildASMetadata()}, nil
+	return &OAuthMetadataOutput{Body: pruneEmptyClaims(a.buildASMetadata())}, nil
 }
 
 // buildASMetadata constructs the RFC 8414 Authorization Server Metadata
@@ -223,11 +300,27 @@ func (a *API) buildASMetadata() map[string]any {
 		// of which endpoint receives it.
 		"introspection_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
 		"revocation_endpoint_auth_signing_alg_values_supported":    clientAssertionSigningAlgs,
-		// REQUIRED by RFC 8414 §2 unconditionally — unlike the grant list, this
-		// member must be present even when the flow is unavailable, or the
-		// document is invalid and strict parsers reject the whole thing (the
-		// #263 failure). The VALUE is gated below: an empty array is the
-		// accurate way to say "no response type is supported".
+		// RFC 8414 §2 lists this member as REQUIRED, and the VALUE is gated
+		// below: it gains "code" only when the authorization_code flow is
+		// actually servable. When it is not, this stays empty and
+		// pruneEmptyClaims drops the member entirely — §2's "claims with zero
+		// elements MUST be omitted" wins over its REQUIRED, because the two
+		// cannot both be honoured by an AS that supports no response type and
+		// only one of them is unambiguous about what the consumer sees.
+		//
+		// This used to be emitted as an empty array on the theory that omitting
+		// it would break strict parsers the way #263 did. That was wrong, and
+		// specifically wrong about the parser it named: in the MCP Python SDK's
+		// OAuthMetadata model this member is `list[str] = ["code"]` — it has a
+		// DEFAULT, so omission parses fine. `authorization_endpoint` is the one
+		// with no default, which is why that member is still emitted
+		// unconditionally above and this one is not.
+		//
+		// The real cost of omitting is the other side of that same default: a
+		// client using the SDK fills in ["code"] and believes a flow this
+		// deployment cannot serve. It finds out at /oauth2/authorize, which
+		// answers 503 — a failed flow, not a security boundary, and the honest
+		// price of publishing a conformant document.
 		"response_types_supported": []string{},
 		// RFC 8414 — the algorithms a private_key_jwt client may sign its
 		// client_assertion with. Kept in step with internal/jwtalg's allow-list,
@@ -254,8 +347,14 @@ func (a *API) buildASMetadata() map[string]any {
 		"backchannel_user_code_parameter_supported":  false,
 		// We don't accept signed bc-authorize requests in v1 — clients
 		// authenticate via standard client_secret_basic/post against the
-		// backchannel endpoint. An empty array signals "no signing algs
-		// supported" per the spec's MAY clause.
+		// backchannel endpoint.
+		//
+		// Left empty deliberately, and pruneEmptyClaims then drops it: "no
+		// signing algs supported" is expressed by the member's ABSENCE, not by
+		// an empty array. Written as a literal empty slice rather than simply
+		// not listing it so that the reason it is absent stays recorded here —
+		// this was the one offender that was unconditionally non-conformant, on
+		// every deployment, and deleting the line would leave nothing to read.
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
 	}
 
@@ -292,7 +391,16 @@ func (a *API) buildASMetadata() map[string]any {
 		body["client_id_metadata_document_supported"] = true
 	}
 
-	return body
+	// Swept here so the BASE document is conformant for whoever calls this, not
+	// only for the two ops that serve it today. Both callers also sweep, and
+	// that is not redundancy to be tidied away later: openidConfigurationOp adds
+	// two OIDC-only members AFTER this returns, and one of them
+	// (id_token_signing_alg_values_supported) can itself come back empty, so its
+	// sweep has to run after the addition. This one cannot cover that, and that
+	// one cannot cover a future caller who forgets. pruneEmptyClaims is
+	// idempotent, so running both costs a map walk and removes the requirement
+	// that anyone remember the rule.
+	return pruneEmptyClaims(body)
 }
 
 // openidConfigurationOp serves OpenID Connect Discovery 1.0 metadata at
@@ -350,7 +458,11 @@ func (a *API) openidConfigurationOp(_ context.Context, _ *struct{}) (*OpenIDConf
 	// that id_tokens are available — see the note above on response_types_supported.
 	body["id_token_signing_alg_values_supported"] = a.signingAlgValues()
 
-	return &OpenIDConfigurationOutput{Body: body}, nil
+	// Pruned here rather than inside buildASMetadata: the two members above are
+	// added AFTER the base document is built, and signingAlgValues can itself
+	// come back empty (every published key lacking an `alg`). Pruning upstream
+	// would sweep the document before its last member existed.
+	return &OpenIDConfigurationOutput{Body: pruneEmptyClaims(body)}, nil
 }
 
 // signingAlgValues returns the distinct `alg` values of the published signing
@@ -361,8 +473,15 @@ func (a *API) openidConfigurationOp(_ context.Context, _ *struct{}) (*OpenIDConf
 func (a *API) signingAlgValues() []string {
 	set := a.jwksSvc.KeySet()
 
-	// Non-nil zero-length start: this member is REQUIRED, and a nil slice
-	// marshals to `null`, which is not the "no algorithms" the empty array is.
+	// Non-nil zero-length start, but no longer for the reason this comment used
+	// to give. It argued that a nil slice marshals to `null` while `[]string{}`
+	// marshals to `[]`, and that the difference mattered. Since zeroid#316 it
+	// does not: pruneEmptyClaims deletes the member for BOTH — a typed nil slice
+	// and an empty one are alike Kind() == Slice with Len() == 0 — so each
+	// resolves to the same absence on the wire, which is what the RFC asks for.
+	//
+	// Kept because appending to a non-nil empty slice needs no nil check at any
+	// future call site, not because the two encode differently.
 	algs := []string{}
 	seen := map[string]struct{}{}
 
@@ -413,7 +532,11 @@ func (a *API) signingAlgValues() []string {
 // the JWT envelope from RFC 9701. When signed introspection lands, this
 // field gets added in the same PR — not before.
 func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*ProtectedResourceMetadataOutput, error) {
-	return &ProtectedResourceMetadataOutput{Body: map[string]any{
+	// No member here can currently be empty — every array is a non-empty
+	// literal. Swept anyway so the rule holds for the document rather than for
+	// today's contents: RFC 9728 §2 inherits the same zero-elements prohibition,
+	// and the next member added should not have to rediscover it.
+	return &ProtectedResourceMetadataOutput{Body: pruneEmptyClaims(map[string]any{
 		"resource":                 a.issuer,
 		"resource_name":            "ZeroID",
 		"authorization_servers":    []string{a.issuer},
@@ -429,5 +552,5 @@ func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*Prot
 		// Note: `dpop_signing_alg_values_supported` is RFC 9449 §5.1 AS
 		// metadata, not PRM — it's already advertised in oauthMetadataOp.
 		"dpop_bound_access_tokens_required": false,
-	}}, nil
+	})}, nil
 }
