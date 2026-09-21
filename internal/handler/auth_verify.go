@@ -3,7 +3,6 @@ package handler
 import (
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
@@ -56,11 +55,24 @@ func (a *API) authVerifyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, ok := strings.CutPrefix(authHeader, "Bearer ")
-	token = strings.TrimSpace(token)
+	// RFC 9110 §11.1: the scheme is case-insensitive. RFC 9449 §7.1: a
+	// DPoP-bound access token is presented under the DPoP scheme, not
+	// Bearer. Forward-auth is the resource server for every proxied
+	// upstream, so it must read the scheme its own clients are told to send.
+	token, scheme, ok := middleware.ExtractAuthToken(authHeader, middleware.SchemeBearer, middleware.SchemeDPoP)
 	if !ok || token == "" {
 		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidRequest, "", prm))
 		http.Error(w, `{"error":"invalid_authorization_header"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// RFC 9449 §7.1: the DPoP scheme asserts a proof accompanies the token.
+	// Refuse the request when it does not, so the scheme can never present a
+	// token under weaker terms than Bearer. The proof is verified against
+	// cnf.jkt after introspection.
+	if scheme == middleware.SchemeDPoP && r.Header.Get("DPoP") == "" {
+		w.Header().Set("WWW-Authenticate", middleware.WWWAuthenticate(oautherror.InvalidRequest, "DPoP scheme requires a DPoP proof header", prm))
+		http.Error(w, `{"error":"invalid_request","error_description":"DPoP scheme requires a DPoP proof header"}`, http.StatusUnauthorized)
 		return
 	}
 
