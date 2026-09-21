@@ -155,7 +155,15 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ env.RELEASE_TAG }}"
-          for MOD in authjwt dpop jwks; do
+          # Leaf-first, deliberately. pkg/authjwt's go.mod requires pkg/jwks
+          # at this same version, so tagging authjwt before jwks publishes a
+          # module whose own dependency does not yet exist. The window is
+          # normally milliseconds — but for a Go module PUSHING THE TAG IS
+          # PUBLICATION, which is the entire lesson of the v1.9.3 incident
+          # this change exists to prevent. If the job dies between the two
+          # pushes, pkg/authjwt is permanently published unresolvable: the
+          # same failure, one level down. Ordering costs nothing.
+          for MOD in jwks dpop authjwt; do
             SUBTAG="pkg/${MOD}/${VERSION}"
             if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
               echo "Tag ${SUBTAG} already exists, skipping"

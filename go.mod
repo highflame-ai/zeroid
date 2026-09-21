@@ -106,16 +106,11 @@ require (
 	mellium.im/sasl v0.3.2 // indirect
 )
 
-// pkg/authjwt is import-only-from-tests. Go does not follow test
-// imports across module boundaries, so the v0.0.0 placeholder in the
-// require directive above is invisible to downstream consumers — they
-// never try to resolve it.
-//
 // LOCKSTEP VERSIONING. zeroid and its nested modules (pkg/authjwt,
-// pkg/dpop) all carry the SAME version, tagged at the same commit on
-// every release. The pins above therefore name the version being
-// released NEXT, not the last one — release.yml verifies they equal
-// the release tag, and tags all three modules at that commit.
+// pkg/dpop, pkg/jwks) all carry the SAME version, tagged at the same
+// commit on every release. The pins above therefore name the version
+// being released NEXT, not the last one — release.yml verifies they
+// equal the release tag, and tags all three modules at that commit.
 //
 // This is what makes drift impossible rather than merely detected. A
 // nested module's tag points at the commit whose go.mod names it, so
@@ -126,7 +121,7 @@ require (
 // after it was already consumable. v1.9.3 shipped exactly that way.
 //
 // The cost is version numbers advancing without changes, and one
-// forward jump (pkg/dpop v1.9.4 -> v1.9.4) to join the shared line.
+// forward jump (pkg/dpop v1.6.3 -> v1.9.4) to join the shared line.
 // Both are cheap next to a release that cannot be un-published.
 //
 // Local replaces keep in-repo builds working when GOWORK=off (Docker
