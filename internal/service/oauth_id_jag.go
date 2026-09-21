@@ -134,7 +134,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Peek at the assertion to extract iss without verifying — we need iss to
 	// look up which IdP's JWKS to validate against. (typ was already confirmed
 	// as oauth-id-jag+jwt by the caller's isIDJAGAssertion branch.)
-	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
+	peeked, err := jwt.ParseInsecure([]byte(req.Assertion))
 	if err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "ID-JAG assertion is malformed", err)
 	}
@@ -177,19 +177,19 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if req.ClientID == "" {
 		return nil, oauthUnauthorized("ID-JAG redemption requires confidential client authentication", nil)
 	}
-	authedClient, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	// Same shared enforcement client_credentials uses: the registered
+	// token_endpoint_auth_method decides which credential is acceptable, so a
+	// key-based client can redeem an ID-JAG and a secret from one is refused.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req)
 	if err != nil {
-		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, oauthUnauthorized("invalid client credentials", err)
-		}
-		return nil, oauthUnauthorized("client verification failed", err)
+		return nil, err
 	}
 
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
 	// the wire field for ID-JAG callers.
-	verified, err := s.validateExternalAssertion(ctx, req.Subject, entry, "assertion")
+	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion")
 	if err != nil {
 		return nil, err
 	}
@@ -230,6 +230,23 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	resources, ok := extractResourceClaim(rawClaims)
 	if !ok || len(resources) == 0 {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing required resource claim — cannot audience-restrict the minted token")
+	}
+
+	// RFC 8707 `resource` on the token request NARROWS the binding to a subset of
+	// what the IdP authorized (CAP-IDN-026). Where an ID-JAG names several
+	// servers, the client — which knows which one it is about to call — selects;
+	// without the parameter the claim decides for it and the token is minted good
+	// for every server in the assertion, which is wider than any single call
+	// needs. Every requested value must appear in the claim, so this can only
+	// shrink the set, never extend it: the IdP remains the sole source of
+	// authority and the client only spends less of it.
+	//
+	// Placed AFTER the missing-claim check so an assertion with no resource fails
+	// with the D4 error regardless of what the request asked for, and BEFORE the
+	// single-use jti is consumed so a bad `resource` does not burn the grant.
+	resources, err = narrowResourcesTo(resources, req.Resource)
+	if err != nil {
+		return nil, err
 	}
 
 	// Resolve the application identity if requested (IDOR-guarded, same as the

@@ -146,6 +146,12 @@ type Server struct {
 	// configured.
 	externalIssuerRegistry *service.ExternalIssuerRegistry
 
+	// clientJWKSCache holds a live JWKS client per registered client `jwks_uri`
+	// (RFC 7523 §2.2 private_key_jwt). Each cached entry owns a background
+	// refresh goroutine, so it must be closed on shutdown or those goroutines
+	// outlive the HTTP listener.
+	clientJWKSCache *service.ClientJWKSCache
+
 	// revocationDispatcher fans out RevocationEvents
 	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
 	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
@@ -385,7 +391,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// one for a closed deployment, and the difference is invisible unless
 		// somebody says so at boot.
 		if effectiveDomains == 0 {
-			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. Set an allowlist to run CIMD as a closed ecosystem.")
+			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. " +
+				"Set an allowlist to run CIMD as a closed ecosystem. Until then CIMD clients also get no error redirect and no " +
+				"interactive-login redirect (RFC 6749 4.1.2.1 carve-out), so a browser-driven CIMD client cannot sign a user in.")
 		}
 	}
 
@@ -417,6 +425,29 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// path: a failure here is logged and the token is still issued.
 	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
+	// RFC 7523 §2.2 private_key_jwt client authentication (zeroid#206).
+	//
+	// Both stores are wired UNCONDITIONALLY, for the same reason the ID-JAG
+	// replay store is: verifyClientAssertion fails closed on a nil replay store,
+	// so a deployment that conditionally skipped this wiring would reject every
+	// key-based client rather than degrade quietly — but the better outcome is
+	// simply never to be in that state.
+	//
+	// The jti ledger is the shared DPoP replay table; client-assertion jtis are
+	// namespaced "cla:" before insertion so they cannot collide with DPoP or
+	// actor-key-proof jtis living in the same table.
+	oauthSvc.SetClientAssertionReplayStore(postgres.NewDPoPReplayStore(db))
+	// The JWKS cache fetches from client-supplied `jwks_uri` values, which are
+	// attacker-controlled input wherever registration is open. It therefore gets
+	// the SAME SSRF-guarded HTTP client the external-issuer registry and the
+	// attestation OIDC verifier use — without it, a registered jwks_uri is a
+	// server-side request forgery primitive pointed at cloud metadata endpoints
+	// and internal services.
+	clientJWKSCache := service.NewClientJWKSCache(cfg.ClientAuth.JWKSCacheSize,
+		authjwt.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
+	)
+	oauthSvc.SetClientJWKSCache(clientJWKSCache)
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -436,6 +467,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
+	// Same flag that relaxes the SSRF guard on the jwks_uri fetch also relaxes
+	// the https requirement at registration — an http loopback URL would be
+	// useless if the dialer refused loopback, so the two move together.
+	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -463,6 +498,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
+	// An allow-list is the deployer vetting which hosts may publish a metadata
+	// document, which is what lets a CIMD client be redirected to at all. The
+	// EFFECTIVE count, for the same reason the startup log uses it: the raw
+	// slice counts entries the service already dropped.
+	apiHandler.SetCIMDPublishersVetted(cimdSvc.AllowedDomainCount() > 0)
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
@@ -513,8 +553,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// the self-service group below (public) and the proof-generation group on the
 	// admin router further down.
 	agentAuthCfg := internalMiddleware.AgentAuthConfig{
-		PublicKey: jwksSvc.PublicKey(),
-		Issuer:    cfg.Token.Issuer,
+		// The whole JWKS, not jwksSvc.PublicKey(): the grants sign RS256
+		// whenever RSA keys are loaded, so a single EC key verified none of
+		// the tokens this server issues (#357).
+		KeySet: jwksSvc.KeySet(),
+		Issuer: cfg.Token.Issuer,
 		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
 		// document so they can chain resource → PRM → AS metadata.
 		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
@@ -602,6 +645,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		jwksSvc:                jwksSvc,
 		refreshTokenSvc:        refreshTokenSvc,
 		externalIssuerRegistry: externalIssuerRegistry,
+		clientJWKSCache:        clientJWKSCache,
 		revocationDispatcher:   revocationDispatcher,
 		cleanupWorker:          worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
 		adminAuthState:         authState,
@@ -726,6 +770,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri)
+	// AFTER the listener has drained. Closing before http.Shutdown lets an
+	// in-flight private_key_jwt verification repopulate the cache on its way
+	// out and spawn a refresh goroutine that nothing will ever close.
+	if s.clientJWKSCache != nil {
+		s.clientJWKSCache.Close()
 	}
 	if err := s.db.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -1441,6 +1492,31 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
 		updated = true
 	}
+	// token_endpoint_auth_method and its key material are reconciled like any
+	// other config-declared field. They were previously omitted, which was
+	// harmless while the method was decorative — it is now the field that
+	// decides which credential authenticates the client, so leaving it
+	// unreconciled meant a deployer could set private_key_jwt + jwks_uri in
+	// config, restart, get no error and no log line, and still be running a
+	// client_secret_basic client whose old secret authenticates on every grant.
+	// That is the same advertised-but-silently-inert failure this change exists
+	// to remove, reproduced on the programmatic registration surface.
+	//
+	// UpdateClient validates the resulting combination, so an incoherent config
+	// (private_key_jwt with no keys, or alongside a stored secret) surfaces as
+	// an error here rather than persisting.
+	if cfg.TokenEndpointAuthMethod != "" && cfg.TokenEndpointAuthMethod != existing.TokenEndpointAuthMethod {
+		existing.TokenEndpointAuthMethod = cfg.TokenEndpointAuthMethod
+		updated = true
+	}
+	if len(cfg.JWKS) > 0 && !bytes.Equal(cfg.JWKS, existing.JWKS) {
+		existing.JWKS = cfg.JWKS
+		updated = true
+	}
+	if cfg.JWKSURI != "" && cfg.JWKSURI != existing.JWKSURI {
+		existing.JWKSURI = cfg.JWKSURI
+		updated = true
+	}
 	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
 		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
 		updated = true
@@ -1602,6 +1678,41 @@ var jsonShapedFormFields = map[string]struct{}{
 	"authorization_details": {},
 }
 
+// repeatableFormFields are OAuth form parameters that a spec explicitly permits
+// to appear MORE THAN ONCE, overriding RFC 6749 §3.1's blanket "MUST NOT be
+// included more than once".
+//
+// Today only RFC 8707 `resource` qualifies: §2 states "the parameter can be
+// included multiple times to indicate multiple resources". Without this set the
+// duplicate-key guard below would reject a conformant multi-resource request
+// with `duplicate OAuth parameter: resource` — a spec violation that would look
+// to an interop tester like we do not support the parameter at all.
+//
+// Repeats are collapsed into a JSON array so the downstream binder
+// (handler.resourceParam) sees the same shape a JSON caller would send.
+//
+// Scoped to /oauth2/token, the only endpoint that binds `resource`. Applying it
+// across every OAuthFormEndpoint would make a repeated `resource` on
+// /oauth2/bc-authorize parse cleanly and then be discarded by a body struct
+// that has no such field — advertising support for a parameter that does
+// nothing. Narrow the carve-out to where the parameter is real.
+var repeatableFormFields = map[string]map[string]struct{}{
+	"/oauth2/token": {
+		"resource": {},
+	},
+}
+
+// formFieldRepeatable reports whether parameter k may legally appear more than
+// once on the given endpoint.
+func formFieldRepeatable(path, k string) bool {
+	fields, ok := repeatableFormFields[path]
+	if !ok {
+		return false
+	}
+	_, repeatable := fields[k]
+	return repeatable
+}
+
 // mediaTypeEquals parses a Content-Type header and reports whether the media
 // type portion matches want (case-insensitive per RFC 7231 §3.1.1.1).
 // Parameters like charset are ignored for the comparison.
@@ -1657,10 +1768,45 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 		for k, vs := range r.PostForm {
 			// RFC 6749 §3.1: request parameters MUST NOT be included more
 			// than once. Duplicate keys are rejected rather than silently
-			// collapsed to vs[0].
+			// collapsed to vs[0] — EXCEPT where a later spec explicitly makes
+			// the parameter repeatable (repeatableFormFields), in which case
+			// every occurrence is preserved as a JSON array.
 			if len(vs) > 1 {
-				writeValidationError(w, r, "duplicate OAuth parameter: "+k)
-				return
+				if !formFieldRepeatable(r.URL.Path, k) {
+					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
+					return
+				}
+				// Bound the repeat count HERE, not only at the service's
+				// stricter cap. The token endpoint is unauthenticated, and
+				// without this a 10 MiB body of repeated `resource=` produces
+				// ~800k values that are collected, re-marshalled to JSON, and
+				// URI-validated per element by the request binder before the
+				// service rejects the count. That work is linear rather than
+				// amplifying, so it is not a denial-of-service on its own — but
+				// it is unbounded work admitted on the caller's say-so, and one
+				// comparison removes it. Deliberately looser than the service's
+				// own limit so THAT stays the single authority on how many
+				// resources a request may name, with its own error message.
+				const maxFormRepeats = 64
+				if len(vs) > maxFormRepeats {
+					writeValidationError(w, r,
+						"too many repeated values for OAuth parameter: "+k)
+					return
+				}
+				// Drop valueless occurrences per RFC 6749 §3.2 before binding,
+				// so `resource=https://a&resource=` yields one resource rather
+				// than one resource plus an empty string.
+				kept := make([]string, 0, len(vs))
+				for _, v := range vs {
+					if v != "" {
+						kept = append(kept, v)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				flat[k] = kept
+				continue
 			}
 			if len(vs) == 0 {
 				continue

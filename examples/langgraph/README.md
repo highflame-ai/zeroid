@@ -17,10 +17,13 @@ ZeroID enforces cryptographically verifiable scope boundaries using **WIMSE** id
 The LangGraph graph uses conditional routing to direct requests to the appropriate handler based on data source:
 
 ```
-                  ┌─ payroll_direct (own token) ──┐
-START → read_inbox┤                               ├→ END
-                  └─ payroll_from_email (context) ─┘
+                    ┌─ internal_request ─┐
+START ─ provenance ─┤                    ├─→ model_decides ─→ execute_payroll ─→ END
+                    └─ read_inbox ───────┘
 ```
+
+Both paths converge on the same model and the same tool. Only the token differs, chosen by
+data provenance in one four-line map.
 
 The tool boundary enforces scope cryptographically — it doesn't matter that the LLM was tricked into executing the injected command. The token can't authorize the action.
 
@@ -34,11 +37,14 @@ make setup-keys && docker compose up -d
 ```
 **2. Install dependencies:**
 ```bash
-pip install highflame langgraph 'PyJWT[cryptography]'
+pip install highflame langgraph langchain-core cryptography
 ```
-**3. Run the example:**
+**3. Open the notebook:**
 ```bash
-export ZEROID_BASE_URL=http://localhost:8899
-export ZEROID_ADMIN_API_KEY=zid_sk_... # Replace with your actual admin key
-python confused_deputy.py
+jupyter notebook examples/langgraph/confused_deputy.ipynb
 ```
+
+The notebook needs no LLM API key — the model is deterministic, so every run gives the same
+output. It needs no admin credential either, because the local compose default puts no auth
+on the admin routes. Each run registers agents under a fresh `run_id`, so you can re-run it
+freely.

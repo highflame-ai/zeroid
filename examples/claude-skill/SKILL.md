@@ -92,7 +92,9 @@ Request body fields:
    - `scope` -- requested scopes
 
 3. **`urn:ietf:params:oauth:grant-type:jwt-bearer`** -- agent presents a signed JWT assertion
-   - `subject` -- the signed JWT assertion
+   - `assertion` -- the signed JWT assertion (RFC 7523 §2.1)
+   - `subject` -- DEPRECATED alias for `assertion`; still accepted, but new
+     callers should send `assertion`
    - `scope` -- requested scopes
 
 4. **`urn:ietf:params:oauth:grant-type:token-exchange`** -- RFC 8693 delegation (see Delegate section below)

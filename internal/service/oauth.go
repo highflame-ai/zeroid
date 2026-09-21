@@ -84,6 +84,21 @@ type OAuthService struct {
 	// SetObservedIDJAGResourceStore. Nil is valid and simply means the inventory
 	// is not being collected — it must NEVER affect whether a token is minted.
 	observedIDJAGResources ObservedIDJAGResourceStore
+	// clientAssertionReplay is the single-use ledger for redeemed RFC 7523 §2.2
+	// client-assertion jti values. Wired after construction via
+	// SetClientAssertionReplayStore, backed by the same shared Postgres replay
+	// table DPoP and actor-key proofs use (jtis are namespaced "cla:" so the
+	// three producers cannot collide). Nil makes private_key_jwt client
+	// authentication fail CLOSED — verifyClientAssertion refuses rather than
+	// accept an assertion it cannot mark as spent, because the alternative is
+	// silently downgrading single-use to unlimited-use.
+	clientAssertionReplay clientAssertionReplayGuard
+	// clientJWKS caches a live JWKS client per registered `jwks_uri`. Wired
+	// after construction via SetClientJWKSCache with an SSRF-guarded HTTP
+	// client. Nil means only inline `jwks` clients can authenticate; a
+	// jwks_uri client then fails closed with a server error rather than
+	// skipping verification.
+	clientJWKS *ClientJWKSCache
 	// requireTokenInspectionAuth, when true, makes the introspection (RFC 7662)
 	// and revocation (RFC 7009) endpoints reject anonymous callers — a caller
 	// MUST present client credentials. When false the endpoints accept-and-
@@ -176,6 +191,21 @@ var reservedClaims = map[string]bool{
 	// route fail closed regardless of which grant is in play.
 	"role":            true,
 	"privilege_scope": true,
+	// RFC 9068 §2.2 `client_id` — set from the OAuth client the grant actually
+	// authenticated or resolved (IssueRequest.ClientID), never from caller
+	// input. It exists so a resource server can attribute a call to a client,
+	// which makes a forgeable one worse than none: the CustomClaims loop in
+	// IssueCredential runs AFTER the dedicated set, so without this entry an
+	// `additional_claims: {"client_id": "..."}` would silently win and let a
+	// caller impersonate any client — including a CIMD client, whose entire
+	// identity is that one string because it has no registration row.
+	//
+	// `application_id` is deliberately NOT added here. It has carried the same
+	// value on the authorization_code path since long before this claim
+	// existed and is equally unreserved, so reserving it now could break a
+	// trusted-service caller that legitimately sets it. That pre-existing gap
+	// is worth its own change rather than being smuggled into this one.
+	"client_id": true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
@@ -441,6 +471,24 @@ func (s *OAuthService) SetObservedIDJAGResourceStore(store ObservedIDJAGResource
 	s.observedIDJAGResources = store
 }
 
+// SetClientAssertionReplayStore wires the single-use ledger for redeemed RFC
+// 7523 §2.2 client-assertion jti values. REQUIRED for private_key_jwt client
+// authentication: verifyClientAssertion fails closed when this is unset, so a
+// deployment that forgets to wire it rejects key-based clients rather than
+// accepting replayable assertions.
+func (s *OAuthService) SetClientAssertionReplayStore(store clientAssertionReplayGuard) {
+	s.clientAssertionReplay = store
+}
+
+// SetClientJWKSCache wires the per-client JWKS cache used to verify assertions
+// from clients that published a `jwks_uri` rather than an inline `jwks`. The
+// cache must be constructed with an SSRF-guarded HTTP client (server.go does
+// this) — a registered jwks_uri is attacker-supplied input that this server
+// makes outbound requests to.
+func (s *OAuthService) SetClientJWKSCache(cache *ClientJWKSCache) {
+	s.clientJWKS = cache
+}
+
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
 // introspection (RFC 7662) and revocation (RFC 7009) endpoints. When true,
 // anonymous callers are rejected; when false, the accept-and-verify posture
@@ -467,11 +515,25 @@ type TokenRequest struct {
 	GrantType    string
 	ClientID     string
 	ClientSecret string
-	Scope        string
-	AccountID    string // tenant — required for client_credentials and external principal exchange
-	ProjectID    string // tenant — required for client_credentials and external principal exchange
-	Subject      string // assertion JWT for jwt_bearer grant
-	APIKey       string // zid_sk_* API key for api_key grant
+	// ClientAssertion / ClientAssertionType carry RFC 7523 §2.2 private_key_jwt
+	// CLIENT AUTHENTICATION — distinct from Assertion below, which is the RFC
+	// 7523 §2.1 authorization GRANT. The two are easy to conflate because both
+	// are signed JWTs defined by the same RFC: §2.1 answers "on whose authority
+	// is this token issued", §2.2 answers "which client is asking". A single
+	// request may legitimately carry both (a jwt-bearer grant presented by a
+	// private_key_jwt client), so they are separate fields and are never read
+	// interchangeably.
+	ClientAssertion     string
+	ClientAssertionType string
+	Scope               string
+	AccountID           string // tenant — required for client_credentials and external principal exchange
+	ProjectID           string // tenant — required for client_credentials and external principal exchange
+	// Assertion is the RFC 7523 §2.1 assertion JWT for the jwt-bearer grant.
+	// Named for the spec rather than ZeroID's legacy `subject` wire spelling,
+	// which now survives only as the deprecated request alias the handler
+	// resolves — so the old name lives at exactly one place instead of three.
+	Assertion string
+	APIKey    string // zid_sk_* API key for api_key grant
 	// token_exchange (RFC 8693) fields:
 	SubjectToken     string // the subject token being exchanged
 	SubjectTokenType string // urn:ietf:params:oauth:token-type:access_token or jwt
@@ -514,6 +576,24 @@ type TokenRequest struct {
 	// exchange AND ONLY for a profiled Audience (the refresh grant re-stamps that
 	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
 	IssueRefreshToken bool
+	// Resource carries the RFC 8707 `resource` request parameter — the protected
+	// resource(s) the minted token is being bound to (CAP-IDN-026). A single
+	// value or several; the wire accepts a bare string or an array, and a
+	// form-encoded request may repeat the parameter (RFC 8707 §2).
+	//
+	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
+	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// grant no authority the grant did not already carry — which is why an
+	// arbitrary caller-supplied identifier is safe to accept without a registry
+	// of known resource servers.
+	//
+	// Mutually exclusive with Audience: that names a server-defined scope profile
+	// (it widens), this names a resource (it narrows). Both on one request is
+	// `invalid_request` — see checkResourceAudienceExclusive.
+	//
+	// Validated once in Token() before dispatch, so every grant sees a list that
+	// is already syntax-checked and de-duplicated.
+	Resource []string
 	// authorization_code grant fields:
 	Code         string // HS256 auth code JWT
 	CodeVerifier string // PKCE S256 code verifier
@@ -533,6 +613,25 @@ type TokenRequest struct {
 
 // Token handles the /oauth2/token endpoint dispatch.
 func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
+	// grant dispatch so every grant — including custom ones registered via
+	// RegisterGrant — sees the same validated list and no grant can forget the
+	// exclusivity rule. Order matters: the audience/resource conflict is a
+	// malformed REQUEST (invalid_request) and is reported as such even when the
+	// resource values would also have failed validation, so a caller that made
+	// both mistakes is told about the structural one first.
+	if err := checkResourceAudienceExclusive(req); err != nil {
+		return nil, err
+	}
+	validatedResources, err := validateResourceIndicators(req.Resource)
+	if err != nil {
+		return nil, err
+	}
+	req.Resource = validatedResources
+	if len(req.Resource) > 0 && !grantSupportsResource(req.GrantType) {
+		return nil, rejectUnsupportedResource(req, req.GrantType)
+	}
+
 	switch req.GrantType {
 	case "client_credentials":
 		return s.clientCredentials(ctx, req)
@@ -570,13 +669,14 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
 	}
 
-	// Validate client credentials against the oauth_clients table.
-	client, err := s.oauthClientSvc.VerifyClientSecret(ctx, req.ClientID, req.ClientSecret)
+	// Authenticate the client with whatever its REGISTERED method requires —
+	// a client_secret, or an RFC 7523 §2.2 client_assertion. This used to call
+	// VerifyClientSecret directly and consult the registered method nowhere,
+	// which both accepted a secret from a key-based client and made a
+	// secretless key-based client unable to authenticate here at all.
+	client, err := s.authenticateRegisteredClient(ctx, req)
 	if err != nil {
-		if errors.Is(err, ErrOAuthClientNotFound) || errors.Is(err, ErrInvalidClientSecret) {
-			return nil, oauthUnauthorized("invalid client credentials", err)
-		}
-		return nil, oauthUnauthorized("client verification failed", err)
+		return nil, err
 	}
 
 	// Ensure client_credentials grant is permitted.
@@ -597,9 +697,6 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
-	// Parse and intersect requested scopes with the client's allowed scopes.
-	scopes := intersectScopes(parseScopeString(req.Scope), client.Scopes)
-
 	// Resolve the identity for this client (external_id == client_id within the tenant).
 	// Tenant comes from the token request — client registration is global.
 	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
@@ -617,18 +714,54 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// the chokepoint can't enforce TTL, scope, delegation-depth, trust-
 	// level, or policy-expiry caps for client_credentials. Mirrors the
 	// pattern used in jwt_bearer / token_exchange / api_key.
+	//
+	// Resolved BEFORE the scope grant is computed (rather than after, as
+	// before) so its AllowedScopes narrows the grant here too — not only
+	// deep inside IssueCredential's EnforcePolicy/dual-read checks, which
+	// hard-reject the whole request instead of narrowing, and would
+	// otherwise let this grant say "grantable" while IssueCredential still
+	// refuses the same request for the same underlying reason.
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	// Narrow against the client's own scopes first (checked above: a
+	// client with none can mint nothing), then against the identity's
+	// policy ceiling. Same narrow/intersectScopes selection rule as
+	// apiKeyGrant: decided once from the caller's true original request,
+	// not re-decided per step.
+	rawRequested := parseScopeString(req.Scope)
+	narrow := intersectScopes
+	if len(rawRequested) > 0 {
+		narrow = narrowScopes
+	}
+	scopes := narrow(rawRequested, client.Scopes)
+	scopes = narrow(scopes, effectiveAllowedScopes(policy, identity))
+
+	// Stricter than the shared requireGrantableScope, which permits an empty
+	// grant when the caller named no scope. That is safe only where an empty
+	// set means "nothing was asked"; here it can also mean the client's
+	// registered scopes and the policy ceiling are disjoint — a denial. There
+	// is no identity or delegation fallback on this path (see the zero-scope
+	// check above), so either way nothing is grantable, and issuing would mint
+	// a token with no `scopes` claim: IssueCredential's dual-read and
+	// EnforcePolicy scope checks are both gated on len(Scopes) > 0, and a
+	// claimless token reads downstream as "no scope ceiling to check".
+	if len(scopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+	}
+
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -640,8 +773,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 // The assertion is validated against the identity's registered public_key_pem.
 // iss must equal the agent's WIMSE URI; aud must equal the issuer URL.
 func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.Subject == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "subject (assertion JWT) is required for jwt_bearer grant")
+	if req.Assertion == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "assertion is required for the jwt-bearer grant (RFC 7523 §2.1)")
 	}
 
 	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
@@ -652,17 +785,29 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	// work so the two validation modes stay cleanly separate (D2: the branch
 	// must be unambiguous). Every other (non-ID-JAG) assertion keeps the exact
 	// NHI self-signed behavior below.
-	if isIDJAGAssertion(req.Subject) {
+	if isIDJAGAssertion(req.Assertion) {
 		return s.idJAGBearer(ctx, req)
 	}
 
+	// `resource` is honoured on the ID-JAG profile only, where it narrows the
+	// set the corporate IdP authorized. The NHI self-signed path has no such
+	// authorized set — the assertion proves possession of a registered key and
+	// says nothing about which resources the agent may reach — so there is
+	// nothing to narrow against and binding would be an unreviewed grant of
+	// exactly the kind CAP-IDN-026 avoids by only ever narrowing. Reject rather
+	// than ignore: the grant type is marked as supporting `resource`, so without
+	// this the parameter would be silently dropped here.
+	if err := rejectUnsupportedResource(req, "self-signed jwt-bearer (RFC 7523)"); err != nil {
+		return nil, err
+	}
+
 	// Reject alg=none / HS* before any further work — JWT-SVID §3.
-	if err := jwtalg.Validate(req.Subject); err != nil {
+	if err := jwtalg.Validate(req.Assertion); err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT uses an unsupported algorithm", err)
 	}
 
 	// Peek at the assertion without signature verification to extract the iss claim (WIMSE URI).
-	peeked, err := jwt.ParseInsecure([]byte(req.Subject))
+	peeked, err := jwt.ParseInsecure([]byte(req.Assertion))
 	if err != nil {
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "assertion JWT is malformed", err)
 	}
@@ -699,7 +844,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// Fully validate the assertion JWT against the agent's registered public key.
-	assertionToken, err := jwt.Parse([]byte(req.Subject),
+	assertionToken, err := jwt.Parse([]byte(req.Assertion),
 		jwt.WithKey(jwa.ES256(), agentPubKey),
 		jwt.WithValidate(true),
 		jwt.WithAudience(s.issuer),
@@ -733,6 +878,9 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
 	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
+	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+		return nil, err
+	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
 		Identity:          identity,
@@ -890,7 +1038,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// what can be delegated — a sub-agent can never receive more than its
 	// principal currently holds, per RFC 8693 intent.
 	requestedScopes := parseScopeString(req.Scope)
-	actorAllowed := effectiveAllowedScopes(actorPolicy, actorIdentity)
+	actorAllowed, actorCeilingFrom := effectiveAllowedScopesWithSource(actorPolicy, actorIdentity)
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
@@ -915,7 +1063,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		}
 	}
 	if len(scopes) == 0 {
-		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not available for delegation")
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed, actorCeilingFrom)
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
@@ -949,7 +1097,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// child that survives the parent's expiry — and once the parent row
 	// expires, the cascade-revocation walk can no longer reach the child
 	// (the traversal anchors on live ancestry).
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:            actorIdentity,
 		IdentityPolicyID:    actorPolicy.ID,
 		Scopes:              scopes,
@@ -960,7 +1108,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -1126,7 +1277,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		audience = []string{req.Audience}
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeTokenExchange,
@@ -1140,7 +1291,16 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	// The external-principal exchange binds too. It cannot collide with the
+	// audience profile above — `audience` and `resource` are mutually exclusive
+	// at the Token() gate, so exactly one of them is ever non-empty here. That
+	// exclusivity also means the refresh token in step 6 is unreachable for a
+	// bound request (it is gated on a profiled audience), which is why this path
+	// needs no separate refresh suppression.
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
@@ -1370,10 +1530,26 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	//     ∩ key.policy.allowed_scopes (per-credential restriction)
 	//     ∩ identity.policy.allowed_scopes (authority ceiling)
 	//     ∩ identity.allowed_scopes  (deprecated fallback when policies are wide open)
-	// intersectScopes treats an empty allowed list as "no restriction" so
-	// chaining naturally short-circuits layers that don't restrict.
-	scopes := parseScopeString(req.Scope)
-	scopes = intersectScopes(scopes, sk.Scopes)
+	//
+	// Which composing function narrows each step is decided ONCE, from the
+	// caller's true original request, not re-decided per step: intersectScopes
+	// treats an empty *requested* argument as "caller omitted scope, grant the
+	// full ceiling" (RFC 6749 §3.3's default) — correct for the very first
+	// application against a genuinely omitted request, but wrong if fed an
+	// intermediate result that became empty because an EARLIER ceiling in this
+	// chain actually denied it: the next intersectScopes call would reinterpret
+	// that denial as "nothing was asked" and reset to its own full ceiling,
+	// silently granting scopes an earlier layer explicitly excluded. Once the
+	// request is known to be explicit, every step uses narrowScopes instead,
+	// which has no such reinterpretation and lets a real denial propagate to
+	// the end of the chain instead of being undone by the next ceiling.
+	rawRequested := parseScopeString(req.Scope)
+	narrow := intersectScopes
+	if len(rawRequested) > 0 {
+		narrow = narrowScopes
+	}
+	scopes := rawRequested
+	scopes = narrow(scopes, sk.Scopes)
 	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
 		// Hard fail rather than silently skip the intersection: a
 		// transient DB error during scope resolution must not widen
@@ -1386,14 +1562,17 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		if err != nil {
 			return nil, oauthServerError("failed to resolve API key credential policy", err)
 		}
-		scopes = intersectScopes(scopes, kp.AllowedScopes)
+		scopes = narrow(scopes, kp.AllowedScopes)
 	}
-	scopes = intersectScopes(scopes, identityPolicyScopes)
+	scopes = narrow(scopes, identityPolicyScopes)
 	if len(identityPolicyScopes) == 0 && identity != nil {
-		scopes = intersectScopes(scopes, identity.AllowedScopes)
+		scopes = narrow(scopes, identity.AllowedScopes)
+	}
+	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+		return nil, err
 	}
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:           identity,
 		IdentityPolicyID:   identityPolicyID,
 		CredentialPolicyID: sk.CredentialPolicyID,
@@ -1408,7 +1587,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
-	})
+	}
+	bindResourceOnIssue(&issue, req.Resource)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -1482,8 +1664,38 @@ type IssueAuthCodeRequest struct {
 	// OAuth client's registered Scopes — a code can never authorize a
 	// scope the client itself isn't allowed. Empty means "no
 	// resolver-side narrowing"; the client's full registered scope
-	// surface is encoded.
+	// surface is encoded — UNLESS RequestedScope shows the caller asked
+	// explicitly, in which case empty means a real denial and the code
+	// refuses instead.
 	Scopes []string
+
+	// RequestedScope is the raw, unparsed `scope` value the caller supplied
+	// at /oauth2/authorize, before any resolver-side narrowing folded it
+	// into Scopes above. It exists only to tell apart two states that look
+	// identical once collapsed into Scopes==[]: "the caller never asked for
+	// a scope" (default to the client's full registered surface, RFC 6749
+	// §3.3) and "the caller asked explicitly, and narrowing upstream
+	// already denied it" (refuse — resetting to the client's full surface
+	// here would silently grant scopes the caller was just denied).
+	//
+	// Optional. A caller that leaves it empty (including every existing
+	// caller of this exported function predating this field) gets the
+	// pre-existing behavior: Scopes==[] is always read as "omitted."
+	RequestedScope string
+
+	// Resources is the RFC 8707 resource ceiling the resource owner
+	// consented to, baked into the code's "rsc" claim (CAP-IDN-027).
+	// Optional; empty means no ceiling was recorded, and the token exchange
+	// may then bind to whatever it names (CAP-IDN-026).
+	//
+	// IssueAuthCode validates these itself via ValidateAuthorizeResource
+	// rather than trusting the caller, for the same reason it re-runs
+	// checkAuthorizeClientPolicy against a pre-resolved Client: a
+	// programmatic caller that bypasses the /oauth2/authorize handler must
+	// not be able to skip a gate. The handler validates too, so a bad value
+	// is reported as an RFC 6749 §4.1.2.1 redirect on the common path
+	// instead of surfacing here.
+	Resources []string
 
 	// Client is an already-resolved OAuth client, as returned by
 	// ResolveAuthorizeClient. Optional. When non-nil, IssueAuthCode skips the
@@ -1528,9 +1740,10 @@ type IssueAuthCodeRequest struct {
 //  1. Client lookup — registry first, CIMD fallback (resolveClientRegistryOrCIMD,
 //     one shared policy). A registry row wins whether active or not, so
 //     deactivation stays a kill switch and cannot fall through to CIMD.
-//  2. Client state — issuance is restricted to ACTIVE PUBLIC clients (the
-//     pre-CIMD GetPublicClient contract): 401 invalid_client. A confidential
-//     client cannot obtain a code here.
+//  2. Client state — issuance is restricted to ACTIVE clients that may obtain a
+//     code (MayObtainAuthorizationCode): 401 invalid_client. A SECRET-based
+//     confidential client cannot obtain a code here; a key-based one can, since
+//     it authenticates with its key at the token endpoint.
 //  3. Grant-type allow-list — 400 unauthorized_client.
 //  4. Redirect-URI allow-list — 400 invalid_request. normalizeLoopback handles
 //     the 127.0.0.1 ↔ localhost equivalence (RFC 8252 §7.3) so native-app CLI
@@ -1601,12 +1814,13 @@ func (s *OAuthService) ResolveAuthorizeClient(
 func checkAuthorizeClientPolicy(
 	client *domain.OAuthClient, redirectURI string,
 ) (redirectURIValidated bool, err error) {
-	// Issuance is restricted to ACTIVE PUBLIC clients (the pre-CIMD
-	// GetPublicClient contract): a confidential client cannot obtain a code here,
-	// and deactivation stays a kill switch. CIMD-synthesized clients are always
+	// Issuance is restricted to ACTIVE clients that may obtain a code (the
+	// pre-CIMD GetPublicClient contract, widened only to key-based clients):
+	// a SECRET-based confidential client cannot obtain a code here, and
+	// deactivation stays a kill switch. CIMD-synthesized clients are always
 	// active and public (see synthesizeCIMDClient), so this is not a carve-out
 	// they need — it applies to every path.
-	if !client.IsActive || client.ClientType != "public" {
+	if !client.IsActive || !client.MayObtainAuthorizationCode() {
 		return false, oauthUnauthorized("unknown or inactive client_id", nil)
 	}
 
@@ -1743,15 +1957,34 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", err
 	}
 
-	// Scope intersection: the issued code can never authorize a scope
-	// the client itself isn't allowed. Empty req.Scopes means
-	// "no resolver-side narrowing" — pass through the client's full
-	// registered surface.
-	scopes := req.Scopes
-	if len(scopes) == 0 {
-		scopes = oauthClient.Scopes
-	} else {
-		scopes = intersectScopes(scopes, oauthClient.Scopes)
+	// Scope intersection: the issued code can never authorize a scope the
+	// client itself isn't allowed. Which meaning req.Scopes==[] carries is
+	// decided by RequestedScope, not re-derived from req.Scopes itself —
+	// req.Scopes alone cannot tell "no resolver-side narrowing happened"
+	// (pass through the client's full surface, RFC 6749 §3.3) apart from "the
+	// caller asked explicitly and narrowing upstream already denied it"
+	// (refuse). Collapsing both into "empty means unrestricted" is exactly
+	// the escalation class the self-mint grants (apiKeyGrant et al.) were
+	// fixed for elsewhere in this file: a denial silently reinterpreted as an
+	// omitted request and reset to a wider ceiling.
+	narrow := intersectScopes
+	if len(parseScopeString(req.RequestedScope)) > 0 {
+		narrow = narrowScopes
+	}
+	scopes := narrow(req.Scopes, oauthClient.Scopes)
+	if err := requireGrantableScope(req.RequestedScope, scopes); err != nil {
+		return "", err
+	}
+
+	// Validate the consented resource ceiling here as well as in the handler
+	// (CAP-IDN-027). Re-validating rather than trusting req.Resources is the
+	// same posture checkAuthorizeClientPolicy takes above: a programmatic
+	// caller supplying a pre-resolved Client cannot skip a gate, and a
+	// ceiling is a security claim — a value that reaches the "rsc" claim
+	// unvalidated is one Shield will later enforce on.
+	resources, err := ValidateAuthorizeResource(req.Resources)
+	if err != nil {
+		return "", err
 	}
 
 	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
@@ -1770,6 +2003,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		OrgID:         req.OrgID,
 		AccountID:     req.AccountID,
 		ProjectID:     req.ProjectID,
+		Resources:     resources,
 	}
 
 	signed, err := mintAuthCodeJWT(claims, s.hmacSecret, s.authCodeIssuer, now)
@@ -1905,7 +2139,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	// client_secret even on the PKCE authorization_code path — PKCE proves
 	// possession of the code, the secret proves the client's identity (defense
 	// in depth). Public PKCE clients carry no secret and pass through unchanged.
-	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+	if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 		return nil, err
 	}
 
@@ -1921,6 +2155,34 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	if !verifyCodeChallenge(req.CodeVerifier, authCode.CodeChallenge) {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "PKCE verification failed")
+	}
+
+	// Resolve the RFC 8707 binding against the ceiling the code recorded
+	// (CAP-IDN-027) BEFORE the code is consumed.
+	//
+	// Three shapes, all correct after this:
+	//   - ceiling present, request omits `resource` → binds to the ceiling.
+	//     This is the row that used to return a silently UNBOUND token: a
+	//     client following RFC 8707 §2 alone sends `resource` at the
+	//     authorization request only, and nothing carried it to the mint.
+	//   - ceiling present, request names a subset → binds to the selection.
+	//   - no ceiling → binds to whatever the request names (CAP-IDN-026).
+	//
+	// Anything outside the ceiling is invalid_target. The client selects; it
+	// can never add.
+	//
+	// Ordered above Consume for the reason the comment below gives about PKCE:
+	// this is a REQUEST-PARAMETER check, so failing it must not burn the code.
+	// Otherwise a client that named the wrong resource would have its code
+	// consumed, and its corrected retry would get invalid_grant ("already
+	// used") plus revokeAuthCodeTokens — forcing the whole browser leg again
+	// over a fixable typo. Both inputs are available here with no extra I/O:
+	// the ceiling came out of the signed code above, and req.Resource was
+	// validated in Token() before dispatch. The refresh path guards the
+	// equivalent case on a non-consuming peek for the same reason.
+	boundResources, err := narrowToCeiling(authCode.Resources, req.Resource)
+	if err != nil {
+		return nil, err
 	}
 
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
@@ -1997,17 +2259,22 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		GrantType:         domain.GrantTypeAuthorizationCode,
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
 		ApplicationID:     authCode.ClientID,
+		ClientID:          authCode.ClientID,
 		TTL:               ttl,
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+
+	bindResourceOnIssue(&issue, boundResources)
+
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
@@ -2018,8 +2285,77 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 
 	var refreshFamilyID string
 
+	// A resource-bound exchange IS now issued a refresh token (CAP-IDN-027,
+	// amending CAP-IDN-026).
+	//
+	// It previously was not, and that was the fail-closed answer at the time:
+	// the refresh path re-mints from state carried on the refresh-token row,
+	// the RFC 8707 binding lived only in CustomClaims, and rotation did not
+	// carry it — so a rotated token came back silently UNBOUND. Bind to server
+	// X, refresh, use anywhere, with INV-IDN-006 enforcement gone quiet because
+	// its discriminator claim had simply vanished.
+	//
+	// The binding is now carried (resourceCeiling below → the refresh row →
+	// every successor row on rotation), so suppression is no longer buying the
+	// safety it was there for — and it had a real cost: a desktop MCP client
+	// that bound correctly was sent to a browser every hour, which made NOT
+	// binding the path of least resistance. That is the likeliest way this
+	// invariant fails in practice, and it is not an attack.
+	//
+	// The ceiling stored is the CODE's ceiling where there is one, and
+	// otherwise whatever the token request bound to. The second case matters:
+	// a client using CAP-IDN-026's token-only binding has no code ceiling, and
+	// storing nothing there would reintroduce exactly the silent unbinding
+	// above on its first rotation.
+	resourceCeiling := authCode.Resources
+	if len(resourceCeiling) == 0 {
+		resourceCeiling = boundResources
+	}
+
+	// A refresh family may only carry a SINGLE-VALUED ceiling.
+	//
+	// The authorize leg caps the consented ceiling at one
+	// (maxAuthorizeResourceIndicators), but the fallback above can seed a
+	// family from a token-only binding, and THAT came through the token
+	// endpoint's cap of eight. Storing a multi-valued ceiling breaks the model
+	// in two ways:
+	//
+	//   - It makes multi-audience access tokens durable. A refresh naming both
+	//     values re-mints a token valid at both resources for the family's
+	//     whole life — exactly RFC 8707 §3's lateral-movement shape, and the
+	//     thing the cap of one exists to make unrepresentable.
+	//   - It makes re-targeting expressible: the client can alternate which
+	//     value it selects on each rotation. The blanket `resource`-on-refresh
+	//     rejection was retired on the explicit grounds that a single-valued
+	//     ceiling leaves nothing to re-target between. That reasoning has to
+	//     actually hold.
+	//
+	// So a multi-resource token-only binding gets no refresh token, which is
+	// precisely what it got before CAP-IDN-027 — no regression, just no new
+	// capability for the one shape that cannot carry it safely. The access
+	// token is still bound to every resource requested; only the long-lived
+	// half is withheld.
+	// Deliberately a separate flag rather than clearing hasRefreshGrant, which
+	// states a property of the CLIENT (registered for the grant) and should not
+	// be overwritten to mean "we declined to issue one for this exchange".
+	issueRefresh := hasRefreshGrant
+	if len(resourceCeiling) > 1 {
+		log.Info().
+			Str("client_id", req.ClientID).
+			Strs("resource", resourceCeiling).
+			Msg("multi-resource binding: refresh token suppressed (a refresh family carries a single-valued ceiling only)")
+
+		// Clearing resourceCeiling is a dead store today — the only read of it
+		// is inside the `if issueRefresh` block below, which the next line
+		// disables. Kept deliberately so the two cannot drift: if a later edit
+		// ever reads the ceiling outside that block, it must not find a
+		// multi-valued one here.
+		resourceCeiling = nil
+		issueRefresh = false
+	}
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
-	if hasRefreshGrant && s.refreshTokenSvc != nil {
+	if issueRefresh && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
 			ClientID:          req.ClientID,
 			AccountID:         authCode.AccountID,
@@ -2033,6 +2369,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// rotation (and the access token each one mints) stays inside the
 			// same delegation tree (issue #81).
 			MissionID: cred.MissionID,
+			// Seed the family with the resource ceiling so every rotation
+			// re-stamps the same binding (CAP-IDN-027). Copied forward onto each
+			// successor row, like MissionID.
+			Resources: resourceCeiling,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -2113,6 +2453,30 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		audienceRefreshToken = peeked
 	}
 
+	// `audience` and `resource` are mutually exclusive, and on this grant the
+	// audience arrives from the STORED FAMILY rather than from the request — so
+	// checkResourceAudienceExclusive, which compares two request parameters,
+	// cannot see the conflict and lets it through.
+	//
+	// That was unreachable while the refresh grant rejected `resource` outright.
+	// Removing the blanket rejection (CAP-IDN-027) opened it, and the
+	// consequence is not benign: bindResourceOnIssue sets issue.Audience, so a
+	// resource-bound refresh of an audience-profile family would OVERWRITE the
+	// profile `aud` that rotation exists to preserve — the harness daemon
+	// validates `aud` on every message, so the client would break its own
+	// session — while also producing the profiled-audience-plus-resource-binding
+	// token that CAP-IDN-026 states can never exist.
+	//
+	// Checked here, against a non-consuming peek and before any rotation, so a
+	// rejected request never burns the token. invalid_request (not
+	// invalid_target) to match checkResourceAudienceExclusive: the request is
+	// structurally incoherent, not naming an unacceptable resource.
+	if audienceRefreshToken != nil && len(req.Resource) > 0 {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"audience and resource are mutually exclusive: this refresh token was issued for an "+
+				"audience profile, so it cannot be rotated into a resource-bound token")
+	}
+
 	var accessTTL, refreshTokenTTL int
 	if audienceRefreshToken != nil {
 		// Client-less audience-profile token. The refreshed access token is
@@ -2143,7 +2507,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		}
 		accessTTL = oauthClient.AccessTokenTTL
 		refreshTokenTTL = oauthClient.RefreshTokenTTL
-		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret); err != nil {
+		if err := s.verifyConfidentialClientAuth(ctx, oauthClient, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 			return nil, err
 		}
 	} else if err == nil {
@@ -2207,6 +2571,33 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// mismatch does not consume the token.
 		if peeked.ClientID != req.ClientID {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "client_id mismatch")
+		}
+
+		// Resource selection is validated HERE, on the peek, for the same
+		// session-bricking reason every other gate in this block is
+		// (CAP-IDN-027). A request naming a resource outside the family's
+		// ceiling is a bad request against an otherwise-valid token — if it
+		// were checked after RotateRefreshToken committed, an invalid_target
+		// would consume the client's refresh token and its retry would trip
+		// reuse detection and revoke the whole family. The result is recomputed
+		// against the authoritative claimed row below; this call is the gate,
+		// not the source of the binding.
+		if _, err := resolveRefreshResources(peeked.Resources, req.Resource); err != nil {
+			return nil, err
+		}
+
+		// The audience/resource exclusivity backstop, hoisted here from just
+		// before issuance. The primary check (near the top of this function)
+		// keys off PeekRefreshTokenIncludingRevoked; if THAT peek fails
+		// transiently the primary check is skipped, and the only remaining
+		// guard used to sit after RotateRefreshToken — where failing closed
+		// burns the client's refresh token and its retry trips reuse detection,
+		// revoking the whole family. Both inputs are available here, on a
+		// non-consuming peek, so there is no reason to check it any later.
+		if peeked.Audience != "" && len(req.Resource) > 0 {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"audience and resource are mutually exclusive: this refresh token was issued "+
+					"for an audience profile, so it cannot be rotated into a resource-bound token")
 		}
 
 		// Identity gate. The link came from the OAuth client at
@@ -2303,17 +2694,42 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		applicationID = ""
 	}
 
+	// Re-stamp the RFC 8707 binding on rotation (CAP-IDN-027). Computed against
+	// the authoritative CLAIMED row rather than the earlier peek — the peek was
+	// the gate, this is the value. Re-running it cannot newly fail in practice
+	// (the ceiling is copied verbatim across rotation, so claimed and peeked
+	// agree), but deriving the binding from the row we actually consumed is the
+	// arrangement in which they cannot disagree.
+	refreshResources, err := resolveRefreshResources(oldToken.Resources, req.Resource)
+	if err != nil {
+		return nil, err
+	}
+
 	// Inherit scopes from the original refresh token. Without this the
 	// refreshed access token would be issued with no scopes (or default
 	// scopes), breaking the contract that refresh preserves the original
 	// grant's authority.
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeRefreshToken,
-		UseRS256:          true,
-		SubjectOverride:   oldToken.UserID,
-		ApplicationID:     applicationID,
+	refreshIssue := IssueRequest{
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		GrantType:        domain.GrantTypeRefreshToken,
+		UseRS256:         true,
+		SubjectOverride:  oldToken.UserID,
+		ApplicationID:    applicationID,
+		// oldToken.ClientID, not req.ClientID — the same source `applicationID`
+		// above already uses. A refresh is continuity of an existing grant, so
+		// the client the token is attributed to must come from the stored grant
+		// rather than from the request that is redeeming it.
+		//
+		// The two are equal in practice: a cross-client refresh is rejected
+		// (verified — it answers invalid_grant). But the only client_id check I
+		// could locate is inside the `audienceRefreshToken != nil` branch, so
+		// for an ordinary refresh token the equality is upheld somewhere I
+		// could not point at. Deriving an attribution claim from a request
+		// field whose validation I cannot locate is the wrong trade: this way
+		// `client_id` and `application_id` are provably the same value, and
+		// neither depends on that check holding.
+		ClientID:          oldToken.ClientID,
 		Audience:          refreshAudience,
 		TTL:               accessTTL,
 		Scopes:            parseScopeString(oldToken.Scopes),
@@ -2324,7 +2740,26 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// IssueCredential then falls back to defaulting mission_id to the new
 		// credential's own JTI (the pre-fix behavior).
 		MissionID: oldToken.MissionID,
-	})
+	}
+	// Applied after the literal so the binding goes through the one function
+	// that sets both `aud` and the reserved `resource` claim together. A
+	// no-op for an unbound family, so ordinary refresh issuance is unchanged.
+	//
+	// The guard is defence in depth, not the primary control: the peek-time
+	// check near the top of this function already refuses `resource` against an
+	// audience-profile family. But bindResourceOnIssue OVERWRITES
+	// issue.Audience, so if that check is ever bypassed — a transient peek
+	// failure, or a future edit that reorders it — the failure mode is a
+	// silently re-audienced token rather than an error. Fail closed instead:
+	// the two are mutually exclusive by contract (CAP-IDN-026), so their
+	// coexistence here is a server bug, not a client one.
+	if len(refreshAudience) > 0 && len(refreshResources) > 0 {
+		return nil, oauthServerError(
+			"refresh family carries both an audience profile and a resource binding", nil)
+	}
+	bindResourceOnIssue(&refreshIssue, refreshResources)
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, refreshIssue)
 	if err != nil {
 		return nil, err
 	}
@@ -2477,6 +2912,69 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 	return parts[0], parts[1], nil
 }
 
+// implementedClientAuthMethods are the token-endpoint client authentication
+// methods this server can actually ENFORCE.
+//
+// The empty string is included deliberately: it means "unset", which is what a
+// row predating the column carries. Registration never writes it (it defaults
+// to none or client_secret_basic), so an empty value is legacy data and must
+// keep behaving exactly as it did.
+//
+// private_key_jwt is present as of zeroid#206: verifyClientAssertion implements
+// RFC 7523 §2.2 against the client's registered jwks/jwks_uri, and
+// enforceRegisteredClientAuthMethod makes it binding, so such a client is now
+// genuinely authenticated rather than waved through.
+//
+// client_secret_jwt and tls_client_auth remain ABSENT because nothing here
+// validates them: client_secret_jwt is dropped in OAuth 2.1 and will not be
+// added; tls_client_auth (RFC 8705) is deferred pending an mTLS termination
+// story. A client registered for either still fails closed here.
+var implementedClientAuthMethods = map[string]bool{
+	"":                            true,
+	"none":                        true,
+	"client_secret_post":          true,
+	"client_secret_basic":         true,
+	clientAuthMethodPrivateKeyJWT: true,
+}
+
+// rejectUnimplementedClientAuth refuses a client whose REGISTERED
+// token_endpoint_auth_method this server cannot enforce.
+//
+// This closes a silent downgrade, not a missing feature. Registration accepts
+// `token_endpoint_auth_method: private_key_jwt` and stores the client's key
+// material, but sets client_type from the separate `confidential` flag — so a
+// key-based client lands as client_type=public with an empty secret hash, which
+// is precisely the shape verifyConfidentialClientAuth waves through. The result
+// is that a client registered for key-based authentication authenticates with
+// NOTHING on authorization_code, refresh_token, CIBA redemption, introspection
+// and revocation.
+//
+// The asymmetry is what makes it worth refusing rather than leaving to the
+// eventual implementation: a deployer who chose private_key_jwt specifically to
+// avoid shared secrets ends up with WEAKER authentication than one who chose a
+// secret, with no error on any surface to say so. Failing loudly is strictly
+// better than proceeding unauthenticated, and it cannot regress a working
+// deployment because no such client can be authenticating correctly today —
+// there is no code path that would have checked its key.
+//
+// invalid_client (401) rather than invalid_request: the client is well-formed
+// and known, it simply cannot be authenticated as registered. RFC 6749 §5.2
+// assigns invalid_client to failed or absent client authentication.
+//
+// Interim hardening for zeroid#206 scope item 2, deliberately landed ahead of
+// the RFC 7523 §2.2 client-assertion work it is bundled with there: it has no
+// dependency on that work, and leaving the downgrade open while it is built
+// would be the wrong order.
+func rejectUnimplementedClientAuth(client *domain.OAuthClient) error {
+	if client == nil || implementedClientAuthMethods[client.TokenEndpointAuthMethod] {
+		return nil
+	}
+	return oauthUnauthorized(fmt.Sprintf(
+		"client is registered for token_endpoint_auth_method %q, which this authorization "+
+			"server does not implement; it cannot be authenticated",
+		client.TokenEndpointAuthMethod), nil)
+}
+
 // verifyConfidentialClientAuth enforces RFC 6749 §2.3 / §10.4 client
 // authentication for an already-resolved OAuth client. When the client is
 // CONFIDENTIAL it MUST present and prove its client_secret before any grant
@@ -2489,16 +2987,30 @@ func (s *OAuthService) parseWIMSEURI(wimseURI string) (accountID, projectID stri
 // secret; the caller passes the already-resolved client purely to read its
 // ClientType. The re-fetch is intentional — VerifyClientSecret owns the
 // constant-time comparison and the active-client gate.
-func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret string) error {
+func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client *domain.OAuthClient, clientID, clientSecret, assertion, assertionType string) error {
 	if client == nil {
 		return nil
 	}
-	// A client is confidential if it declares so OR carries a stored secret
-	// hash. The second clause is belt-and-suspenders against an inconsistent
-	// row (secret set but client_type != "confidential"), which would
-	// otherwise skip secret verification and allow an unintended bypass. Same
-	// test the CIBA bc-authorize/redeem paths use.
-	if client.ClientType != "confidential" && client.ClientSecret == "" {
+	// Refuse a client registered for an authentication method this server does
+	// not implement, BEFORE the public-client pass-through below.
+	if err := rejectUnimplementedClientAuth(client); err != nil {
+		return err
+	}
+	if err := s.enforceRegisteredClientAuthMethod(ctx, client, clientID, clientSecret, assertion, assertionType); err != nil {
+		return err
+	}
+	// private_key_jwt is fully authenticated by the assertion — the secret
+	// paths below do not apply to it.
+	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+		return nil
+	}
+	// Credential-less (public PKCE) clients pass through — they prove
+	// possession by other means: PKCE on authorization_code, the refresh-token
+	// string itself on refresh_token. The predicate derives this from the
+	// registered method, with the old client_type/secret test surviving inside
+	// it as the fallback for rows predating that column. Same question the CIBA
+	// bc-authorize/redeem paths ask.
+	if !client.RequiresClientAuthentication() {
 		return nil
 	}
 	if clientSecret == "" {
@@ -2532,8 +3044,57 @@ func (s *OAuthService) verifyConfidentialClientAuth(ctx context.Context, client 
 // 401) when a presented secret does not verify, when only a client_secret is
 // supplied without a client_id, or when a client_id without a secret does not
 // resolve to a public client. Operational failures surface as 500.
-func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret string) error {
-	// Anonymous call — neither half presented.
+func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, clientSecret, assertion, assertionType string) error {
+	// An RFC 7523 §2.2 client assertion, when presented, IS the authentication —
+	// handled before the secret-shaped branches below so a key-based client is
+	// never asked for a secret it does not have.
+	//
+	// Resolution is registry-only (GetClient), matching the no-secret branch's
+	// deliberate exclusion of CIMD clients: introspection has no redirect_uri
+	// binding to protect it, so a self-published metadata document must not be
+	// able to satisfy this gate and turn introspection into a token oracle.
+	if clientAssertionPresented(assertion, assertionType) {
+		if clientSecret != "" {
+			return oauthUnauthorized(
+				"client presented both a client_secret and a client_assertion; exactly one authentication method is permitted", nil)
+		}
+		if clientID == "" {
+			if fromAssertion, ok := ClientIDFromAssertion(assertion); ok {
+				clientID = fromAssertion
+			}
+		}
+		if clientID == "" {
+			return oauthUnauthorized("client_assertion is missing an iss claim identifying the client", nil)
+		}
+		client, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+		if err != nil {
+			if errors.Is(err, ErrOAuthClientNotFound) {
+				return oauthUnauthorized("client authentication required", nil)
+			}
+			// Operational failure (DB outage) — a 500, never a 401. Reading it
+			// as "unregistered" would let a transient store failure decide an
+			// authentication outcome.
+			return oauthServerError("client verification failed", err)
+		}
+		// GetClientByClientID deliberately does NOT gate on IsActive (its CIMD
+		// callers need the distinction), so the check belongs here: a
+		// deactivated client must not be able to authenticate with a key that
+		// is still perfectly valid. The secret path gets this for free —
+		// VerifyClientSecret applies its own active-client gate.
+		if !client.IsActive {
+			return oauthUnauthorized("client authentication required", nil)
+		}
+		if err := rejectUnimplementedClientAuth(client); err != nil {
+			return err
+		}
+		if client.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+			return oauthUnauthorized(
+				"client is not registered for private_key_jwt and cannot authenticate with a client_assertion", nil)
+		}
+		return s.verifyClientAssertion(ctx, client, clientID, assertion, assertionType)
+	}
+
+	// Anonymous call — no credential of any kind presented.
 	if clientID == "" && clientSecret == "" {
 		// Strict mode (RFC 7662 §2.1 / RFC 7009 §2.1): the endpoint MUST
 		// require some form of authorization — reject the anonymous caller.
@@ -2567,11 +3128,46 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// safe because redirect_uri binding protects the flow; token INSPECTION
 	// has no equivalent binding, so it stays registry-only.
 	if clientSecret == "" {
-		if _, err := s.oauthClientSvc.GetPublicClient(ctx, clientID); err != nil {
+		publicClient, err := s.oauthClientSvc.GetPublicClient(ctx, clientID)
+		if err != nil {
 			if errors.Is(err, ErrOAuthClientNotFound) {
 				return oauthUnauthorized("client authentication required", nil)
 			}
 			return oauthServerError("client verification failed", err)
+		}
+		// Same downgrade as the grant paths: a client registered for an
+		// unimplementable method lands as public with no secret, so without this
+		// it satisfies the no-secret branch and gets introspection/revocation
+		// with no authentication at all. The secret branch below needs no
+		// equivalent check — such a client has no stored hash, so
+		// VerifyClientSecret fails closed.
+		if err := rejectUnimplementedClientAuth(publicClient); err != nil {
+			return err
+		}
+		// A private_key_jwt client USED TO land client_type=public with no secret
+		// (registration derived client_type from the separate `confidential`
+		// flag), so it reached this branch too — and rejectUnimplementedClientAuth
+		// no longer stops it, because the method became implemented. Without this
+		// check, making private_key_jwt work would silently REOPEN the exact
+		// introspection downgrade #346 closed: the client would authenticate by
+		// presenting its client_id and nothing else.
+		//
+		// NOT DEAD CODE, though coverage tooling will now suggest otherwise.
+		// Since zeroid#348 a key-based client registers as
+		// client_type=confidential, and GetPublicClient filters
+		// client_type='public' in SQL — so this branch is unreachable for any
+		// client registered after that change. It stays reachable, and
+		// load-bearing, for rows written BEFORE it. Those were deliberately not
+		// migrated: the #206 census found no key-based rows in dev1 or prod, so
+		// there was nothing to backfill, but that census cannot speak for other
+		// deployments. Deleting this re-opens #346's downgrade for exactly the
+		// installs whose rows predate the convergence.
+		//
+		// Key-based clients authenticate here through the client_assertion branch
+		// at the top of this function, never through this one.
+		if publicClient.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
+			return oauthUnauthorized(
+				"client is registered for private_key_jwt and must authenticate with a client_assertion (RFC 7523 §2.2)", nil)
 		}
 		return nil
 	}
@@ -2602,13 +3198,176 @@ func parseScopeString(scope string) []string {
 // keep working. Callers should migrate restrictions onto the policy's
 // allowed_scopes and drop reliance on this fallback.
 func effectiveAllowedScopes(policy *domain.CredentialPolicy, identity *domain.Identity) []string {
+	scopes, _ := effectiveAllowedScopesWithSource(policy, identity)
+	return scopes
+}
+
+// scopeCeilingSource names where effectiveAllowedScopes drew a ceiling from.
+// A denial has to point at the thing the caller must actually edit, and the
+// two sources need different repairs: widen the credential policy, or widen
+// the identity's registration.
+type scopeCeilingSource int
+
+const (
+	// ceilingUnset means no layer restricted scopes.
+	ceilingUnset scopeCeilingSource = iota
+	// ceilingFromPolicy means the credential policy supplied the ceiling.
+	ceilingFromPolicy
+	// ceilingFromIdentity means the deprecated identity.AllowedScopes did.
+	ceilingFromIdentity
+)
+
+// effectiveAllowedScopesWithSource is effectiveAllowedScopes plus the source
+// of the ceiling it returned. Both live here so the "which layer won" rule has
+// exactly one definition: a caller that re-derived the source separately would
+// silently go stale the moment this precedence changes.
+func effectiveAllowedScopesWithSource(policy *domain.CredentialPolicy, identity *domain.Identity) ([]string, scopeCeilingSource) {
 	if policy != nil && len(policy.AllowedScopes) > 0 {
-		return policy.AllowedScopes
+		return policy.AllowedScopes, ceilingFromPolicy
 	}
-	if identity != nil {
-		return identity.AllowedScopes
+	if identity != nil && len(identity.AllowedScopes) > 0 {
+		return identity.AllowedScopes, ceilingFromIdentity
 	}
-	return nil
+	return nil, ceilingUnset
+}
+
+// requireGrantableScope closes the gap between intersectScopes' silent
+// narrowing and IssueCredential's "if len(req.Scopes) > 0" claim-omission
+// (credential.go): when a caller explicitly names a scope and every named
+// scope gets intersected away, minting anyway produces a token with no
+// `scopes` claim at all — indistinguishable downstream from a legacy token
+// that predates the scopes feature. Shield's checkScopeCeiling deliberately
+// treats an absent claim as "check not applicable" for that legacy case (see
+// its own comment), so a caller could otherwise escalate past its ceiling
+// simply by naming a scope it does not hold.
+//
+// Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
+// safety net (this file, tokenExchange), extended to the grants that mint a
+// token for the caller's own use rather than delegating to another identity.
+// A caller that asks for nothing is unaffected: intersectScopes' RFC 6749
+// §3.3 default (empty request grants the full ceiling) still applies, and so
+// does an identity/client with a genuinely empty ceiling and no explicit
+// ask.
+//
+// requestedRaw is tested via parseScopeString rather than `== ""` so a
+// whitespace-only value (e.g. "scope=\" \"") is treated identically to an
+// omitted one everywhere a caller's "did they actually ask for something"
+// decision is made — narrowScopes/intersectScopes selection above and this
+// check must agree, or a malformed-but-technically-non-empty scope string
+// gets a different answer depending on which one happens to run.
+func requireGrantableScope(requestedRaw string, granted []string) error {
+	if len(parseScopeString(requestedRaw)) == 0 || len(granted) > 0 {
+		return nil
+	}
+	return oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+}
+
+// delegationScopeDenial explains WHICH term of the three-way delegation
+// intersection came out empty:
+//
+//	requested ∩ the subject token's own scopes ∩ the actor's ceiling
+//
+// One message used to serve all three causes, and they need OPPOSITE repairs:
+// name the scopes, widen the DELEGATOR, or widen the SUB-AGENT. A caller who
+// guesses wrong widens the party that was never the constraint.
+//
+// All three sets are already in hand at the call site, so naming the empty
+// term costs no extra lookup.
+//
+// The error code stays invalid_scope and the original sentence stays as a
+// prefix, so neither the wire contract nor an existing log grep changes.
+//
+// subjectHolds is the subject token's granted scopes as a set. actorCeiling
+// is the actor's effective allowed scopes; empty means "no restriction from
+// this layer", so an unrestricted actor is never blamed. ceilingFrom says
+// which layer supplied that ceiling, because widening a credential policy and
+// widening a registration are different repairs — naming the wrong one is the
+// mistake this whole function exists to prevent.
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorCeiling []string, ceilingFrom scopeCeilingSource) error {
+	const base = "requested scopes are not available for delegation"
+
+	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
+	// omitted scope is a hard failure rather than "grant the full ceiling".
+	// Say so, because every other grant taught the caller the opposite.
+	if len(requested) == 0 {
+		return oauthBadRequest(oautherror.InvalidScope, base+
+			": no scopes were requested, and this grant has no default — name the scopes to delegate")
+	}
+
+	actorSet := make(map[string]bool, len(actorCeiling))
+	for _, s := range actorCeiling {
+		actorSet[s] = true
+	}
+
+	// Each scope is blamed once. A scope the subject cannot delegate is the
+	// subject's problem even when the actor also lacks it — reporting it
+	// under both terms would read as two separate repairs.
+	var notHeld, notPermitted []string
+	for _, s := range requested {
+		switch {
+		case !subjectHolds[s]:
+			notHeld = append(notHeld, s)
+		case len(actorCeiling) > 0 && !actorSet[s]:
+			notPermitted = append(notPermitted, s)
+		}
+	}
+
+	var reasons []string
+	if len(notHeld) > 0 {
+		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
+	}
+	if len(notPermitted) > 0 {
+		// effectiveAllowedScopes is either/or, not layered: when the policy
+		// sets scopes, the identity's own list is never read. Blaming the
+		// registration in that case sends the caller to edit a field the
+		// ceiling did not come from.
+		actorTerm := "the actor identity is not registered for ["
+		if ceilingFrom == ceilingFromPolicy {
+			actorTerm = "the actor's credential policy does not permit ["
+		}
+		reasons = append(reasons, actorTerm+strings.Join(notPermitted, " ")+"]")
+	}
+	if len(reasons) == 0 {
+		// Unreachable by construction: the caller only invokes this when the
+		// grant is empty, which means every requested scope failed a term.
+		// Kept so a future change to the intersection cannot produce a
+		// dangling colon.
+		return oauthBadRequest(oautherror.InvalidScope, base)
+	}
+
+	return oauthBadRequest(oautherror.InvalidScope, base+": "+strings.Join(reasons, "; "))
+}
+
+// narrowScopes filters `granted` — a scope set already known to reflect a
+// real, explicit caller request, never "caller asked for nothing" — against
+// one ceiling. Unlike intersectScopes, an empty `granted` stays empty: it
+// never reinterprets that as an omitted request and falls back to `ceiling`.
+//
+// This is what a chain of ceilings needs and intersectScopes alone cannot
+// provide: composing plain intersectScopes calls treats an empty
+// *intermediate* result — a real denial from an earlier ceiling in the
+// chain — as "nothing was asked" and resets to the next ceiling's full set,
+// silently undoing that denial (see apiKeyGrant, which chains up to four).
+// narrowScopes has no such special case, so a denial anywhere in the chain
+// propagates to the end instead of being reset by the next step.
+//
+// An empty ceiling means "no restriction from this layer," same as
+// intersectScopes.
+func narrowScopes(granted, ceiling []string) []string {
+	if len(ceiling) == 0 {
+		return granted
+	}
+	set := make(map[string]bool, len(ceiling))
+	for _, s := range ceiling {
+		set[s] = true
+	}
+	var kept []string
+	for _, s := range granted {
+		if set[s] {
+			kept = append(kept, s)
+		}
+	}
+	return kept
 }
 
 // intersectScopes returns the subset of requested scopes that are in the allowed set.

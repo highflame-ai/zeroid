@@ -79,23 +79,14 @@ def _build_actor_token(wimse_uri: str, private_key_pem: bytes, aud: str) -> str:
 def _fetch_all_identities() -> dict[str, tuple[str, str]]:
     """Return {external_id: (id, wimse_uri)} for ALL identities.
 
-    identities.list() uses the server's default limit (20) and orders by
+    identities.list() returns a single page (limit 20 by default) ordered by
     created_at DESC, so the first-registered identities fall off the end.
-    We page manually via the transport to get the full set.
+    iter_all() walks every page at the service ceiling of 100.
     """
-    result: dict[str, tuple[str, str]] = {}
-    offset, limit = 0, 100
-    while True:
-        resp = client._transport.request(
-            "GET", f"/identities?limit={limit}&offset={offset}"
-        )
-        page = resp.json().get("identities") or []
-        for i in page:
-            result[i["external_id"]] = (i["id"], i.get("wimse_uri", ""))
-        if len(page) < limit:
-            break
-        offset += limit
-    return result
+    return {
+        i.external_id: (i.id, i.wimse_uri or "")
+        for i in client.identities.iter_all()
+    }
 
 
 def load_hierarchy():

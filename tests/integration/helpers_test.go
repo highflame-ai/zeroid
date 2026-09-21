@@ -260,6 +260,13 @@ func runTests(m *testing.M) int {
 		Attestation: zeroid.AttestationConfig{
 			AllowPrivateIssuerEndpoints: true,
 		},
+		// Same reason as the two flags above: the private_key_jwt `jwks_uri`
+		// fixtures serve a key set from an httptest listener on 127.0.0.1,
+		// which the SSRF guard blocks by default. Production keeps this false —
+		// a registered jwks_uri is attacker-supplied wherever DCR is open.
+		ClientAuth: zeroid.ClientAuthConfig{
+			AllowPrivateJWKSEndpoints: true,
+		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a
 		// product deployer supplies. ZeroID itself ships product-agnostic.
@@ -356,6 +363,9 @@ func runTests(m *testing.M) int {
 	//   test_principal_account → AccountID (required to "apply")
 	//   test_principal_project → ProjectID
 	//   test_principal_user    → UserID
+	//   test_principal_scopes  → Scopes (space-separated; empty means the
+	//                            principal has no scope restriction of its
+	//                            own — see Principal.Scopes)
 	//   test_principal_reject  → "true" returns a non-sentinel error
 	//   (anything else)        → ErrPrincipalNotApplicable
 	//
@@ -373,6 +383,7 @@ func runTests(m *testing.M) int {
 			AccountID: acct,
 			ProjectID: req.Form("test_principal_project"),
 			UserID:    req.Form("test_principal_user"),
+			Scopes:    strings.Fields(req.Form("test_principal_scopes")),
 		}, nil
 	})
 

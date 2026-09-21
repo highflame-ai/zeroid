@@ -56,7 +56,21 @@ type VerifierConfig struct {
 	Issuer string
 
 	// Audience is the expected "aud" claim value. If set, tokens without this
-	// audience are rejected. Use your service identifier (e.g., "my-mcp-server").
+	// audience are rejected.
+	//
+	// NOT an authorization signal, and not proof a token was minted for you.
+	// ZeroID stamps `aud` on every token it issues (defaulting to the issuer URL
+	// to satisfy JWT-SVID §3), and since CAP-IDN-026 a caller may set it to any
+	// absolute URI by passing the RFC 8707 `resource` parameter at the token
+	// endpoint. So pinning this to your own identifier does not establish that
+	// the authorization server intended the token for your service — any tenant
+	// principal can request that value.
+	//
+	// Use it as a routing/hygiene filter if you like. Authorize on the claims
+	// that carry authority: `scopes`, the principal (`sub` / identity_type /
+	// trust_level), and — for a resource binding ZeroID actually recorded — the
+	// `resource` claim (Claims.Resource), which callers cannot forge because it
+	// is server-reserved.
 	Audience string
 
 	// IntrospectURL is the URL of the token introspection endpoint (RFC 7662).

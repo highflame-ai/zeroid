@@ -392,9 +392,19 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	// approval prompts to an end user), so allowing an unauthenticated party to
 	// initiate against a confidential client lets them spam prompts at
 	// arbitrary users under that client's identity. Require + verify the
-	// client_secret when the client is confidential. A client is confidential
-	// if it declares so or carries a stored secret hash (belt-and-suspenders).
-	if client.ClientType == "confidential" || client.ClientSecret != "" {
+	// client_secret when the client must authenticate — a question derived from
+	// the REGISTERED method, with the old client_type/stored-hash test surviving
+	// inside the predicate as the fallback for rows that predate it.
+	//
+	// Before that test, refuse a client whose registered method this endpoint
+	// cannot enforce. A key-based client authenticates with an assertion
+	// bc-authorize does not accept, so it would otherwise reach a secret-shaped
+	// check it can never satisfy — and, before the predicate recognised its
+	// method, skip authentication entirely and be free to fire notifier prompts.
+	if err := requireNonAssertionClientAuth(client); err != nil {
+		return nil, err
+	}
+	if client.RequiresClientAuthentication() {
 		if in.ClientSecret == "" {
 			return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 		}
@@ -706,7 +716,14 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		if !client.IsActive {
 			return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
 		}
-		if client.ClientType == "confidential" || client.ClientSecret != "" {
+		// Same precondition as bc-authorize: redemption does not accept a client
+		// assertion, so a key-based client must be refused here rather than sent
+		// to a secret-shaped check it cannot satisfy — and, before the predicate
+		// recognised its method, it skipped authentication on the poll path too.
+		if err := requireNonAssertionClientAuth(client); err != nil {
+			return nil, err
+		}
+		if client.RequiresClientAuthentication() {
 			if in.ClientSecret == "" {
 				return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 			}

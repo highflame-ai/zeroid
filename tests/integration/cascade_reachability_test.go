@@ -209,7 +209,7 @@ func TestProofTokenSingleUseUnderConcurrency(t *testing.T) {
 
 	tokResp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    buildAssertion(t, agentKey, identity.WIMSEURI),
+		"assertion":  buildAssertion(t, agentKey, identity.WIMSEURI),
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusOK, tokResp.StatusCode)

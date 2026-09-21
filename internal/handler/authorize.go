@@ -169,11 +169,15 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// path: on a GET, req.Form is empty by construction, so a resolver
 	// reading req.Form("api_key") sees nothing and must fall through to
 	// a header or cookie. See registerAuthorizeRoute.
-	params := r.PostForm.Get
+	// `values` is the SAME single source `params` reads, kept so a repeatable
+	// parameter can be read in full. RFC 8707 §2 permits `resource` to appear
+	// more than once, and params/Get would silently return only the first —
+	// dropping a resource the client asked to be bound to.
+	values := r.PostForm
 	if r.Method == http.MethodGet {
-		query := r.URL.Query()
-		params = query.Get
+		values = r.URL.Query()
 	}
+	params := values.Get
 	postForm := r.PostForm
 	header := r.Header
 	req := &service.AuthorizeRequest{
@@ -184,6 +188,7 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		CodeChallengeMethod: params("code_challenge_method"),
 		State:               params("state"),
 		Scope:               params("scope"),
+		Resource:            values["resource"],
 		Form:                postForm.Get,
 		Header: func(name string) string {
 			return header.Get(name)
@@ -315,6 +320,37 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The RFC 8707 resource ceiling (CAP-IDN-027). Validated HERE, alongside
+	// the other parameters a request can doom itself on, rather than only at
+	// step 6: reaching IssueAuthCode means having passed through the resolver
+	// chain, so a client that sent a malformed identifier would first send its
+	// human to a login surface and only then be refused. IssueAuthCode
+	// re-validates, so a programmatic caller is still gated.
+	//
+	// invalid_target in BOTH vocabularies, unlike the response_type gate above
+	// which splits them. That gate keeps invalid_request in the JSON body for
+	// backward compatibility — "what POST callers have parsed since v1" — and
+	// this gate is new, so it has no such callers to keep faith with. RFC 8707
+	// §2 names invalid_target for a resource the AS cannot honour, and
+	// /oauth2/token already answers that way for the same parameter; splitting
+	// the codes here would mean one parameter reporting two different errors
+	// depending on which endpoint rejected it.
+	resourceCeiling, err := service.ValidateAuthorizeResource(req.Resource)
+	if err != nil {
+		_, desc, status := extractOAuthError(err)
+		a.failAuthorize(w, r, req, oauthClient, status,
+			oautherror.InvalidTarget, oautherror.InvalidTarget, desc)
+
+		return
+	}
+	// Normalise the snapshot to the VALIDATED, de-duplicated ceiling. Two
+	// consumers depend on this rather than on the raw parameter:
+	// redirectToInteractiveLogin rebuilds return_to from req (and its contract
+	// is that it carries only validated parameters), and any resolver that
+	// reads req.Resource sees the canonical form rather than whatever repeated
+	// or duplicated shape arrived on the wire.
+	req.Resource = resourceCeiling
+
 	// ── Step 4: principal resolution ─────────────────────────────────
 	// The resolvePrincipal callback is wired unconditionally by
 	// Server.NewServer (it's a method bound to the server's resolver
@@ -388,9 +424,14 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	// The service layer (IssueAuthCode) does the final intersection
 	// against the client's registered scope set. Here we just combine
 	// what the caller asked for with what the resolver pre-narrowed.
+	// Tested with strings.Fields, not req.Scope != "": IssueAuthCode and
+	// requireGrantableScope both decide "did the caller actually ask" by
+	// parsing the scope string, so a whitespace-only scope must look omitted
+	// here too. Branching on != "" narrowed to an empty set here while the
+	// service still read the request as omitted and fell back to the client's
+	// full registered scopes — wider than sending no scope at all.
 	scopes := principal.Scopes
-	if req.Scope != "" {
-		requested := strings.Fields(req.Scope)
+	if requested := strings.Fields(req.Scope); len(requested) > 0 {
 		if len(scopes) > 0 {
 			scopes = intersectStrings(requested, scopes)
 		} else {
@@ -416,6 +457,8 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
 		Scopes:              scopes,
+		RequestedScope:      req.Scope,
+		Resources:           resourceCeiling,
 		Client:              oauthClient,
 	})
 	if err != nil {
@@ -475,12 +518,15 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
-//   - A self-asserted (CIMD) client. Sending a user through the deployment's real
-//     login page on behalf of a client nobody vetted is the more damaging half of
-//     the same problem failAuthorize declines: the victim authenticates for real,
-//     and the flow resumes toward an attacker-published redirect_uri. Refusing
-//     here means an unvetted client cannot borrow the login surface's credibility.
-//     Set cimd.allowed_domains to vet the publishing hosts and this applies again.
+//   - A self-asserted (CIMD) client heading for an unvetted REMOTE destination.
+//     Sending a user through the deployment's real login page on behalf of such a
+//     client is the more damaging half of the same problem failAuthorize declines:
+//     the victim authenticates for real, and the flow resumes toward an
+//     attacker-published redirect_uri. A loopback or private-use redirect_uri is
+//     not that — the code lands on the user's own machine — so those proceed, which
+//     is what keeps the native/CLI/MCP browser leg working. Setting
+//     cimd.allowed_domains lifts the refusal for remote hosts too. See
+//     refusesRedirectTo.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -499,7 +545,7 @@ func (a *API) redirectToInteractiveLogin(
 	client *domain.OAuthClient, resolverName string,
 ) bool {
 	if r.Method != http.MethodGet || a.interactiveLoginURL == nil ||
-		client == nil || client.SelfAsserted() {
+		a.refusesRedirectTo(client, req.RedirectURI) {
 		return false
 	}
 
@@ -530,6 +576,24 @@ func (a *API) redirectToInteractiveLogin(
 
 	if req.Scope != "" {
 		returnTo.Set("scope", req.Scope)
+	}
+
+	// The RFC 8707 consented ceiling MUST survive the login round trip
+	// (CAP-IDN-027). Omitting it was a silent-unbinding bug of exactly the kind
+	// this capability exists to close: the pre-login pass validates `resource`
+	// and the resumed pass then sees it absent, so the code is minted with no
+	// `rsc` claim, the access token carries no `resource` claim, and Shield —
+	// which keys INV-IDN-006 on that claim's PRESENCE — honours the token at
+	// every MCP server in the tenant. No error at any step. And because it is
+	// the FIRST browser visit that bounces through login, that was the common
+	// path, not an edge case.
+	//
+	// Added with Add rather than Set: RFC 8707 §2 permits the parameter to
+	// repeat, and req.Resource holds the validated, de-duplicated ceiling
+	// (normalised in authorizeHandler right after ValidateAuthorizeResource),
+	// which is what this function's "validated fields only" contract requires.
+	for _, resource := range req.Resource {
+		returnTo.Add("resource", resource)
 	}
 
 	q := u.Query()
@@ -582,9 +646,13 @@ func (a *API) redirectToInteractiveLogin(
 // target nobody vetted. Registered and dynamically-registered clients — where
 // somebody did — are unaffected and get the conformant redirect.
 //
-// Deployers who want CIMD clients to receive redirects can restore them by
-// setting cimd.allowed_domains, which re-establishes the vetting the rule assumes;
-// see docs/cimd.md. The gate is provenance, not the CIMD feature itself.
+// Two things narrow that deviation, because it is provenance-and-reach, not the
+// CIMD feature itself. A loopback or private-use redirect_uri is redirected
+// normally — it delivers to the caller's own device, so there is no third party
+// to hand an error or a code to, which is the same reasoning RFC 8252 §7.3 uses
+// to accept those callbacks from unregistered native clients. And setting
+// cimd.allowed_domains restores redirects to remote hosts as well, by
+// re-establishing the vetting the rule assumes. See docs/cimd.md.
 //
 // jsonCode vs redirectCode: the wire code sometimes has to differ between the
 // two shapes. A failed resolver is invalid_client to a programmatic POST caller
@@ -601,7 +669,7 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || client == nil || client.SelfAsserted() {
+	if r.Method != http.MethodGet || a.refusesRedirectTo(client, req.RedirectURI) {
 		writeAuthorizeError(w, status, jsonCode, description)
 
 		return

@@ -100,8 +100,12 @@ def main() -> None:
     # sub is the WIMSE URI, not a UUID — resolve the identity UUID from the registry.
     agent_cfg = cfg.get("agents", {}).get(agent_id) or cfg.get("agents", {}).get("*") or {}
     external_id = (agent_cfg.get("external_id") if isinstance(agent_cfg, dict) else None) or agent_id
-    identities = client.identities.list()
-    identity = next((i for i in identities if i.external_id == external_id), None)
+    # iter_all() walks every page. list() returns only the first 20 identities,
+    # which makes an existing identity look unregistered once the tenant grows.
+    identity = next(
+        (i for i in client.identities.iter_all() if i.external_id == external_id),
+        None,
+    )
     if identity is None:
         sys.exit(f"identity not found for external_id={external_id!r} — has the sidecar registered it?")
     identity_id = identity.id
