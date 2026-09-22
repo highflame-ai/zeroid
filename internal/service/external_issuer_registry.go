@@ -7,7 +7,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
-	"github.com/highflame-ai/zeroid/pkg/authjwt"
+	"github.com/highflame-ai/zeroid/pkg/jwks"
 )
 
 // ExternalIssuerEntry pairs a configured external IdP with its live JWKS
@@ -15,7 +15,7 @@ import (
 // NewExternalIssuerRegistry and shut down on Close.
 type ExternalIssuerEntry struct {
 	Config domain.ExternalIssuerConfig
-	JWKS   *authjwt.JWKSClient
+	JWKS   *jwks.Client
 }
 
 // ExternalIssuerRegistry resolves a token's iss claim to a configured
@@ -32,7 +32,7 @@ type ExternalIssuerRegistry struct {
 }
 
 // NewExternalIssuerRegistry builds a registry from validated config. Each
-// entry's JWKS client warms up best-effort: authjwt.NewJWKSClient does an
+// entry's JWKS client warms up best-effort: jwks.New does an
 // initial fetch but deliberately does NOT fail on an unreachable JWKS — it
 // logs a warning and relies on background refresh plus a synchronous
 // EnsureLoaded on the first verification (externalIDTokenExchange calls it).
@@ -41,8 +41,8 @@ type ExternalIssuerRegistry struct {
 // than blocking boot. Only config-level errors (e.g. empty jwks_uri) fail
 // here. Entries are created in order; partial failure closes whatever
 // clients were already created and returns the failing issuer's error.
-func NewExternalIssuerRegistry(ctx context.Context, configs []domain.ExternalIssuerConfig, opts ...authjwt.JWKSOption) (*ExternalIssuerRegistry, error) {
-	_ = ctx // reserved for future use; current authjwt.NewJWKSClient does its own fetch context
+func NewExternalIssuerRegistry(ctx context.Context, configs []domain.ExternalIssuerConfig, opts ...jwks.Option) (*ExternalIssuerRegistry, error) {
+	_ = ctx // reserved for future use; current jwks.New does its own fetch context
 	r := &ExternalIssuerRegistry{
 		byIss: make(map[string]*ExternalIssuerEntry, len(configs)),
 	}
@@ -55,11 +55,11 @@ func NewExternalIssuerRegistry(ctx context.Context, configs []domain.ExternalIss
 		// via opts (WithExternalIssuerJWKSOption) — the last WithHTTPClient
 		// wins. Then the per-issuer refresh interval overrides the package
 		// default; caller-supplied opts follow so they can override anything.
-		issuerOpts := append([]authjwt.JWKSOption{
-			authjwt.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.AllowPrivateEndpoints)),
-			authjwt.WithRefreshInterval(cfg.JWKSCacheTTL),
+		issuerOpts := append([]jwks.Option{
+			jwks.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.AllowPrivateEndpoints)),
+			jwks.WithRefreshInterval(cfg.JWKSCacheTTL),
 		}, opts...)
-		client, err := authjwt.NewJWKSClient(cfg.JWKSURI, issuerOpts...)
+		client, err := jwks.New(cfg.JWKSURI, issuerOpts...)
 		if err != nil {
 			r.Close()
 			return nil, fmt.Errorf("external issuer %s: %w", cfg.Issuer, err)
