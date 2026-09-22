@@ -38,7 +38,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 	"github.com/highflame-ai/zeroid/internal/telemetry"
 	"github.com/highflame-ai/zeroid/internal/worker"
-	"github.com/highflame-ai/zeroid/pkg/authjwt"
+	"github.com/highflame-ai/zeroid/pkg/jwks"
 )
 
 // middlewareHolder stores optional middleware in a thread-safe way.
@@ -193,16 +193,16 @@ type ServerOption func(*serverOptions)
 
 // serverOptions is the internal accumulator behind ServerOption.
 type serverOptions struct {
-	externalIssuerJWKSOpts []authjwt.JWKSOption
+	externalIssuerJWKSOpts []jwks.Option
 	cimdHTTPClient         *http.Client
 }
 
-// WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
+// WithExternalIssuerJWKSOption forwards a pkg/jwks option to the
 // external-issuer registry built inside NewServer. Intended primarily for
 // tests that need to bypass TLS verification when pointing the registry at
 // a fake JWKS server (httptest.NewTLSServer); production deployers should
 // not need this.
-func WithExternalIssuerJWKSOption(opt authjwt.JWKSOption) ServerOption {
+func WithExternalIssuerJWKSOption(opt jwks.Option) ServerOption {
 	return func(o *serverOptions) {
 		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
 	}
@@ -421,7 +421,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	}
 
 	// Build the external-issuer registry when the deployer has configured
-	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
+	// trusted upstream IdPs. JWKS warm-up is best-effort (pkg/jwks does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
 	// deploy); an issuer that never loads fails closed at token-exchange time.
 	var externalIssuerRegistry *service.ExternalIssuerRegistry
@@ -467,7 +467,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// server-side request forgery primitive pointed at cloud metadata endpoints
 	// and internal services.
 	clientJWKSCache := service.NewClientJWKSCache(cfg.ClientAuth.JWKSCacheSize,
-		authjwt.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
+		jwks.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
 	)
 	oauthSvc.SetClientJWKSCache(clientJWKSCache)
 

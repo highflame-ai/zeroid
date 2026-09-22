@@ -3,6 +3,7 @@ module github.com/highflame-ai/zeroid/pkg/authjwt
 go 1.27.0
 
 require (
+	github.com/highflame-ai/zeroid/pkg/jwks v1.9.4
 	github.com/lestrrat-go/jwx/v4 v4.4.0
 	github.com/rs/zerolog v1.35.1
 )
@@ -16,3 +17,5 @@ require (
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+replace github.com/highflame-ai/zeroid/pkg/jwks => ../jwks

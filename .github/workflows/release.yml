@@ -89,56 +89,44 @@ jobs:
             echo "Release tag matches svu recommendation."
           fi
 
-      # pkg/dpop drift guard. zeroid is a Go module that contains a
-      # nested published module at pkg/dpop, and zeroid's non-test
-      # code imports it — downstream consumers pull pkg/dpop
-      # transitively. The release cadences are intentionally
-      # DECOUPLED: zeroid/go.mod pins pkg/dpop to a specific released
-      # version (not the zeroid release tag). When pkg/dpop/ source
-      # changes, the maintainer runs release-dpop.yml to cut a new
-      # pkg/dpop release and open a PR bumping zeroid's reference.
-      # See RELEASING.md.
+      # LOCKSTEP CHECK. zeroid and its nested modules (pkg/authjwt,
+      # pkg/dpop) share one version, tagged at the same commit. So the
+      # only thing to verify is that go.mod already NAMES the version
+      # being released — the tag-submodules job then creates those tags
+      # at this commit, making go.mod self-consistent by construction.
       #
-      # This guard catches the foot-gun: if pkg/dpop/ source on main
-      # has diverged from the version zeroid/go.mod references, that
-      # means pkg/dpop changed but the release-dpop dance was never
-      # run. Releasing zeroid in that state ships a binary that
-      # references the OLD pkg/dpop (whatever the proxy serves for
-      # the pinned tag) while in-repo tests passed against the NEW
-      # local source — a silent regression. Fail loudly instead.
-      #
-      # pkg/authjwt is NOT checked because it's imported only from
-      # tests/integration. Go does not follow test imports across
-      # module boundaries, so its version reference (currently
-      # v0.0.0 placeholder) is invisible to downstream consumers
-      # and cannot break anything. The pkg/authjwt tag is still
-      # created by tag-submodules at every zeroid release for
-      # convenience.
-      - name: Verify pkg/dpop/ source matches the version in go.mod
+      # This replaces a source-drift guard. Drift detection was the
+      # right check for the old decoupled cadence, but it could only
+      # ever run AFTER the release tag was pushed — and for a Go module
+      # pushing the tag IS publication. v1.9.3 failed that guard
+      # correctly and shipped anyway: module tag live and serving a
+      # broken go.mod, with goreleaser and tag-submodules skipped.
+      # Under lockstep there is no drift to detect, and this check
+      # fails BEFORE any submodule tag is created.
+      - name: Verify submodule pins match the release version (lockstep)
         shell: bash
         run: |-
-          MODPATH="github.com/highflame-ai/zeroid/pkg/dpop"
-          REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
-          if [[ -z "${REF}" ]]; then
-            echo "::error::go.mod has no require directive for ${MODPATH}"
-            exit 1
-          fi
-          TAG="pkg/dpop/${REF}"
-          if ! git rev-parse "${TAG}" >/dev/null 2>&1; then
-            echo "::error::go.mod references ${MODPATH} ${REF} but tag ${TAG} does not exist."
-            echo "::error::This usually means the pkg/dpop release-dpop dance was started but not completed."
-            echo "::error::Either fix go.mod to reference an existing pkg/dpop tag, or run release-dpop.yml."
-            exit 1
-          fi
-          if ! git diff --quiet "${TAG}" -- pkg/dpop/; then
-            echo "::error::pkg/dpop/ source has drifted from ${TAG} but go.mod still references it."
-            echo "::error::Releasing zeroid now would ship a binary using the OLD pkg/dpop ${REF}, while in-repo tests passed against the NEW local source. Silent regression risk."
-            echo "::error::Fix by running release-dpop.yml first to cut a new pkg/dpop release and update zeroid/go.mod's reference:"
-            echo "::error::  gh workflow run release-dpop.yml --field version=<next-dpop-vX.Y.Z>"
-            echo "::error::  # ...review + merge the PR opened by release-dpop, then re-publish this release."
-            exit 1
-          fi
-          echo "✓ pkg/dpop/ source matches ${TAG} — safe to release"
+          VERSION="${{ env.RELEASE_TAG }}"
+          FAILED=0
+          for MOD in dpop authjwt jwks; do
+            MODPATH="github.com/highflame-ai/zeroid/pkg/${MOD}"
+            REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
+            if [[ -z "${REF}" ]]; then
+              echo "::error::go.mod has no require directive for ${MODPATH}"
+              FAILED=1
+              continue
+            fi
+            if [[ "${REF}" != "${VERSION}" ]]; then
+              echo "::error::go.mod pins ${MODPATH} to ${REF}, but this release is ${VERSION}."
+              echo "::error::All modules release in lockstep, so the pins must name the version being released."
+              echo "::error::Fix: make release-prep VERSION=${VERSION}   (bumps go.mod and opens a PR), then re-run."
+              FAILED=1
+              continue
+            fi
+            echo "✓ ${MODPATH} pinned at ${VERSION}"
+          done
+          [[ "${FAILED}" -eq 0 ]] || exit 1
+          echo "✓ all module pins match ${VERSION} — safe to release"
 
   tag-submodules:
     needs:
@@ -153,34 +141,38 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      # Tag pkg/authjwt at the release commit. pkg/authjwt is
-      # CLUBBED with zeroid releases — its version moves in lockstep
-      # with zeroid's because it's imported only from tests/integration
-      # (not transitively visible to downstream consumers) and so its
-      # version reference in zeroid/go.mod cannot break anything. Any
-      # external consumer who imports pkg/authjwt directly gets the
-      # tag at the zeroid release commit, which is the most recent
-      # source.
+      # Tag every nested module at the release commit. LOCKSTEP: all
+      # modules carry the same version, so a consumer resolving
+      # zeroid@vX.Y.Z gets pkg/dpop@vX.Y.Z and pkg/authjwt@vX.Y.Z built
+      # from this exact tree — no version arithmetic, no stale-pin state.
       #
-      # pkg/dpop is NOT tagged here. It has DECOUPLED release cadence
-      # because it IS transitively visible to downstream consumers,
-      # and zeroid/go.mod references a specific pinned pkg/dpop
-      # version. Tagging pkg/dpop only happens via release-dpop.yml
-      # when its source actually changes. The highflame-validate
-      # job above guards against pkg/dpop source drifting from the
-      # pinned version.
-      - name: Tag pkg/authjwt at release commit
+      # pkg/dpop used to be excluded here and released on its own cadence
+      # via release-dpop.yml. That cadence bought nothing measurable —
+      # consumers pinned mismatched versions and lagged by minors rather
+      # than deliberately holding back — while the coordination it
+      # required is what let the #347 replay-store fix sit unpublished.
+      - name: Tag nested modules at release commit
         shell: bash
         run: |
           VERSION="${{ env.RELEASE_TAG }}"
-          SUBTAG="pkg/authjwt/${VERSION}"
-          if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
-            echo "Tag ${SUBTAG} already exists, skipping"
-          else
-            git tag "${SUBTAG}"
-            git push origin "${SUBTAG}"
-            echo "Created and pushed tag ${SUBTAG}"
-          fi
+          # Leaf-first, deliberately. pkg/authjwt's go.mod requires pkg/jwks
+          # at this same version, so tagging authjwt before jwks publishes a
+          # module whose own dependency does not yet exist. The window is
+          # normally milliseconds — but for a Go module PUSHING THE TAG IS
+          # PUBLICATION, which is the entire lesson of the v1.9.3 incident
+          # this change exists to prevent. If the job dies between the two
+          # pushes, pkg/authjwt is permanently published unresolvable: the
+          # same failure, one level down. Ordering costs nothing.
+          for MOD in jwks dpop authjwt; do
+            SUBTAG="pkg/${MOD}/${VERSION}"
+            if git rev-parse "${SUBTAG}" >/dev/null 2>&1; then
+              echo "Tag ${SUBTAG} already exists, skipping"
+            else
+              git tag "${SUBTAG}"
+              git push origin "${SUBTAG}"
+              echo "Created and pushed tag ${SUBTAG}"
+            fi
+          done
 
   highflame-sast:
     needs:
