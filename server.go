@@ -197,7 +197,7 @@ type serverOptions struct {
 	cimdHTTPClient         *http.Client
 }
 
-// WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
+// WithExternalIssuerJWKSOption forwards a pkg/jwks option to the
 // external-issuer registry built inside NewServer. Intended primarily for
 // tests that need to bypass TLS verification when pointing the registry at
 // a fake JWKS server (httptest.NewTLSServer); production deployers should
@@ -421,7 +421,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	}
 
 	// Build the external-issuer registry when the deployer has configured
-	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
+	// trusted upstream IdPs. JWKS warm-up is best-effort (pkg/jwks does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
 	// deploy); an issuer that never loads fails closed at token-exchange time.
 	var externalIssuerRegistry *service.ExternalIssuerRegistry
