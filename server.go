@@ -194,6 +194,7 @@ type ServerOption func(*serverOptions)
 // serverOptions is the internal accumulator behind ServerOption.
 type serverOptions struct {
 	externalIssuerJWKSOpts []jwks.Option
+	cimdHTTPClient         *http.Client
 }
 
 // WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
@@ -204,6 +205,24 @@ type serverOptions struct {
 func WithExternalIssuerJWKSOption(opt jwks.Option) ServerOption {
 	return func(o *serverOptions) {
 		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
+	}
+}
+
+// WithCIMDHTTPClient replaces the HTTP client the CIMD metadata-document
+// fetcher uses. Sibling of WithExternalIssuerJWKSOption and intended for the
+// same narrow reason: a test publishing documents on httptest.NewTLSServer
+// needs a client that trusts that server's self-signed cert, which no Config
+// field can express. Production deployers should not need this.
+//
+// SUPPLYING ONE REPLACES THE SSRF GUARD, which is the whole point and also the
+// hazard: the default client refuses a client_id URL resolving to a private,
+// loopback, link-local, multicast, CGN or unspecified address, and CIMD fetches
+// request-supplied URLs. Anything passed here is trusted to make that decision
+// itself. cimd.allow_private_metadata_endpoints is the supported way to relax
+// the guard without also replacing it.
+func WithCIMDHTTPClient(c *http.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.cimdHTTPClient = c
 	}
 }
 
@@ -363,12 +382,16 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// dispatch, so a client_id URL can never make ZeroID reach a private /
 	// loopback / metadata address (unless the deployer opts into the test/dev
 	// relaxation). Enabled by default (cfg.CIMD.Enabled defaults true).
+	cimdHTTPClient := options.cimdHTTPClient
+	if cimdHTTPClient == nil {
+		cimdHTTPClient = attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints)
+	}
 	cimdSvc := service.NewCIMDService(service.CIMDConfig{
 		Enabled:          cfg.CIMD.Enabled,
 		AllowedDomains:   cfg.CIMD.AllowedDomains,
 		MaxDocumentBytes: cfg.CIMD.MaxDocumentBytes,
 		CacheTTL:         time.Duration(cfg.CIMD.CacheTTLSeconds) * time.Second,
-		HTTPClient:       attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints),
+		HTTPClient:       cimdHTTPClient,
 	})
 	oauthSvc.SetCIMDService(cimdSvc)
 	if cfg.CIMD.Enabled {
