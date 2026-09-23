@@ -122,6 +122,11 @@ type IssueRequest struct {
 	// Used for external principal exchange (sub = external user ID) and authorization_code
 	// (sub = authenticated user ID). For NHI grants, leave empty to use the WIMSE URI.
 	SubjectOverride string
+	// OwnerUserIDOverride sources the owner_user_id claim from the credential's
+	// own provenance instead of Identity.OwnerUserID. Set by the api_key grant
+	// for auto-provisioned service placeholders: those rows are shared by every
+	// key for a product, so their owner is only whoever created the first key.
+	OwnerUserIDOverride string
 	// ActingUserID is the end user the principal is acting on behalf of (runtime, per-request).
 	// Distinct from the identity owner (Identity.OwnerUserID) who registered the agent.
 	// For NHI tokens where an agent serves a specific user, this populates the RFC 8693 "act" claim.
@@ -416,11 +421,19 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	_ = token.Set("trust_level", string(req.Identity.TrustLevel))
 	_ = token.Set("status", string(req.Identity.Status))
 
-	// Owner — the user who registered/owns this identity. Distinct from:
+	// Owner: the human accountable for this credential. Distinct from:
 	//   - sub (the principal itself)
 	//   - act.sub (the end user the principal is acting on behalf of)
-	if req.Identity.OwnerUserID != "" {
-		_ = token.Set("owner_user_id", req.Identity.OwnerUserID)
+	//
+	// Normally the identity's registered owner. OwnerUserIDOverride wins when
+	// set, because a shared placeholder identity's owner is not accountable for
+	// a credential someone else provisioned under it (see the field doc).
+	owner := req.Identity.OwnerUserID
+	if req.OwnerUserIDOverride != "" {
+		owner = req.OwnerUserIDOverride
+	}
+	if owner != "" {
+		_ = token.Set("owner_user_id", owner)
 	}
 
 	if req.DelegationDepth > 0 {
