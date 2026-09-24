@@ -1580,9 +1580,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		GrantType:          domain.GrantTypeAPIKey,
 		UseRS256:           true,
 		// sub = WIMSE URI (the identity), not the creator.
-		// owner_user_id is set from Identity.OwnerUserID automatically.
 		// The creator is the acting user (the developer using the SDK right now).
-		ActingUserID: sk.CreatedBy,
+		ActingUserID:        sk.CreatedBy,
+		OwnerUserIDOverride: apiKeyOwnerOverride(identity, sk),
 		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
@@ -1609,6 +1609,25 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	}()
 
 	return accessToken, nil
+}
+
+// apiKeyOwnerOverride returns the human to carry owner_user_id for a credential
+// minted from sk, or "" to keep the identity's registered owner. A key with no
+// identity_id shares one placeholder identity per (account, project, product)
+// whose owner is frozen at first creation, so it names the wrong human for every
+// later key. Registered identities keep their registrant (INV-IDN-012).
+//
+// Known gap: an explicitly registered identity_type=service identity is not
+// distinguishable from the auto-provisioned placeholder (both leave created_by
+// empty), so its registrant is displaced too. Needs a marker column to fix.
+func apiKeyOwnerOverride(identity *domain.Identity, sk *domain.APIKey) string {
+	if identity == nil || sk == nil || identity.IdentityType != domain.IdentityTypeService {
+		return ""
+	}
+
+	// usableHuman is the repo's filter for this value class: it trims, caps
+	// length, and rejects the reserved system: prefix case-insensitively.
+	return usableHuman(sk.CreatedBy)
 }
 
 // IssueAuthCodeRequest is the input shape for OAuthService.IssueAuthCode —
