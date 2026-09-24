@@ -117,7 +117,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// verbatim with the ID-JAG jwt-bearer path (validateExternalAssertion).
 	// "subject_token" is the field name in the error strings because that is
 	// what an id_token-exchange caller presents.
-	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token")
+	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +270,39 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 // in error strings ("subject_token" vs "assertion") so callers surface the
 // right wire field. On success the verified token is returned for claim
 // mapping; on any failure an *OAuthError shaped for direct return.
-func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string) (jwt.Token, error) {
+// subjectRequirement says what satisfies RFC 7523 §3's requirement that an
+// assertion "identify the principal that is the subject of the JWT".
+//
+// It is a parameter rather than a constant because the two callers are on
+// different profiles and the answer genuinely differs — and because relaxing it
+// for both would be a security change to the external-IdP token exchange that
+// nobody asked for.
+type subjectRequirement int
+
+const (
+	// requirePlainSub is RFC 7523 §3 as written: a `sub` claim, or nothing. The
+	// external-IdP subject_token exchange stays here.
+	requirePlainSub subjectRequirement = iota
+
+	// allowSubjectIdentifier additionally accepts a resolvable RFC 9493 `sub_id`
+	// (zeroid#265).
+	//
+	// A DELIBERATE DEVIATION FROM RFC 7523 §3, confined to the ID-JAG profile,
+	// and worth stating plainly because the specs disagree: §3 says the JWT MUST
+	// carry `sub`, while the MCP interop matrix lists `sub_id` as a supported
+	// way for an ID-JAG to name its subject — and its acceptance case drops
+	// `sub` entirely. An assertion in that shape is non-conformant to RFC 7523
+	// read literally.
+	//
+	// Accepted here because `sub_id` identifies the principal at least as
+	// precisely as `sub` does (more so for iss_sub, which cannot collide across
+	// issuers), so the SPIRIT of §3 is met even where the letter is not. Scoped
+	// to this one profile so the deviation is a decision recorded in one place
+	// rather than a general loosening — subject_token is unaffected.
+	allowSubjectIdentifier
+)
+
+func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement) (jwt.Token, error) {
 	cfg := entry.Config
 
 	// Algorithm allowlist gate. Read the JWS header before signature
@@ -338,7 +370,21 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 	// token without an expiry (replayable forever) or without a subject is
 	// rejected rather than silently accepted.
 	if _, ok := verified.Subject(); !ok {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing required sub claim", fieldName))
+		if subjectReq != allowSubjectIdentifier {
+			return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing required sub claim", fieldName))
+		}
+		// An RFC 9493 `sub_id` may stand in for `sub` on this profile. It must
+		// actually RESOLVE — a present-but-unreadable one is reported as such
+		// rather than as a missing subject, because those are different faults
+		// and the publisher can only fix the one they are told about.
+		_, resolved, subIDErr := resolveSubjectIdentifier(tokenClaimsAsMap(verified))
+		if subIDErr != nil {
+			return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s has an unusable sub_id: %v", fieldName, subIDErr))
+		}
+		if !resolved {
+			return nil, oauthBadRequest("invalid_grant",
+				fmt.Sprintf("%s has neither a sub claim nor a sub_id — nothing identifies the principal", fieldName))
+		}
 	}
 	if _, ok := verified.Expiration(); !ok {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s missing required exp claim", fieldName))
