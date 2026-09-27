@@ -141,6 +141,10 @@ SDK / Cedar / DB contract for no functional gain).
 - `discovered → active` — **direct activation**, permitted only when adoption *and*
   activation happen together: the first EMA / ID-JAG mint for the agent both assigns the
   reconciled identity and grants it rights. (Otherwise go `discovered → pending → active`.)
+- Both adoption transitions stamp `adopted_at`; reverting an adoption (`pending →
+  discovered`, via dismiss) clears it. Connector syncs never touch it, unlike
+  `updated_at`, so inventory lists order by `COALESCE(adopted_at, created_at)`:
+  newest adoption first, with native identities keeping their creation time.
 - All existing transitions (`pending→active`, `active→suspended|deactivated|expired`,
   `suspended→active`, …) are unchanged.
 
