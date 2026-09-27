@@ -121,7 +121,7 @@ func TestAdoptedAt_BackfillMatchesRuntime(t *testing.T) {
 	require.Nil(t, runtime[native])
 
 	// Forget the runtime stamps, then let the backfill rebuild them.
-	_, err := testDB.NewUpdate().Table("identities").Set("adopted_at = NULL").Where("id IN (?)", bun.In(ids)).Exec(ctx)
+	_, err := testDB.NewUpdate().Table("identities").Set("adopted_at = NULL").Where("id IN (?)", bun.List(ids)).Exec(ctx)
 	require.NoError(t, err)
 	backfill, err := migrations.FS.ReadFile("046_identity_adopted_at_backfill.up.sql")
 	require.NoError(t, err)
