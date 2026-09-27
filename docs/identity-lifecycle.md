@@ -126,7 +126,7 @@ SDK / Cedar / DB contract for no functional gain).
 
 | Our `status` | ISO/IEC 24760 | `IsUsable()` | Meaning |
 | --- | --- | --- | --- |
-| **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no Highflame credential. |
+| **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no ZeroID credential. |
 | `pending` | **Established** | false | Registered & **owned**, governable, not yet granted rights. The "adopted" state. |
 | `active` | **Active** | **true** | Granted rights: credential enrolled or reconciled via EMA. The "managed" state. |
 | `suspended` | **Suspended** | false | Reversible halt. |
