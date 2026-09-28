@@ -377,11 +377,12 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 		// actually RESOLVE — a present-but-unreadable one is reported as such
 		// rather than as a missing subject, because those are different faults
 		// and the publisher can only fix the one they are told about.
-		_, resolved, subIDErr := resolveSubjectIdentifier(tokenClaimsAsMap(verified))
+		verifiedIss, _ := verified.Issuer()
+		subID, subIDErr := parseSubjectIdentifier(tokenClaimsAsMap(verified), verifiedIss)
 		if subIDErr != nil {
 			return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("%s has an unusable sub_id: %v", fieldName, subIDErr))
 		}
-		if !resolved {
+		if subID == nil {
 			return nil, oauthBadRequest("invalid_grant",
 				fmt.Sprintf("%s has neither a sub claim nor a sub_id — nothing identifies the principal", fieldName))
 		}

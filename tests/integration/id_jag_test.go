@@ -648,14 +648,69 @@ func TestIDJAG_SubjectIdentifier(t *testing.T) {
 			"the structured identifier must BECOME the principal, not merely be tolerated")
 	})
 
-	t.Run("iss_sub keeps the issuer so subjects cannot collide", func(t *testing.T) {
+	t.Run("iss_sub is ONE principal with the plain sub it restates", func(t *testing.T) {
+		// Same person, two assertion shapes, one principal. An earlier version
+		// rendered iss_sub as "iss#sub", which gave this person a second user_id
+		// and would have re-keyed every user of an IdP the day it began emitting
+		// sub_id. The issuer is already on the token as user_id_iss, and is now
+		// pinned to the signer (next case), so the bare sub is collision-safe.
+		viaSubID := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "1001"},
+		})
+		require.Equal(t, http.StatusOK, viaSubID.StatusCode, "body=%s", viaSubID.RawBody)
+		viaSub := redeem(t, map[string]any{"sub": "1001"})
+		require.Equal(t, http.StatusOK, viaSub.StatusCode, "body=%s", viaSub.RawBody)
+
+		a := decodeIssuedTokenClaims(t, viaSubID.AccessToken)
+		b := decodeIssuedTokenClaims(t, viaSub.AccessToken)
+		assert.Equal(t, "1001", a["sub"])
+		assert.Equal(t, b["sub"], a["sub"], "one person must not have two principals")
+		assert.Equal(t, upstreamIss, a["user_id_iss"],
+			"the issuer that disambiguates subjects across IdPs is recorded here")
+	})
+
+	t.Run("iss_sub naming ANOTHER issuer is refused", func(t *testing.T) {
+		// The object's iss is chosen by the IdP that signed it. Unchecked, one
+		// trusted IdP could mint principals in another IdP's namespace — the
+		// exact collision the issuer exists to prevent.
 		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "iss_sub", "iss": "https://other-idp.test", "sub": "admin"},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "may only identify its own subjects")
+	})
+
+	t.Run("iss_sub agreeing with sub is accepted", func(t *testing.T) {
+		// The most internally consistent assertion possible. The previous
+		// comparison set "1001" against "iss#1001" and refused it every time.
+		resp := redeem(t, map[string]any{
+			"sub":    "1001",
 			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "1001"},
 		})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
-		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
-		assert.Equal(t, upstreamIss+"#1001", claims["sub"],
-			"a bare 1001 would merge this person with subject 1001 at every other IdP")
+		assert.Equal(t, "1001", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("iss_sub contradicting sub is refused", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub":    "1001",
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "2002"},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "different principals")
+	})
+
+	t.Run("opaque sub plus email sub_id — the common IdP shape — mints", func(t *testing.T) {
+		// Two different KINDS of identifier for one person. Comparing their
+		// strings proves nothing, and refusing it rejected ordinary IdPs. The
+		// principal is still the deployer's mapped claim.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uOKTA123",
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uOKTA123", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"],
+			"the mapped claim stays authoritative when present")
 	})
 
 	t.Run("a plain sub still works and is unaffected", func(t *testing.T) {
@@ -677,8 +732,13 @@ func TestIDJAG_SubjectIdentifier(t *testing.T) {
 		// either a broken IdP or an attempt to have one identity pass the checks
 		// while another reaches the mint. Silently preferring either would make
 		// which identity is authorised depend on an implementation detail.
+		//
+		// Compared like with like: an email sub_id against the plain email
+		// claim. (An email-shaped `sub` is not an email claim — `sub` is opaque
+		// by spec — so that pairing is a different kind and not compared.)
 		resp := redeem(t, map[string]any{
-			"sub":    alice,
+			"sub":    "00uALICE",
+			"email":  alice,
 			"sub_id": map[string]any{"format": "email", "email": mallory},
 		})
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)

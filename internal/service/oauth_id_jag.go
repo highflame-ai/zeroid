@@ -218,8 +218,8 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// structured identifier instead of, or as well as, the plain mapped claim.
 	// Resolved here rather than inside the mapping helper because it is a
 	// spec-named claim with its own shape, not another path ClaimMapping could
-	// point at.
-	subIDPrincipal, haveSubID, err := resolveSubjectIdentifier(rawClaims)
+	// point at. upstreamIss is the verified issuer, which `iss_sub` is pinned to.
+	subID, err := parseSubjectIdentifier(rawClaims, upstreamIss)
 	if err != nil {
 		// A present-but-unreadable sub_id fails the redemption outright. It must
 		// NOT fall back to the plain subject: an IdP that meant to name a subject
@@ -228,16 +228,23 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// ends up authorising someone other than whoever it was written for.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG has an unusable sub_id: %v", err))
 	}
-	if haveSubID {
-		// Both present and disagreeing is refused, never merged and never
-		// ranked. Two different principals in one assertion is either a broken
-		// IdP or an attempt to have one identity pass the checks while another
-		// reaches the mint; there is no reading of it safe to act on.
-		if subjectIdentifierConflicts(userID, subIDPrincipal) {
+	if subID != nil {
+		// A same-kind contradiction is refused, never merged and never ranked:
+		// two different principals in one assertion is either a broken IdP or
+		// an attempt to have one identity pass the checks while another reaches
+		// the mint. Only identifiers of the same kind are compared — an opaque
+		// `sub` beside an email `sub_id` is two names for one person, not two
+		// people, and refusing it would reject the most common IdP shape.
+		if claim := subID.conflictingClaim(rawClaims); claim != "" {
 			return nil, oauthBadRequest(oautherror.InvalidGrant,
-				"ID-JAG sub_id and the mapped user_id claim name different principals")
+				fmt.Sprintf("ID-JAG sub_id and the %q claim name different principals", claim))
 		}
-		userID = subIDPrincipal
+		// The deployer's mapping stays authoritative. sub_id supplies the
+		// principal only when the mapped claim is absent, so the same person
+		// keeps one user_id whether or not their IdP emits sub_id.
+		if userID == "" {
+			userID = subID.principal
+		}
 	}
 
 	if userID == "" {
