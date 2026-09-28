@@ -904,6 +904,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			identity.OwnerUserID == "" {
 			return nil, fmt.Errorf("%w: adopting a discovered identity requires an owner_user_id", ErrInvalidIdentityField)
 		}
+		if priorStatus == domain.IdentityStatusDiscovered &&
+			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) {
+			now := time.Now()
+			identity.AdoptedAt = &now
+		}
 		identity.Status = *req.Status
 	}
 	if req.CredentialPolicyID != nil {
@@ -1329,6 +1334,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		identity.Status = domain.IdentityStatusDiscovered
 		identity.OwnerUserID = ""
 		identity.CredentialPolicyID = defaultPolicyID
+		identity.AdoptedAt = nil
 		identity.UpdatedAt = time.Now()
 		if err := s.repo.Update(ctx, identity); err != nil {
 			return nil, err
