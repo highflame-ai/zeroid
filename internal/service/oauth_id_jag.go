@@ -189,7 +189,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
 	// the wire field for ID-JAG callers.
-	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion")
+	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier)
 	if err != nil {
 		return nil, err
 	}
@@ -212,9 +212,57 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// resolve the external subject through ClaimMapping. Fail closed when it is
 	// absent or empty — an unmappable identity must never mint a token (an
 	// admitted-but-unidentifiable agent matches no Cedar policy).
-	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
-	if !ok || userID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
+	userID, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
+
+	// RFC 9493 `sub_id` (zeroid#265). An IdP may name the subject with a
+	// structured identifier instead of, or as well as, the plain mapped claim.
+	// Resolved here rather than inside the mapping helper because it is a
+	// spec-named claim with its own shape, not another path ClaimMapping could
+	// point at. upstreamIss is the verified issuer, which `iss_sub` is pinned to.
+	subID, err := parseSubjectIdentifier(rawClaims, upstreamIss)
+	switch {
+	case err == nil:
+	case errors.Is(err, errSubjectIdentifierUnsupported) && userID != "":
+		// A well-formed sub_id in a format we do not resolve, beside a present
+		// mapped claim. The mapped claim is the principal, and a format we
+		// cannot read can neither supply nor contradict it, so it is set aside
+		// rather than allowed to sink an otherwise valid assertion — an IdP
+		// emitting RFC 9493's `account` or `phone_number` next to an ordinary
+		// sub is conformant, not broken.
+		log.Debug().Err(err).Str("user_id_iss", upstreamIss).
+			Msg("ID-JAG sub_id format not resolved; mapped claim is authoritative")
+		subID = nil
+	default:
+		// Everything else fails the redemption outright: a MALFORMED sub_id,
+		// a foreign-issuer iss_sub, or an unsupported one we would have needed
+		// as the principal. It must NOT fall back to the plain subject: an IdP
+		// that meant to name a subject and produced something we cannot read
+		// has told us its identity claim is broken, and quietly minting on a
+		// different claim is how an assertion ends up authorising someone other
+		// than whoever it was written for.
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG has an unusable sub_id: %v", err))
+	}
+	if subID != nil {
+		// A same-kind contradiction is refused, never merged and never ranked:
+		// two different principals in one assertion is either a broken IdP or
+		// an attempt to have one identity pass the checks while another reaches
+		// the mint. Only identifiers of the same kind are compared — an opaque
+		// `sub` beside an email `sub_id` is two names for one person, not two
+		// people, and refusing it would reject the most common IdP shape.
+		if claim := subID.conflictingClaim(rawClaims); claim != "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant,
+				fmt.Sprintf("ID-JAG sub_id and the %q claim name different principals", claim))
+		}
+		// The deployer's mapping stays authoritative. sub_id supplies the
+		// principal only when the mapped claim is absent, so the same person
+		// keeps one user_id whether or not their IdP emits sub_id.
+		if userID == "" {
+			userID = subID.principal
+		}
+	}
+
+	if userID == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) and has no usable sub_id — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
 	}
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
