@@ -493,6 +493,12 @@ type Identity struct {
 	// worker sweeps the identity into status=deactivated.
 	ExpiresAt *time.Time `bun:"expires_at" json:"expires_at,omitempty"`
 
+	// AdoptedAt is when a discovered identity was last adopted (discovered →
+	// pending|active); cleared if the adoption is reverted. NULL for native
+	// identities and anything never adopted. Distinct from UpdatedAt, which
+	// every connector sync bumps.
+	AdoptedAt *time.Time `bun:"adopted_at" json:"adopted_at,omitempty"`
+
 	// Lifecycle
 	CreatedBy  string    `bun:"created_by,type:varchar(255)"   json:"created_by,omitempty"`
 	ModifiedBy string    `bun:"modified_by,type:varchar(255)"  json:"modified_by,omitempty"`
