@@ -125,7 +125,10 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	q := db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
-		OrderExpr("created_at DESC")
+		// Adopted identities sort by when they were adopted, not when a
+		// connector first saw them (migration 045); everything else keeps its
+		// creation time. id breaks ties so offset pagination is stable.
+		OrderExpr("COALESCE(adopted_at, created_at) DESC, id DESC")
 
 	if len(identityTypes) == 1 {
 		q = q.Where("identity_type = ?", identityTypes[0])

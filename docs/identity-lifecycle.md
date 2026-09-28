@@ -126,7 +126,7 @@ SDK / Cedar / DB contract for no functional gain).
 
 | Our `status` | ISO/IEC 24760 | `IsUsable()` | Meaning |
 | --- | --- | --- | --- |
-| **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no Highflame credential. |
+| **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no ZeroID credential. |
 | `pending` | **Established** | false | Registered & **owned**, governable, not yet granted rights. The "adopted" state. |
 | `active` | **Active** | **true** | Granted rights: credential enrolled or reconciled via EMA. The "managed" state. |
 | `suspended` | **Suspended** | false | Reversible halt. |
@@ -141,6 +141,10 @@ SDK / Cedar / DB contract for no functional gain).
 - `discovered → active` — **direct activation**, permitted only when adoption *and*
   activation happen together: the first EMA / ID-JAG mint for the agent both assigns the
   reconciled identity and grants it rights. (Otherwise go `discovered → pending → active`.)
+- Both adoption transitions stamp `adopted_at`; reverting an adoption (`pending →
+  discovered`, via dismiss) clears it. Connector syncs never touch it, unlike
+  `updated_at`, so inventory lists order by `COALESCE(adopted_at, created_at)`:
+  newest adoption first, with native identities keeping their creation time.
 - All existing transitions (`pending→active`, `active→suspended|deactivated|expired`,
   `suspended→active`, …) are unchanged.
 

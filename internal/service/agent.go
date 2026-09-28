@@ -111,6 +111,7 @@ type AgentResponse struct {
 	CreatedAt          time.Time             `json:"created_at"`
 	CreatedBy          string                `json:"created_by"`
 	UpdatedAt          time.Time             `json:"updated_at"`
+	AdoptedAt          *time.Time            `json:"adopted_at,omitempty"`
 	DelegationDepth    int                   `json:"delegation_depth"`
 }
 
@@ -603,6 +604,7 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 		Labels:             labels,
 		Metadata:           metadata,
 		CreatedAt:          identity.CreatedAt,
+		AdoptedAt:          identity.AdoptedAt,
 		CreatedBy:          identity.CreatedBy,
 		UpdatedAt:          identity.UpdatedAt,
 	}
