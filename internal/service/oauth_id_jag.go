@@ -220,12 +220,26 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// spec-named claim with its own shape, not another path ClaimMapping could
 	// point at. upstreamIss is the verified issuer, which `iss_sub` is pinned to.
 	subID, err := parseSubjectIdentifier(rawClaims, upstreamIss)
-	if err != nil {
-		// A present-but-unreadable sub_id fails the redemption outright. It must
-		// NOT fall back to the plain subject: an IdP that meant to name a subject
-		// and produced something we cannot read has told us its identity claim is
-		// broken, and quietly minting on a different claim is how an assertion
-		// ends up authorising someone other than whoever it was written for.
+	switch {
+	case err == nil:
+	case errors.Is(err, errSubjectIdentifierUnsupported) && userID != "":
+		// A well-formed sub_id in a format we do not resolve, beside a present
+		// mapped claim. The mapped claim is the principal, and a format we
+		// cannot read can neither supply nor contradict it, so it is set aside
+		// rather than allowed to sink an otherwise valid assertion — an IdP
+		// emitting RFC 9493's `account` or `phone_number` next to an ordinary
+		// sub is conformant, not broken.
+		log.Debug().Err(err).Str("user_id_iss", upstreamIss).
+			Msg("ID-JAG sub_id format not resolved; mapped claim is authoritative")
+		subID = nil
+	default:
+		// Everything else fails the redemption outright: a MALFORMED sub_id,
+		// a foreign-issuer iss_sub, or an unsupported one we would have needed
+		// as the principal. It must NOT fall back to the plain subject: an IdP
+		// that meant to name a subject and produced something we cannot read
+		// has told us its identity claim is broken, and quietly minting on a
+		// different claim is how an assertion ends up authorising someone other
+		// than whoever it was written for.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG has an unusable sub_id: %v", err))
 	}
 	if subID != nil {

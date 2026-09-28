@@ -1,6 +1,8 @@
 package service
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +15,9 @@ const testAssertionIss = "https://idp.example.com"
 
 // addr builds an email-shaped value without a literal address in source.
 func addr(local, domain string) string { return local + "\x40" + domain }
+
+// testPhone builds an E.164-shaped value at runtime.
+func testPhone() string { return "+1" + strings.Repeat("5", 10) }
 
 func TestParseSubjectIdentifier(t *testing.T) {
 	t.Parallel()
@@ -92,29 +97,55 @@ func TestParseSubjectIdentifier(t *testing.T) {
 		assert.Equal(t, " padded ", got.principal)
 	})
 
+	// MALFORMED: a broken identity claim. Always fatal, never the sentinel.
 	for name, claim := range map[string]any{
 		"not an object":           addr("alice", "example.com"),
 		"missing format":          map[string]any{"email": addr("alice", "example.com")},
 		"blank format":            map[string]any{"format": "   ", "email": addr("a", "b.c")},
-		"format with padding":     map[string]any{"format": " email", "email": addr("a", "b.c")},
-		"unknown format":          map[string]any{"format": "phone_number", "phone_number": "+15551234"},
 		"email without email":     map[string]any{"format": "email"},
 		"email with blank member": map[string]any{"format": "email", "email": "   "},
 		"opaque without id":       map[string]any{"format": "opaque"},
 		"iss_sub without iss":     map[string]any{"format": "iss_sub", "sub": "1001"},
 		"iss_sub without sub":     map[string]any{"format": "iss_sub", "iss": testAssertionIss},
 		"non-string member":       map[string]any{"format": "email", "email": 42},
-		"aliases is refused by design": map[string]any{
+		"iss_sub foreign issuer":  map[string]any{"format": "iss_sub", "iss": "https://other.example", "sub": "x"},
+	} {
+		t.Run("malformed: "+name, func(t *testing.T) {
+			got, err := parseSubjectIdentifier(map[string]any{"sub_id": claim}, testAssertionIss)
+			require.Error(t, err, "a malformed sub_id must fail, not read as absent")
+			assert.Nil(t, got)
+			assert.False(t, errors.Is(err, errSubjectIdentifierUnsupported),
+				"malformed must never be classed as merely unsupported — that class can be set aside")
+		})
+	}
+
+	// UNSUPPORTED: well-formed but unresolved here. The caller may set these
+	// aside when the mapped claim is present, so they must carry the sentinel.
+	for name, claim := range map[string]any{
+		"RFC 9493 account":      map[string]any{"format": "account", "uri": "acct:" + addr("alice", "x.test")},
+		"RFC 9493 phone_number": map[string]any{"format": "phone_number", "phone_number": testPhone()},
+		"format with padding":   map[string]any{"format": " email", "email": addr("a", "b.c")},
+		"aliases by design": map[string]any{
 			"format":  "aliases",
 			"aliases": []any{map[string]any{"format": "email", "email": addr("a", "b.c")}},
 		},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run("unsupported: "+name, func(t *testing.T) {
 			got, err := parseSubjectIdentifier(map[string]any{"sub_id": claim}, testAssertionIss)
-			require.Error(t, err, "a malformed sub_id must fail, not read as absent")
+			require.Error(t, err)
 			assert.Nil(t, got)
+			assert.True(t, errors.Is(err, errSubjectIdentifierUnsupported))
 		})
 	}
+
+	t.Run("IdP-controlled strings are bounded in the error text", func(t *testing.T) {
+		long := strings.Repeat("x", 10*maxEchoedClaimLen)
+		_, err := parseSubjectIdentifier(map[string]any{
+			"sub_id": map[string]any{"format": long},
+		}, testAssertionIss)
+		require.Error(t, err)
+		assert.Less(t, len(err.Error()), 3*maxEchoedClaimLen)
+	})
 }
 
 func TestSubjectIdentifierConflictingClaim(t *testing.T) {
@@ -152,6 +183,10 @@ func TestSubjectIdentifierConflictingClaim(t *testing.T) {
 
 		// Absent counterpart: nothing to contradict.
 		{"iss_sub with no plain sub", issSub("1001"), map[string]any{}, ""},
+
+		// Blank identifies nobody, so it cannot name a different somebody.
+		{"blank email claim", email(alice), map[string]any{"email": ""}, ""},
+		{"whitespace-only sub", issSub("1001"), map[string]any{"sub": "  "}, ""},
 
 		// Same-kind contradictions are refused.
 		{"iss_sub.sub differs from sub", issSub("1001"), map[string]any{"sub": "2002"}, "sub"},

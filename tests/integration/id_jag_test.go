@@ -758,6 +758,39 @@ func TestIDJAG_SubjectIdentifier(t *testing.T) {
 		assert.Contains(t, resp.RawBody, "unusable sub_id")
 	})
 
+	t.Run("an unimplemented RFC 9493 format beside a mapped sub does not sink the assertion", func(t *testing.T) {
+		// RFC 9493 also defines account, phone_number, did and uri. The mapped
+		// claim is the principal, and a format we cannot read can neither supply
+		// nor contradict it — so a conformant IdP emitting one is not refused.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uACCOUNT",
+			"sub_id": map[string]any{"format": "account", "uri": "acct:" + alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uACCOUNT", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("an unimplemented format is still fatal when it is the only subject", func(t *testing.T) {
+		// Nothing else names the principal, so it cannot be set aside.
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "account", "uri": "acct:" + alice},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "unusable sub_id")
+	})
+
+	t.Run("a blank email claim does not contradict an email sub_id", func(t *testing.T) {
+		// IdPs routinely emit "email": "" for users without one. Blank names
+		// nobody, so it cannot name a different somebody.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uBLANK",
+			"email":  "",
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uBLANK", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
 	t.Run("neither sub nor sub_id still fails closed", func(t *testing.T) {
 		resp := redeem(t, map[string]any{})
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
