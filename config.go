@@ -259,13 +259,75 @@ type ServerConfig struct {
 	// pre-flip shape sets "/api/v1".
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
 
-	// TrustForwardedHeaders tells the server to read X-Forwarded-Proto and
-	// X-Forwarded-Host when reconstructing the effective request URL for
-	// DPoP htu validation (RFC 9449 §4.3). Production deployers behind a
-	// trusted edge proxy (nginx, AWS ALB, GCP LB) flip this on; deployers
-	// that terminate TLS at the service itself leave it false so spoofed
-	// proxy headers cannot move the htu goalposts.
+	// ForwardedHeaders selects which X-Forwarded-* headers are trusted when
+	// reconstructing the effective request URL for DPoP htu validation
+	// (RFC 9449 §4.3). It exists because a TLS-terminating edge makes the
+	// service see itself as http://…, so without SOME trust every correct proof
+	// — signed for the public https://… URL — fails htu.
+	//
+	//	"none" (default)  trust nothing: scheme from the connection, host
+	//	                  from the Host header. Right when TLS terminates here.
+	//	"proto"           trust X-Forwarded-Proto only; host still from Host.
+	//	                  Right behind AWS ALB and any edge that sets the
+	//	                  scheme but does not overwrite X-Forwarded-Host.
+	//	"proto_host"      trust both. Right ONLY behind an edge that sets and
+	//	                  overwrites both (a configured nginx, GCP LB, most CDNs).
+	//
+	// The split is the point. AWS ALB sets X-Forwarded-Proto but never sets
+	// X-Forwarded-Host, so a client-supplied one reaches the service untouched;
+	// trusting it there lets a client choose the host its proof is checked
+	// against, and a proof signed for another server validates here. Host is
+	// safer because an edge routes on it. When unsure, "proto" is the safe
+	// choice behind a TLS-terminating proxy.
+	//
+	// Empty means "not set" and defers to the deprecated TrustForwardedHeaders.
+	// Resolve through ForwardedHeadersMode, never by reading the field.
+	// Env var: ZEROID_FORWARDED_HEADERS.
+	ForwardedHeaders string `koanf:"forwarded_headers"`
+
+	// TrustForwardedHeaders is the original all-or-nothing switch.
+	//
+	// Deprecated: equivalent to ForwardedHeaders "proto_host", and kept only so
+	// existing deployments keep working. New configuration should set
+	// ForwardedHeaders — most deployments behind a proxy want "proto", which
+	// this flag cannot express. Setting it alongside a ForwardedHeaders value
+	// other than "proto_host" is rejected by Validate as ambiguous.
 	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
+}
+
+// Forwarded-header trust modes for ServerConfig.ForwardedHeaders.
+const (
+	ForwardedHeadersNone      = "none"
+	ForwardedHeadersProto     = "proto"
+	ForwardedHeadersProtoHost = "proto_host"
+)
+
+// ForwardedHeadersMode resolves the effective forwarded-header trust mode,
+// honouring the deprecated TrustForwardedHeaders when ForwardedHeaders is
+// unset. Returns an error for an unknown mode or a conflict between the two
+// settings; Validate surfaces the same error at startup.
+func (s *ServerConfig) ForwardedHeadersMode() (string, error) {
+	mode := strings.TrimSpace(s.ForwardedHeaders)
+	switch mode {
+	case "":
+		if s.TrustForwardedHeaders {
+			return ForwardedHeadersProtoHost, nil
+		}
+		return ForwardedHeadersNone, nil
+	case ForwardedHeadersNone, ForwardedHeadersProto, ForwardedHeadersProtoHost:
+	default:
+		return "", fmt.Errorf("server.forwarded_headers %q is not a known mode (expected %q, %q or %q)",
+			mode, ForwardedHeadersNone, ForwardedHeadersProto, ForwardedHeadersProtoHost)
+	}
+	// Refused rather than resolved: someone set both, and silently letting
+	// either win would decide whether X-Forwarded-Host is trusted on their
+	// behalf — which is the entire question this setting exists to answer.
+	if s.TrustForwardedHeaders && mode != ForwardedHeadersProtoHost {
+		return "", fmt.Errorf("server.trust_forwarded_headers=true (deprecated; means %q) conflicts with "+
+			"server.forwarded_headers=%q — unset trust_forwarded_headers and keep forwarded_headers",
+			ForwardedHeadersProtoHost, mode)
+	}
+	return mode, nil
 }
 
 // GetAdminPathPrefix returns the admin route prefix. Defaults to "" (router
@@ -450,6 +512,12 @@ func LoadConfig(configPath string) (Config, error) {
 func (c *Config) Validate() error {
 	if c.Server.Port == "" {
 		return fmt.Errorf("server.port is required")
+	}
+	// Not production-gated: an unknown mode or a conflict with the deprecated
+	// flag is never right, and resolving either silently would decide whether
+	// X-Forwarded-Host is trusted on the deployer's behalf.
+	if _, err := c.Server.ForwardedHeadersMode(); err != nil {
+		return err
 	}
 	if c.Database.URL == "" {
 		return fmt.Errorf("database URL is required: provide ZEROID_DATABASE_URL or individual DB_ vars")
@@ -674,6 +742,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		"server.write_timeout":            "15s",
 		"server.idle_timeout":             "60s",
 		"server.shutdown_timeout_seconds": 30,
+		// Empty, not "none": empty means "unset" and defers to the deprecated
+		// trust_forwarded_headers, so existing deployments keep their behaviour.
+		"server.forwarded_headers": "",
 
 		// Database
 		"database.port":           "5432",
@@ -766,6 +837,7 @@ var envMapping = map[string]string{
 	"ZEROID_PORT":                    "server.port",
 	"ZEROID_ENV":                     "server.env",
 	"ZEROID_ADMIN_PATH_PREFIX":       "server.admin_path_prefix",
+	"ZEROID_FORWARDED_HEADERS":       "server.forwarded_headers",
 	"ZEROID_TRUST_FORWARDED_HEADERS": "server.trust_forwarded_headers",
 
 	// Database

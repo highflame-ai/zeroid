@@ -567,7 +567,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// RequestURLMiddleware records the request's effective URL on context.Context
 	// so DPoP htu validation (RFC 9449 §4.3) compares against what the client
 	// actually hit, not against the static config value.
-	r.Use(internalMiddleware.RequestURLMiddleware(cfg.Server.TrustForwardedHeaders))
+	//
+	// Validate (above) has already rejected an unknown or conflicting mode, so
+	// the error here is unreachable; it is still checked rather than dropped,
+	// because a silent fallback would pick a trust level nobody configured.
+	fwdMode, err := cfg.Server.ForwardedHeadersMode()
+	if err != nil {
+		return nil, err
+	}
+	r.Use(internalMiddleware.RequestURLMiddleware(internalMiddleware.ForwardedTrust{
+		Proto: fwdMode == ForwardedHeadersProto || fwdMode == ForwardedHeadersProtoHost,
+		Host:  fwdMode == ForwardedHeadersProtoHost,
+	}))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
