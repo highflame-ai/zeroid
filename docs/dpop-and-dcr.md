@@ -99,14 +99,24 @@ The 500 case is deliberate: a database-unreachable signal must never look like a
 
 ### Reverse-proxy deployments
 
-If ZeroID sits behind nginx / an AWS ALB / a GCP LB, set:
+Behind a TLS-terminating proxy, ZeroID sees its own URL as `http://…` while a correct client signs its proof for the public `https://…` URL — so without forwarded-header trust **every correct proof fails `htu`**. Pick the mode that matches what your edge actually does:
 
 ```yaml
 server:
-  trust_forwarded_headers: true
+  forwarded_headers: proto   # none | proto | proto_host
 ```
 
-`RequestURLMiddleware` will then read `X-Forwarded-Proto` and `X-Forwarded-Host` when reconstructing the URL the client signed. **Leave it `false` if the service terminates TLS itself** — otherwise a spoofed `X-Forwarded-Host` could move the `htu` goalpost.
+| Mode | Trusts | Use when |
+|---|---|---|
+| `none` (default) | nothing | ZeroID terminates TLS itself |
+| `proto` | `X-Forwarded-Proto`; host from `Host` | **AWS ALB**, or any edge that sets the scheme but does not overwrite `X-Forwarded-Host` |
+| `proto_host` | `X-Forwarded-Proto` and `X-Forwarded-Host` | only behind an edge that sets **and overwrites** both (a configured nginx, GCP LB, most CDNs) |
+
+**Why the split matters.** An AWS ALB sets `X-Forwarded-Proto` but never sets `X-Forwarded-Host`, so a client-supplied value reaches ZeroID untouched. Trusting it there lets the client choose the host its proof is checked against — a proof signed for another server then validates here, which is exactly the cross-server replay `htu` exists to prevent. `Host` is safer because the edge routes on it: a request naming another server never arrives. When unsure, `proto` is the safe choice behind a TLS-terminating proxy.
+
+Only `http` and `https` are honoured from `X-Forwarded-Proto`; any other value is ignored rather than written into the comparison URL.
+
+The older `trust_forwarded_headers: true` still works and means `proto_host`. It is deprecated because it cannot express `proto`; setting it alongside any other `forwarded_headers` value is rejected at startup as ambiguous.
 
 ### Replay store and cleanup
 
@@ -378,7 +388,7 @@ The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. P
 
 ```yaml
 server:
-  trust_forwarded_headers: false   # set true when behind a trusted edge proxy (nginx/ALB/etc.) for DPoP htu correctness
+  forwarded_headers: none   # behind a TLS-terminating proxy: "proto" (e.g. AWS ALB), or "proto_host" only if the edge overwrites X-Forwarded-Host — see "Reverse-proxy deployments"
 ```
 
 No DCR-specific config knobs — the feature is governed by which clients hold `client:register` scope.

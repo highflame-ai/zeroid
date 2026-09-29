@@ -432,3 +432,114 @@ func TestSampleConfigEnvVarsAreAllWired(t *testing.T) {
 		}
 	}
 }
+
+// TestForwardedHeadersMode pins resolution of the forwarded-header trust mode,
+// including the deprecated all-or-nothing flag it replaces.
+func TestForwardedHeadersMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		legacy  bool
+		want    string
+		wantErr string
+	}{
+		{"unset and legacy off is none", "", false, ForwardedHeadersNone, ""},
+		{"unset honours the legacy flag as proto_host", "", true, ForwardedHeadersProtoHost, ""},
+		{"none", "none", false, ForwardedHeadersNone, ""},
+		{"proto", "proto", false, ForwardedHeadersProto, ""},
+		{"proto_host", "proto_host", false, ForwardedHeadersProtoHost, ""},
+		{"surrounding space tolerated", "  proto ", false, ForwardedHeadersProto, ""},
+		{"legacy flag agreeing with proto_host is fine", "proto_host", true, ForwardedHeadersProtoHost, ""},
+
+		// Refused, never resolved: letting either win would decide whether
+		// X-Forwarded-Host is trusted on the deployer's behalf.
+		{"legacy flag with proto conflicts", "proto", true, "", "conflicts"},
+		{"legacy flag with none conflicts", "none", true, "", "conflicts"},
+
+		// An unknown mode must fail, not read as "none" — a typo like
+		// "proto-host" silently trusting nothing would keep DPoP broken, and
+		// one silently trusting everything would be worse.
+		{"unknown mode", "proto-host", false, "", "not a known mode"},
+		{"case matters", "Proto", false, "", "not a known mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := ServerConfig{ForwardedHeaders: tc.mode, TrustForwardedHeaders: tc.legacy}
+			got, err := s.ForwardedHeadersMode()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got mode=%q err=%v", tc.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got (%q, %v), want (%q, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsBadForwardedHeaders confirms the resolution errors stop
+// startup, in every environment — neither case is ever right.
+func TestValidateRejectsBadForwardedHeaders(t *testing.T) {
+	for _, s := range []ServerConfig{
+		{ForwardedHeaders: "everything"},
+		{ForwardedHeaders: ForwardedHeadersProto, TrustForwardedHeaders: true},
+	} {
+		cfg := baseValidConfig(t)
+		cfg.Server.ForwardedHeaders = s.ForwardedHeaders
+		cfg.Server.TrustForwardedHeaders = s.TrustForwardedHeaders
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate accepted forwarded_headers=%q trust_forwarded_headers=%v",
+				s.ForwardedHeaders, s.TrustForwardedHeaders)
+		}
+	}
+
+	cfg := baseValidConfig(t)
+	cfg.Server.ForwardedHeaders = ForwardedHeadersProto
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("control: proto must validate, got %v", err)
+	}
+}
+
+// TestLoadForwardedHeaders pins the env var and the default, through the real
+// loader. The default must stay EMPTY rather than "none": empty defers to the
+// deprecated flag, so an existing deployment running
+// ZEROID_TRUST_FORWARDED_HEADERS=true keeps its behaviour instead of hitting
+// the conflict error on upgrade.
+func TestLoadForwardedHeaders(t *testing.T) {
+	t.Run("default is unset and resolves to none", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Server.ForwardedHeaders != "" {
+			t.Fatalf("default forwarded_headers = %q, want empty", cfg.Server.ForwardedHeaders)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersNone {
+			t.Fatalf("default resolves to %q, want none", m)
+		}
+	})
+
+	t.Run("env var binds", func(t *testing.T) {
+		t.Setenv("ZEROID_FORWARDED_HEADERS", "proto")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProto {
+			t.Fatalf("ZEROID_FORWARDED_HEADERS=proto resolved to %q", m)
+		}
+	})
+
+	t.Run("legacy env var alone still works on upgrade", func(t *testing.T) {
+		t.Setenv("ZEROID_TRUST_FORWARDED_HEADERS", "true")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("an existing deployment must not fail to start: %v", err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProtoHost {
+			t.Fatalf("legacy flag resolved to %q, want proto_host", m)
+		}
+	})
+}
