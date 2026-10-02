@@ -417,3 +417,42 @@ func TestAuthorize_WhitespaceOnlyScopeDoesNotWiden(t *testing.T) {
 	assert.Equal(t, "tools:read", scope,
 		"the grant must stay at the principal's scopes; tools:admin is the client's registered scope and was never held or requested")
 }
+
+// TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling: an identity whose
+// row-level allowed_scopes is narrower than its identity policy must get the
+// intersection on an omitted-scope api_key grant. apiKeyGrant used to skip the
+// row-level narrowing whenever the policy had scopes of its own, then
+// IssueCredential's legacy subset check rejected the policy's extra scope —
+// so every such key failed to exchange at all. Forge's per-sandbox inference
+// identity (tools:* on the row, tenant default policy carrying nhi:manage)
+// hit exactly this, and the gateway answered 401 invalid_credential.
+func TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("apikey-wide-policy"),
+		"allowed_grant_types": []string{"api_key"},
+		"allowed_scopes":      []string{"nhi:manage", "tools:read", "tools:execute"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	externalID := uid("apikey-narrow-row")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":                 externalID,
+		"external_id":          externalID,
+		"sub_type":             "code_agent",
+		"created_by":           "test-user",
+		"credential_policy_id": policyID,
+		"allowed_scopes":       []string{"tools:read", "tools:execute"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+	scope, _ := decode(t, tokenResp)["scope"].(string)
+	assert.Contains(t, scope, "tools:read")
+	assert.Contains(t, scope, "tools:execute")
+	assert.NotContains(t, scope, "nhi:manage")
+}

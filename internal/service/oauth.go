@@ -1565,7 +1565,11 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		scopes = narrow(scopes, kp.AllowedScopes)
 	}
 	scopes = narrow(scopes, identityPolicyScopes)
-	if len(identityPolicyScopes) == 0 && identity != nil {
+	// Unconditional: IssueCredential's legacy check enforces the row-level
+	// allowed_scopes even when the identity policy has scopes of its own, so
+	// skipping it here handed that check a policy scope the row excludes and
+	// the grant failed outright instead of returning the intersection.
+	if identity != nil {
 		scopes = narrow(scopes, identity.AllowedScopes)
 	}
 	if err := requireGrantableScope(req.Scope, scopes); err != nil {
