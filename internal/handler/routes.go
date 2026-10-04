@@ -42,9 +42,13 @@ type API struct {
 	delegationSvc        *service.DelegationService
 	jwksSvc              *signing.JWKSService
 	signingCredSvc       *service.SigningCredentialService
-	db                   *bun.DB
-	issuer               string
-	startTime            time.Time
+	// tenantSettingsSvc backs the per-tenant settings routes (the token
+	// profile). Set with SetTenantSettingsService; the routes are registered
+	// only when it is non-nil.
+	tenantSettingsSvc *service.TenantSettingsService
+	db                *bun.DB
+	issuer            string
+	startTime         time.Time
 
 	// cimdEnabled advertises CIMD support in the OAuth 2.0 Authorization Server
 	// Metadata document (client_id_metadata_document_supported). Set via
@@ -383,6 +387,13 @@ func (a *API) SetInteractiveLoginURL(fn func(*service.AuthorizeRequest) string) 
 	a.interactiveLoginURL = fn
 }
 
+// SetTenantSettingsService wires the per-tenant settings routes. Kept as a
+// setter, like the other optional wiring here, so NewAPI's signature does not
+// grow for every new admin surface.
+func (a *API) SetTenantSettingsService(svc *service.TenantSettingsService) {
+	a.tenantSettingsSvc = svc
+}
+
 // RegisterAdmin registers admin/management endpoints:
 // identities, credentials, policies, attestation, signals, oauth clients, proof verify.
 // These run on the admin port which is protected at the network layer.
@@ -392,6 +403,9 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerCredentialRoutes(api)
 	a.registerAttestationRoutes(api)
 	a.registerAttestationPolicyRoutes(api)
+	if a.tenantSettingsSvc != nil {
+		a.registerTenantSettingsRoutes(api)
+	}
 	a.registerOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
 	a.registerAgentRoutes(api)
