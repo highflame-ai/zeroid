@@ -394,12 +394,16 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		Scopes:                scopes,
 		// Audience-restrict to the ID-JAG resource(s) (D4). IssueCredential stamps
 		// these verbatim as the aud claim instead of defaulting to the issuer URL.
-		Audience:          resources,
-		UseRS256:          true,
-		SubjectOverride:   userID,
-		UserEmail:         userEmail,
-		UserName:          userName,
-		ApplicationID:     req.ApplicationID,
+		Audience:        resources,
+		UseRS256:        true,
+		SubjectOverride: userID,
+		UserEmail:       userEmail,
+		UserName:        userName,
+		ApplicationID:   req.ApplicationID,
+		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
+		// this client and bound the ID-JAG's own client_id claim to it, so it
+		// is exactly the client the token is issued to.
+		ClientID:          authedClient.ClientID,
 		TTL:               900, // 15 minutes — short-lived, matching the external-IdP paths
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,

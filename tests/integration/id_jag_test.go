@@ -131,6 +131,10 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 
 		// Scopes flow from the ID-JAG `scope` claim (IdP already scoped it).
 		require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"])
+
+		// D8 (human-rooted delegation): RFC 9068 §2.2 client_id is the client
+		// the grant authenticated and bound the ID-JAG to.
+		require.Equal(t, client.ClientID, claims["client_id"])
 	})
 
 	t.Run("resource as RFC 8707 array → aud is the full authorized set", func(t *testing.T) {
