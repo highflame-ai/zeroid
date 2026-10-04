@@ -76,7 +76,13 @@ func buildIDJAGCustomClaims(
 	// Honest propagation of RFC 9068 authentication-context claims — only
 	// forward auth_time/acr/amr when the deployer asked for them AND the ID-JAG
 	// actually set them. Never default-fill.
+	// Reserved claims are skipped for the same reason as on the ID-token
+	// exchange: config restricts the list today, but that guarantee is held
+	// one file away.
 	for _, claim := range cfg.PropagateClaims {
+		if reservedClaims[claim] {
+			continue
+		}
 		if v, present := rawClaims[claim]; present {
 			customClaims[claim] = v
 		}

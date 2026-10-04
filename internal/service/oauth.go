@@ -206,6 +206,28 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
+	// Delegation lineage. `mission_id` names the delegation tree a token
+	// belongs to, so audit and revocation that group by mission trust it; a
+	// caller who could set it through additional_claims on the broker,
+	// id_token or ID-JAG paths could graft a token onto someone else's tree.
+	// `principal_type` says whether `sub` is a person or a workload, and is
+	// what a `required_principal_type` policy and every RFC 8693-profile
+	// consumer decide on, so a forged `user` would launder a workload chain
+	// into a human-rooted one. `may_act` (RFC 8693 §4.4) names who may act
+	// for the subject; only the issuer may assert it. `scope` is the RFC 9068
+	// §2.2.3 string form ZeroID emits beside `scopes`, so it must carry the
+	// same authority — never a caller-supplied value.
+	"mission_id":     true,
+	"principal_type": true,
+	"may_act":        true,
+	"scope":          true,
+	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
+	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
+	// neither, so additional_claims is the only way either reaches a signed
+	// token; unreserved, a caller could name any agent and enroll its own key
+	// on it through POST /agents/self/public-key.
+	"identity_id": true,
+	"agent_id":    true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
