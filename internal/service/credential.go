@@ -188,6 +188,44 @@ type IssueRequest struct {
 	PrincipalType domain.PrincipalType
 	PrincipalSub  string
 	PrincipalIss  string
+
+	// Actors is the RFC 8693 §4.1 actor chain for an exchanged token under the
+	// rfc8693 profile: the current actor first, prior actors after it, most
+	// recent first. Ignored under the legacy profile, which keeps its
+	// single-level `act`. Capped at domain.MaxActorChainDepth.
+	Actors []domain.Actor
+}
+
+// actorChainClaim renders an actor chain as the nested RFC 8693 §4.1 `act`
+// claim. The current actor (actors[0]) carries its own attributes; prior
+// actors carry only `sub`, since they are informational and access control
+// uses only the top-level claims and the current actor. Past
+// domain.MaxActorChainDepth the deepest prior actors are dropped, which §4.1
+// allows for the same reason.
+func actorChainClaim(actors []domain.Actor) map[string]any {
+	if len(actors) > domain.MaxActorChainDepth {
+		actors = actors[:domain.MaxActorChainDepth]
+	}
+	var nested map[string]any
+	for i := len(actors) - 1; i >= 0; i-- {
+		a := map[string]any{"sub": actors[i].Sub}
+		if i == 0 {
+			if actors[i].IdentityType != "" {
+				a["identity_type"] = actors[i].IdentityType
+			}
+			if actors[i].TrustLevel != "" {
+				a["trust_level"] = actors[i].TrustLevel
+			}
+			if actors[i].ExternalID != "" {
+				a["external_id"] = actors[i].ExternalID
+			}
+		}
+		if nested != nil {
+			a["act"] = nested
+		}
+		nested = a
+	}
+	return nested
 }
 
 // resolvedPrincipal is the principal a credential's chain acts for.
@@ -451,6 +489,22 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	jti := uuid.New().String()
 	principal := s.resolvePrincipal(req)
 
+	// The tenant's token profile decides the claim shape. A read failure
+	// fails the issuance: minting in the wrong shape after a tenant has
+	// switched is the inconsistency a staged rollout has to rule out.
+	profile := domain.TokenProfileLegacy
+	if s.tenantSettings != nil {
+		p, err := s.tenantSettings.TokenProfile(ctx, req.Identity.AccountID, req.Identity.ProjectID)
+		if err != nil {
+			return nil, nil, err
+		}
+		profile = p
+	}
+	rfc8693 := profile == domain.TokenProfileRFC8693
+	// Under rfc8693 an exchanged token's top level describes the principal,
+	// so the actor's own attributes move inside the outermost `act`.
+	actorsInAct := rfc8693 && len(req.Actors) > 0
+
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
 	// default to this credential's own JTI — making this credential the
@@ -468,6 +522,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.SubjectOverride != "" {
 		sub = req.SubjectOverride
 	}
+	if rfc8693 {
+		// RFC 8693 §4.1 / RFC 9068 §2.2: `sub` is the principal whose
+		// authority is used, fixed for the life of the chain. Equal to the
+		// legacy value on every non-exchange grant; on an exchange it is the
+		// parent's principal rather than the actor.
+		sub = principal.Sub
+	}
 	_ = token.Set(jwt.SubjectKey, sub)
 	_ = token.Set(jwt.IssuedAtKey, now)
 	_ = token.Set(jwt.ExpirationKey, expiresAt)
@@ -476,11 +537,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	_ = token.Set("project_id", req.Identity.ProjectID)
 	_ = token.Set("grant_type", string(req.GrantType))
 
-	// Identity claims.
-	_ = token.Set("external_id", req.Identity.ExternalID)
-	_ = token.Set("identity_type", string(req.Identity.IdentityType))
+	// Identity claims. external_id, identity_type and trust_level are the
+	// actor's own attributes; on an rfc8693 exchange they are carried inside
+	// the outermost `act` instead, because the top level describes the person.
+	if !actorsInAct {
+		_ = token.Set("external_id", req.Identity.ExternalID)
+		_ = token.Set("identity_type", string(req.Identity.IdentityType))
+		_ = token.Set("trust_level", string(req.Identity.TrustLevel))
+	}
 	_ = token.Set("sub_type", string(req.Identity.SubType))
-	_ = token.Set("trust_level", string(req.Identity.TrustLevel))
 	_ = token.Set("status", string(req.Identity.Status))
 
 	// Owner: the human accountable for this credential. Distinct from:
@@ -571,14 +636,39 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
 
-	// RFC 8693 "act" claim — two use cases:
-	//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
-	//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
-	// These are mutually exclusive per token — a delegated token already has act from the orchestrator.
-	if req.DelegatedBy != "" {
-		_ = token.Set("act", map[string]string{"sub": req.DelegatedBy})
-	} else if req.ActingUserID != "" {
-		_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
+	if rfc8693 {
+		// The principal's type is a private claim (RFC 7519 §4.3): no standard
+		// claim says whether `sub` is a person or a workload. Reserved, and set
+		// after CustomClaims, so it is only ever ZeroID's own derivation.
+		_ = token.Set("principal_type", string(principal.Type))
+		// With `sub`, the issuer forms the RFC 9493 iss_sub identifier, so two
+		// IdPs' `alice` never collide. Carried on every user-subject token,
+		// including exchanged ones, which previously dropped it.
+		if principal.Type == domain.PrincipalUser {
+			_ = token.Set("user_id_iss", principal.Iss)
+		}
+		// RFC 9068 §2.2.3 `scope`: the space-delimited string a 9068 resource
+		// server reads, emitted beside the `scopes` array until consumers move.
+		if len(req.Scopes) > 0 {
+			_ = token.Set("scope", strings.Join(req.Scopes, " "))
+		}
+		// RFC 8693 §4.1 `act`: the current actor outermost, prior actors
+		// nested. Only workloads appear; the person is `sub`, never an actor.
+		if len(req.Actors) > 0 {
+			_ = token.Set("act", actorChainClaim(req.Actors))
+		} else if req.ActingUserID != "" {
+			_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
+		}
+	} else {
+		// Legacy "act" claim — two use cases:
+		//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
+		//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
+		// These are mutually exclusive per token — a delegated token already has act from the orchestrator.
+		if req.DelegatedBy != "" {
+			_ = token.Set("act", map[string]string{"sub": req.DelegatedBy})
+		} else if req.ActingUserID != "" {
+			_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
+		}
 	}
 
 	// DPoP binding: embed cnf.jkt so resource servers can match the proof key (RFC 9449 §6.1).

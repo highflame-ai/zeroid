@@ -1105,7 +1105,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		parentDepth = int(d)
 	}
 
+	// The delegating agent, persisted as delegated_by_wimse_uri for the
+	// delegation graph. Under the legacy shape that is the parent's `sub`;
+	// under rfc8693 the parent's `sub` is the principal, and the agent that
+	// delegated is the parent's current actor.
+	parentActors := priorActorsOf(subjectParsed)
 	delegatedBy, _ := subjectParsed.Subject()
+	if len(parentActors) > 0 {
+		delegatedBy = parentActors[0].Sub
+	}
 
 	// Resolve mission_id from the subject_token (issue #81). Prefer the
 	// explicit mission_id claim; fall back to the subject_token's own jti
@@ -1151,6 +1159,25 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss
+
+	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
+	// outermost, then the parent's actors. A parent with no actors was a root
+	// grant; its client acted for the principal, so it becomes the first
+	// prior actor (T0's client A in the design's three-hop example).
+	issue.Actors = append([]domain.Actor{{
+		Sub:          actorIdentity.WIMSEURI,
+		IdentityType: string(actorIdentity.IdentityType),
+		TrustLevel:   string(actorIdentity.TrustLevel),
+		ExternalID:   actorIdentity.ExternalID,
+	}}, parentActors...)
+	if len(parentActors) == 0 {
+		if cid, _ := jwt.Get[string](subjectParsed, "client_id"); cid != "" {
+			issue.Actors = append(issue.Actors, domain.Actor{Sub: cid})
+		}
+	}
+	if len(issue.Actors) > domain.MaxActorChainDepth {
+		issue.Actors = issue.Actors[:domain.MaxActorChainDepth]
+	}
 	bindResourceOnIssue(&issue, req.Resource)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
@@ -1159,6 +1186,33 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// priorActorsOf returns a subject token's RFC 8693 actor chain, current actor
+// first, as prior actors carrying only their `sub`. Only a token issued under
+// the rfc8693 profile has one: the legacy shape's single-level `act` holds a
+// delegating orchestrator or an end user depending on the grant, not an actor
+// chain, so it is not read as one. The profile is recognised by the presence
+// of `principal_type`, which only rfc8693 tokens carry.
+func priorActorsOf(token jwt.Token) []domain.Actor {
+	if _, err := jwt.Get[string](token, "principal_type"); err != nil {
+		return nil
+	}
+	act, err := jwt.Get[map[string]any](token, "act")
+	if err != nil {
+		return nil
+	}
+	var out []domain.Actor
+	for act != nil && len(out) < domain.MaxActorChainDepth {
+		sub, _ := act["sub"].(string)
+		if sub == "" {
+			break
+		}
+		out = append(out, domain.Actor{Sub: sub})
+		next, _ := act["act"].(map[string]any)
+		act = next
+	}
+	return out
 }
 
 // parentPrincipal returns the principal of a subject token's chain, which an
