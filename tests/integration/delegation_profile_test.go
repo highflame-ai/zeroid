@@ -22,9 +22,17 @@ const issuedTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_toke
 // response fields, not only on the JWT.
 func exchangeForResponse(t *testing.T, policyID, namePrefix string, scopes []string, parentToken string) map[string]any {
 	t.Helper()
+	body, _ := exchangeAs(t, policyID, uid(namePrefix), scopes, parentToken)
+	return body
+}
+
+// exchangeAs is exchangeForResponse with a caller-chosen actor external_id, so
+// a test can assert claims that name the actor. Returns the token response and
+// the actor's WIMSE URI.
+func exchangeAs(t *testing.T, policyID, extID string, scopes []string, parentToken string) (map[string]any, string) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-	extID := uid(namePrefix)
 	registerIdentityWithPolicy(t, extID, policyID, ecPublicKeyPEM(t, key), scopes, adminHeaders())
 	wimse := fetchIdentityWIMSEByExternalID(t, extID)
 	resp := post(t, "/oauth2/token", map[string]any{
@@ -33,10 +41,26 @@ func exchangeForResponse(t *testing.T, policyID, namePrefix string, scopes []str
 		"actor_token":   buildAssertion(t, key, wimse),
 		"scope":         scopesToString(scopes),
 	}, nil)
-	require.Equal(t, http.StatusOK, resp.StatusCode, "token_exchange %s", namePrefix)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "token_exchange as %s", extID)
 	body := decode(t, resp)
 	_ = resp.Body.Close()
-	return body
+	return body, wimse
+}
+
+// TestTokenExchange_ClientIDIsTheActor covers the exchange half of D8: RFC 9068
+// §2.2 and RFC 8693 §4.3 put the client the token was issued to in client_id,
+// and on an exchange that client is the actor. Emitted for every tenant, so
+// this holds under the default legacy profile too. The ID-JAG half is asserted
+// in TestIDJAG_EndToEnd.
+func TestTokenExchange_ClientIDIsTheActor(t *testing.T) {
+	scopes := []string{"data:read"}
+	policyID := delegationPolicy(t, uid("d8-policy"), scopes)
+	_, _, root := issueRootCredential(t, policyID, "d8-orch", scopes)
+
+	actorExtID := uid("d8-actor")
+	body, _ := exchangeAs(t, policyID, actorExtID, scopes, root)
+	claims := decodeJWTPayload(t, body["access_token"].(string))
+	assert.Equal(t, actorExtID, claims["client_id"])
 }
 
 // TestTokenExchange_IssuedTokenType covers D7: RFC 8693 §2.2.1 makes

@@ -1139,6 +1139,11 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
+		// RFC 9068 §2.2 / RFC 8693 §4.3 client_id (D8): the client the token
+		// is issued to, which on an exchange is the actor. For a ZeroID agent
+		// that is its external_id. Emitted for every tenant — it is additive,
+		// unlike the sub/act change the token profile gates.
+		ClientID: actorIdentity.ExternalID,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
