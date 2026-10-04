@@ -2928,7 +2928,16 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	// can validate the caller's DPoP proof against the expected thumbprint.
 	// authorization_details is surfaced per RFC 9396 §7 so resource servers
 	// can read the typed RAR grant via introspection without parsing the JWT.
-	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details"} {
+	//
+	// client_id is an RFC 7662 §2.2 response member. mission_id, owner_user_id
+	// and user_id were in the token but not here (D2), so a resource server
+	// that introspects instead of verifying locally could not see the delegation
+	// tree or the accountable human, and the TypeScript SDK's introspection type
+	// declared owner_user_id and user_id fields that were always undefined.
+	for _, claim := range []string{
+		"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details",
+		"client_id", "mission_id", "owner_user_id", "user_id",
+	} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v
 		}

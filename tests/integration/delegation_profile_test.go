@@ -47,6 +47,31 @@ func exchangeAs(t *testing.T, policyID, extID string, scopes []string, parentTok
 	return body, wimse
 }
 
+// TestIntrospection_Fields covers D2: RFC 7662 introspection now returns the
+// lineage and attribution claims the token carries, so a resource server that
+// introspects instead of verifying locally sees the same delegation tree and
+// accountable human. Every value must equal the token's own claim.
+func TestIntrospection_Fields(t *testing.T) {
+	scopes := []string{"data:read"}
+	policyID := delegationPolicy(t, uid("d2-policy"), scopes)
+	_, _, root := issueRootCredential(t, policyID, "d2-orch", scopes)
+	body := exchangeForResponse(t, policyID, "d2-actor", scopes, root)
+	token := body["access_token"].(string)
+	claims := decodeJWTPayload(t, token)
+
+	got := introspect(t, token)
+	require.Equal(t, true, got["active"])
+	for _, claim := range []string{"client_id", "mission_id"} {
+		require.NotEmpty(t, claims[claim], "precondition: the exchanged token carries %s", claim)
+		assert.Equal(t, claims[claim], got[claim], "introspection must return the token's %s", claim)
+	}
+	if owner, ok := claims["owner_user_id"]; ok {
+		assert.Equal(t, owner, got["owner_user_id"])
+	} else {
+		assert.NotContains(t, got, "owner_user_id", "a claim the token lacks is not invented")
+	}
+}
+
 // TestTokenExchange_ClientIDIsTheActor covers the exchange half of D8: RFC 9068
 // §2.2 and RFC 8693 §4.3 put the client the token was issued to in client_id,
 // and on an exchange that client is the actor. Emitted for every tenant, so
