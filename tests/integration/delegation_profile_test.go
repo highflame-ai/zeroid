@@ -375,3 +375,219 @@ func TestTokenExchange_IssuedTokenType(t *testing.T) {
 		assert.Equal(t, issuedTokenTypeAccessToken, body["issued_token_type"])
 	})
 }
+
+// actChain flattens a token's nested `act` into the actors' subs, current
+// actor first.
+func actChain(t *testing.T, claims map[string]any) []string {
+	t.Helper()
+	var out []string
+	act, _ := claims["act"].(map[string]any)
+	for act != nil {
+		out = append(out, act["sub"].(string))
+		act, _ = act["act"].(map[string]any)
+	}
+	return out
+}
+
+// TestRFC8693Profile_UserSubjectThreeHops is the design's P2 fix: three
+// exchanges from a person's token, and every token still names her as `sub`,
+// with the agents nested in `act` current-first and client_id the holder.
+func TestRFC8693Profile_UserSubjectThreeHops(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+
+	t0, alice := tn.userRoot(t, scopes)
+	t0Claims := decodeJWTPayload(t, t0)
+	assert.Equal(t, alice, t0Claims["sub"])
+	assert.Equal(t, "user", t0Claims["principal_type"])
+	assert.Nil(t, t0Claims["act"], "a root grant has no actors")
+
+	extA, extB, extC := uid("hrd-a"), uid("hrd-b"), uid("hrd-c")
+	t1, wimseA := tn.exchange(t, policyID, extA, scopes, t0)
+	t2, wimseB := tn.exchange(t, policyID, extB, scopes, t1["access_token"].(string))
+	t3, wimseC := tn.exchange(t, policyID, extC, scopes, t2["access_token"].(string))
+
+	for i, tc := range []struct {
+		body   map[string]any
+		holder string
+		chain  []string
+	}{
+		{t1, extA, []string{wimseA}},
+		{t2, extB, []string{wimseB, wimseA}},
+		{t3, extC, []string{wimseC, wimseB, wimseA}},
+	} {
+		claims := decodeJWTPayload(t, tc.body["access_token"].(string))
+		assert.Equal(t, alice, claims["sub"], "hop %d: sub stays the person", i+1)
+		assert.Equal(t, "user", claims["principal_type"], "hop %d", i+1)
+		assert.Equal(t, t0Claims["iss"], claims["user_id_iss"], "hop %d: the person's issuer travels with her", i+1)
+		assert.Equal(t, tc.holder, claims["client_id"], "hop %d: client_id is the holder", i+1)
+		assert.Equal(t, tc.chain, actChain(t, claims), "hop %d: act nests the agents, current first", i+1)
+		assert.ElementsMatch(t, []any{"data:read"}, claims["scopes"], "hop %d: scopes stay within T0", i+1)
+		assert.Equal(t, float64(i+1), claims["delegation_depth"], "hop %d", i+1)
+
+		// The actor's attributes are inside the outermost act; the top level
+		// describes the person.
+		act := claims["act"].(map[string]any)
+		assert.Equal(t, tc.holder, act["external_id"], "hop %d: actor attributes live in act", i+1)
+		assert.NotEmpty(t, act["identity_type"], "hop %d", i+1)
+		assert.NotEmpty(t, act["trust_level"], "hop %d", i+1)
+		assert.NotContains(t, claims, "external_id", "hop %d: not at the top level", i+1)
+		assert.NotContains(t, claims, "trust_level", "hop %d: not at the top level", i+1)
+		assert.NotContains(t, claims, "identity_type", "hop %d: not at the top level", i+1)
+		if inner, ok := act["act"].(map[string]any); ok {
+			assert.Equal(t, []string{"sub"}, mapKeys(inner, "act"), "hop %d: prior actors carry only sub", i+1)
+		}
+
+		// Persisted principal agrees with the token.
+		assert.Equal(t, principalRow{"user", alice, t0Claims["iss"].(string)}, principalOf(t, tc.body["access_token"].(string)))
+	}
+}
+
+// mapKeys returns m's keys except those named in skip.
+func mapKeys(m map[string]any, skip ...string) []string {
+	var out []string
+	for k := range m {
+		ignored := false
+		for _, s := range skip {
+			if k == s {
+				ignored = true
+			}
+		}
+		if !ignored {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// TestRFC8693Profile_WorkloadSubject: a chain rooted in an agent's own
+// authority keeps that agent as `sub`, with principal_type workload, and the
+// sub-agent as the current actor.
+func TestRFC8693Profile_WorkloadSubject(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+
+	root, orch := tn.workloadRoot(t, policyID, scopes)
+	rootClaims := decodeJWTPayload(t, root)
+	assert.Equal(t, orch, rootClaims["sub"])
+	assert.Equal(t, "workload", rootClaims["principal_type"])
+	assert.Nil(t, rootClaims["user_id_iss"], "user_id_iss names a person's issuer only")
+
+	child, sub := tn.exchange(t, policyID, uid("hrd-sub"), scopes, root)
+	claims := decodeJWTPayload(t, child["access_token"].(string))
+	assert.Equal(t, orch, claims["sub"], "the orchestrator stays the principal")
+	assert.Equal(t, "workload", claims["principal_type"])
+	assert.Equal(t, sub, actChain(t, claims)[0], "the sub-agent is the current actor")
+}
+
+// TestRFC8693_ScopeString covers D23 on the ZeroID side: the rfc8693 profile
+// emits the RFC 9068 §2.2.3 space-delimited `scope` beside `scopes`.
+func TestRFC8693_ScopeString(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read", "data:write"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+	claims := decodeJWTPayload(t, root)
+	assert.Equal(t, "data:read data:write", claims["scope"])
+	assert.ElementsMatch(t, []any{"data:read", "data:write"}, claims["scopes"], "scopes stays until consumers move")
+}
+
+// TestLegacyProfile_Unchanged is the golden check that a tenant on the default
+// profile sees today's claims, apart from the additive fixes (issued_token_type,
+// client_id): the actor in `sub`, a single-level `act`, identity attributes at
+// the top level, no principal_type and no scope string.
+func TestLegacyProfile_Unchanged(t *testing.T) {
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+
+	root, alice := tn.userRoot(t, scopes)
+	mid, wimseA := tn.exchange(t, policyID, uid("hrd-lg-a"), scopes, root)
+	leaf, wimseB := tn.exchange(t, policyID, uid("hrd-lg-b"), scopes, mid["access_token"].(string))
+
+	midClaims := decodeJWTPayload(t, mid["access_token"].(string))
+	assert.Equal(t, wimseA, midClaims["sub"], "legacy: the actor is sub")
+	assert.Equal(t, map[string]any{"sub": alice}, midClaims["act"], "legacy: act holds the parent's sub, one level")
+
+	claims := decodeJWTPayload(t, leaf["access_token"].(string))
+	assert.Equal(t, wimseB, claims["sub"])
+	assert.Equal(t, map[string]any{"sub": wimseA}, claims["act"], "legacy: one level, no nesting")
+	for _, absent := range []string{"principal_type", "scope", "user_id_iss"} {
+		assert.NotContains(t, claims, absent, "legacy must not emit %s", absent)
+	}
+	for _, present := range []string{"external_id", "identity_type", "trust_level", "sub_type", "status"} {
+		assert.Contains(t, claims, present, "legacy keeps %s at the top level", present)
+	}
+}
+
+// TestRFC8693Profile_DelegationGraphKeepsTheDelegatingAgent: the delegation
+// graph records which agent delegated (delegated_by_wimse_uri). Under rfc8693
+// the parent's `sub` is the person, so the delegating agent must be read from
+// the parent's current actor, or the graph would show Alice delegating.
+func TestRFC8693Profile_DelegationGraphKeepsTheDelegatingAgent(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+
+	root, _ := tn.userRoot(t, scopes)
+	mid, wimseA := tn.exchange(t, policyID, uid("hrd-dg-a"), scopes, root)
+	leaf, _ := tn.exchange(t, policyID, uid("hrd-dg-b"), scopes, mid["access_token"].(string))
+
+	jti := decodeJWTPayload(t, leaf["access_token"].(string))["jti"].(string)
+	var delegatedBy string
+	err := testDB.NewSelect().Table("issued_credentials").Column("delegated_by_wimse_uri").
+		Where("jti = ?", jti).Scan(context.Background(), &delegatedBy)
+	require.NoError(t, err)
+	assert.Equal(t, wimseA, delegatedBy, "the delegating agent is A, not the person")
+}
+
+// TestChainSubject_SurvivesRefresh: a refresh is continuity of the same grant,
+// so the refreshed token keeps the principal and its issuer — across more than
+// one rotation, since the family copies the issuer forward.
+func TestChainSubject_SurvivesRefresh(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	user := uid("hrd-rt-user")
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":          "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token":       "external-principal-assertion",
+		"account_id":          tn.account,
+		"project_id":          tn.project,
+		"user_id":             user,
+		"audience":            "codeoid",
+		"issue_refresh_token": true,
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	_ = resp.Body.Close()
+	refresh := body["refresh_token"].(string)
+	iss := decodeJWTPayload(t, body["access_token"].(string))["iss"].(string)
+
+	for rotation := 1; rotation <= 2; rotation++ {
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "refresh_token",
+			"refresh_token": refresh,
+			"client_id":     "codeoid",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "rotation %d", rotation)
+		rotated := decode(t, resp)
+		_ = resp.Body.Close()
+		refresh = rotated["refresh_token"].(string)
+
+		claims := decodeJWTPayload(t, rotated["access_token"].(string))
+		assert.Equal(t, user, claims["sub"], "rotation %d: sub survives", rotation)
+		assert.Equal(t, "user", claims["principal_type"], "rotation %d", rotation)
+		assert.Equal(t, iss, claims["user_id_iss"], "rotation %d", rotation)
+		assert.Equal(t, principalRow{"user", user, iss}, principalOf(t, rotated["access_token"].(string)), "rotation %d", rotation)
+	}
+
+	var familyIssuers []string
+	err := testDB.NewSelect().Table("refresh_tokens").Column("principal_iss").
+		Where("user_id = ?", user).Scan(context.Background(), &familyIssuers)
+	require.NoError(t, err)
+	require.Len(t, familyIssuers, 3, "the family: issuance plus two rotations")
+	for _, got := range familyIssuers {
+		assert.Equal(t, iss, got, "every row in the family records the principal's issuer")
+	}
+}
