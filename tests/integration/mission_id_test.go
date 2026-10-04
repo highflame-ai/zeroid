@@ -13,6 +13,79 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestMissionID_CannotBeForgedViaAdditionalClaims is the end-to-end half of
+// D1 (human-rooted delegation). The broker path merges caller-supplied
+// additional_claims into the token, filtered by reservedClaims; before the fix
+// mission_id was not reserved and was set before the custom-claims loop, so a
+// caller could graft its token onto any delegation tree. The same holds for the
+// other lineage and authority claims the design introduces.
+func TestMissionID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
+	const forgedMission = "forged-mission-of-another-tree"
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": "external-principal-assertion",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"user_id":       uid("d1-user"),
+		"additional_claims": map[string]any{
+			"mission_id":     forgedMission,
+			"principal_type": "forged",
+			"may_act":        map[string]any{"sub": "attacker"},
+			"scope":          "attacker:all",
+		},
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "reserved claims are dropped, not fatal")
+	body := decode(t, resp)
+	_ = resp.Body.Close()
+	claims := decodeJWTPayload(t, body["access_token"].(string))
+
+	assert.NotEqual(t, forgedMission, claims["mission_id"],
+		"mission_id must come from ZeroID's own lineage resolution")
+	assert.Equal(t, claims["jti"], claims["mission_id"],
+		"a broker-path token is a mission root, so its mission_id is its own jti")
+	assert.NotEqual(t, "forged", claims["principal_type"], "principal_type must never be caller-supplied")
+	assert.Nil(t, claims["may_act"], "may_act must never be caller-supplied")
+	assert.NotEqual(t, "attacker:all", claims["scope"], "the scope string must never be caller-supplied")
+}
+
+// TestIdentityID_CannotBeForgedViaAdditionalClaims: agent self-service
+// (POST /agents/self/public-key) takes the identity it acts on from the
+// token's identity_id claim, which ZeroID itself never sets. Before the fix a
+// caller could put any agent's UUID there through additional_claims and enroll
+// its own key on that agent, then sign actor tokens as it.
+func TestIdentityID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
+	victimExtID := uid("d1-victim")
+	victimID := registerIdentityWithPolicy(t, victimExtID, "", "", []string{"data:read"}, adminHeaders())
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": "external-principal-assertion",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"user_id":       uid("d1-user"),
+		"additional_claims": map[string]any{
+			"identity_id": victimID,
+			"agent_id":    victimID,
+		},
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "reserved claims are dropped, not fatal")
+	token := decode(t, resp)["access_token"].(string)
+	_ = resp.Body.Close()
+
+	claims := decodeJWTPayload(t, token)
+	assert.Nil(t, claims["identity_id"], "identity_id must never be caller-supplied")
+	assert.Nil(t, claims["agent_id"], "agent_id must never be caller-supplied")
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	enroll := post(t, "/agents/self/public-key", map[string]any{
+		"new_public_key_pem": ecPublicKeyPEM(t, key),
+		"new_key_proof":      "not-checked-before-the-identity",
+	}, map[string]string{"Authorization": "Bearer " + token})
+	defer func() { _ = enroll.Body.Close() }()
+	assert.Equal(t, http.StatusUnauthorized, enroll.StatusCode, "a forged identity_id must not reach agent self-service")
+}
+
 // TestMissionID_ChainPropagation pins the issue #81 invariant: every
 // credential in a delegation tree carries the same mission_id, and the
 // admin filter `GET /credentials?mission_id=<id>` returns the whole

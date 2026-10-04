@@ -412,7 +412,6 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	_ = token.Set("account_id", req.Identity.AccountID)
 	_ = token.Set("project_id", req.Identity.ProjectID)
 	_ = token.Set("grant_type", string(req.GrantType))
-	_ = token.Set("mission_id", missionID)
 
 	// Identity claims.
 	_ = token.Set("external_id", req.Identity.ExternalID)
@@ -502,6 +501,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	for k, v := range req.CustomClaims {
 		_ = token.Set(k, v)
 	}
+
+	// mission_id is set after CustomClaims, not before: every grant filters
+	// caller input against reservedClaims, but internal callers also pass
+	// CustomClaims, and the lineage a token is grafted onto must come from the
+	// exchange's own resolution of the parent and nothing else.
+	_ = token.Set("mission_id", missionID)
 
 	// RFC 8693 "act" claim — two use cases:
 	//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
