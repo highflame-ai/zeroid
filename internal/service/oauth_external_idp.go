@@ -30,6 +30,10 @@ const externalIDTokenClockSkew = 60 * time.Second
 // direct-federation path (issue #88) instead of the broker path.
 const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
 
+// TokenTypeAccessToken is the RFC 8693 §3 identifier for an OAuth 2.0 access
+// token, returned as issued_token_type on every token-exchange response.
+const TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
+
 // ErrUnknownExternalIssuer is returned when a token-exchange request carries
 // an upstream `iss` that is not in the deployer-configured external_issuers
 // allowlist. Wrapped onto the *OAuthError so callers can branch with

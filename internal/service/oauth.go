@@ -660,7 +660,16 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
 		return s.jwtBearer(ctx, req)
 	case "urn:ietf:params:oauth:grant-type:token-exchange":
-		return s.tokenExchange(ctx, req)
+		// RFC 8693 §2.2.1 makes issued_token_type REQUIRED on every
+		// token-exchange response. Stamped here, at the one dispatch point,
+		// so all three exchange modes (NHI delegation, the trusted-broker
+		// principal exchange, OIDC ID-token federation) carry it and a new
+		// mode cannot forget to. Every mode issues a ZeroID access token.
+		tok, err := s.tokenExchange(ctx, req)
+		if tok != nil {
+			tok.IssuedTokenType = TokenTypeAccessToken
+		}
+		return tok, err
 	case "api_key":
 		return s.apiKeyGrant(ctx, req)
 	case "authorization_code":

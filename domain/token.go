@@ -50,11 +50,15 @@ type ActorClaims struct {
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
 type AccessToken struct {
 	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"` // "Bearer"
-	ExpiresIn   int    `json:"expires_in"` // seconds
-	Scope       string `json:"scope,omitempty"`
-	JTI         string `json:"jti"`
-	IssuedAt    int64  `json:"iat"`
+	// IssuedTokenType is the RFC 8693 §2.2.1 token type identifier of the
+	// issued token. REQUIRED on a token-exchange response and absent from
+	// every other grant's response, where RFC 6749 §5.1 does not define it.
+	IssuedTokenType string `json:"issued_token_type,omitempty"`
+	TokenType       string `json:"token_type"` // "Bearer"
+	ExpiresIn       int    `json:"expires_in"` // seconds
+	Scope           string `json:"scope,omitempty"`
+	JTI             string `json:"jti"`
+	IssuedAt        int64  `json:"iat"`
 	// Convenience fields — duplicated from JWT so callers don't need to decode.
 	AccountID    string `json:"account_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
