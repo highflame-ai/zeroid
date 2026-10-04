@@ -298,6 +298,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
 	signingCredRepo := postgres.NewSigningCredentialRepository(db)
 	delegationRepo := postgres.NewDelegationRepository(db)
+	tenantSettingsRepo := postgres.NewTenantSettingsRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
 	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
@@ -326,7 +327,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// dependency-free and sits alongside credentialPolicySvc at the top.
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
+	tenantSettingsSvc := service.NewTenantSettingsService(tenantSettingsRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL, cfg.Token.AuditRetentionDays)
+	// The token profile decides the claim shape of every token, so the
+	// issuance chokepoint reads it (human-rooted delegation, phase 1).
+	credentialSvc.SetTenantSettingsService(tenantSettingsSvc)
 	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
@@ -521,6 +526,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
+	apiHandler.SetTenantSettingsService(tenantSettingsSvc)
 	// An allow-list is the deployer vetting which hosts may publish a metadata
 	// document, which is what lets a CIMD client be redirected to at all. The
 	// EFFECTIVE count, for the same reason the startup log uses it: the raw

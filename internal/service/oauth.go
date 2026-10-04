@@ -1145,6 +1145,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
+	// The child inherits its chain's principal and never re-derives it, so a
+	// person stays the principal at every hop however deep the chain goes.
+	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
+	issue.PrincipalType = parent.Type
+	issue.PrincipalSub = parent.Sub
+	issue.PrincipalIss = parent.Iss
 	bindResourceOnIssue(&issue, req.Resource)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
@@ -1153,6 +1159,36 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// parentPrincipal returns the principal of a subject token's chain, which an
+// exchange passes down unchanged.
+//
+// A parent minted since migration 047 carries its principal on its row. A
+// parent minted before has none, and the design's legacy rule applies:
+//
+//   - At depth 0 the parent's `sub` is genuine — no exchange has rewritten it.
+//     A WIMSE URI there is a workload; anything else is a person, whose issuer
+//     is the upstream IdP's when the token says so.
+//   - Above depth 0 the legacy profile put the actor in `sub`, so the original
+//     principal is lost. The child gets principal_type = unknown, which never
+//     satisfies a principal requirement (fail closed).
+func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *domain.IssuedCredential, parentDepth int) resolvedPrincipal {
+	if subjectCred.PrincipalType != "" {
+		return resolvedPrincipal{Type: subjectCred.PrincipalType, Sub: subjectCred.PrincipalSub, Iss: subjectCred.PrincipalIss}
+	}
+	sub, _ := subjectParsed.Subject()
+	if parentDepth > 0 {
+		return resolvedPrincipal{Type: domain.PrincipalUnknown, Sub: sub, Iss: s.issuer}
+	}
+	if _, _, err := s.parseWIMSEURI(sub); err == nil {
+		return resolvedPrincipal{Type: domain.PrincipalWorkload, Sub: sub, Iss: s.issuer}
+	}
+	iss, _ := jwt.Get[string](subjectParsed, "user_id_iss")
+	if iss == "" {
+		iss = s.issuer
+	}
+	return resolvedPrincipal{Type: domain.PrincipalUser, Sub: sub, Iss: iss}
 }
 
 // externalPrincipalExchange handles RFC 8693 token exchange for externally-authenticated
@@ -1336,7 +1372,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// needs no separate refresh suppression.
 	bindResourceOnIssue(&issue, req.Resource)
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
@@ -1368,6 +1404,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			Audience:          req.Audience,
 			TTL:               refreshTTL,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			// The family records whose issuer vouched for the user, so it
+			// is revoked by the RFC 9493 (issuer, subject) pair.
+			PrincipalIss: cred.PrincipalIss,
 		})
 		if rtErr != nil {
 			// Fail CLOSED: the caller explicitly asked for a refresh token (its
@@ -2458,6 +2497,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// re-stamps the same binding (CAP-IDN-027). Copied forward onto each
 			// successor row, like MissionID.
 			Resources: resourceCeiling,
+			// Seed the family with the principal's issuer, so it is revoked
+			// by the RFC 9493 (issuer, subject) pair and every rotation keeps
+			// the same principal. Copied forward like MissionID.
+			PrincipalIss: cred.PrincipalIss,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -2825,6 +2868,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// IssueCredential then falls back to defaulting mission_id to the new
 		// credential's own JTI (the pre-fix behavior).
 		MissionID: oldToken.MissionID,
+		// Keep the principal's issuer across rotation, so a user a federated
+		// IdP vouched for is not re-attributed to ZeroID's own issuer. Empty
+		// on a family minted before migration 047: the chokepoint then derives
+		// it as for any other user subject.
+		PrincipalIss: oldToken.PrincipalIss,
 	}
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A

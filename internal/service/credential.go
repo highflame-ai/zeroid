@@ -37,6 +37,16 @@ type CredentialService struct {
 	// wires every revocation path. Nil-safe: when no dispatcher is attached, or
 	// no notifier is set on it, revocation behaviour is unchanged.
 	revocationDispatcher *RevocationDispatcher
+	// tenantSettings resolves each tenant's token profile, which decides the
+	// claim shape of every token this service issues. Nil-safe: when unset,
+	// every tenant is on the legacy profile.
+	tenantSettings *TenantSettingsService
+}
+
+// SetTenantSettingsService wires the per-tenant settings the issuance
+// chokepoint reads (the token profile). Wired once at server construction.
+func (s *CredentialService) SetTenantSettingsService(ts *TenantSettingsService) {
+	s.tenantSettings = ts
 }
 
 // NewCredentialService creates a new CredentialService.
@@ -166,6 +176,58 @@ type IssueRequest struct {
 	// (own CredentialPolicyID, else tenant default) and enforces it. Leaving it
 	// false preserves the prior behavior for every other caller.
 	ResolveIdentityPolicy bool
+
+	// PrincipalType, PrincipalSub and PrincipalIss name the principal whose
+	// authority the chain uses (RFC 8693 §4.1). Token exchange sets all three
+	// from the parent, because a child inherits its chain's principal and
+	// never re-derives it. Every other path leaves PrincipalType and
+	// PrincipalSub empty and IssueCredential derives them: a user when
+	// SubjectOverride is set (exactly the six grants that mint for a person),
+	// a workload otherwise. PrincipalIss may be set on its own, by the refresh
+	// grant, to carry a federated user's issuer across rotation.
+	PrincipalType domain.PrincipalType
+	PrincipalSub  string
+	PrincipalIss  string
+}
+
+// resolvedPrincipal is the principal a credential's chain acts for.
+type resolvedPrincipal struct {
+	Type domain.PrincipalType
+	Sub  string
+	Iss  string
+}
+
+// resolvePrincipal decides the principal for a credential. The subject is
+// decided once, here, for every issuance path, so no grant can disagree with
+// another about who a chain acts for.
+//
+//   - An exchange passes its parent's principal through unchanged.
+//   - SubjectOverride is set by exactly the six grants that mint for a person
+//     (authorization_code, refresh_token, CIBA, ID-JAG, ID-token exchange, the
+//     trusted-broker principal exchange), so its presence means a user subject.
+//   - Every other grant mints for the identity itself: a workload subject.
+//
+// The issuer of a user subject is the upstream IdP's when the grant is
+// federated (the reserved user_id_iss claim the federated grants set), so the
+// pair is an RFC 9493 iss_sub identifier and two IdPs' `alice` never collide.
+// A user ZeroID resolved locally, and every workload, take ZeroID's own issuer.
+func (s *CredentialService) resolvePrincipal(req IssueRequest) resolvedPrincipal {
+	if req.PrincipalType != "" {
+		return resolvedPrincipal{Type: req.PrincipalType, Sub: req.PrincipalSub, Iss: req.PrincipalIss}
+	}
+	if req.SubjectOverride == "" {
+		return resolvedPrincipal{Type: domain.PrincipalWorkload, Sub: req.Identity.WIMSEURI, Iss: s.issuer}
+	}
+	iss := req.PrincipalIss
+	if iss == "" {
+		if upstream, ok := req.CustomClaims["user_id_iss"].(string); ok && upstream != "" {
+			iss = upstream
+		}
+	}
+	if iss == "" {
+		iss = s.issuer
+	}
+	return resolvedPrincipal{Type: domain.PrincipalUser, Sub: req.SubjectOverride, Iss: iss}
 }
 
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
@@ -387,6 +449,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	jti := uuid.New().String()
+	principal := s.resolvePrincipal(req)
 
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
@@ -566,6 +629,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		AuditRetentionUntil: &auditRetentionUntil,
+		// Persisted for every tenant, whatever its token profile, so a chain
+		// minted today is reachable by per-user revocation (phase 2).
+		PrincipalType: principal.Type,
+		PrincipalSub:  principal.Sub,
+		PrincipalIss:  principal.Iss,
 	}
 
 	if err := s.repo.Create(ctx, cred); err != nil {
