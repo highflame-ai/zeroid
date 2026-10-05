@@ -30,6 +30,15 @@ type TenantSettingsOutput struct {
 	Body *domain.TenantSettings
 }
 
+// UpdateTenantSettingsOutput is the update response: the stored settings, and
+// how many long-lived user access tokens a switch to rfc8693 revoked.
+type UpdateTenantSettingsOutput struct {
+	Body struct {
+		*domain.TenantSettings
+		RevokedLongLivedTokens int `json:"revoked_long_lived_tokens" doc:"Credentials revoked because they were user-subject access tokens longer-lived than the short default, which the rfc8693 profile does not keep. Always 0 when setting legacy."`
+	}
+}
+
 // ── Tenant settings routes ───────────────────────────────────────────────────
 
 func (a *API) registerTenantSettingsRoutes(api huma.API) {
@@ -64,23 +73,27 @@ func (a *API) getTenantSettingsOp(ctx context.Context, _ *struct{}) (*TenantSett
 	return &TenantSettingsOutput{Body: settings}, nil
 }
 
-func (a *API) updateTenantSettingsOp(ctx context.Context, input *UpdateTenantSettingsInput) (*TenantSettingsOutput, error) {
+func (a *API) updateTenantSettingsOp(ctx context.Context, input *UpdateTenantSettingsInput) (*UpdateTenantSettingsOutput, error) {
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
-	settings, err := a.tenantSettingsSvc.SetTokenProfile(ctx, tenant.AccountID, tenant.ProjectID, domain.TokenProfile(input.Body.TokenProfile))
+	settings, revoked, err := a.tenantSettingsSvc.SetTokenProfile(ctx, tenant.AccountID, tenant.ProjectID, domain.TokenProfile(input.Body.TokenProfile))
 	if err != nil {
 		if errors.Is(err, service.ErrInvalidTokenProfile) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
-		log.Error().Err(err).Msg("failed to update tenant settings")
-		return nil, huma.Error500InternalServerError("failed to update tenant settings")
+		log.Error().Err(err).Int("revoked", revoked).Msg("failed to update tenant settings")
+		return nil, huma.Error500InternalServerError("failed to update tenant settings; repeat the request to finish")
 	}
 	log.Info().
 		Str("account_id", tenant.AccountID).
 		Str("project_id", tenant.ProjectID).
 		Str("token_profile", string(settings.TokenProfile)).
+		Int("revoked_long_lived_tokens", revoked).
 		Msg("tenant token profile updated")
-	return &TenantSettingsOutput{Body: settings}, nil
+	out := &UpdateTenantSettingsOutput{}
+	out.Body.TenantSettings = settings
+	out.Body.RevokedLongLivedTokens = revoked
+	return out, nil
 }

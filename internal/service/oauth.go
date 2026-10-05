@@ -135,11 +135,17 @@ type ObservedIDJAGResourceStore interface {
 	Record(ctx context.Context, accountID, projectID, authorizingISS string, resources []string) error
 }
 
-// Default token TTLs (used when per-client TTL is not configured).
-const (
-	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
-	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
-)
+// defaultUserAccessTokenTTL is the access token lifetime for a person's
+// authorization_code or refresh token when the client sets no TTL of its own:
+// 1 hour, whether or not the client holds the refresh grant (D14).
+//
+// A client without the refresh grant used to get 90 days instead. For a
+// person that is a 90-day sub=alice root: every delegated child is clamped
+// only to it, and revoking her IdP session does not touch it. A client that
+// needs continuity registers for the refresh grant; one that does not
+// re-authorizes. An explicit per-client access_token_ttl is still honoured,
+// within the server's max TTL.
+const defaultUserAccessTokenTTL = 3600
 
 // externalPrincipalAccessTokenTTL is the lifetime (seconds) of the SHORT-LIVED
 // access token issued by the external-principal exchange — 15 minutes, whether
@@ -2442,17 +2448,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "authorization code has already been used")
 	}
 
-	// Determine access token TTL.
-	// Priority: per-client config > grant-type-based default > server default.
+	// Determine access token TTL: the client's own configuration, else the
+	// short user-subject default (D14).
 	hasRefreshGrant := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken))
 
 	ttl := oauthClient.AccessTokenTTL
 	if ttl <= 0 {
-		// No per-client TTL — use grant-type-based defaults.
-		ttl = defaultAccessTokenTTLNoRefresh
-		if hasRefreshGrant {
-			ttl = defaultAccessTokenTTLWithRefresh
-		}
+		ttl = defaultUserAccessTokenTTL
 	}
 
 	// Resolve the carrier identity. The default is a synthetic stub (this
@@ -2781,7 +2783,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	}
 
 	if accessTTL <= 0 {
-		accessTTL = defaultAccessTokenTTLWithRefresh
+		accessTTL = defaultUserAccessTokenTTL
 	}
 
 	// Pre-rotation validation (HIGH — session-bricking fix). The gates that can
