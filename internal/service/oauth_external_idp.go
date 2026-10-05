@@ -198,8 +198,11 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	scopes := parseScopeString(req.Scope)
 	issue := IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
+		// The IdP's scopes are not read on this path, so the token is bounded
+		// only by the caller's request and the governing policy (ceiling rule, P1).
+		RequestBoundedRoot: true,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
 		// Govern the synthetic-carrier path (no application_id, so no identity
 		// row and no IdentityPolicyID above) by the tenant default policy.
 		// resolveIdentityPolicyID falls back to EnsureDefaultPolicy on the

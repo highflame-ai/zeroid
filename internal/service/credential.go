@@ -12,9 +12,13 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/internal/telemetry"
 )
 
 // CredentialService handles JWT issuance, rotation, and revocation.
@@ -204,6 +208,17 @@ type IssueRequest struct {
 	// until the ceiling rule enforces on them. No effect on a workload
 	// principal.
 	UserGrantBounded bool
+
+	// ScopeCeilingUnbounded is set by the api_key and NHI jwt_bearer grants
+	// when every scope ceiling they applied was empty (the key, the key's
+	// policy, the identity's policy, the deprecated identity list), so a
+	// workload subject got whatever scope it named. RequestBoundedRoot is set
+	// by the user-subject roots the design calls bounded only by the
+	// caller's request: the trusted broker (without a server-defined audience
+	// profile), ID-token exchange and CIBA. Both feed the ceiling rule (P1),
+	// which counts in phase 1 and refuses in phase 2.
+	ScopeCeilingUnbounded bool
+	RequestBoundedRoot    bool
 }
 
 // actorChainClaim renders an actor chain as the nested RFC 8693 §4.1 `act`
@@ -236,6 +251,56 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 		nested = a
 	}
 	return nested
+}
+
+// recordUnboundedScope implements the ceiling rule's first phase (P1): it
+// counts, without refusing, a token issued for a named scope that nothing
+// other than the requester bounded. Somewhere in the chain, something other
+// than the requester must bound the scopes; these are the issuances where
+// nothing did.
+//
+//   - A workload subject whose every scope ceiling was empty: it got whatever
+//     it asked for (api_key, NHI jwt_bearer).
+//   - A user-subject root bounded only by the caller's request (trusted
+//     broker, ID-token exchange, CIBA) whose governing policy sets neither
+//     allowed_scopes nor user_grant_scopes, and no Cedar decision exists yet.
+//
+// Phase 2 refuses these with invalid_scope behind
+// workload_subject_requires_ceiling. Counting first, per identity, lets
+// owners see in advance which agents enforcement will break.
+func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueRequest, principal resolvedPrincipal, identityPolicy *domain.CredentialPolicy) {
+	if len(req.Scopes) == 0 {
+		return
+	}
+	var root string
+	switch {
+	case req.ScopeCeilingUnbounded && principal.Type == domain.PrincipalWorkload:
+		root = "workload"
+	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
+		bounded := len(req.Identity.AllowedScopes) > 0
+		if identityPolicy != nil {
+			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
+		}
+		if bounded {
+			return
+		}
+		root = "user"
+	default:
+		return
+	}
+	telemetry.WorkloadUnboundedScope.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("account_id", req.Identity.AccountID),
+		attribute.String("project_id", req.Identity.ProjectID),
+		attribute.String("identity_id", req.Identity.ID),
+		attribute.String("grant_type", string(req.GrantType)),
+		attribute.String("principal_type", root),
+	))
+	log.Warn().
+		Str("identity_id", req.Identity.ID).
+		Str("grant_type", string(req.GrantType)).
+		Str("principal_type", root).
+		Strs("scopes", req.Scopes).
+		Msg("ceiling rule: issued named scopes with no configured ceiling; this will be refused once the rule is enforced — configure allowed_scopes, or user_grant_scopes for a user grant")
 }
 
 // accessTokenTyp chooses the access token's JOSE typ header (D9).
@@ -789,6 +854,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Str("mission_id", missionID).
 		Int("ttl_seconds", ttl).
 		Msg("Credential issued")
+
+	s.recordUnboundedScope(ctx, req, principal, identityPolicy)
 
 	tokenType := "Bearer"
 	if req.DPoPKeyThumbprint != "" {

@@ -898,11 +898,13 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  policy.ID,
-		Scopes:            scopes,
-		GrantType:         domain.GrantTypeJWTBearer,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// The ceiling rule (P1) counts a workload that named a scope no layer capped.
+		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
+		Identity:              identity,
+		IdentityPolicyID:      policy.ID,
+		Scopes:                scopes,
+		GrantType:             domain.GrantTypeJWTBearer,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
 	})
 	if err != nil {
 		return nil, err
@@ -1423,19 +1425,22 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeTokenExchange,
-		Scopes:            scopes,
-		Audience:          audience,
-		UseRS256:          true,
-		SubjectOverride:   req.UserID,
-		UserEmail:         req.UserEmail,
-		UserName:          req.UserName,
-		ApplicationID:     req.ApplicationID,
-		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// Bounded only by the trusted caller's request unless a server-defined
+		// audience profile chose the scopes (ceiling rule, P1).
+		RequestBoundedRoot: len(audience) == 0,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
+		GrantType:          domain.GrantTypeTokenExchange,
+		Scopes:             scopes,
+		Audience:           audience,
+		UseRS256:           true,
+		SubjectOverride:    req.UserID,
+		UserEmail:          req.UserEmail,
+		UserName:           req.UserName,
+		ApplicationID:      req.ApplicationID,
+		TTL:                externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
+		CustomClaims:       customClaims,
+		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
@@ -1712,8 +1717,9 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		OwnerUserIDOverride: apiKeyOwnerOverride(identity, sk),
 		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
 		// must never mint a 30-day token even if the identity policy allows.
-		CredentialExpiresAt: sk.ExpiresAt,
-		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+		CredentialExpiresAt:   sk.ExpiresAt,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && len(rowScopes) == 0,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
