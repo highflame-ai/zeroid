@@ -685,3 +685,54 @@ func TestAccessTokenTyp_PolicyToggle(t *testing.T) {
 		_ = resp.Body.Close()
 	})
 }
+
+// apiKeyRoot registers an agent in the tenant (its key created by "test-user")
+// and exchanges the key for a token.
+func (tn hrdTenant) apiKeyRoot(t *testing.T, scopes []string) (string, string) {
+	t.Helper()
+	reg := registerAgentInTenant(t, uid("hrd-ak"), tn.headers)
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    reg.APIKey,
+		"scope":      scopesToString(scopes),
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "api_key root")
+	token := decode(t, resp)["access_token"].(string)
+	_ = resp.Body.Close()
+	return token, decodeJWTPayload(t, token)["sub"].(string)
+}
+
+// TestRFC8693Profile_APIKeyHasNoActor covers D6: the key's creator is not
+// acting, so under rfc8693 an api-key token is a workload-subject token with no
+// `act`. The creator stays identity metadata in owner_user_id, which
+// introspection returns (D2). Legacy keeps act.sub = the creator, unchanged.
+func TestRFC8693Profile_APIKeyHasNoActor(t *testing.T) {
+	scopes := []string{"data:read"}
+
+	t.Run("rfc8693: no act, creator stays metadata", func(t *testing.T) {
+		tn := newTenant(t, "rfc8693")
+		token, agent := tn.apiKeyRoot(t, scopes)
+		claims := decodeJWTPayload(t, token)
+		assert.NotContains(t, claims, "act", "the key creator is not an actor")
+		assert.Equal(t, "workload", claims["principal_type"])
+		assert.Contains(t, agent, "spiffe://", "sub is the agent")
+		require.NotEmpty(t, claims["owner_user_id"], "the creator is still recorded")
+		assert.Equal(t, claims["owner_user_id"], introspect(t, token)["owner_user_id"], "and readable by introspection")
+
+		// The design's acceptance: exchange keeps the agent as sub and makes the
+		// sub-agent the current actor.
+		policyID := tn.policy(t, scopes)
+		child, subAgent := tn.exchange(t, policyID, uid("hrd-ak-sub"), scopes, token)
+		childClaims := decodeJWTPayload(t, child["access_token"].(string))
+		assert.Equal(t, agent, childClaims["sub"])
+		assert.Equal(t, subAgent, actChain(t, childClaims)[0])
+	})
+
+	t.Run("legacy: act.sub is still the creator", func(t *testing.T) {
+		tn := newTenant(t, "")
+		token, _ := tn.apiKeyRoot(t, scopes)
+		act, ok := decodeJWTPayload(t, token)["act"].(map[string]any)
+		require.True(t, ok, "legacy api-key tokens keep act")
+		assert.Equal(t, "test-user", act["sub"])
+	})
+}
