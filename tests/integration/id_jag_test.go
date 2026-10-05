@@ -844,6 +844,8 @@ func TestExternalIdP_SubjectTokenStillRequiresPlainSub(t *testing.T) {
 		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
 		"subject_token":      idToken,
 		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+		"client_id":          rpClient(t, federationAud).ClientID,
+		"client_secret":      rpClient(t, federationAud).ClientSecret,
 		"account_id":         fedCfg.AccountID,
 		"project_id":         fedCfg.ProjectID,
 	})

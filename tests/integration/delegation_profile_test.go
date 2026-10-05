@@ -951,3 +951,87 @@ func TestWorkloadSubject_EmptyCeilingCountedNotRefused(t *testing.T) {
 	assert.ElementsMatch(t, []any{"crm:write"}, decodeJWTPayload(t, token)["scopes"],
 		"phase 1 counts the unbounded scope and still grants it")
 }
+
+// TestIDTokenExchange_RequiresBoundClient is D13: only the relying party an ID
+// token was issued to may redeem it, authenticated as that client (OpenID
+// Connect Core §2, §3.1.3.7). Before the fix anyone holding Alice's ID token
+// could mint a sub=alice token.
+func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
+	upstreamIss := "https://upstream.d13.test"
+	aud := "https://zeroid-rp.d13.test"
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer: upstreamIss, JWKSURI: upstream.JWKSURL(), Audience: aud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	rp := rpClient(t, aud)
+	other := registerOAuthClient(t, uid("d13-other"), nil)
+	idToken := func(extra map[string]any) string {
+		now := time.Now()
+		claims := map[string]any{
+			"iss": upstreamIss, "aud": aud, "sub": uid("d13-alice"),
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		}
+		for k, v := range extra {
+			claims[k] = v
+		}
+		return upstream.SignToken(t, claims)
+	}
+	redeem := func(token string, client *oauthClientResp, secret string) (int, map[string]any) {
+		body := map[string]any{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      token,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+			"account_id":         fedCfg.AccountID,
+			"project_id":         fedCfg.ProjectID,
+		}
+		if client != nil {
+			body["client_id"] = client.ClientID
+			body["client_secret"] = secret
+		}
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		var got map[string]any
+		_ = json.Unmarshal([]byte(resp.RawBody), &got)
+		return resp.StatusCode, got
+	}
+
+	t.Run("no client authentication", func(t *testing.T) {
+		status, body := redeem(idToken(nil), nil, "")
+		assert.Equal(t, http.StatusUnauthorized, status)
+		assert.Equal(t, "invalid_client", body["error"])
+	})
+	t.Run("wrong client secret", func(t *testing.T) {
+		status, body := redeem(idToken(nil), &rp, "not-the-secret")
+		assert.Equal(t, http.StatusUnauthorized, status)
+		assert.Equal(t, "invalid_client", body["error"])
+	})
+	t.Run("a client the token was not issued to", func(t *testing.T) {
+		status, body := redeem(idToken(nil), &other, other.ClientSecret)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+	})
+	t.Run("azp names a different party", func(t *testing.T) {
+		status, body := redeem(idToken(map[string]any{"azp": other.ClientID}), &rp, rp.ClientSecret)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+	})
+	t.Run("several audiences and no azp", func(t *testing.T) {
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}}), &rp, rp.ClientSecret)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+	})
+	t.Run("the relying party, authenticated", func(t *testing.T) {
+		status, body := redeem(idToken(nil), &rp, rp.ClientSecret)
+		require.Equal(t, http.StatusOK, status, "body=%v", body)
+		assert.Equal(t, rp.ClientID, decodeIssuedTokenClaims(t, body["access_token"].(string))["client_id"])
+	})
+	t.Run("several audiences with azp naming the relying party", func(t *testing.T) {
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}, "azp": aud}), &rp, rp.ClientSecret)
+		assert.Equal(t, http.StatusOK, status, "body=%v", body)
+	})
+}
