@@ -5,7 +5,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -590,4 +593,95 @@ func TestChainSubject_SurvivesRefresh(t *testing.T) {
 	for _, got := range familyIssuers {
 		assert.Equal(t, iss, got, "every row in the family records the principal's issuer")
 	}
+}
+
+// headerTyp returns a compact JWT's JOSE typ header.
+func headerTyp(t *testing.T, token string) string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	require.Len(t, parts, 3)
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	require.NoError(t, err)
+	var hdr map[string]any
+	require.NoError(t, json.Unmarshal(raw, &hdr))
+	typ, _ := hdr["typ"].(string)
+	return typ
+}
+
+// policyWith creates a delegation policy in the tenant with extra fields set.
+func (tn hrdTenant) policyWith(t *testing.T, scopes []string, extra map[string]any) string {
+	t.Helper()
+	body := map[string]any{
+		"name":                 uid("hrd-policy"),
+		"allowed_grant_types":  []string{"client_credentials", "token_exchange"},
+		"allowed_scopes":       scopes,
+		"max_delegation_depth": 5,
+		"max_ttl_seconds":      3600,
+	}
+	for k, v := range extra {
+		body[k] = v
+	}
+	return createRichCredentialPolicy(t, body, tn.headers)
+}
+
+// TestRFC8693_ExchangeResponse is the design's response check: the exchange
+// response carries issued_token_type, and the token is typed at+jwt (RFC 9068
+// §2.1) by default under the new profile.
+func TestRFC8693_ExchangeResponse(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+	child, _ := tn.exchange(t, policyID, uid("hrd-er"), scopes, root)
+
+	assert.Equal(t, issuedTokenTypeAccessToken, child["issued_token_type"])
+	assert.Equal(t, "at+jwt", headerTyp(t, child["access_token"].(string)))
+	assert.Equal(t, "at+jwt", headerTyp(t, root), "every token of the tenant, not only exchanges")
+}
+
+// TestAccessTokenTyp_PolicyToggle covers D9's resolution of the RFC 9068 vs
+// JWT-SVID conflict: at+jwt is the rfc8693 default, a policy can choose JWT so
+// an agent's tokens stay valid JWT-SVIDs, and legacy is always JWT.
+func TestAccessTokenTyp_PolicyToggle(t *testing.T) {
+	scopes := []string{"data:read"}
+
+	t.Run("rfc8693 policy choosing JWT keeps the token a JWT-SVID", func(t *testing.T) {
+		tn := newTenant(t, "rfc8693")
+		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "JWT"})
+		root, _ := tn.workloadRoot(t, policyID, scopes)
+		assert.Equal(t, "JWT", headerTyp(t, root))
+		child, _ := tn.exchange(t, policyID, uid("hrd-typ"), scopes, root)
+		assert.Equal(t, "JWT", headerTyp(t, child["access_token"].(string)), "the actor's own policy decides its token")
+	})
+
+	t.Run("legacy ignores a policy asking for at+jwt", func(t *testing.T) {
+		tn := newTenant(t, "")
+		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "at+jwt"})
+		root, _ := tn.workloadRoot(t, policyID, scopes)
+		assert.Equal(t, "JWT", headerTyp(t, root), "the legacy profile's shape never changes")
+	})
+
+	t.Run("an update can reset to the default", func(t *testing.T) {
+		tn := newTenant(t, "rfc8693")
+		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "JWT"})
+		resp := doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+policyID), map[string]any{"jwt_typ": ""}, tn.headers)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		_ = resp.Body.Close()
+		root, _ := tn.workloadRoot(t, policyID, scopes)
+		assert.Equal(t, "at+jwt", headerTyp(t, root))
+	})
+
+	t.Run("an unknown typ is refused", func(t *testing.T) {
+		tn := newTenant(t, "rfc8693")
+		resp := post(t, adminPath("/credential-policies"), map[string]any{
+			"name": uid("hrd-bad-typ"), "jwt_typ": "JOSE",
+		}, tn.headers)
+		assert.Contains(t, []int{http.StatusBadRequest, http.StatusUnprocessableEntity}, resp.StatusCode)
+		_ = resp.Body.Close()
+
+		policyID := tn.policy(t, scopes)
+		resp = doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+policyID), map[string]any{"jwt_typ": "JOSE"}, tn.headers)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "a client error, not a server fault")
+		_ = resp.Body.Close()
+	})
 }

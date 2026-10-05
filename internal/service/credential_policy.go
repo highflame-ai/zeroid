@@ -118,6 +118,9 @@ type CreatePolicyRequest struct {
 	SourceKey string
 	// ExpiresAt time-bounds the policy. Nil means "no expiry".
 	ExpiresAt *time.Time
+	// JWTTyp is the access token typ header under the rfc8693 profile:
+	// "at+jwt" (the default when empty) or "JWT".
+	JWTTyp string
 }
 
 // CreatePolicy creates a new credential policy.
@@ -144,6 +147,9 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 	if req.RequiredAttestation != "" && !domain.AttestationLevel(req.RequiredAttestation).Valid() {
 		return nil, fmt.Errorf("invalid required_attestation: %s", req.RequiredAttestation)
 	}
+	if !domain.ValidJWTTyp(req.JWTTyp) {
+		return nil, fmt.Errorf("%w: invalid jwt_typ %q (must be %s or %s)", ErrInvalidPolicyField, req.JWTTyp, domain.JWTTypAccessToken, domain.JWTTypJWT)
+	}
 
 	policy := &domain.CredentialPolicy{
 		ID:                  uuid.New().String(),
@@ -161,6 +167,7 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		SourceKey:           req.SourceKey,
 		IsActive:            true,
 		ExpiresAt:           req.ExpiresAt,
+		JWTTyp:              req.JWTTyp,
 		CreatedAt:           time.Now(),
 		UpdatedAt:           time.Now(),
 	}
@@ -236,6 +243,8 @@ type UpdatePolicyRequest struct {
 	//   ""  → clear to NULL (no expiry)
 	//   rfc3339 → set
 	ExpiresAt *string
+	// JWTTyp: nil leaves it unchanged; "" resets to the profile default.
+	JWTTyp *string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -283,6 +292,12 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	}
 	if req.MaxDelegationDepth != nil {
 		policy.MaxDelegationDepth = *req.MaxDelegationDepth
+	}
+	if req.JWTTyp != nil {
+		if !domain.ValidJWTTyp(*req.JWTTyp) {
+			return nil, fmt.Errorf("%w: invalid jwt_typ %q (must be %s or %s)", ErrInvalidPolicyField, *req.JWTTyp, domain.JWTTypAccessToken, domain.JWTTypJWT)
+		}
+		policy.JWTTyp = *req.JWTTyp
 	}
 	if req.IsActive != nil {
 		policy.IsActive = *req.IsActive

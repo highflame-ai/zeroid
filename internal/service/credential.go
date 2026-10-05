@@ -228,6 +228,29 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 	return nested
 }
 
+// accessTokenTyp chooses the access token's JOSE typ header (D9).
+//
+// Two specs ZeroID follows disagree, and a token can satisfy only one:
+// RFC 9068 §2.1 types a JWT access token "at+jwt", so a resource server can
+// tell it apart from an ID token; JWT-SVID §2.3 allows only "JWT" or "JOSE".
+//
+//   - Legacy profile: always "JWT". Its contract is today's token unchanged.
+//   - rfc8693 profile: "at+jwt" by default, or "JWT" when the identity's
+//     governing policy chooses it, for agents whose tokens must stay valid
+//     JWT-SVIDs. A grant with no identity policy gets the default.
+//
+// Only the governing (identity) policy decides. A header has no
+// narrowest-wins meaning, so an API key's own policy does not override it.
+func accessTokenTyp(rfc8693 bool, identityPolicy *domain.CredentialPolicy) string {
+	if !rfc8693 {
+		return domain.JWTTypJWT
+	}
+	if identityPolicy != nil && identityPolicy.JWTTyp == domain.JWTTypJWT {
+		return domain.JWTTypJWT
+	}
+	return domain.JWTTypAccessToken
+}
+
 // resolvedPrincipal is the principal a credential's chain acts for.
 type resolvedPrincipal struct {
 	Type domain.PrincipalType
@@ -404,6 +427,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// that when the key inherits the identity policy verbatim (the common
 	// case: CredentialPolicyID == IdentityPolicyID), so the hot path pays
 	// for exactly one enforcement pass.
+	// The identity's governing policy, kept for choices beyond enforcement
+	// (the token's typ header). Nil when no identity policy governs the grant.
+	var identityPolicy *domain.CredentialPolicy
 	if s.policySvc != nil {
 		var attestationLevel string
 		if s.attestationRepo != nil && req.Identity.ID != "" {
@@ -460,6 +486,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Msg("Identity policy enforcement denied issuance")
 				return nil, nil, err
 			}
+			identityPolicy = policy
 		}
 
 		// API key policy — per-credential restriction. Checked only when a
@@ -677,19 +704,20 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
-	// kid lets verifiers pick the right key from the JWKS; typ=JWT is per
-	// JWT-SVID §3 (jwx doesn't default it).
+	// kid lets verifiers pick the right key from the JWKS. jwx doesn't default
+	// typ, so it is always set explicitly (see accessTokenTyp).
+	typ := accessTokenTyp(rfc8693, identityPolicy)
 	var signed []byte
 	var signErr error
 	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.RSAKeyID())
-		_ = hdrs.Set(jws.TypeKey, "JWT")
+		_ = hdrs.Set(jws.TypeKey, typ)
 		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.RS256(), s.jwksSvc.RSAPrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	} else {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.KeyID())
-		_ = hdrs.Set(jws.TypeKey, "JWT")
+		_ = hdrs.Set(jws.TypeKey, typ)
 		signed, signErr = jwt.Sign(token, jwt.WithKey(jwa.ES256(), s.jwksSvc.PrivateKey(), jws.WithProtectedHeaders(hdrs)))
 	}
 	if signErr != nil {
