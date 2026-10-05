@@ -83,9 +83,32 @@ type Graph struct {
 
 // Chain is the response shape for /delegations/by-jti/{jti} — one full
 // lineage from root to leaf with scope attenuation per edge.
+//
+// Principal is the party the whole chain acts for (RFC 8693 §4.1). A user
+// principal has no identity row, so the chain also carries a node for the
+// person, first in Nodes, and the root credential's edge points at it rather
+// than nowhere.
 type Chain struct {
-	Nodes []*GraphNode `json:"nodes"`
-	Edges []*GraphEdge `json:"edges"`
+	Nodes     []*GraphNode    `json:"nodes"`
+	Edges     []*GraphEdge    `json:"edges"`
+	Principal *ChainPrincipal `json:"principal,omitempty"`
+}
+
+// ChainPrincipal is a chain's principal: the RFC 9493 issuer-and-subject pair
+// and whether it is a person or a workload. NodeID is the node that stands for
+// it in the chain.
+type ChainPrincipal struct {
+	Type   string `json:"type"`
+	Sub    string `json:"sub"`
+	Iss    string `json:"iss"`
+	NodeID string `json:"node_id,omitempty"`
+}
+
+// userPrincipalNodeID is the node id for a person in a chain. It is built from
+// the (issuer, subject) pair so two IdPs' users of the same name stay distinct,
+// and is prefixed so it cannot collide with an identity's UUID.
+func userPrincipalNodeID(iss, sub string) string {
+	return "user:" + iss + "#" + sub
 }
 
 // DelegationService assembles delegation graphs and chains for the
@@ -310,7 +333,44 @@ func (s *DelegationService) WalkByJTI(ctx context.Context, jti, accountID, proje
 		return nil, ErrCredentialNotFound
 	}
 	g := s.buildGraph(ctx, creds, accountID, projectID, "")
-	return &Chain{Nodes: g.Nodes, Edges: g.Edges}, nil
+	chain := &Chain{Nodes: g.Nodes, Edges: g.Edges}
+	attachPrincipal(chain, creds)
+	return chain, nil
+}
+
+// attachPrincipal sets the chain's principal from its credentials, which all
+// carry the same one because exchange copies it unchanged. A user principal
+// gets a node of its own, and an edge with no holder identity — a person's
+// root grant — points at it. Chains minted before principals were recorded
+// get none.
+func attachPrincipal(chain *Chain, creds []*domain.IssuedCredential) {
+	var p *domain.IssuedCredential
+	for _, c := range creds {
+		if c.PrincipalType != "" {
+			p = c
+			break
+		}
+	}
+	if p == nil {
+		return
+	}
+	chain.Principal = &ChainPrincipal{Type: string(p.PrincipalType), Sub: p.PrincipalSub, Iss: p.PrincipalIss}
+	if p.PrincipalType != domain.PrincipalUser {
+		return
+	}
+	nodeID := userPrincipalNodeID(p.PrincipalIss, p.PrincipalSub)
+	chain.Principal.NodeID = nodeID
+	// First, because the person is where the chain starts.
+	chain.Nodes = append([]*GraphNode{{
+		ID:           nodeID,
+		Name:         p.PrincipalSub,
+		IdentityType: string(domain.PrincipalUser),
+	}}, chain.Nodes...)
+	for _, e := range chain.Edges {
+		if e.To == "" {
+			e.To = nodeID
+		}
+	}
 }
 
 // ListChains returns chain summaries (one per delegation tree) active

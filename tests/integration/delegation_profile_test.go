@@ -1133,3 +1133,93 @@ func TestProfileSwitch_RevokesLongLivedUserTokens(t *testing.T) {
 	again := switchTo(tn.headers)
 	assert.EqualValues(t, 0, again["revoked_long_lived_tokens"], "repeating the switch is safe")
 }
+
+// verifyHeaders calls the forward-auth endpoint with token and returns the
+// response headers.
+func verifyHeaders(t *testing.T, token string) http.Header {
+	t.Helper()
+	resp := get(t, "/oauth2/token/verify", map[string]string{"Authorization": "Bearer " + token})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+	return resp.Header
+}
+
+// TestForwardAuth_RFC8693Headers covers #228's forward-auth surface: upstreams
+// that do not parse claims get the principal, its type and the current actor.
+// Under rfc8693 an exchanged token's identity attributes are inside act, and
+// the headers are read from there — without that they would go missing.
+func TestForwardAuth_RFC8693Headers(t *testing.T) {
+	scopes := []string{"data:read"}
+
+	t.Run("rfc8693 exchanged token", func(t *testing.T) {
+		tn := newTenant(t, "rfc8693")
+		policyID := tn.policy(t, scopes)
+		root, alice := tn.userRoot(t, scopes)
+		extB := uid("hrd-fa-b")
+		body, wimseB := tn.exchange(t, policyID, extB, scopes, root)
+
+		h := verifyHeaders(t, body["access_token"].(string))
+		assert.Equal(t, alice, h.Get("X-Forwarded-User"), "X-Forwarded-User keeps meaning sub")
+		assert.Equal(t, alice, h.Get("X-Zeroid-Subject"))
+		assert.Equal(t, "user", h.Get("X-Zeroid-Principal-Type"))
+		assert.Equal(t, wimseB, h.Get("X-Zeroid-Actor"), "the agent presenting the token")
+		assert.Equal(t, extB, h.Get("X-Zeroid-External-ID"), "read from act")
+		assert.NotEmpty(t, h.Get("X-Zeroid-Identity-Type"), "read from act")
+		assert.NotEmpty(t, h.Get("X-Zeroid-Trust-Level"), "read from act")
+	})
+
+	t.Run("legacy exchanged token", func(t *testing.T) {
+		tn := newTenant(t, "")
+		policyID := tn.policy(t, scopes)
+		root, alice := tn.userRoot(t, scopes)
+		extB := uid("hrd-fa-lb")
+		body, wimseB := tn.exchange(t, policyID, extB, scopes, root)
+
+		h := verifyHeaders(t, body["access_token"].(string))
+		assert.Equal(t, wimseB, h.Get("X-Forwarded-User"), "legacy: the actor is sub")
+		assert.Equal(t, wimseB, h.Get("X-Zeroid-Actor"), "a legacy act is not the current actor")
+		assert.Equal(t, "user", h.Get("X-Zeroid-Principal-Type"), "the recorded principal, for every tenant")
+		assert.Equal(t, alice, h.Get("X-Zeroid-Subject"), "the subject is the recorded principal, agreeing with the principal type, not the actor in sub")
+		assert.Equal(t, extB, h.Get("X-Zeroid-External-ID"))
+	})
+}
+
+// TestDelegationByJTI_IncludesThePrincipal covers #228's lineage surface: the
+// chain names its principal, and a person — who has no identity row — gets a
+// node the root grant's edge points at, instead of an edge to nowhere.
+func TestDelegationByJTI_IncludesThePrincipal(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, alice := tn.userRoot(t, scopes)
+	body, _ := tn.exchange(t, policyID, uid("hrd-ln"), scopes, root)
+	leafJTI := decodeJWTPayload(t, body["access_token"].(string))["jti"].(string)
+
+	resp := get(t, adminPath("/delegations/by-jti/"+leafJTI), tn.headers)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	chain := decode(t, resp)
+	_ = resp.Body.Close()
+
+	principal, ok := chain["principal"].(map[string]any)
+	require.True(t, ok, "the chain names its principal")
+	assert.Equal(t, "user", principal["type"])
+	assert.Equal(t, alice, principal["sub"])
+	nodeID := principal["node_id"].(string)
+	require.NotEmpty(t, nodeID)
+
+	nodes := chain["nodes"].([]any)
+	require.NotEmpty(t, nodes)
+	personNode := nodes[0].(map[string]any)
+	assert.Equal(t, nodeID, personNode["id"], "the person's node comes first: the chain starts with them")
+	assert.Equal(t, alice, personNode["name"])
+	assert.Equal(t, "user", personNode["identity_type"])
+
+	rootJTI := decodeJWTPayload(t, root)["jti"].(string)
+	for _, e := range chain["edges"].([]any) {
+		edge := e.(map[string]any)
+		assert.NotEmpty(t, edge["to"], "no edge points nowhere")
+		if edge["jti"] == rootJTI {
+			assert.Equal(t, nodeID, edge["to"], "the person's root grant points at the person")
+		}
+	}
+}
