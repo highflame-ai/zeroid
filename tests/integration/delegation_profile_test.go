@@ -939,3 +939,15 @@ func TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes(t *testing.T) {
 		assert.Equal(t, "policy_violation", body["error"])
 	})
 }
+
+// TestWorkloadSubject_EmptyCeilingCountedNotRefused pins the ceiling rule's
+// phase-1 behaviour (P1): an agent with no scope ceiling that names a scope is
+// still issued it — the rule only counts it (zeroid_workload_unbounded_scope;
+// asserted in TestCeilingRule_CountsUnboundedNamedScopes). Phase 2 turns this
+// into invalid_scope, and this test is what changes then.
+func TestWorkloadSubject_EmptyCeilingCountedNotRefused(t *testing.T) {
+	tn := newTenant(t, "")
+	token, _ := tn.apiKeyRoot(t, []string{"crm:write"})
+	assert.ElementsMatch(t, []any{"crm:write"}, decodeJWTPayload(t, token)["scopes"],
+		"phase 1 counts the unbounded scope and still grants it")
+}

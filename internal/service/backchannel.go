@@ -978,17 +978,20 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	customClaims["authorization_details"] = rarBytes
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		Scopes:            parseScopeString(row.Scope),
-		GrantType:         domain.GrantTypeCIBA,
-		TTL:               ttl,
-		UseRS256:          true,
-		SubjectOverride:   row.ApprovedSubjectID,
-		UserEmail:         row.ApprovedSubjectEmail,
-		UserName:          row.ApprovedSubjectName,
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: dpopKeyThumbprint,
+		// CIBA approval is binary: the token is bounded by the requested scope
+		// and the bound agent's policy, if any (ceiling rule, P1).
+		RequestBoundedRoot: true,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
+		Scopes:             parseScopeString(row.Scope),
+		GrantType:          domain.GrantTypeCIBA,
+		TTL:                ttl,
+		UseRS256:           true,
+		SubjectOverride:    row.ApprovedSubjectID,
+		UserEmail:          row.ApprovedSubjectEmail,
+		UserName:           row.ApprovedSubjectName,
+		CustomClaims:       customClaims,
+		DPoPKeyThumbprint:  dpopKeyThumbprint,
 	})
 	if err != nil {
 		// The pre-burn gates above catch the deterministic refusals; anything

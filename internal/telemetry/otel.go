@@ -39,6 +39,13 @@ var (
 	IdentityOps        metric.Int64Counter
 	PolicyEnforcements metric.Int64Counter
 	AuthErrors         metric.Int64Counter
+	// WorkloadUnboundedScope counts tokens issued for a named scope with no
+	// configured ceiling: a workload subject whose every scope ceiling was
+	// empty, or a user-subject root bounded only by the caller's request.
+	// Exported to Prometheus as zeroid_workload_unbounded_scope_total. The
+	// ceiling rule (human-rooted delegation P1) counts in phase 1 and refuses
+	// in phase 2, so this lists the identities enforcement will affect.
+	WorkloadUnboundedScope metric.Int64Counter
 )
 
 func init() {
@@ -48,21 +55,31 @@ func init() {
 func initNoOpMetrics() {
 	Tracer = otel.Tracer("zeroid")
 	Meter = otel.Meter("zeroid")
+	registerInstruments(Meter)
+}
 
-	TokenIssuances, _ = Meter.Int64Counter("zeroid.token.issuances",
+// registerInstruments creates every instrument on m. It is the one place an
+// instrument is declared, called for the no-op defaults and again by Init with
+// the real meter, so a new instrument cannot be registered in one and silently
+// stay a no-op because it was missed in the other.
+func registerInstruments(m metric.Meter) {
+	TokenIssuances, _ = m.Int64Counter("zeroid.token.issuances",
 		metric.WithDescription("Total token issuances"),
 	)
-	TokenLatency, _ = Meter.Float64Histogram("zeroid.token.latency_ms",
+	TokenLatency, _ = m.Float64Histogram("zeroid.token.latency_ms",
 		metric.WithDescription("Token issuance latency in milliseconds"),
 	)
-	IdentityOps, _ = Meter.Int64Counter("zeroid.identity.operations",
+	IdentityOps, _ = m.Int64Counter("zeroid.identity.operations",
 		metric.WithDescription("Identity CRUD operations"),
 	)
-	PolicyEnforcements, _ = Meter.Int64Counter("zeroid.policy.enforcements",
+	PolicyEnforcements, _ = m.Int64Counter("zeroid.policy.enforcements",
 		metric.WithDescription("Credential policy enforcement decisions"),
 	)
-	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
+	AuthErrors, _ = m.Int64Counter("zeroid.errors",
 		metric.WithDescription("Authentication errors"),
+	)
+	WorkloadUnboundedScope, _ = m.Int64Counter("zeroid.workload.unbounded_scope",
+		metric.WithDescription("Tokens issued for a named scope with no configured scope ceiling (ceiling rule, counted before it is enforced)"),
 	)
 }
 
@@ -127,22 +144,7 @@ func Init(cfg Config) error {
 	// Re-initialise instruments with real providers.
 	Tracer = tracerProvider.Tracer("zeroid")
 	Meter = meterProvider.Meter("zeroid")
-
-	TokenIssuances, _ = Meter.Int64Counter("zeroid.token.issuances",
-		metric.WithDescription("Total token issuances"),
-	)
-	TokenLatency, _ = Meter.Float64Histogram("zeroid.token.latency_ms",
-		metric.WithDescription("Token issuance latency in milliseconds"),
-	)
-	IdentityOps, _ = Meter.Int64Counter("zeroid.identity.operations",
-		metric.WithDescription("Identity CRUD operations"),
-	)
-	PolicyEnforcements, _ = Meter.Int64Counter("zeroid.policy.enforcements",
-		metric.WithDescription("Credential policy enforcement decisions"),
-	)
-	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
-		metric.WithDescription("Authentication errors"),
-	)
+	registerInstruments(Meter)
 
 	return nil
 }
