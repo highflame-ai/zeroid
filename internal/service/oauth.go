@@ -1920,6 +1920,36 @@ func (s *OAuthService) resolveClientRegistryOrCIMD(ctx context.Context, clientID
 	return client, true, err
 }
 
+// ResolveCIMDClientForDisplay resolves a CIMD client_id for a consent screen.
+//
+// READ-ONLY, and it decides nothing. Admission is still /oauth2/authorize, with
+// the same resolution and the same cache; this exists so a consent surface can
+// show a human WHO is asking before they approve, which
+// draft-ietf-oauth-client-id-metadata-document §8.5 asks of an authorization
+// server and which no surface can do while the only resolution happens after
+// the human has already said yes.
+//
+// It opens no new capability. The resolution it performs, including the
+// outbound fetch, is exactly what an unauthenticated /oauth2/authorize carrying
+// the same client_id already performs: same SSRF-guarded fetcher, same
+// allowed_domains gate, same positive and negative cache, same singleflight. A
+// caller who can reach this can reach that.
+//
+// The returned client's Name, ClientURI and LogoURI are UNTRUSTED strings from
+// a document at a URL the caller chose. See domain.OAuthClient.
+func (s *OAuthService) ResolveCIMDClientForDisplay(
+	ctx context.Context, clientID string,
+) (*domain.OAuthClient, error) {
+	if !s.cimdSvc.Enabled() {
+		return nil, ErrCIMDDisabled
+	}
+	if !IsCIMDClientID(clientID) {
+		return nil, ErrCIMDInvalidClientID
+	}
+
+	return s.cimdSvc.ResolveClient(ctx, clientID)
+}
+
 // Returns a signed JWT on success, or an *OAuthError shaped for direct
 // surfacing from the /oauth2/authorize handler.
 func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeRequest) (string, error) {
