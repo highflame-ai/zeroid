@@ -1080,7 +1080,26 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// what can be delegated — a sub-agent can never receive more than its
 	// principal currently holds, per RFC 8693 intent.
 	requestedScopes := parseScopeString(req.Scope)
+	// The parent's depth. jwx v4: jwt.Get[float64] replaces the v2 Token.Get
+	// + assertion; JSON numbers decode as float64 regardless of integer intent.
+	var parentDepth int
+	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
+		parentDepth = int(d)
+	}
+	// The child inherits its chain's principal and never re-derives it, so a
+	// person stays the principal at every hop however deep the chain goes.
+	// Resolved before the scope computation: a chain acting for a person is
+	// capped by the actor's user-grant ceiling, not its own authority (D10).
+	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
 	actorAllowed, actorCeilingFrom := effectiveAllowedScopesWithSource(actorPolicy, actorIdentity)
+	if parent.Type == domain.PrincipalUser {
+		// Empty means no extra cap from the actor: the person's grant, which
+		// the parent's scopes already carry, bounds the chain.
+		actorAllowed, actorCeilingFrom = actorPolicy.UserGrantScopes, ceilingFromUserGrant
+		if len(actorAllowed) == 0 {
+			actorCeilingFrom = ceilingUnset
+		}
+	}
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
@@ -1108,13 +1127,8 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed, actorCeilingFrom)
 	}
 
-	// Step 5: Compute delegation depth (increment from orchestrator's depth).
-	// jwx v4: jwt.Get[float64] replaces the v2 Token.Get + assertion. JSON
-	// numbers decode as float64 regardless of integer intent.
-	var parentDepth int
-	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
-		parentDepth = int(d)
-	}
+	// Step 5: the child's delegation depth is the parent's plus one
+	// (parentDepth, read above).
 
 	// The delegating agent, persisted as delegated_by_wimse_uri for the
 	// delegation graph. Under the legacy shape that is the parent's `sub`;
@@ -1164,12 +1178,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
-	// The child inherits its chain's principal and never re-derives it, so a
-	// person stays the principal at every hop however deep the chain goes.
-	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss
+	// A delegated chain is bounded by its parent, so a user-subject child is
+	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
+	issue.UserGrantBounded = true
 
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
 	// outermost, then the parent's actors. A parent with no actors was a root
@@ -2467,8 +2481,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Bounded by the user's consent and the client's registered scopes, so a
+		// linked identity's user-grant ceiling applies, not its own (D10).
+		UserGrantBounded:  true,
 		GrantType:         domain.GrantTypeAuthorizationCode,
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
@@ -2924,6 +2941,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		Identity:         identity,
 		IdentityPolicyID: identityPolicyID,
 		GrantType:        domain.GrantTypeRefreshToken,
+		// A refresh continues its family's root. An authorization_code family
+		// is bounded by consent (D10's split ceiling applies); a trusted-broker
+		// audience-profile family is bounded only by the broker's request, so
+		// it keeps allowed_scopes, as its root did.
+		UserGrantBounded: oldToken.Audience == "",
 		UseRS256:         true,
 		SubjectOverride:  oldToken.UserID,
 		ApplicationID:    applicationID,
@@ -3440,6 +3462,9 @@ const (
 	ceilingFromPolicy
 	// ceilingFromIdentity means the deprecated identity.AllowedScopes did.
 	ceilingFromIdentity
+	// ceilingFromUserGrant means the policy's user_grant_scopes did: the
+	// split ceiling for a token the actor holds for a person (D10).
+	ceilingFromUserGrant
 )
 
 // effectiveAllowedScopesWithSource is effectiveAllowedScopes plus the source
@@ -3547,8 +3572,11 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 		// registration in that case sends the caller to edit a field the
 		// ceiling did not come from.
 		actorTerm := "the actor identity is not registered for ["
-		if ceilingFrom == ceilingFromPolicy {
+		switch ceilingFrom {
+		case ceilingFromPolicy:
 			actorTerm = "the actor's credential policy does not permit ["
+		case ceilingFromUserGrant:
+			actorTerm = "the actor's credential policy's user_grant_scopes does not permit ["
 		}
 		reasons = append(reasons, actorTerm+strings.Join(notPermitted, " ")+"]")
 	}
