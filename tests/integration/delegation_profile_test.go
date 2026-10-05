@@ -736,3 +736,98 @@ func TestRFC8693Profile_APIKeyHasNoActor(t *testing.T) {
 		assert.Equal(t, "test-user", act["sub"])
 	})
 }
+
+// postStatus posts and returns the status and decoded body.
+func postStatus(t *testing.T, path string, body map[string]any, headers map[string]string) (int, map[string]any) {
+	t.Helper()
+	resp := post(t, path, body, headers)
+	got := decode(t, resp)
+	_ = resp.Body.Close()
+	return resp.StatusCode, got
+}
+
+// exchangeAttempt registers an actor under policyID and attempts the exchange,
+// returning the status and body instead of requiring success.
+func (tn hrdTenant) exchangeAttempt(t *testing.T, policyID string, scopes []string, parent string) (int, map[string]any) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	wimse := tn.register(t, uid("hrd-try"), policyID, ecPublicKeyPEM(t, key), scopes)
+	return postStatus(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": parent,
+		"actor_token":   buildAssertion(t, key, wimse),
+		"scope":         scopesToString(scopes),
+	}, nil)
+}
+
+// TestRequiredPrincipalType_RejectsWorkload: an agent whose policy requires a
+// user subject cannot mint its own workload token.
+func TestRequiredPrincipalType_RejectsWorkload(t *testing.T) {
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policyWith(t, scopes, map[string]any{"required_principal_type": "user"})
+
+	extID := uid("hrd-rpt")
+	tn.register(t, extID, policyID, "", scopes)
+	client := registerOAuthClient(t, extID, scopes)
+	status, body := postStatus(t, "/oauth2/token", map[string]any{
+		"grant_type": "client_credentials", "account_id": tn.account, "project_id": tn.project,
+		"client_id": client.ClientID, "client_secret": client.ClientSecret, "scope": "data:read",
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "policy_violation", body["error"])
+}
+
+// TestRequiredPrincipalType_BlocksLaundering is P3: an agent holding both a
+// person's token and its own broader workload token cannot hand the workload
+// one to an actor that requires a user subject. The person-rooted one works.
+func TestRequiredPrincipalType_BlocksLaundering(t *testing.T) {
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	openPolicy := tn.policy(t, scopes)
+	userOnly := tn.policyWith(t, scopes, map[string]any{"required_principal_type": "user"})
+
+	ownToken, _ := tn.workloadRoot(t, openPolicy, scopes)
+	status, body := tn.exchangeAttempt(t, userOnly, scopes, ownToken)
+	assert.Equal(t, http.StatusBadRequest, status, "a workload-rooted token must not reach a user-only actor")
+	assert.Equal(t, "policy_violation", body["error"])
+
+	userToken, _ := tn.userRoot(t, scopes)
+	status, _ = tn.exchangeAttempt(t, userOnly, scopes, userToken)
+	assert.Equal(t, http.StatusOK, status, "the person-rooted token is accepted")
+}
+
+// TestRequiredPrincipalType_LegacyParentFailsClosed: a child of a delegated
+// legacy parent has an unknown principal, which never satisfies a user
+// requirement — the human may have been in that chain, but nothing proves it.
+func TestRequiredPrincipalType_LegacyParentFailsClosed(t *testing.T) {
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	openPolicy := tn.policy(t, scopes)
+	userOnly := tn.policyWith(t, scopes, map[string]any{"required_principal_type": "user"})
+
+	root, _ := tn.userRoot(t, scopes)
+	mid, _ := tn.exchange(t, openPolicy, uid("hrd-lp"), scopes, root)
+	midToken := mid["access_token"].(string)
+	forgetPrincipal(t, midToken)
+
+	status, body := tn.exchangeAttempt(t, userOnly, scopes, midToken)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "policy_violation", body["error"])
+}
+
+// TestRequiredPrincipalType_PolicyValidation: owner is refused until personal
+// agents ship, and an API key's policy may not require less than its identity's.
+func TestRequiredPrincipalType_PolicyValidation(t *testing.T) {
+	tn := newTenant(t, "")
+	status, _ := postStatus(t, adminPath("/credential-policies"), map[string]any{
+		"name": uid("hrd-owner"), "required_principal_type": "owner",
+	}, tn.headers)
+	assert.Contains(t, []int{http.StatusBadRequest, http.StatusUnprocessableEntity}, status, "owner is not available yet")
+
+	policyID := tn.policy(t, nil)
+	resp := doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+policyID), map[string]any{"required_principal_type": "owner"}, tn.headers)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	_ = resp.Body.Close()
+}

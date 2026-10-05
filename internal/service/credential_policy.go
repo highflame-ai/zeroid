@@ -121,6 +121,8 @@ type CreatePolicyRequest struct {
 	// JWTTyp is the access token typ header under the rfc8693 profile:
 	// "at+jwt" (the default when empty) or "JWT".
 	JWTTyp string
+	// RequiredPrincipalType: "" (any) or "user".
+	RequiredPrincipalType string
 }
 
 // CreatePolicy creates a new credential policy.
@@ -150,26 +152,30 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 	if !domain.ValidJWTTyp(req.JWTTyp) {
 		return nil, fmt.Errorf("%w: invalid jwt_typ %q (must be %s or %s)", ErrInvalidPolicyField, req.JWTTyp, domain.JWTTypAccessToken, domain.JWTTypJWT)
 	}
+	if err := validateRequiredPrincipalType(req.RequiredPrincipalType); err != nil {
+		return nil, err
+	}
 
 	policy := &domain.CredentialPolicy{
-		ID:                  uuid.New().String(),
-		AccountID:           req.AccountID,
-		ProjectID:           req.ProjectID,
-		Name:                req.Name,
-		Description:         req.Description,
-		MaxTTLSeconds:       req.MaxTTLSeconds,
-		AllowedGrantTypes:   req.AllowedGrantTypes,
-		AllowedScopes:       req.AllowedScopes,
-		RequiredTrustLevel:  req.RequiredTrustLevel,
-		RequiredAttestation: req.RequiredAttestation,
-		MaxDelegationDepth:  req.MaxDelegationDepth,
-		Source:              req.Source,
-		SourceKey:           req.SourceKey,
-		IsActive:            true,
-		ExpiresAt:           req.ExpiresAt,
-		JWTTyp:              req.JWTTyp,
-		CreatedAt:           time.Now(),
-		UpdatedAt:           time.Now(),
+		ID:                    uuid.New().String(),
+		AccountID:             req.AccountID,
+		ProjectID:             req.ProjectID,
+		Name:                  req.Name,
+		Description:           req.Description,
+		MaxTTLSeconds:         req.MaxTTLSeconds,
+		AllowedGrantTypes:     req.AllowedGrantTypes,
+		AllowedScopes:         req.AllowedScopes,
+		RequiredTrustLevel:    req.RequiredTrustLevel,
+		RequiredAttestation:   req.RequiredAttestation,
+		MaxDelegationDepth:    req.MaxDelegationDepth,
+		Source:                req.Source,
+		SourceKey:             req.SourceKey,
+		IsActive:              true,
+		ExpiresAt:             req.ExpiresAt,
+		JWTTyp:                req.JWTTyp,
+		RequiredPrincipalType: req.RequiredPrincipalType,
+		CreatedAt:             time.Now(),
+		UpdatedAt:             time.Now(),
 	}
 
 	if req.SourceKey != "" {
@@ -245,6 +251,8 @@ type UpdatePolicyRequest struct {
 	ExpiresAt *string
 	// JWTTyp: nil leaves it unchanged; "" resets to the profile default.
 	JWTTyp *string
+	// RequiredPrincipalType: nil leaves it unchanged; "" clears it (any).
+	RequiredPrincipalType *string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -298,6 +306,12 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 			return nil, fmt.Errorf("%w: invalid jwt_typ %q (must be %s or %s)", ErrInvalidPolicyField, *req.JWTTyp, domain.JWTTypAccessToken, domain.JWTTypJWT)
 		}
 		policy.JWTTyp = *req.JWTTyp
+	}
+	if req.RequiredPrincipalType != nil {
+		if err := validateRequiredPrincipalType(*req.RequiredPrincipalType); err != nil {
+			return nil, err
+		}
+		policy.RequiredPrincipalType = *req.RequiredPrincipalType
 	}
 	if req.IsActive != nil {
 		policy.IsActive = *req.IsActive
@@ -365,6 +379,14 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 		return fmt.Errorf("%w: grant type %q is not permitted by policy (allowed: %v)", ErrPolicyViolation, req.GrantType, policy.AllowedGrantTypes)
 	}
 
+	// 2b. Principal type meets policy.required_principal_type. Checked for
+	// every grant, so an agent that requires a user subject can neither mint
+	// its own workload token nor accept one in an exchange (P3). An unknown
+	// principal — a child of a delegated legacy parent — never satisfies it.
+	if policy.RequiredPrincipalType == domain.RequirePrincipalUser && req.PrincipalType != domain.PrincipalUser {
+		return fmt.Errorf("%w: policy %q requires a user subject, and this token's chain is rooted in a %s principal", ErrPolicyViolation, policy.Name, principalTypeLabel(req.PrincipalType))
+	}
+
 	// 3. Scopes subset of policy.allowed_scopes (if policy defines scope restrictions)
 	if len(policy.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		policyScopes := make(map[string]bool, len(policy.AllowedScopes))
@@ -404,6 +426,14 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 	return nil
 }
 
+// principalTypeLabel names a principal type in a policy denial.
+func principalTypeLabel(t domain.PrincipalType) string {
+	if t == "" {
+		return "unrecorded"
+	}
+	return string(t)
+}
+
 // EnforceSubset verifies that narrower is no broader than wider along every
 // axis of the credential policy. Used at API-key creation time to reject
 // keys whose policy would grant more than the owning identity's policy
@@ -424,6 +454,13 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 func (s *CredentialPolicyService) EnforceSubset(narrower, wider *domain.CredentialPolicy) error {
 	if narrower == nil || wider == nil {
 		return nil
+	}
+
+	// Principal requirement: a narrower policy must require at least as much,
+	// in the order any < user < owner.
+	if domain.PrincipalRequirementRank(narrower.RequiredPrincipalType) < domain.PrincipalRequirementRank(wider.RequiredPrincipalType) {
+		return fmt.Errorf("%w: required_principal_type %q is weaker than identity policy's %q",
+			ErrPolicySubsetViolation, narrower.RequiredPrincipalType, wider.RequiredPrincipalType)
 	}
 
 	// Scope ceiling: narrower.AllowedScopes must be ⊆ wider.AllowedScopes
@@ -502,6 +539,22 @@ type EnforcePolicyRequest struct {
 	TrustLevel       domain.TrustLevel
 	AttestationLevel string
 	DelegationDepth  int
+	// PrincipalType is the type of the principal the token's chain acts for.
+	PrincipalType domain.PrincipalType
+}
+
+// validateRequiredPrincipalType accepts the principal requirements a policy
+// may set today. "owner" needs the personal-agent profile (the agent's owner
+// bound to a linked IdP identity), which ships later, so it is refused rather
+// than stored as a requirement nothing can satisfy correctly.
+func validateRequiredPrincipalType(v string) error {
+	switch v {
+	case domain.RequirePrincipalAny, domain.RequirePrincipalUser:
+		return nil
+	case domain.RequirePrincipalOwner:
+		return fmt.Errorf("%w: required_principal_type %q is not available yet (it arrives with the personal-agent profile)", ErrInvalidPolicyField, v)
+	}
+	return fmt.Errorf("%w: invalid required_principal_type %q (must be empty or %q)", ErrInvalidPolicyField, v, domain.RequirePrincipalUser)
 }
 
 // attestationLevelRank returns a numeric rank for attestation levels.

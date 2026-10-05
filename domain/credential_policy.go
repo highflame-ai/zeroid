@@ -87,9 +87,15 @@ type CredentialPolicy struct {
 	// (JWT-SVID §2.3 allows only JWT or JOSE). The two specs disagree and a
 	// token can satisfy only one. Ignored under the legacy profile, which
 	// always issues JWT.
-	JWTTyp    string    `bun:"jwt_typ,type:varchar(10),nullzero" json:"jwt_typ,omitempty"`
-	CreatedAt time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	JWTTyp string `bun:"jwt_typ,type:varchar(10),nullzero" json:"jwt_typ,omitempty"`
+	// RequiredPrincipalType requires that the chain a token belongs to is
+	// rooted in a person: "" (any, the default) or "user". Checked for every
+	// grant the identity uses, so an agent that requires a user subject can
+	// neither mint its own workload token nor accept one in an exchange — the
+	// authority-laundering path (P3). "owner" arrives with personal agents.
+	RequiredPrincipalType string    `bun:"required_principal_type,type:varchar(20),nullzero" json:"required_principal_type,omitempty"`
+	CreatedAt             time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt             time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // Access token `typ` header values a credential policy may choose.

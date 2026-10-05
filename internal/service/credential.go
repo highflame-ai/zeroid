@@ -427,6 +427,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// that when the key inherits the identity policy verbatim (the common
 	// case: CredentialPolicyID == IdentityPolicyID), so the hot path pays
 	// for exactly one enforcement pass.
+	// The principal is decided before enforcement because a policy can require
+	// a user subject (required_principal_type).
+	principal := s.resolvePrincipal(req)
+
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
 	var identityPolicy *domain.CredentialPolicy
@@ -442,6 +446,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			TrustLevel:       req.Identity.TrustLevel,
 			AttestationLevel: attestationLevel,
 			DelegationDepth:  req.DelegationDepth,
+			PrincipalType:    principal.Type,
 		}
 
 		// Identity policy — governance ceiling.
@@ -514,7 +519,6 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(ttl) * time.Second)
 	jti := uuid.New().String()
-	principal := s.resolvePrincipal(req)
 
 	// The tenant's token profile decides the claim shape. A read failure
 	// fails the issuance: minting in the wrong shape after a tenant has

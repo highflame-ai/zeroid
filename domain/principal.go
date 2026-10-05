@@ -34,6 +34,29 @@ const (
 	PrincipalUnknown PrincipalType = "unknown"
 )
 
+// Principal requirements a credential policy may set, ordered from weakest to
+// strongest: any ("") < user < owner.
+const (
+	RequirePrincipalAny   = ""
+	RequirePrincipalUser  = "user"
+	RequirePrincipalOwner = "owner"
+)
+
+// PrincipalRequirementRank orders principal requirements for subset checks:
+// a narrower policy must require at least as much as the wider one. -1 for an
+// unrecognised value.
+func PrincipalRequirementRank(req string) int {
+	switch req {
+	case RequirePrincipalAny:
+		return 0
+	case RequirePrincipalUser:
+		return 1
+	case RequirePrincipalOwner:
+		return 2
+	}
+	return -1
+}
+
 // IsValid reports whether t is one of the principal types ZeroID assigns.
 func (t PrincipalType) IsValid() bool {
 	switch t {
