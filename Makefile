@@ -79,12 +79,8 @@ next-version: ## Print svu-computed next semver from commits since last v* tag
 		echo "current : $$($${SVU} current)"; \
 		echo "next    : $$($${SVU} next)"
 	@echo
-	@echo "Cut a zeroid release: draft a new release in the GitHub UI with tag = svu's recommendation"
-	@echo "(or higher). See RELEASING.md."
-	@echo
-	@echo "LOCKSTEP: zeroid, pkg/authjwt and pkg/dpop all release at the SAME version,"
-	@echo "tagged at the same commit. Run 'make release-prep VERSION=vX.Y.Z' first so"
-	@echo "go.mod names the version being released — release.yml refuses otherwise."
+	@echo "Cut a release: Actions → Release Build - Zeroid → Run workflow."
+	@echo "It runs release-prep for svu's next version, then creates that tag. See RELEASING.md."
 
 release-prep: ## Bump go.mod's nested-module pins to the next release version (lockstep). Requires VERSION=vX.Y.Z.
 	@if [ -z "$(VERSION)" ]; then \
@@ -95,17 +91,22 @@ release-prep: ## Bump go.mod's nested-module pins to the next release version (l
 		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
 		exit 1; \
 	fi
-	@# LOCKSTEP: zeroid, pkg/authjwt and pkg/dpop all carry the same version and
+	@# LOCKSTEP: zeroid and its nested modules carry the same version and
 	@# are tagged at the same commit. go.mod must therefore name the version being
 	@# released BEFORE the release is cut — release.yml refuses to proceed
 	@# otherwise. This target makes that a one-liner instead of a hand edit.
 	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/(authjwt\|dpop\|jwks)) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' go.mod
 	@rm -f go.mod.bak
+	@# pkg/authjwt requires pkg/jwks at the same lockstep version. The release
+	@# workflow tags jwks before authjwt so this pin can name the version that
+	@# is about to be published.
+	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/jwks) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' pkg/authjwt/go.mod
+	@rm -f pkg/authjwt/go.mod.bak
 	@go build ./... >/dev/null
 	@echo "go.mod pins bumped to $(VERSION):"
-	@grep -E 'zeroid/pkg/(authjwt|dpop|jwks)' go.mod
+	@grep -E 'zeroid/pkg/(authjwt|dpop|jwks)' go.mod pkg/authjwt/go.mod
 	@echo
-	@echo "Commit this, merge it, then cut the $(VERSION) release normally."
+	@echo "Commit this, merge it, then publish the $(VERSION) release."
 
 
 clean: ## Remove binary, keys, and docker volumes

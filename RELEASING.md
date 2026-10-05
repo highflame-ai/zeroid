@@ -35,19 +35,15 @@ was not enough last time.
 All modules release in **lockstep**: `zeroid`, `pkg/authjwt`, `pkg/dpop` and `pkg/jwks` carry the
 SAME version and are tagged at the SAME commit, every time.
 
-```bash
-# 1. Point go.mod at the version you are about to release.
-make release-prep VERSION=v1.9.4
-#    ...commit + merge that.
+**Actions → Release Build - Zeroid → Run workflow.** Leave the version empty to use svu's next tag.
 
-# 2. github.com/highflame-ai/zeroid → Releases → "Draft a new release"
-#    Choose a tag → "Create new tag: v1.9.4 on publish" → Publish
-```
+1. **`cut-release`** runs `make release-prep` for that version and pushes the pin commit to `main` when `go.mod` does not already name it. The commit is `devops:`, so it does not raise the version again.
+2. **The same job creates the GitHub release** on that commit. Creating it pushes tag `vX.Y.Z`. The cloud repo clones that tag, so the bump has to be in the commit before the tag exists.
+3. **The release event** checks the pins, tags `pkg/jwks/vX.Y.Z`, `pkg/dpop/vX.Y.Z` and `pkg/authjwt/vX.Y.Z` at that commit, runs integration tests, builds the binaries, and then triggers `highflame-cloud`'s `trigger-release-zeroid.yml` with `RELEASE_VER` set to the tag.
 
-`release.yml` then validates the tag format, runs svu against commit history,
-**verifies go.mod's nested-module pins equal the release version**, tags
-`pkg/authjwt/vX.Y.Z`, `pkg/dpop/vX.Y.Z` and `pkg/jwks/vX.Y.Z` at the release commit, runs integration
-tests, builds goreleaser binaries and pushes the Docker image.
+Housekeeping commits (`devops:`, `build(deps)`, `[Snyk]`, `Bump`) do not cut a release. `make release-prep VERSION=vX.Y.Z` remains the local form of the bump the workflow runs.
+
+The GitHub App behind `HIGHFLAME_GITHUB_APP_ID` has to be allowed to push commits and tags to `main`. The default workflow token cannot: a commit it pushes does not start the next workflow, and the pin bump would stop there.
 
 To preview what svu would recommend:
 
@@ -155,8 +151,8 @@ Run `make next-version` to preview.
 |---------|-------|-----|
 | `Invalid version format` | Tag doesn't match `vMAJOR.MINOR.PATCH` | Use a semver tag |
 | `Release tag X is below svu's computed next version Y` | A `feat:` commit since the last tag implies a minor bump | Re-create the release at Y or higher |
-| `go.mod pins ... to X, but this release is Y` | You skipped `make release-prep` | `make release-prep VERSION=Y`, merge, then re-publish |
-| Both at once: go.mod pins `vA.B.C`, and svu demands `vA.B+1.0` | A `feat:` landed on `main` **after** you ran `release-prep`. The gates now disagree — the pin names the version you prepared, svu names a higher floor — and satisfying one violates the other. | `make release-prep VERSION=<svu's version>`, merge, then publish at that version. To avoid it: run `release-prep` **last**, after the final merge to `main`. Any `feat:` merged in between silently invalidates the pins. |
+| `go.mod pins ... to X, but this release is Y` | A tag was published from the Releases UI before the pins named Y | That tag is already public. Let the next `feat:` or `fix:` on `main` cut the next version. Do not republish Y. |
+| Both at once: go.mod pins `vA.B.C`, and svu demands `vA.B+1.0` | A `feat:` landed on `main` after a release was prepared by hand | Run the workflow again with the version empty. svu supplies the higher tag, and the pins are bumped before that tag is created. |
 | The release tag exists but the run failed | **Expected, and not recoverable in place.** Pushing the tag publishes the Go module; the workflow runs afterwards. Cut the next patch version — do not force-push the tag, since the proxy may already have cached it. |
 
 ---
@@ -174,7 +170,7 @@ To add one (e.g. `pkg/dcr/`):
    at the **current lockstep version**, plus a `replace` for in-repo builds.
 3. **`.github/workflows/release.yml`** — add `dcr` to the `for MOD in ...` loops in
    BOTH the lockstep check and the tag-nested-modules step.
-4. **`Makefile`** — extend the `release-prep` sed to cover the new module path.
+4. **`Makefile`** — extend the `release-prep` sed to cover the new module path. `cut-release` calls that target. If another nested module requires the new one, bump that `go.mod` in the same target and reject a mismatch from `release.yml`, the way `pkg/authjwt/go.mod` pins `pkg/jwks`.
 5. **`Dockerfile`** — add `COPY pkg/<new>/go.mod pkg/<new>/go.sum ./pkg/<new>/`
    before `RUN go mod download`. Missing this fails the Docker build outright:
    zeroid's `replace` points at a directory that is not in the build context, and
@@ -211,7 +207,7 @@ zeroid tried the independent model and the evidence says it did not fit:
 
 The trade now:
 
-- **Common case:** one command (`make release-prep`) plus Publish in the UI.
+- **Common case:** Actions → Release Build - Zeroid → Run workflow. It bumps the pins, creates the tag on that commit, tags the nested modules, and triggers `highflame-cloud`.
 - **Cost:** version numbers advance without changes. Harmless.
 - **Foot-gun:** no longer detected, but *structurally absent* — the tag is created at
   the commit whose go.mod names it.
