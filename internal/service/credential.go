@@ -681,10 +681,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		}
 		// RFC 8693 §4.1 `act`: the current actor outermost, prior actors
 		// nested. Only workloads appear; the person is `sub`, never an actor.
+		//
+		// ActingUserID never becomes `act` here (D6). Only the api_key grant
+		// sets it, to the key's creator, and the creator is not acting: §4.1
+		// reserves `act` for the party currently acting, and reading it as
+		// "the human" is what let one person's brokered credentials be used
+		// for every agent whose key they created (highflame-firehog#669). An
+		// api-key token is a workload-subject token with no actor; the creator
+		// stays identity metadata, carried in owner_user_id and returned by
+		// introspection.
 		if len(req.Actors) > 0 {
 			_ = token.Set("act", actorChainClaim(req.Actors))
-		} else if req.ActingUserID != "" {
-			_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
 		}
 	} else {
 		// Legacy "act" claim — two use cases:
