@@ -3107,6 +3107,27 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 			result[claim] = v
 		}
 	}
+	// aud is an RFC 7662 §2.2 response member, so a resource server can check
+	// a token was meant for it without parsing the JWT.
+	if aud, ok := parsed.Audience(); ok && len(aud) > 0 {
+		result["aud"] = aud
+	}
+	// The principal comes from the credential row, not the token: legacy
+	// tokens do not carry principal_type, but every credential since migration
+	// 047 records it, so introspection reports it for every tenant. The
+	// principal's identifier is reported beside it because under the legacy
+	// profile an exchanged token's sub is the actor, not the principal, and a
+	// principal_type of user next to an agent's sub would misname the agent as
+	// the person.
+	if cred.PrincipalType != "" {
+		result["principal_type"] = string(cred.PrincipalType)
+		if cred.PrincipalSub != "" {
+			result["principal_sub"] = cred.PrincipalSub
+		}
+		if cred.PrincipalIss != "" {
+			result["principal_iss"] = cred.PrincipalIss
+		}
+	}
 
 	return result, nil
 }

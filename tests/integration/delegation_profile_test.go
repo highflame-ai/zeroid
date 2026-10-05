@@ -319,6 +319,17 @@ func TestIntrospection_Fields(t *testing.T) {
 	} else {
 		assert.NotContains(t, got, "owner_user_id", "a claim the token lacks is not invented")
 	}
+	assert.Equal(t, claims["aud"], got["aud"], "aud is an RFC 7662 response member")
+	// principal_type is read from the credential row, so it is reported even
+	// for a legacy-profile token, which does not carry the claim.
+	assert.NotContains(t, claims, "principal_type", "precondition: a legacy token")
+	assert.Equal(t, "workload", got["principal_type"])
+	// Under legacy the exchanged token's sub is the actor, so the principal is
+	// reported on its own: here the root workload, not the actor in sub.
+	rootClaims := decodeJWTPayload(t, root)
+	assert.Equal(t, rootClaims["sub"], got["principal_sub"], "the principal is the root, not the actor in sub")
+	assert.NotEqual(t, claims["sub"], got["principal_sub"], "precondition: legacy sub is the actor")
+	assert.Equal(t, rootClaims["iss"], got["principal_iss"])
 }
 
 // TestTokenExchange_ClientIDIsTheActor covers the exchange half of D8: RFC 9068
