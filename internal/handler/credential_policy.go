@@ -29,6 +29,7 @@ type CreatePolicyInput struct {
 		Source              string     `json:"source,omitempty" doc:"Provenance of an auto-derived policy (e.g. 'discovery'); omit for user-authored policies"`
 		SourceKey           string     `json:"source_key,omitempty" doc:"Stable dedup identity within the source; when set, create is idempotent by (source, source_key)"`
 		ExpiresAt           *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
+		JWTTyp              string     `json:"jwt_typ,omitempty" enum:"at+jwt,JWT" doc:"Access token JOSE typ header under the rfc8693 token profile. at+jwt (the default) types the token per RFC 9068; JWT keeps it a conformant JWT-SVID for SPIFFE-strict consumers. The two specs disagree, so a token can satisfy only one. Ignored under the legacy profile, which always issues JWT."`
 	}
 }
 
@@ -62,6 +63,8 @@ type UpdatePolicyInput struct {
 		// ExpiresAt tri-state: omit to leave unchanged, "" to clear (no expiry),
 		// RFC3339 string to set.
 		ExpiresAt *string `json:"expires_at,omitempty" doc:"RFC3339 expiry, or empty string to clear"`
+		// JWTTyp: omit to leave unchanged, "" to reset to the profile default.
+		JWTTyp *string `json:"jwt_typ,omitempty" doc:"Access token typ header under the rfc8693 profile: at+jwt or JWT, or empty string to reset to the default (at+jwt)"`
 	}
 }
 
@@ -131,10 +134,14 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 		Source:              input.Body.Source,
 		SourceKey:           input.Body.SourceKey,
 		ExpiresAt:           input.Body.ExpiresAt,
+		JWTTyp:              input.Body.JWTTyp,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNameConflict) {
 			return nil, huma.Error409Conflict("credential policy with this name already exists")
+		}
+		if errors.Is(err, service.ErrInvalidPolicyField) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create credential policy")
 		return nil, huma.Error500InternalServerError("failed to create credential policy")
@@ -195,6 +202,7 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
 		IsActive:            input.Body.IsActive,
 		ExpiresAt:           input.Body.ExpiresAt,
+		JWTTyp:              input.Body.JWTTyp,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {

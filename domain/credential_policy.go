@@ -81,8 +81,31 @@ type CredentialPolicy struct {
 	// policy the same as an inactive one — identity policy, per-key policy,
 	// or both. NULL means "no expiry".
 	ExpiresAt *time.Time `bun:"expires_at"                       json:"expires_at,omitempty"`
-	CreatedAt time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt time.Time  `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	// JWTTyp chooses the access token's JOSE `typ` header under the rfc8693
+	// token profile: JWTTypAccessToken (the default when empty, RFC 9068
+	// §2.1) or JWTTypJWT for agents whose tokens must stay valid JWT-SVIDs
+	// (JWT-SVID §2.3 allows only JWT or JOSE). The two specs disagree and a
+	// token can satisfy only one. Ignored under the legacy profile, which
+	// always issues JWT.
+	JWTTyp    string    `bun:"jwt_typ,type:varchar(10),nullzero" json:"jwt_typ,omitempty"`
+	CreatedAt time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// Access token `typ` header values a credential policy may choose.
+const (
+	// JWTTypAccessToken is the RFC 9068 §2.1 type of a JWT access token, and
+	// the rfc8693 profile's default.
+	JWTTypAccessToken = "at+jwt"
+	// JWTTypJWT keeps the token a conformant JWT-SVID (JWT-SVID §2.3), and is
+	// what the legacy profile always issues.
+	JWTTypJWT = "JWT"
+)
+
+// ValidJWTTyp reports whether v is a typ a policy may choose; empty means the
+// profile default.
+func ValidJWTTyp(v string) bool {
+	return v == "" || v == JWTTypAccessToken || v == JWTTypJWT
 }
 
 // IsExpired reports whether the policy has aged out. A nil ExpiresAt
