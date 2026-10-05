@@ -1052,6 +1052,17 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token iss does not match actor identity WIMSE URI")
 	}
 
+	// RFC 8693 §4.4: a subject token that carries may_act names who may act
+	// for its subject, and this actor must be that party. ZeroID does not
+	// emit may_act yet (when to set it is design question Q7), and it is a
+	// reserved claim callers cannot inject, so this binds only tokens a future
+	// issuance path stamps.
+	if mayAct, err := jwt.Get[map[string]any](subjectParsed, "may_act"); err == nil {
+		if !mayActPermits(mayAct, actorIdentity.WIMSEURI, s.issuer) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token's may_act does not name this actor")
+		}
+	}
+
 	// Step 3: Resolve the actor's identity policy — the authority ceiling
 	// for delegation. Scopes, max_delegation_depth, required_trust_level,
 	// and the token_exchange grant type allow-list are all enforced from
@@ -1186,6 +1197,24 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// mayActPermits reports whether an RFC 8693 §4.4 may_act claim names actor.
+// The claim's members identify the party the same way `act` does: `sub` must
+// equal the actor's WIMSE URI. When it also names an issuer, that issuer must
+// be ZeroID's own, since ZeroID is what vouches for the actor's identity. A
+// claim that names no subject permits no one (fail closed).
+func mayActPermits(mayAct map[string]any, actorSub, issuer string) bool {
+	sub, _ := mayAct["sub"].(string)
+	if sub == "" || sub != actorSub {
+		return false
+	}
+	if iss, ok := mayAct["iss"]; ok {
+		if s, _ := iss.(string); s != issuer {
+			return false
+		}
+	}
+	return true
 }
 
 // priorActorsOf returns a subject token's RFC 8693 actor chain, current actor
