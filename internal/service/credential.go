@@ -194,6 +194,16 @@ type IssueRequest struct {
 	// recent first. Ignored under the legacy profile, which keeps its
 	// single-level `act`. Capped at domain.MaxActorChainDepth.
 	Actors []domain.Actor
+
+	// UserGrantBounded marks a grant whose user principal's grant is itself
+	// bounded — a delegated user chain (by its parent), ID-JAG (by the IdP),
+	// authorization_code and refresh (by consent) — so a user-subject token
+	// is capped by the policy's user_grant_scopes instead of allowed_scopes
+	// (D10). Left false on the trusted-broker, ID-token and CIBA roots, which
+	// are bounded only by the caller's request and so keep allowed_scopes
+	// until the ceiling rule enforces on them. No effect on a workload
+	// principal.
+	UserGrantBounded bool
 }
 
 // actorChainClaim renders an actor chain as the nested RFC 8693 §4.1 `act`
@@ -380,7 +390,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// (pre-migration-008) keep working until they migrate the restriction onto
 	// their credential policy's allowed_scopes. New callers should not rely on
 	// this path.
-	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
+	// The deprecated identity list is the old allowed_scopes, so the split
+	// ceiling (D10) skips it for a bounded user-subject chain too.
+	splitCeiling := req.UserGrantBounded && s.resolvePrincipal(req).Type == domain.PrincipalUser
+	if !splitCeiling && len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {
 			allowed[s] = true
@@ -447,6 +460,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			AttestationLevel: attestationLevel,
 			DelegationDepth:  req.DelegationDepth,
 			PrincipalType:    principal.Type,
+			UserGrantBounded: req.UserGrantBounded,
 		}
 
 		// Identity policy — governance ceiling.

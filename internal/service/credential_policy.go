@@ -123,6 +123,8 @@ type CreatePolicyRequest struct {
 	JWTTyp string
 	// RequiredPrincipalType: "" (any) or "user".
 	RequiredPrincipalType string
+	// UserGrantScopes caps what the identity may hold for a person.
+	UserGrantScopes []string
 }
 
 // CreatePolicy creates a new credential policy.
@@ -174,6 +176,7 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		ExpiresAt:             req.ExpiresAt,
 		JWTTyp:                req.JWTTyp,
 		RequiredPrincipalType: req.RequiredPrincipalType,
+		UserGrantScopes:       req.UserGrantScopes,
 		CreatedAt:             time.Now(),
 		UpdatedAt:             time.Now(),
 	}
@@ -253,6 +256,8 @@ type UpdatePolicyRequest struct {
 	JWTTyp *string
 	// RequiredPrincipalType: nil leaves it unchanged; "" clears it (any).
 	RequiredPrincipalType *string
+	// UserGrantScopes: nil leaves it unchanged; an empty list clears it.
+	UserGrantScopes []string
 }
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
@@ -312,6 +317,9 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 			return nil, err
 		}
 		policy.RequiredPrincipalType = *req.RequiredPrincipalType
+	}
+	if req.UserGrantScopes != nil {
+		policy.UserGrantScopes = req.UserGrantScopes
 	}
 	if req.IsActive != nil {
 		policy.IsActive = *req.IsActive
@@ -387,15 +395,21 @@ func (s *CredentialPolicyService) EnforcePolicy(ctx context.Context, policy *dom
 		return fmt.Errorf("%w: policy %q requires a user subject, and this token's chain is rooted in a %s principal", ErrPolicyViolation, policy.Name, principalTypeLabel(req.PrincipalType))
 	}
 
-	// 3. Scopes subset of policy.allowed_scopes (if policy defines scope restrictions)
-	if len(policy.AllowedScopes) > 0 && len(req.Scopes) > 0 {
-		policyScopes := make(map[string]bool, len(policy.AllowedScopes))
-		for _, s := range policy.AllowedScopes {
+	// 3. Scopes subset of the policy's ceiling (if it defines one): the
+	// user-grant ceiling for a bounded user-subject chain, allowed_scopes
+	// otherwise (D10).
+	if ceiling := scopeCeiling(policy, req); len(ceiling) > 0 && len(req.Scopes) > 0 {
+		policyScopes := make(map[string]bool, len(ceiling))
+		for _, s := range ceiling {
 			policyScopes[s] = true
+		}
+		field := "allowed_scopes"
+		if req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser {
+			field = "user_grant_scopes"
 		}
 		for _, requested := range req.Scopes {
 			if !policyScopes[requested] {
-				return fmt.Errorf("%w: scope %q is not permitted by policy", ErrPolicyViolation, requested)
+				return fmt.Errorf("%w: scope %q is not permitted by the policy's %s", ErrPolicyViolation, requested, field)
 			}
 		}
 	}
@@ -541,6 +555,21 @@ type EnforcePolicyRequest struct {
 	DelegationDepth  int
 	// PrincipalType is the type of the principal the token's chain acts for.
 	PrincipalType domain.PrincipalType
+	// UserGrantBounded selects the split ceiling (D10): when the principal is
+	// a user and the person's grant is itself bounded, scopes are capped by
+	// user_grant_scopes rather than allowed_scopes. See
+	// IssueRequest.UserGrantBounded for where it is set.
+	UserGrantBounded bool
+}
+
+// scopeCeiling returns the scope list that caps a request under policy: the
+// user-grant ceiling for a bounded user-subject chain, the identity's own
+// authority otherwise. Empty means no restriction from this layer.
+func scopeCeiling(policy *domain.CredentialPolicy, req EnforcePolicyRequest) []string {
+	if req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser {
+		return policy.UserGrantScopes
+	}
+	return policy.AllowedScopes
 }
 
 // validateRequiredPrincipalType accepts the principal requirements a policy

@@ -1064,7 +1064,27 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// never receive more than its principal currently holds, per RFC 8693
 	// intent.
 	requestedScopes := parseScopeString(req.Scope)
+	// The parent's depth. jwx v4: jwt.Get[float64] replaces the v2 Token.Get
+	// + assertion; JSON numbers decode as float64 regardless of integer intent.
+	var parentDepth int
+	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
+		parentDepth = int(d)
+	}
+	// The child inherits its chain's principal and never re-derives it, so a
+	// person stays the principal at every hop however deep the chain goes.
+	// Resolved before the scope computation: a chain acting for a person is
+	// capped by the actor's user-grant ceiling, not its own authority (D10).
+	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
 	actorPolicyScopes, actorRowScopes := identityScopeCeilings(actorPolicy, actorIdentity)
+	userGrantCeiling := parent.Type == domain.PrincipalUser
+	if userGrantCeiling {
+		// D10: a token the actor holds for a person is capped by its
+		// user_grant_scopes, which replaces both of its own-authority
+		// ceilings (policy and registration). Empty means no extra cap from
+		// the actor: the person's grant, which the parent's scopes already
+		// carry, bounds the chain.
+		actorPolicyScopes, actorRowScopes = actorPolicy.UserGrantScopes, nil
+	}
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
@@ -1080,16 +1100,11 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes)
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
 	}
 
-	// Step 5: Compute delegation depth (increment from orchestrator's depth).
-	// jwx v4: jwt.Get[float64] replaces the v2 Token.Get + assertion. JSON
-	// numbers decode as float64 regardless of integer intent.
-	var parentDepth int
-	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
-		parentDepth = int(d)
-	}
+	// Step 5: the child's delegation depth is the parent's plus one
+	// (parentDepth, read above).
 
 	// The delegating agent, persisted as delegated_by_wimse_uri for the
 	// delegation graph. Under the legacy shape that is the parent's `sub`;
@@ -1139,12 +1154,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
-	// The child inherits its chain's principal and never re-derives it, so a
-	// person stays the principal at every hop however deep the chain goes.
-	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss
+	// A delegated chain is bounded by its parent, so a user-subject child is
+	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
+	issue.UserGrantBounded = true
 
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
 	// outermost, then the parent's actors. A parent with no actors was a root
@@ -2421,8 +2436,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Bounded by the user's consent and the client's registered scopes, so a
+		// linked identity's user-grant ceiling applies, not its own (D10).
+		UserGrantBounded:  true,
 		GrantType:         domain.GrantTypeAuthorizationCode,
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
@@ -2878,6 +2896,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		Identity:         identity,
 		IdentityPolicyID: identityPolicyID,
 		GrantType:        domain.GrantTypeRefreshToken,
+		// A refresh continues its family's root. An authorization_code family
+		// is bounded by consent (D10's split ceiling applies); a trusted-broker
+		// audience-profile family is bounded only by the broker's request, so
+		// it keeps allowed_scopes, as its root did.
+		UserGrantBounded: oldToken.Audience == "",
 		UseRS256:         true,
 		SubjectOverride:  oldToken.UserID,
 		ApplicationID:    applicationID,
@@ -3485,8 +3508,10 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 // means "no restriction from this layer", so an unrestricted layer is never
 // blamed. They are kept apart because widening a credential policy and
 // widening a registration are different repairs — naming the wrong one is the
-// mistake this whole function exists to prevent.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string) error {
+// mistake this whole function exists to prevent. userGrant says actorPolicy is
+// the policy's user_grant_scopes, the ceiling on what the actor may hold for a
+// person (D10), so the denial names that field rather than allowed_scopes.
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, userGrant bool) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -3523,7 +3548,11 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
 	}
 	if len(notPermitted) > 0 {
-		reasons = append(reasons, "the actor's credential policy does not permit ["+strings.Join(notPermitted, " ")+"]")
+		policyTerm := "the actor's credential policy does not permit ["
+		if userGrant {
+			policyTerm = "the actor's credential policy's user_grant_scopes does not permit ["
+		}
+		reasons = append(reasons, policyTerm+strings.Join(notPermitted, " ")+"]")
 	}
 	if len(notRegistered) > 0 {
 		reasons = append(reasons, "the actor identity is not registered for ["+strings.Join(notRegistered, " ")+"]")

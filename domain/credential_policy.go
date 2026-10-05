@@ -93,9 +93,16 @@ type CredentialPolicy struct {
 	// grant the identity uses, so an agent that requires a user subject can
 	// neither mint its own workload token nor accept one in an exchange — the
 	// authority-laundering path (P3). "owner" arrives with personal agents.
-	RequiredPrincipalType string    `bun:"required_principal_type,type:varchar(20),nullzero" json:"required_principal_type,omitempty"`
-	CreatedAt             time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt             time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	RequiredPrincipalType string `bun:"required_principal_type,type:varchar(20),nullzero" json:"required_principal_type,omitempty"`
+	// UserGrantScopes caps what this identity may hold for a person — tokens
+	// whose principal is a user, held as client or current actor — while
+	// AllowedScopes keeps capping its own authority (D10). Empty means no
+	// extra cap: the person's own grant bounds the chain. Applied only where
+	// that grant is itself bounded (a delegated user chain, ID-JAG,
+	// authorization_code and refresh); see IssueRequest.UserGrantBounded.
+	UserGrantScopes []string  `bun:"user_grant_scopes,array" json:"user_grant_scopes,omitempty"`
+	CreatedAt       time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt       time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // Access token `typ` header values a credential policy may choose.

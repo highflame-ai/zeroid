@@ -392,6 +392,10 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		ResolveIdentityPolicy: true,
 		GrantType:             domain.GrantTypeJWTBearer,
 		Scopes:                scopes,
+		// The IdP's policy decision bounds an ID-JAG's scopes, so the
+		// application identity's user-grant ceiling applies rather than its
+		// own allowed_scopes, which would reject scopes the IdP granted (D10).
+		UserGrantBounded: true,
 		// Audience-restrict to the ID-JAG resource(s) (D4). IssueCredential stamps
 		// these verbatim as the aud claim instead of defaulting to the issuer URL.
 		Audience:        resources,

@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // Human-rooted delegation, phase 1 (highflame-architecture#359). The tests in
@@ -830,4 +833,109 @@ func TestRequiredPrincipalType_PolicyValidation(t *testing.T) {
 	resp := doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+policyID), map[string]any{"required_principal_type": "owner"}, tn.headers)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	_ = resp.Body.Close()
+}
+
+// TestUserGrantScopes_SplitCeiling is D10: an agent registered for its own
+// authority ([nhi:manage]) can still hold crm:write for Alice, because what it
+// holds for a person is capped by user_grant_scopes, not allowed_scopes; when
+// user_grant_scopes is set it caps that. The agent's own authority is still
+// capped by allowed_scopes. Every tenant, whatever the profile.
+func TestUserGrantScopes_SplitCeiling(t *testing.T) {
+	tn := newTenant(t, "")
+	own := []string{"nhi:manage"}
+	crm := []string{"crm:write"}
+
+	t.Run("an agent registered for nhi:manage holds crm:write for Alice", func(t *testing.T) {
+		policyID := tn.policy(t, own)
+		alice, _ := tn.userRoot(t, crm)
+		body, _ := tn.exchange(t, policyID, uid("hrd-ugs"), crm, alice)
+		claims := decodeJWTPayload(t, body["access_token"].(string))
+		assert.ElementsMatch(t, []any{"crm:write"}, claims["scopes"])
+	})
+
+	t.Run("user_grant_scopes caps what it may hold for a person", func(t *testing.T) {
+		policyID := tn.policyWith(t, own, map[string]any{"user_grant_scopes": []string{"crm:read"}})
+		alice, _ := tn.userRoot(t, crm)
+		status, body := tn.exchangeAttempt(t, policyID, crm, alice)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_scope", body["error"])
+		assert.Contains(t, body["error_description"], "user_grant_scopes", "the denial names the ceiling it came from")
+	})
+
+	t.Run("allowed_scopes still caps the agent's own authority", func(t *testing.T) {
+		rootPolicy := tn.policy(t, crm)
+		ownToken, _ := tn.workloadRoot(t, rootPolicy, crm)
+		actorPolicy := tn.policy(t, own)
+		status, body := tn.exchangeAttempt(t, actorPolicy, crm, ownToken)
+		assert.Equal(t, http.StatusBadRequest, status, "a workload chain is the agent's own authority")
+		assert.Equal(t, "invalid_scope", body["error"])
+	})
+}
+
+// TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes is D10 on the ID-JAG
+// path: the IdP's policy decision bounds an ID-JAG's scopes, so an application
+// identity's own allowed_scopes no longer rejects scopes the IdP granted.
+// user_grant_scopes, when set, still caps them.
+func TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes(t *testing.T) {
+	upstreamIss := "https://corp-idp.d10.test"
+	federationAud := "https://zeroid.d10.test"
+	const mcpResource = "https://mcp-server.d10.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer: upstreamIss, JWKSURI: upstream.JWKSURL(), Audience: federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub", "email": "email"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	fedTenant := map[string]string{"X-Account-ID": fedCfg.AccountID, "X-Project-ID": fedCfg.ProjectID}
+	client := registerOAuthClient(t, uid("d10-client"), []string{"tools:read", "tools:exec"})
+
+	appIdentity := func(extra map[string]any) string {
+		body := map[string]any{
+			"name":                 uid("d10-app-policy"),
+			"allowed_grant_types":  []string{"jwt_bearer"},
+			"allowed_scopes":       []string{"nhi:manage"}, // the app's own authority
+			"max_delegation_depth": 5,
+			"max_ttl_seconds":      3600,
+		}
+		for k, v := range extra {
+			body[k] = v
+		}
+		policyID := createRichCredentialPolicy(t, body, fedTenant)
+		return registerIdentityWithPolicy(t, uid("d10-app"), policyID, "", nil, fedTenant)
+	}
+	redeem := func(applicationID string) (int, map[string]any) {
+		now := time.Now()
+		idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+			"iss": upstreamIss, "aud": federationAud, "sub": uid("d10-user"),
+			"client_id": client.ClientID, "jti": uid("d10-jti"),
+			"resource": mcpResource, "scope": "tools:read tools:exec",
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		})
+		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": idjag,
+			"account_id": fedCfg.AccountID, "project_id": fedCfg.ProjectID,
+			"client_id": client.ClientID, "client_secret": client.ClientSecret,
+			"application_id": applicationID,
+		})
+		var body map[string]any
+		_ = json.Unmarshal([]byte(resp.RawBody), &body)
+		return resp.StatusCode, body
+	}
+
+	t.Run("the IdP's scopes pass the app's own allowed_scopes", func(t *testing.T) {
+		status, body := redeem(appIdentity(nil))
+		require.Equal(t, http.StatusOK, status, "body=%v", body)
+		assert.ElementsMatch(t, []any{"tools:read", "tools:exec"}, decodeIssuedTokenClaims(t, body["access_token"].(string))["scopes"])
+	})
+
+	t.Run("user_grant_scopes still caps them", func(t *testing.T) {
+		status, body := redeem(appIdentity(map[string]any{"user_grant_scopes": []string{"tools:read"}}))
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "policy_violation", body["error"])
+	})
 }
