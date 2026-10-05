@@ -33,8 +33,10 @@ func TestAuthorizationCodeCLIFlow(t *testing.T) {
 	assert.Equal(t, "Bearer", token["token_type"])
 	assert.NotEmpty(t, accessToken)
 
-	// CLI tokens are 90 days (7776000 s).
-	assert.EqualValues(t, 90*24*3600, token["expires_in"], "CLI access token TTL should be 90 days")
+	// A client with no TTL of its own and no refresh grant gets the short
+	// user-subject default, not 90 days (D14): a 90-day sub=user root outlived
+	// the person's IdP session and clamped every delegated child only to itself.
+	assert.EqualValues(t, 3600, token["expires_in"], "a no-refresh client's user access token is short-lived")
 
 	// CLI clients do NOT receive a refresh token.
 	assert.Empty(t, token["refresh_token"], "CLI clients must not receive a refresh token")

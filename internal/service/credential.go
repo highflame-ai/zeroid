@@ -948,6 +948,30 @@ func (s *CredentialService) RevokeAllActiveForIdentity(ctx context.Context, iden
 	return int64(len(revoked)), nil
 }
 
+// RevokeLongLivedUserAccessTokens revokes a tenant's active user-subject
+// access tokens whose lifetime exceeds maxTTLSeconds, cascading to their
+// delegated descendants, and returns how many credentials it revoked. Called
+// when a tenant switches to the rfc8693 profile, so 90-day roots minted under
+// the old no-refresh default do not outlive the switch (D14). Revoking an
+// access token leaves its refresh family alone, so a client with the refresh
+// grant simply refreshes; one without it re-authorizes.
+func (s *CredentialService) RevokeLongLivedUserAccessTokens(ctx context.Context, accountID, projectID string, maxTTLSeconds int, reason string) (int, error) {
+	ids, err := s.repo.ListActiveLongLivedUserAccessTokenIDs(ctx, accountID, projectID, maxTTLSeconds)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, id := range ids {
+		revoked, err := s.repo.Revoke(ctx, id, accountID, projectID, reason)
+		if err != nil {
+			return total, err
+		}
+		s.dispatchRevocations(ctx, revoked, reason)
+		total += len(revoked)
+	}
+	return total, nil
+}
+
 // RevokeAllActiveForOwner revokes every active credential belonging to an
 // identity owned by ownerUserID within accountID, cascading to any delegated
 // descendants via the parent_jti chain. Returns the total number revoked. This

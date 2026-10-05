@@ -12,9 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/highflame-ai/zeroid/domain"
 )
 
@@ -1034,4 +1037,88 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}, "azp": aud}), &rp, rp.ClientSecret)
 		assert.Equal(t, http.StatusOK, status, "body=%v", body)
 	})
+}
+
+// authCodeToken redeems an authorization code for a person in the tenant
+// through clientID, returning the token response.
+func (tn hrdTenant) authCodeToken(t *testing.T, clientID string) map[string]any {
+	t.Helper()
+	verifier, challenge := buildPKCEPair(t)
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(testIssuer).Subject("auth-code").IssuedAt(now).Expiration(now.Add(5*time.Minute)).
+		Claim("cid", clientID).Claim("uid", uid("hrd-ac-user")).
+		Claim("aid", tn.account).Claim("pid", tn.project).
+		Claim("cc", challenge).Claim("ruri", testRedirectURI).Claim("scp", []string{"data:read"}).
+		Build()
+	require.NoError(t, err)
+	code, err := jwt.Sign(tok, jwt.WithKey(jwa.HS256(), []byte(testHMACSecret)))
+	require.NoError(t, err)
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "authorization_code", "client_id": clientID,
+		"code": string(code), "code_verifier": verifier, "redirect_uri": testRedirectURI,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "authorization_code via %s", clientID)
+	body := decode(t, resp)
+	_ = resp.Body.Close()
+	return body
+}
+
+// ensureAuthCodeClient registers a public authorization_code client (no
+// refresh grant) with the given access-token TTL; 0 means no TTL of its own.
+func ensureAuthCodeClient(t *testing.T, accessTTL int) string {
+	t.Helper()
+	clientID := uid("hrd-ac-client")
+	require.NoError(t, testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:       clientID,
+		Name:           clientID,
+		GrantTypes:     []string{"authorization_code"},
+		RedirectURIs:   []string{testRedirectURI},
+		AccessTokenTTL: accessTTL,
+	}))
+	return clientID
+}
+
+// TestUserSubject_NoNinetyDayTTL is D14: an authorization_code client with no
+// TTL of its own and no refresh grant gets a short user-subject token, not the
+// 90-day one that outlived the person's IdP session.
+func TestUserSubject_NoNinetyDayTTL(t *testing.T) {
+	tn := newTenant(t, "")
+	body := tn.authCodeToken(t, ensureAuthCodeClient(t, 0))
+	assert.EqualValues(t, 3600, body["expires_in"])
+	assert.Empty(t, body["refresh_token"], "a no-refresh client re-authorizes instead")
+}
+
+// TestProfileSwitch_RevokesLongLivedUserTokens: switching a tenant to rfc8693
+// revokes its user-subject access tokens longer-lived than the short default,
+// so 90-day roots minted under the old default do not outlive the switch
+// (D14). Short-lived ones are left alone, other tenants are untouched, and
+// repeating the request is safe.
+func TestProfileSwitch_RevokesLongLivedUserTokens(t *testing.T) {
+	tn := newTenant(t, "")
+	other := newTenant(t, "")
+	longClient := ensureAuthCodeClient(t, 90*24*3600)
+	shortClient := ensureAuthCodeClient(t, 0)
+
+	long := tn.authCodeToken(t, longClient)["access_token"].(string)
+	short := tn.authCodeToken(t, shortClient)["access_token"].(string)
+	elsewhere := other.authCodeToken(t, longClient)["access_token"].(string)
+
+	switchTo := func(h map[string]string) map[string]any {
+		resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "rfc8693"}, h)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		body := decode(t, resp)
+		_ = resp.Body.Close()
+		return body
+	}
+
+	body := switchTo(tn.headers)
+	assert.Equal(t, "rfc8693", body["token_profile"])
+	assert.EqualValues(t, 1, body["revoked_long_lived_tokens"])
+	assert.False(t, introspect(t, long)["active"].(bool), "the 90-day root is revoked")
+	assert.True(t, introspect(t, short)["active"].(bool), "a short-lived token is left alone")
+	assert.True(t, introspect(t, elsewhere)["active"].(bool), "another tenant is untouched")
+
+	again := switchTo(tn.headers)
+	assert.EqualValues(t, 0, again["revoked_long_lived_tokens"], "repeating the switch is safe")
 }

@@ -332,6 +332,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// The token profile decides the claim shape of every token, so the
 	// issuance chokepoint reads it (human-rooted delegation, phase 1).
 	credentialSvc.SetTenantSettingsService(tenantSettingsSvc)
+	tenantSettingsSvc.SetCredentialService(credentialSvc)
 	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
