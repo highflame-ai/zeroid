@@ -566,6 +566,34 @@ func (s *CIMDService) resolveUncached(
 //
 // In open mode (no allow-list) domainAllowed admits everything, so this is a
 // no-op — correctly, since open mode refuses these redirects outright.
+// cimdDisplayURI returns uri when it is safe to put in front of a human, and
+// "" otherwise.
+//
+// Safe here means one thing: an absolute https:// URL. These values end up in
+// an href and an img src on a consent screen, so a `javascript:` or `data:`
+// value is script execution on the authorization server's own origin, handed
+// over by whoever published the document. http:// is refused too — the document
+// itself must be served over https (draft §3), and a mixed-content logo would
+// be blocked by the browser anyway while a mixed-content client_uri downgrades
+// the one link a user might click to check who is asking.
+//
+// Dropping rather than rejecting the whole document is deliberate. These fields
+// are decoration; a malformed one must not deny a client the ability to log
+// anyone in. The consent screen then falls back to the client_id host, which
+// draft §8.5 requires it to show regardless.
+func cimdDisplayURI(uri string) string {
+	uri = strings.TrimSpace(uri)
+	if uri == "" {
+		return ""
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return ""
+	}
+
+	return uri
+}
+
 func (s *CIMDService) redirectHostsAllowed(clientIDHost string, redirectURIs []string) error {
 	for _, raw := range redirectURIs {
 		u, err := url.Parse(raw)
@@ -894,6 +922,8 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	return &domain.OAuthClient{
 		ClientID:                clientID,
 		Name:                    name,
+		ClientURI:               cimdDisplayURI(doc.ClientURI),
+		LogoURI:                 cimdDisplayURI(doc.LogoURI),
 		ClientType:              clientType,
 		TokenEndpointAuthMethod: authMethod,
 		JWKS:                    jwks,
