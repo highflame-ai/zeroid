@@ -232,9 +232,16 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-${{ env.GO_VER }}-
 
+      # `make test-integration` runs `go test ./tests/... -race`, and the race
+      # detector requires cgo. With CGO_ENABLED=0 this job died in 0.03s on
+      # `-race requires cgo; enable cgo by setting CGO_ENABLED=1` — before a
+      # single test ran — taking highflame-goreleaser and highflame-trigger
+      # down with it, so every release since shipped no binaries and never
+      # triggered highflame-cloud. pr-check.yml already runs the same target
+      # with CGO_ENABLED: 1.
       - name: Run tests
         env:
-          CGO_ENABLED: 0
+          CGO_ENABLED: 1
         shell: bash
         run: |-
           make test-integration
