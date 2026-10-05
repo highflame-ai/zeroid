@@ -101,8 +101,8 @@ const (
 	// TokenProfileRFC8693 issues the RFC 8693 delegation shape: `sub` is the
 	// principal for the whole chain, `act` nests the actors with the current
 	// one outermost, `principal_type` says whether `sub` is a person or a
-	// workload, and access tokens are typed `at+jwt` with the RFC 9068 `scope`
-	// string. A tenant opts in once its consumers read both shapes.
+	// workload, and tokens carry the RFC 9068 `scope` string. A tenant opts in
+	// once its consumers read both shapes.
 	TokenProfileRFC8693 TokenProfile = "rfc8693"
 )
 

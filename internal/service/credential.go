@@ -308,18 +308,14 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 // Two specs ZeroID follows disagree, and a token can satisfy only one:
 // RFC 9068 §2.1 types a JWT access token "at+jwt", so a resource server can
 // tell it apart from an ID token; JWT-SVID §2.3 allows only "JWT" or "JOSE".
-//
-//   - Legacy profile: always "JWT". Its contract is today's token unchanged.
-//   - rfc8693 profile: "at+jwt" by default, or "JWT" when the identity's
-//     governing policy chooses it, for agents whose tokens must stay valid
-//     JWT-SVIDs. A grant with no identity policy gets the default.
+// Every access token is "at+jwt" by default, whatever the tenant's token
+// profile, or "JWT" when the identity's governing policy chooses it, for
+// agents whose tokens must stay valid JWT-SVIDs. A grant with no identity
+// policy gets the default.
 //
 // Only the governing (identity) policy decides. A header has no
 // narrowest-wins meaning, so an API key's own policy does not override it.
-func accessTokenTyp(rfc8693 bool, identityPolicy *domain.CredentialPolicy) string {
-	if !rfc8693 {
-		return domain.JWTTypJWT
-	}
+func accessTokenTyp(identityPolicy *domain.CredentialPolicy) string {
 	if identityPolicy != nil && identityPolicy.JWTTyp == domain.JWTTypJWT {
 		return domain.JWTTypJWT
 	}
@@ -796,7 +792,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Sign: RS256 for api_key grant (compatible), ES256 for all agent/NHI flows.
 	// kid lets verifiers pick the right key from the JWKS. jwx doesn't default
 	// typ, so it is always set explicitly (see accessTokenTyp).
-	typ := accessTokenTyp(rfc8693, identityPolicy)
+	typ := accessTokenTyp(identityPolicy)
 	var signed []byte
 	var signErr error
 	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {

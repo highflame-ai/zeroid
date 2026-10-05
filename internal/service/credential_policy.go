@@ -118,8 +118,8 @@ type CreatePolicyRequest struct {
 	SourceKey string
 	// ExpiresAt time-bounds the policy. Nil means "no expiry".
 	ExpiresAt *time.Time
-	// JWTTyp is the access token typ header under the rfc8693 profile:
-	// "at+jwt" (the default when empty) or "JWT".
+	// JWTTyp is the access token typ header: "at+jwt" (the default when
+	// empty) or "JWT".
 	JWTTyp string
 	// RequiredPrincipalType: "" (any) or "user".
 	RequiredPrincipalType string

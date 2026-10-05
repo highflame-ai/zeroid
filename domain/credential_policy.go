@@ -81,12 +81,11 @@ type CredentialPolicy struct {
 	// policy the same as an inactive one — identity policy, per-key policy,
 	// or both. NULL means "no expiry".
 	ExpiresAt *time.Time `bun:"expires_at"                       json:"expires_at,omitempty"`
-	// JWTTyp chooses the access token's JOSE `typ` header under the rfc8693
-	// token profile: JWTTypAccessToken (the default when empty, RFC 9068
-	// §2.1) or JWTTypJWT for agents whose tokens must stay valid JWT-SVIDs
-	// (JWT-SVID §2.3 allows only JWT or JOSE). The two specs disagree and a
-	// token can satisfy only one. Ignored under the legacy profile, which
-	// always issues JWT.
+	// JWTTyp chooses the access token's JOSE `typ` header, under either token
+	// profile: JWTTypAccessToken (the default when empty, RFC 9068 §2.1) or
+	// JWTTypJWT for agents whose tokens must stay valid JWT-SVIDs (JWT-SVID
+	// §2.3 allows only JWT or JOSE). The two specs disagree and a token can
+	// satisfy only one.
 	JWTTyp string `bun:"jwt_typ,type:varchar(10),nullzero" json:"jwt_typ,omitempty"`
 	// RequiredPrincipalType requires that the chain a token belongs to is
 	// rooted in a person: "" (any, the default) or "user". Checked for every

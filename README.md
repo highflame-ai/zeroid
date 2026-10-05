@@ -132,10 +132,9 @@ Each tenant (account and project) issues tokens in one of two shapes, set with `
 | `principal_type` | absent | `user`, `workload`, or `unknown` for a chain whose principal predates recording it |
 | Actor attributes (`identity_type`, `trust_level`, `external_id`) on an exchanged token | top level | inside the outermost `act` |
 | `scope` (RFC 9068 space-delimited string) | absent | present beside `scopes` |
-| `typ` header | `JWT` | `at+jwt` (RFC 9068 §2.1); a credential policy can choose `JWT` (`jwt_typ`) to keep an agent's tokens valid JWT-SVIDs |
 | api-key tokens | `act.sub` = the key's creator | no `act` |
 
-Every tenant gets `issued_token_type` on exchange responses, `client_id` on exchanged and ID-JAG tokens, and `client_id`, `aud`, `mission_id`, `owner_user_id` and the recorded principal (`principal_type`, `principal_sub`, `principal_iss`) on introspection. Switching a tenant to `rfc8693` also revokes its user access tokens longer-lived than the short default; refresh-capable clients simply refresh. Read tokens of either shape with `pkg/authjwt`: `PrincipalType()`, `CurrentActor()`, `PriorActors()`, `IsLegacyProfile()`.
+Every tenant gets access tokens typed `at+jwt` (RFC 9068 §2.1; a credential policy can choose `JWT` with `jwt_typ` to keep an agent's tokens valid JWT-SVIDs), `issued_token_type` on exchange responses, `client_id` on exchanged and ID-JAG tokens, and `client_id`, `aud`, `mission_id`, `owner_user_id` and the recorded principal (`principal_type`, `principal_sub`, `principal_iss`) on introspection. Switching a tenant to `rfc8693` also revokes its user access tokens longer-lived than the short default; refresh-capable clients simply refresh. Read tokens of either shape with `pkg/authjwt`: `PrincipalType()`, `CurrentActor()`, `PriorActors()`, `IsLegacyProfile()`.
 
 **Rule for resource servers (RFC 8693 §4.1).** Decide on the top-level claims and the current actor. The person behind a call is `sub` when `principal_type` is `user`; otherwise there is none. The agent is `act.sub`, or `sub` when there is no `act` (for a legacy token, always `sub`). Nested actors are audit history, not grounds for access. Forward-auth hands upstreams the same reading as `X-Zeroid-Subject` (the recorded principal, for either profile), `X-Zeroid-Principal-Type` and `X-Zeroid-Actor`.
 
