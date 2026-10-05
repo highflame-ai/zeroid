@@ -91,20 +91,17 @@ func TestAccessTokenTyp(t *testing.T) {
 	atPolicy := &domain.CredentialPolicy{JWTTyp: domain.JWTTypAccessToken}
 	defaultPolicy := &domain.CredentialPolicy{}
 	for _, tc := range []struct {
-		name    string
-		rfc8693 bool
-		policy  *domain.CredentialPolicy
-		want    string
+		name   string
+		policy *domain.CredentialPolicy
+		want   string
 	}{
-		{"legacy is always JWT", false, nil, "JWT"},
-		{"legacy ignores a policy asking for at+jwt", false, atPolicy, "JWT"},
-		{"rfc8693 defaults to at+jwt with no policy", true, nil, "at+jwt"},
-		{"rfc8693 defaults to at+jwt with an unset policy", true, defaultPolicy, "at+jwt"},
-		{"rfc8693 honours a policy choosing JWT", true, jwtPolicy, "JWT"},
-		{"rfc8693 honours a policy choosing at+jwt", true, atPolicy, "at+jwt"},
+		{"defaults to at+jwt with no policy", nil, "at+jwt"},
+		{"defaults to at+jwt with an unset policy", defaultPolicy, "at+jwt"},
+		{"honours a policy choosing JWT", jwtPolicy, "JWT"},
+		{"honours a policy choosing at+jwt", atPolicy, "at+jwt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, accessTokenTyp(tc.rfc8693, tc.policy))
+			assert.Equal(t, tc.want, accessTokenTyp(tc.policy))
 		})
 	}
 }

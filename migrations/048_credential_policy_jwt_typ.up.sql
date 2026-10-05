@@ -9,11 +9,9 @@
 --                   can tell it apart from an ID token.
 --   JWT-SVID §2.3   `typ`, if set, MUST be `JWT` or `JOSE`.
 --
--- Under the rfc8693 token profile the default is `at+jwt`. A policy sets `JWT`
+-- The default is `at+jwt`, under either token profile. A policy sets `JWT`
 -- for agents whose tokens must stay valid JWT-SVIDs (SPIFFE-strict consumers).
--- NULL means the profile's default. The legacy profile always issues `JWT`,
--- since its contract is today's token shape unchanged; the column is ignored
--- there.
+-- NULL means the default.
 --
 -- A nullable column with no default: catalog-only, no table rewrite.
 SET LOCAL lock_timeout = '5s';

@@ -657,8 +657,8 @@ func TestRFC8693_ExchangeResponse(t *testing.T) {
 }
 
 // TestAccessTokenTyp_PolicyToggle covers D9's resolution of the RFC 9068 vs
-// JWT-SVID conflict: at+jwt is the rfc8693 default, a policy can choose JWT so
-// an agent's tokens stay valid JWT-SVIDs, and legacy is always JWT.
+// JWT-SVID conflict: at+jwt is the default for every tenant, and a policy can
+// choose JWT so an agent's tokens stay valid JWT-SVIDs, under either profile.
 func TestAccessTokenTyp_PolicyToggle(t *testing.T) {
 	scopes := []string{"data:read"}
 
@@ -671,11 +671,18 @@ func TestAccessTokenTyp_PolicyToggle(t *testing.T) {
 		assert.Equal(t, "JWT", headerTyp(t, child["access_token"].(string)), "the actor's own policy decides its token")
 	})
 
-	t.Run("legacy ignores a policy asking for at+jwt", func(t *testing.T) {
+	t.Run("legacy defaults to at+jwt too", func(t *testing.T) {
 		tn := newTenant(t, "")
-		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "at+jwt"})
+		policyID := tn.policy(t, scopes)
 		root, _ := tn.workloadRoot(t, policyID, scopes)
-		assert.Equal(t, "JWT", headerTyp(t, root), "the legacy profile's shape never changes")
+		assert.Equal(t, "at+jwt", headerTyp(t, root), "the typ default does not depend on the token profile")
+	})
+
+	t.Run("legacy policy choosing JWT keeps the token a JWT-SVID", func(t *testing.T) {
+		tn := newTenant(t, "")
+		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "JWT"})
+		root, _ := tn.workloadRoot(t, policyID, scopes)
+		assert.Equal(t, "JWT", headerTyp(t, root))
 	})
 
 	t.Run("an update can reset to the default", func(t *testing.T) {

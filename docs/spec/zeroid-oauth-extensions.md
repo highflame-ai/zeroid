@@ -221,9 +221,9 @@ CIBA) sign with **RS256**. The claims below are emitted for the relevant NHI;
 the ones flagged *agent-shaped* characterise an Agent Identity
 (`identity_type = agent`, Section 3.2) and are normally absent on a plain
 service, application, or MCP-server NHI. The `kid` header selects the verifying key
-from the JWKS. `typ` is `JWT` under the legacy token profile; under the
-`rfc8693` profile it is `at+jwt` (RFC 9068 §2.1), unless the identity's credential
-policy sets `jwt_typ = JWT` so the token stays a conformant JWT-SVID (JWT-SVID
+from the JWKS. `typ` is `at+jwt` (RFC 9068 §2.1) under either token profile,
+unless the identity's credential policy sets `jwt_typ = JWT` so the token stays
+a conformant JWT-SVID (JWT-SVID
 §2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
 not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
 
