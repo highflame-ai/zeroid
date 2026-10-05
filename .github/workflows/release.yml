@@ -232,19 +232,31 @@ jobs:
           restore-keys: |
             go-${{ runner.os }}-${{ env.GO_VER }}-
 
-      # `make test-integration` runs `go test ./tests/... -race`, and the race
-      # detector requires cgo. With CGO_ENABLED=0 this job died in 0.03s on
-      # `-race requires cgo; enable cgo by setting CGO_ENABLED=1` — before a
-      # single test ran — taking highflame-goreleaser and highflame-trigger
-      # down with it, so every release since shipped no binaries and never
-      # triggered highflame-cloud. pr-check.yml already runs the same target
-      # with CGO_ENABLED: 1.
+      # Run the tests DIRECTLY rather than through `make test-integration`,
+      # and without `-race`.
+      #
+      # The make target carries `-race`, which requires cgo. With
+      # CGO_ENABLED=0 this job died in 0.03s on `-race requires cgo` before a
+      # single test ran, and because highflame-goreleaser and
+      # highflame-trigger both need it, every release since published no
+      # binaries and never triggered highflame-cloud. v1.10.0 and v1.11.0 both
+      # failed that way.
+      #
+      # CGO_ENABLED stays 0 on purpose: it is what Dockerfile and
+      # .goreleaser.yml build with, so the release gate exercises the cgo
+      # configuration that actually ships — notably the pure-Go net resolver,
+      # which the SSRF guard and the CIMD and JWKS fetchers all depend on.
+      #
+      # Race coverage is not lost. pr-check.yml runs these same tests with
+      # `-race` and CGO_ENABLED: 1 on every PR, inline rather than through the
+      # make target, so the two are independent and the detector still sees
+      # every change before it merges.
       - name: Run tests
         env:
-          CGO_ENABLED: 1
+          CGO_ENABLED: 0
         shell: bash
         run: |-
-          make test-integration
+          go test ./tests/... -v -count=1 -timeout=600s
 
   highflame-goreleaser:
     if: github.event_name == 'release'
