@@ -15,10 +15,12 @@ import (
 func registerIdentityIn(t *testing.T, headers map[string]string, externalID string, scopes []string) identityResp {
 	t.Helper()
 	body := map[string]any{
-		"external_id":    externalID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": scopes,
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}
+	if len(scopes) > 0 {
+		body["credential_policy_id"] = scopedPolicy(t, scopes, headers)
 	}
 	resp := post(t, adminPath("/identities"), body, headers)
 	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerIdentityIn: expected 201, got %d", resp.StatusCode)

@@ -576,10 +576,10 @@ func TestDelegationChains_TimeWindowExcludesOutOfRange(t *testing.T) {
 	// Issue one chain in this fresh tenant.
 	extID := uid("window-orch")
 	body := map[string]any{
-		"external_id":    extID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": []string{"data:read"},
+		"external_id":          extID,
+		"trust_level":          "unverified",
+		"owner_user_id":        "user-test-owner",
+		"credential_policy_id": scopedPolicy(t, []string{"data:read"}, headers),
 	}
 	idResp := post(t, adminPath("/identities"), body, headers)
 	require.Equal(t, http.StatusCreated, idResp.StatusCode)
@@ -656,10 +656,10 @@ func issueRootInTenant(t *testing.T, headers map[string]string, namePrefix strin
 	t.Helper()
 	extID := uid(namePrefix)
 	body := map[string]any{
-		"external_id":    extID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": []string{"data:read"},
+		"external_id":          extID,
+		"trust_level":          "unverified",
+		"owner_user_id":        "user-test-owner",
+		"credential_policy_id": scopedPolicy(t, []string{"data:read"}, headers),
 	}
 	idResp := post(t, adminPath("/identities"), body, headers)
 	require.Equal(t, http.StatusCreated, idResp.StatusCode)

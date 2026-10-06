@@ -252,9 +252,6 @@ func extractOAuthError(err error) (code, description string, status int) {
 	if errors.Is(err, service.ErrPolicyViolation) {
 		return "policy_violation", err.Error(), http.StatusBadRequest
 	}
-	if errors.Is(err, service.ErrScopesNotAllowed) {
-		return oautherror.InsufficientScope, err.Error(), http.StatusBadRequest
-	}
 	// Identity gates can fire at the chokepoint after the per-grant
 	// check passed (TOCTOU window). Map to stable error_description
 	// strings — the per-grant checks emit the exact same values, so

@@ -27,6 +27,13 @@ var ErrIdentityAlreadyExists = errors.New("identity already exists")
 // (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
 
+// ErrIdentityAllowedScopesRemoved is returned when a caller sets allowed_scopes
+// on an identity. The credential policy is the only scope ceiling; the
+// identity field was deprecated in its favour and is no longer read, so
+// accepting a value would let a caller believe an identity is narrowed when
+// it is not. Wrapped in ErrInvalidIdentityField, so it maps to 400.
+var ErrIdentityAllowedScopesRemoved = fmt.Errorf("%w: allowed_scopes on an identity is no longer supported; set the scope ceiling on a credential policy and pass its id as credential_policy_id", ErrInvalidIdentityField)
+
 // ErrIdentityNotFound is returned by lookup methods when no identity matches
 // the supplied selector within the caller's tenant. Wraps sql.ErrNoRows from
 // the store layer so handlers can errors.Is and map to 404 without coupling
@@ -115,7 +122,7 @@ type RegisterIdentityRequest struct {
 	// native identities.
 	SourceID      string
 	OwnerUserID   string
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // Removed: must be empty (ErrIdentityAllowedScopesRemoved).
 	PublicKeyPEM  string
 	Framework     string
 	Version       string
@@ -199,9 +206,10 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	if !req.SubType.ValidForIdentityType(req.IdentityType) {
 		return nil, fmt.Errorf("%w: invalid sub_type %q for identity_type %q", ErrInvalidIdentityField, req.SubType, req.IdentityType)
 	}
-	if req.AllowedScopes == nil {
-		req.AllowedScopes = []string{}
+	if len(req.AllowedScopes) > 0 {
+		return nil, ErrIdentityAllowedScopesRemoved
 	}
+	req.AllowedScopes = []string{}
 	if req.Capabilities == nil {
 		req.Capabilities = json.RawMessage("[]")
 	}
@@ -851,8 +859,8 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.OwnerUserID != "" {
 		identity.OwnerUserID = req.OwnerUserID
 	}
-	if req.AllowedScopes != nil {
-		identity.AllowedScopes = req.AllowedScopes
+	if len(req.AllowedScopes) > 0 {
+		return nil, ErrIdentityAllowedScopesRemoved
 	}
 	if req.PublicKeyPEM != "" {
 		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {

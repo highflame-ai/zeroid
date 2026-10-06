@@ -38,6 +38,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	zeroid "github.com/highflame-ai/zeroid"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 const (
@@ -521,10 +522,12 @@ type oauthClientResp struct {
 func registerIdentity(t *testing.T, externalID string, scopes []string, publicKeyPEM ...string) identityResp {
 	t.Helper()
 	body := map[string]any{
-		"external_id":    externalID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": scopes,
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}
+	if len(scopes) > 0 {
+		body["credential_policy_id"] = scopedPolicy(t, scopes, adminHeaders())
 	}
 	if len(publicKeyPEM) > 0 && publicKeyPEM[0] != "" {
 		body["public_key_pem"] = publicKeyPEM[0]
@@ -537,6 +540,20 @@ func registerIdentity(t *testing.T, externalID string, scopes []string, publicKe
 		ExternalID: raw["external_id"].(string),
 		WIMSEURI:   raw["wimse_uri"].(string),
 	}
+}
+
+// scopedPolicy creates a credential policy that is the tenant default's twin
+// apart from its scope ceiling, and returns its id. The credential policy is
+// the only scope ceiling, so this is how a test gives an identity scopes.
+func scopedPolicy(t *testing.T, scopes []string, headers map[string]string) string {
+	t.Helper()
+	return createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("scoped-policy"),
+		"allowed_scopes":       scopes,
+		"allowed_grant_types":  domain.DefaultAllowedGrantTypes(),
+		"max_ttl_seconds":      domain.DefaultMaxTTLSeconds,
+		"max_delegation_depth": domain.DefaultMaxDelegationDepth,
+	}, headers)
 }
 
 // registerOAuthClient creates a confidential M2M OAuth client via POST /api/v1/oauth/clients.

@@ -64,7 +64,7 @@ type RegisterAgentInput struct {
 		Capabilities             json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels                   json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata                 json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
+		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"Removed. Must be empty: the scope ceiling is set on a credential policy, passed as credential_policy_id. A non-empty value is refused with 400."`
 		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator"`
 		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`

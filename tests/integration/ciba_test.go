@@ -271,7 +271,7 @@ func TestCIBAOffboardByOwnerReachesCIBACredentials(t *testing.T) {
 	idResp := post(t, adminPath("/identities"), map[string]any{
 		"external_id": uid("ciba-anchor"), "owner_user_id": owner,
 		"identity_type": "agent", "sub_type": "human_proxy",
-		"allowed_scopes": []string{"openid"}, "trust_level": "first_party",
+		"credential_policy_id": scopedPolicy(t, []string{"openid"}, headers), "trust_level": "first_party",
 	}, headers)
 	require.Equal(t, http.StatusCreated, idResp.StatusCode)
 	identityID := decode(t, idResp)["id"].(string)
@@ -333,7 +333,7 @@ func TestCIBAPreBurnGatesPreserveApproval(t *testing.T) {
 	idResp := post(t, adminPath("/identities"), map[string]any{
 		"external_id": uid("ciba-preburn"), "owner_user_id": owner,
 		"identity_type": "agent", "sub_type": "human_proxy",
-		"allowed_scopes": []string{"openid"}, "trust_level": "first_party",
+		"credential_policy_id": scopedPolicy(t, []string{"openid"}, headers), "trust_level": "first_party",
 	}, headers)
 	require.Equal(t, http.StatusCreated, idResp.StatusCode)
 	identityID := decode(t, idResp)["id"].(string)

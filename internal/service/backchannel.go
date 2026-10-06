@@ -912,18 +912,6 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 				}
 			}
 		}
-		if len(bound.AllowedScopes) > 0 {
-			allowed := make(map[string]bool, len(bound.AllowedScopes))
-			for _, sc := range bound.AllowedScopes {
-				allowed[sc] = true
-			}
-			for _, sc := range requested {
-				if !allowed[sc] {
-					return nil, oauthBadRequest(oautherror.InvalidScope,
-						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
-				}
-			}
-		}
 		if policy.MaxTTLSeconds > 0 && policy.MaxTTLSeconds < ttl {
 			ttl = policy.MaxTTLSeconds
 		}
@@ -997,8 +985,6 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		// known refusals to the 4xx codes sibling grant paths use instead of
 		// a blanket 500.
 		switch {
-		case errors.Is(err, ErrScopesNotAllowed):
-			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
 		case errors.Is(err, ErrPolicyViolation):
 			return nil, oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", err)
 		case errors.Is(err, domain.ErrIdentityNotUsable), errors.Is(err, domain.ErrIdentityExpired):

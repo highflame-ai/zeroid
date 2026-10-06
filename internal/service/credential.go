@@ -168,9 +168,6 @@ type IssueRequest struct {
 	ResolveIdentityPolicy bool
 }
 
-// ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
-var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
-
 // IssueCredential issues a short-lived JWT for an identity.
 //
 // Gate: identities not in a usable status never receive a fresh credential.
@@ -249,24 +246,6 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
-	}
-
-	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes
-	// list, requested scopes must still be a subset. This is retained for one
-	// deprecation cycle so tenants that set scope ceilings on the identity row
-	// (pre-migration-008) keep working until they migrate the restriction onto
-	// their credential policy's allowed_scopes. New callers should not rely on
-	// this path.
-	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
-		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
-		for _, s := range req.Identity.AllowedScopes {
-			allowed[s] = true
-		}
-		for _, requested := range req.Scopes {
-			if !allowed[requested] {
-				return nil, nil, fmt.Errorf("%w: %q not in allowed_scopes", ErrScopesNotAllowed, requested)
-			}
-		}
 	}
 
 	// Enforce credential policies. The identity policy is the authority

@@ -36,12 +36,12 @@ func TestDelegationScopeDenial_NoScopesRequested(t *testing.T) {
 	// token_exchange is the ONE grant with no RFC 6749 §3.3 default, so an
 	// omitted scope is a hard failure rather than "grant the full ceiling".
 	// A caller who has only ever used the other grants will not expect that.
-	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil)
+	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "no scopes were requested")
 	assert.NotContains(t, desc, "does not hold", "nothing was asked for, so no scope can be named")
-	assert.NotContains(t, desc, "not registered for")
+	assert.NotContains(t, desc, "credential policy")
 }
 
 func TestDelegationScopeDenial_SubjectDoesNotHold(t *testing.T) {
@@ -51,29 +51,25 @@ func TestDelegationScopeDenial_SubjectDoesNotHold(t *testing.T) {
 		[]string{"data:read", "tools:read"},
 		map[string]bool{}, // subject holds nothing
 		[]string{"data:read", "tools:read"},
-		nil,
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "the subject token does not hold [data:read tools:read]")
-	assert.NotContains(t, desc, "not registered for")
+	assert.NotContains(t, desc, "credential policy")
 }
 
-func TestDelegationScopeDenial_ActorCeilingExcludes(t *testing.T) {
-	// The third term. The delegator holds it; the sub-agent was never
-	// registered for it. Here widening the sub-agent IS the fix.
+func TestDelegationScopeDenial_ActorPolicyExcludes(t *testing.T) {
+	// The third term. The delegator holds it; the sub-agent's credential
+	// policy does not permit it. Here widening the sub-agent's policy IS the fix.
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{"data:read": true},
-		nil,                    // the policy places no restriction
-		[]string{"tools:read"}, // the registration excludes data:read
+		[]string{"tools:read"},
 	)
 
 	desc := denialText(t, err)
-	assert.Contains(t, desc, "the actor identity is not registered for [data:read]")
+	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
 	assert.NotContains(t, desc, "does not hold")
-	assert.NotContains(t, desc, "credential policy",
-		"this ceiling came from the registration, so the policy is not the thing to edit")
 }
 
 func TestDelegationScopeDenial_BothTermsNamedSeparately(t *testing.T) {
@@ -82,29 +78,27 @@ func TestDelegationScopeDenial_BothTermsNamedSeparately(t *testing.T) {
 	err := delegationScopeDenial(
 		[]string{"data:read", "order:write"},
 		map[string]bool{"data:read": true}, // subject lacks order:write
-		nil,
-		[]string{"order:write"}, // actor registration lacks data:read
+		[]string{"order:write"},            // actor policy lacks data:read
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "the subject token does not hold [order:write]")
-	assert.Contains(t, desc, "the actor identity is not registered for [data:read]")
+	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
 }
 
 func TestDelegationScopeDenial_UnrestrictedActorBlamesTheSubjectOnly(t *testing.T) {
 	// An actor with no ceiling cannot be the cause: an empty ceiling means
-	// "no restriction from this layer". Blaming it would send the caller to
-	// widen a registration that was never the constraint.
+	// "no restriction". Blaming it would send the caller to widen a policy
+	// that was never the constraint.
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{},
 		nil, // no actor policy ceiling
-		nil, // no actor registration ceiling
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "the subject token does not hold [data:read]")
-	assert.NotContains(t, desc, "not registered for")
+	assert.NotContains(t, desc, "credential policy")
 }
 
 func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
@@ -114,74 +108,21 @@ func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
 		[]string{"data:read"},
 		map[string]bool{},      // subject lacks it
 		[]string{"tools:read"}, // and the actor policy lacks it too
-		nil,
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "the subject token does not hold [data:read]")
-	assert.NotContains(t, desc, "not registered for",
+	assert.NotContains(t, desc, "credential policy",
 		"a scope the subject cannot delegate is not also the sub-agent's problem")
 }
 
-// The actor's credential policy and its registration are separate ceilings
-// that both bind, and they need different repairs. A denial must name the
-// one that excluded the scope, and a scope both exclude is blamed on the
-// policy alone.
-
-func TestDelegationScopeDenial_PolicyCeilingBlamesThePolicy(t *testing.T) {
-	err := delegationScopeDenial(
-		[]string{"data:read"},
-		map[string]bool{"data:read": true},
-		[]string{"tools:read"},
-		[]string{"data:read"}, // the registration lists it; the policy does not
-	)
-
-	desc := denialText(t, err)
-	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
-	assert.NotContains(t, desc, "not registered for",
-		"the registration lists data:read; only the policy excluded it")
-}
-
-func TestDelegationScopeDenial_RowNarrowerThanPolicyBlamesTheRegistration(t *testing.T) {
-	// The policy permits the scope and the registration does not. The row
-	// binds even though the policy restricts, so the registration is the
-	// thing to widen.
-	err := delegationScopeDenial(
-		[]string{"nhi:manage"},
-		map[string]bool{"nhi:manage": true},
-		[]string{"nhi:manage", "tools:read"},
-		[]string{"tools:read"},
-	)
-
-	desc := denialText(t, err)
-	assert.Contains(t, desc, "the actor identity is not registered for [nhi:manage]")
-	assert.NotContains(t, desc, "credential policy")
-}
-
-func TestDelegationScopeDenial_ScopeBothCeilingsExcludeIsBlamedOnce(t *testing.T) {
-	err := delegationScopeDenial(
-		[]string{"data:read"},
-		map[string]bool{"data:read": true},
-		[]string{"tools:read"},
-		[]string{"tools:read"},
-	)
-
-	desc := denialText(t, err)
-	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
-	assert.NotContains(t, desc, "not registered for")
-}
-
-func TestIdentityScopeCeilings(t *testing.T) {
+// The credential policy is the only scope ceiling. The identity row's
+// deprecated allowed_scopes is never read, whatever it holds.
+func TestPolicyScopeCeiling(t *testing.T) {
 	policy := &domain.CredentialPolicy{AllowedScopes: []string{"tools:read"}}
-	identity := &domain.Identity{AllowedScopes: []string{"order:read"}}
-
-	p, r := identityScopeCeilings(policy, identity)
-	assert.Equal(t, []string{"tools:read"}, p)
-	assert.Equal(t, []string{"order:read"}, r, "the row is returned even when the policy restricts")
-
-	p, r = identityScopeCeilings(nil, nil)
-	assert.Empty(t, p)
-	assert.Empty(t, r)
+	assert.Equal(t, []string{"tools:read"}, policyScopeCeiling(policy))
+	assert.Empty(t, policyScopeCeiling(&domain.CredentialPolicy{}), "an open policy places no restriction")
+	assert.Empty(t, policyScopeCeiling(nil))
 }
 
 func TestGrantScopes(t *testing.T) {
@@ -195,7 +136,7 @@ func TestGrantScopes(t *testing.T) {
 		{"no ceiling, omitted request keeps the legacy scopeless grant", "", nil, nil, false},
 		{"no ceiling, explicit request passes through", "a b", [][]string{nil, {}}, []string{"a", "b"}, false},
 		{"omitted request defaults to the single ceiling", "", [][]string{{"a", "b"}}, []string{"a", "b"}, false},
-		{"row narrower than policy yields the intersection", "",
+		{"a narrower later ceiling yields the intersection", "",
 			[][]string{{"nhi:manage", "tools:read"}, {"tools:read"}}, []string{"tools:read"}, false},
 		{"empty ceilings are skipped, not treated as denials", "",
 			[][]string{nil, {"a", "b"}, {}, {"b"}}, []string{"b"}, false},

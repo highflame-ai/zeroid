@@ -15,10 +15,9 @@ import (
 func TestRegisterIdentity(t *testing.T) {
 	externalID := uid("research-agent")
 	resp := post(t, adminPath("/identities"), map[string]any{
-		"external_id":    externalID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": []string{"research:read"},
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 
@@ -44,10 +43,9 @@ func TestRegisterIdentityDuplicateReturns409(t *testing.T) {
 
 	// Second registration with the same external_id — must be rejected.
 	resp := post(t, adminPath("/identities"), map[string]any{
-		"external_id":    externalID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": []string{"billing:read"},
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
 	}, adminHeaders())
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
 	_ = resp.Body.Close()
@@ -69,10 +67,9 @@ func TestRegisterIdentityRejectsForbiddenSPIFFEChars(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := post(t, adminPath("/identities"), map[string]any{
-				"external_id":    tc.externalID,
-				"trust_level":    "unverified",
-				"owner_user_id":  "user-test-owner",
-				"allowed_scopes": []string{"billing:read"},
+				"external_id":   tc.externalID,
+				"trust_level":   "unverified",
+				"owner_user_id": "user-test-owner",
 			}, adminHeaders())
 			assert.True(t,
 				resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity,
@@ -86,9 +83,8 @@ func TestRegisterIdentityRejectsForbiddenSPIFFEChars(t *testing.T) {
 // TestRegisterIdentityMissingExternalID verifies that omitting external_id returns 400/422.
 func TestRegisterIdentityMissingExternalID(t *testing.T) {
 	resp := post(t, adminPath("/identities"), map[string]any{
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": []string{"billing:read"},
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
 	}, adminHeaders())
 	assert.True(t,
 		resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity,
@@ -471,13 +467,12 @@ func TestListAgentsPagination(t *testing.T) {
 func TestListIdentitiesEndpointFilters(t *testing.T) {
 	ext := uid("id-filter")
 	post(t, adminPath("/identities"), map[string]any{
-		"external_id":    ext,
-		"trust_level":    "first_party",
-		"identity_type":  "application",
-		"sub_type":       "chatbot",
-		"owner_user_id":  "test-user",
-		"name":           "Filterable App " + ext,
-		"allowed_scopes": []string{"read:data"},
+		"external_id":   ext,
+		"trust_level":   "first_party",
+		"identity_type": "application",
+		"sub_type":      "chatbot",
+		"owner_user_id": "test-user",
+		"name":          "Filterable App " + ext,
 	}, adminHeaders())
 
 	// Filter by identity_type.

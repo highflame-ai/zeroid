@@ -41,13 +41,19 @@ func patchCredentialPolicy(t *testing.T, id string, body map[string]any, headers
 // caller-supplied credential policy. Mirrors registerIdentity but exposes
 // the policy ID, public key, and headers so tests can drive cross-tenant
 // and policy-gated scenarios.
+//
+// The credential policy is the only scope ceiling. With no policyID, scopes
+// (when given) become a policy of their own (scopedPolicy); with a policyID,
+// that policy alone decides and scopes is ignored.
 func registerIdentityWithPolicy(t *testing.T, externalID, policyID, publicKeyPEM string, scopes []string, headers map[string]string) string {
 	t.Helper()
 	body := map[string]any{
-		"external_id":    externalID,
-		"trust_level":    "unverified",
-		"owner_user_id":  "user-test-owner",
-		"allowed_scopes": scopes,
+		"external_id":   externalID,
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}
+	if policyID == "" && len(scopes) > 0 {
+		policyID = scopedPolicy(t, scopes, headers)
 	}
 	if policyID != "" {
 		body["credential_policy_id"] = policyID
@@ -668,8 +674,7 @@ func TestAttestationVerifyDoesNotDemoteTrust(t *testing.T) {
 
 	idResp := post(t, adminPath("/identities"), map[string]any{
 		"external_id": uid("noclamp"), "owner_user_id": "user-noclamp-owner",
-		"trust_level": "first_party", "allowed_scopes": []string{"data:read"},
-		"credential_policy_id": polID,
+		"trust_level": "first_party", "credential_policy_id": polID,
 	}, headers)
 	require.Equal(t, http.StatusCreated, idResp.StatusCode)
 	idID := decode(t, idResp)["id"].(string)
