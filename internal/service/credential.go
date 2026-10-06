@@ -445,16 +445,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
 
-	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes
-	// list, requested scopes must still be a subset. This is retained for one
-	// deprecation cycle so tenants that set scope ceilings on the identity row
-	// (pre-migration-008) keep working until they migrate the restriction onto
-	// their credential policy's allowed_scopes. New callers should not rely on
-	// this path.
-	// The deprecated identity list is the old allowed_scopes, so the split
-	// ceiling (D10) skips it for a bounded user-subject chain too.
-	splitCeiling := req.UserGrantBounded && s.resolvePrincipal(req).Type == domain.PrincipalUser
-	if !splitCeiling && len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
+	// The identity's allowed_scopes is its absolute ceiling: no token for this
+	// identity may carry a scope outside it, under any grant and whether the
+	// identity acts on its own authority or for a person. Credential policies
+	// (allowed_scopes, and user_grant_scopes for a chain acting for a person)
+	// only narrow within it.
+	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {
 			allowed[s] = true

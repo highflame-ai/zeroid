@@ -883,6 +883,37 @@ func TestUserGrantScopes_SplitCeiling(t *testing.T) {
 		assert.Contains(t, body["error_description"], "user_grant_scopes", "the denial names the ceiling it came from")
 	})
 
+	t.Run("the identity's allowed_scopes still caps what it holds for a person", func(t *testing.T) {
+		// The identity's allowed_scopes is its absolute ceiling. user_grant_scopes
+		// replaces the policy's allowed_scopes for a person's chain; it does not
+		// lift the identity ceiling. Here the policy places no user-grant cap,
+		// Alice holds crm:read and crm:write, and the identity is registered
+		// for crm:read only.
+		policyID := tn.policy(t, own)
+		alice, _ := tn.userRoot(t, []string{"crm:read", "crm:write"})
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		wimse := tn.register(t, uid("hrd-ugs-row"), policyID, ecPublicKeyPEM(t, key), []string{"crm:read"})
+		exchange := func(scope string) (int, map[string]any) {
+			return postStatus(t, "/oauth2/token", map[string]any{
+				"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+				"subject_token": alice,
+				"actor_token":   buildAssertion(t, key, wimse),
+				"scope":         scope,
+			}, nil)
+		}
+
+		status, body := exchange("crm:read crm:write")
+		require.Equal(t, http.StatusOK, status)
+		assert.ElementsMatch(t, []any{"crm:read"}, decodeJWTPayload(t, body["access_token"].(string))["scopes"],
+			"narrowed to the identity's ceiling")
+
+		status, body = exchange("crm:write")
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_scope", body["error"])
+		assert.Contains(t, body["error_description"], "the actor identity is not registered for [crm:write]")
+	})
+
 	t.Run("allowed_scopes still caps the agent's own authority", func(t *testing.T) {
 		rootPolicy := tn.policy(t, crm)
 		ownToken, _ := tn.workloadRoot(t, rootPolicy, crm)
