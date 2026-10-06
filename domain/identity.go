@@ -445,14 +445,14 @@ type Identity struct {
 	// identity points at the tenant's default policy unless the creator chose
 	// a more specific one.
 	//
-	// AllowedScopes is deprecated in favour of the identity policy's
-	// allowed_scopes. It is still read as a fallback during the deprecation
-	// window when the identity policy does not restrict scopes (i.e. the
-	// policy's allowed_scopes is empty). New code should set the scope
-	// ceiling on the policy, not on the identity row.
+	// AllowedScopes is the identity's absolute scope ceiling, the equivalent
+	// of RFC 7591 client `scope` metadata: no token for this identity carries
+	// a scope outside it. Credential policies are reusable bundles that narrow
+	// within it. Empty means no ceiling from this layer. See
+	// docs/scope-ceilings.md.
 	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
-	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
+	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // The identity's absolute scope ceiling; see above.
 	PublicKeyPEM       string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.

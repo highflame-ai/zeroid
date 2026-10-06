@@ -251,12 +251,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
 
-	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes
-	// list, requested scopes must still be a subset. This is retained for one
-	// deprecation cycle so tenants that set scope ceilings on the identity row
-	// (pre-migration-008) keep working until they migrate the restriction onto
-	// their credential policy's allowed_scopes. New callers should not rely on
-	// this path.
+	// The identity's allowed_scopes is its absolute ceiling (RFC 7591 §2 client
+	// `scope`): no token for this identity may carry a scope outside it, under
+	// any grant. The grants narrow to it first (grantScopes); this re-check is
+	// the chokepoint, and covers the grants that take their scopes from a
+	// person's grant rather than computing them. See docs/scope-ceilings.md.
 	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {

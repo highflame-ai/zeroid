@@ -854,8 +854,8 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// Resolve the identity policy — the authority ceiling for scopes, TTL,
-	// grant types, and trust level. Its allowed_scopes and the deprecated
-	// identity.AllowedScopes both narrow the grant (identityScopeCeilings).
+	// grant types, and trust level. Its allowed_scopes and the identity's own
+	// allowed_scopes ceiling both narrow the grant (identityScopeCeilings).
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
@@ -1016,8 +1016,8 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 
 	// Step 4: Compute the granted scopes as the intersection of
 	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes ∩ the
-	// actor's deprecated identity.AllowedScopes (identityScopeCeilings; an
-	// empty actor ceiling places no restriction). The orchestrator's granted
+	// actor identity's allowed_scopes ceiling (identityScopeCeilings; an
+	// empty layer places no restriction). The orchestrator's granted
 	// scopes remain authoritative for what can be delegated — a sub-agent can
 	// never receive more than its principal currently holds, per RFC 8693
 	// intent.
@@ -1504,7 +1504,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	//     ∩ key.scopes               (per-key legacy restriction, if set)
 	//     ∩ key.policy.allowed_scopes (per-credential restriction)
 	//     ∩ identity.policy.allowed_scopes (authority ceiling)
-	//     ∩ identity.allowed_scopes  (deprecated row-level restriction)
+	//     ∩ identity.allowed_scopes  (the identity's absolute ceiling)
 	var keyPolicyScopes []string
 	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
 		// Hard fail rather than silently skip the intersection: a
@@ -3193,14 +3193,15 @@ func parseScopeString(scope string) []string {
 }
 
 // identityScopeCeilings returns an identity's two scope ceilings: its
-// credential policy's allowed_scopes and the deprecated identity-row
-// allowed_scopes. Both bind — they are layers, not alternatives. Treating the
-// row as a fallback read only when the policy is open contradicted
-// IssueCredential, whose dual-read enforces the row unconditionally: an
-// identity whose row was narrower than its policy computed a policy scope as
-// grantable here and was then refused outright there. Letting the policy
-// supersede the row instead would widen authority, since the row is set
-// per-identity and the policy is often a shared tenant default.
+// credential policy's allowed_scopes and the identity's own allowed_scopes,
+// its absolute ceiling (RFC 7591 §2 client `scope`; docs/scope-ceilings.md).
+// Both bind — they are layers, not alternatives. Treating the identity's list
+// as a fallback read only when the policy is open contradicted
+// IssueCredential, which enforces it unconditionally: an identity narrower
+// than its policy computed a policy scope as grantable here and was then
+// refused outright there. Letting the policy supersede it instead would widen
+// authority, since the identity's list is set per identity and the policy is
+// often a shared tenant default.
 //
 // Either may be nil (no restriction from that layer). Pass both to
 // grantScopes as separate ceilings rather than pre-intersecting them: a
