@@ -445,11 +445,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
 
-	// The identity's allowed_scopes is its absolute ceiling: no token for this
-	// identity may carry a scope outside it, under any grant and whether the
-	// identity acts on its own authority or for a person. Credential policies
-	// (allowed_scopes, and user_grant_scopes for a chain acting for a person)
-	// only narrow within it.
+	// The identity's allowed_scopes is its absolute ceiling (RFC 7591 §2 client
+	// `scope`): no token for this identity may carry a scope outside it, under
+	// any grant and whether the identity acts on its own authority or for a
+	// person. Credential policies (allowed_scopes, and user_grant_scopes for a
+	// chain acting for a person) only narrow within it. The grants narrow to it
+	// first (grantScopes); this re-check is the chokepoint, and covers the
+	// grants that take their scopes from a person's grant rather than computing
+	// them. See docs/scope-ceilings.md.
 	if len(req.Identity.AllowedScopes) > 0 && len(req.Scopes) > 0 {
 		allowed := make(map[string]bool, len(req.Identity.AllowedScopes))
 		for _, s := range req.Identity.AllowedScopes {

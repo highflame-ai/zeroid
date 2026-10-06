@@ -115,7 +115,7 @@ type RegisterIdentityRequest struct {
 	// native identities.
 	SourceID      string
 	OwnerUserID   string
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	PublicKeyPEM  string
 	Framework     string
 	Version       string
