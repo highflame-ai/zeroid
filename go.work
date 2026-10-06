@@ -14,8 +14,9 @@
 // require pins are what the proxy serves and must be real tags.
 //
 // Releases: see RELEASING.md. All modules release in LOCKSTEP at one
-// version, tagged at one commit, so `make release-prep VERSION=vX.Y.Z`
-// is the only version ceremony.
+// version, tagged at one commit. Run release.yml from Actions: it bumps
+// the pins, creates the tag on that commit, then highflame-cloud is
+// triggered with that tag.
 
 go 1.27.0
 

@@ -3,7 +3,7 @@ module github.com/highflame-ai/zeroid/pkg/authjwt
 go 1.27.0
 
 require (
-	github.com/highflame-ai/zeroid/pkg/jwks v1.9.4
+	github.com/highflame-ai/zeroid/pkg/jwks v1.11.0
 	github.com/lestrrat-go/jwx/v4 v4.4.0
 	github.com/rs/zerolog v1.35.1
 )
