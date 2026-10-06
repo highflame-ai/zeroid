@@ -728,28 +728,12 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 
 	// Narrow against the client's own scopes first (checked above: a
 	// client with none can mint nothing), then against the identity's
-	// policy ceiling. Same narrow/intersectScopes selection rule as
-	// apiKeyGrant: decided once from the caller's true original request,
-	// not re-decided per step.
-	rawRequested := parseScopeString(req.Scope)
-	narrow := intersectScopes
-	if len(rawRequested) > 0 {
-		narrow = narrowScopes
-	}
-	scopes := narrow(rawRequested, client.Scopes)
-	scopes = narrow(scopes, effectiveAllowedScopes(policy, identity))
-
-	// Stricter than the shared requireGrantableScope, which permits an empty
-	// grant when the caller named no scope. That is safe only where an empty
-	// set means "nothing was asked"; here it can also mean the client's
-	// registered scopes and the policy ceiling are disjoint — a denial. There
-	// is no identity or delegation fallback on this path (see the zero-scope
-	// check above), so either way nothing is grantable, and issuing would mint
-	// a token with no `scopes` claim: IssueCredential's dual-read and
-	// EnforcePolicy scope checks are both gated on len(Scopes) > 0, and a
-	// claimless token reads downstream as "no scope ceiling to check".
-	if len(scopes) == 0 {
-		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
+	// policy and row ceilings. client.Scopes is non-empty, so grantScopes
+	// always sees a restricting ceiling and never returns an empty grant.
+	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
+	scopes, err := grantScopes(req.Scope, client.Scopes, policyScopes, rowScopes)
+	if err != nil {
+		return nil, err
 	}
 
 	issue := IssueRequest{
@@ -870,15 +854,15 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// Resolve the identity policy — the authority ceiling for scopes, TTL,
-	// grant types, and trust level. The policy's allowed_scopes is the
-	// canonical restriction; identity.AllowedScopes is only read as a
-	// deprecated fallback when the policy declares no scope restriction.
+	// grant types, and trust level. Its allowed_scopes and the deprecated
+	// identity.AllowedScopes both narrow the grant (identityScopeCeilings).
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
-	scopes := intersectScopes(parseScopeString(req.Scope), effectiveAllowedScopes(policy, identity))
-	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
+	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1030,40 +1014,31 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthServerError("failed to resolve actor credential policy", err)
 	}
 
-	// Step 4: Compute the granted scopes as the three-way intersection of
-	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes. When
-	// the policy declares no scope restriction we fall back to the legacy
-	// identity.AllowedScopes for backward compat during the deprecation
-	// window. The orchestrator's granted scopes remain authoritative for
-	// what can be delegated — a sub-agent can never receive more than its
-	// principal currently holds, per RFC 8693 intent.
+	// Step 4: Compute the granted scopes as the intersection of
+	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes ∩ the
+	// actor's deprecated identity.AllowedScopes (identityScopeCeilings; an
+	// empty actor ceiling places no restriction). The orchestrator's granted
+	// scopes remain authoritative for what can be delegated — a sub-agent can
+	// never receive more than its principal currently holds, per RFC 8693
+	// intent.
 	requestedScopes := parseScopeString(req.Scope)
-	actorAllowed, actorCeilingFrom := effectiveAllowedScopesWithSource(actorPolicy, actorIdentity)
+	actorPolicyScopes, actorRowScopes := identityScopeCeilings(actorPolicy, actorIdentity)
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
 	}
+	// The orchestrator term is filtered explicitly rather than through
+	// narrowScopes: an orchestrator holding no scopes can delegate nothing,
+	// whereas narrowScopes reads an empty ceiling as "no restriction".
 	var scopes []string
-	if len(actorAllowed) == 0 {
-		// Actor has no scope restriction → intersection is requested ∩ orchestrator.
-		for _, s := range requestedScopes {
-			if orchSet[s] {
-				scopes = append(scopes, s)
-			}
-		}
-	} else {
-		actorSet := make(map[string]bool, len(actorAllowed))
-		for _, s := range actorAllowed {
-			actorSet[s] = true
-		}
-		for _, s := range requestedScopes {
-			if orchSet[s] && actorSet[s] {
-				scopes = append(scopes, s)
-			}
+	for _, s := range requestedScopes {
+		if orchSet[s] {
+			scopes = append(scopes, s)
 		}
 	}
+	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorAllowed, actorCeilingFrom)
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes)
 	}
 
 	// Step 5: Compute delegation depth (increment from orchestrator's depth).
@@ -1513,43 +1488,24 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	// linked to a real identity. api_key tokens then pass through both
 	// layers of policy enforcement: the identity policy and the key's
 	// own (optionally narrower) policy.
+	var identityPolicy *domain.CredentialPolicy
 	var identityPolicyID string
-	var identityPolicyScopes []string
 	if identity != nil && identity.ID != "" {
 		ip, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 		if err != nil {
 			return nil, oauthServerError("failed to resolve identity credential policy", err)
 		}
+		identityPolicy = ip
 		identityPolicyID = ip.ID
-		identityPolicyScopes = ip.AllowedScopes
 	}
 
-	// Scope resolution chain (narrowest wins):
+	// Scope resolution chain (narrowest wins, composed by grantScopes):
 	//   requested
 	//     ∩ key.scopes               (per-key legacy restriction, if set)
 	//     ∩ key.policy.allowed_scopes (per-credential restriction)
 	//     ∩ identity.policy.allowed_scopes (authority ceiling)
-	//     ∩ identity.allowed_scopes  (deprecated fallback when policies are wide open)
-	//
-	// Which composing function narrows each step is decided ONCE, from the
-	// caller's true original request, not re-decided per step: intersectScopes
-	// treats an empty *requested* argument as "caller omitted scope, grant the
-	// full ceiling" (RFC 6749 §3.3's default) — correct for the very first
-	// application against a genuinely omitted request, but wrong if fed an
-	// intermediate result that became empty because an EARLIER ceiling in this
-	// chain actually denied it: the next intersectScopes call would reinterpret
-	// that denial as "nothing was asked" and reset to its own full ceiling,
-	// silently granting scopes an earlier layer explicitly excluded. Once the
-	// request is known to be explicit, every step uses narrowScopes instead,
-	// which has no such reinterpretation and lets a real denial propagate to
-	// the end of the chain instead of being undone by the next ceiling.
-	rawRequested := parseScopeString(req.Scope)
-	narrow := intersectScopes
-	if len(rawRequested) > 0 {
-		narrow = narrowScopes
-	}
-	scopes := rawRequested
-	scopes = narrow(scopes, sk.Scopes)
+	//     ∩ identity.allowed_scopes  (deprecated row-level restriction)
+	var keyPolicyScopes []string
 	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
 		// Hard fail rather than silently skip the intersection: a
 		// transient DB error during scope resolution must not widen
@@ -1562,13 +1518,11 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		if err != nil {
 			return nil, oauthServerError("failed to resolve API key credential policy", err)
 		}
-		scopes = narrow(scopes, kp.AllowedScopes)
+		keyPolicyScopes = kp.AllowedScopes
 	}
-	scopes = narrow(scopes, identityPolicyScopes)
-	if len(identityPolicyScopes) == 0 && identity != nil {
-		scopes = narrow(scopes, identity.AllowedScopes)
-	}
-	if err := requireGrantableScope(req.Scope, scopes); err != nil {
+	identityPolicyScopes, rowScopes := identityScopeCeilings(identityPolicy, identity)
+	scopes, err := grantScopes(req.Scope, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
+	if err != nil {
 		return nil, err
 	}
 
@@ -3238,46 +3192,69 @@ func parseScopeString(scope string) []string {
 	return strings.Fields(scope)
 }
 
-// effectiveAllowedScopes returns the scope ceiling to apply for grant flows
-// that are not credential-backed (jwt_bearer, token_exchange actor). When the
-// identity's credential policy declares a non-empty allowed_scopes list, that
-// list is authoritative. When the policy does not restrict scopes, we fall
-// back to the deprecated identity.AllowedScopes field for one release cycle
-// so tenants that set scope ceilings on the identity row pre-migration-008
-// keep working. Callers should migrate restrictions onto the policy's
-// allowed_scopes and drop reliance on this fallback.
-func effectiveAllowedScopes(policy *domain.CredentialPolicy, identity *domain.Identity) []string {
-	scopes, _ := effectiveAllowedScopesWithSource(policy, identity)
-	return scopes
+// identityScopeCeilings returns an identity's two scope ceilings: its
+// credential policy's allowed_scopes and the deprecated identity-row
+// allowed_scopes. Both bind — they are layers, not alternatives. Treating the
+// row as a fallback read only when the policy is open contradicted
+// IssueCredential, whose dual-read enforces the row unconditionally: an
+// identity whose row was narrower than its policy computed a policy scope as
+// grantable here and was then refused outright there. Letting the policy
+// supersede the row instead would widen authority, since the row is set
+// per-identity and the policy is often a shared tenant default.
+//
+// Either may be nil (no restriction from that layer). Pass both to
+// grantScopes as separate ceilings rather than pre-intersecting them: a
+// disjoint pair intersects to an empty list, which every scope helper reads
+// as "unrestricted".
+func identityScopeCeilings(policy *domain.CredentialPolicy, identity *domain.Identity) (policyScopes, rowScopes []string) {
+	if policy != nil {
+		policyScopes = policy.AllowedScopes
+	}
+	if identity != nil {
+		rowScopes = identity.AllowedScopes
+	}
+	return policyScopes, rowScopes
 }
 
-// scopeCeilingSource names where effectiveAllowedScopes drew a ceiling from.
-// A denial has to point at the thing the caller must actually edit, and the
-// two sources need different repairs: widen the credential policy, or widen
-// the identity's registration.
-type scopeCeilingSource int
-
-const (
-	// ceilingUnset means no layer restricted scopes.
-	ceilingUnset scopeCeilingSource = iota
-	// ceilingFromPolicy means the credential policy supplied the ceiling.
-	ceilingFromPolicy
-	// ceilingFromIdentity means the deprecated identity.AllowedScopes did.
-	ceilingFromIdentity
-)
-
-// effectiveAllowedScopesWithSource is effectiveAllowedScopes plus the source
-// of the ceiling it returned. Both live here so the "which layer won" rule has
-// exactly one definition: a caller that re-derived the source separately would
-// silently go stale the moment this precedence changes.
-func effectiveAllowedScopesWithSource(policy *domain.CredentialPolicy, identity *domain.Identity) ([]string, scopeCeilingSource) {
-	if policy != nil && len(policy.AllowedScopes) > 0 {
-		return policy.AllowedScopes, ceilingFromPolicy
+// grantScopes resolves a self-mint grant's scopes: the caller's request
+// narrowed by every ceiling, narrowest wins. An empty ceiling places no
+// restriction. An omitted request (RFC 6749 §3.3) defaults to the first
+// restricting ceiling, narrowed by the rest.
+//
+// The default is taken once, at the first restricting ceiling. It is never
+// re-taken on an intermediate result that became empty because an earlier
+// ceiling excluded everything; that would reinterpret a real denial as
+// "nothing was asked" and reset to a wider ceiling. Chained intersectScopes
+// calls do exactly that.
+//
+// When any ceiling restricts and nothing survives, the grant is refused with
+// invalid_scope whether or not the caller named a scope. Minting anyway would
+// produce a token with no `scopes` claim, because IssueCredential omits the
+// claim and skips its own scope checks when the set is empty. Downstream
+// (Shield's checkScopeCeiling) reads an absent claim as "no ceiling to
+// check", so a disjoint pair of ceilings would otherwise mint an
+// unrestricted token. Only an identity with no ceiling anywhere still gets
+// the legacy scopeless token on an omitted request.
+func grantScopes(requestedRaw string, ceilings ...[]string) ([]string, error) {
+	scopes := parseScopeString(requestedRaw)
+	seeded := len(scopes) > 0
+	restricted := false
+	for _, ceiling := range ceilings {
+		if len(ceiling) == 0 {
+			continue
+		}
+		restricted = true
+		if !seeded {
+			scopes = append([]string(nil), ceiling...)
+			seeded = true
+			continue
+		}
+		scopes = narrowScopes(scopes, ceiling)
 	}
-	if identity != nil && len(identity.AllowedScopes) > 0 {
-		return identity.AllowedScopes, ceilingFromIdentity
+	if restricted && len(scopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope, "requested scopes are not permitted for this identity")
 	}
-	return nil, ceilingUnset
+	return scopes, nil
 }
 
 // requireGrantableScope closes the gap between intersectScopes' silent
@@ -3291,8 +3268,9 @@ func effectiveAllowedScopesWithSource(policy *domain.CredentialPolicy, identity 
 // simply by naming a scope it does not hold.
 //
 // Mirrors tokenExchange's existing "len(scopes) == 0 -> invalid_scope"
-// safety net (this file, tokenExchange), extended to the grants that mint a
-// token for the caller's own use rather than delegating to another identity.
+// safety net (this file, tokenExchange). Used by IssueAuthCode's single
+// client ceiling; the self-mint grants compose several ceilings through
+// grantScopes, which applies a stricter form of this rule.
 // A caller that asks for nothing is unaffected: intersectScopes' RFC 6749
 // §3.3 default (empty request grants the full ceiling) still applies, and so
 // does an identity/client with a genuinely empty ceiling and no explicit
@@ -3326,13 +3304,13 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 // The error code stays invalid_scope and the original sentence stays as a
 // prefix, so neither the wire contract nor an existing log grep changes.
 //
-// subjectHolds is the subject token's granted scopes as a set. actorCeiling
-// is the actor's effective allowed scopes; empty means "no restriction from
-// this layer", so an unrestricted actor is never blamed. ceilingFrom says
-// which layer supplied that ceiling, because widening a credential policy and
+// subjectHolds is the subject token's granted scopes as a set. actorPolicy
+// and actorRow are the actor's two ceilings (see identityScopeCeilings); empty
+// means "no restriction from this layer", so an unrestricted layer is never
+// blamed. They are kept apart because widening a credential policy and
 // widening a registration are different repairs — naming the wrong one is the
 // mistake this whole function exists to prevent.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorCeiling []string, ceilingFrom scopeCeilingSource) error {
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -3343,21 +3321,24 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 			": no scopes were requested, and this grant has no default — name the scopes to delegate")
 	}
 
-	actorSet := make(map[string]bool, len(actorCeiling))
-	for _, s := range actorCeiling {
-		actorSet[s] = true
+	excludes := func(ceiling []string, s string) bool {
+		return len(ceiling) > 0 && !slices.Contains(ceiling, s)
 	}
 
-	// Each scope is blamed once. A scope the subject cannot delegate is the
-	// subject's problem even when the actor also lacks it — reporting it
-	// under both terms would read as two separate repairs.
-	var notHeld, notPermitted []string
+	// Each scope is blamed once, on the first term that excludes it. A scope
+	// the subject cannot delegate is the subject's problem even when the actor
+	// also lacks it, and a scope the policy excludes is the policy's even when
+	// the registration also lacks it — reporting it under two terms would read
+	// as two separate repairs.
+	var notHeld, notPermitted, notRegistered []string
 	for _, s := range requested {
 		switch {
 		case !subjectHolds[s]:
 			notHeld = append(notHeld, s)
-		case len(actorCeiling) > 0 && !actorSet[s]:
+		case excludes(actorPolicy, s):
 			notPermitted = append(notPermitted, s)
+		case excludes(actorRow, s):
+			notRegistered = append(notRegistered, s)
 		}
 	}
 
@@ -3366,15 +3347,10 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
 	}
 	if len(notPermitted) > 0 {
-		// effectiveAllowedScopes is either/or, not layered: when the policy
-		// sets scopes, the identity's own list is never read. Blaming the
-		// registration in that case sends the caller to edit a field the
-		// ceiling did not come from.
-		actorTerm := "the actor identity is not registered for ["
-		if ceilingFrom == ceilingFromPolicy {
-			actorTerm = "the actor's credential policy does not permit ["
-		}
-		reasons = append(reasons, actorTerm+strings.Join(notPermitted, " ")+"]")
+		reasons = append(reasons, "the actor's credential policy does not permit ["+strings.Join(notPermitted, " ")+"]")
+	}
+	if len(notRegistered) > 0 {
+		reasons = append(reasons, "the actor identity is not registered for ["+strings.Join(notRegistered, " ")+"]")
 	}
 	if len(reasons) == 0 {
 		// Unreachable by construction: the caller only invokes this when the
@@ -3396,7 +3372,7 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 // provide: composing plain intersectScopes calls treats an empty
 // *intermediate* result — a real denial from an earlier ceiling in the
 // chain — as "nothing was asked" and resets to the next ceiling's full set,
-// silently undoing that denial (see apiKeyGrant, which chains up to four).
+// silently undoing that denial (see grantScopes, which chains up to five).
 // narrowScopes has no such special case, so a denial anywhere in the chain
 // propagates to the end instead of being reset by the next step.
 //
