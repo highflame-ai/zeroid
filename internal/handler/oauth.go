@@ -509,6 +509,27 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 		Tags: []string{"OAuth"},
 	}, a.bcAuthorizeOp)
 
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-cimd-client-info",
+		Method:      http.MethodGet,
+		Path:        "/oauth2/cimd/client-info",
+		Summary:     "Display metadata for a CIMD client (consent screens)",
+		Description: "Resolves a Client ID Metadata Document and returns the fields a consent " +
+			"screen needs to tell a human who is asking.\n\n" +
+			"**Read-only. It decides nothing.** Admission is still `/oauth2/authorize`, which " +
+			"performs the same resolution against the same cache. This endpoint exists because " +
+			"that resolution happens AFTER the human has approved, which is one hop too late to " +
+			"inform the decision it exists to inform.\n\n" +
+			"**`client_name`, `client_uri` and `logo_uri` are UNTRUSTED.** They come from a " +
+			"document at a URL the client chose. The draft §4 self-reference check, which this " +
+			"endpoint applies, stops one client displaying another's name; it does not make the " +
+			"strings safe to render. Per §8.5 a consent screen MUST show `client_id_host` " +
+			"alongside them, never instead of them, and MUST escape them. `client_uri` and " +
+			"`logo_uri` are guaranteed absolute `https://` URLs or absent, so a `javascript:` " +
+			"value cannot reach an href.",
+		Tags: []string{"OAuth"},
+	}, a.cimdClientInfoOp)
+
 	advertiseFormContentType(api, "/oauth2/token", "/oauth2/token/introspect", "/oauth2/token/revoke", "/oauth2/bc-authorize")
 }
 
@@ -995,4 +1016,60 @@ func mapBackchannelAdminError(err error) error {
 		}
 	}
 	return huma.Error500InternalServerError("backchannel admin request failed")
+}
+
+// CIMDClientInfoInput is the client_id whose document to resolve.
+type CIMDClientInfoInput struct {
+	ClientID string `query:"client_id" required:"true" doc:"The CIMD client_id: the https URL its metadata document is published at."`
+}
+
+// CIMDClientInfoOutput carries only what a consent screen renders. It is
+// deliberately NOT the synthesized client: redirect_uris, grant types and key
+// material are admission inputs, and a display endpoint has no business
+// handing them to whoever asks.
+type CIMDClientInfoOutput struct {
+	Body struct {
+		ClientID string `json:"client_id"`
+		// The host of client_id. Per draft §8.5 a consent screen shows this
+		// WHATEVER else it shows, because it is the only part of the identity
+		// the publisher does not choose. Returned pre-extracted so every
+		// surface derives it the same way.
+		ClientIDHost string `json:"client_id_host"`
+		ClientName   string `json:"client_name,omitempty"`
+		ClientURI    string `json:"client_uri,omitempty"`
+		LogoURI      string `json:"logo_uri,omitempty"`
+		// False always, today. The field is here so a consent screen can render
+		// "not verified" from a value rather than a hardcoded string, and so
+		// adding publisher vetting later does not change this contract.
+		Verified bool `json:"verified"`
+	}
+}
+
+// cimdClientInfoOp resolves a CIMD document for display. See the registration
+// above for the trust contract; the short version is that every string it
+// returns except client_id_host was chosen by whoever published the document.
+func (a *API) cimdClientInfoOp(
+	ctx context.Context, input *CIMDClientInfoInput,
+) (*CIMDClientInfoOutput, error) {
+	client, err := a.oauthSvc.ResolveCIMDClientForDisplay(ctx, input.ClientID)
+	if err != nil {
+		// One status for every failure, on purpose. Disabled, not allow-listed,
+		// unreachable, malformed and self-reference-mismatched are different
+		// facts about the DOCUMENT, and distinguishing them here would turn a
+		// read-only endpoint into a probe for which hosts a deployment admits.
+		// A consent screen treats any failure the same way regardless: fall
+		// back to the client_id host, which it must show anyway.
+		return nil, huma.Error404NotFound("no displayable metadata for this client_id")
+	}
+
+	out := &CIMDClientInfoOutput{}
+	out.Body.ClientID = client.ClientID
+	out.Body.ClientName = client.Name
+	out.Body.ClientURI = client.ClientURI
+	out.Body.LogoURI = client.LogoURI
+	if u, parseErr := url.Parse(client.ClientID); parseErr == nil {
+		out.Body.ClientIDHost = u.Hostname()
+	}
+
+	return out, nil
 }

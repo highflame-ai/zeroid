@@ -88,6 +88,29 @@ type OAuthClient struct {
 	ClientType              string `bun:"client_type"                json:"client_type"`
 	TokenEndpointAuthMethod string `bun:"token_endpoint_auth_method" json:"token_endpoint_auth_method,omitempty"`
 
+	// RFC 7591 display metadata. Populated ONLY on a CIMD-synthesized client,
+	// and never persisted: `bun:"-"` keeps both off oauth_clients, which has no
+	// columns for them and must not grow any — a CIMD client is ephemeral by
+	// definition and is never written to the registry.
+	//
+	// They exist for one reason. draft-ietf-oauth-client-id-metadata-document
+	// §8.5 asks the authorization server to fetch the document "in order to
+	// provide users with additional information about the request, such as the
+	// application name and logo", and to display the client_id hostname IN
+	// ADDITION to whatever it fetched. Without them a consent screen can offer
+	// a human nothing but a URL.
+	//
+	// UNTRUSTED, and the §8.5 context is phishing. Both are attacker-controlled
+	// strings from a document at a URL the attacker chose. The draft §4
+	// self-reference check is what stops one client displaying another's name;
+	// it does nothing to make the strings safe to render. A consent surface MUST
+	// show them beside the client_id host, never instead of it, and MUST escape
+	// them. The scheme is validated at synthesis — see cimdDisplayURI — so a
+	// `javascript:` value can never reach an href, but that is the only
+	// guarantee offered.
+	ClientURI string `bun:"-" json:"client_uri,omitempty"`
+	LogoURI   string `bun:"-" json:"logo_uri,omitempty"`
+
 	// OAuth configuration
 	GrantTypes   []string `bun:"grant_types,array"  json:"grant_types"`
 	RedirectURIs []string `bun:"redirect_uris,array" json:"redirect_uris"`

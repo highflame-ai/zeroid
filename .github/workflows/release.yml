@@ -1,6 +1,19 @@
 name: Release Build - Zeroid
 
+# Run workflow bumps the nested-module pins to svu's next version, pushes
+# that commit to main, then creates the GitHub release on that same
+# commit. The tag is created only after go.mod names it.
+#
+# The release event then tags pkg/jwks, pkg/dpop and pkg/authjwt, tests,
+# builds binaries, and triggers highflame-cloud. The cloud workflow
+# clones that tag. It receives RELEASE_VER after the tag exists.
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (vX.Y.Z). Empty uses svu's next version."
+        required: false
+        type: string
   release:
     types:
       - published
@@ -21,6 +34,7 @@ env:
 
 jobs:
   highflame-validate:
+    if: github.event_name == 'release'
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -103,32 +117,47 @@ jobs:
       # broken go.mod, with goreleaser and tag-submodules skipped.
       # Under lockstep there is no drift to detect, and this check
       # fails BEFORE any submodule tag is created.
-      - name: Verify submodule pins match the release version (lockstep)
+      # Draft-a-release path. workflow_dispatch writes the pins and the
+      # tag together, so they already match. This is the other path:
+      # someone ran `make release-prep VERSION=vX.Y.Z`, committed it, then
+      # drafted a release. The version in that commit must be the tag.
+      - name: make release-prep version matches the release tag
         shell: bash
         run: |-
-          VERSION="${{ env.RELEASE_TAG }}"
+          TAG="${{ env.RELEASE_TAG }}"
           FAILED=0
           for MOD in dpop authjwt jwks; do
             MODPATH="github.com/highflame-ai/zeroid/pkg/${MOD}"
             REF=$(awk -v mp="${MODPATH}" '$1 == mp { print $2; exit }' go.mod)
             if [[ -z "${REF}" ]]; then
-              echo "::error::go.mod has no require directive for ${MODPATH}"
+              echo "::error::go.mod has no make release-prep pin for ${MODPATH}."
               FAILED=1
               continue
             fi
-            if [[ "${REF}" != "${VERSION}" ]]; then
-              echo "::error::go.mod pins ${MODPATH} to ${REF}, but this release is ${VERSION}."
-              echo "::error::All modules release in lockstep, so the pins must name the version being released."
-              echo "::error::Fix: make release-prep VERSION=${VERSION}   (bumps go.mod and opens a PR), then re-run."
+            if [[ "${REF}" != "${TAG}" ]]; then
+              echo "::error::make release-prep version is ${REF}, release tag is ${TAG}. They must match."
               FAILED=1
               continue
             fi
-            echo "✓ ${MODPATH} pinned at ${VERSION}"
+            echo "✓ make release-prep version ${REF} matches release tag ${TAG} (${MODPATH})"
           done
-          [[ "${FAILED}" -eq 0 ]] || exit 1
-          echo "✓ all module pins match ${VERSION} — safe to release"
+          AUTHJWT_JWKS=$(awk '$1 == "github.com/highflame-ai/zeroid/pkg/jwks" { print $2; exit }' pkg/authjwt/go.mod)
+          if [[ "${AUTHJWT_JWKS}" != "${TAG}" ]]; then
+            echo "::error::make release-prep version in pkg/authjwt/go.mod is ${AUTHJWT_JWKS:-<missing>}, release tag is ${TAG}. They must match."
+            FAILED=1
+          else
+            echo "✓ make release-prep version ${AUTHJWT_JWKS} matches release tag ${TAG} (pkg/authjwt → pkg/jwks)"
+          fi
+          if [[ "${FAILED}" -ne 0 ]]; then
+            echo "::error::The committed make release-prep version does not match the release tag ${TAG}."
+            echo "::error::Draft the release on the commit where you ran: make release-prep VERSION=${TAG}"
+            echo "::error::Or Actions → Release Build - Zeroid → Run workflow, which commits that version and creates the tag together."
+            exit 1
+          fi
+          echo "✓ make release-prep version matches release tag ${TAG}"
 
   tag-submodules:
+    if: github.event_name == 'release'
     needs:
       - highflame-validate
     permissions:
@@ -175,6 +204,7 @@ jobs:
           done
 
   highflame-sast:
+    if: github.event_name == 'release'
     needs:
       - highflame-validate
     permissions:
@@ -210,6 +240,7 @@ jobs:
           make test-integration
 
   highflame-goreleaser:
+    if: github.event_name == 'release'
     needs:
       - highflame-validate
       - highflame-sast
@@ -257,6 +288,7 @@ jobs:
           args: release --clean
 
   highflame-trigger:
+    if: github.event_name == 'release'
     needs:
       - highflame-validate
       - highflame-sast
@@ -290,3 +322,110 @@ jobs:
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
             --ref ${{ env.DEVOPS_BRANCH }} \
             -f RELEASE_VER=${{ env.RELEASE_TAG }}
+
+  # Manual run, before any tag exists. release-prep commits first; the
+  # release is created on that commit, so the tag and the cloud clone see
+  # the same go.mod. The app token is what makes `release: published` run
+  # afterwards. The default workflow token would not.
+  cut-release:
+    if: github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: zeroid-cut-release
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create APP token
+        uses: actions/create-github-app-token@v3
+        id: app
+        with:
+          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
+          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VER }}
+          cache: false
+
+      - name: Install GitHub CLI
+        run: sudo apt install gh -y
+
+      - name: Bump pins and publish the release
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin --tags --force
+          go install github.com/caarlos0/svu/v3@latest
+
+          EXPECTED="$(svu next)"
+          CURRENT="$(svu current)"
+          echo "svu current : ${CURRENT}"
+          echo "svu next    : ${EXPECTED}"
+
+          if [[ -n "${INPUT_VERSION}" ]] && ! printf '%s' "${INPUT_VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version must match vMAJOR.MINOR.PATCH; got ${INPUT_VERSION}"
+            exit 1
+          fi
+          if [[ -z "${INPUT_VERSION}" ]]; then
+            if [[ "${EXPECTED}" == "${CURRENT}" ]]; then
+              echo "::error::No feat: or fix: commits since ${CURRENT}. Nothing to release."
+              exit 1
+            fi
+            VERSION="${EXPECTED}"
+          else
+            VERSION="${INPUT_VERSION}"
+            HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${VERSION}" | sort -V | tail -1)"
+            if [[ "${VERSION}" != "${EXPECTED}" && "${HIGHEST}" != "${VERSION}" ]]; then
+              echo "::error::${VERSION} is below svu's next version ${EXPECTED}."
+              exit 1
+            fi
+          fi
+
+          if [[ ! "${VERSION}" =~ ${REGEX_PATTERN} ]]; then
+            echo "::error::Invalid version format: ${VERSION}"
+            exit 1
+          fi
+          echo "Valid version format: ${VERSION}"
+
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Tag ${VERSION} already exists. Refusing to move it."
+            exit 1
+          fi
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Release ${VERSION} already exists. Refusing to move it."
+            exit 1
+          fi
+          echo "Releasing ${VERSION}"
+
+          make release-prep VERSION="${VERSION}"
+          git add -- go.mod pkg/authjwt/go.mod go.sum pkg/authjwt/go.sum go.work.sum
+          if ! git diff --quiet; then
+            echo "::error::release-prep changed files other than the module pins:"
+            git status --porcelain
+            exit 1
+          fi
+          if ! git diff --cached --quiet; then
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+            git commit -m "devops: point nested-module pins at ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+          echo "Publishing ${VERSION} at ${SHA}"
+          gh release create "${VERSION}" --target "${SHA}" --title "${VERSION}" --generate-notes
