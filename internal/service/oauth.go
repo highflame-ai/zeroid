@@ -1086,12 +1086,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	actorPolicyScopes, actorRowScopes := identityScopeCeilings(actorPolicy, actorIdentity)
 	userGrantCeiling := parent.Type == domain.PrincipalUser
 	if userGrantCeiling {
-		// D10: a token the actor holds for a person is capped by its
-		// user_grant_scopes, which replaces both of its own-authority
-		// ceilings (policy and registration). Empty means no extra cap from
-		// the actor: the person's grant, which the parent's scopes already
-		// carry, bounds the chain.
-		actorPolicyScopes, actorRowScopes = actorPolicy.UserGrantScopes, nil
+		// D10: a token the actor holds for a person is capped by its policy's
+		// user_grant_scopes instead of its policy's allowed_scopes. Empty means
+		// no extra cap from the policy: the person's grant, which the parent's
+		// scopes already carry, bounds the chain. The identity's own
+		// allowed_scopes is its absolute ceiling and still binds.
+		actorPolicyScopes = actorPolicy.UserGrantScopes
 	}
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {

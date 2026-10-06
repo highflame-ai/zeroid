@@ -399,10 +399,10 @@ that make agent orchestration attributable. The terms **orchestrator** and
 **sub-agent** below are agent roles (Section 3.2); a delegation between
 non-agent NHIs uses the same mechanism without those role labels.
 
-### 5.1 Scope attenuation (three-way intersection)
+### 5.1 Scope attenuation (intersection)
 
 On an NHI delegation exchange the issued scope set **MUST** equal the
-intersection of:
+intersection of (an empty set places no restriction, except the subject token's):
 
 1. the scopes **requested** (`scope` parameter),
 2. the scopes the **orchestrator** (subject_token) actually holds, and
@@ -410,6 +410,10 @@ intersection of:
    policy when the chain's principal is a workload, or its `user_grant_scopes`
    when the principal is a person. An empty `user_grant_scopes` adds no cap; the
    person's own grant, carried in the subject token's scopes, bounds the chain.
+4. the sub-agent **identity's own** `allowed_scopes`, its absolute ceiling under
+   either principal (see `docs/scope-ceilings.md`). `user_grant_scopes` replaces
+   the policy's `allowed_scopes` for a person's chain; it never lifts the
+   identity's ceiling.
 
 The split ceiling exists because an agent's own authority and what it may hold
 for a person rarely overlap: agents are registered for their own scopes and
