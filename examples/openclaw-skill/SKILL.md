@@ -63,9 +63,20 @@ curl -s -X POST "$ZEROID_BASE_URL/agents/register" \
 
 The `sub_type` field classifies the agent role: `orchestrator`, `autonomous`, `tool_agent`, `code_agent`, etc. The `trust_level` controls what grants and scopes the agent can access: `unverified`, `verified_third_party`, `first_party`.
 
-To register a bare identity without an API key (for manual credential management):
+To register a bare identity without an API key (for manual credential management), first create a credential policy carrying its scopes, then reference it. The credential policy is the identity's scope ceiling — the identity itself carries no scopes, and a non-empty `allowed_scopes` on `POST /identities` is refused with 400:
 
 ```bash
+# 1. Policy holding the scope ceiling (see "Credential Policies" below)
+curl -s -X POST "$ZEROID_BASE_URL/credential-policies" \
+  -H "Authorization: Bearer $ZEROID_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "data-fetcher-policy",
+    "allowed_scopes": ["data:read", "data:write"],
+    "allowed_grant_types": ["api_key", "jwt_bearer"]
+  }'
+
+# 2. Identity bound to that policy (use the "id" returned above)
 curl -s -X POST "$ZEROID_BASE_URL/identities" \
   -H "Authorization: Bearer $ZEROID_API_KEY" \
   -H "Content-Type: application/json" \
@@ -73,9 +84,11 @@ curl -s -X POST "$ZEROID_BASE_URL/identities" \
     "external_id": "data-fetcher-1",
     "trust_level": "unverified",
     "owner_user_id": "user-ops",
-    "allowed_scopes": ["data:read", "data:write"]
+    "credential_policy_id": "<policy_id>"
   }'
 ```
+
+`POST /agents/register` accepts the same `credential_policy_id` field. Omit it and the identity falls back to the tenant default policy.
 
 ---
 
@@ -212,7 +225,7 @@ curl -s -X DELETE "$ZEROID_BASE_URL/agents/registry/{agent_id}" \
 
 ## 5. Credential Policies
 
-Create governance templates that enforce TTL limits, allowed grant types, required trust levels, and maximum delegation depth. Policies are assigned to API keys and enforced at token issuance time.
+Create governance templates that enforce TTL limits, allowed grant types, allowed scopes, required trust levels, and maximum delegation depth. Policies are assigned to identities (`credential_policy_id`, the identity's authority ceiling) and to API keys, and are enforced at token issuance time. Note that `max_delegation_depth` defaults to 0 — set it if the identity takes part in delegation.
 
 ```bash
 curl -s -X POST "$ZEROID_BASE_URL/credential-policies" \

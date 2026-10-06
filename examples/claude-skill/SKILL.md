@@ -67,6 +67,7 @@ Request body fields:
 - `labels` (optional) -- JSON object of key-value labels
 - `metadata` (optional) -- JSON object of opaque product-specific metadata
 - `public_key_pem` (optional) -- PEM-encoded EC P-256 public key for jwt_bearer and token_exchange grants
+- `credential_policy_id` (optional) -- ID of a credential policy (see Credential Policies below) that is the identity's authority ceiling: its `allowed_scopes`, grant types, TTL and delegation depth bound every token the agent gets. Defaults to the tenant default policy. To restrict an agent's scopes, create a policy with those `allowed_scopes` first and pass its ID here. Do not send `allowed_scopes` on the identity itself -- a non-empty value is refused with 400.
 
 The response includes the identity (with its WIMSE/SPIFFE URI) and a one-time API key (`zid_sk_...`). Warn the user to save the API key securely -- it is only shown once.
 
@@ -195,7 +196,7 @@ Other policy endpoints:
 - **PATCH /credential-policies/{id}** -- update a policy
 - **DELETE /credential-policies/{id}** -- delete a policy
 
-Policies define each agent's operational envelope programmatically. They enforce what grant types, scopes, TTLs, and delegation depths are allowed.
+Policies define each agent's operational envelope programmatically. They enforce what grant types, scopes, TTLs, and delegation depths are allowed. Attach a policy to an agent with `credential_policy_id` on `POST /agents/register` (or `PATCH /identities/{id}`); the policy's `allowed_scopes` is the only scope ceiling an identity has. `max_delegation_depth` defaults to 0, so set it for any agent that delegates or is delegated to.
 
 Ask the user what constraints they want to enforce and build the policy accordingly.
 

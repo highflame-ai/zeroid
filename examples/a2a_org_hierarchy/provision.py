@@ -6,13 +6,16 @@ On each `docker compose up`:
     revocation command (fast path for restarts without `docker compose down -v`).
   • Otherwise register all 32 agents (idempotent: existing identities get their
     public key updated and a fresh API key issued), build the mission tree, and
-    write the manifest.
+    write the manifest. Each agent's scope ceiling is a credential policy
+    (one per distinct scope set, reused across runs).
 """
 
+import hashlib
 import json
 import os
 import sys
 import time
+import urllib.request
 
 import jwt
 import yaml
@@ -89,6 +92,60 @@ def _fetch_all_identities() -> dict[str, tuple[str, str]]:
     }
 
 
+def _admin_request(method: str, path: str, body: dict) -> dict:
+    """Call the ZeroID admin REST API directly.
+
+    Used where the published SDK has no parameter for the field we need:
+    identities.create() / identities.update() do not accept
+    credential_policy_id. Sends the same tenant headers as the SDK client
+    (account_id / project_id default to "default").
+    """
+    req = urllib.request.Request(
+        f"{ZEROID_BASE_URL}{path}",
+        data=json.dumps(body).encode(),
+        method=method,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Account-ID": "default",
+            "X-Project-ID": "default",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read() or b"{}")
+
+
+_policy_ids: dict[tuple, str] = {}
+
+
+def _policy_for_scopes(scopes: list) -> str:
+    """Return the id of a credential policy whose allowed_scopes is *scopes*.
+
+    The credential policy is the identity's scope ceiling (the identity row
+    carries no allowed_scopes). One policy per distinct scope set, named by a
+    hash of the set so re-runs reuse it: a 409 on create means it already
+    exists, so look it up by name.
+    """
+    key = tuple(sorted(scopes))
+    if key in _policy_ids:
+        return _policy_ids[key]
+    name = "cascade-demo-" + hashlib.sha256(" ".join(key).encode()).hexdigest()[:12]
+    try:
+        policy = client.credential_policies.create(
+            name=name,
+            description="cascade-demo scope ceiling: " + " ".join(key),
+            allowed_scopes=list(key),
+            # Tier 1 roots use api_key; tiers 2-3 are delegated via token_exchange.
+            allowed_grant_types=["api_key", "token_exchange"],
+            # The tree is depth 2; 0 would refuse every delegation.
+            max_delegation_depth=2,
+        )
+    except ConflictError:
+        policy = next(p for p in client.credential_policies.list() if p.name == name)
+    _policy_ids[key] = policy.id
+    return policy.id
+
+
 def load_hierarchy():
     with open(HIERARCHY_PATH) as f:
         data = yaml.safe_load(f)
@@ -112,18 +169,21 @@ def register_agents(agents: list, all_scopes: list) -> dict:
         priv, pub = _generate_keypair()
         name = ag["name"]
         existing_id, existing_wimse = existing.get(ag["external_id"], (None, None))
+        # The agent's scope ceiling lives on its credential policy.
+        policy_id = _policy_for_scopes(ag["scopes"])
 
         if ag["tier"] == 1:
             if existing_id:
+                # Re-link the policy before minting the key, so the key is
+                # issued under the current ceiling.
+                _admin_request("PATCH", f"/identities/{existing_id}", {
+                    "credential_policy_id": policy_id,
+                    "public_key_pem":       pub,
+                })
                 new_key = client.api_keys.create(
                     name=f"{ag['external_id']}-demo",
                     identity_id=existing_id,
                     scopes=ag["scopes"],
-                )
-                client.identities.update(
-                    existing_id,
-                    allowed_scopes=ag["scopes"],
-                    public_key_pem=pub,
                 )
                 api_key     = new_key.key
                 identity_id = existing_id
@@ -136,11 +196,8 @@ def register_agents(agents: list, all_scopes: list) -> dict:
                     sub_type=ag["sub_type"],
                     trust_level="first_party",
                     created_by="provision@demo.local",
-                )
-                client.identities.update(
-                    reg.identity.id,
-                    allowed_scopes=ag["scopes"],
                     public_key_pem=pub,
+                    credential_policy_id=policy_id,
                 )
                 api_key     = reg.api_key
                 identity_id = reg.identity.id
@@ -159,28 +216,30 @@ def register_agents(agents: list, all_scopes: list) -> dict:
 
         else:
             if existing_id:
-                client.identities.update(
-                    existing_id,
-                    allowed_scopes=ag["scopes"],
-                    public_key_pem=pub,
-                )
+                _admin_request("PATCH", f"/identities/{existing_id}", {
+                    "credential_policy_id": policy_id,
+                    "public_key_pem":       pub,
+                })
                 identity_id = existing_id
                 wimse_uri   = existing_wimse
                 indent = "    " if ag["tier"] == 3 else "  "
                 print(f"{indent}[Tier {ag['tier']}] {name:28s} → existing, pubkey updated")
             else:
-                identity = client.identities.create(
-                    external_id=ag["external_id"],
-                    name=ag["display_name"],
-                    owner_user_id="provision@demo.local",
-                    identity_type="agent",
-                    sub_type=ag["sub_type"],
-                    trust_level="first_party",
-                    allowed_scopes=ag["scopes"],
-                    public_key_pem=pub,
-                )
-                identity_id = identity.id
-                wimse_uri   = identity.wimse_uri
+                # REST rather than client.identities.create(): the SDK's
+                # create() has no credential_policy_id, and setting it in the
+                # same call means the identity never exists without its ceiling.
+                identity = _admin_request("POST", "/identities", {
+                    "external_id":          ag["external_id"],
+                    "name":                 ag["display_name"],
+                    "owner_user_id":        "provision@demo.local",
+                    "identity_type":        "agent",
+                    "sub_type":             ag["sub_type"],
+                    "trust_level":          "first_party",
+                    "credential_policy_id": policy_id,
+                    "public_key_pem":       pub,
+                })
+                identity_id = identity["id"]
+                wimse_uri   = identity.get("wimse_uri", "")
                 indent = "    " if ag["tier"] == 3 else "  "
                 print(f"{indent}[Tier {ag['tier']}] {name:28s} → {wimse_uri}")
 

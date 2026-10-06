@@ -52,6 +52,7 @@ no tools entry is written for that agent.
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -67,6 +68,7 @@ log = logging.getLogger("agent-identity-sidecar")
 _token_cache: dict[str, tuple[str, float]] = {}  # agent_id → (jwt, expires_at)
 _wimse_cache: dict[str, str] = {}                # "<acct>/<proj>/<external_id>" → wimse_uri
 _issuer_cache: dict[str, str] = {}               # zeroid_url → issuer
+_policy_cache: dict[str, str] = {}               # "<acct>/<proj>/<policy name>" → policy id
 
 AUTH_STORE_VERSION = 1   # src/agents/auth-profiles/constants.ts
 LOCK_STALE_SECS = 30     # src/agents/auth-profiles/constants.ts AUTH_STORE_LOCK_OPTIONS.stale
@@ -496,6 +498,68 @@ def fetch_zeroid_issuer(zeroid_url: str) -> str:
         raise RuntimeError(f"could not fetch ZeroID issuer from {url}: {e}") from e
 
 
+def _identity_write(client, method: str, path: str, body: dict):
+    """POST/PATCH an identity through the client's own transport.
+
+    The published SDK's identities.create() / identities.update() have no
+    credential_policy_id parameter, so send the body ourselves. Going through
+    client._transport keeps the client's base URL, credential and tenant
+    headers, and maps errors to the SDK's exceptions (409 → ConflictError).
+    """
+    from highflame.zeroid.types import Identity
+    body = {k: v for k, v in body.items() if v is not None}  # omit unset fields
+    resp = client._transport.request(method, path, body)
+    return Identity.model_validate(resp.json())
+
+
+def ensure_scope_policy(
+    client,
+    label: str,
+    scopes: list[str],
+    grant_types: list[str],
+) -> str:
+    """
+    Return the id of a credential policy whose allowed_scopes is *scopes*.
+
+    The credential policy is an identity's scope ceiling — the identity row
+    carries no scopes of its own. One policy per (label, scope set), named by a
+    hash of the set so restarts reuse it; a 409 on create means it already
+    exists, so look it up by name. max_delegation_depth=2 allows
+    orchestrator → main agent → sub-agent and nothing deeper.
+    """
+    key = " ".join(sorted(set(scopes)))
+    name = f"openclaw-{label}-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    cache_key = f"{client.account_id}/{client.project_id}/{name}"
+    if cache_key in _policy_cache:
+        return _policy_cache[cache_key]
+
+    from highflame.zeroid.errors import ZeroIDError
+
+    try:
+        policy = client.credential_policies.create(
+            name=name,
+            description=f"openclaw sidecar {label} scope ceiling: {key}",
+            allowed_scopes=sorted(set(scopes)) or None,
+            allowed_grant_types=grant_types,
+            max_ttl_seconds=3600,
+            max_delegation_depth=2,
+        )
+        log.info("created credential policy %s (scopes=%s)", name, key)
+    except ZeroIDError as e:
+        if "409" not in str(e) and getattr(e, "code", "") not in ("conflict", "already_exists"):
+            raise
+        policy = next(
+            (p for p in client.credential_policies.list() if p.name == name), None
+        )
+        if policy is None:
+            raise RuntimeError(
+                f"credential policy {name!r} returned 409 but was not found in list"
+            ) from e
+
+    _policy_cache[cache_key] = policy.id
+    return policy.id
+
+
 def ensure_sub_agent_identity(
     client,
     external_id: str,
@@ -505,7 +569,10 @@ def ensure_sub_agent_identity(
 ) -> str:
     """
     Register or update the sub-agent identity in ZeroID and return its wimse_uri.
-    On 409 (already exists), patches public_key_pem and allowed_scopes in place.
+
+    *allowed_scopes* (from the sidecar config) becomes the identity's
+    credential policy — its scope ceiling. On 409 (already exists), patches
+    public_key_pem and credential_policy_id in place.
     Results are cached for the process lifetime.
     """
     cache_key = f"{client.account_id}/{client.project_id}/{external_id}"
@@ -514,17 +581,20 @@ def ensure_sub_agent_identity(
 
     from highflame.zeroid.errors import ZeroIDError
 
+    # Sub-agents only ever obtain tokens as the actor of a token exchange.
+    policy_id = ensure_scope_policy(client, "agent", allowed_scopes, ["token_exchange"])
+
     try:
-        identity = client.identities.create(
-            external_id=external_id,
-            owner_user_id=owner_user_id or client.account_id,
-            name=external_id,
-            identity_type="agent",
-            sub_type="tool_agent",
-            trust_level="first_party",
-            allowed_scopes=allowed_scopes,
-            public_key_pem=public_pem,
-        )
+        identity = _identity_write(client, "POST", "/identities", {
+            "external_id": external_id,
+            "owner_user_id": owner_user_id or client.account_id,
+            "name": external_id,
+            "identity_type": "agent",
+            "sub_type": "tool_agent",
+            "trust_level": "first_party",
+            "credential_policy_id": policy_id,
+            "public_key_pem": public_pem,
+        })
         wimse_uri = identity.wimse_uri
         log.info("registered sub-agent identity %s → %s", external_id, wimse_uri)
     except ZeroIDError as e:
@@ -541,11 +611,10 @@ def ensure_sub_agent_identity(
             raise RuntimeError(
                 f"identity {external_id!r} returned 409 but was not found in list"
             ) from e
-        updated = client.identities.update(
-            existing.id,
-            public_key_pem=public_pem,
-            allowed_scopes=allowed_scopes,
-        )
+        updated = _identity_write(client, "PATCH", f"/identities/{existing.id}", {
+            "public_key_pem": public_pem,
+            "credential_policy_id": policy_id,
+        })
         wimse_uri = updated.wimse_uri
         log.info("updated sub-agent identity %s → %s", external_id, wimse_uri)
 
@@ -572,9 +641,10 @@ def resolve_identity_key_dynamic(
     agent's token automatically. When omitted, the orchestrator's token is
     used as the subject via client.tokens.delegate().
 
-    ZeroID enforces: granted scope = subject scopes ∩ agent allowed_scopes
-    ∩ requested scope — so the tool policy written to openclaw.json reflects
-    what was actually granted, not what was requested.
+    ZeroID enforces: granted scope = subject scopes ∩ requested scope, and
+    the result must fit the agent's credential policy (its scope ceiling,
+    built from the config's allowed_scopes) — so the tool policy written to
+    openclaw.json reflects what was actually granted, not what was requested.
     """
     cached = _token_cache.get(agent_id)
     if cached and time.time() < cached[1]:
@@ -780,8 +850,9 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
       3. Auto-register a new orchestrator identity and issue an API key
 
     The key is always persisted to the key store after step 3 so subsequent
-    runs skip registration. The orchestrator's allowed_scopes is set to the
-    union of all agent scopes so every sub-agent exchange has a valid parent.
+    runs skip registration. The orchestrator's credential policy (its scope
+    ceiling) allows the union of all agent scopes so every sub-agent exchange
+    has a valid parent.
     """
     if cfg.get("orchestrator_api_key"):
         return cfg["orchestrator_api_key"]
@@ -812,14 +883,19 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
     )
 
     owner_user_id = cfg.get("admin_user_id", "").strip() or None
+    # The orchestrator logs in with its API key and is the root subject of
+    # every delegation.
+    policy_id = ensure_scope_policy(
+        bootstrap, "orchestrator", all_scopes, ["api_key", "token_exchange"],
+    )
     api_key: str
     try:
-        identity = bootstrap.identities.create(
-            name=_ORCH_EXTERNAL_ID,
-            external_id=_ORCH_EXTERNAL_ID,
-            owner_user_id=owner_user_id,
-            allowed_scopes=all_scopes or None,
-        )
+        identity = _identity_write(bootstrap, "POST", "/identities", {
+            "name": _ORCH_EXTERNAL_ID,
+            "external_id": _ORCH_EXTERNAL_ID,
+            "owner_user_id": owner_user_id,
+            "credential_policy_id": policy_id,
+        })
         created = bootstrap.api_keys.create(
             name="sidecar-orchestrator",
             identity_id=identity.id,
@@ -833,7 +909,7 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
     except ZeroIDError as e:
         if "409" not in str(e) and getattr(e, "code", "") not in ("conflict", "already_exists"):
             raise
-        # Already registered — find identity, update scopes, issue a fresh API key.
+        # Already registered — find identity, re-link its policy, issue a fresh API key.
         # iter_all() walks every page; list() would stop at the first 20.
         existing_identity = next(
             (i for i in bootstrap.identities.iter_all() if i.external_id == _ORCH_EXTERNAL_ID),
@@ -843,11 +919,10 @@ def ensure_orchestrator_ready(cfg: dict, key_store: AgentKeyStore) -> str:
             raise RuntimeError(
                 "orchestrator identity returned 409 but was not found in list"
             ) from e
-        bootstrap.identities.update(
-            existing_identity.id,
-            owner_user_id=owner_user_id,
-            allowed_scopes=all_scopes or None,
-        )
+        _identity_write(bootstrap, "PATCH", f"/identities/{existing_identity.id}", {
+            "owner_user_id": owner_user_id,
+            "credential_policy_id": policy_id,
+        })
         created = bootstrap.api_keys.create(
             name="sidecar-orchestrator",
             identity_id=existing_identity.id,

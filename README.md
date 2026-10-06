@@ -486,6 +486,7 @@ Full interactive API docs: `GET http://localhost:8899/docs`
 policy = client.credential_policies.create(
     name="budget-optimizer-policy",
     allowed_scopes=["campaigns:read", "campaigns:write", "budget:reallocate"],
+    allowed_grant_types=["api_key"],  # the agent authenticates with its API key only
     max_ttl_seconds=3600,           # tokens expire hourly — no long-lived access
     required_trust_level="first_party",
     max_delegation_depth=0,         # this agent cannot spawn sub-agents
@@ -497,6 +498,7 @@ agent = client.agents.register(
     sub_type="autonomous",
     trust_level="first_party",
     created_by="operations@company.com",  # owner claim in every token
+    credential_policy_id=policy.id,       # the policy is the agent's scope ceiling
 )
 
 # Agent runs autonomously. Per-action approvals are replaced by the policy envelope.
@@ -564,26 +566,31 @@ policy = client.credential_policies.create(
     name="sec-ops-policy",
     max_delegation_depth=2,
     allowed_scopes=["alerts:read", "logs:read", "logs:query", "firewall:write"],
+    allowed_grant_types=["api_key", "token_exchange"],  # API-key login + delegation
 )
 
-# Three agents registered with separate identities
+# Three agents registered with separate identities, all under the same policy —
+# the policy (not the identity) is each agent's scope ceiling.
 monitor  = client.agents.register(name="Security Monitor",  
                                   external_id="sec-monitor",
                                   sub_type="orchestrator",  
                                   trust_level="first_party",
-                                  created_by="operations@company.com")
+                                  created_by="operations@company.com",
+                                  credential_policy_id=policy.id)
 
 investigator = client.agents.register(name="Log Investigator", 
                                       external_id="log-investigator",
                                       sub_type="autonomous",    
                                       trust_level="first_party",
-                                      created_by="operations@company.com")
+                                      created_by="operations@company.com",
+                                      credential_policy_id=policy.id)
 
 remediator   = client.agents.register(name="Firewall Agent",    
                                       external_id="fw-remediator",
                                       sub_type="tool_agent",    
                                       trust_level="first_party",
-                                      created_by="operations@company.com")
+                                      created_by="operations@company.com",
+                                      credential_policy_id=policy.id)
 
 # Each agent runs with its own client, initialized with its own api_key.
 # delegate() uses the client's internally managed token as the subject.
