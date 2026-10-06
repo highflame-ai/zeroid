@@ -36,7 +36,7 @@ func TestDelegationScopeDenial_NoScopesRequested(t *testing.T) {
 	// token_exchange is the ONE grant with no RFC 6749 §3.3 default, so an
 	// omitted scope is a hard failure rather than "grant the full ceiling".
 	// A caller who has only ever used the other grants will not expect that.
-	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, ceilingUnset)
+	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil, false)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "no scopes were requested")
@@ -51,7 +51,8 @@ func TestDelegationScopeDenial_SubjectDoesNotHold(t *testing.T) {
 		[]string{"data:read", "tools:read"},
 		map[string]bool{}, // subject holds nothing
 		[]string{"data:read", "tools:read"},
-		ceilingFromPolicy,
+		nil,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -65,8 +66,9 @@ func TestDelegationScopeDenial_ActorCeilingExcludes(t *testing.T) {
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{"data:read": true},
-		[]string{"tools:read"}, // actor ceiling excludes data:read
-		ceilingFromIdentity,
+		nil,                    // the policy places no restriction
+		[]string{"tools:read"}, // the registration excludes data:read
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -82,8 +84,9 @@ func TestDelegationScopeDenial_BothTermsNamedSeparately(t *testing.T) {
 	err := delegationScopeDenial(
 		[]string{"data:read", "order:write"},
 		map[string]bool{"data:read": true}, // subject lacks order:write
-		[]string{"order:write"},            // actor ceiling lacks data:read
-		ceilingFromIdentity,
+		nil,
+		[]string{"order:write"}, // actor registration lacks data:read
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -98,8 +101,9 @@ func TestDelegationScopeDenial_UnrestrictedActorBlamesTheSubjectOnly(t *testing.
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{},
-		nil, // no actor ceiling
-		ceilingUnset,
+		nil, // no actor policy ceiling
+		nil, // no actor registration ceiling
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -113,8 +117,9 @@ func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{},      // subject lacks it
-		[]string{"tools:read"}, // and the actor ceiling lacks it too
-		ceilingFromPolicy,
+		[]string{"tools:read"}, // and the actor policy lacks it too
+		nil,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -123,63 +128,132 @@ func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
 		"a scope the subject cannot delegate is not also the sub-agent's problem")
 }
 
-// effectiveAllowedScopes is either/or: when the credential policy sets scopes,
-// the identity's own list is never read. A denial that always blamed the
-// registration would send the caller to edit a field the ceiling did not come
-// from — the exact wrong-repair hint this denial exists to remove.
+// The actor's credential policy and its registration are separate ceilings
+// that both bind, and they need different repairs. A denial must name the
+// one that excluded the scope, and a scope both exclude is blamed on the
+// policy alone.
 
 func TestDelegationScopeDenial_PolicyCeilingBlamesThePolicy(t *testing.T) {
 	err := delegationScopeDenial(
 		[]string{"data:read"},
 		map[string]bool{"data:read": true},
 		[]string{"tools:read"},
-		ceilingFromPolicy,
+		[]string{"data:read"}, // the registration lists it; the policy does not
+		false,
 	)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
 	assert.NotContains(t, desc, "not registered for",
-		"the registration may well list data:read; the policy overrode it")
+		"the registration lists data:read; only the policy excluded it")
 }
 
-func TestEffectiveAllowedScopesWithSource(t *testing.T) {
+func TestDelegationScopeDenial_RowNarrowerThanPolicyBlamesTheRegistration(t *testing.T) {
+	// The policy permits the scope and the registration does not. The row
+	// binds even though the policy restricts, so the registration is the
+	// thing to widen.
+	err := delegationScopeDenial(
+		[]string{"nhi:manage"},
+		map[string]bool{"nhi:manage": true},
+		[]string{"nhi:manage", "tools:read"},
+		[]string{"tools:read"},
+		false,
+	)
+
+	desc := denialText(t, err)
+	assert.Contains(t, desc, "the actor identity is not registered for [nhi:manage]")
+	assert.NotContains(t, desc, "credential policy")
+}
+
+func TestDelegationScopeDenial_ScopeBothCeilingsExcludeIsBlamedOnce(t *testing.T) {
+	err := delegationScopeDenial(
+		[]string{"data:read"},
+		map[string]bool{"data:read": true},
+		[]string{"tools:read"},
+		[]string{"tools:read"},
+		false,
+	)
+
+	desc := denialText(t, err)
+	assert.Contains(t, desc, "the actor's credential policy does not permit [data:read]")
+	assert.NotContains(t, desc, "not registered for")
+}
+
+func TestIdentityScopeCeilings(t *testing.T) {
 	policy := &domain.CredentialPolicy{AllowedScopes: []string{"tools:read"}}
 	identity := &domain.Identity{AllowedScopes: []string{"order:read"}}
 
-	t.Run("a policy ceiling wins and is reported as the source", func(t *testing.T) {
-		scopes, src := effectiveAllowedScopesWithSource(policy, identity)
-		assert.Equal(t, []string{"tools:read"}, scopes)
-		assert.Equal(t, ceilingFromPolicy, src)
-	})
+	p, r := identityScopeCeilings(policy, identity)
+	assert.Equal(t, []string{"tools:read"}, p)
+	assert.Equal(t, []string{"order:read"}, r, "the row is returned even when the policy restricts")
 
-	t.Run("an unrestricted policy falls back to the identity", func(t *testing.T) {
-		scopes, src := effectiveAllowedScopesWithSource(&domain.CredentialPolicy{}, identity)
-		assert.Equal(t, []string{"order:read"}, scopes)
-		assert.Equal(t, ceilingFromIdentity, src)
-	})
+	p, r = identityScopeCeilings(nil, nil)
+	assert.Empty(t, p)
+	assert.Empty(t, r)
+}
 
-	t.Run("neither layer restricts", func(t *testing.T) {
-		scopes, src := effectiveAllowedScopesWithSource(&domain.CredentialPolicy{}, &domain.Identity{})
-		assert.Empty(t, scopes)
-		assert.Equal(t, ceilingUnset, src)
-	})
+func TestGrantScopes(t *testing.T) {
+	cases := []struct {
+		name      string
+		requested string
+		ceilings  [][]string
+		want      []string
+		denied    bool
+	}{
+		{"no ceiling, omitted request keeps the legacy scopeless grant", "", nil, nil, false},
+		{"no ceiling, explicit request passes through", "a b", [][]string{nil, {}}, []string{"a", "b"}, false},
+		{"omitted request defaults to the single ceiling", "", [][]string{{"a", "b"}}, []string{"a", "b"}, false},
+		{"row narrower than policy yields the intersection", "",
+			[][]string{{"nhi:manage", "tools:read"}, {"tools:read"}}, []string{"tools:read"}, false},
+		{"empty ceilings are skipped, not treated as denials", "",
+			[][]string{nil, {"a", "b"}, {}, {"b"}}, []string{"b"}, false},
+		{"explicit request narrowed by every ceiling", "a b c",
+			[][]string{{"a", "b"}, {"b", "c"}}, []string{"b"}, false},
+		{"disjoint ceilings deny an omitted request instead of minting a scopeless token", "",
+			[][]string{{"nhi:manage"}, {"tools:read"}}, nil, true},
+		{"an earlier denial is not reset by a later ceiling", "",
+			[][]string{{"a"}, {"b"}, {"a", "b"}}, nil, true},
+		{"explicit request outside every ceiling is denied", "z",
+			[][]string{{"a"}}, nil, true},
+		{"whitespace-only request is treated as omitted", "  ",
+			[][]string{{"a"}}, []string{"a"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := grantScopes(c.requested, c.ceilings...)
+			if c.denied {
+				require.Error(t, err)
+				oe, ok := err.(*OAuthError)
+				require.True(t, ok)
+				assert.Equal(t, oautherror.InvalidScope, oe.Code)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, c.want, got)
+		})
+	}
 
-	t.Run("the source never disagrees with the scopes effectiveAllowedScopes returns", func(t *testing.T) {
-		// One decision point: a caller that re-derived the source separately
-		// would go stale the moment the precedence changes.
-		for _, c := range []struct {
-			name     string
-			policy   *domain.CredentialPolicy
-			identity *domain.Identity
-		}{
-			{"policy wins", policy, identity},
-			{"identity fallback", &domain.CredentialPolicy{}, identity},
-			{"nothing set", nil, nil},
-		} {
-			t.Run(c.name, func(t *testing.T) {
-				scopes, _ := effectiveAllowedScopesWithSource(c.policy, c.identity)
-				assert.Equal(t, effectiveAllowedScopes(c.policy, c.identity), scopes)
-			})
-		}
+	t.Run("the default is a copy, not the ceiling's backing array", func(t *testing.T) {
+		ceiling := []string{"a", "b"}
+		got, err := grantScopes("", ceiling)
+		require.NoError(t, err)
+		got[0] = "mutated"
+		assert.Equal(t, "a", ceiling[0])
 	})
+}
+
+// TestDelegationScopeDenial_NamesUserGrantScopes: for a chain acting for a
+// person the actor's ceiling is its policy's user_grant_scopes (D10), so the
+// denial must send the caller to that field, not to allowed_scopes.
+func TestDelegationScopeDenial_NamesUserGrantScopes(t *testing.T) {
+	err := delegationScopeDenial(
+		[]string{"data:write"},
+		map[string]bool{"data:write": true},
+		[]string{"data:read"},
+		nil,
+		true,
+	)
+
+	desc := denialText(t, err)
+	assert.Contains(t, desc, "user_grant_scopes does not permit [data:write]")
 }
