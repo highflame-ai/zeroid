@@ -90,7 +90,7 @@ Rules:
   its own endpoint needs.
 - **The gateway decides through policy.** For calls a gateway forwards to a
   third party, the token's scopes are available to the policy decision point as
-  `principal.scopes` (Cedar), together with the actor chain and the target, so
+  `context.principal.scopes` (Cedar), together with the actor chain and the target, so
   a tenant can condition a tool call on them. A hardcoded table mapping actions
   to scopes is not used: a request does not reveal which scope it "needs".
   Resource binding (RFC 8707: a token bound to one server cannot be used at
