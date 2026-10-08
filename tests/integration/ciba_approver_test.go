@@ -662,7 +662,7 @@ func TestCIBAApproverHTTP(t *testing.T) {
 // is left untouched.
 func TestCIBAApproverMigration(t *testing.T) {
 	ctx := context.Background()
-	const name = "048_ciba_approver_binding"
+	const name = "051_ciba_approver_binding"
 	up, err := fs.ReadFile(zeroid.MigrationFiles(), name+".up.sql")
 	require.NoError(t, err)
 	down, err := fs.ReadFile(zeroid.MigrationFiles(), name+".down.sql")

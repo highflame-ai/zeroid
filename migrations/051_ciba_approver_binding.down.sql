@@ -1,4 +1,4 @@
--- Reverting 048. Roll the binary back FIRST: bun enumerates model columns
+-- Reverting 051. Roll the binary back FIRST: bun enumerates model columns
 -- explicitly, so a binary that knows these columns fails every
 -- backchannel_auth_requests query against a schema without them.
 SET LOCAL lock_timeout = '3s';
