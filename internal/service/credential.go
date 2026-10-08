@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -179,10 +180,10 @@ var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permi
 // be issued to an identity of type t, or "" when all are permitted.
 //
 // ciba:approve lets its holder resolve CIBA requests on behalf of a user, so
-// it is reserved for approval-channel services and never issued to agent
-// identities.
+// it is reserved for approval-channel services and never issued to agent or
+// MCP server identities.
 func scopeRefusedForIdentityType(t domain.IdentityType, scopes []string) string {
-	if t != domain.IdentityTypeAgent {
+	if t != domain.IdentityTypeAgent && t != domain.IdentityTypeMCPServer {
 		return ""
 	}
 	for _, sc := range scopes {
@@ -191,6 +192,40 @@ func scopeRefusedForIdentityType(t domain.IdentityType, scopes []string) string 
 		}
 	}
 	return ""
+}
+
+// cibaApproveListed reports whether ciba:approve is listed explicitly for this
+// issuance: in the identity's own allowed_scopes, or in the allowed_scopes of
+// the identity policy (the one passed in, else the identity's own or tenant
+// default) or of the per-credential policy. Lookup failures count as not
+// listed.
+func (s *CredentialService) cibaApproveListed(ctx context.Context, req IssueRequest) bool {
+	if req.Identity == nil {
+		return false
+	}
+	if slices.Contains(req.Identity.AllowedScopes, domain.ScopeCIBAApprove) {
+		return true
+	}
+	if s.policySvc == nil {
+		return false
+	}
+	identityPolicyID := req.IdentityPolicyID
+	if identityPolicyID == "" {
+		resolved, err := s.resolveIdentityPolicyID(ctx, req.Identity)
+		if err == nil {
+			identityPolicyID = resolved
+		}
+	}
+	for _, id := range []string{identityPolicyID, req.CredentialPolicyID} {
+		if id == "" {
+			continue
+		}
+		policy, err := s.policySvc.GetPolicy(ctx, id, req.Identity.AccountID, req.Identity.ProjectID)
+		if err == nil && policy != nil && slices.Contains(policy.AllowedScopes, domain.ScopeCIBAApprove) {
+			return true
+		}
+	}
+	return false
 }
 
 // IssueCredential issues a short-lived JWT for an identity.
@@ -277,6 +312,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// scope ceilings say (see scopeRefusedForIdentityType).
 	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
 		return nil, nil, fmt.Errorf("%w: %q is not issued to %s identities", ErrScopesNotAllowed, refused, req.Identity.IdentityType)
+	}
+
+	// ciba:approve is issued only to identities that list it explicitly, on
+	// the identity row or on a credential policy that governs this issuance.
+	// An empty ceiling means "no restriction" for every other scope; it never
+	// yields this one.
+	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !s.cibaApproveListed(ctx, req) {
+		return nil, nil, fmt.Errorf("%w: %q is issued only to identities that list it explicitly", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
 	}
 
 	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes

@@ -125,6 +125,11 @@ const (
 
 	// Service sub-types.
 	SubTypeLLMProvider SubType = "llm_provider"
+	// SubTypeApprovalChannel marks a service identity that resolves CIBA
+	// requests on behalf of the users it names (a chat or email bridge, a
+	// customer-built approval UI). Deployers that front the admin API with
+	// several caller classes should let only their most trusted class set it.
+	SubTypeApprovalChannel SubType = "approval_channel"
 )
 
 // agentSubTypes is the set of sub-types valid for identity_type = "agent".
@@ -153,7 +158,8 @@ var applicationSubTypes = map[SubType]bool{
 
 // serviceSubTypes is the set of sub-types valid for identity_type = "service".
 var serviceSubTypes = map[SubType]bool{
-	SubTypeLLMProvider: true,
+	SubTypeLLMProvider:     true,
+	SubTypeApprovalChannel: true,
 }
 
 // ValidForIdentityType reports whether s is a valid sub-type for the given identity type.

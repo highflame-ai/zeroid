@@ -730,6 +730,98 @@ func TestCIBAApproveScopeRefusedForAgentIdentity(t *testing.T) {
 	_ = ok.Body.Close()
 }
 
+// registerServiceIdentity registers a service identity through the admin API
+// and returns its bootstrap API key.
+func registerServiceIdentity(t *testing.T, identityType, subType string, allowedScopes []string, policyID string) string {
+	t.Helper()
+	externalID := uid("svc-ciba-approve")
+	body := map[string]any{
+		"name":          externalID,
+		"external_id":   externalID,
+		"identity_type": identityType,
+		"created_by":    "test-user",
+	}
+	if subType != "" {
+		body["sub_type"] = subType
+	}
+	if allowedScopes != nil {
+		body["allowed_scopes"] = allowedScopes
+	}
+	if policyID != "" {
+		body["credential_policy_id"] = policyID
+	}
+	resp := post(t, adminPath("/agents/register"), body, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+	return apiKey
+}
+
+func mintAPIKeyScope(t *testing.T, apiKey, scope string) *http.Response {
+	t.Helper()
+	return post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+		"scope":      scope,
+	}, nil)
+}
+
+// TestCIBAApproveScopeRequiresExplicitListing pins that ciba:approve is issued
+// only to identities that list it explicitly: an empty scope ceiling never
+// yields it, and MCP server identities never receive it.
+func TestCIBAApproveScopeRequiresExplicitListing(t *testing.T) {
+	t.Run("service identity without a listing is refused", func(t *testing.T) {
+		apiKey := registerServiceIdentity(t, "service", "", nil, "")
+		resp := mintAPIKeyScope(t, apiKey, "ciba:approve")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.NotEmpty(t, decode(t, resp)["error"])
+	})
+
+	t.Run("mcp_server identity listing it is refused", func(t *testing.T) {
+		apiKey := registerServiceIdentity(t, "mcp_server", "", []string{"ciba:approve"}, "")
+		resp := mintAPIKeyScope(t, apiKey, "ciba:approve")
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		_ = resp.Body.Close()
+	})
+
+	t.Run("approval channel listing it on the identity is issued", func(t *testing.T) {
+		apiKey := registerServiceIdentity(t, "service", "approval_channel", []string{"ciba:approve"}, "")
+		resp := mintAPIKeyScope(t, apiKey, "ciba:approve")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		tok, _ := decode(t, resp)["access_token"].(string)
+		claims := decodeJWTPayload(t, tok)
+		require.Equal(t, "approval_channel", claims["sub_type"])
+		require.Equal(t, "service", claims["identity_type"])
+	})
+
+	t.Run("listing on the credential policy is honoured", func(t *testing.T) {
+		pol := post(t, adminPath("/credential-policies"), map[string]any{
+			"name":                uid("ciba-approve-policy"),
+			"max_ttl_seconds":     3600,
+			"allowed_grant_types": []string{"api_key"},
+			"allowed_scopes":      []string{"ciba:approve"},
+		}, adminHeaders())
+		require.Equal(t, http.StatusCreated, pol.StatusCode)
+		policyID, _ := decode(t, pol)["id"].(string)
+		require.NotEmpty(t, policyID)
+
+		apiKey := registerServiceIdentity(t, "service", "approval_channel", nil, policyID)
+		resp := mintAPIKeyScope(t, apiKey, "ciba:approve")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		_ = resp.Body.Close()
+	})
+
+	t.Run("approval_channel is not a valid agent sub_type", func(t *testing.T) {
+		externalID := uid("agent-channel")
+		resp := post(t, adminPath("/agents/register"), map[string]any{
+			"name": externalID, "external_id": externalID,
+			"identity_type": "agent", "sub_type": "approval_channel", "created_by": "test-user",
+		}, adminHeaders())
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		_ = resp.Body.Close()
+	})
+}
+
 // ── requesting chain ─────────────────────────────────────────────────────────
 
 // externalPrincipalToken mints a token whose sub is userID via the trusted

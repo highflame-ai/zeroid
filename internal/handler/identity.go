@@ -23,7 +23,7 @@ type CreateIdentityInput struct {
 		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
 		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
-		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Sub-type within identity type"`
 		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
 		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy."`

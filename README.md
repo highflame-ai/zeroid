@@ -912,6 +912,15 @@ location /oauth2/ { proxy_pass http://zeroid; }                          # publi
 Deployments that never use CIBA should still add that rule: the endpoints are registered
 regardless, and the default credential policy permits the CIBA grant.
 
+**Approval channels and `ciba:approve`.** The `ciba:approve` scope (held by a service that
+resolves CIBA requests for the users it names, such as a chat or email bridge) is issued
+only to identities that list it explicitly — in the identity's `allowed_scopes` or on a
+credential policy that governs the issuance — and never to `agent` or `mcp_server`
+identities. An empty scope ceiling never yields it. Register such a service with
+`identity_type: service` and `sub_type: approval_channel` so a gateway can recognise it
+from the token's `sub_type` claim. If your admin API serves several caller classes, let
+only the most trusted one set that sub-type or list the scope.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/agents/register` | Register agent (identity + credential, atomic) |

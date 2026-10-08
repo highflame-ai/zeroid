@@ -55,7 +55,7 @@ type RegisterAgentInput struct {
 		Name                     string          `json:"name" required:"true" minLength:"1" doc:"Human-readable name"`
 		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
-		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Operational role"`
+		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Operational role. approval_channel (identity_type service only) marks a CIBA approval channel."`
 		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
 		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
