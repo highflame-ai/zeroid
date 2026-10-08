@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -16,7 +17,9 @@ import (
 type RequestingToken struct {
 	JTI        string
 	Subject    string
-	ActSubject string // act.sub, "" when the token has no act claim
+	ActSubject string          // act.sub, "" when the token has no act claim
+	Act        json.RawMessage // the act claim as issued, nil when absent
+	ExpiresAt  time.Time
 	ClientID   string
 	AccountID  string
 	ProjectID  string
@@ -91,22 +94,31 @@ func stampAuthorizationDetails(row *domain.BackchannelAuthRequest) (json.RawMess
 }
 
 // requestingChainIssue adjusts a CIBA issuance for a row that carries a
-// requesting chain: the token keeps the chain's subject, act and identity
-// claims, and carries nothing about the approver. Deterministic refusals are
-// returned before the caller burns the auth_req_id. Returns ok=false when the
-// row has no requesting chain.
+// requesting chain: the token keeps the chain's subject, act (as issued,
+// nested actors included) and identity claims, carries nothing about the
+// approver, and never outlives the requesting token. When the requesting
+// token belongs to an identity, that identity's credential policy governs the
+// result. Every refusal is returned before the caller burns the auth_req_id.
+// Returns ok=false when the row has no requesting chain.
 func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *domain.BackchannelAuthRequest, req *IssueRequest) (bool, error) {
 	if row.RequestingJTI == "" {
 		return false, nil
 	}
 	req.SubjectOverride = row.RequesterSub
-	req.DelegatedBy = row.RequesterActSub
 	req.UserEmail = ""
 	req.UserName = ""
 	req.ParentJTI = row.RequestingJTI
+	if row.RequestingAct != "" {
+		var act map[string]any
+		if err := json.Unmarshal([]byte(row.RequestingAct), &act); err != nil {
+			return true, oauthServerError("failed to decode the requesting token's act claim", err)
+		}
+		req.ActClaim = act
+		req.DelegatedBy, _ = act["sub"].(string)
+	}
 
 	if s.credentialSvc == nil || s.credentialSvc.repo == nil {
-		return true, nil
+		return true, oauthServerError("backchannel service is missing its credential service", nil)
 	}
 	cred, err := s.credentialSvc.repo.GetByJTI(ctx, row.RequestingJTI)
 	if err != nil {
@@ -115,11 +127,18 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if cred.IsRevoked {
 		return true, oauthBadRequest(oautherror.InvalidGrant, "the requesting token for this request has been revoked")
 	}
+	if !time.Now().Before(cred.ExpiresAt) {
+		return true, oauthBadRequest(oautherror.InvalidGrant, "the requesting token for this request has expired")
+	}
+	// Never outlive the chain: the chokepoint clamps exp to this bound.
+	chainExp := cred.ExpiresAt
+	req.CredentialExpiresAt = &chainExp
 	req.MissionID = cred.MissionID
 	req.DelegationDepth = cred.DelegationDepth
 	if cred.IdentityID == nil || *cred.IdentityID == "" {
 		return true, nil
 	}
+
 	ident, err := s.identitySvc.GetIdentity(ctx, *cred.IdentityID, row.AccountID, row.ProjectID)
 	if err != nil {
 		log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("requesting identity lookup failed")
@@ -134,22 +153,62 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if refused := scopeRefusedForIdentityType(ident.IdentityType, req.Scopes); refused != "" {
 		return true, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to this identity", refused))
 	}
-	if len(ident.AllowedScopes) > 0 {
-		allowed := make(map[string]bool, len(ident.AllowedScopes))
-		for _, sc := range ident.AllowedScopes {
-			allowed[sc] = true
-		}
-		for _, sc := range req.Scopes {
-			if !allowed[sc] {
-				return true, oauthBadRequest(oautherror.InvalidScope,
-					fmt.Sprintf("scope %q is not in the requesting identity's allowed_scopes", sc))
-			}
+	if err := requireScopesWithin(req.Scopes, ident.AllowedScopes, "the requesting identity's allowed_scopes"); err != nil {
+		return true, err
+	}
+
+	// The requesting identity's credential policy is its authority ceiling;
+	// enforce it here, before the burn. The grant-type axis is evaluated
+	// against the grant that minted the requesting token (the chain's own
+	// grant), so a policy need not list CIBA for its tokens to be extended
+	// by an approval.
+	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, ident)
+	if err != nil {
+		return true, oauthServerError("failed to resolve the requesting identity's credential policy", err)
+	}
+	if err := requireScopesWithin(req.Scopes, policy.AllowedScopes, "the requesting identity's credential policy"); err != nil {
+		return true, err
+	}
+	if policy.MaxTTLSeconds > 0 && req.TTL > policy.MaxTTLSeconds {
+		req.TTL = policy.MaxTTLSeconds
+	}
+	var attestationLevel string
+	if s.credentialSvc.attestationRepo != nil {
+		attestationLevel, _ = s.credentialSvc.attestationRepo.GetHighestVerifiedLevel(ctx, ident.ID)
+	}
+	if s.credentialSvc.policySvc != nil {
+		if perr := s.credentialSvc.policySvc.EnforcePolicy(ctx, policy, EnforcePolicyRequest{
+			TTL:              req.TTL,
+			GrantType:        cred.GrantType,
+			Scopes:           req.Scopes,
+			TrustLevel:       ident.TrustLevel,
+			AttestationLevel: attestationLevel,
+			DelegationDepth:  req.DelegationDepth,
+		}); perr != nil {
+			return true, oauthBadRequestCause(oautherror.AccessDenied, "the requesting identity's credential policy refused issuance", perr)
 		}
 	}
+
 	req.Identity = ident
-	// The requesting identity's own ceiling was enforced when its token was
-	// issued; this grant is governed by the CIBA client's identity, checked
-	// before issuance.
+	// Enforced above against the chain's grant type; the chokepoint would
+	// re-check it against the CIBA grant type instead.
 	req.IdentityPolicyID = ""
 	return true, nil
+}
+
+// requireScopesWithin refuses any requested scope outside a non-empty ceiling.
+func requireScopesWithin(requested, ceiling []string, what string) error {
+	if len(ceiling) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(ceiling))
+	for _, sc := range ceiling {
+		allowed[sc] = true
+	}
+	for _, sc := range requested {
+		if !allowed[sc] {
+			return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not permitted by %s", sc, what))
+		}
+	}
+	return nil
 }

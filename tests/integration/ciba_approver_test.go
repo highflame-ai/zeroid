@@ -3,11 +3,13 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/uptrace/bun"
@@ -269,6 +271,8 @@ func TestCIBAApproverBinding(t *testing.T) {
 		row := loadBackchannelRow(t, repo, id)
 		require.Equal(t, domain.BackchannelStatusApproved, row.Status)
 		require.Equal(t, "login_hint", row.HintSatisfied)
+		require.NotNil(t, row.ApprovedAt)
+		require.Nil(t, row.DeniedAt)
 		require.False(t, row.ShadowWouldDeny)
 	})
 
@@ -451,6 +455,8 @@ func TestCIBAApproverBinding(t *testing.T) {
 		row := loadBackchannelRow(t, repo, id)
 		require.Equal(t, domain.BackchannelStatusDenied, row.Status)
 		require.Equal(t, "user-a", row.ApprovedSubjectID, "the resolving user is recorded on deny")
+		require.NotNil(t, row.DeniedAt, "deny records when the request was resolved")
+		require.Nil(t, row.ApprovedAt)
 		require.Equal(t, testApproverIssuer, row.ApproverIss)
 		require.Equal(t, "session", row.ApproverAuth)
 		require.Equal(t, "login_hint", row.HintSatisfied)
@@ -664,8 +670,8 @@ func TestCIBAApproverMigration(t *testing.T) {
 
 	columns := []string{
 		"four_eyes", "requester_owner", "requester_sub", "requester_actor",
-		"requesting_jti", "requester_act_sub", "approver_iss", "approver_auth",
-		"channel_client_id", "hint_satisfied", "shadow_would_deny", "shadow_reason",
+		"requesting_jti", "requesting_act", "approver_iss", "approver_auth",
+		"channel_client_id", "hint_satisfied", "shadow_would_deny", "shadow_reason", "denied_at",
 	}
 	countColumns := func(tx bun.Tx) int {
 		var n int
@@ -743,27 +749,55 @@ func externalPrincipalToken(t *testing.T, accountID, projectID, userID string) s
 	return tok
 }
 
-func pollCIBA(t *testing.T, clientID, authReqID string) map[string]any {
+// cibaClient is a confidential OAuth client registered for the CIBA grant.
+type cibaClient struct{ ID, Secret string }
+
+func newConfidentialCIBAClient(t *testing.T) cibaClient {
+	t.Helper()
+	id := uid("ciba-conf")
+	resp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id": id, "name": id, "confidential": true,
+		"grant_types": []string{zeroidGrantTypeCIBA},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	secret, _ := decode(t, resp)["client_secret"].(string)
+	require.NotEmpty(t, secret)
+	return cibaClient{ID: id, Secret: secret}
+}
+
+// bcAuthorizeAs posts bc-authorize for c in the test tenant.
+func bcAuthorizeAs(t *testing.T, c cibaClient, body map[string]any) *http.Response {
+	t.Helper()
+	body["client_id"] = c.ID
+	body["client_secret"] = c.Secret
+	body["account_id"] = testAccountID
+	body["project_id"] = testProjectID
+	return post(t, "/oauth2/bc-authorize", body, nil)
+}
+
+func pollCIBARaw(t *testing.T, c cibaClient, authReqID string) (int, map[string]any) {
 	t.Helper()
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":  zeroidGrantTypeCIBA,
-		"auth_req_id": authReqID,
-		"client_id":   clientID,
+		"grant_type":    zeroidGrantTypeCIBA,
+		"auth_req_id":   authReqID,
+		"client_id":     c.ID,
+		"client_secret": c.Secret,
 	}, nil)
-	body := decode(t, resp)
-	require.Equal(t, http.StatusOK, resp.StatusCode, "poll: %v", body)
+	return resp.StatusCode, decode(t, resp)
+}
+
+func pollCIBA(t *testing.T, c cibaClient, authReqID string) map[string]any {
+	t.Helper()
+	status, body := pollCIBARaw(t, c, authReqID)
+	require.Equal(t, http.StatusOK, status, "poll: %v", body)
 	return body
 }
 
 func TestCIBARequestingToken(t *testing.T) {
-	bcAuthorize := func(t *testing.T, body map[string]any) (*http.Response, string) {
+	bcAuthorize := func(t *testing.T, body map[string]any) (*http.Response, cibaClient) {
 		t.Helper()
-		clientID := uid("ciba-chain")
-		registerTestOAuthClient(clientID, []string{"client_credentials"})
-		body["client_id"] = clientID
-		body["account_id"] = testAccountID
-		body["project_id"] = testProjectID
-		return post(t, "/oauth2/bc-authorize", body, nil), clientID
+		c := newConfidentialCIBAClient(t)
+		return bcAuthorizeAs(t, c, body), c
 	}
 
 	t.Run("Invalid_400", func(t *testing.T) {
@@ -854,14 +888,12 @@ func TestCIBAApprovalKeepsRequestingSubject(t *testing.T) {
 	aliceToken := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
 	aliceClaims := decodeJWTPayload(t, aliceToken)
 
-	clientID := uid("ciba-keep-sub")
-	registerTestOAuthClient(clientID, []string{"client_credentials"})
-	resp := post(t, "/oauth2/bc-authorize", map[string]any{
-		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+	client := newConfidentialCIBAClient(t)
+	resp := bcAuthorizeAs(t, client, map[string]any{
 		"group_hint":            "highflame:role:admin",
 		"requesting_token":      aliceToken,
 		"authorization_details": []map[string]any{{"type": "tool_call", "tool": "transfer_funds"}},
-	}, nil)
+	})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	id, _ := decode(t, resp)["auth_req_id"].(string)
 
@@ -871,7 +903,7 @@ func TestCIBAApprovalKeepsRequestingSubject(t *testing.T) {
 	require.Equal(t, http.StatusOK, ap.StatusCode)
 	_ = ap.Body.Close()
 
-	body := pollCIBA(t, clientID, id)
+	body := pollCIBA(t, client, id)
 	claims := decodeJWTPayload(t, body["access_token"].(string))
 	require.Equal(t, "alice", claims["sub"], "the approval must not change the chain's subject")
 	for _, k := range []string{"user_email", "user_name", "name"} {
@@ -913,12 +945,10 @@ func TestCIBAApprovalKeepsAgentChainClaims(t *testing.T) {
 	agentToken, _ := decode(t, tr)["access_token"].(string)
 	agentClaims := decodeJWTPayload(t, agentToken)
 
-	clientID := uid("ciba-chain-agent-client")
-	registerTestOAuthClient(clientID, []string{"client_credentials"})
-	resp := post(t, "/oauth2/bc-authorize", map[string]any{
-		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+	client := newConfidentialCIBAClient(t)
+	resp := bcAuthorizeAs(t, client, map[string]any{
 		"login_hint": "user-a", "requesting_token": agentToken,
-	}, nil)
+	})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	id, _ := decode(t, resp)["auth_req_id"].(string)
 
@@ -926,7 +956,7 @@ func TestCIBAApprovalKeepsAgentChainClaims(t *testing.T) {
 	require.Equal(t, http.StatusOK, ap.StatusCode)
 	_ = ap.Body.Close()
 
-	claims := decodeJWTPayload(t, pollCIBA(t, clientID, id)["access_token"].(string))
+	claims := decodeJWTPayload(t, pollCIBA(t, client, id)["access_token"].(string))
 	require.Equal(t, agentClaims["sub"], claims["sub"])
 	for _, k := range []string{"identity_type", "external_id", "owner_user_id", "agent_id"} {
 		require.Equal(t, agentClaims[k], claims[k], "claim %s", k)
@@ -936,4 +966,204 @@ func TestCIBAApprovalKeepsAgentChainClaims(t *testing.T) {
 	row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
 	require.Equal(t, agentClaims["sub"], row.RequesterSub)
 	require.Equal(t, "user-a", row.ApprovedSubjectID)
+}
+
+// TestCIBARequestingTokenClientAuth: requesting_token is considered only for
+// an authenticated confidential client, and only after client authentication.
+func TestCIBARequestingTokenClientAuth(t *testing.T) {
+	valid := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+
+	t.Run("PublicClient_400", func(t *testing.T) {
+		clientID := uid("ciba-public-chain")
+		registerTestOAuthClient(clientID, []string{"client_credentials"})
+		resp := post(t, "/oauth2/bc-authorize", map[string]any{
+			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+			"login_hint": "user-a", "requesting_token": valid,
+		}, nil)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		body := decode(t, resp)
+		require.Equal(t, "invalid_request", body["error"])
+		require.Equal(t, "requesting_token requires an authenticated client", body["error_description"])
+	})
+
+	t.Run("FailedClientAuth_SameErrorForValidAndInvalidToken", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		attempt := func(tok, account, project string) (int, map[string]any) {
+			resp := post(t, "/oauth2/bc-authorize", map[string]any{
+				"client_id": c.ID, "client_secret": "wrong-secret",
+				"account_id": account, "project_id": project,
+				"login_hint": "user-a", "requesting_token": tok,
+			}, nil)
+			return resp.StatusCode, decode(t, resp)
+		}
+		validStatus, validBody := attempt(valid, testAccountID, testProjectID)
+		invalidStatus, invalidBody := attempt("not-a-token", testAccountID, testProjectID)
+		otherStatus, otherBody := attempt(valid, "acct-elsewhere", "proj-elsewhere")
+		require.Equal(t, invalidStatus, validStatus)
+		require.Equal(t, invalidBody, validBody)
+		require.Equal(t, invalidStatus, otherStatus)
+		require.Equal(t, invalidBody, otherBody)
+		require.Equal(t, "invalid_client", validBody["error"])
+	})
+}
+
+func approveAs(t *testing.T, authReqID, sub string) {
+	t.Helper()
+	ap := post(t, adminPath("/oauth2/bc-authorize/"+authReqID+"/approve"), map[string]any{"subject_id": sub}, adminHeaders())
+	require.Equal(t, http.StatusOK, ap.StatusCode)
+	_ = ap.Body.Close()
+}
+
+func numClaim(t *testing.T, claims map[string]any, k string) int64 {
+	t.Helper()
+	v, ok := claims[k].(float64)
+	require.True(t, ok, "claim %s: %v", k, claims[k])
+	return int64(v)
+}
+
+// TestCIBARequestingIdentityPolicy: the requesting identity's credential
+// policy bounds the approved token's scopes, and a refusal does not consume
+// the approval.
+func TestCIBARequestingIdentityPolicy(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("ciba-chain-policy"),
+		"allowed_grant_types":  []string{"client_credentials", "token_exchange"},
+		"allowed_scopes":       []string{"tools:read", "tools:write"},
+		"max_delegation_depth": 5,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+	// The identity's own allowed_scopes include tools:admin; its credential
+	// policy does not, so the policy is what refuses it.
+	extID := uid("ciba-chain-root")
+	registerIdentityWithPolicy(t, extID, policyID, "", []string{"tools:read", "tools:write", "tools:admin"}, adminHeaders())
+	rootClient := registerOAuthClient(t, extID, []string{"tools:read"})
+	rr := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "client_credentials", "account_id": testAccountID, "project_id": testProjectID,
+		"client_id": rootClient.ClientID, "client_secret": rootClient.ClientSecret, "scope": "tools:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, rr.StatusCode)
+	rootToken, _ := decode(t, rr)["access_token"].(string)
+	rootClaims := decodeJWTPayload(t, rootToken)
+
+	t.Run("ScopeOutsidePolicy_RefusedWithoutConsumingApproval", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{
+			"login_hint": "user-a", "requesting_token": rootToken, "scope": "tools:admin",
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+		approveAs(t, id, "user-a")
+
+		status, body := pollCIBARaw(t, c, id)
+		require.Equal(t, http.StatusBadRequest, status)
+		require.Equal(t, "invalid_scope", body["error"])
+		row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+		require.Equal(t, domain.BackchannelStatusApproved, row.Status, "a refusal must not consume the approval")
+	})
+
+	t.Run("ScopeWithinPolicy_Minted", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{
+			"login_hint": "user-a", "requesting_token": rootToken, "scope": "tools:write",
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+		approveAs(t, id, "user-a")
+
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		require.Equal(t, rootClaims["sub"], claims["sub"])
+		require.LessOrEqual(t, numClaim(t, claims, "exp"), numClaim(t, rootClaims, "exp"),
+			"the approved token must not outlive the requesting token")
+	})
+}
+
+// TestCIBAApprovedTokenExpiryBoundedByChain: a requesting token with a short
+// remaining life bounds the approved token's exp.
+func TestCIBAApprovedTokenExpiryBoundedByChain(t *testing.T) {
+	tok := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+	reqClaims := decodeJWTPayload(t, tok)
+
+	short := time.Now().Add(60 * time.Second)
+	_, err := testDB.NewUpdate().Model((*domain.IssuedCredential)(nil)).
+		Set("expires_at = ?", short).Where("jti = ?", reqClaims["jti"]).Exec(context.Background())
+	require.NoError(t, err)
+
+	c := newConfidentialCIBAClient(t)
+	resp := bcAuthorizeAs(t, c, map[string]any{"login_hint": "user-a", "requesting_token": tok})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	id, _ := decode(t, resp)["auth_req_id"].(string)
+	approveAs(t, id, "user-a")
+
+	claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+	require.LessOrEqual(t, numClaim(t, claims, "exp"), short.Unix()+1)
+}
+
+// TestCIBAApprovedTokenKeepsActClaim: the requesting token's act claim is
+// carried over exactly as issued.
+func TestCIBAApprovedTokenKeepsActClaim(t *testing.T) {
+	policyID := delegationPolicy(t, uid("ciba-act-policy"), []string{"tools:read"})
+	_, _, rootToken := issueRootCredential(t, policyID, "ciba-act-root", []string{"tools:read"})
+	_, _, childToken := exchangeToken(t, policyID, "ciba-act-child", []string{"tools:read"}, []string{"tools:read"}, rootToken)
+	childClaims := decodeJWTPayload(t, childToken)
+	require.NotNil(t, childClaims["act"], "a delegated token carries act")
+
+	t.Run("Delegated", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{"login_hint": "user-a", "requesting_token": childToken, "scope": "tools:read"})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+		approveAs(t, id, "user-a")
+
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		require.Equal(t, childClaims["sub"], claims["sub"])
+		require.Equal(t, childClaims["act"], claims["act"])
+	})
+
+	t.Run("NestedActors", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{"login_hint": "user-a", "requesting_token": childToken, "scope": "tools:read"})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+
+		// A chain recorded with nested actors (act.act) is reproduced as is.
+		nested := map[string]any{
+			"sub": childClaims["act"].(map[string]any)["sub"],
+			"act": map[string]any{"sub": "spiffe://upstream.example.test/orchestrator", "act": map[string]any{"sub": "user-origin"}},
+		}
+		raw, err := json.Marshal(nested)
+		require.NoError(t, err)
+		_, err = testDB.NewUpdate().Model((*domain.BackchannelAuthRequest)(nil)).
+			Set("requesting_act = ?", string(raw)).Where("auth_req_id = ?", id).Exec(context.Background())
+		require.NoError(t, err)
+		approveAs(t, id, "user-a")
+
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		require.Equal(t, nested, claims["act"])
+	})
+}
+
+// TestCIBADeniedAtExposed: a denied request records and exposes when it was
+// denied.
+func TestCIBADeniedAtExposed(t *testing.T) {
+	clientID := uid("ciba-denied-at")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID, "login_hint": "user-a",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	id, _ := decode(t, resp)["auth_req_id"].(string)
+
+	before := time.Now().Add(-time.Second)
+	dr := post(t, adminPath("/oauth2/bc-authorize/"+id+"/deny"), nil, adminHeaders())
+	require.Equal(t, http.StatusOK, dr.StatusCode)
+	_ = dr.Body.Close()
+
+	row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+	require.NotNil(t, row.DeniedAt)
+	require.True(t, row.DeniedAt.After(before))
+	raw, err := json.Marshal(row)
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(raw, &m))
+	require.NotEmpty(t, m["denied_at"], "denied_at is part of the row's JSON read model")
 }

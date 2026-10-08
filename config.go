@@ -527,14 +527,14 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// token.hmac_secret signs/verifies stateless authorization_code JWTs
-	// (HS256). The authorization_code grant is optional, so the secret is not
-	// globally required — but a weak secret is forgeable, so when one IS set
-	// we enforce a floor. 32 bytes matches the HS256 output size.
 	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
 		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
 	}
 
+	// token.hmac_secret signs/verifies stateless authorization_code JWTs
+	// (HS256). The authorization_code grant is optional, so the secret is not
+	// globally required — but a weak secret is forgeable, so when one IS set
+	// we enforce a floor. 32 bytes matches the HS256 output size.
 	if c.Token.HMACSecret != "" && len(c.Token.HMACSecret) < 32 {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
 	}
@@ -755,12 +755,12 @@ func loadDefaults(k *koanf.Koanf) error {
 		// private_key_jwt client auth. Both production-safe at their zero
 		// value; stated explicitly so the resolved config reports them.
 		"client_auth.allow_private_jwks_endpoints": false,
+		"client_auth.jwks_cache_size":              0,
 
 		// CIBA approver binding — both off so standalone deployments keep
 		// today's approve/deny behaviour until they opt in.
 		"backchannel.require_approver_identity": false,
 		"backchannel.enforce_hints":             "off",
-		"client_auth.jwks_cache_size":           0,
 
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,

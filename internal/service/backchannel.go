@@ -406,22 +406,6 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 			fmt.Sprintf("requester_owner exceeds maximum length of %d characters", domain.MaxRequesterOwnerChars))
 	}
 
-	var requesting *RequestingToken
-	if in.RequestingToken != "" {
-		rt, err := s.resolveRequestingToken(ctx, in)
-		if err != nil {
-			return nil, err
-		}
-		requesting = rt
-	} else if in.GroupHint != "" && in.LoginHint == "" {
-		// Without a requesting token or login_hint nothing names the
-		// subject of the token, so an approver would become it. Refused
-		// when approvers are authenticated; unchanged otherwise.
-		if require, _, _ := s.approverSettings(); require {
-			return nil, oauthBadRequest(oautherror.InvalidRequest, "group_hint requires requesting_token")
-		}
-	}
-
 	// Resolve the client. GetClientByClientID intentionally returns any
 	// client (public or confidential) WITHOUT an is_active filter (the
 	// underlying repo GetByClientID skips the check — tracked as a follow-up;
@@ -470,6 +454,29 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		// "unknown/deactivated client".
 		if _, verr := s.oauthClientSvc.VerifyClientSecret(ctx, in.ClientID, in.ClientSecret); verr != nil {
 			return nil, oauthBadRequestCause(oautherror.InvalidClient, "client authentication failed", verr)
+		}
+	}
+
+	// requesting_token and the group_hint-only refusal are evaluated only
+	// after the client has been resolved and authenticated, so the response
+	// reveals nothing about a token to an unauthenticated caller. Only a
+	// client that authenticated above may send requesting_token.
+	var requesting *RequestingToken
+	if in.RequestingToken != "" {
+		if !client.RequiresClientAuthentication() {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token requires an authenticated client")
+		}
+		rt, err := s.resolveRequestingToken(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		requesting = rt
+	} else if in.GroupHint != "" && in.LoginHint == "" {
+		// Without a requesting token or login_hint nothing names the
+		// subject of the token, so an approver would become it. Refused
+		// when approvers are authenticated; unchanged otherwise.
+		if require, _, _ := s.approverSettings(); require {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "group_hint requires requesting_token")
 		}
 	}
 
@@ -580,7 +587,7 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		row.RequesterSub = requesting.Subject
 		row.RequesterActor = requesting.Actor()
 		row.RequestingJTI = requesting.JTI
-		row.RequesterActSub = requesting.ActSubject
+		row.RequestingAct = string(requesting.Act)
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)

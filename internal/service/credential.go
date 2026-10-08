@@ -135,6 +135,10 @@ type IssueRequest struct {
 	// UserEmail and UserName are set for human user tokens.
 	UserEmail string
 	UserName  string
+	// ActClaim, when non-nil, is emitted verbatim as the RFC 8693 "act" claim
+	// (nested actors included), taking precedence over DelegatedBy and
+	// ActingUserID. Used to carry an existing chain's act unchanged.
+	ActClaim map[string]any
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
@@ -531,7 +535,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
 	//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
 	// These are mutually exclusive per token — a delegated token already has act from the orchestrator.
-	if req.DelegatedBy != "" {
+	if req.ActClaim != nil {
+		_ = token.Set("act", req.ActClaim)
+	} else if req.DelegatedBy != "" {
 		_ = token.Set("act", map[string]string{"sub": req.DelegatedBy})
 	} else if req.ActingUserID != "" {
 		_ = token.Set("act", map[string]string{"sub": req.ActingUserID})

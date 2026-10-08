@@ -284,11 +284,12 @@ type BackchannelAuthRequest struct {
 	//   RequesterActor   who made the request: its act.sub, else its client_id,
 	//                    else its sub
 	//   RequestingJTI    the requesting token's jti
-	//   RequesterActSub  the requesting token's act.sub ("" when it had none)
-	RequesterSub    string `bun:"requester_sub,type:text"                     json:"requester_sub,omitempty"`
-	RequesterActor  string `bun:"requester_actor,type:text"                   json:"requester_actor,omitempty"`
-	RequestingJTI   string `bun:"requesting_jti,type:text"                    json:"-"`
-	RequesterActSub string `bun:"requester_act_sub,type:text"                 json:"-"`
+	//   RequestingAct    the requesting token's act claim as issued (JSON,
+	//                    nested actors included; "" when it had none)
+	RequesterSub   string `bun:"requester_sub,type:text"                     json:"requester_sub,omitempty"`
+	RequesterActor string `bun:"requester_actor,type:text"                   json:"requester_actor,omitempty"`
+	RequestingJTI  string `bun:"requesting_jti,type:text"                    json:"-"`
+	RequestingAct  string `bun:"requesting_act,type:text"                    json:"-"`
 	// Approval record. ApprovedSubject* name the user who resolved the
 	// request (approved or denied); the fields below record how that user
 	// was authenticated and which binding check they satisfied.
@@ -312,6 +313,9 @@ type BackchannelAuthRequest struct {
 	ExpiresAt       time.Time  `bun:"expires_at,notnull"                           json:"expires_at"`
 	CreatedAt       time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
 	ApprovedAt      *time.Time `bun:"approved_at"                                  json:"approved_at,omitempty"`
+	// DeniedAt is when the request was denied (nil unless status is denied).
+	// Separate from ApprovedAt, which also bounds the redemption window.
+	DeniedAt *time.Time `bun:"denied_at" json:"denied_at,omitempty"`
 }
 
 // BackchannelResolution is what an approve or deny records on the row: the

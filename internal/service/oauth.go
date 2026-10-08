@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -448,6 +449,12 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 	rt := &RequestingToken{JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID}
 	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
 		rt.ActSubject, _ = act["sub"].(string)
+		if b, merr := json.Marshal(act); merr == nil {
+			rt.Act = b
+		}
+	}
+	if exp, ok := parsed.Expiration(); ok {
+		rt.ExpiresAt = exp
 	}
 	if cid, err := jwt.Get[string](parsed, "client_id"); err == nil {
 		rt.ClientID = cid

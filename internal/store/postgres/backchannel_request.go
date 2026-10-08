@@ -90,7 +90,8 @@ func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID
 	now := time.Now()
 	q := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
-		Set("status = ?", domain.BackchannelStatusDenied)
+		Set("status = ?", domain.BackchannelStatusDenied).
+		Set("denied_at = ?", now)
 	res, err := setResolution(q, rec).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusPending).
