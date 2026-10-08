@@ -137,6 +137,13 @@ backchannel:
   # Env: ZEROID_BACKCHANNEL_ENFORCE_HINTS
   enforce_hints: "off"
 
+  # How long approved/issued/denied requests are kept after resolution, so
+  # approval history stays readable. Unresolved requests are still deleted as
+  # soon as they expire; a retained request can never be redeemed again.
+  # Go duration; default 720h (30 days).
+  # Env: ZEROID_BACKCHANNEL_RESOLVED_RETENTION
+  resolved_retention: 720h
+
 # OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
 # proves its identity with a JWT signed by a key it published rather than with a
 # shared secret.

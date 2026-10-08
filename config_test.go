@@ -414,17 +414,24 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		if cfg.Backchannel.EnforceHints != "off" {
 			t.Errorf("backchannel.enforce_hints must default to off, got %q", cfg.Backchannel.EnforceHints)
 		}
+		if cfg.Backchannel.ResolvedRetention != "720h" {
+			t.Errorf("backchannel.resolved_retention must default to 720h, got %q", cfg.Backchannel.ResolvedRetention)
+		}
 	})
 
 	t.Run("env", func(t *testing.T) {
 		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "true")
 		t.Setenv("ZEROID_BACKCHANNEL_ENFORCE_HINTS", "shadow")
+		t.Setenv("ZEROID_BACKCHANNEL_RESOLVED_RETENTION", "48h")
 		cfg, err := LoadConfig("")
 		if err != nil {
 			t.Fatalf("LoadConfig failed: %v", err)
 		}
 		if !cfg.Backchannel.RequireApproverIdentity {
 			t.Error("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY=true did not reach backchannel")
+		}
+		if cfg.Backchannel.ResolvedRetention != "48h" {
+			t.Errorf("ZEROID_BACKCHANNEL_RESOLVED_RETENTION=48h did not reach backchannel, got %q", cfg.Backchannel.ResolvedRetention)
 		}
 		if cfg.Backchannel.EnforceHints != "shadow" {
 			t.Errorf("ZEROID_BACKCHANNEL_ENFORCE_HINTS=shadow did not reach backchannel, got %q", cfg.Backchannel.EnforceHints)
@@ -435,6 +442,23 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "maybe")
 		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid bool") {
 			t.Fatalf("expected a bool parse error, got %v", err)
+		}
+	})
+
+	t.Run("validate_resolved_retention", func(t *testing.T) {
+		for _, v := range []string{"", "0s", "720h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("resolved_retention=%q must validate, got %v", v, err)
+			}
+		}
+		for _, v := range []string{"30d", "-1h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "backchannel.resolved_retention") {
+				t.Errorf("resolved_retention=%q must be rejected naming the key, got %v", v, err)
+			}
 		}
 	})
 

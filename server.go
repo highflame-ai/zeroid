@@ -296,6 +296,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
+	// Validate() already rejected a malformed value.
+	if d, err := cfg.Backchannel.resolvedRetention(); err == nil {
+		backchannelRepo.SetResolvedRetention(d)
+	}
 	signingCredRepo := postgres.NewSigningCredentialRepository(db)
 	delegationRepo := postgres.NewDelegationRepository(db)
 

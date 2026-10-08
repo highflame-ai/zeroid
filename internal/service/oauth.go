@@ -422,7 +422,19 @@ func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
 	if bc != nil {
 		bc.setRequestingTokenVerifier(s.verifyRequestingToken)
+		bc.setTrustedCallerCheck(s.isTrustedServiceCaller)
 	}
+}
+
+// isTrustedServiceCaller reports whether the deployer's TrustedServiceValidator
+// accepts the current request. False when none is installed.
+func (s *OAuthService) isTrustedServiceCaller(ctx context.Context) bool {
+	v := s.trustedServiceValidator
+	if v == nil {
+		return false
+	}
+	_, err := v(ctx)
+	return err == nil
 }
 
 // verifyRequestingToken verifies a bc-authorize requesting_token: an access

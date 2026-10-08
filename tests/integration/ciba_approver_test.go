@@ -1167,3 +1167,95 @@ func TestCIBADeniedAtExposed(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &m))
 	require.NotEmpty(t, m["denied_at"], "denied_at is part of the row's JSON read model")
 }
+
+// TestCIBARequestingTokenTrustedService: a caller accepted by the deployer's
+// TrustedServiceValidator may send requesting_token through a public client.
+func TestCIBARequestingTokenTrustedService(t *testing.T) {
+	tok := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+	clientID := uid("ciba-trusted-public")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	body := func() map[string]any {
+		return map[string]any{
+			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+			"login_hint": "user-a", "requesting_token": tok,
+		}
+	}
+
+	resp := post(t, "/oauth2/bc-authorize", body(), map[string]string{testTrustedServiceHeader: "step-up-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	id, _ := decode(t, resp)["auth_req_id"].(string)
+	require.Equal(t, "alice", loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id).RequesterSub)
+
+	resp = post(t, "/oauth2/bc-authorize", body(), nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "invalid_request", decode(t, resp)["error"])
+}
+
+// TestCIBAResolvedRetention pins the reaping rules: unresolved rows go at
+// expiry, resolved rows stay for the retention window, and a retained row is
+// never redeemable again.
+func TestCIBAResolvedRetention(t *testing.T) {
+	ctx := context.Background()
+	repo := postgres.NewBackchannelRequestRepository(testDB)
+	repo.SetResolvedRetention(time.Hour)
+	svc := service.NewBackchannelService(repo, service.NewOAuthClientService(postgres.NewOAuthClientRepository(testDB)), nil, nil, service.DefaultBackchannelConfig())
+
+	clientID := uid("ciba-retention")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	now := time.Now()
+	ago := func(d time.Duration) *time.Time { t := now.Add(-d); return &t }
+
+	type fixture struct {
+		name       string
+		status     domain.BackchannelStatus
+		expiresAt  time.Time
+		approvedAt *time.Time
+		deniedAt   *time.Time
+		kept       bool
+	}
+	fixtures := []fixture{
+		{name: "pending-expired", status: domain.BackchannelStatusPending, expiresAt: now.Add(-time.Minute), kept: false},
+		{name: "pending-live", status: domain.BackchannelStatusPending, expiresAt: now.Add(time.Minute), kept: true},
+		{name: "expired", status: domain.BackchannelStatusExpired, expiresAt: now.Add(-time.Minute), kept: false},
+		{name: "denied-recent", status: domain.BackchannelStatusDenied, expiresAt: now.Add(-time.Minute), deniedAt: ago(5 * time.Minute), kept: true},
+		{name: "denied-old", status: domain.BackchannelStatusDenied, expiresAt: now.Add(-time.Minute), deniedAt: ago(2 * time.Hour), kept: false},
+		{name: "denied-legacy", status: domain.BackchannelStatusDenied, expiresAt: now.Add(-2 * time.Hour), kept: false},
+		{name: "approved-recent", status: domain.BackchannelStatusApproved, expiresAt: now.Add(-30 * time.Minute), approvedAt: ago(30 * time.Minute), kept: true},
+		{name: "approved-old", status: domain.BackchannelStatusApproved, expiresAt: now.Add(-2 * time.Hour), approvedAt: ago(2 * time.Hour), kept: false},
+		{name: "issued-recent", status: domain.BackchannelStatusIssued, expiresAt: now.Add(-30 * time.Minute), approvedAt: ago(30 * time.Minute), kept: true},
+		{name: "issued-old", status: domain.BackchannelStatusIssued, expiresAt: now.Add(-2 * time.Hour), approvedAt: ago(2 * time.Hour), kept: false},
+	}
+	ids := map[string]string{}
+	for _, f := range fixtures {
+		id := uid("ret-" + f.name)
+		ids[f.name] = id
+		require.NoError(t, repo.Create(ctx, &domain.BackchannelAuthRequest{
+			AuthReqID: id, AccountID: testAccountID, ProjectID: testProjectID, ClientID: clientID,
+			LoginHint: "user-a", AuthorizationDetailsRaw: json.RawMessage("[]"),
+			NotificationMode: domain.BackchannelNotificationPoll, Status: f.status, IntervalSeconds: 5,
+			ExpiresAt: f.expiresAt, CreatedAt: now.Add(-3 * time.Hour), ApprovedAt: f.approvedAt, DeniedAt: f.deniedAt,
+		}))
+	}
+
+	_, err := svc.DeleteExpired(ctx, now)
+	require.NoError(t, err)
+	for _, f := range fixtures {
+		_, gerr := repo.GetByAuthReqID(ctx, ids[f.name])
+		if f.kept {
+			require.NoError(t, gerr, "%s must be kept", f.name)
+		} else {
+			require.ErrorIs(t, gerr, postgres.ErrBackchannelRequestNotFound, "%s must be reaped", f.name)
+		}
+	}
+
+	// Retained resolved rows cannot be redeemed.
+	_, rerr := svc.Redeem(ctx, service.RedeemInput{AuthReqID: ids["issued-recent"], ClientID: clientID})
+	requireOAuthError(t, rerr, oautherror.AccessDenied)
+	_, rerr = svc.Redeem(ctx, service.RedeemInput{AuthReqID: ids["approved-recent"], ClientID: clientID})
+	requireOAuthError(t, rerr, oautherror.ExpiredToken)
+	_, rerr = svc.Redeem(ctx, service.RedeemInput{AuthReqID: ids["denied-recent"], ClientID: clientID})
+	requireOAuthError(t, rerr, oautherror.AccessDenied)
+	affected, merr := repo.MarkIssued(ctx, ids["approved-recent"], now)
+	require.NoError(t, merr)
+	require.Zero(t, affected, "a retained approval past its redemption window is not issuable")
+}

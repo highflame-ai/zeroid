@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -136,6 +138,26 @@ type BackchannelConfig struct {
 	//          ciba_approver_would_deny_total{reason}.
 	//   on     refuse ineligible approvers with 403 access_denied.
 	EnforceHints string `koanf:"enforce_hints"`
+
+	// ResolvedRetention is how long approved, issued and denied requests are
+	// kept after they were resolved, so approval history stays readable
+	// (Go duration, e.g. "720h"). Unresolved requests are still reaped as
+	// soon as they expire, and a retained row is never redeemable again.
+	// Default "720h" (30 days); values below the 10-minute post-approval
+	// redemption grace act as that floor.
+	ResolvedRetention string `koanf:"resolved_retention"`
+}
+
+// resolvedRetention parses ResolvedRetention; empty means the default.
+func (b BackchannelConfig) resolvedRetention() (time.Duration, error) {
+	if b.ResolvedRetention == "" {
+		return postgres.DefaultResolvedRetention, nil
+	}
+	d, err := time.ParseDuration(b.ResolvedRetention)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("backchannel.resolved_retention must be a non-negative Go duration such as \"720h\" (got %q)", b.ResolvedRetention)
+	}
+	return d, nil
 }
 
 // CIMDConfig governs Client ID Metadata Documents
@@ -530,6 +552,9 @@ func (c *Config) Validate() error {
 	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
 		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
 	}
+	if _, err := c.Backchannel.resolvedRetention(); err != nil {
+		return err
+	}
 
 	// token.hmac_secret signs/verifies stateless authorization_code JWTs
 	// (HS256). The authorization_code grant is optional, so the secret is not
@@ -761,6 +786,7 @@ func loadDefaults(k *koanf.Koanf) error {
 		// today's approve/deny behaviour until they opt in.
 		"backchannel.require_approver_identity": false,
 		"backchannel.enforce_hints":             "off",
+		"backchannel.resolved_retention":        "720h",
 
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
@@ -848,6 +874,7 @@ var envMapping = map[string]string{
 	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS":   "backchannel.allow_private_notification_endpoints",
 	"ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY": "backchannel.require_approver_identity",
 	"ZEROID_BACKCHANNEL_ENFORCE_HINTS":             "backchannel.enforce_hints",
+	"ZEROID_BACKCHANNEL_RESOLVED_RETENTION":        "backchannel.resolved_retention",
 
 	// CIMD (Client ID Metadata Documents). Enabled by default; disable with
 	// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for

@@ -60,9 +60,11 @@ type BackchannelService struct {
 	// when enforce_hints is shadow or on. Guarded by mu.
 	approverAuthorizer ApproverAuthorizer
 
-	// verifyRequestingToken verifies bc-authorize requesting_token values.
-	// Wired by OAuthService.SetBackchannelService. Guarded by mu.
+	// verifyRequestingToken verifies bc-authorize requesting_token values,
+	// and isTrustedCaller applies the deployer's TrustedServiceValidator.
+	// Both wired by OAuthService.SetBackchannelService. Guarded by mu.
 	verifyRequestingToken requestingTokenVerifier
+	isTrustedCaller       func(ctx context.Context) bool
 
 	// svcCtx is the long-lived context used by detached notifier goroutines.
 	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
@@ -460,10 +462,11 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	// requesting_token and the group_hint-only refusal are evaluated only
 	// after the client has been resolved and authenticated, so the response
 	// reveals nothing about a token to an unauthenticated caller. Only a
-	// client that authenticated above may send requesting_token.
+	// client that authenticated above, or a caller the deployer's
+	// TrustedServiceValidator accepts, may send requesting_token.
 	var requesting *RequestingToken
 	if in.RequestingToken != "" {
-		if !client.RequiresClientAuthentication() {
+		if !s.callerAuthenticated(ctx, client) {
 			return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token requires an authenticated client")
 		}
 		rt, err := s.resolveRequestingToken(ctx, in)

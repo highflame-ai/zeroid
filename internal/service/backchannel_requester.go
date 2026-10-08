@@ -38,6 +38,27 @@ func (t *RequestingToken) Actor() string {
 
 type requestingTokenVerifier func(ctx context.Context, token string) (*RequestingToken, error)
 
+// setTrustedCallerCheck is wired by OAuthService.SetBackchannelService: it
+// reports whether the deployer's TrustedServiceValidator accepts the request.
+func (s *BackchannelService) setTrustedCallerCheck(fn func(ctx context.Context) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.isTrustedCaller = fn
+}
+
+// callerAuthenticated reports whether the bc-authorize caller authenticated:
+// either as the client (a client that must authenticate got past the secret
+// check) or through the deployer's trusted-service mechanism.
+func (s *BackchannelService) callerAuthenticated(ctx context.Context, client *domain.OAuthClient) bool {
+	if client.RequiresClientAuthentication() {
+		return true
+	}
+	s.mu.RLock()
+	trusted := s.isTrustedCaller
+	s.mu.RUnlock()
+	return trusted != nil && trusted(ctx)
+}
+
 // setRequestingTokenVerifier is wired by OAuthService.SetBackchannelService,
 // which owns token verification.
 func (s *BackchannelService) setRequestingTokenVerifier(fn requestingTokenVerifier) {
