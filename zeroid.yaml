@@ -12,10 +12,21 @@ server:
   write_timeout: "15s"
   idle_timeout: "60s"
   shutdown_timeout_seconds: 30
-  # Trust X-Forwarded-Proto / X-Forwarded-Host when reconstructing the
-  # request URL for DPoP htu validation (RFC 9449 §4.3). Set true ONLY
-  # behind a trusted edge proxy that strips client-supplied values;
-  # leave false when ZeroID terminates TLS itself. Env: ZEROID_TRUST_FORWARDED_HEADERS
+  # Which X-Forwarded-* headers to trust when reconstructing the request URL
+  # for DPoP htu validation (RFC 9449 §4.3). Behind a TLS-terminating proxy
+  # SOME trust is required, or every correct proof fails htu.
+  #   none        TLS terminates at ZeroID itself.
+  #   proto       trust X-Forwarded-Proto only; host from Host. The safe
+  #               choice behind AWS ALB, which sets the scheme but passes a
+  #               client-supplied X-Forwarded-Host through untouched.
+  #   proto_host  trust both — ONLY behind an edge that sets and overwrites
+  #               both. Otherwise a client chooses the host htu is checked
+  #               against.
+  # Left empty so the deprecated trust_forwarded_headers below still applies
+  # to existing deployments. Env: ZEROID_FORWARDED_HEADERS
+  forwarded_headers: ""
+  # Deprecated — equivalent to forwarded_headers: proto_host. Conflicts with
+  # any other forwarded_headers value. Env: ZEROID_TRUST_FORWARDED_HEADERS
   trust_forwarded_headers: false
 
 database:
