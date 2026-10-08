@@ -160,9 +160,15 @@ type OAuthClientConfig struct {
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted
-// internal service that is allowed to perform external principal token exchange
-// (RFC 8693). Implementations read from context (set by deployer-provided global
-// middleware) and return the service name on success, or an error to reject.
+// internal service. Implementations read from context (set by deployer-provided
+// global middleware) and return the service name on success, or an error to
+// reject. A trusted caller may:
+//
+//   - perform the external principal token exchange (RFC 8693);
+//   - send a requesting_token on POST /oauth2/bc-authorize from a public CIBA
+//     client, binding the request (and the token later issued for it) to that
+//     token's chain. Without a trusted caller, requesting_token is accepted
+//     only from a client that authenticated.
 //
 // Set via Server.TrustedServiceValidator() after NewServer.
 type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)
