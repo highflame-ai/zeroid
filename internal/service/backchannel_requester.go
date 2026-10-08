@@ -23,6 +23,8 @@ type RequestingToken struct {
 	ClientID   string
 	AccountID  string
 	ProjectID  string
+	// DPoPKeyThumbprint is the token's cnf.jkt, "" when it is not DPoP-bound.
+	DPoPKeyThumbprint string
 }
 
 // Actor returns who made the request: act.sub, else client_id, else sub.
@@ -86,6 +88,33 @@ func (s *BackchannelService) resolveRequestingToken(ctx context.Context, in Crea
 	return rt, nil
 }
 
+// requireRequestingTokenHolder refuses a poll on a row made with a
+// requesting_token unless the poll presents that same token (jti match) and,
+// when that token is DPoP-bound, carries a DPoP proof for its key. Every
+// refusal is access_denied and leaves the row unchanged.
+func (s *BackchannelService) requireRequestingTokenHolder(ctx context.Context, row *domain.BackchannelAuthRequest, in RedeemInput) error {
+	if row.RequestingJTI == "" {
+		return nil
+	}
+	if in.RequestingToken == "" {
+		return oauthBadRequest(oautherror.AccessDenied, "this request was made with a requesting_token; present it as requesting_token to redeem")
+	}
+	s.mu.RLock()
+	verify := s.verifyRequestingToken
+	s.mu.RUnlock()
+	if verify == nil {
+		return oauthBadRequest(oautherror.AccessDenied, "requesting_token cannot be verified by this deployment")
+	}
+	rt, err := verify(ctx, in.RequestingToken)
+	if err != nil || rt.JTI != row.RequestingJTI {
+		return oauthBadRequestCause(oautherror.AccessDenied, "requesting_token does not match this request", err)
+	}
+	if rt.DPoPKeyThumbprint != "" && rt.DPoPKeyThumbprint != in.DPoPKeyThumbprint {
+		return oauthBadRequest(oautherror.AccessDenied, "the requesting_token is DPoP-bound; a DPoP proof for its key is required")
+	}
+	return nil
+}
+
 // stampAuthorizationDetails adds approval_id (the auth_req_id) and, when
 // known, approver_auth to every authorization_details entry approved by row.
 // Values supplied by the client under those keys are overwritten.
@@ -116,8 +145,8 @@ func stampAuthorizationDetails(row *domain.BackchannelAuthRequest) (json.RawMess
 
 // requestingChainIssue adjusts a CIBA issuance for a row that carries a
 // requesting chain: the token keeps the chain's subject, act (as issued,
-// nested actors included) and identity claims, carries nothing about the
-// approver, and never outlives the requesting token. When the requesting
+// nested actors included), identity claims and DPoP key binding, carries
+// nothing about the approver, and never outlives the requesting token. When the requesting
 // token belongs to an identity, that identity's credential policy governs the
 // result. Every refusal is returned before the caller burns the auth_req_id.
 // Returns ok=false when the row has no requesting chain.
@@ -156,6 +185,12 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.CredentialExpiresAt = &chainExp
 	req.MissionID = cred.MissionID
 	req.DelegationDepth = cred.DelegationDepth
+	// Keep the chain's sender constraint: a DPoP-bound requesting token
+	// yields a token bound to the same key (in poll mode the poll has already
+	// proved possession of it).
+	if cred.DPoPKeyThumbprint != "" {
+		req.DPoPKeyThumbprint = cred.DPoPKeyThumbprint
+	}
 	if cred.IdentityID == nil || *cred.IdentityID == "" {
 		return true, nil
 	}

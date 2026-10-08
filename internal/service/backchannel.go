@@ -780,6 +780,9 @@ type RedeemInput struct {
 	// authentication rules, same as refresh_token/authorization_code). Empty
 	// for public clients.
 	ClientSecret string
+	// RequestingToken must be the bc-authorize requesting_token when the
+	// request was made with one (see requireRequestingTokenHolder).
+	RequestingToken string
 	// DPoPKeyThumbprint forwards the proof key thumbprint from the token
 	// endpoint so a CIBA-redeemed token can still be DPoP-bound (RFC 9449).
 	// Non-empty when the polling /oauth2/token call carried a valid DPoP
@@ -855,6 +858,13 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	// single-use semantics.
 	if row.NotificationMode == domain.BackchannelNotificationPush {
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id is delivered via push callback; polling is not permitted")
+	}
+
+	// A request made with a requesting_token is redeemable only by the holder
+	// of that token (and of its DPoP key, when bound). Checked on every poll,
+	// so a poller without it learns nothing about the request's state.
+	if err := s.requireRequestingTokenHolder(ctx, row, in); err != nil {
+		return nil, err
 	}
 
 	now := time.Now()

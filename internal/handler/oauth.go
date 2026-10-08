@@ -139,6 +139,9 @@ type TokenInput struct {
 		RefreshToken string `json:"refresh_token,omitempty" doc:"Refresh token (zid_rt_*)"`
 		// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 		AuthReqID string `json:"auth_req_id,omitempty" doc:"Backchannel auth_req_id returned from /oauth2/bc-authorize"`
+		// RequestingToken proves, on a CIBA poll, that the poller holds the
+		// requesting_token the bc-authorize request was made with.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension (CIBA grant) — required when the bc-authorize request carried a requesting_token: the same token. When that token is DPoP-bound, the poll must also carry a DPoP proof for its key."`
 		// RFC 6749 §3.1: the server MUST ignore unrecognized request
 		// parameters rather than rejecting the request outright.
 		_ struct{} `additionalProperties:"true"`
@@ -762,6 +765,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		RedirectURI:         input.Body.RedirectURI,
 		RefreshTokenStr:     input.Body.RefreshToken,
 		AuthReqID:           input.Body.AuthReqID,
+		RequestingToken:     input.Body.RequestingToken,
 		DPoPKeyThumbprint:   dpopThumbprint,
 	})
 	if err != nil {

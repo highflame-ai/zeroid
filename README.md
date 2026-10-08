@@ -708,6 +708,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/token \
 # }
 ```
 
+**Requests made with a `requesting_token`.** A bc-authorize request may carry the access token of the request it is for (`requesting_token`, accepted from an authenticated client or a caller your `TrustedServiceValidator` accepts). The approved token then keeps that token's `sub`, `act`, identity claims and DPoP binding (`cnf.jkt`) and never outlives it. Redeeming such a request requires the same token on every poll, as the `requesting_token` form parameter (`-d 'requesting_token=<token>'`); when that token is DPoP-bound, the poll must also carry a `DPoP` proof for its key. A poll without them gets `access_denied` and leaves the approval redeemable. Requests made without `requesting_token` are polled as shown above.
+
 **Ping mode** delivers a callback to the client's registered `client_notification_endpoint` the moment the user resolves — agents that don't want to poll can wait for the ping and then call `/oauth2/token` once. **Push mode** delivers the full access token to the callback directly. Both modes require `backchannel_token_delivery_mode` set on the client at registration; the callback endpoint is SSRF-guarded.
 
 **Why this matters:** Every CIBA approval produces a token whose `sub` is the approving user and whose `backchannel_client_id` claim identifies the agent that asked. Downstream systems get a real, attributable consent trail — "alice-agent acted with Alice's explicit approval at 14:32, with binding message X" — without you building approval infrastructure.

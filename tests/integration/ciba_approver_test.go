@@ -867,20 +867,32 @@ func bcAuthorizeAs(t *testing.T, c cibaClient, body map[string]any) *http.Respon
 	return post(t, "/oauth2/bc-authorize", body, nil)
 }
 
-func pollCIBARaw(t *testing.T, c cibaClient, authReqID string) (int, map[string]any) {
+// pollCIBARaw polls the token endpoint for authReqID. requestingToken, when
+// given, is sent as the requesting_token parameter, which a request made with
+// a requesting_token must present to be redeemed.
+func pollCIBARaw(t *testing.T, c cibaClient, authReqID string, requestingToken ...string) (int, map[string]any) {
 	t.Helper()
-	resp := post(t, "/oauth2/token", map[string]any{
+	return pollCIBAWithHeaders(t, c, authReqID, nil, requestingToken...)
+}
+
+func pollCIBAWithHeaders(t *testing.T, c cibaClient, authReqID string, headers map[string]string, requestingToken ...string) (int, map[string]any) {
+	t.Helper()
+	body := map[string]any{
 		"grant_type":    zeroidGrantTypeCIBA,
 		"auth_req_id":   authReqID,
 		"client_id":     c.ID,
 		"client_secret": c.Secret,
-	}, nil)
+	}
+	if len(requestingToken) > 0 {
+		body["requesting_token"] = requestingToken[0]
+	}
+	resp := post(t, "/oauth2/token", body, headers)
 	return resp.StatusCode, decode(t, resp)
 }
 
-func pollCIBA(t *testing.T, c cibaClient, authReqID string) map[string]any {
+func pollCIBA(t *testing.T, c cibaClient, authReqID string, requestingToken ...string) map[string]any {
 	t.Helper()
-	status, body := pollCIBARaw(t, c, authReqID)
+	status, body := pollCIBARaw(t, c, authReqID, requestingToken...)
 	require.Equal(t, http.StatusOK, status, "poll: %v", body)
 	return body
 }
@@ -995,7 +1007,7 @@ func TestCIBAApprovalKeepsRequestingSubject(t *testing.T) {
 	require.Equal(t, http.StatusOK, ap.StatusCode)
 	_ = ap.Body.Close()
 
-	body := pollCIBA(t, client, id)
+	body := pollCIBA(t, client, id, aliceToken)
 	claims := decodeJWTPayload(t, body["access_token"].(string))
 	require.Equal(t, "alice", claims["sub"], "the approval must not change the chain's subject")
 	for _, k := range []string{"user_email", "user_name", "name"} {
@@ -1048,7 +1060,7 @@ func TestCIBAApprovalKeepsAgentChainClaims(t *testing.T) {
 	require.Equal(t, http.StatusOK, ap.StatusCode)
 	_ = ap.Body.Close()
 
-	claims := decodeJWTPayload(t, pollCIBA(t, client, id)["access_token"].(string))
+	claims := decodeJWTPayload(t, pollCIBA(t, client, id, agentToken)["access_token"].(string))
 	require.Equal(t, agentClaims["sub"], claims["sub"])
 	for _, k := range []string{"identity_type", "external_id", "owner_user_id", "agent_id"} {
 		require.Equal(t, agentClaims[k], claims[k], "claim %s", k)
@@ -1146,7 +1158,7 @@ func TestCIBARequestingIdentityPolicy(t *testing.T) {
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 		approveAs(t, id, "user-a")
 
-		status, body := pollCIBARaw(t, c, id)
+		status, body := pollCIBARaw(t, c, id, rootToken)
 		require.Equal(t, http.StatusBadRequest, status)
 		require.Equal(t, "invalid_scope", body["error"])
 		row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
@@ -1162,7 +1174,7 @@ func TestCIBARequestingIdentityPolicy(t *testing.T) {
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 		approveAs(t, id, "user-a")
 
-		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id, rootToken)["access_token"].(string))
 		require.Equal(t, rootClaims["sub"], claims["sub"])
 		require.LessOrEqual(t, numClaim(t, claims, "exp"), numClaim(t, rootClaims, "exp"),
 			"the approved token must not outlive the requesting token")
@@ -1186,7 +1198,7 @@ func TestCIBAApprovedTokenExpiryBoundedByChain(t *testing.T) {
 	id, _ := decode(t, resp)["auth_req_id"].(string)
 	approveAs(t, id, "user-a")
 
-	claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+	claims := decodeJWTPayload(t, pollCIBA(t, c, id, tok)["access_token"].(string))
 	require.LessOrEqual(t, numClaim(t, claims, "exp"), short.Unix()+1)
 }
 
@@ -1206,7 +1218,7 @@ func TestCIBAApprovedTokenKeepsActClaim(t *testing.T) {
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 		approveAs(t, id, "user-a")
 
-		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id, childToken)["access_token"].(string))
 		require.Equal(t, childClaims["sub"], claims["sub"])
 		require.Equal(t, childClaims["act"], claims["act"])
 	})
@@ -1229,7 +1241,7 @@ func TestCIBAApprovedTokenKeepsActClaim(t *testing.T) {
 		require.NoError(t, err)
 		approveAs(t, id, "user-a")
 
-		claims := decodeJWTPayload(t, pollCIBA(t, c, id)["access_token"].(string))
+		claims := decodeJWTPayload(t, pollCIBA(t, c, id, childToken)["access_token"].(string))
 		require.Equal(t, nested, claims["act"])
 	})
 }

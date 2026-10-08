@@ -458,7 +458,10 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 		return nil, fmt.Errorf("requesting_token is not active")
 	}
 	sub, _ := parsed.Subject()
-	rt := &RequestingToken{JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID}
+	rt := &RequestingToken{
+		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
+		DPoPKeyThumbprint: cred.DPoPKeyThumbprint,
+	}
 	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
 		rt.ActSubject, _ = act["sub"].(string)
 		if b, merr := json.Marshal(act); merr == nil {
@@ -658,6 +661,9 @@ type TokenRequest struct {
 	TrustedService bool
 	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
+	// RequestingToken is the requesting_token a CIBA poll presents when the
+	// bc-authorize request was made with one.
+	RequestingToken string
 	// DPoPKeyThumbprint is the base64url JWK thumbprint of the client's DPoP key.
 	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
 	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
@@ -706,6 +712,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 			AuthReqID:         req.AuthReqID,
 			ClientID:          req.ClientID,
 			ClientSecret:      req.ClientSecret,
+			RequestingToken:   req.RequestingToken,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
