@@ -1255,6 +1255,8 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			AuthorizationDetails: n.AuthorizationDetails,
 			FourEyes:             n.FourEyes,
 			RequesterOwner:       n.RequesterOwner,
+			RequesterSub:         n.RequesterSub,
+			RequesterActor:       n.RequesterActor,
 		})
 	})
 }

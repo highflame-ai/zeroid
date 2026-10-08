@@ -5,6 +5,14 @@
 --   four_eyes, requester_owner  bc-authorize extension parameters. With
 --                               four_eyes set, the user named by
 --                               requester_owner may not resolve the request.
+--   requester_sub,
+--   requester_actor,
+--   requesting_jti,
+--   requester_act_sub           the requesting chain, from the bc-authorize
+--                               requesting_token parameter: on whose behalf
+--                               (sub), who asked (act.sub / client_id), and
+--                               the token's jti and act.sub used to keep the
+--                               chain's sub and act on the minted token.
 --   approver_iss, approver_auth,
 --   channel_client_id           how the resolving user was authenticated
 --                               (approver_auth: session | channel_attested).
@@ -25,6 +33,10 @@ SET LOCAL lock_timeout = '3s';
 ALTER TABLE backchannel_auth_requests
     ADD COLUMN IF NOT EXISTS four_eyes         BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS requester_owner   TEXT    NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS requester_sub     TEXT    NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS requester_actor   TEXT    NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS requesting_jti    TEXT    NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS requester_act_sub TEXT    NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS approver_iss      TEXT    NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS approver_auth     TEXT    NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS channel_client_id TEXT    NOT NULL DEFAULT '',

@@ -206,6 +206,12 @@ type BackchannelNotification struct {
 	// approve or deny the request, so a notifier can leave them out.
 	FourEyes       bool
 	RequesterOwner string
+	// RequesterSub and RequesterActor describe the requesting chain when
+	// bc-authorize carried a requesting_token: on whose behalf the request
+	// was made (the token's sub) and who made it (its act.sub, else its
+	// client_id, else its sub). Empty otherwise.
+	RequesterSub   string
+	RequesterActor string
 }
 
 // BackchannelNotifier delivers a CIBA approval prompt to the end user via an

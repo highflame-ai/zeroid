@@ -870,6 +870,10 @@ type BcAuthorizeInput struct {
 		// a bool, because form-encoded requests arrive as strings.
 		FourEyes       string `json:"four_eyes,omitempty" doc:"Extension — \"true\" or \"false\". When true, the user named by requester_owner may not approve or deny the request. Requires requester_owner."`
 		RequesterOwner string `json:"requester_owner,omitempty" doc:"Extension — user id of the owner of the requesting identity. Max 255 characters."`
+		// RequestingToken is the access token of the request the approval
+		// is for. Verified (this issuer, active, same tenant); the token
+		// minted on approval keeps its sub and act.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension — the access token (issued by this server, same tenant) of the request being approved. The token minted on approval keeps its subject and actor; the approver is recorded only on the approval record."`
 		// CIBA Core 1.0 §7.1 inherits RFC 6749 §3.1's ignore-unrecognized-params
 		// posture, same as TokenInput/IntrospectInput/OAuthRevokeInput.
 		_ struct{} `additionalProperties:"true"`
@@ -917,6 +921,7 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		AuthorizationDetailsRaw: []byte(input.Body.AuthorizationDetails),
 		FourEyes:                fourEyes,
 		RequesterOwner:          input.Body.RequesterOwner,
+		RequestingToken:         input.Body.RequestingToken,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")

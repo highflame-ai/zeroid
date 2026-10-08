@@ -249,8 +249,11 @@ func TestCIBAApproverIdentity(t *testing.T) {
 }
 
 func TestCIBAApproverBinding(t *testing.T) {
+	// The approver comes from the request context in every subtest, so these
+	// run with RequireApproverIdentity off: a group_hint-only request then
+	// needs no requesting_token (see TestCIBARequestingToken).
 	t.Run("On_LoginHintMismatch_Forbidden", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		oe := requireOAuthStatus(t, svc.Approve(approverCtx("user-b"), approveIn(id)), oautherror.AccessDenied, http.StatusForbidden)
@@ -259,7 +262,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("On_LoginHintMatch_ApprovedAndRecorded", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-a"), approveIn(id)))
@@ -271,7 +274,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_FourEyes_RequesterOwnerCannotApprove", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: true, SatisfiedHint: "group_hint"}}
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) {
 			in.GroupHint = "highflame:role:admin"
 			in.FourEyes = true
@@ -290,7 +293,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("On_FourEyesWithoutFlag_RequesterOwnerMayApprove", func(t *testing.T) {
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) {
 			in.LoginHint = "user-owner"
 			in.RequesterOwner = "user-owner"
@@ -299,7 +302,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("On_GroupHint_NoAuthorizer_Forbidden", func(t *testing.T) {
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		oe := requireOAuthStatus(t, svc.Approve(approverCtx("user-a"), approveIn(id)), oautherror.AccessDenied, http.StatusForbidden)
@@ -308,7 +311,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_GroupHint_AuthorizerDenies_ReasonSurfaced", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: false, Reason: "approval requires role admin"}}
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) {
 			in.GroupHint = "highflame:role:admin"
 			in.FourEyes = true
@@ -331,7 +334,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_GroupHint_AuthorizerAllows", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: true, SatisfiedHint: "group_hint"}}
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-admin"), approveIn(id)))
@@ -340,7 +343,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_LoginHintOnly_AuthorizerNotConsulted", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: false, Reason: "unused"}}
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-a"), approveIn(id)))
@@ -349,7 +352,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_BothHints_BothMustPass", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: true, SatisfiedHint: "group_hint"}}
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) {
 			in.LoginHint = "user-a"
 			in.GroupHint = "highflame:role:admin"
@@ -359,7 +362,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_AuthorizerError_FailsClosed", func(t *testing.T) {
 		authz := &recordingAuthorizer{err: errors.New("membership lookup unavailable")}
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		oe := requireOAuthStatus(t, svc.Approve(approverCtx("user-a"), approveIn(id)), oautherror.AccessDenied, http.StatusForbidden)
@@ -368,7 +371,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("On_AuthorizerPanic_FailsClosed", func(t *testing.T) {
 		authz := &recordingAuthorizer{panics: true}
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on", authorizer: authz})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		requireOAuthStatus(t, svc.Approve(approverCtx("user-a"), approveIn(id)), oautherror.AccessDenied, http.StatusForbidden)
@@ -390,7 +393,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Shadow_IneligibleApprover_AllowedAndRecorded", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "shadow"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "shadow"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-b"), approveIn(id)))
@@ -403,7 +406,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Shadow_GroupHintWithoutAuthorizer_AllowedAndRecorded", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "shadow"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "shadow"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-b"), approveIn(id)))
@@ -413,7 +416,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Shadow_EligibleApprover_NoWouldDeny", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "shadow"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "shadow"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-a"), approveIn(id)))
@@ -425,7 +428,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 
 	t.Run("Off_IneligibleApprover_AllowedWithoutChecks", func(t *testing.T) {
 		authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: false}}
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "off", authorizer: authz})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "off", authorizer: authz})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.GroupHint = "highflame:role:admin" })
 
 		require.NoError(t, svc.Approve(approverCtx("user-b"), approveIn(id)))
@@ -437,7 +440,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Deny_SameRules_On", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		oe := requireOAuthStatus(t, svc.Deny(approverCtx("user-b"), denyIn(id)), oautherror.AccessDenied, http.StatusForbidden)
@@ -454,7 +457,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Deny_SameRules_FourEyes", func(t *testing.T) {
-		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "on"})
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "on"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) {
 			in.LoginHint = "user-owner"
 			in.FourEyes = true
@@ -464,7 +467,7 @@ func TestCIBAApproverBinding(t *testing.T) {
 	})
 
 	t.Run("Deny_Shadow_RecordsWouldDeny", func(t *testing.T) {
-		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true, enforceHints: "shadow"})
+		svc, repo := newApproverBackchannelSvc(t, approverSvcOpts{enforceHints: "shadow"})
 		id := createApproverTestRequest(t, svc, func(in *service.CreateAuthRequestInput) { in.LoginHint = "user-a" })
 
 		require.NoError(t, svc.Deny(approverCtx("user-b"), denyIn(id)))
@@ -660,7 +663,8 @@ func TestCIBAApproverMigration(t *testing.T) {
 	require.NoError(t, err)
 
 	columns := []string{
-		"four_eyes", "requester_owner", "approver_iss", "approver_auth",
+		"four_eyes", "requester_owner", "requester_sub", "requester_actor",
+		"requesting_jti", "requester_act_sub", "approver_iss", "approver_auth",
 		"channel_client_id", "hint_satisfied", "shadow_would_deny", "shadow_reason",
 	}
 	countColumns := func(tx bun.Tx) int {
@@ -718,4 +722,218 @@ func TestCIBAApproveScopeRefusedForAgentIdentity(t *testing.T) {
 	}, nil)
 	require.Equal(t, http.StatusOK, ok.StatusCode)
 	_ = ok.Body.Close()
+}
+
+// ── requesting chain ─────────────────────────────────────────────────────────
+
+// externalPrincipalToken mints a token whose sub is userID via the trusted
+// external-principal exchange.
+func externalPrincipalToken(t *testing.T, accountID, projectID, userID string) string {
+	t.Helper()
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": "external-principal-assertion",
+		"account_id":    accountID,
+		"project_id":    projectID,
+		"user_id":       userID,
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	tok, _ := decode(t, resp)["access_token"].(string)
+	require.NotEmpty(t, tok)
+	return tok
+}
+
+func pollCIBA(t *testing.T, clientID, authReqID string) map[string]any {
+	t.Helper()
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":  zeroidGrantTypeCIBA,
+		"auth_req_id": authReqID,
+		"client_id":   clientID,
+	}, nil)
+	body := decode(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "poll: %v", body)
+	return body
+}
+
+func TestCIBARequestingToken(t *testing.T) {
+	bcAuthorize := func(t *testing.T, body map[string]any) (*http.Response, string) {
+		t.Helper()
+		clientID := uid("ciba-chain")
+		registerTestOAuthClient(clientID, []string{"client_credentials"})
+		body["client_id"] = clientID
+		body["account_id"] = testAccountID
+		body["project_id"] = testProjectID
+		return post(t, "/oauth2/bc-authorize", body, nil), clientID
+	}
+
+	t.Run("Invalid_400", func(t *testing.T) {
+		resp, _ := bcAuthorize(t, map[string]any{"login_hint": "user-a", "requesting_token": "not-a-token"})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.Equal(t, "invalid_request", decode(t, resp)["error"])
+	})
+
+	t.Run("OtherTenant_400", func(t *testing.T) {
+		tok := externalPrincipalToken(t, "acct-other-chain", "proj-other-chain", "alice")
+		resp, _ := bcAuthorize(t, map[string]any{"login_hint": "user-a", "requesting_token": tok})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.Equal(t, "invalid_request", decode(t, resp)["error"])
+	})
+
+	t.Run("Revoked_400", func(t *testing.T) {
+		tok := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+		rv := post(t, "/oauth2/token/revoke", map[string]string{"token": tok}, nil)
+		require.Equal(t, http.StatusOK, rv.StatusCode)
+		_ = rv.Body.Close()
+		resp, _ := bcAuthorize(t, map[string]any{"login_hint": "user-a", "requesting_token": tok})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		require.Equal(t, "invalid_request", decode(t, resp)["error"])
+	})
+
+	t.Run("Valid_RequesterRecordedAndNotified", func(t *testing.T) {
+		notifier := newRecordingNotifier()
+		testZeroIDServer.SetBackchannelNotifier(notifier.notify)
+		testZeroIDServer.SetBackchannelNotifyDispatchSync(true)
+		t.Cleanup(func() {
+			testZeroIDServer.SetBackchannelNotifyDispatchSync(false)
+			testZeroIDServer.SetBackchannelNotifier(nil)
+		})
+		tok := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+		resp, _ := bcAuthorize(t, map[string]any{"group_hint": "highflame:role:admin", "requesting_token": tok})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+
+		row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+		require.Equal(t, "alice", row.RequesterSub)
+		require.NotEmpty(t, row.RequesterActor)
+		n := notifier.last()
+		require.NotNil(t, n)
+		require.Equal(t, "alice", n.RequesterSub)
+		require.Equal(t, row.RequesterActor, n.RequesterActor)
+	})
+
+	t.Run("GroupHintOnlyRoot_RefusedWhenIdentityRequired", func(t *testing.T) {
+		svc, _ := newApproverBackchannelSvc(t, approverSvcOpts{requireIdentity: true})
+		clientID := uid("ciba-root-group")
+		registerTestOAuthClient(clientID, []string{"client_credentials"})
+		in := service.CreateAuthRequestInput{
+			ClientID: clientID, AccountID: testAccountID, ProjectID: testProjectID,
+			GroupHint: "highflame:role:admin",
+		}
+		_, err := svc.CreateAuthRequest(context.Background(), in)
+		oe := requireOAuthStatus(t, err, oautherror.InvalidRequest, http.StatusBadRequest)
+		require.Equal(t, "group_hint requires requesting_token", oe.Description)
+
+		// login_hint alongside group_hint names the subject, so it is accepted.
+		in.LoginHint = "user-a"
+		_, err = svc.CreateAuthRequest(context.Background(), in)
+		require.NoError(t, err)
+
+		// Unchanged when the approver identity is not required.
+		plain, _ := newApproverBackchannelSvc(t, approverSvcOpts{})
+		in.LoginHint = ""
+		_, err = plain.CreateAuthRequest(context.Background(), in)
+		require.NoError(t, err)
+	})
+}
+
+// TestCIBAApprovalKeepsRequestingSubject: a group_hint approval by an admin on
+// a requesting token whose sub is alice mints a token with sub=alice; the
+// admin appears only in the approval record. Each approved
+// authorization_details entry carries approval_id and approver_auth.
+func TestCIBAApprovalKeepsRequestingSubject(t *testing.T) {
+	authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: true, SatisfiedHint: "group_hint"}}
+	testZeroIDServer.SetBackchannelRequireApproverIdentity(true)
+	require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("on"))
+	testZeroIDServer.SetApproverAuthorizer(authz)
+	t.Cleanup(func() {
+		testZeroIDServer.SetBackchannelRequireApproverIdentity(false)
+		require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("off"))
+		testZeroIDServer.SetApproverAuthorizer(nil)
+	})
+
+	aliceToken := externalPrincipalToken(t, testAccountID, testProjectID, "alice")
+	aliceClaims := decodeJWTPayload(t, aliceToken)
+
+	clientID := uid("ciba-keep-sub")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+		"group_hint":            "highflame:role:admin",
+		"requesting_token":      aliceToken,
+		"authorization_details": []map[string]any{{"type": "tool_call", "tool": "transfer_funds"}},
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	id, _ := decode(t, resp)["auth_req_id"].(string)
+
+	h := adminHeaders()
+	h[testApproverSubHeader] = "admin"
+	ap := post(t, adminPath("/oauth2/bc-authorize/"+id+"/approve"), map[string]any{}, h)
+	require.Equal(t, http.StatusOK, ap.StatusCode)
+	_ = ap.Body.Close()
+
+	body := pollCIBA(t, clientID, id)
+	claims := decodeJWTPayload(t, body["access_token"].(string))
+	require.Equal(t, "alice", claims["sub"], "the approval must not change the chain's subject")
+	for _, k := range []string{"user_email", "user_name", "name"} {
+		v, _ := claims[k].(string)
+		require.NotContains(t, v, "admin", "approver must not appear in claim %s", k)
+	}
+	for _, k := range []string{"identity_type", "external_id", "owner_user_id"} {
+		require.Equal(t, aliceClaims[k], claims[k], "identity claim %s carried from the requesting token", k)
+	}
+
+	rar, ok := claims["authorization_details"].([]any)
+	require.True(t, ok, "authorization_details claim: %v", claims["authorization_details"])
+	require.Len(t, rar, 1)
+	entry := rar[0].(map[string]any)
+	require.Equal(t, "tool_call", entry["type"])
+	require.Equal(t, "transfer_funds", entry["tool"])
+	require.Equal(t, id, entry["approval_id"])
+	require.Equal(t, "session", entry["approver_auth"])
+
+	row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+	require.Equal(t, "admin", row.ApprovedSubjectID)
+	require.Equal(t, "alice", row.RequesterSub)
+	require.Equal(t, "group_hint", row.HintSatisfied)
+}
+
+// TestCIBAApprovalKeepsAgentChainClaims: with an agent's token as the
+// requesting token, the minted token keeps the agent's subject and identity
+// claims.
+func TestCIBAApprovalKeepsAgentChainClaims(t *testing.T) {
+	externalID := uid("ciba-chain-agent")
+	reg := post(t, adminPath("/agents/register"), map[string]any{
+		"name": externalID, "external_id": externalID, "sub_type": "tool_agent",
+		"trust_level": "first_party", "created_by": "user-owner-1",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, reg.StatusCode)
+	apiKey, _ := decode(t, reg)["api_key"].(string)
+	tr := post(t, "/oauth2/token", map[string]any{"grant_type": "api_key", "api_key": apiKey}, nil)
+	require.Equal(t, http.StatusOK, tr.StatusCode)
+	agentToken, _ := decode(t, tr)["access_token"].(string)
+	agentClaims := decodeJWTPayload(t, agentToken)
+
+	clientID := uid("ciba-chain-agent-client")
+	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	resp := post(t, "/oauth2/bc-authorize", map[string]any{
+		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+		"login_hint": "user-a", "requesting_token": agentToken,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	id, _ := decode(t, resp)["auth_req_id"].(string)
+
+	ap := post(t, adminPath("/oauth2/bc-authorize/"+id+"/approve"), map[string]any{"subject_id": "user-a"}, adminHeaders())
+	require.Equal(t, http.StatusOK, ap.StatusCode)
+	_ = ap.Body.Close()
+
+	claims := decodeJWTPayload(t, pollCIBA(t, clientID, id)["access_token"].(string))
+	require.Equal(t, agentClaims["sub"], claims["sub"])
+	for _, k := range []string{"identity_type", "external_id", "owner_user_id", "agent_id"} {
+		require.Equal(t, agentClaims[k], claims[k], "claim %s", k)
+	}
+	require.Nil(t, claims["user_email"])
+
+	row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+	require.Equal(t, agentClaims["sub"], row.RequesterSub)
+	require.Equal(t, "user-a", row.ApprovedSubjectID)
 }

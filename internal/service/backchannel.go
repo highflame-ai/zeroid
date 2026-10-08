@@ -60,6 +60,10 @@ type BackchannelService struct {
 	// when enforce_hints is shadow or on. Guarded by mu.
 	approverAuthorizer ApproverAuthorizer
 
+	// verifyRequestingToken verifies bc-authorize requesting_token values.
+	// Wired by OAuthService.SetBackchannelService. Guarded by mu.
+	verifyRequestingToken requestingTokenVerifier
+
 	// svcCtx is the long-lived context used by detached notifier goroutines.
 	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
 	// can wind down on graceful shutdown instead of leaking past the server's
@@ -104,6 +108,8 @@ type BackchannelNotification struct {
 	AuthorizationDetails domain.AuthorizationDetails
 	FourEyes             bool
 	RequesterOwner       string
+	RequesterSub         string
+	RequesterActor       string
 }
 
 // BackchannelServiceConfig bounds the request lifecycle.
@@ -338,6 +344,10 @@ type CreateAuthRequestInput struct {
 	// FourEyes requires a non-empty RequesterOwner.
 	FourEyes       bool
 	RequesterOwner string
+	// RequestingToken is the access token of the request the approval is
+	// for. When present it must be an active token from this server in the
+	// same tenant; the token minted on approval then keeps its sub and act.
+	RequestingToken string
 }
 
 // CreateAuthRequestOutput is returned to the client on success.
@@ -394,6 +404,22 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	if utf8.RuneCountInString(in.RequesterOwner) > domain.MaxRequesterOwnerChars {
 		return nil, oauthBadRequest(oautherror.InvalidRequest,
 			fmt.Sprintf("requester_owner exceeds maximum length of %d characters", domain.MaxRequesterOwnerChars))
+	}
+
+	var requesting *RequestingToken
+	if in.RequestingToken != "" {
+		rt, err := s.resolveRequestingToken(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		requesting = rt
+	} else if in.GroupHint != "" && in.LoginHint == "" {
+		// Without a requesting token or login_hint nothing names the
+		// subject of the token, so an approver would become it. Refused
+		// when approvers are authenticated; unchanged otherwise.
+		if require, _, _ := s.approverSettings(); require {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "group_hint requires requesting_token")
+		}
 	}
 
 	// Resolve the client. GetClientByClientID intentionally returns any
@@ -549,6 +575,12 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		IntervalSeconds:            s.cfg.DefaultPollInterval,
 		ExpiresAt:                  now.Add(expiry),
 		CreatedAt:                  now,
+	}
+	if requesting != nil {
+		row.RequesterSub = requesting.Subject
+		row.RequesterActor = requesting.Actor()
+		row.RequestingJTI = requesting.JTI
+		row.RequesterActSub = requesting.ActSubject
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)
@@ -1001,20 +1033,6 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		identity = &anchor
 	}
 
-	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
-	// additionally rejects an approved row that has outlived both expires_at
-	// and the post-approval grace window — the atomic DB-layer counterpart to
-	// the expired_token pre-check in Redeem. A row that lost that race (or any
-	// concurrent second redemption) yields affected=0 and is rejected below.
-	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
-	if mErr != nil {
-		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
-		return nil, oauthServerError("failed to commit issuance state", mErr)
-	}
-	if affected == 0 {
-		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
-	}
-
 	customClaims := map[string]any{
 		"token_exchange":        "ciba",
 		"backchannel_client_id": row.ClientID,
@@ -1031,16 +1049,20 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// §5.2: also include it on the token response body so polling / push
 	// clients see what was granted.
 	//
-	// The raw bytes are passed through verbatim (as json.RawMessage) so
-	// jwx serialises the array structure rather than the {Type, Raw}
-	// surface of the domain type. The bc-authorize-side validator
-	// guarantees the persisted bytes are a valid RFC 9396 array (a
-	// legacy CIBA row stores the canonical empty `[]`); no re-parse or
-	// special-case filtering on issuance.
-	rarBytes := row.AuthorizationDetailsRaw
+	// Each entry is stamped with approval_id (this auth_req_id) and
+	// approver_auth so a resource server can tie a call to the approval and
+	// see how the approver was authenticated. The result is passed as
+	// json.RawMessage so jwx serialises the array structure rather than the
+	// {Type, Raw} surface of the domain type. The bc-authorize-side
+	// validator guarantees the persisted bytes are a valid RFC 9396 array (a
+	// legacy CIBA row stores the canonical empty `[]`).
+	rarBytes, rerr := stampAuthorizationDetails(row)
+	if rerr != nil {
+		return nil, oauthServerError("failed to prepare authorization_details", rerr)
+	}
 	customClaims["authorization_details"] = rarBytes
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		Scopes:            parseScopeString(row.Scope),
@@ -1052,7 +1074,30 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		UserName:          row.ApprovedSubjectName,
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: dpopKeyThumbprint,
-	})
+	}
+	// A request made with a requesting_token is approved INTO that chain:
+	// the token keeps the chain's sub, act and identity claims, and the
+	// approver stays on the row only. Root grants keep sub = the approved
+	// user, as above.
+	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
+		return nil, cerr
+	}
+
+	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
+	// additionally rejects an approved row that has outlived both expires_at
+	// and the post-approval grace window — the atomic DB-layer counterpart to
+	// the expired_token pre-check in Redeem. A row that lost that race (or any
+	// concurrent second redemption) yields affected=0 and is rejected below.
+	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
+	if mErr != nil {
+		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
+		return nil, oauthServerError("failed to commit issuance state", mErr)
+	}
+	if affected == 0 {
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
+	}
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		// The pre-burn gates above catch the deterministic refusals; anything
 		// landing here is a race-window state change or an axis only the
@@ -1225,6 +1270,8 @@ func (s *BackchannelService) dispatchNotifierWithRAR(
 		AuthorizationDetails: details,
 		FourEyes:             row.FourEyes,
 		RequesterOwner:       row.RequesterOwner,
+		RequesterSub:         row.RequesterSub,
+		RequesterActor:       row.RequesterActor,
 	}
 
 	deliver := func() {

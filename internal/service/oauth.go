@@ -419,6 +419,40 @@ func (s *OAuthService) HasTrustedServiceValidator() bool {
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+	if bc != nil {
+		bc.setRequestingTokenVerifier(s.verifyRequestingToken)
+	}
+}
+
+// verifyRequestingToken verifies a bc-authorize requesting_token: an access
+// token this server issued (signature against its own keys, iss equal to its
+// issuer), unexpired, and backed by an active, unrevoked credential row.
+// The tenant comparison is the caller's.
+func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr string) (*RequestingToken, error) {
+	parsed, err := s.parseToken(tokenStr, true)
+	if err != nil {
+		return nil, fmt.Errorf("requesting_token is not a valid token from this issuer: %w", err)
+	}
+	if iss, _ := parsed.Issuer(); iss != s.issuer {
+		return nil, fmt.Errorf("requesting_token was not issued by this server")
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return nil, fmt.Errorf("requesting_token has no jti")
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil || cred == nil || !active {
+		return nil, fmt.Errorf("requesting_token is not active")
+	}
+	sub, _ := parsed.Subject()
+	rt := &RequestingToken{JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID}
+	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
+		rt.ActSubject, _ = act["sub"].(string)
+	}
+	if cid, err := jwt.Get[string](parsed, "client_id"); err == nil {
+		rt.ClientID = cid
+	}
+	return rt, nil
 }
 
 // SetCIMDService wires the Client ID Metadata Document resolver after

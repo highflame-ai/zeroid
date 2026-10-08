@@ -275,6 +275,20 @@ type BackchannelAuthRequest struct {
 	// the request (enforced under backchannel.enforce_hints).
 	FourEyes       bool   `bun:"four_eyes,notnull,default:false"              json:"four_eyes,omitempty"`
 	RequesterOwner string `bun:"requester_owner,type:text"                    json:"requester_owner,omitempty"`
+	// Requesting chain, from the bc-authorize requesting_token extension
+	// parameter (the access token of the request the approval is for). When
+	// set, the token minted on approval keeps that chain's sub and act; the
+	// approver is recorded only on this row.
+	//
+	//   RequesterSub     the requesting token's sub (on whose behalf)
+	//   RequesterActor   who made the request: its act.sub, else its client_id,
+	//                    else its sub
+	//   RequestingJTI    the requesting token's jti
+	//   RequesterActSub  the requesting token's act.sub ("" when it had none)
+	RequesterSub    string `bun:"requester_sub,type:text"                     json:"requester_sub,omitempty"`
+	RequesterActor  string `bun:"requester_actor,type:text"                   json:"requester_actor,omitempty"`
+	RequestingJTI   string `bun:"requesting_jti,type:text"                    json:"-"`
+	RequesterActSub string `bun:"requester_act_sub,type:text"                 json:"-"`
 	// Approval record. ApprovedSubject* name the user who resolved the
 	// request (approved or denied); the fields below record how that user
 	// was authenticated and which binding check they satisfied.

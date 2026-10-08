@@ -317,6 +317,8 @@ func runTests(m *testing.M) int {
 					Subject: sub,
 					Issuer:  testApproverIssuer,
 					Auth:    zeroid.ApproverAuthSession,
+					Email:   sub + "@approver.example.test",
+					Name:    "Approver " + sub,
 				}))
 			}
 			next.ServeHTTP(w, r)
