@@ -171,6 +171,24 @@ type IssueRequest struct {
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
 var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
 
+// scopeRefusedForIdentityType returns the first scope in scopes that may never
+// be issued to an identity of type t, or "" when all are permitted.
+//
+// ciba:approve lets its holder resolve CIBA requests on behalf of a user, so
+// it is reserved for approval-channel services and never issued to agent
+// identities.
+func scopeRefusedForIdentityType(t domain.IdentityType, scopes []string) string {
+	if t != domain.IdentityTypeAgent {
+		return ""
+	}
+	for _, sc := range scopes {
+		if sc == domain.ScopeCIBAApprove {
+			return sc
+		}
+	}
+	return ""
+}
+
 // IssueCredential issues a short-lived JWT for an identity.
 //
 // Gate: identities not in a usable status never receive a fresh credential.
@@ -249,6 +267,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
+	}
+
+	// Some scopes are never issued to certain identity types, whatever their
+	// scope ceilings say (see scopeRefusedForIdentityType).
+	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
+		return nil, nil, fmt.Errorf("%w: %q is not issued to %s identities", ErrScopesNotAllowed, refused, req.Identity.IdentityType)
 	}
 
 	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes
