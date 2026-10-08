@@ -57,6 +57,15 @@ func IsValidBackchannelDeliveryMode(mode string) bool {
 // Clients submit this at /oauth2/token along with auth_req_id to poll for a token.
 const GrantTypeCIBA GrantType = "urn:openid:params:grant-type:ciba"
 
+// ScopeCIBAApprove is the scope carried by approval-channel credentials that
+// resolve CIBA requests on behalf of a user. It is never issued to an agent
+// identity (enforced at the CredentialService.IssueCredential chokepoint).
+const ScopeCIBAApprove = "ciba:approve"
+
+// MaxRequesterOwnerChars caps the requester_owner bc-authorize extension
+// parameter, matching MaxGroupHintChars.
+const MaxRequesterOwnerChars = 255
+
 // ─── RFC 9396 OAuth 2.0 Rich Authorization Requests (RAR) ───────────────────
 //
 // RAR extends a CIBA bc-authorize request with an `authorization_details`
@@ -261,10 +270,46 @@ type BackchannelAuthRequest struct {
 	ApprovedSubjectID          string                      `bun:"approved_subject_id,type:varchar(255)"        json:"approved_subject_id,omitempty"`
 	ApprovedSubjectEmail       string                      `bun:"approved_subject_email,type:varchar(255)"     json:"approved_subject_email,omitempty"`
 	ApprovedSubjectName        string                      `bun:"approved_subject_name,type:varchar(255)"      json:"approved_subject_name,omitempty"`
-	IntervalSeconds            int                         `bun:"interval_seconds,notnull,default:5"           json:"interval"`
-	LastPolledAt               *time.Time                  `bun:"last_polled_at"                               json:"last_polled_at,omitempty"`
-	LastNotifyError            string                      `bun:"last_notify_error,type:text"                  json:"last_notify_error,omitempty"`
-	ExpiresAt                  time.Time                   `bun:"expires_at,notnull"                           json:"expires_at"`
-	CreatedAt                  time.Time                   `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	ApprovedAt                 *time.Time                  `bun:"approved_at"                                  json:"approved_at,omitempty"`
+	// FourEyes and RequesterOwner are bc-authorize extension parameters.
+	// When FourEyes is set, the user named by RequesterOwner may not resolve
+	// the request (enforced under backchannel.enforce_hints).
+	FourEyes       bool   `bun:"four_eyes,notnull,default:false"              json:"four_eyes,omitempty"`
+	RequesterOwner string `bun:"requester_owner,type:text"                    json:"requester_owner,omitempty"`
+	// Approval record. ApprovedSubject* name the user who resolved the
+	// request (approved or denied); the fields below record how that user
+	// was authenticated and which binding check they satisfied.
+	//
+	//   ApproverIss      issuer that authenticated the approver
+	//   ApproverAuth     "session" | "channel_attested" ("" when the approver
+	//                    came from the request body, not the request context)
+	//   ChannelClientID  approval channel that attested the approver
+	//   HintSatisfied    "login_hint" | "group_hint" | "" (checks off or not met)
+	//   ShadowWouldDeny  enforce_hints=shadow: the approver would have been
+	//                    refused under enforce_hints=on; ShadowReason says why
+	ApproverIss     string     `bun:"approver_iss,type:text"                      json:"approver_iss,omitempty"`
+	ApproverAuth    string     `bun:"approver_auth,type:text"                     json:"approver_auth,omitempty"`
+	ChannelClientID string     `bun:"channel_client_id,type:text"                 json:"channel_client_id,omitempty"`
+	HintSatisfied   string     `bun:"hint_satisfied,type:text"                    json:"hint_satisfied,omitempty"`
+	ShadowWouldDeny bool       `bun:"shadow_would_deny,notnull,default:false"     json:"shadow_would_deny,omitempty"`
+	ShadowReason    string     `bun:"shadow_reason,type:text"                     json:"shadow_reason,omitempty"`
+	IntervalSeconds int        `bun:"interval_seconds,notnull,default:5"           json:"interval"`
+	LastPolledAt    *time.Time `bun:"last_polled_at"                               json:"last_polled_at,omitempty"`
+	LastNotifyError string     `bun:"last_notify_error,type:text"                  json:"last_notify_error,omitempty"`
+	ExpiresAt       time.Time  `bun:"expires_at,notnull"                           json:"expires_at"`
+	CreatedAt       time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	ApprovedAt      *time.Time `bun:"approved_at"                                  json:"approved_at,omitempty"`
+}
+
+// BackchannelResolution is what an approve or deny records on the row: the
+// resolving user and the approval-record fields of BackchannelAuthRequest.
+type BackchannelResolution struct {
+	SubjectID       string
+	SubjectEmail    string
+	SubjectName     string
+	ApproverIss     string
+	ApproverAuth    string
+	ChannelClientID string
+	HintSatisfied   string
+	ShadowWouldDeny bool
+	ShadowReason    string
 }

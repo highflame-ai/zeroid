@@ -15,6 +15,7 @@ import (
 	"github.com/knadh/koanf/v2"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -113,6 +114,28 @@ type BackchannelConfig struct {
 	// register endpoints like https://localhost:9000/. Production deployments
 	// MUST keep this false (see GHSA-599q-j34m-33vc).
 	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+
+	// RequireApproverIdentity makes the CIBA approve/deny endpoints take the
+	// approver ONLY from the request context, set by the deployer's
+	// authentication layer via WithApproverIdentity. A call without one gets
+	// 401 invalid_client ("approver identity required"); a body subject_id
+	// that differs from it gets 400 invalid_request. Default false: the body
+	// subject_id is accepted when no context identity is present, which keeps
+	// standalone deployments that authenticate approvers at their edge working.
+	RequireApproverIdentity bool `koanf:"require_approver_identity"`
+
+	// EnforceHints binds the CIBA approver to the request on approve AND deny:
+	// login_hint set → the approver must be that user; four_eyes set → the
+	// approver must not be requester_owner; group_hint set → the
+	// ApproverAuthorizer (Server.SetApproverAuthorizer) must allow, and with
+	// none installed the check fails.
+	//
+	//   off    (default) no checks.
+	//   shadow evaluate, always allow, record shadow_would_deny/shadow_reason on
+	//          the row, log "ciba approver would deny" and count
+	//          ciba_approver_would_deny_total{reason}.
+	//   on     refuse ineligible approvers with 403 access_denied.
+	EnforceHints string `koanf:"enforce_hints"`
 }
 
 // CIMDConfig governs Client ID Metadata Documents
@@ -508,6 +531,10 @@ func (c *Config) Validate() error {
 	// (HS256). The authorization_code grant is optional, so the secret is not
 	// globally required — but a weak secret is forgeable, so when one IS set
 	// we enforce a floor. 32 bytes matches the HS256 output size.
+	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
+		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
+	}
+
 	if c.Token.HMACSecret != "" && len(c.Token.HMACSecret) < 32 {
 		return fmt.Errorf("token.hmac_secret must be at least 32 bytes when set, got %d: it signs stateless auth-code JWTs (HS256) and a short secret is forgeable", len(c.Token.HMACSecret))
 	}
@@ -728,7 +755,12 @@ func loadDefaults(k *koanf.Koanf) error {
 		// private_key_jwt client auth. Both production-safe at their zero
 		// value; stated explicitly so the resolved config reports them.
 		"client_auth.allow_private_jwks_endpoints": false,
-		"client_auth.jwks_cache_size":              0,
+
+		// CIBA approver binding — both off so standalone deployments keep
+		// today's approve/deny behaviour until they opt in.
+		"backchannel.require_approver_identity": false,
+		"backchannel.enforce_hints":             "off",
+		"client_auth.jwks_cache_size":           0,
 
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
@@ -813,7 +845,9 @@ var envMapping = map[string]string{
 
 	// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
 	// test/dev deployments only. Production MUST leave this false.
-	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
+	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS":   "backchannel.allow_private_notification_endpoints",
+	"ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY": "backchannel.require_approver_identity",
+	"ZEROID_BACKCHANNEL_ENFORCE_HINTS":             "backchannel.enforce_hints",
 
 	// CIMD (Client ID Metadata Documents). Enabled by default; disable with
 	// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
@@ -856,6 +890,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub") ||
 			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
 			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
+			strings.HasSuffix(configPath, ".require_approver_identity") ||
 			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):

@@ -400,6 +400,61 @@ func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
 	}
 }
 
+// CIBA approver settings: defaults keep standalone deployments unchanged, and
+// both env vars reach the typed fields.
+func TestBackchannelApproverConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Backchannel.RequireApproverIdentity {
+			t.Error("backchannel.require_approver_identity must default to false")
+		}
+		if cfg.Backchannel.EnforceHints != "off" {
+			t.Errorf("backchannel.enforce_hints must default to off, got %q", cfg.Backchannel.EnforceHints)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "true")
+		t.Setenv("ZEROID_BACKCHANNEL_ENFORCE_HINTS", "shadow")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if !cfg.Backchannel.RequireApproverIdentity {
+			t.Error("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY=true did not reach backchannel")
+		}
+		if cfg.Backchannel.EnforceHints != "shadow" {
+			t.Errorf("ZEROID_BACKCHANNEL_ENFORCE_HINTS=shadow did not reach backchannel, got %q", cfg.Backchannel.EnforceHints)
+		}
+	})
+
+	t.Run("bad_bool", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "maybe")
+		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid bool") {
+			t.Fatalf("expected a bool parse error, got %v", err)
+		}
+	})
+
+	t.Run("validate_enforce_hints", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q must validate, got %v", mode, err)
+			}
+		}
+		cfg := baseValidConfig(t)
+		cfg.Backchannel.EnforceHints = "strict"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") {
+			t.Fatalf("enforce_hints=strict must be rejected naming the key, got %v", err)
+		}
+	})
+}
+
 // Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
 // variable the loader actually reads.
 //

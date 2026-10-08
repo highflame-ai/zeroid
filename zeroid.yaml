@@ -124,6 +124,19 @@ backchannel:
   # Env: ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS
   allow_private_notification_endpoints: false
 
+  # Take the approve/deny approver ONLY from the request context, set by the
+  # embedding application's authentication layer (zeroid.WithApproverIdentity).
+  # Missing identity → 401; a body subject_id that differs → 400. Default false
+  # keeps accepting the body subject_id when no context identity is present.
+  # Env: ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY
+  require_approver_identity: false
+
+  # Bind approve/deny to the request's login_hint / group_hint / four_eyes:
+  # off (default) | shadow (allow, record would-deny) | on (403 access_denied).
+  # group_hint checks need an ApproverAuthorizer (Server.SetApproverAuthorizer).
+  # Env: ZEROID_BACKCHANNEL_ENFORCE_HINTS
+  enforce_hints: "off"
+
 # OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
 # proves its identity with a JWT signed by a key it published rather than with a
 # shared secret.

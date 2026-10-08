@@ -486,6 +486,8 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// otherwise-circular dependency cleanly.
 	backchannelCfg := service.DefaultBackchannelConfig()
 	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
+	backchannelCfg.RequireApproverIdentity = cfg.Backchannel.RequireApproverIdentity
+	backchannelCfg.EnforceHints = cfg.Backchannel.EnforceHints
 	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
@@ -1251,6 +1253,8 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			BindingMessage:       n.BindingMessage,
 			ExpiresAt:            n.ExpiresAt,
 			AuthorizationDetails: n.AuthorizationDetails,
+			FourEyes:             n.FourEyes,
+			RequesterOwner:       n.RequesterOwner,
 		})
 	})
 }
@@ -1337,6 +1341,40 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 	// Wrap the public-typed validator into the service-internal alias so the
 	// service layer stays decoupled from the top-level package's type names.
 	s.backchannelSvc.RegisterAuthorizationDetailValidator(typ, service.AuthorizationDetailValidator(fn))
+}
+
+// SetApproverAuthorizer installs the hook consulted on CIBA approve/deny for
+// requests carrying a group_hint, when backchannel.enforce_hints is shadow or
+// on. zeroid treats group_hint as opaque; the authorizer decides whether the
+// approver satisfies it (e.g. holds the named role). The built-in login_hint
+// and four_eyes checks run first. With no authorizer installed, group_hint
+// requests fail the check with reason "no approver authorizer configured".
+// Passing nil removes the hook.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetApproverAuthorizer(a ApproverAuthorizer) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetApproverAuthorizer(a)
+}
+
+// SetBackchannelRequireApproverIdentity toggles
+// backchannel.require_approver_identity at runtime.
+func (s *Server) SetBackchannelRequireApproverIdentity(require bool) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetRequireApproverIdentity(require)
+}
+
+// SetBackchannelEnforceHints sets backchannel.enforce_hints ("off", "shadow"
+// or "on") at runtime. An unknown mode is rejected and the setting unchanged.
+func (s *Server) SetBackchannelEnforceHints(mode string) error {
+	if s.backchannelSvc == nil {
+		return nil
+	}
+	return s.backchannelSvc.SetEnforceHints(mode)
 }
 
 // SetBackchannelNotifyDispatchSync forces synchronous notifier dispatch.

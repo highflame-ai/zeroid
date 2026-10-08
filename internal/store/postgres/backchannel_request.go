@@ -62,19 +62,18 @@ func (r *BackchannelRequestRepository) GetByAuthReqID(ctx context.Context, authR
 	return req, nil
 }
 
-// MarkApproved transitions a pending row to approved and records the resolved
-// subject. The status='pending' guard makes the operation idempotent and
-// prevents re-approving a denied/expired row. Returns the number of rows
-// affected so callers can detect "already approved/denied" as 0.
-func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReqID, subjectID, subjectEmail, subjectName string) (int64, error) {
+// MarkApproved transitions a pending row to approved and records the
+// resolution (resolving user and approval record). The status='pending' guard
+// makes the operation idempotent and prevents re-approving a denied/expired
+// row. Returns the number of rows affected so callers can detect "already
+// approved/denied" as 0.
+func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReqID string, rec domain.BackchannelResolution) (int64, error) {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
 		Set("status = ?", domain.BackchannelStatusApproved).
-		Set("approved_subject_id = ?", subjectID).
-		Set("approved_subject_email = ?", subjectEmail).
-		Set("approved_subject_name = ?", subjectName).
-		Set("approved_at = ?", now).
+		Set("approved_at = ?", now)
+	res, err := setResolution(q, rec).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusPending).
 		Where("expires_at > ?", now).
@@ -85,12 +84,14 @@ func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReq
 	return res.RowsAffected()
 }
 
-// MarkDenied transitions a pending row to denied. Same guard semantics as MarkApproved.
-func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID string) (int64, error) {
+// MarkDenied transitions a pending row to denied and records the resolution.
+// Same guard semantics as MarkApproved.
+func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID string, rec domain.BackchannelResolution) (int64, error) {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
-		Set("status = ?", domain.BackchannelStatusDenied).
+		Set("status = ?", domain.BackchannelStatusDenied)
+	res, err := setResolution(q, rec).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusPending).
 		Where("expires_at > ?", now).
@@ -99,6 +100,20 @@ func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID
 		return 0, fmt.Errorf("failed to mark backchannel request denied: %w", err)
 	}
 	return res.RowsAffected()
+}
+
+// setResolution adds the resolving user and approval-record columns to q.
+func setResolution(q *bun.UpdateQuery, rec domain.BackchannelResolution) *bun.UpdateQuery {
+	return q.
+		Set("approved_subject_id = ?", rec.SubjectID).
+		Set("approved_subject_email = ?", rec.SubjectEmail).
+		Set("approved_subject_name = ?", rec.SubjectName).
+		Set("approver_iss = ?", rec.ApproverIss).
+		Set("approver_auth = ?", rec.ApproverAuth).
+		Set("channel_client_id = ?", rec.ChannelClientID).
+		Set("hint_satisfied = ?", rec.HintSatisfied).
+		Set("shadow_would_deny = ?", rec.ShadowWouldDeny).
+		Set("shadow_reason = ?", rec.ShadowReason)
 }
 
 // MarkIssued transitions an approved row to issued so a second redemption of
