@@ -14,9 +14,9 @@ on:
         description: "Version to release (vX.Y.Z). Empty uses svu's next version."
         required: false
         type: string
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*.*.*"
 
 env:
   GO_VER: "1.27.0"
@@ -27,7 +27,7 @@ env:
   # "v1.7.0 — PKCE PrincipalResolver" that would fail the tag-format
   # regex. tag_name is the load-bearing identifier for every gate in
   # this workflow.
-  RELEASE_TAG: ${{ github.event.release.tag_name }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
   DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
   CICD_WORKFLOW: "trigger-release-zeroid.yml"
