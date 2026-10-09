@@ -680,7 +680,7 @@ func TestCIBAApproverMigration(t *testing.T) {
 		require.NoError(t, tx.QueryRowContext(ctx,
 			`SELECT count(*) FROM information_schema.columns
 			 WHERE table_name = 'backchannel_auth_requests' AND column_name IN (?)`,
-			bun.In(columns)).Scan(&n))
+			bun.List(columns)).Scan(&n))
 		return n
 	}
 
