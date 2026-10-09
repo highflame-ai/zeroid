@@ -1365,3 +1365,56 @@ func TestCIBAResolvedRetention(t *testing.T) {
 	require.NoError(t, merr)
 	require.Zero(t, affected, "a retained approval past its redemption window is not issuable")
 }
+
+// TestCIBARequesterOwnerFromRequestingToken pins that when bc-authorize
+// carries a requesting_token for a registered identity, requester_owner is
+// that identity's owner_user_id: a differing request parameter is ignored,
+// and four_eyes needs no explicit requester_owner.
+func TestCIBARequesterOwnerFromRequestingToken(t *testing.T) {
+	const owner = "user-owner-l1"
+	externalID := uid("ciba-owner-agent")
+	reg := post(t, adminPath("/agents/register"), map[string]any{
+		"name": externalID, "external_id": externalID, "sub_type": "tool_agent",
+		"trust_level": "first_party", "created_by": owner,
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, reg.StatusCode)
+	apiKey, _ := decode(t, reg)["api_key"].(string)
+	tr := post(t, "/oauth2/token", map[string]any{"grant_type": "api_key", "api_key": apiKey}, nil)
+	require.Equal(t, http.StatusOK, tr.StatusCode)
+	agentToken, _ := decode(t, tr)["access_token"].(string)
+	repo := postgres.NewBackchannelRequestRepository(testDB)
+
+	t.Run("MismatchingParameterIgnored", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{
+			"login_hint": owner, "requesting_token": agentToken,
+			"four_eyes": "true", "requester_owner": "someone-else",
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+		row := loadBackchannelRow(t, repo, id)
+		require.Equal(t, owner, row.RequesterOwner)
+		require.True(t, row.FourEyes)
+
+		require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(true))
+		require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("on"))
+		t.Cleanup(func() {
+			require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("off"))
+			require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(false))
+		})
+		h := adminHeaders()
+		h[testApproverSubHeader] = owner
+		ap := post(t, adminPath("/oauth2/bc-authorize/"+id+"/approve"), map[string]any{}, h)
+		require.Equal(t, http.StatusForbidden, ap.StatusCode, "%v", decode(t, ap))
+	})
+
+	t.Run("OmittedParameterDerived", func(t *testing.T) {
+		c := newConfidentialCIBAClient(t)
+		resp := bcAuthorizeAs(t, c, map[string]any{
+			"login_hint": "user-a", "requesting_token": agentToken, "four_eyes": "true",
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		id, _ := decode(t, resp)["auth_req_id"].(string)
+		require.Equal(t, owner, loadBackchannelRow(t, repo, id).RequesterOwner)
+	})
+}

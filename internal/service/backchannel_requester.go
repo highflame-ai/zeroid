@@ -23,6 +23,8 @@ type RequestingToken struct {
 	ClientID   string
 	AccountID  string
 	ProjectID  string
+	// IdentityID is the identity the token was issued to, "" when none.
+	IdentityID string
 	// DPoPKeyThumbprint is the token's cnf.jkt, "" when it is not DPoP-bound.
 	DPoPKeyThumbprint string
 }
@@ -86,6 +88,20 @@ func (s *BackchannelService) resolveRequestingToken(ctx context.Context, in Crea
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token is invalid")
 	}
 	return rt, nil
+}
+
+// requestingOwner returns the owner_user_id of the identity rt was issued to,
+// or "" when rt names no identity or the identity has no owner. A failed
+// lookup is invalid_request.
+func (s *BackchannelService) requestingOwner(ctx context.Context, rt *RequestingToken) (string, error) {
+	if rt == nil || rt.IdentityID == "" || s.identitySvc == nil {
+		return "", nil
+	}
+	ident, err := s.identitySvc.GetIdentity(ctx, rt.IdentityID, rt.AccountID, rt.ProjectID)
+	if err != nil {
+		return "", oauthBadRequestCause(oautherror.InvalidRequest, "requesting_token is invalid", err)
+	}
+	return ident.OwnerUserID, nil
 }
 
 // requireRequestingTokenHolder refuses a poll on a row made with a

@@ -462,6 +462,9 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
 		DPoPKeyThumbprint: cred.DPoPKeyThumbprint,
 	}
+	if cred.IdentityID != nil {
+		rt.IdentityID = *cred.IdentityID
+	}
 	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
 		rt.ActSubject, _ = act["sub"].(string)
 		if b, merr := json.Marshal(act); merr == nil {

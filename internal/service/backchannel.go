@@ -343,7 +343,9 @@ type CreateAuthRequestInput struct {
 	AuthorizationDetailsRaw []byte
 	// FourEyes and RequesterOwner are extension parameters: with FourEyes
 	// set, the user named by RequesterOwner may not resolve the request.
-	// FourEyes requires a non-empty RequesterOwner.
+	// FourEyes requires a non-empty RequesterOwner. When RequestingToken was
+	// issued to an identity with an owner_user_id, that owner is used as
+	// RequesterOwner and a differing value here is ignored.
 	FourEyes       bool
 	RequesterOwner string
 	// RequestingToken is the access token of the request the approval is
@@ -400,7 +402,9 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		)
 	}
 
-	if in.FourEyes && in.RequesterOwner == "" {
+	// With a requesting_token, requester_owner is derived from the
+	// requesting identity after the token is verified (below).
+	if in.FourEyes && in.RequesterOwner == "" && in.RequestingToken == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
 	}
 	if utf8.RuneCountInString(in.RequesterOwner) > domain.MaxRequesterOwnerChars {
@@ -474,6 +478,25 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 			return nil, err
 		}
 		requesting = rt
+		// The requesting identity's owner is the requester_owner; a
+		// differing request parameter is ignored.
+		owner, err := s.requestingOwner(ctx, rt)
+		if err != nil {
+			return nil, err
+		}
+		if owner != "" {
+			if in.RequesterOwner != "" && in.RequesterOwner != owner {
+				log.Warn().
+					Str("client_id", in.ClientID).
+					Str("requester_owner", in.RequesterOwner).
+					Str("identity_owner", owner).
+					Msg("bc-authorize requester_owner differs from the requesting identity's owner; using the identity's owner")
+			}
+			in.RequesterOwner = owner
+		}
+		if in.FourEyes && in.RequesterOwner == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
+		}
 	} else if in.GroupHint != "" && in.LoginHint == "" {
 		// Without a requesting token or login_hint nothing names the
 		// subject of the token, so an approver would become it. Refused
