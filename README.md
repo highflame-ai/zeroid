@@ -929,7 +929,10 @@ depend on how the body was spelled. The same mark is required to issue any crede
 approval channel (an identity with `sub_type: approval_channel` or whose scope ceiling lists
 `ciba:approve`): API keys, including keys that inherit the identity's ceiling, key rotation,
 `public_key_pem` writes, and OAuth clients bound to the identity or whose `client_id` is its
-`external_id`, plus rotating the secret of a client registered under the mark.
+`external_id`, admin `/credentials/issue` and `/credentials/{id}/rotate` (refused before
+anything is revoked), plus rotating the secret of, deleting, or revoking a client or API key
+registered under the mark. Discovery ingest and the discovery source sweeps (prune,
+release, purge) leave approval channels unchanged.
 `ciba:approve` is then minted only from an API key, OAuth client or public key that was
 written under the mark, so credentials obtained before an identity became an approval
 channel do not carry it. Clients declared in configuration are registered under the mark

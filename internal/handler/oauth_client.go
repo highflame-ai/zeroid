@@ -285,6 +285,9 @@ func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientI
 
 func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*DeleteOAuthClientOutput, error) {
 	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID); err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to delete oauth client")
 		return nil, huma.Error500InternalServerError("failed to delete oauth client")
 	}

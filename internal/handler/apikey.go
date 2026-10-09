@@ -225,6 +225,9 @@ func (a *API) revokeAPIKeyOp(ctx context.Context, input *RevokeAPIKeyInput) (*Re
 
 	n, err := a.apiKeySvc.RevokeKey(ctx, input.ID, tenant.AccountID, tenant.ProjectID, revokedBy, input.Body.Reason)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		log.Error().Err(err).Str("key_id", input.ID).Msg("failed to revoke API key")
 		return nil, huma.Error500InternalServerError("failed to revoke API key")
 	}

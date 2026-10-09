@@ -374,8 +374,10 @@ func ApproverIdentityFromContext(ctx context.Context) (ApproverIdentity, bool) {
 // (directly or by attaching a policy that lists it), are refused with 403, as
 // are writes that issue a credential for an approval channel: API keys, key
 // rotation, public keys, OAuth clients bound to or named after it, and secret
-// rotation for a client registered with the mark. ciba:approve is minted only
-// from an API key, OAuth client or public key written with the mark.
+// rotation for a client registered with the mark, admin credential issue and
+// rotate, and deleting or revoking a client or API key registered with the
+// mark. ciba:approve is minted only from an API key, OAuth client or public
+// key written with the mark, or by an admin issue or rotate made with it.
 // Set it in the AdminAuth layer for the most trusted caller class only.
 func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
 	return service.WithTrustedApprovalChannelWrite(ctx)

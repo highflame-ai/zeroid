@@ -305,6 +305,14 @@ func (s *APIKeyService) RevokeKey(ctx context.Context, id, accountID, projectID,
 	if revokedBy == "" {
 		revokedBy = middleware.SystemCallerPrefix + "unattributed"
 	}
+	// A key created by a trusted approval-channel caller is revoked only by
+	// one (approval_channel_write.go). A key not found here falls through to
+	// the tenant-scoped revoke, which reports zero rows.
+	if !TrustedApprovalChannelWrite(ctx) {
+		if sk, err := s.repo.GetByID(ctx, id, accountID, projectID); err == nil && sk.ChannelTrusted {
+			return 0, ErrApprovalChannelWriteNotTrusted
+		}
+	}
 	return s.repo.Revoke(ctx, id, accountID, projectID, revokedBy, reason)
 }
 

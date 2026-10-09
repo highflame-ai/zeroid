@@ -465,8 +465,14 @@ func (s *OAuthClientService) UpdateClient(ctx context.Context, client *domain.OA
 	return s.repo.Update(ctx, client)
 }
 
-// DeleteClient removes an OAuth2 client.
+// DeleteClient removes an OAuth2 client. A client registered by a trusted
+// approval-channel caller is removed only by one (approval_channel_write.go).
 func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error {
+	if !TrustedApprovalChannelWrite(ctx) {
+		if client, err := s.repo.GetByID(ctx, id); err == nil && client.ChannelTrusted {
+			return ErrApprovalChannelWriteNotTrusted
+		}
+	}
 	return s.repo.Delete(ctx, id)
 }
 
