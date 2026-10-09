@@ -57,8 +57,8 @@ func TestApprovalChannelWritesRequireTrustedContext(t *testing.T) {
 		}, adminHeaders()), "scope")
 	})
 
-	// Bodies whose keys differ only by case or by Unicode folding, or repeat,
-	// decode to the marker and the scope here whatever another parser saw.
+	// Request bodies with non-canonical field spellings or duplicate keys are
+	// refused rather than registering an identity.
 	for name, tmpl := range map[string]string{
 		"folded duplicate keys": `{"name":"%[1]s","external_id":"%[1]s","identity_type":"service","created_by":"test-user",` +
 			`"sub_type":"approval_channel","ſub_type":"api_service","allowed_scopes":["ciba:approve"],"allowed_ſcopes":[]}`,
