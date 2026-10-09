@@ -466,8 +466,16 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		for _, mode := range []string{"", "off", "shadow", "on"} {
 			cfg := baseValidConfig(t)
 			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = true
 			if err := cfg.Validate(); err != nil {
 				t.Errorf("enforce_hints=%q must validate, got %v", mode, err)
+			}
+		}
+		for _, mode := range []string{"", "off"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q without require_approver_identity must validate, got %v", mode, err)
 			}
 		}
 		cfg := baseValidConfig(t)
@@ -475,6 +483,19 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") {
 			t.Fatalf("enforce_hints=strict must be rejected naming the key, got %v", err)
+		}
+	})
+
+	t.Run("validate_enforce_hints_requires_approver_identity", func(t *testing.T) {
+		for _, mode := range []string{"shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = false
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") ||
+				!strings.Contains(err.Error(), "backchannel.require_approver_identity") {
+				t.Errorf("enforce_hints=%q without require_approver_identity must be rejected naming both keys, got %v", mode, err)
+			}
 		}
 	})
 }

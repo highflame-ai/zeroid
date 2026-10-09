@@ -134,6 +134,7 @@ backchannel:
   # Bind approve/deny to the request's login_hint / group_hint / four_eyes:
   # off (default) | shadow (allow, record would-deny) | on (403 access_denied).
   # group_hint checks need an ApproverAuthorizer (Server.SetApproverAuthorizer).
+  # shadow and on require require_approver_identity: true.
   # Env: ZEROID_BACKCHANNEL_ENFORCE_HINTS
   enforce_hints: "off"
 

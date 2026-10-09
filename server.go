@@ -1366,16 +1366,20 @@ func (s *Server) SetApproverAuthorizer(a ApproverAuthorizer) {
 }
 
 // SetBackchannelRequireApproverIdentity toggles
-// backchannel.require_approver_identity at runtime.
-func (s *Server) SetBackchannelRequireApproverIdentity(require bool) {
+// backchannel.require_approver_identity at runtime. Turning it off while
+// backchannel.enforce_hints is shadow or on is rejected and the setting
+// unchanged; set enforce_hints to off first.
+func (s *Server) SetBackchannelRequireApproverIdentity(require bool) error {
 	if s.backchannelSvc == nil {
-		return
+		return nil
 	}
-	s.backchannelSvc.SetRequireApproverIdentity(require)
+	return s.backchannelSvc.SetRequireApproverIdentity(require)
 }
 
 // SetBackchannelEnforceHints sets backchannel.enforce_hints ("off", "shadow"
-// or "on") at runtime. An unknown mode is rejected and the setting unchanged.
+// or "on") at runtime. An unknown mode, or shadow/on while
+// backchannel.require_approver_identity is false, is rejected and the setting
+// unchanged.
 func (s *Server) SetBackchannelEnforceHints(mode string) error {
 	if s.backchannelSvc == nil {
 		return nil

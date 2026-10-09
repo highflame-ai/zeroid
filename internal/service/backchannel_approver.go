@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/rs/zerolog/log"
@@ -126,21 +127,43 @@ func (s *BackchannelService) SetApproverAuthorizer(a ApproverAuthorizer) {
 	s.approverAuthorizer = a
 }
 
-// SetRequireApproverIdentity toggles backchannel.require_approver_identity at
-// runtime.
-func (s *BackchannelService) SetRequireApproverIdentity(require bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cfg.RequireApproverIdentity = require
+// EnforceHintsActive reports whether mode runs the approver binding checks
+// (shadow or on). Those modes require RequireApproverIdentity.
+func EnforceHintsActive(mode string) bool {
+	return mode == EnforceHintsShadow || mode == EnforceHintsOn
 }
 
-// SetEnforceHints sets backchannel.enforce_hints at runtime.
+// errEnforceHintsNeedsApproverIdentity is returned by the runtime setters for a
+// change that would leave enforce_hints shadow or on without
+// require_approver_identity.
+var errEnforceHintsNeedsApproverIdentity = errors.New(
+	"enforce_hints shadow or on requires require_approver_identity=true")
+
+// SetRequireApproverIdentity toggles backchannel.require_approver_identity at
+// runtime. Turning it off while enforce_hints is shadow or on is refused and
+// leaves the setting unchanged.
+func (s *BackchannelService) SetRequireApproverIdentity(require bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !require && EnforceHintsActive(s.cfg.EnforceHints) {
+		return errEnforceHintsNeedsApproverIdentity
+	}
+	s.cfg.RequireApproverIdentity = require
+	return nil
+}
+
+// SetEnforceHints sets backchannel.enforce_hints at runtime. shadow and on are
+// refused unless require_approver_identity is true; a refused or unknown mode
+// leaves the setting unchanged.
 func (s *BackchannelService) SetEnforceHints(mode string) error {
 	if !ValidEnforceHints(mode) {
 		return fmt.Errorf("enforce_hints must be one of off, shadow, on (got %q)", mode)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if EnforceHintsActive(mode) && !s.cfg.RequireApproverIdentity {
+		return errEnforceHintsNeedsApproverIdentity
+	}
 	s.cfg.EnforceHints = mode
 	return nil
 }

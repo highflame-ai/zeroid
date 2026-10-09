@@ -130,7 +130,8 @@ type BackchannelConfig struct {
 	// login_hint set → the approver must be that user; four_eyes set → the
 	// approver must not be requester_owner; group_hint set → the
 	// ApproverAuthorizer (Server.SetApproverAuthorizer) must allow, and with
-	// none installed the check fails.
+	// none installed the check fails. shadow and on require
+	// RequireApproverIdentity.
 	//
 	//   off    (default) no checks.
 	//   shadow evaluate, always allow, record shadow_would_deny/shadow_reason on
@@ -551,6 +552,12 @@ func (c *Config) Validate() error {
 
 	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
 		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
+	}
+	// The binding checks compare against the authenticated approver; with
+	// require_approver_identity off the approver can come from the request
+	// body, so the checks would record a result they did not establish.
+	if service.EnforceHintsActive(c.Backchannel.EnforceHints) && !c.Backchannel.RequireApproverIdentity {
+		return fmt.Errorf("backchannel.enforce_hints=%s requires backchannel.require_approver_identity=true", c.Backchannel.EnforceHints)
 	}
 	if _, err := c.Backchannel.resolvedRetention(); err != nil {
 		return err

@@ -575,12 +575,14 @@ func TestCIBAApproverHTTP(t *testing.T) {
 	testZeroIDServer.SetBackchannelNotifyDispatchSync(true)
 	t.Cleanup(func() {
 		testZeroIDServer.SetBackchannelNotifyDispatchSync(false)
-		testZeroIDServer.SetBackchannelRequireApproverIdentity(false)
 		require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("off"))
+		require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(false))
 	})
-	testZeroIDServer.SetBackchannelRequireApproverIdentity(true)
+	require.Error(t, testZeroIDServer.SetBackchannelEnforceHints("on"), "enforce_hints needs require_approver_identity")
+	require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(true))
 	require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("on"))
 	require.Error(t, testZeroIDServer.SetBackchannelEnforceHints("strict"), "unknown modes are rejected")
+	require.Error(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(false), "require_approver_identity stays on while enforce_hints is on")
 
 	newRequest := func(t *testing.T, loginHint string) string {
 		t.Helper()
@@ -980,12 +982,12 @@ func TestCIBARequestingToken(t *testing.T) {
 // authorization_details entry carries approval_id and approver_auth.
 func TestCIBAApprovalKeepsRequestingSubject(t *testing.T) {
 	authz := &recordingAuthorizer{decision: zeroid.ApproverDecision{Allowed: true, SatisfiedHint: "group_hint"}}
-	testZeroIDServer.SetBackchannelRequireApproverIdentity(true)
+	require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(true))
 	require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("on"))
 	testZeroIDServer.SetApproverAuthorizer(authz)
 	t.Cleanup(func() {
-		testZeroIDServer.SetBackchannelRequireApproverIdentity(false)
 		require.NoError(t, testZeroIDServer.SetBackchannelEnforceHints("off"))
+		require.NoError(t, testZeroIDServer.SetBackchannelRequireApproverIdentity(false))
 		testZeroIDServer.SetApproverAuthorizer(nil)
 	})
 
