@@ -474,6 +474,21 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
 	}
+	// Discovery never modifies an approval channel: its configuration
+	// (metadata included) is managed only through trusted writes. The row is
+	// returned unchanged.
+	channel, err := s.IsApprovalChannel(ctx, identity)
+	if err != nil {
+		return nil, false, err
+	}
+	if channel {
+		log.Info().
+			Str("identity_id", identity.ID).
+			Str("external_id", identity.ExternalID).
+			Str("origin", string(req.Origin)).
+			Msg("discovery reconcile skipped an approval-channel identity")
+		return identity, false, nil
+	}
 	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
 	// ingested manually first, then a connector picked it up). Never overwrite a
