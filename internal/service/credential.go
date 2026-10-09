@@ -883,6 +883,12 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialExpired)
 	}
 
+	// A credential carrying ciba:approve is rotated only by a trusted
+	// approval-channel caller, checked before anything is revoked.
+	if slices.Contains(old.Scopes, domain.ScopeCIBAApprove) && !TrustedApprovalChannelWrite(ctx) {
+		return nil, nil, ErrApprovalChannelWriteNotTrusted
+	}
+
 	// Revoke the old credential (cascades to descendants and fires the
 	// RevocationNotifier per affected JTI, same as any other revoke path).
 	revoked, err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated")
@@ -898,6 +904,9 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		TTL:                   old.TTLSeconds,
 		GrantType:             old.GrantType,
 		ResolveIdentityPolicy: true,
+		// An admin rotation by a trusted approval-channel caller may carry
+		// ciba:approve forward.
+		ChannelTrustedCredential: TrustedApprovalChannelWrite(ctx),
 	})
 }
 
