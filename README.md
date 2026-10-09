@@ -920,8 +920,12 @@ only to identities that list it explicitly — in the identity's `allowed_scopes
 credential policy that governs the issuance — and never to `agent` or `mcp_server`
 identities. An empty scope ceiling never yields it. Register such a service with
 `identity_type: service` and `sub_type: approval_channel` so a gateway can recognise it
-from the token's `sub_type` claim. If your admin API serves several caller classes, let
-only the most trusted one set that sub-type or list the scope.
+from the token's `sub_type` claim. Admin writes that set `sub_type: approval_channel` or
+put `ciba:approve` on an identity, a credential policy or an API key (directly or by
+attaching a policy that lists it) are refused with 403 unless your `AdminAuth` layer marks
+the request with `zeroid.WithTrustedApprovalChannelWrite(ctx)`; set it for your most
+trusted caller class only. The check runs on the decoded request values, so it does not
+depend on how the body was spelled.
 
 | Method | Path | Description |
 |--------|------|-------------|

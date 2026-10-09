@@ -706,7 +706,7 @@ func TestCIBAApproveScopeRefusedForAgentIdentity(t *testing.T) {
 		"trust_level":    "first_party",
 		"created_by":     "test-user",
 		"allowed_scopes": []string{"tools:read", "ciba:approve"},
-	}, adminHeaders())
+	}, channelWriteHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	apiKey, _ := decode(t, resp)["api_key"].(string)
 	require.NotEmpty(t, apiKey)
@@ -730,8 +730,8 @@ func TestCIBAApproveScopeRefusedForAgentIdentity(t *testing.T) {
 	_ = ok.Body.Close()
 }
 
-// registerServiceIdentity registers a service identity through the admin API
-// and returns its bootstrap API key.
+// registerServiceIdentity registers a service identity through the admin API,
+// as a trusted approval-channel write, and returns its bootstrap API key.
 func registerServiceIdentity(t *testing.T, identityType, subType string, allowedScopes []string, policyID string) string {
 	t.Helper()
 	externalID := uid("svc-ciba-approve")
@@ -750,7 +750,7 @@ func registerServiceIdentity(t *testing.T, identityType, subType string, allowed
 	if policyID != "" {
 		body["credential_policy_id"] = policyID
 	}
-	resp := post(t, adminPath("/agents/register"), body, adminHeaders())
+	resp := post(t, adminPath("/agents/register"), body, channelWriteHeaders())
 	require.Equal(t, http.StatusCreated, resp.StatusCode)
 	apiKey, _ := decode(t, resp)["api_key"].(string)
 	require.NotEmpty(t, apiKey)
@@ -800,7 +800,7 @@ func TestCIBAApproveScopeRequiresExplicitListing(t *testing.T) {
 			"max_ttl_seconds":     3600,
 			"allowed_grant_types": []string{"api_key"},
 			"allowed_scopes":      []string{"ciba:approve"},
-		}, adminHeaders())
+		}, channelWriteHeaders())
 		require.Equal(t, http.StatusCreated, pol.StatusCode)
 		policyID, _ := decode(t, pol)["id"].(string)
 		require.NotEmpty(t, policyID)
@@ -816,7 +816,7 @@ func TestCIBAApproveScopeRequiresExplicitListing(t *testing.T) {
 		resp := post(t, adminPath("/agents/register"), map[string]any{
 			"name": externalID, "external_id": externalID,
 			"identity_type": "agent", "sub_type": "approval_channel", "created_by": "test-user",
-		}, adminHeaders())
+		}, channelWriteHeaders())
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		_ = resp.Body.Close()
 	})

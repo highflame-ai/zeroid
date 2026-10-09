@@ -135,6 +135,9 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Metadata:           input.Body.Metadata,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		// Neither identity_id nor product supplied — the key has no identity to
 		// link. A caller-side omission, so return 400 naming both fields
 		// instead of a 500 from the failed UUID cast at insert time.

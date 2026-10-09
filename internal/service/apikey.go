@@ -87,6 +87,13 @@ type CreateAPIKeyResponse struct {
 // policy; the tenant's default policy is auto-created and assigned only when the
 // identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, "", req.Scopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.credentialPolicySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	// Every key has an identity link, and the caller supplies one of the two
 	// ways to establish it. Reject the empty case here rather than letting an
 	// unlinked key reach the insert, where the empty IdentityID fails the

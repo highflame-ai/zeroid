@@ -17,11 +17,23 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
+// approvalChannelWriteError maps a write refused for lacking a trusted
+// approval-channel context to 403, or returns nil for any other error.
+func approvalChannelWriteError(err error) error {
+	if errors.Is(err, service.ErrApprovalChannelWriteNotTrusted) {
+		return huma.Error403Forbidden(err.Error())
+	}
+	return nil
+}
+
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
 // Internal details are logged server-side; only generic messages are returned to clients.
 func mapErr(err error) error {
 	if err == nil {
 		return nil
+	}
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
 	}
 	// Typed sentinels first. Service-layer callers wrap with these so
 	// callers see a 400 instead of a 500 on caller-fixable states.
@@ -351,6 +363,9 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		// A collision with a soft-deleted identity is actionable — surface the
 		// existing id so the caller can reactivate it instead of being stuck
 		// behind an opaque 409 for a row hidden from the active registry view.

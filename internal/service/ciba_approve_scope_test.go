@@ -86,3 +86,28 @@ func TestApprovalChannelSubTypeValidOnlyForService(t *testing.T) {
 		}
 	}
 }
+
+func TestRequireTrustedApprovalChannelWrite(t *testing.T) {
+	ctx := context.Background()
+	trusted := WithTrustedApprovalChannelWrite(ctx)
+	if TrustedApprovalChannelWrite(ctx) || !TrustedApprovalChannelWrite(trusted) {
+		t.Fatal("the trusted mark is off by default and on once set")
+	}
+	for _, tc := range []struct {
+		sub    domain.SubType
+		scopes []string
+	}{
+		{domain.SubTypeApprovalChannel, nil},
+		{"", []string{"tools:read", domain.ScopeCIBAApprove}},
+	} {
+		if err := requireTrustedApprovalChannelWrite(ctx, tc.sub, tc.scopes); !errors.Is(err, ErrApprovalChannelWriteNotTrusted) {
+			t.Fatalf("%v %v: expected refusal, got %v", tc.sub, tc.scopes, err)
+		}
+		if err := requireTrustedApprovalChannelWrite(trusted, tc.sub, tc.scopes); err != nil {
+			t.Fatalf("%v %v: trusted write refused: %v", tc.sub, tc.scopes, err)
+		}
+	}
+	if err := requireTrustedApprovalChannelWrite(ctx, domain.SubTypeLLMProvider, []string{"tools:read"}); err != nil {
+		t.Fatalf("ordinary write refused: %v", err)
+	}
+}

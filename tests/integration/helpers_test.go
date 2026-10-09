@@ -92,6 +92,11 @@ const testTrustedServiceHeader = "X-Test-Trusted-Service"
 // sets a session-authenticated zeroid.ApproverIdentity with this subject.
 const testApproverSubHeader = "X-Test-Approver-Sub"
 
+// testApprovalChannelWriteHeader stands in for a deployer's most trusted admin
+// caller: when present, the test global middleware marks the request with
+// zeroid.WithTrustedApprovalChannelWrite.
+const testApprovalChannelWriteHeader = "X-Test-Approval-Channel-Write"
+
 // testInteractiveLoginURL is the stub consent surface for the #276 tests.
 const testInteractiveLoginURL = "https://studio.example.test/login"
 
@@ -311,6 +316,9 @@ func runTests(m *testing.M) int {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Header.Get(testTrustedServiceHeader) != "" {
 				r = r.WithContext(context.WithValue(r.Context(), trustedServiceCtxKey{}, r.Header.Get(testTrustedServiceHeader)))
+			}
+			if r.Header.Get(testApprovalChannelWriteHeader) != "" {
+				r = r.WithContext(zeroid.WithTrustedApprovalChannelWrite(r.Context()))
 			}
 			if sub := r.Header.Get(testApproverSubHeader); sub != "" {
 				r = r.WithContext(zeroid.WithApproverIdentity(r.Context(), zeroid.ApproverIdentity{

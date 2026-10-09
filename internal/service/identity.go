@@ -149,6 +149,13 @@ type RegisterIdentityRequest struct {
 // is adopted (identity-lifecycle.md). The discovery service reaches this path
 // through UpsertDiscoveredIdentity (idempotent on external_id), not directly.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.policySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	if req.Origin == "" {
 		req.Origin = domain.OriginNative
 	}
@@ -346,6 +353,10 @@ type DiscoveredIdentityRequest struct {
 //
 // Returns the resulting identity and whether it was newly created.
 func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, nil); err != nil {
+		return nil, false, err
+	}
 	if !req.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
 	}
@@ -820,6 +831,15 @@ type UpdateIdentityRequest struct {
 
 // UpdateIdentity updates mutable fields of an existing identity.
 func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, projectID string, req UpdateIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if req.CredentialPolicyID != nil {
+		if err := requireTrustedPolicyAttachment(ctx, s.policySvc, *req.CredentialPolicyID, accountID, projectID); err != nil {
+			return nil, err
+		}
+	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
