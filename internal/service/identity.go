@@ -262,20 +262,23 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
 		PublicKeyPEM:       req.PublicKeyPEM,
-		Framework:          req.Framework,
-		Version:            req.Version,
-		Publisher:          req.Publisher,
-		Description:        req.Description,
-		Capabilities:       req.Capabilities,
-		Labels:             req.Labels,
-		Metadata:           req.Metadata,
-		CapabilityTier:     req.CapabilityTier,
-		RiskTier:           req.RiskTier,
-		IAL:                req.IAL,
-		ExpiresAt:          req.ExpiresAt,
-		CreatedBy:          req.CreatedBy,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		// The register gate above already refused an untrusted approval
+		// channel, so only the mark itself is recorded here.
+		PublicKeyChannelTrusted: req.PublicKeyPEM != "" && TrustedApprovalChannelWrite(ctx),
+		Framework:               req.Framework,
+		Version:                 req.Version,
+		Publisher:               req.Publisher,
+		Description:             req.Description,
+		Capabilities:            req.Capabilities,
+		Labels:                  req.Labels,
+		Metadata:                req.Metadata,
+		CapabilityTier:          req.CapabilityTier,
+		RiskTier:                req.RiskTier,
+		IAL:                     req.IAL,
+		ExpiresAt:               req.ExpiresAt,
+		CreatedBy:               req.CreatedBy,
+		CreatedAt:               time.Now(),
+		UpdatedAt:               time.Now(),
 	}
 
 	if err := s.repo.Create(ctx, identity); err != nil {
@@ -732,7 +735,11 @@ func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, proje
 	if err != nil {
 		return nil, err
 	}
+	if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
 	identity.PublicKeyPEM = publicKeyPEM
+	identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -878,7 +885,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
 			return nil, err
 		}
+		if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+			return nil, err
+		}
 		identity.PublicKeyPEM = req.PublicKeyPEM
+		identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	}
 	if req.Framework != nil {
 		identity.Framework = *req.Framework

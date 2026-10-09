@@ -140,6 +140,11 @@ type IssueRequest struct {
 	// (nested actors included), taking precedence over DelegatedBy and
 	// ActingUserID. Used to carry an existing chain's act unchanged.
 	ActClaim map[string]any
+	// ChannelTrustedCredential reports that the credential presented for this
+	// issuance (API key, OAuth client or public key) was written by a caller
+	// marked with WithTrustedApprovalChannelWrite. ciba:approve is issued only
+	// when it is set; grants that present no such credential leave it false.
+	ChannelTrustedCredential bool
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
@@ -320,6 +325,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// yields this one.
 	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !s.cibaApproveListed(ctx, req) {
 		return nil, nil, fmt.Errorf("%w: %q is issued only to identities that list it explicitly", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
+	}
+	// ... and only from a credential written in the trusted approval-channel
+	// context, so a credential obtained any other way never carries it.
+	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !req.ChannelTrustedCredential {
+		return nil, nil, fmt.Errorf("%w: %q is issued only from a credential created by a trusted approval-channel write", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
 	}
 
 	// Dual-read legacy fallback: if the identity has a non-empty AllowedScopes

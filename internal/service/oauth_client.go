@@ -306,6 +306,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		ClientNotificationEndpoint:   req.ClientNotificationEndpoint,
 		BackchannelTokenDeliveryMode: deliveryMode,
 		RegistrationSource:           "internal",
+		ChannelTrusted:               TrustedApprovalChannelWrite(ctx),
 		IsActive:                     true,
 		CreatedAt:                    now,
 		UpdatedAt:                    now,
@@ -394,6 +395,11 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	client, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, "", ErrOAuthClientNotFound
+	}
+	// A client registered in the trusted approval-channel context gets a new
+	// secret only from a caller in that context (approval_channel_write.go).
+	if client.ChannelTrusted && !TrustedApprovalChannelWrite(ctx) {
+		return nil, "", ErrApprovalChannelWriteNotTrusted
 	}
 	// Minting a secret for a key-based client would recreate exactly the
 	// two-credential state registration refuses: the secret is unusable on the

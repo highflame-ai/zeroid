@@ -111,3 +111,22 @@ func TestRequireTrustedApprovalChannelWrite(t *testing.T) {
 		t.Fatalf("ordinary write refused: %v", err)
 	}
 }
+
+// TestCIBAApproveRequiresTrustedCredential pins that ciba:approve is refused
+// when the presented credential was not written in the trusted
+// approval-channel context, even for an identity that lists the scope.
+func TestCIBAApproveRequiresTrustedCredential(t *testing.T) {
+	svc := NewCredentialService(nil, nil, nil, nil, "https://issuer.example.test", 900, 3600, 30)
+	_, _, err := svc.IssueCredential(context.Background(), IssueRequest{
+		Identity: &domain.Identity{
+			IdentityType:  domain.IdentityTypeService,
+			SubType:       domain.SubTypeApprovalChannel,
+			Status:        domain.IdentityStatusActive,
+			AllowedScopes: []string{domain.ScopeCIBAApprove},
+		},
+		Scopes: []string{domain.ScopeCIBAApprove},
+	})
+	if !errors.Is(err, ErrScopesNotAllowed) {
+		t.Fatalf("expected ErrScopesNotAllowed, got %v", err)
+	}
+}

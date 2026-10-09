@@ -460,6 +460,10 @@ type Identity struct {
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
 	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
 	PublicKeyPEM       string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
+	// PublicKeyChannelTrusted records that PublicKeyPEM was last written by a
+	// caller marked with WithTrustedApprovalChannelWrite. ciba:approve is
+	// issued on the jwt-bearer grant only when it is set.
+	PublicKeyChannelTrusted bool `bun:"public_key_channel_trusted,notnull" json:"-"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.
 	Framework    string          `bun:"framework,type:varchar(100)"  json:"framework,omitempty"`

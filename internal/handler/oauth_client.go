@@ -152,7 +152,14 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		if terr != nil {
 			return nil, huma.Error401Unauthorized("missing tenant context")
 		}
-		if _, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
+		bound, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID)
+		if err == nil {
+			// A client bound to an approval channel is a credential for it.
+			if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, bound); err != nil {
+				return nil, oauthClientWriteError(err)
+			}
+		}
+		if err != nil {
 			// Distinguish caller-fixable not-found-in-tenant (400) from
 			// transient DB errors (500). The repo wraps sql.ErrNoRows in
 			// its "failed to get identity" string, so unwrap to get the
@@ -162,6 +169,23 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 			}
 			log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("identity lookup failed during oauth client create")
 			return nil, huma.Error500InternalServerError("failed to validate identity_id")
+		}
+	}
+
+	// client_credentials resolves the identity whose external_id equals the
+	// client_id, so a client named after an approval channel in the caller's
+	// tenant is a credential for it. Other tenants are covered at issuance:
+	// ciba:approve is minted only from a client registered in the trusted
+	// context.
+	if tenant, terr := internalMiddleware.GetTenant(ctx); terr == nil && input.Body.ClientID != "" {
+		named, err := a.identitySvc.GetIdentityByExternalID(ctx, input.Body.ClientID, tenant.AccountID, tenant.ProjectID)
+		if err == nil {
+			if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, named); err != nil {
+				return nil, oauthClientWriteError(err)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			log.Error().Err(err).Msg("identity lookup failed during oauth client create")
+			return nil, huma.Error500InternalServerError("failed to validate client_id")
 		}
 	}
 
@@ -242,6 +266,9 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientCreatedOutput, error) {
 	client, plainSecret, err := a.oauthClientSvc.RotateSecret(ctx, input.ID)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
 		}
@@ -266,4 +293,14 @@ func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput
 	out.Body.Deleted = true
 	out.Body.ID = input.ID
 	return out, nil
+}
+
+// oauthClientWriteError maps a refused approval-channel write to 403 and any
+// other failure of the check to 500.
+func oauthClientWriteError(err error) error {
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
+	}
+	log.Error().Err(err).Msg("approval-channel check failed during oauth client create")
+	return huma.Error500InternalServerError("failed to validate the client's identity")
 }

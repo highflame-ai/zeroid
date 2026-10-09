@@ -371,7 +371,11 @@ func ApproverIdentityFromContext(ctx context.Context) (ApproverIdentity, bool) {
 // the deployer trusts to create and manage CIBA approval channels. Without
 // the mark, admin writes that set sub_type approval_channel, or put the
 // ciba:approve scope on an identity, a credential policy or an API key
-// (directly or by attaching a policy that lists it), are refused with 403.
+// (directly or by attaching a policy that lists it), are refused with 403, as
+// are writes that issue a credential for an approval channel: API keys, key
+// rotation, public keys, OAuth clients bound to or named after it, and secret
+// rotation for a client registered with the mark. ciba:approve is minted only
+// from an API key, OAuth client or public key written with the mark.
 // Set it in the AdminAuth layer for the most trusted caller class only.
 func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
 	return service.WithTrustedApprovalChannelWrite(ctx)

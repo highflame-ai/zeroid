@@ -802,6 +802,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: client.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -932,6 +934,8 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeJWTBearer,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: identity.PublicKeyChannelTrusted,
 	})
 	if err != nil {
 		return nil, err
@@ -1601,6 +1605,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: sk.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 

@@ -119,6 +119,11 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to load identity %s: %w", req.IdentityID, err)
 	}
+	// A key for an approval channel, including one that inherits the
+	// channel's ceiling, needs a trusted caller (approval_channel_write.go).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
 
 	// Ensure the key has a credential policy.
 	// Two layers of validation run here:
@@ -240,6 +245,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ExpiresAt:          expiresAt,
 		State:              domain.APIKeyStateActive,
 		Metadata:           metadata,
+		ChannelTrusted:     TrustedApprovalChannelWrite(ctx),
 	}
 
 	if err := s.repo.Create(ctx, sk); err != nil {

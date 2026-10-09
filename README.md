@@ -925,7 +925,15 @@ put `ciba:approve` on an identity, a credential policy or an API key (directly o
 attaching a policy that lists it) are refused with 403 unless your `AdminAuth` layer marks
 the request with `zeroid.WithTrustedApprovalChannelWrite(ctx)`; set it for your most
 trusted caller class only. The check runs on the decoded request values, so it does not
-depend on how the body was spelled.
+depend on how the body was spelled. The same mark is required to issue any credential for an
+approval channel (an identity with `sub_type: approval_channel` or whose scope ceiling lists
+`ciba:approve`): API keys, including keys that inherit the identity's ceiling, key rotation,
+`public_key_pem` writes, and OAuth clients bound to the identity or whose `client_id` is its
+`external_id`, plus rotating the secret of a client registered under the mark.
+`ciba:approve` is then minted only from an API key, OAuth client or public key that was
+written under the mark, so credentials obtained before an identity became an approval
+channel do not carry it. Clients declared in configuration are registered under the mark
+only when `Server.EnsureClient` is called with a marked context.
 
 | Method | Path | Description |
 |--------|------|-------------|
