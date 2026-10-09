@@ -4,7 +4,7 @@ name: Release Build - Zeroid
 # that commit to main, then creates the GitHub release on that same
 # commit. The tag is created only after go.mod names it.
 #
-# The release event then tags pkg/jwks, pkg/dpop and pkg/authjwt, tests,
+# The tag push then tags pkg/jwks, pkg/dpop and pkg/authjwt, tests,
 # builds binaries, and triggers highflame-cloud. The cloud workflow
 # clones that tag. It receives RELEASE_VER after the tag exists.
 on:
@@ -34,7 +34,7 @@ env:
 
 jobs:
   highflame-validate:
-    if: github.event_name == 'release'
+    if: github.event_name == 'push'
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -157,7 +157,7 @@ jobs:
           echo "✓ make release-prep version matches release tag ${TAG}"
 
   tag-submodules:
-    if: github.event_name == 'release'
+    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -204,7 +204,7 @@ jobs:
           done
 
   highflame-sast:
-    if: github.event_name == 'release'
+    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -240,7 +240,7 @@ jobs:
           make test-integration
 
   highflame-goreleaser:
-    if: github.event_name == 'release'
+    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
@@ -288,7 +288,7 @@ jobs:
           args: release --clean
 
   highflame-trigger:
-    if: github.event_name == 'release'
+    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
