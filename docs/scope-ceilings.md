@@ -63,7 +63,8 @@ Layers, each optional; an empty layer places no restriction:
 | Layer | Applies to |
 |---|---|
 | The identity's `allowed_scopes` | every token for the identity: the absolute ceiling |
-| The identity's credential policy `allowed_scopes` | every token for the identity |
+| The identity's credential policy `allowed_scopes` | every token for the identity, except a chain acting for a person |
+| The credential policy's `user_grant_scopes` | a token-exchange hop whose chain acts for a person, in place of the policy's `allowed_scopes` (empty: no extra cap from the policy) |
 | The API key's scopes and its own credential policy | `api_key` tokens |
 | The OAuth client's registered scopes | `client_credentials` and `authorization_code` |
 | The subject token's scopes | token exchange: a child never exceeds its parent |
@@ -103,7 +104,7 @@ Rules:
 | Registration (`POST /identities`, `PATCH /identities/{id}`, `POST /agents/register`) | Stores the ceiling. No check that it is a subset of the policy, or the reverse: the intersection at issuance makes either order safe |
 | API key with its own policy | The key's policy must be a subset of the identity's policy; the identity ceiling then applies on top |
 | `client_credentials`, `jwt_bearer`, `api_key` | Scopes = request ∩ client or key scopes ∩ key policy ∩ identity policy ∩ identity ceiling; an omitted request gets the narrowest layer; nothing left is refused |
-| Token exchange (agent to sub-agent) | Scopes = request ∩ the subject token's scopes ∩ the actor's policy ∩ the actor's ceiling; every hop narrows; a denial names the layer that excluded each scope |
+| Token exchange (agent to sub-agent) | Scopes = request ∩ the subject token's scopes ∩ the actor's policy ∩ the actor's ceiling; every hop narrows; a denial names the layer that excluded each scope. When the chain acts for a person, the actor's policy term is its `user_grant_scopes`; the actor's ceiling still binds |
 | `authorization_code`, refresh, ID-JAG, ID-token exchange, broker exchange, CIBA | Scopes come from the person's grant and the client; when an identity is linked, a requested scope outside its ceiling or policy is refused at issuance rather than narrowed |
 | Refresh after a ceiling or policy changed | The refreshed token is re-checked against the current layers; a scope now outside them fails the refresh |
 | Ceiling or policy changed with tokens outstanding | Issued tokens keep their scopes until they expire; new grants and new delegations use the current layers |
