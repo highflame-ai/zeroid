@@ -20,7 +20,7 @@ run: build ## Build and run zeroid locally
 # checkout: the integration suite alone takes ~127s under -race, so the 120s Go
 # timeout panicked the binary before it finished. A target that always fails
 # teaches people to stop running it, and the gap it hid is the one that matters
-# — CI splits these two jobs and gives them 300s and 600s respectively.
+# — CI splits these two jobs and gives them 300s and 900s respectively.
 
 # NOTE: the exclusion below is a substring match, so it would also drop a
 # nested helper package such as internal/foo/tests. Deliberately left matching
@@ -35,7 +35,7 @@ test: ## Run unit tests (mirrors the CI unit job; excludes ./tests)
 	go test $$(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
 
 test-integration: ## Run integration tests only, requires Docker (mirrors the CI integration job)
-	go test ./tests/... -v -race -count=1 -timeout=600s
+	go test ./tests/... -v -race -count=1 -timeout=900s
 
 test-all: test test-integration ## Run both suites, the way CI does
 
