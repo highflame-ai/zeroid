@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -224,6 +225,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ProjectID:          req.ProjectID,
 		IdentityID:         req.IdentityID,
 		CreatedBy:          req.CreatedBy,
+		CreatedActor:       middleware.GetCallerName(ctx),
 		CredentialPolicyID: policyID,
 		Product:            req.Product,
 		Scopes:             scopes,
@@ -287,7 +289,20 @@ func (s *APIKeyService) GetKey(ctx context.Context, id, accountID, projectID str
 // but the common revoke-by-ID path treats both as a silent no-op to avoid
 // leaking cross-tenant existence.
 func (s *APIKeyService) RevokeKey(ctx context.Context, id, accountID, projectID, revokedBy, reason string) (int64, error) {
+	if revokedBy == "" {
+		revokedBy = middleware.SystemCallerPrefix + "unattributed"
+	}
 	return s.repo.Revoke(ctx, id, accountID, projectID, revokedBy, reason)
+}
+
+// revocationActor names who a bulk key revoke is recorded against: the
+// request's caller (a human, or a system: worker that set itself), else the
+// call site's system label.
+func revocationActor(ctx context.Context, fallback string) string {
+	if caller := middleware.GetCallerName(ctx); caller != "" {
+		return caller
+	}
+	return middleware.SystemCallerPrefix + fallback
 }
 
 // generateAPIKey creates a cryptographically random API key with the given prefix.

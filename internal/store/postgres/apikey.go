@@ -196,14 +196,15 @@ func (r *APIKeyRepository) GetActiveByIdentityID(ctx context.Context, identityID
 }
 
 // RevokeByIdentityID revokes all active API keys for an identity.
-func (r *APIKeyRepository) RevokeByIdentityID(ctx context.Context, identityID string) error {
+// revokedBy lands in the key-revoke audit row (migration 047).
+func (r *APIKeyRepository) RevokeByIdentityID(ctx context.Context, identityID, revokedBy, reason string) error {
 	now := time.Now()
 	_, err := r.db.NewUpdate().
 		Model((*domain.APIKey)(nil)).
 		Set("state = ?", domain.APIKeyStateRevoked).
 		Set("revoked_at = ?", now).
-		Set("revoked_by = ?", "system:identity_revocation").
-		Set("revoke_reason = ?", "identity deactivated or key rotated").
+		Set("revoked_by = ?", revokedBy).
+		Set("revoke_reason = ?", reason).
 		Set("updated_at = ?", now).
 		Where("identity_id = ?", identityID).
 		Where("state = ?", domain.APIKeyStateActive).

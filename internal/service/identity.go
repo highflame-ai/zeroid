@@ -1354,7 +1354,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 // CAE signal payload so subscribers can distinguish "deactivated" from
 // "deleted" cleanups.
 func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID); err != nil {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID, revocationActor(ctx, "identity_revocation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Msg("identity cleanup: failed to revoke linked API keys")
 	}

@@ -535,7 +535,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	}
 
 	// Revoke existing keys.
-	s.revokeKeysByIdentity(ctx, identity.ID)
+	s.revokeKeysByIdentity(ctx, identity.ID, "key rotated")
 
 	createdBy := rotationAttribution(identity, middleware.GetCallerName(ctx))
 
@@ -788,8 +788,8 @@ func rotationAttribution(identity *domain.Identity, callerName string) string {
 	return middleware.SystemCallerPrefix + "key_rotation"
 }
 
-func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID); err != nil {
+func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID, reason string) {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID, revocationActor(ctx, "key_rotation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identityID).Msg("Failed to revoke keys for identity")
 	}
 }
