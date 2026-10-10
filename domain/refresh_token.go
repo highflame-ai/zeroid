@@ -58,7 +58,7 @@ type RefreshToken struct {
 	// families can never match another IdP's user of the same name. Copied
 	// verbatim onto every successor row on rotation and read back when the
 	// refresh grant re-mints, so the refreshed token keeps the same principal.
-	// nullzero ⇒ empty on families minted before migration 047.
+	// nullzero ⇒ empty on families minted before migration 048.
 	PrincipalIss string `bun:"principal_iss,nullzero" json:"principal_iss,omitempty"`
 	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
 	// this refresh family was issued for by the external-principal exchange.

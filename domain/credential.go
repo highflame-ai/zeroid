@@ -126,7 +126,7 @@ type IssuedCredential struct {
 	// Written for every credential whatever the tenant's token profile, and
 	// copied unchanged down a delegation chain, so revoking a person reaches
 	// every chain acting for them in one indexed lookup. Empty on rows written
-	// before migration 047. PrincipalSub differs from Subject, which is always
+	// before migration 048. PrincipalSub differs from Subject, which is always
 	// the identity's WIMSE URI.
 	PrincipalType PrincipalType `bun:"principal_type,type:varchar(20),nullzero" json:"principal_type,omitempty"`
 	PrincipalSub  string        `bun:"principal_sub,type:text,nullzero"         json:"principal_sub,omitempty"`

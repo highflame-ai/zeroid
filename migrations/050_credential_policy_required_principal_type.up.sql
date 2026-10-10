@@ -1,4 +1,4 @@
--- 049_credential_policy_required_principal_type.up.sql
+-- 050_credential_policy_required_principal_type.up.sql
 -- A credential policy can require that the chain a token belongs to is rooted
 -- in a person (human-rooted delegation, highflame-authn#224).
 --

@@ -1245,7 +1245,7 @@ func priorActorsOf(token jwt.Token) []domain.Actor {
 // parentPrincipal returns the principal of a subject token's chain, which an
 // exchange passes down unchanged.
 //
-// A parent minted since migration 047 carries its principal on its row. A
+// A parent minted since migration 048 carries its principal on its row. A
 // parent minted before has none, and the design's legacy rule applies:
 //
 //   - At depth 0 the parent's `sub` is genuine — no exchange has rewritten it.
@@ -2938,7 +2938,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		MissionID: oldToken.MissionID,
 		// Keep the principal's issuer across rotation, so a user a federated
 		// IdP vouched for is not re-attributed to ZeroID's own issuer. Empty
-		// on a family minted before migration 047: the chokepoint then derives
+		// on a family minted before migration 048: the chokepoint then derives
 		// it as for any other user subject.
 		PrincipalIss: oldToken.PrincipalIss,
 	}
@@ -3065,7 +3065,7 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	}
 	// The principal comes from the credential row, not the token: legacy
 	// tokens do not carry principal_type, but every credential since migration
-	// 047 records it, so introspection reports it for every tenant. The
+	// 048 records it, so introspection reports it for every tenant. The
 	// principal's identifier is reported beside it because under the legacy
 	// profile an exchanged token's sub is the actor, not the principal, and a
 	// principal_type of user next to an agent's sub would misname the agent as

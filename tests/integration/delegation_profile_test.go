@@ -163,7 +163,7 @@ func principalOf(t *testing.T, token string) principalRow {
 }
 
 // forgetPrincipal clears a credential's persisted principal, making it look
-// like a row minted before migration 047.
+// like a row minted before migration 048.
 func forgetPrincipal(t *testing.T, token string) {
 	t.Helper()
 	jti := decodeJWTPayload(t, token)["jti"].(string)
