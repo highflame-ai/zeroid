@@ -141,3 +141,35 @@ func TestAgentAuthMiddleware_KeyTrustStaysNarrow(t *testing.T) {
 		})
 	}
 }
+
+// Under the rfc8693 token profile an exchanged token's `sub` is the principal,
+// possibly a person, and the presenting agent is the current actor. The
+// middleware must name the agent, or the self-service endpoints that attribute
+// to AgentClaims.Subject would record the person as having acted.
+func TestExtractAgentClaims_RFC8693NamesTheCurrentActor(t *testing.T) {
+	tok := jwt.New()
+	require.NoError(t, tok.Set(jwt.SubjectKey, "alice"))
+	require.NoError(t, tok.Set("principal_type", "user"))
+	require.NoError(t, tok.Set("act", map[string]any{
+		"sub":         "spiffe://zeroid.test/acct/proj/agent/b",
+		"trust_level": "first_party",
+		"act":         map[string]any{"sub": "spiffe://zeroid.test/acct/proj/agent/a"},
+	}))
+
+	got := extractAgentClaims(tok)
+	assert.Equal(t, "spiffe://zeroid.test/acct/proj/agent/b", got.Subject, "the presenting agent is the current actor")
+	assert.Equal(t, "first_party", got.TrustLevel, "the actor's trust level is read from act")
+}
+
+// A legacy-shaped token is read exactly as before: its single-level act names
+// a delegator or an end user, not the presenting agent.
+func TestExtractAgentClaims_LegacyShapeUnchanged(t *testing.T) {
+	tok := jwt.New()
+	require.NoError(t, tok.Set(jwt.SubjectKey, "spiffe://zeroid.test/acct/proj/agent/b"))
+	require.NoError(t, tok.Set("trust_level", "unverified"))
+	require.NoError(t, tok.Set("act", map[string]any{"sub": "alice"}))
+
+	got := extractAgentClaims(tok)
+	assert.Equal(t, "spiffe://zeroid.test/acct/proj/agent/b", got.Subject)
+	assert.Equal(t, "unverified", got.TrustLevel)
+}

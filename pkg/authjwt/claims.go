@@ -69,8 +69,16 @@ type Claims struct {
 	// populated with the root JTI. See zeroid issue #81.
 	MissionID string `json:"mission_id,omitempty"`
 
-	// RFC 8693 delegation
+	// RFC 8693 delegation. Under the rfc8693 token profile this is the current
+	// actor, with prior actors nested in its Actor field. Under the legacy
+	// profile it is a single level whose meaning depends on the grant (the
+	// delegating orchestrator, or the key's creator); read it through
+	// CurrentActor and PriorActors rather than directly.
 	ActorClaims *ActorClaims `json:"act,omitempty"`
+
+	// principalType is the private principal_type claim, present only on
+	// tokens issued under the rfc8693 profile. Read with PrincipalType.
+	principalType string
 
 	// Custom holds any additional claims not mapped to typed fields.
 	// Consuming services can use this for deployment-specific claims
@@ -79,9 +87,78 @@ type Claims struct {
 }
 
 // ActorClaims represents the "act" claim in a delegated token (RFC 8693).
+// Under the rfc8693 profile the outermost act is the current actor and carries
+// its own attributes; prior actors nest in Actor, most recent first, and carry
+// only their subject.
 type ActorClaims struct {
 	Subject string `json:"sub"`
 	Issuer  string `json:"iss,omitempty"`
+
+	// The current actor's own attributes, carried inside act under the
+	// rfc8693 profile because the token's top level describes the principal.
+	IdentityType string `json:"identity_type,omitempty"`
+	TrustLevel   string `json:"trust_level,omitempty"`
+	ExternalID   string `json:"external_id,omitempty"`
+
+	// Actor is the prior actor, if any (RFC 8693 §4.1 nesting).
+	Actor *ActorClaims `json:"act,omitempty"`
+}
+
+// maxActorChain bounds how deep parseActorClaims follows nested act claims.
+// ZeroID caps the chain at 16; this guards against a hostile or malformed
+// token from another issuer that this verifier might be pointed at.
+const maxActorChain = 16
+
+// Principal types reported by PrincipalType.
+const (
+	PrincipalUser     = "user"
+	PrincipalWorkload = "workload"
+	PrincipalUnknown  = "unknown"
+)
+
+// IsLegacyProfile reports whether the token was issued under ZeroID's legacy
+// profile, recognised by the absence of principal_type. Under it an exchanged
+// token's sub is the actor, not the principal, and act is a single level
+// whose meaning depends on the grant.
+func (c *Claims) IsLegacyProfile() bool {
+	return c.principalType == ""
+}
+
+// PrincipalType returns whether the token's chain acts for a person ("user")
+// or a workload ("workload"), or "unknown" for a chain whose principal was
+// lost before principals were tracked. Empty for a legacy-profile token.
+//
+// The resource-server rule (RFC 8693 §4.1): decide on the top-level claims and
+// the current actor. The person behind a call is Subject when PrincipalType is
+// "user"; otherwise there is none.
+func (c *Claims) PrincipalType() string {
+	return c.principalType
+}
+
+// CurrentActor returns the party presenting the token: act.sub for an
+// rfc8693-profile token that has an actor, otherwise sub. A legacy-profile
+// token's act names a delegator or a key's creator rather than the party
+// acting, so for those the current actor is always sub.
+func (c *Claims) CurrentActor() string {
+	if !c.IsLegacyProfile() && c.ActorClaims != nil && c.ActorClaims.Subject != "" {
+		return c.ActorClaims.Subject
+	}
+	return c.Subject
+}
+
+// PriorActors returns the actors before the current one, most recent first,
+// for an rfc8693-profile token. They are audit history, not grounds for access
+// (RFC 8693 §4.1). Nil for a legacy-profile token, whose act is not an actor
+// chain.
+func (c *Claims) PriorActors() []string {
+	if c.IsLegacyProfile() || c.ActorClaims == nil {
+		return nil
+	}
+	var out []string
+	for a := c.ActorClaims.Actor; a != nil && len(out) < maxActorChain; a = a.Actor {
+		out = append(out, a.Subject)
+	}
+	return out
 }
 
 // GetCustomString returns a custom claim value as a string.
@@ -127,6 +204,34 @@ func (c *Claims) RequireScope(scope string) error {
 // Agent returns a typed AgentIdentity if this token represents an NHI
 // (agent, application, service, mcp_server). Returns nil for human tokens.
 func (c *Claims) Agent() *AgentIdentity {
+	// Under the rfc8693 profile an exchanged token's top level describes the
+	// principal, possibly a person; the agent is the current actor, whose
+	// attributes are carried inside act, and the party that delegated to it
+	// is the first prior actor.
+	if !c.IsLegacyProfile() && c.ActorClaims != nil && c.ActorClaims.Subject != "" {
+		act := c.ActorClaims
+		if act.ExternalID == "" {
+			return nil
+		}
+		a := &AgentIdentity{
+			Sub:             act.Subject,
+			ExternalID:      act.ExternalID,
+			IdentityType:    act.IdentityType,
+			SubType:         c.SubType,
+			TrustLevel:      act.TrustLevel,
+			Name:            c.Name,
+			Framework:       c.Framework,
+			Publisher:       c.Publisher,
+			Capabilities:    c.Capabilities,
+			Scopes:          c.Scopes,
+			DelegationDepth: c.DelegationDepth,
+			Owner:           c.OwnerUserID,
+		}
+		if prior := c.PriorActors(); len(prior) > 0 {
+			a.DelegatedBy = prior[0]
+		}
+		return a
+	}
 	if c.ExternalID == "" {
 		return nil
 	}
@@ -268,8 +373,9 @@ func extractClaims(token jwt.Token) *Claims {
 		"status": {}, "name": {}, "framework": {}, "version": {}, "publisher": {},
 		"capabilities": {},
 		"grant_type":   {}, "scopes": {}, "delegation_depth": {},
-		"act":        {},
-		"mission_id": {},
+		"act":            {},
+		"mission_id":     {},
+		"principal_type": {},
 	}
 
 	// RFC 8707 resource binding. Per RFC 8707 the value is a single URI string
@@ -316,6 +422,7 @@ func extractClaims(token jwt.Token) *Claims {
 	c.Scopes = getStringSlice("scopes")
 	c.DelegationDepth = getInt("delegation_depth")
 	c.MissionID = getString("mission_id")
+	c.principalType = getString("principal_type")
 
 	// RFC 8693 delegation. The act claim is a nested object; pull it as
 	// interface{} so parseActorClaims can handle any concrete shape jwx
@@ -343,6 +450,10 @@ func extractClaims(token jwt.Token) *Claims {
 }
 
 func parseActorClaims(raw any) *ActorClaims {
+	return parseActorClaimsDepth(raw, 0)
+}
+
+func parseActorClaimsDepth(raw any, depth int) *ActorClaims {
 	switch v := raw.(type) {
 	case map[string]any:
 		act := &ActorClaims{}
@@ -352,18 +463,27 @@ func parseActorClaims(raw any) *ActorClaims {
 		if iss, ok := v["iss"].(string); ok {
 			act.Issuer = iss
 		}
+		act.IdentityType, _ = v["identity_type"].(string)
+		act.TrustLevel, _ = v["trust_level"].(string)
+		act.ExternalID, _ = v["external_id"].(string)
+		if nested, ok := v["act"]; ok && depth+1 < maxActorChain {
+			act.Actor = parseActorClaimsDepth(nested, depth+1)
+		}
 		return act
 	default:
-		// Try JSON roundtrip for typed maps
+		// Try a JSON roundtrip for typed maps. Decode into a plain map and
+		// re-enter the map branch, not into ActorClaims, whose recursive Actor
+		// field would follow nested act with no regard for maxActorChain.
 		data, err := json.Marshal(raw)
 		if err != nil {
 			return nil
 		}
-		act := &ActorClaims{}
-		if err := json.Unmarshal(data, act); err != nil {
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
 			return nil
 		}
-		if act.Subject == "" {
+		act := parseActorClaimsDepth(m, depth)
+		if act == nil || act.Subject == "" {
 			return nil
 		}
 		return act

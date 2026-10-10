@@ -221,8 +221,15 @@ CIBA) sign with **RS256**. The claims below are emitted for the relevant NHI;
 the ones flagged *agent-shaped* characterise an Agent Identity
 (`identity_type = agent`, Section 3.2) and are normally absent on a plain
 service, application, or MCP-server NHI. The `kid` header selects the verifying key
-from the JWKS; `typ` is `JWT`. Beyond the RFC 7519 registered claims, ZeroID
-emits the following.
+from the JWKS. `typ` is `at+jwt` (RFC 9068 §2.1) under either token profile,
+unless the identity's credential policy sets `jwt_typ = JWT` so the token stays
+a conformant JWT-SVID (JWT-SVID
+§2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
+not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
+
+Each tenant issues in one **token profile** (Section 4.4): `legacy`, the
+default, or `rfc8693`, which adopts the RFC 8693 delegation semantics. Claims
+below are common to both unless marked.
 
 ### 4.1 Tenancy and grant claims (always present)
 
@@ -232,6 +239,8 @@ emits the following.
 | `project_id` | string | Tenant project scope. |
 | `grant_type` | string | The grant that minted this credential. Most grants serialize in short form: `client_credentials`, `jwt_bearer`, `token_exchange`, `api_key`, `authorization_code`, `refresh_token`. CIBA is the exception — its claim value is the full URN `urn:openid:params:grant-type:ciba`. (Note: on the **request** the `grant_type` parameter for `token_exchange` and `jwt_bearer` uses the full IETF URN forms, e.g. `urn:ietf:params:oauth:grant-type:token-exchange`; the **claim** uses the short form for those two. CIBA matches in both places.) |
 | `mission_id` | string | Delegation-tree identifier; see Section 5.4. Always present. Opaque to consumers. |
+| `client_id` | string | RFC 9068 §2.2: the OAuth client the token was issued to. On an exchanged token this is the actor (its `external_id`); on `authorization_code`, `refresh_token`, ID-JAG and ID-token exchange it is the authenticated client. |
+| `principal_type` | string | *`rfc8693` profile only.* Whether `sub` is a person (`user`) or a workload (`workload`), or `unknown` for a chain exchanged from a delegated parent minted before principals were recorded. A private claim (RFC 7519 §4.3): no standard claim types `sub`. ZeroID records the principal of every credential for every tenant whatever the profile, and introspection reports it as `principal_type`, `principal_sub` and `principal_iss`, so a legacy token, whose `sub` is the actor, still names its principal. |
 
 `aud` is always present; when the request supplies no audience it defaults to
 the issuer URL (JWT-SVID §3 requires `aud`).
@@ -272,26 +281,57 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
 | Claim | Type | Presence | Description |
 |---|---|---|---|
 | `scopes` | array&lt;string&gt; | when non-empty | Granted scopes. (ZeroID emits the JSON array `scopes`, in addition to the standard space-delimited `scope` on the token *response*.) |
+| `scope` | string | when non-empty, `rfc8693` profile | The RFC 9068 §2.2.3 space-delimited form of `scopes`, emitted beside it until consumers move. |
 | `delegation_depth` | number | when &gt; 0 | Number of `token_exchange` hops from the root; see Section 5.2. Omitted (≡ 0) for a directly-issued credential. |
 | `application_id` | string | when set | OAuth client / application the token was issued for (`api_key`, `authorization_code`). |
 | `user_email` | string | when set | End-user email (human/external-principal/CIBA paths). |
 | `user_name` | string | when set | End-user display name (same paths). |
 
-### 4.4 Delegation actor claim (`act`)
+### 4.4 Delegation: `sub`, `act` and the token profile
 
-ZeroID populates the RFC 8693 §4.1 `act` claim as a single-level object
-`{"sub": "<principal>"}`, used in two mutually-exclusive ways on a given token:
+**`rfc8693` profile.** ZeroID follows RFC 8693 §4.1 delegation semantics:
 
-1. **Agent delegation** (*agent-shaped*) — `act.sub` is the **orchestrator
-   agent's WIMSE URI** (the agent that delegated). Set on `token_exchange`-issued
-   tokens; this is the orchestrator → sub-agent chain of Section 5.
-2. **User context** (any NHI) — `act.sub` is the **end-user id** the NHI is
-   acting for. Set when an NHI acts on behalf of a human (e.g. `jwt_bearer`,
-   `authorization_code`-delegated flows). This case is not agent-specific.
+- `sub` is the **principal** whose authority the chain uses — a person, or the
+  root workload — and is fixed for the life of the chain, through every
+  exchange and refresh (RFC 9068 §2.2). `principal_type` says which. A user
+  principal also carries `user_id_iss`, its issuer: the upstream IdP's for a
+  federated user, otherwise ZeroID's own, forming an RFC 9493 `iss_sub` pair.
+- `act` is the **current actor**, with prior actors nested inside it, most
+  recent first:
+  `{"sub": "<C>", "identity_type": "agent", "trust_level": "...", "external_id": "<c>", "act": {"sub": "<B>", "act": {"sub": "<A>"}}}`.
+  Only workloads appear; the person is never an actor. The current actor's own
+  attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
+  the outermost `act` rather than at the top level, because the top level
+  describes the principal. Prior actors carry only `sub`. On an exchange from a
+  root grant, the root token's `client_id` becomes the first prior actor. The
+  chain is capped at 16 actors for token size; past it the deepest prior actors
+  are dropped, which §4.1 allows because they are informational.
+- A root grant has no `act`. An `api_key` token in particular carries none: the
+  key's creator is not acting, and stays identity metadata in `owner_user_id`.
 
-A token carries at most one `act`. ZeroID's `act` is a single object, not the
-nested `act` chain RFC 8693 permits; the full lineage is reconstructable from
-the `parent_jti` edges rather than by nesting.
+**Rule for resource servers.** Decide on the top-level claims and the current
+actor. The person behind a call is `sub` when `principal_type` is `user`;
+otherwise there is none. The agent is `act.sub`, or `sub` when there is no
+`act`. Nested actors are audit history, not grounds for access.
+
+**`legacy` profile (the default).** `act` is a single-level object
+`{"sub": "<x>"}` whose meaning depends on the grant: on an exchanged token it
+is the parent's `sub` (the delegating agent, or the person after the first hop),
+and `sub` is the actor; on an `api_key` token it is the key's creator. The full
+lineage is reconstructable from the `parent_jti` edges. Consumers should read a
+legacy token's current actor as `sub` (`pkg/authjwt` `CurrentActor()` does).
+Tokens are told apart by `principal_type`, which only the `rfc8693` profile
+emits.
+
+The profile is a per-tenant setting (`PUT /tenant-settings`, `token_profile`).
+Switching a tenant to `rfc8693` revokes its user-subject access tokens
+longer-lived than the short default, cascading to their descendants.
+
+**`may_act` (RFC 8693 §4.4).** When a subject token carries `may_act`, the
+exchange's actor MUST be the party it names (`sub` equal to the actor's WIMSE
+URI; an `iss` member, if present, equal to ZeroID's issuer), or the exchange
+fails with `invalid_grant`. `may_act` is reserved (Section 8); ZeroID does not
+yet emit it.
 
 ### 4.5 Sender-constraint claim (`cnf.jkt`)
 
@@ -359,18 +399,56 @@ that make agent orchestration attributable. The terms **orchestrator** and
 **sub-agent** below are agent roles (Section 3.2); a delegation between
 non-agent NHIs uses the same mechanism without those role labels.
 
-### 5.1 Scope attenuation (three-way intersection)
+### 5.1 Scope attenuation (intersection)
 
 On an NHI delegation exchange the issued scope set **MUST** equal the
-intersection of:
+intersection of (an empty set places no restriction, except the subject token's):
 
 1. the scopes **requested** (`scope` parameter),
 2. the scopes the **orchestrator** (subject_token) actually holds, and
-3. the `allowed_scopes` of the **sub-agent's** (actor) credential policy.
+3. the **actor's ceiling**: the `allowed_scopes` of the sub-agent's credential
+   policy when the chain's principal is a workload, or its `user_grant_scopes`
+   when the principal is a person. An empty `user_grant_scopes` adds no cap; the
+   person's own grant, carried in the subject token's scopes, bounds the chain.
+4. the sub-agent **identity's own** `allowed_scopes`, its absolute ceiling under
+   either principal (see `docs/scope-ceilings.md`). `user_grant_scopes` replaces
+   the policy's `allowed_scopes` for a person's chain; it never lifts the
+   identity's ceiling.
+
+The split ceiling exists because an agent's own authority and what it may hold
+for a person rarely overlap: agents are registered for their own scopes and
+discover the resources they act on at run time. `user_grant_scopes` applies
+wherever the person's grant is itself bounded (a delegated user chain, ID-JAG,
+`authorization_code`, and refresh of an `authorization_code` family); the
+trusted-broker, ID-token and CIBA roots, bounded only by the caller's request,
+keep `allowed_scopes`.
+
+The response carries `issued_token_type`
+(`urn:ietf:params:oauth:token-type:access_token`, RFC 8693 §2.2.1) on every
+exchange mode.
 
 A delegated credential can therefore never hold a scope its delegator lacked,
 nor one the sub-agent's policy forbids. Requesting a scope outside the
 intersection is silently narrowed (the scope is dropped), not granted.
+
+### 5.1a Principal requirement (`required_principal_type`)
+
+A credential policy MAY set `required_principal_type = user`. Every grant the
+identity uses is then refused with `policy_violation` unless the token's chain
+acts for a person: the identity cannot mint its own workload token, and as an
+actor it refuses a workload-rooted subject token. A chain with an `unknown`
+principal never satisfies it. This closes authority laundering, where an agent
+holding both a person's token and its own broader workload token exchanges
+whichever is broader. An API key's policy may require more than its identity's
+policy, never less.
+
+### 5.1b Unbounded scopes (the ceiling rule)
+
+Somewhere in a chain, something other than the requester must bound the scopes.
+ZeroID counts, per identity, tokens issued for a named scope with no configured
+ceiling — a workload whose every ceiling was empty, or a request-bounded user
+root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` — as
+`zeroid_workload_unbounded_scope_total`. These are not yet refused.
 
 ### 5.2 Delegation depth tracking and capping
 
@@ -482,8 +560,18 @@ upstream ID token. The mode:
   (`external_issuers`), keyed by the upstream `iss`. A token whose `iss` is not
   configured **MUST** be rejected (`invalid_request`). The
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
-  here — the JWKS signature check, issuer allowlist, and audience binding *are*
-  the trust anchor.
+  here — the JWKS signature check, issuer allowlist, audience binding and
+  client binding below *are* the trust anchor.
+- **MUST** authenticate the redeeming client (absent client credentials →
+  `invalid_client`), through the same client authentication as ID-JAG, and
+  **MUST** redeem only for the relying party the ID token was issued to (OpenID
+  Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
+  token's `aud` values, `azp`, if present, must equal it, and a token with
+  several audiences must carry `azp`. A mismatch is `invalid_grant`. Without
+  this, anyone holding a person's ID token could mint a token with that person
+  as `sub`. Since an ID token's `aud` is the relying party's `client_id`, the
+  ZeroID client is registered with that same `client_id`, and the issued token
+  carries it as `client_id`.
 - **MUST** verify the ID token's signature against the issuer's JWKS (fetched
   from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
   absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
@@ -653,8 +741,10 @@ iss sub aud exp nbf iat jti
 account_id project_id user_id owner_user_id external_id identity_type
 sub_type trust_level status name framework version publisher capabilities
 scopes grant_type delegation_depth user_email user_name
+# RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
+resource client_id scope may_act
 # ZeroID internal / provenance
-act token_exchange trusted_by user_id_iss
+act token_exchange trusted_by user_id_iss mission_id principal_type
 # RFC 9449 sender-constraint
 cnf
 # Authorization (gated)

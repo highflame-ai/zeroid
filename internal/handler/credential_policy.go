@@ -18,17 +18,20 @@ import (
 
 type CreatePolicyInput struct {
 	Body struct {
-		Name                string     `json:"name" required:"true" minLength:"1" doc:"Policy name (unique per tenant)"`
-		Description         string     `json:"description,omitempty" doc:"Policy description"`
-		MaxTTLSeconds       int        `json:"max_ttl_seconds,omitempty" doc:"Maximum token TTL in seconds"`
-		AllowedGrantTypes   []string   `json:"allowed_grant_types,omitempty" doc:"Permitted OAuth grant types"`
-		AllowedScopes       []string   `json:"allowed_scopes,omitempty" doc:"Permitted OAuth scopes"`
-		RequiredTrustLevel  string     `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
-		RequiredAttestation string     `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
-		MaxDelegationDepth  int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth"`
-		Source              string     `json:"source,omitempty" doc:"Provenance of an auto-derived policy (e.g. 'discovery'); omit for user-authored policies"`
-		SourceKey           string     `json:"source_key,omitempty" doc:"Stable dedup identity within the source; when set, create is idempotent by (source, source_key)"`
-		ExpiresAt           *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
+		Name                  string     `json:"name" required:"true" minLength:"1" doc:"Policy name (unique per tenant)"`
+		Description           string     `json:"description,omitempty" doc:"Policy description"`
+		MaxTTLSeconds         int        `json:"max_ttl_seconds,omitempty" doc:"Maximum token TTL in seconds"`
+		AllowedGrantTypes     []string   `json:"allowed_grant_types,omitempty" doc:"Permitted OAuth grant types"`
+		AllowedScopes         []string   `json:"allowed_scopes,omitempty" doc:"Permitted OAuth scopes"`
+		RequiredTrustLevel    string     `json:"required_trust_level,omitempty" doc:"Minimum trust level required"`
+		RequiredAttestation   string     `json:"required_attestation,omitempty" doc:"Minimum attestation level required"`
+		MaxDelegationDepth    int        `json:"max_delegation_depth,omitempty" doc:"Maximum delegation chain depth"`
+		Source                string     `json:"source,omitempty" doc:"Provenance of an auto-derived policy (e.g. 'discovery'); omit for user-authored policies"`
+		SourceKey             string     `json:"source_key,omitempty" doc:"Stable dedup identity within the source; when set, create is idempotent by (source, source_key)"`
+		ExpiresAt             *time.Time `json:"expires_at,omitempty" doc:"RFC3339 timestamp after which the policy is no longer valid"`
+		UserGrantScopes       []string   `json:"user_grant_scopes,omitempty" doc:"Caps what this identity may hold for a person (tokens acting for a user). allowed_scopes keeps capping its own authority. Omit for no extra cap: the person's own grant bounds the chain."`
+		RequiredPrincipalType string     `json:"required_principal_type,omitempty" enum:"user" doc:"Require that the token's chain is rooted in a person. user: tokens for this identity must be acting for a signed-in person, which also stops the identity minting its own workload tokens. Omit for any principal."`
+		JWTTyp                string     `json:"jwt_typ,omitempty" enum:"at+jwt,JWT" doc:"Access token JOSE typ header, under either token profile. at+jwt (the default) types the token per RFC 9068; JWT keeps it a conformant JWT-SVID for SPIFFE-strict consumers. The two specs disagree, so a token can satisfy only one."`
 	}
 }
 
@@ -62,6 +65,10 @@ type UpdatePolicyInput struct {
 		// ExpiresAt tri-state: omit to leave unchanged, "" to clear (no expiry),
 		// RFC3339 string to set.
 		ExpiresAt *string `json:"expires_at,omitempty" doc:"RFC3339 expiry, or empty string to clear"`
+		// JWTTyp: omit to leave unchanged, "" to reset to the profile default.
+		UserGrantScopes       []string `json:"user_grant_scopes,omitempty" doc:"Caps what this identity may hold for a person; an empty list clears the cap"`
+		RequiredPrincipalType *string  `json:"required_principal_type,omitempty" doc:"user to require a person-rooted chain, or empty string to allow any principal"`
+		JWTTyp                *string  `json:"jwt_typ,omitempty" doc:"Access token typ header: at+jwt or JWT, or empty string to reset to the default (at+jwt)"`
 	}
 }
 
@@ -118,23 +125,29 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 	}
 
 	policy, err := a.credentialPolicySvc.CreatePolicy(ctx, service.CreatePolicyRequest{
-		AccountID:           tenant.AccountID,
-		ProjectID:           tenant.ProjectID,
-		Name:                input.Body.Name,
-		Description:         input.Body.Description,
-		MaxTTLSeconds:       input.Body.MaxTTLSeconds,
-		AllowedGrantTypes:   input.Body.AllowedGrantTypes,
-		AllowedScopes:       input.Body.AllowedScopes,
-		RequiredTrustLevel:  input.Body.RequiredTrustLevel,
-		RequiredAttestation: input.Body.RequiredAttestation,
-		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
-		Source:              input.Body.Source,
-		SourceKey:           input.Body.SourceKey,
-		ExpiresAt:           input.Body.ExpiresAt,
+		AccountID:             tenant.AccountID,
+		ProjectID:             tenant.ProjectID,
+		Name:                  input.Body.Name,
+		Description:           input.Body.Description,
+		MaxTTLSeconds:         input.Body.MaxTTLSeconds,
+		AllowedGrantTypes:     input.Body.AllowedGrantTypes,
+		AllowedScopes:         input.Body.AllowedScopes,
+		RequiredTrustLevel:    input.Body.RequiredTrustLevel,
+		RequiredAttestation:   input.Body.RequiredAttestation,
+		MaxDelegationDepth:    input.Body.MaxDelegationDepth,
+		Source:                input.Body.Source,
+		SourceKey:             input.Body.SourceKey,
+		ExpiresAt:             input.Body.ExpiresAt,
+		JWTTyp:                input.Body.JWTTyp,
+		RequiredPrincipalType: input.Body.RequiredPrincipalType,
+		UserGrantScopes:       input.Body.UserGrantScopes,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNameConflict) {
 			return nil, huma.Error409Conflict("credential policy with this name already exists")
+		}
+		if errors.Is(err, service.ErrInvalidPolicyField) {
+			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("name", input.Body.Name).Msg("failed to create credential policy")
 		return nil, huma.Error500InternalServerError("failed to create credential policy")
@@ -185,16 +198,19 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 	}
 
 	policy, err := a.credentialPolicySvc.UpdatePolicy(ctx, input.ID, tenant.AccountID, tenant.ProjectID, service.UpdatePolicyRequest{
-		Name:                input.Body.Name,
-		Description:         input.Body.Description,
-		MaxTTLSeconds:       input.Body.MaxTTLSeconds,
-		AllowedGrantTypes:   input.Body.AllowedGrantTypes,
-		AllowedScopes:       input.Body.AllowedScopes,
-		RequiredTrustLevel:  input.Body.RequiredTrustLevel,
-		RequiredAttestation: input.Body.RequiredAttestation,
-		MaxDelegationDepth:  input.Body.MaxDelegationDepth,
-		IsActive:            input.Body.IsActive,
-		ExpiresAt:           input.Body.ExpiresAt,
+		Name:                  input.Body.Name,
+		Description:           input.Body.Description,
+		MaxTTLSeconds:         input.Body.MaxTTLSeconds,
+		AllowedGrantTypes:     input.Body.AllowedGrantTypes,
+		AllowedScopes:         input.Body.AllowedScopes,
+		RequiredTrustLevel:    input.Body.RequiredTrustLevel,
+		RequiredAttestation:   input.Body.RequiredAttestation,
+		MaxDelegationDepth:    input.Body.MaxDelegationDepth,
+		IsActive:              input.Body.IsActive,
+		ExpiresAt:             input.Body.ExpiresAt,
+		JWTTyp:                input.Body.JWTTyp,
+		RequiredPrincipalType: input.Body.RequiredPrincipalType,
+		UserGrantScopes:       input.Body.UserGrantScopes,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyNotFound) {
