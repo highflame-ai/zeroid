@@ -160,9 +160,15 @@ type OAuthClientConfig struct {
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted
-// internal service that is allowed to perform external principal token exchange
-// (RFC 8693). Implementations read from context (set by deployer-provided global
-// middleware) and return the service name on success, or an error to reject.
+// internal service. Implementations read from context (set by deployer-provided
+// global middleware) and return the service name on success, or an error to
+// reject. A trusted caller may:
+//
+//   - perform the external principal token exchange (RFC 8693);
+//   - send a requesting_token on POST /oauth2/bc-authorize from a public CIBA
+//     client, binding the request (and the token later issued for it) to that
+//     token's chain. Without a trusted caller, requesting_token is accepted
+//     only from a client that authenticated.
 //
 // Set via Server.TrustedServiceValidator() after NewServer.
 type TrustedServiceValidator func(ctx context.Context) (serviceName string, err error)
@@ -201,6 +207,17 @@ type BackchannelNotification struct {
 	// non-empty; scope and binding_message remain the fallback for clients
 	// that have not adopted RAR.
 	AuthorizationDetails domain.AuthorizationDetails
+	// FourEyes and RequesterOwner echo the bc-authorize extension
+	// parameters: with FourEyes set, the user named by RequesterOwner may not
+	// approve or deny the request, so a notifier can leave them out.
+	FourEyes       bool
+	RequesterOwner string
+	// RequesterSub and RequesterActor describe the requesting chain when
+	// bc-authorize carried a requesting_token: on whose behalf the request
+	// was made (the token's sub) and who made it (its act.sub, else its
+	// client_id, else its sub). Empty otherwise.
+	RequesterSub   string
+	RequesterActor string
 }
 
 // BackchannelNotifier delivers a CIBA approval prompt to the end user via an
@@ -305,3 +322,69 @@ type RevocationEvent struct {
 // — there is no new required configuration and no behavioural difference for
 // existing deployers.
 type RevocationNotifier func(ctx context.Context, e RevocationEvent) error
+
+// ApproverAuth says how the user resolving a CIBA request was authenticated:
+// ApproverAuthSession (their own session or ID token) or
+// ApproverAuthChannelAttested (an approval channel vouched for them).
+//
+// See internal/service/backchannel_approver.go for the canonical definitions.
+type ApproverAuth = service.ApproverAuth
+
+const (
+	ApproverAuthSession         = service.ApproverAuthSession
+	ApproverAuthChannelAttested = service.ApproverAuthChannelAttested
+)
+
+// ApproverIdentity is the authenticated user resolving a CIBA request. The
+// deployer's authentication layer sets it on the approve/deny request context
+// with WithApproverIdentity. When backchannel.require_approver_identity is
+// true it is the only source of the approver; otherwise it takes precedence
+// over the request body's subject_id, which must match it when both are sent.
+type ApproverIdentity = service.ApproverIdentity
+
+// ApprovalRequestView is the read-only view of a pending CIBA request handed
+// to an ApproverAuthorizer.
+type ApprovalRequestView = service.ApprovalRequestView
+
+// ApproverDecision is an ApproverAuthorizer's verdict. Reason is returned to
+// the caller on refusal and should name what is required (e.g. "approval
+// requires role admin"). SatisfiedHint is "login_hint", "group_hint" or "".
+type ApproverDecision = service.ApproverDecision
+
+// ApproverAuthorizer decides whether an approver may resolve a CIBA request
+// carrying a group_hint. Install with Server.SetApproverAuthorizer. Returning
+// an error (or panicking) fails the check closed.
+type ApproverAuthorizer = service.ApproverAuthorizer
+
+// WithApproverIdentity returns ctx carrying the authenticated approver for the
+// CIBA approve/deny endpoints.
+func WithApproverIdentity(ctx context.Context, a ApproverIdentity) context.Context {
+	return service.WithApproverIdentity(ctx, a)
+}
+
+// ApproverIdentityFromContext returns the approver set by WithApproverIdentity.
+func ApproverIdentityFromContext(ctx context.Context) (ApproverIdentity, bool) {
+	return service.ApproverIdentityFromContext(ctx)
+}
+
+// WithTrustedApprovalChannelWrite returns ctx marked as coming from a caller
+// the deployer trusts to create and manage CIBA approval channels. Without
+// the mark, admin writes that set sub_type approval_channel, or put the
+// ciba:approve scope on an identity, a credential policy or an API key
+// (directly or by attaching a policy that lists it), are refused with 403, as
+// are writes that issue a credential for an approval channel: API keys, key
+// rotation, public keys, OAuth clients bound to or named after it, and secret
+// rotation for a client registered with the mark, admin credential issue and
+// rotate, and deleting or revoking a client or API key registered with the
+// mark. ciba:approve is minted only from an API key, OAuth client or public
+// key written with the mark, or by an admin issue or rotate made with it.
+// Set it in the AdminAuth layer for the most trusted caller class only.
+func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
+	return service.WithTrustedApprovalChannelWrite(ctx)
+}
+
+// TrustedApprovalChannelWrite reports whether ctx carries the mark set by
+// WithTrustedApprovalChannelWrite.
+func TrustedApprovalChannelWrite(ctx context.Context) bool {
+	return service.TrustedApprovalChannelWrite(ctx)
+}

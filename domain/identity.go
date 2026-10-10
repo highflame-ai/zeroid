@@ -125,6 +125,11 @@ const (
 
 	// Service sub-types.
 	SubTypeLLMProvider SubType = "llm_provider"
+	// SubTypeApprovalChannel marks a service identity that resolves CIBA
+	// requests on behalf of the users it names (a chat or email bridge, a
+	// customer-built approval UI). Deployers that front the admin API with
+	// several caller classes should let only their most trusted class set it.
+	SubTypeApprovalChannel SubType = "approval_channel"
 )
 
 // agentSubTypes is the set of sub-types valid for identity_type = "agent".
@@ -153,7 +158,8 @@ var applicationSubTypes = map[SubType]bool{
 
 // serviceSubTypes is the set of sub-types valid for identity_type = "service".
 var serviceSubTypes = map[SubType]bool{
-	SubTypeLLMProvider: true,
+	SubTypeLLMProvider:     true,
+	SubTypeApprovalChannel: true,
 }
 
 // ValidForIdentityType reports whether s is a valid sub-type for the given identity type.
@@ -454,6 +460,10 @@ type Identity struct {
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
 	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
 	PublicKeyPEM       string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
+	// PublicKeyChannelTrusted records that PublicKeyPEM was last written by a
+	// caller marked with WithTrustedApprovalChannelWrite. ciba:approve is
+	// issued on the jwt-bearer grant only when it is set.
+	PublicKeyChannelTrusted bool `bun:"public_key_channel_trusted,notnull" json:"-"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.
 	Framework    string          `bun:"framework,type:varchar(100)"  json:"framework,omitempty"`

@@ -708,6 +708,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/token \
 # }
 ```
 
+**Requests made with a `requesting_token`.** A bc-authorize request may carry the access token of the request it is for (`requesting_token`, accepted from an authenticated client or a caller your `TrustedServiceValidator` accepts). The approved token then keeps that token's `sub`, `act`, identity claims and DPoP binding (`cnf.jkt`) and never outlives it. Redeeming such a request requires the same token on every poll, as the `requesting_token` form parameter (`-d 'requesting_token=<token>'`); when that token is DPoP-bound, the poll must also carry a `DPoP` proof for its key. A poll without them gets `access_denied` and leaves the approval redeemable. Requests made without `requesting_token` are polled as shown above.
+
 **Ping mode** delivers a callback to the client's registered `client_notification_endpoint` the moment the user resolves — agents that don't want to poll can wait for the ping and then call `/oauth2/token` once. **Push mode** delivers the full access token to the callback directly. Both modes require `backchannel_token_delivery_mode` set on the client at registration; the callback endpoint is SSRF-guarded.
 
 **Why this matters:** Every CIBA approval produces a token whose `sub` is the approving user and whose `backchannel_client_id` claim identifies the agent that asked. Downstream systems get a real, attributable consent trail — "alice-agent acted with Alice's explicit approval at 14:32, with binding message X" — without you building approval infrastructure.
@@ -911,6 +913,30 @@ location /oauth2/ { proxy_pass http://zeroid; }                          # publi
 
 Deployments that never use CIBA should still add that rule: the endpoints are registered
 regardless, and the default credential policy permits the CIBA grant.
+
+**Approval channels and `ciba:approve`.** The `ciba:approve` scope (held by a service that
+resolves CIBA requests for the users it names, such as a chat or email bridge) is issued
+only to identities that list it explicitly — in the identity's `allowed_scopes` or on a
+credential policy that governs the issuance — and never to `agent` or `mcp_server`
+identities. An empty scope ceiling never yields it. Register such a service with
+`identity_type: service` and `sub_type: approval_channel` so a gateway can recognise it
+from the token's `sub_type` claim. Admin writes that set `sub_type: approval_channel` or
+put `ciba:approve` on an identity, a credential policy or an API key (directly or by
+attaching a policy that lists it) are refused with 403 unless your `AdminAuth` layer marks
+the request with `zeroid.WithTrustedApprovalChannelWrite(ctx)`; set it for your most
+trusted caller class only. The check runs on the decoded request values, so it does not
+depend on how the body was spelled. The same mark is required to issue any credential for an
+approval channel (an identity with `sub_type: approval_channel` or whose scope ceiling lists
+`ciba:approve`): API keys, including keys that inherit the identity's ceiling, key rotation,
+`public_key_pem` writes, and OAuth clients bound to the identity or whose `client_id` is its
+`external_id`, admin `/credentials/issue` and `/credentials/{id}/rotate` (refused before
+anything is revoked), plus rotating the secret of, deleting, or revoking a client or API key
+registered under the mark. Discovery ingest and the discovery source sweeps (prune,
+release, purge) leave approval channels unchanged.
+`ciba:approve` is then minted only from an API key, OAuth client or public key that was
+written under the mark, so credentials obtained before an identity became an approval
+channel do not carry it. Clients declared in configuration are registered under the mark
+only when `Server.EnsureClient` is called with a marked context.
 
 | Method | Path | Description |
 |--------|------|-------------|

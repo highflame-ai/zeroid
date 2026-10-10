@@ -39,6 +39,11 @@ var (
 	IdentityOps        metric.Int64Counter
 	PolicyEnforcements metric.Int64Counter
 	AuthErrors         metric.Int64Counter
+
+	// CIBAApproverWouldDeny counts CIBA approve/deny calls allowed under
+	// backchannel.enforce_hints=shadow that enforce_hints=on would refuse.
+	// Attribute: reason (low-cardinality refusal code).
+	CIBAApproverWouldDeny metric.Int64Counter
 )
 
 func init() {
@@ -63,6 +68,9 @@ func initNoOpMetrics() {
 	)
 	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
 		metric.WithDescription("Authentication errors"),
+	)
+	CIBAApproverWouldDeny, _ = Meter.Int64Counter("ciba_approver_would_deny_total",
+		metric.WithDescription("CIBA approver checks that would deny under enforce_hints=on (shadow mode)"),
 	)
 }
 
@@ -142,6 +150,9 @@ func Init(cfg Config) error {
 	)
 	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
 		metric.WithDescription("Authentication errors"),
+	)
+	CIBAApproverWouldDeny, _ = Meter.Int64Counter("ciba_approver_would_deny_total",
+		metric.WithDescription("CIBA approver checks that would deny under enforce_hints=on (shadow mode)"),
 	)
 
 	return nil

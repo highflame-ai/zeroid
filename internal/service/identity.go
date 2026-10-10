@@ -149,6 +149,13 @@ type RegisterIdentityRequest struct {
 // is adopted (identity-lifecycle.md). The discovery service reaches this path
 // through UpsertDiscoveredIdentity (idempotent on external_id), not directly.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.policySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	if req.Origin == "" {
 		req.Origin = domain.OriginNative
 	}
@@ -255,20 +262,23 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
 		PublicKeyPEM:       req.PublicKeyPEM,
-		Framework:          req.Framework,
-		Version:            req.Version,
-		Publisher:          req.Publisher,
-		Description:        req.Description,
-		Capabilities:       req.Capabilities,
-		Labels:             req.Labels,
-		Metadata:           req.Metadata,
-		CapabilityTier:     req.CapabilityTier,
-		RiskTier:           req.RiskTier,
-		IAL:                req.IAL,
-		ExpiresAt:          req.ExpiresAt,
-		CreatedBy:          req.CreatedBy,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		// The register gate above already refused an untrusted approval
+		// channel, so only the mark itself is recorded here.
+		PublicKeyChannelTrusted: req.PublicKeyPEM != "" && TrustedApprovalChannelWrite(ctx),
+		Framework:               req.Framework,
+		Version:                 req.Version,
+		Publisher:               req.Publisher,
+		Description:             req.Description,
+		Capabilities:            req.Capabilities,
+		Labels:                  req.Labels,
+		Metadata:                req.Metadata,
+		CapabilityTier:          req.CapabilityTier,
+		RiskTier:                req.RiskTier,
+		IAL:                     req.IAL,
+		ExpiresAt:               req.ExpiresAt,
+		CreatedBy:               req.CreatedBy,
+		CreatedAt:               time.Now(),
+		UpdatedAt:               time.Now(),
 	}
 
 	if err := s.repo.Create(ctx, identity); err != nil {
@@ -346,6 +356,10 @@ type DiscoveredIdentityRequest struct {
 //
 // Returns the resulting identity and whether it was newly created.
 func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, nil); err != nil {
+		return nil, false, err
+	}
 	if !req.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
 	}
@@ -459,6 +473,21 @@ func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredId
 func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *domain.Identity, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
+	}
+	// Discovery never modifies an approval channel: its configuration
+	// (metadata included) is managed only through trusted writes. The row is
+	// returned unchanged.
+	channel, err := s.IsApprovalChannel(ctx, identity)
+	if err != nil {
+		return nil, false, err
+	}
+	if channel {
+		log.Info().
+			Str("identity_id", identity.ID).
+			Str("external_id", identity.ExternalID).
+			Str("origin", string(req.Origin)).
+			Msg("discovery reconcile skipped an approval-channel identity")
+		return identity, false, nil
 	}
 	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
@@ -721,7 +750,11 @@ func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, proje
 	if err != nil {
 		return nil, err
 	}
+	if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
 	identity.PublicKeyPEM = publicKeyPEM
+	identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -820,6 +853,15 @@ type UpdateIdentityRequest struct {
 
 // UpdateIdentity updates mutable fields of an existing identity.
 func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, projectID string, req UpdateIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if req.CredentialPolicyID != nil {
+		if err := requireTrustedPolicyAttachment(ctx, s.policySvc, *req.CredentialPolicyID, accountID, projectID); err != nil {
+			return nil, err
+		}
+	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
@@ -858,7 +900,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
 			return nil, err
 		}
+		if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+			return nil, err
+		}
 		identity.PublicKeyPEM = req.PublicKeyPEM
+		identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	}
 	if req.Framework != nil {
 		identity.Framework = *req.Framework

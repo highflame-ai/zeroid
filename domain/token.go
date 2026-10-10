@@ -156,6 +156,11 @@ type OAuthClient struct {
 	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
 
+	// ChannelTrusted records that the client was registered by a caller
+	// marked with WithTrustedApprovalChannelWrite.
+	// ciba:approve is issued on client_credentials only when it is set.
+	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
+
 	// Dynamic Client Registration (RFC 7591/7592)
 	// RegistrationSource is "internal" for clients created via the admin/internal
 	// API path, "dynamic" for clients created via POST /oauth2/register, and

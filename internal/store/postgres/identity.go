@@ -545,6 +545,15 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 // caller_name on the context stamps modified_by so the audit trigger records who
 // pruned. Scoped by source_id so one connector's sweep never touches another's
 // agents of the same origin. Returns the number of rows deactivated.
+// notApprovalChannel is the predicate the discovery sweeps (prune, release,
+// purge) add so they never touch an approval channel: sub_type
+// approval_channel, or ciba:approve listed on the identity or its credential
+// policy.
+const notApprovalChannel = `identities.sub_type IS DISTINCT FROM 'approval_channel'
+	AND NOT COALESCE('ciba:approve' = ANY(identities.allowed_scopes), false)
+	AND NOT EXISTS (SELECT 1 FROM credential_policies cp
+		WHERE cp.id = identities.credential_policy_id AND 'ciba:approve' = ANY(cp.allowed_scopes))`
+
 func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
 	db := dbOrTx(ctx, r.db)
 	q := db.NewUpdate().
@@ -561,6 +570,7 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 		Where("source_id = ?", sourceID).
 		Where("status = ?", string(domain.IdentityStatusDiscovered)).
 		Where("updated_at < ?", notSeenSince).
+		Where(notApprovalChannel).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
@@ -602,6 +612,7 @@ func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accoun
 		Where("origin = ?", origin).
 		Where("source_id = ?", sourceID).
 		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where(notApprovalChannel).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("release discovered source: %w", err)
@@ -650,7 +661,8 @@ func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountI
 			Where("project_id = ?", projectID).
 			Where("origin = ?", origin).
 			Where("source_id = ?", sourceID).
-			Where("status = ?", string(domain.IdentityStatusDiscovered))
+			Where("status = ?", string(domain.IdentityStatusDiscovered)).
+			Where(notApprovalChannel)
 	}
 
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {

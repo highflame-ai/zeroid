@@ -56,6 +56,16 @@ type BackchannelService struct {
 	// lookup is well under microsecond cost.
 	rarValidators map[string]AuthorizationDetailValidator
 
+	// approverAuthorizer is consulted for group_hint requests on approve/deny
+	// when enforce_hints is shadow or on. Guarded by mu.
+	approverAuthorizer ApproverAuthorizer
+
+	// verifyRequestingToken verifies bc-authorize requesting_token values,
+	// and isTrustedCaller applies the deployer's TrustedServiceValidator.
+	// Both wired by OAuthService.SetBackchannelService. Guarded by mu.
+	verifyRequestingToken requestingTokenVerifier
+	isTrustedCaller       func(ctx context.Context) bool
+
 	// svcCtx is the long-lived context used by detached notifier goroutines.
 	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
 	// can wind down on graceful shutdown instead of leaking past the server's
@@ -98,6 +108,10 @@ type BackchannelNotification struct {
 	BindingMessage       string
 	ExpiresAt            time.Time
 	AuthorizationDetails domain.AuthorizationDetails
+	FourEyes             bool
+	RequesterOwner       string
+	RequesterSub         string
+	RequesterActor       string
 }
 
 // BackchannelServiceConfig bounds the request lifecycle.
@@ -129,6 +143,17 @@ type BackchannelServiceConfig struct {
 	// setter; both should be set from the same source in the deployer's
 	// server construction code.
 	AllowPrivateNotificationEndpoints bool
+
+	// RequireApproverIdentity makes approve/deny take the approver only from
+	// the request context (WithApproverIdentity). A call without one is
+	// refused with 401 invalid_client. When false, a body subject_id is still
+	// accepted when the context carries no identity.
+	RequireApproverIdentity bool
+
+	// EnforceHints governs the approver binding checks on approve/deny:
+	// "off" (or empty) skips them, "shadow" evaluates and records would-deny
+	// but allows, "on" refuses ineligible approvers with 403 access_denied.
+	EnforceHints string
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -316,6 +341,17 @@ type CreateAuthRequestInput struct {
 	// token-side embed at issuance — see the exact JSON the client
 	// supplied.
 	AuthorizationDetailsRaw []byte
+	// FourEyes and RequesterOwner are extension parameters: with FourEyes
+	// set, the user named by RequesterOwner may not resolve the request.
+	// FourEyes requires a non-empty RequesterOwner. When RequestingToken was
+	// issued to an identity with an owner_user_id, that owner is used as
+	// RequesterOwner and a differing value here is ignored.
+	FourEyes       bool
+	RequesterOwner string
+	// RequestingToken is the access token of the request the approval is
+	// for. When present it must be an active token from this server in the
+	// same tenant; the token minted on approval then keeps its sub and act.
+	RequestingToken string
 }
 
 // CreateAuthRequestOutput is returned to the client on success.
@@ -366,6 +402,16 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		)
 	}
 
+	// With a requesting_token, requester_owner is derived from the
+	// requesting identity after the token is verified (below).
+	if in.FourEyes && in.RequesterOwner == "" && in.RequestingToken == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
+	}
+	if utf8.RuneCountInString(in.RequesterOwner) > domain.MaxRequesterOwnerChars {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			fmt.Sprintf("requester_owner exceeds maximum length of %d characters", domain.MaxRequesterOwnerChars))
+	}
+
 	// Resolve the client. GetClientByClientID intentionally returns any
 	// client (public or confidential) WITHOUT an is_active filter (the
 	// underlying repo GetByClientID skips the check — tracked as a follow-up;
@@ -414,6 +460,49 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		// "unknown/deactivated client".
 		if _, verr := s.oauthClientSvc.VerifyClientSecret(ctx, in.ClientID, in.ClientSecret); verr != nil {
 			return nil, oauthBadRequestCause(oautherror.InvalidClient, "client authentication failed", verr)
+		}
+	}
+
+	// requesting_token and the group_hint-only refusal are evaluated only
+	// after the client has been resolved and authenticated, so the response
+	// reveals nothing about a token to an unauthenticated caller. Only a
+	// client that authenticated above, or a caller the deployer's
+	// TrustedServiceValidator accepts, may send requesting_token.
+	var requesting *RequestingToken
+	if in.RequestingToken != "" {
+		if !s.callerAuthenticated(ctx, client) {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token requires an authenticated client")
+		}
+		rt, err := s.resolveRequestingToken(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		requesting = rt
+		// The requesting identity's owner is the requester_owner; a
+		// differing request parameter is ignored.
+		owner, err := s.requestingOwner(ctx, rt)
+		if err != nil {
+			return nil, err
+		}
+		if owner != "" {
+			if in.RequesterOwner != "" && in.RequesterOwner != owner {
+				log.Warn().
+					Str("client_id", in.ClientID).
+					Str("requester_owner", in.RequesterOwner).
+					Str("identity_owner", owner).
+					Msg("bc-authorize requester_owner differs from the requesting identity's owner; using the identity's owner")
+			}
+			in.RequesterOwner = owner
+		}
+		if in.FourEyes && in.RequesterOwner == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
+		}
+	} else if in.GroupHint != "" && in.LoginHint == "" {
+		// Without a requesting token or login_hint nothing names the
+		// subject of the token, so an approver would become it. Refused
+		// when approvers are authenticated; unchanged otherwise.
+		if require, _, _ := s.approverSettings(); require {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "group_hint requires requesting_token")
 		}
 	}
 
@@ -510,6 +599,8 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		Scope:                      in.Scope,
 		BindingMessage:             bindingMsg,
 		AuthorizationDetailsRaw:    rarRaw,
+		FourEyes:                   in.FourEyes,
+		RequesterOwner:             in.RequesterOwner,
 		NotificationMode:           notificationMode,
 		ClientNotificationEndpoint: notificationEndpoint,
 		ClientNotificationToken:    in.ClientNotificationToken,
@@ -517,6 +608,12 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		IntervalSeconds:            s.cfg.DefaultPollInterval,
 		ExpiresAt:                  now.Add(expiry),
 		CreatedAt:                  now,
+	}
+	if requesting != nil {
+		row.RequesterSub = requesting.Subject
+		row.RequesterActor = requesting.Actor()
+		row.RequestingJTI = requesting.JTI
+		row.RequestingAct = string(requesting.Act)
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)
@@ -532,6 +629,12 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 }
 
 // ApproveInput resolves a pending request positively.
+//
+// The approver comes from the request context (WithApproverIdentity) when
+// present; SubjectID/SubjectEmail/SubjectName are the request-body fields,
+// used as the approver only when the context carries no identity and
+// RequireApproverIdentity is off. A body SubjectID that differs from the
+// context subject is refused.
 type ApproveInput struct {
 	AuthReqID    string
 	AccountID    string
@@ -541,15 +644,22 @@ type ApproveInput struct {
 	SubjectName  string
 }
 
-// Approve transitions the request to approved and stamps the resolved subject.
-// Tenant isolation is enforced by re-loading the row and comparing
-// account_id/project_id — never trust the URL handle alone.
+// Approve transitions the request to approved and stamps the resolved subject
+// and approval record. Tenant isolation is enforced by re-loading the row and
+// comparing account_id/project_id — never trust the URL handle alone.
 //
 // Errors:
-//   - invalid_request: missing fields, tenant mismatch
+//   - invalid_client (401): approver identity required but absent
+//   - invalid_request: missing fields, tenant mismatch, subject_id mismatch
 //   - access_denied: row already in a terminal state, expired, or wrong tenant
+//   - access_denied (403): approver fails the binding checks (enforce_hints=on)
 func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error {
-	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" || in.SubjectID == "" {
+	require, _, _ := s.approverSettings()
+	approver, err := resolveApprover(ctx, require, in.SubjectID, in.SubjectEmail, in.SubjectName)
+	if err != nil {
+		return err
+	}
+	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" || approver.Subject == "" {
 		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id, subject_id are required to approve")
 	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
@@ -570,7 +680,12 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 		return oauthBadRequest(oautherror.AccessDenied, "request has expired")
 	}
 
-	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, in.SubjectID, in.SubjectEmail, in.SubjectName)
+	rec, err := s.authorizeResolution(ctx, "approve", row, approver)
+	if err != nil {
+		return err
+	}
+
+	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, rec)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request approved", err)
 	}
@@ -596,8 +711,17 @@ type DenyInput struct {
 	ProjectID string
 }
 
-// Deny transitions the request to denied. Same tenant-isolation guarantees as Approve.
+// Deny transitions the request to denied. Same tenant-isolation guarantees,
+// approver resolution and binding checks as Approve: a user who may not
+// approve a request may not deny it either. The approver comes only from the
+// request context; without one, deny proceeds only when neither
+// RequireApproverIdentity nor enforce_hints=on is set.
 func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
+	require, _, _ := s.approverSettings()
+	approver, err := resolveApprover(ctx, require, "", "", "")
+	if err != nil {
+		return err
+	}
 	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" {
 		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id are required to deny")
 	}
@@ -614,7 +738,11 @@ func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 	if row.Status != domain.BackchannelStatusPending {
 		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
 	}
-	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID)
+	rec, err := s.authorizeResolution(ctx, "deny", row, approver)
+	if err != nil {
+		return err
+	}
+	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID, rec)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request denied", err)
 	}
@@ -675,6 +803,9 @@ type RedeemInput struct {
 	// authentication rules, same as refresh_token/authorization_code). Empty
 	// for public clients.
 	ClientSecret string
+	// RequestingToken must be the bc-authorize requesting_token when the
+	// request was made with one (see requireRequestingTokenHolder).
+	RequestingToken string
 	// DPoPKeyThumbprint forwards the proof key thumbprint from the token
 	// endpoint so a CIBA-redeemed token can still be DPoP-bound (RFC 9449).
 	// Non-empty when the polling /oauth2/token call carried a valid DPoP
@@ -750,6 +881,13 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	// single-use semantics.
 	if row.NotificationMode == domain.BackchannelNotificationPush {
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id is delivered via push callback; polling is not permitted")
+	}
+
+	// A request made with a requesting_token is redeemable only by the holder
+	// of that token (and of its DPoP key, when bound). Checked on every poll,
+	// so a poller without it learns nothing about the request's state.
+	if err := s.requireRequestingTokenHolder(ctx, row, in); err != nil {
+		return nil, err
 	}
 
 	now := time.Now()
@@ -938,20 +1076,6 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		identity = &anchor
 	}
 
-	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
-	// additionally rejects an approved row that has outlived both expires_at
-	// and the post-approval grace window — the atomic DB-layer counterpart to
-	// the expired_token pre-check in Redeem. A row that lost that race (or any
-	// concurrent second redemption) yields affected=0 and is rejected below.
-	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
-	if mErr != nil {
-		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
-		return nil, oauthServerError("failed to commit issuance state", mErr)
-	}
-	if affected == 0 {
-		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
-	}
-
 	customClaims := map[string]any{
 		"token_exchange":        "ciba",
 		"backchannel_client_id": row.ClientID,
@@ -968,16 +1092,20 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// §5.2: also include it on the token response body so polling / push
 	// clients see what was granted.
 	//
-	// The raw bytes are passed through verbatim (as json.RawMessage) so
-	// jwx serialises the array structure rather than the {Type, Raw}
-	// surface of the domain type. The bc-authorize-side validator
-	// guarantees the persisted bytes are a valid RFC 9396 array (a
-	// legacy CIBA row stores the canonical empty `[]`); no re-parse or
-	// special-case filtering on issuance.
-	rarBytes := row.AuthorizationDetailsRaw
+	// Each entry is stamped with approval_id (this auth_req_id) and
+	// approver_auth so a resource server can tie a call to the approval and
+	// see how the approver was authenticated. The result is passed as
+	// json.RawMessage so jwx serialises the array structure rather than the
+	// {Type, Raw} surface of the domain type. The bc-authorize-side
+	// validator guarantees the persisted bytes are a valid RFC 9396 array (a
+	// legacy CIBA row stores the canonical empty `[]`).
+	rarBytes, rerr := stampAuthorizationDetails(row)
+	if rerr != nil {
+		return nil, oauthServerError("failed to prepare authorization_details", rerr)
+	}
 	customClaims["authorization_details"] = rarBytes
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:          identity,
 		IdentityPolicyID:  identityPolicyID,
 		Scopes:            parseScopeString(row.Scope),
@@ -989,7 +1117,30 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		UserName:          row.ApprovedSubjectName,
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: dpopKeyThumbprint,
-	})
+	}
+	// A request made with a requesting_token is approved INTO that chain:
+	// the token keeps the chain's sub, act and identity claims, and the
+	// approver stays on the row only. Root grants keep sub = the approved
+	// user, as above.
+	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
+		return nil, cerr
+	}
+
+	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
+	// additionally rejects an approved row that has outlived both expires_at
+	// and the post-approval grace window — the atomic DB-layer counterpart to
+	// the expired_token pre-check in Redeem. A row that lost that race (or any
+	// concurrent second redemption) yields affected=0 and is rejected below.
+	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
+	if mErr != nil {
+		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
+		return nil, oauthServerError("failed to commit issuance state", mErr)
+	}
+	if affected == 0 {
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
+	}
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		// The pre-burn gates above catch the deterministic refusals; anything
 		// landing here is a race-window state change or an axis only the
@@ -1160,6 +1311,10 @@ func (s *BackchannelService) dispatchNotifierWithRAR(
 		BindingMessage:       row.BindingMessage,
 		ExpiresAt:            row.ExpiresAt,
 		AuthorizationDetails: details,
+		FourEyes:             row.FourEyes,
+		RequesterOwner:       row.RequesterOwner,
+		RequesterSub:         row.RequesterSub,
+		RequesterActor:       row.RequesterActor,
 	}
 
 	deliver := func() {

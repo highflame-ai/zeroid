@@ -25,7 +25,7 @@ type OAuthError struct {
 	Code string
 	// Description is the human-readable message returned in error_description.
 	Description string
-	// HTTPStatus is the HTTP response status code (400, 401, or 500).
+	// HTTPStatus is the HTTP response status code (400, 401, 403, or 500).
 	HTTPStatus int
 	// err is the underlying cause; preserved for logging, not sent to clients.
 	err error
@@ -60,6 +60,11 @@ func oauthBadRequestCause(code, description string, cause error) *OAuthError {
 // oauthUnauthorized returns an *OAuthError for invalid_client with HTTP 401.
 func oauthUnauthorized(description string, cause error) *OAuthError {
 	return &OAuthError{Code: oautherror.InvalidClient, Description: description, HTTPStatus: http.StatusUnauthorized, err: cause}
+}
+
+// oauthForbidden returns an *OAuthError with HTTP 403 and no underlying cause.
+func oauthForbidden(code, description string) *OAuthError {
+	return &OAuthError{Code: code, Description: description, HTTPStatus: http.StatusForbidden}
 }
 
 // oauthServerError returns an *OAuthError for server_error with HTTP 500.

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -206,6 +207,27 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
+	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
+	// entry in `authorization_details` only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge Shield raised — but the claim
+	// must still never be writable through additional_claims, or a token
+	// from another grant could carry an approval nobody gave. ZeroID writes
+	// it only on the CIBA path, from the approved request row
+	// (stampAuthorizationDetails, which also stamps `approval_id` inside
+	// each entry). `approval_id` is reserved at the top level too so no
+	// caller can mint a look-alike.
+	"authorization_details": true,
+	"approval_id":           true,
+	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
+	// `agent_idp_parent` into context.principal / context.actor, where
+	// policies use them to tell native agents from IdP-registered ones
+	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
+	// ZeroID does not mint them yet; until it does from the identity row,
+	// nothing may set them, or a caller with an id_token exchange could
+	// claim to be a native agent.
+	"origin":           true,
+	"agent_idp_iss":    true,
+	"agent_idp_parent": true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
@@ -419,6 +441,64 @@ func (s *OAuthService) HasTrustedServiceValidator() bool {
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+	if bc != nil {
+		bc.setRequestingTokenVerifier(s.verifyRequestingToken)
+		bc.setTrustedCallerCheck(s.isTrustedServiceCaller)
+	}
+}
+
+// isTrustedServiceCaller reports whether the deployer's TrustedServiceValidator
+// accepts the current request. False when none is installed.
+func (s *OAuthService) isTrustedServiceCaller(ctx context.Context) bool {
+	v := s.trustedServiceValidator
+	if v == nil {
+		return false
+	}
+	_, err := v(ctx)
+	return err == nil
+}
+
+// verifyRequestingToken verifies a bc-authorize requesting_token: an access
+// token this server issued (signature against its own keys, iss equal to its
+// issuer), unexpired, and backed by an active, unrevoked credential row.
+// The tenant comparison is the caller's.
+func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr string) (*RequestingToken, error) {
+	parsed, err := s.parseToken(tokenStr, true)
+	if err != nil {
+		return nil, fmt.Errorf("requesting_token is not a valid token from this issuer: %w", err)
+	}
+	if iss, _ := parsed.Issuer(); iss != s.issuer {
+		return nil, fmt.Errorf("requesting_token was not issued by this server")
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return nil, fmt.Errorf("requesting_token has no jti")
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil || cred == nil || !active {
+		return nil, fmt.Errorf("requesting_token is not active")
+	}
+	sub, _ := parsed.Subject()
+	rt := &RequestingToken{
+		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
+		DPoPKeyThumbprint: cred.DPoPKeyThumbprint,
+	}
+	if cred.IdentityID != nil {
+		rt.IdentityID = *cred.IdentityID
+	}
+	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
+		rt.ActSubject, _ = act["sub"].(string)
+		if b, merr := json.Marshal(act); merr == nil {
+			rt.Act = b
+		}
+	}
+	if exp, ok := parsed.Expiration(); ok {
+		rt.ExpiresAt = exp
+	}
+	if cid, err := jwt.Get[string](parsed, "client_id"); err == nil {
+		rt.ClientID = cid
+	}
+	return rt, nil
 }
 
 // SetCIMDService wires the Client ID Metadata Document resolver after
@@ -605,6 +685,9 @@ type TokenRequest struct {
 	TrustedService bool
 	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
+	// RequestingToken is the requesting_token a CIBA poll presents when the
+	// bc-authorize request was made with one.
+	RequestingToken string
 	// DPoPKeyThumbprint is the base64url JWK thumbprint of the client's DPoP key.
 	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
 	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
@@ -653,6 +736,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 			AuthReqID:         req.AuthReqID,
 			ClientID:          req.ClientID,
 			ClientSecret:      req.ClientSecret,
+			RequestingToken:   req.RequestingToken,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
@@ -742,6 +826,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: client.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -872,6 +958,8 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeJWTBearer,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: identity.PublicKeyChannelTrusted,
 	})
 	if err != nil {
 		return nil, err
@@ -1541,6 +1629,8 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		// must never mint a 30-day token even if the identity policy allows.
 		CredentialExpiresAt: sk.ExpiresAt,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: sk.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 

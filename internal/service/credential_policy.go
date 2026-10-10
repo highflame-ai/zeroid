@@ -122,6 +122,10 @@ type CreatePolicyRequest struct {
 
 // CreatePolicy creates a new credential policy.
 func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePolicyRequest) (*domain.CredentialPolicy, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, "", req.AllowedScopes); err != nil {
+		return nil, err
+	}
 	if req.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
@@ -240,6 +244,10 @@ type UpdatePolicyRequest struct {
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
 func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountID, projectID string, req UpdatePolicyRequest) (*domain.CredentialPolicy, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, "", req.AllowedScopes); err != nil {
+		return nil, err
+	}
 	policy, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, ErrPolicyNotFound

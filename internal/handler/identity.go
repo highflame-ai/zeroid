@@ -23,7 +23,7 @@ type CreateIdentityInput struct {
 		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
 		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
-		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
+		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Sub-type within identity type"`
 		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
 		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy."`
@@ -359,6 +359,9 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		ExpiresAt:          input.Body.ExpiresAt,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		// A collision with a soft-deleted identity is actionable — surface the
 		// existing id so the caller can reactivate it instead of being stuck
 		// behind an opaque 409 for a row hidden from the active registry view.
@@ -550,6 +553,9 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 		ExpiresAt:          input.Body.ExpiresAt,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error400BadRequest("credential policy not found in this tenant")
 		}
@@ -724,6 +730,9 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 		CreatedBy:     internalMiddleware.GetCallerName(ctx),
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("external_id already belongs to a native identity in this tenant")
 		}
@@ -855,6 +864,9 @@ func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscovere
 
 	result, err := a.identitySvc.BulkUpsertDiscoveredIdentities(ctx, reqs)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrInvalidIdentityField) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}

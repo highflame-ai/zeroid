@@ -27,14 +27,27 @@ var ErrBackchannelRequestNotFound = errors.New("backchannel auth request not fou
 // it at issuance; DeleteExpired reaps past it.
 const ApprovedRedemptionGrace = 10 * time.Minute
 
+// DefaultResolvedRetention is how long approved, issued and denied CIBA rows
+// are kept after resolution so the approval history stays readable.
+const DefaultResolvedRetention = 30 * 24 * time.Hour
+
 // BackchannelRequestRepository persists CIBA authentication requests.
 type BackchannelRequestRepository struct {
-	db *bun.DB
+	db                *bun.DB
+	resolvedRetention time.Duration
 }
 
-// NewBackchannelRequestRepository constructs the repository.
+// NewBackchannelRequestRepository constructs the repository with
+// DefaultResolvedRetention.
 func NewBackchannelRequestRepository(db *bun.DB) *BackchannelRequestRepository {
-	return &BackchannelRequestRepository{db: db}
+	return &BackchannelRequestRepository{db: db, resolvedRetention: DefaultResolvedRetention}
+}
+
+// SetResolvedRetention sets how long resolved rows are kept (see
+// DeleteExpired). Values below ApprovedRedemptionGrace act as that floor.
+// Call during construction, before the cleanup worker starts.
+func (r *BackchannelRequestRepository) SetResolvedRetention(d time.Duration) {
+	r.resolvedRetention = d
 }
 
 // Create inserts a new pending request. auth_req_id is the PK; a collision
@@ -62,19 +75,18 @@ func (r *BackchannelRequestRepository) GetByAuthReqID(ctx context.Context, authR
 	return req, nil
 }
 
-// MarkApproved transitions a pending row to approved and records the resolved
-// subject. The status='pending' guard makes the operation idempotent and
-// prevents re-approving a denied/expired row. Returns the number of rows
-// affected so callers can detect "already approved/denied" as 0.
-func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReqID, subjectID, subjectEmail, subjectName string) (int64, error) {
+// MarkApproved transitions a pending row to approved and records the
+// resolution (resolving user and approval record). The status='pending' guard
+// makes the operation idempotent and prevents re-approving a denied/expired
+// row. Returns the number of rows affected so callers can detect "already
+// approved/denied" as 0.
+func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReqID string, rec domain.BackchannelResolution) (int64, error) {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
 		Set("status = ?", domain.BackchannelStatusApproved).
-		Set("approved_subject_id = ?", subjectID).
-		Set("approved_subject_email = ?", subjectEmail).
-		Set("approved_subject_name = ?", subjectName).
-		Set("approved_at = ?", now).
+		Set("approved_at = ?", now)
+	res, err := setResolution(q, rec).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusPending).
 		Where("expires_at > ?", now).
@@ -85,12 +97,15 @@ func (r *BackchannelRequestRepository) MarkApproved(ctx context.Context, authReq
 	return res.RowsAffected()
 }
 
-// MarkDenied transitions a pending row to denied. Same guard semantics as MarkApproved.
-func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID string) (int64, error) {
+// MarkDenied transitions a pending row to denied and records the resolution.
+// Same guard semantics as MarkApproved.
+func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID string, rec domain.BackchannelResolution) (int64, error) {
 	now := time.Now()
-	res, err := r.db.NewUpdate().
+	q := r.db.NewUpdate().
 		Model((*domain.BackchannelAuthRequest)(nil)).
 		Set("status = ?", domain.BackchannelStatusDenied).
+		Set("denied_at = ?", now)
+	res, err := setResolution(q, rec).
 		Where("auth_req_id = ?", authReqID).
 		Where("status = ?", domain.BackchannelStatusPending).
 		Where("expires_at > ?", now).
@@ -99,6 +114,20 @@ func (r *BackchannelRequestRepository) MarkDenied(ctx context.Context, authReqID
 		return 0, fmt.Errorf("failed to mark backchannel request denied: %w", err)
 	}
 	return res.RowsAffected()
+}
+
+// setResolution adds the resolving user and approval-record columns to q.
+func setResolution(q *bun.UpdateQuery, rec domain.BackchannelResolution) *bun.UpdateQuery {
+	return q.
+		Set("approved_subject_id = ?", rec.SubjectID).
+		Set("approved_subject_email = ?", rec.SubjectEmail).
+		Set("approved_subject_name = ?", rec.SubjectName).
+		Set("approver_iss = ?", rec.ApproverIss).
+		Set("approver_auth = ?", rec.ApproverAuth).
+		Set("channel_client_id = ?", rec.ChannelClientID).
+		Set("hint_satisfied = ?", rec.HintSatisfied).
+		Set("shadow_would_deny = ?", rec.ShadowWouldDeny).
+		Set("shadow_reason = ?", rec.ShadowReason)
 }
 
 // MarkIssued transitions an approved row to issued so a second redemption of
@@ -185,44 +214,54 @@ func (r *BackchannelRequestRepository) SweepExpired(ctx context.Context, now tim
 	return res.RowsAffected()
 }
 
-// DeleteExpired reaps rows that can no longer mint a token:
+// DeleteExpired reaps CIBA rows:
 //
-//   - terminal rows (expired/denied/issued) whose expires_at is past, and
-//   - APPROVED-but-not-yet-issued rows whose post-approval grace window has
-//     also lapsed (approved_at + grace < now).
+//   - pending/expired rows (never resolved) as soon as expires_at is past;
+//   - resolved rows (approved, issued, denied) once the resolved-retention
+//     window has passed since they were resolved (approved_at / denied_at),
+//     so the approval history stays readable. A denied row without
+//     denied_at (resolved before the column existed) is aged from
+//     expires_at.
 //
-// Previously approved rows were retained indefinitely so "a slow poll can
-// still complete the issuance" — but with no upper bound, a leaked
-// approved auth_req_id stayed redeemable forever AND was never reaped. We
-// now bound it: an approved row is kept only until the later of its
-// expires_at and (approved_at + ApprovedRedemptionGrace); past both it is
-// reaped. The grace matches the redemption window MarkIssued enforces, so the
-// sweep never deletes a row that is still legitimately redeemable.
+// Keeping a resolved row never makes it redeemable again: Redeem refuses
+// issued and denied rows outright, and an approved row past the later of
+// its expires_at and (approved_at + ApprovedRedemptionGrace) gets
+// expired_token (MarkIssued enforces the same bound atomically). Retention
+// is floored at ApprovedRedemptionGrace so a still-redeemable approval is
+// never reaped.
 func (r *BackchannelRequestRepository) DeleteExpired(ctx context.Context, now time.Time) (int64, error) {
-	graceFloor := now.Add(-ApprovedRedemptionGrace)
+	retention := r.resolvedRetention
+	if retention < ApprovedRedemptionGrace {
+		retention = ApprovedRedemptionGrace
+	}
+	resolvedFloor := now.Add(-retention)
 	res, err := r.db.NewDelete().
 		Model((*domain.BackchannelAuthRequest)(nil)).
 		WhereGroup(" AND ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
 			return q.
 				WhereGroup(" OR ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
-					// Terminal rows past their own expiry.
-					return q.
-						Where("status IN (?, ?, ?) AND expires_at < ?",
-							domain.BackchannelStatusExpired,
-							domain.BackchannelStatusDenied,
-							domain.BackchannelStatusIssued,
-							now,
-						)
+					// Never resolved, past expiry.
+					return q.Where("status IN (?, ?) AND expires_at < ?",
+						domain.BackchannelStatusPending,
+						domain.BackchannelStatusExpired,
+						now,
+					)
 				}).
 				WhereGroup(" OR ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
-					// Approved rows that can no longer be redeemed: past
-					// both expires_at and the post-approval grace window.
-					return q.
-						Where("status = ? AND expires_at < ? AND COALESCE(approved_at, created_at) < ?",
-							domain.BackchannelStatusApproved,
-							now,
-							graceFloor,
-						)
+					// Approved or issued, past expiry and past retention.
+					return q.Where("status IN (?, ?) AND expires_at < ? AND COALESCE(approved_at, created_at) < ?",
+						domain.BackchannelStatusApproved,
+						domain.BackchannelStatusIssued,
+						now,
+						resolvedFloor,
+					)
+				}).
+				WhereGroup(" OR ", func(q *bun.DeleteQuery) *bun.DeleteQuery {
+					// Denied, past retention.
+					return q.Where("status = ? AND COALESCE(denied_at, expires_at) < ?",
+						domain.BackchannelStatusDenied,
+						resolvedFloor,
+					)
 				})
 		}).
 		Exec(ctx)
