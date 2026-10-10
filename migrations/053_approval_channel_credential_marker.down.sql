@@ -1,4 +1,4 @@
--- Reverting 052. Roll the binary back first: bun enumerates model columns
+-- Reverting 053. Roll the binary back first: bun enumerates model columns
 -- explicitly, so a binary that knows these columns fails against a schema
 -- without them.
 SET LOCAL lock_timeout = '3s';

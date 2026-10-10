@@ -1,4 +1,4 @@
--- 052_approval_channel_credential_marker.up.sql
+-- 053_approval_channel_credential_marker.up.sql
 -- Records, per credential, whether it was written by a caller marked with
 -- WithTrustedApprovalChannelWrite. The ciba:approve scope is issued only from
 -- a credential that carries the mark:

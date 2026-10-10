@@ -263,11 +263,11 @@ func TestCIBAApproveRequiresTrustedCredential(t *testing.T) {
 	requireCIBAApproveMinted(t, mintAPIKeyScope(t, key, "ciba:approve"))
 }
 
-// TestApprovalChannelCredentialMarkerMigration applies migration 052's down
+// TestApprovalChannelCredentialMarkerMigration applies migration 053's down
 // and up scripts inside a transaction that is rolled back.
 func TestApprovalChannelCredentialMarkerMigration(t *testing.T) {
 	ctx := context.Background()
-	const name = "052_approval_channel_credential_marker"
+	const name = "053_approval_channel_credential_marker"
 	up, err := fs.ReadFile(zeroid.MigrationFiles(), name+".up.sql")
 	require.NoError(t, err)
 	down, err := fs.ReadFile(zeroid.MigrationFiles(), name+".down.sql")

@@ -1106,17 +1106,21 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	customClaims["authorization_details"] = rarBytes
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		Scopes:            parseScopeString(row.Scope),
-		GrantType:         domain.GrantTypeCIBA,
-		TTL:               ttl,
-		UseRS256:          true,
-		SubjectOverride:   row.ApprovedSubjectID,
-		UserEmail:         row.ApprovedSubjectEmail,
-		UserName:          row.ApprovedSubjectName,
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: dpopKeyThumbprint,
+		// CIBA approval is binary: a root grant is bounded by the requested
+		// scope and the bound agent's policy, if any (ceiling rule, P1).
+		// requestingChainIssue clears this for a step-up into a chain.
+		RequestBoundedRoot: true,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
+		Scopes:             parseScopeString(row.Scope),
+		GrantType:          domain.GrantTypeCIBA,
+		TTL:                ttl,
+		UseRS256:           true,
+		SubjectOverride:    row.ApprovedSubjectID,
+		UserEmail:          row.ApprovedSubjectEmail,
+		UserName:           row.ApprovedSubjectName,
+		CustomClaims:       customClaims,
+		DPoPKeyThumbprint:  dpopKeyThumbprint,
 	}
 	// A request made with a requesting_token is approved INTO that chain:
 	// the token keeps the chain's sub, act and identity claims, and the

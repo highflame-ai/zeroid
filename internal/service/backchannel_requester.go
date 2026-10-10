@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -196,6 +197,13 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if !time.Now().Before(cred.ExpiresAt) {
 		return true, oauthBadRequest(oautherror.InvalidGrant, "the requesting token for this request has expired")
 	}
+	// The approval extends the chain, so the chain's principal carries over
+	// unchanged (RFC 8693 §4.1) and the token is not a request-bounded root:
+	// no role applies and the approver is evidence only (ADR 0041 D15).
+	req.RequestBoundedRoot = false
+	p := requestingChainPrincipal(cred, row.RequesterSub, s.credentialSvc.issuer)
+	req.PrincipalType, req.PrincipalSub, req.PrincipalIss = p.Type, p.Sub, p.Iss
+
 	// Never outlive the chain: the chokepoint clamps exp to this bound.
 	chainExp := cred.ExpiresAt
 	req.CredentialExpiresAt = &chainExp
@@ -266,6 +274,26 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	// re-check it against the CIBA grant type instead.
 	req.IdentityPolicyID = ""
 	return true, nil
+}
+
+// requestingChainPrincipal returns the principal of the chain a step-up is
+// approved into. A requesting credential minted since migration 048 records
+// it; an older one does not, and the exchange's legacy rule applies (see
+// OAuthService.parentPrincipal): at depth 0 a WIMSE subject is a workload and
+// anything else a person; above depth 0 the original principal is lost and
+// the result is unknown, which never satisfies a principal requirement.
+func requestingChainPrincipal(cred *domain.IssuedCredential, sub, issuer string) resolvedPrincipal {
+	if cred.PrincipalType != "" {
+		return resolvedPrincipal{Type: cred.PrincipalType, Sub: cred.PrincipalSub, Iss: cred.PrincipalIss}
+	}
+	switch {
+	case cred.DelegationDepth > 0:
+		return resolvedPrincipal{Type: domain.PrincipalUnknown, Sub: sub, Iss: issuer}
+	case strings.HasPrefix(sub, "spiffe://"):
+		return resolvedPrincipal{Type: domain.PrincipalWorkload, Sub: sub, Iss: issuer}
+	default:
+		return resolvedPrincipal{Type: domain.PrincipalUser, Sub: sub, Iss: issuer}
+	}
 }
 
 // requireScopesWithin refuses any requested scope outside a non-empty ceiling.

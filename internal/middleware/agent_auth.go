@@ -15,7 +15,7 @@ import (
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
 // It is populated by AgentAuthMiddleware and available via GetAgentClaims.
 type AgentClaims struct {
-	Subject    string // WIMSE URI
+	Subject    string // WIMSE URI of the presenting agent: the current actor of an rfc8693 exchanged token, else `sub`
 	AccountID  string
 	ProjectID  string
 	AgentID    string
@@ -176,6 +176,21 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	}
 	if v, err := jwt.Get[string](token, "trust_level"); err == nil {
 		claims.TrustLevel = v
+	}
+	// Under the rfc8693 token profile (recognised by principal_type) an
+	// exchanged token's `sub` is the principal — possibly a person — and the
+	// agent presenting it is the current actor, whose attributes are carried
+	// inside the outermost `act`. Read it the RFC 8693 way: the current actor
+	// if there is one, otherwise `sub`. Legacy-shaped tokens are unchanged.
+	if _, err := jwt.Get[string](token, "principal_type"); err == nil {
+		if act, err := jwt.Get[map[string]any](token, "act"); err == nil {
+			if actor, _ := act["sub"].(string); actor != "" {
+				claims.Subject = actor
+			}
+			if tl, _ := act["trust_level"].(string); tl != "" {
+				claims.TrustLevel = tl
+			}
+		}
 	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v

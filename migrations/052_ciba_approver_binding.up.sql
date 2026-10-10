@@ -1,4 +1,4 @@
--- 051_ciba_approver_binding.up.sql
+-- 052_ciba_approver_binding.up.sql
 -- CIBA approver binding: bc-authorize extension parameters and the approval
 -- record.
 --

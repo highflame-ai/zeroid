@@ -65,7 +65,7 @@ type RegisterAgentRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	CreatedBy     string
 	PublicKeyPEM  string
 	// CredentialPolicyID is the identity policy — the authority ceiling for
