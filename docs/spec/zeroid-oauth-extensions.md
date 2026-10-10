@@ -657,8 +657,14 @@ scopes grant_type delegation_depth user_email user_name
 act token_exchange trusted_by user_id_iss
 # RFC 9449 sender-constraint
 cnf
+# RFC 8707 resource binding, RFC 9068 client attribution
+resource client_id
 # Authorization (gated)
 role privilege_scope
+# Step-up approvals (RFC 9396)
+authorization_details approval_id
+# Agent provenance
+origin agent_idp_iss agent_idp_parent
 ```
 
 Special cases:
@@ -671,6 +677,16 @@ Special cases:
   **dedicated request fields** (`role`, `privilege_scope`) — i.e. only *after*
   the `TrustedServiceValidator` gate. Empty values are omitted, preserving
   byte-identical tokens for callers that don't use them.
+
+- `authorization_details` is written **only** on the CIBA path, from the
+  approved backchannel request, with ZeroID stamping `approval_id` into each
+  entry. A resource server that honours an approval entry (Highflame Shield's
+  step-up) relies on no other grant being able to carry one; `approval_id` is
+  also reserved at the top level so no caller can mint a look-alike.
+- `origin`, `agent_idp_iss` and `agent_idp_parent` describe where an agent was
+  registered (native, or an external IdP such as Entra or Okta). Policies use
+  them to tell the two apart, so no caller may set them; ZeroID does not mint
+  them yet.
 
 This makes the `additional_claims` route fail closed regardless of which grant
 is in play.

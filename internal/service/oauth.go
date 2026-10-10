@@ -207,6 +207,27 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
+	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
+	// entry in `authorization_details` only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge Shield raised — but the claim
+	// must still never be writable through additional_claims, or a token
+	// from another grant could carry an approval nobody gave. ZeroID writes
+	// it only on the CIBA path, from the approved request row
+	// (stampAuthorizationDetails, which also stamps `approval_id` inside
+	// each entry). `approval_id` is reserved at the top level too so no
+	// caller can mint a look-alike.
+	"authorization_details": true,
+	"approval_id":           true,
+	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
+	// `agent_idp_parent` into context.principal / context.actor, where
+	// policies use them to tell native agents from IdP-registered ones
+	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
+	// ZeroID does not mint them yet; until it does from the identity row,
+	// nothing may set them, or a caller with an id_token exchange could
+	// claim to be a native agent.
+	"origin":           true,
+	"agent_idp_iss":    true,
+	"agent_idp_parent": true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
