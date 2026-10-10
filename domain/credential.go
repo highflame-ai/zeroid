@@ -120,4 +120,15 @@ type IssuedCredential struct {
 	// rows written before migration 037; those fall back to the legacy
 	// expires_at prune rule.
 	AuditRetentionUntil *time.Time `bun:"audit_retention_until" json:"audit_retention_until,omitempty"`
+	// PrincipalType, PrincipalSub and PrincipalIss record the principal whose
+	// authority this credential's chain uses (RFC 8693 §4.1): the RFC 9493
+	// issuer-plus-subject pair, and whether it is a person or a workload.
+	// Written for every credential whatever the tenant's token profile, and
+	// copied unchanged down a delegation chain, so revoking a person reaches
+	// every chain acting for them in one indexed lookup. Empty on rows written
+	// before migration 047. PrincipalSub differs from Subject, which is always
+	// the identity's WIMSE URI.
+	PrincipalType PrincipalType `bun:"principal_type,type:varchar(20),nullzero" json:"principal_type,omitempty"`
+	PrincipalSub  string        `bun:"principal_sub,type:text,nullzero"         json:"principal_sub,omitempty"`
+	PrincipalIss  string        `bun:"principal_iss,type:text,nullzero"         json:"principal_iss,omitempty"`
 }

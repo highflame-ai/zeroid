@@ -52,6 +52,14 @@ type RefreshToken struct {
 	// as SQL NULL (pre-migration families, or flows that carried no mission_id);
 	// the refresh path falls back to re-rooting for those. Opaque to consumers.
 	MissionID string `bun:"mission_id,nullzero" json:"mission_id,omitempty"`
+	// PrincipalIss is the issuer of the family's user subject (UserID): the
+	// upstream IdP's issuer for a federated user, otherwise ZeroID's own. With
+	// UserID it forms the RFC 9493 iss_sub pair, so revoking a person's refresh
+	// families can never match another IdP's user of the same name. Copied
+	// verbatim onto every successor row on rotation and read back when the
+	// refresh grant re-mints, so the refreshed token keeps the same principal.
+	// nullzero ⇒ empty on families minted before migration 047.
+	PrincipalIss string `bun:"principal_iss,nullzero" json:"principal_iss,omitempty"`
 	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
 	// this refresh family was issued for by the external-principal exchange.
 	// Copied verbatim onto every successor row on rotation and read back when

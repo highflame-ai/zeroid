@@ -36,7 +36,7 @@ func TestDelegationScopeDenial_NoScopesRequested(t *testing.T) {
 	// token_exchange is the ONE grant with no RFC 6749 §3.3 default, so an
 	// omitted scope is a hard failure rather than "grant the full ceiling".
 	// A caller who has only ever used the other grants will not expect that.
-	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil)
+	err := delegationScopeDenial(nil, map[string]bool{"tools:read": true}, nil, nil, false)
 
 	desc := denialText(t, err)
 	assert.Contains(t, desc, "no scopes were requested")
@@ -52,6 +52,7 @@ func TestDelegationScopeDenial_SubjectDoesNotHold(t *testing.T) {
 		map[string]bool{}, // subject holds nothing
 		[]string{"data:read", "tools:read"},
 		nil,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -67,6 +68,7 @@ func TestDelegationScopeDenial_ActorCeilingExcludes(t *testing.T) {
 		map[string]bool{"data:read": true},
 		nil,                    // the policy places no restriction
 		[]string{"tools:read"}, // the registration excludes data:read
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -84,6 +86,7 @@ func TestDelegationScopeDenial_BothTermsNamedSeparately(t *testing.T) {
 		map[string]bool{"data:read": true}, // subject lacks order:write
 		nil,
 		[]string{"order:write"}, // actor registration lacks data:read
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -100,6 +103,7 @@ func TestDelegationScopeDenial_UnrestrictedActorBlamesTheSubjectOnly(t *testing.
 		map[string]bool{},
 		nil, // no actor policy ceiling
 		nil, // no actor registration ceiling
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -115,6 +119,7 @@ func TestDelegationScopeDenial_EachScopeIsBlamedOnce(t *testing.T) {
 		map[string]bool{},      // subject lacks it
 		[]string{"tools:read"}, // and the actor policy lacks it too
 		nil,
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -134,6 +139,7 @@ func TestDelegationScopeDenial_PolicyCeilingBlamesThePolicy(t *testing.T) {
 		map[string]bool{"data:read": true},
 		[]string{"tools:read"},
 		[]string{"data:read"}, // the registration lists it; the policy does not
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -151,6 +157,7 @@ func TestDelegationScopeDenial_RowNarrowerThanPolicyBlamesTheRegistration(t *tes
 		map[string]bool{"nhi:manage": true},
 		[]string{"nhi:manage", "tools:read"},
 		[]string{"tools:read"},
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -164,6 +171,7 @@ func TestDelegationScopeDenial_ScopeBothCeilingsExcludeIsBlamedOnce(t *testing.T
 		map[string]bool{"data:read": true},
 		[]string{"tools:read"},
 		[]string{"tools:read"},
+		false,
 	)
 
 	desc := denialText(t, err)
@@ -232,4 +240,20 @@ func TestGrantScopes(t *testing.T) {
 		got[0] = "mutated"
 		assert.Equal(t, "a", ceiling[0])
 	})
+}
+
+// TestDelegationScopeDenial_NamesUserGrantScopes: for a chain acting for a
+// person the actor's ceiling is its policy's user_grant_scopes (D10), so the
+// denial must send the caller to that field, not to allowed_scopes.
+func TestDelegationScopeDenial_NamesUserGrantScopes(t *testing.T) {
+	err := delegationScopeDenial(
+		[]string{"data:write"},
+		map[string]bool{"data:write": true},
+		[]string{"data:read"},
+		nil,
+		true,
+	)
+
+	desc := denialText(t, err)
+	assert.Contains(t, desc, "user_grant_scopes does not permit [data:write]")
 }

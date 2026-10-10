@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
 // externalIDTokenClockSkew is the leeway allowed when validating the upstream
@@ -29,6 +31,30 @@ const externalIDTokenClockSkew = 60 * time.Second
 // token. ZeroID dispatches token-exchange requests carrying this type to the
 // direct-federation path (issue #88) instead of the broker path.
 const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
+
+// idTokenIssuedTo checks that an OIDC ID token was issued to clientID (D13),
+// per OpenID Connect Core §2 and §3.1.3.7: clientID must be one of the
+// token's audiences, and when the token names an authorized party (azp) it
+// must be clientID. A token with several audiences must name one, since
+// otherwise any of them could claim it.
+func idTokenIssuedTo(token jwt.Token, clientID string) error {
+	aud, _ := token.Audience()
+	if !slices.Contains(aud, clientID) {
+		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)")
+	}
+	azp, err := jwt.Get[string](token, "azp")
+	if err == nil && azp != clientID {
+		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)")
+	}
+	if err != nil && len(aud) > 1 {
+		return oauthBadRequest(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client")
+	}
+	return nil
+}
+
+// TokenTypeAccessToken is the RFC 8693 §3 identifier for an OAuth 2.0 access
+// token, returned as issued_token_type on every token-exchange response.
+const TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
 
 // ErrUnknownExternalIssuer is returned when a token-exchange request carries
 // an upstream `iss` that is not in the deployer-configured external_issuers
@@ -111,6 +137,19 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
 	}
 
+	// D13: only the relying party an ID token was issued to may redeem it, and
+	// it must authenticate as that client. Without this, anyone holding a
+	// person's ID token could mint a token with that person as sub. Same
+	// shared client authentication ID-JAG uses, so the client's registered
+	// token_endpoint_auth_method decides which credential it must present.
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
+	}
+	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
 	// Verify the upstream ID token against its configured IdP — signature
 	// (JWKS), iss, aud, exp/nbf, alg allow-list, MaxTokenAge, and the
 	// presence of sub/exp/iat. This is the #88 federation substrate, shared
@@ -119,6 +158,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// what an id_token-exchange caller presents.
 	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub)
 	if err != nil {
+		return nil, err
+	}
+	if err := idTokenIssuedTo(verified, authedClient.ClientID); err != nil {
 		return nil, err
 	}
 
@@ -194,8 +236,11 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	scopes := parseScopeString(req.Scope)
 	issue := IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
+		// The IdP's scopes are not read on this path, so the token is bounded
+		// only by the caller's request and the governing policy (ceiling rule, P1).
+		RequestBoundedRoot: true,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
 		// Govern the synthetic-carrier path (no application_id, so no identity
 		// row and no IdentityPolicyID above) by the tenant default policy.
 		// resolveIdentityPolicyID falls back to EnsureDefaultPolicy on the
@@ -212,9 +257,13 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		UserEmail:             userEmail,
 		UserName:              userName,
 		ApplicationID:         req.ApplicationID,
-		TTL:                   900, // 15 minutes — same short-lived posture as the broker path
-		CustomClaims:          customClaims,
-		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		// RFC 9068 §2.2 client_id: the relying party just authenticated and
+		// bound to the ID token's aud/azp (D13), so it is the client the
+		// token is issued to.
+		ClientID:          authedClient.ClientID,
+		TTL:               900, // 15 minutes — same short-lived posture as the broker path
+		CustomClaims:      customClaims,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	}
 	// RFC 8707 resource binding (CAP-IDN-026). token-exchange forks THREE ways —
 	// this id_token federation path, the trusted external-principal exchange, and

@@ -76,7 +76,13 @@ func buildIDJAGCustomClaims(
 	// Honest propagation of RFC 9068 authentication-context claims — only
 	// forward auth_time/acr/amr when the deployer asked for them AND the ID-JAG
 	// actually set them. Never default-fill.
+	// Reserved claims are skipped for the same reason as on the ID-token
+	// exchange: config restricts the list today, but that guarantee is held
+	// one file away.
 	for _, claim := range cfg.PropagateClaims {
+		if reservedClaims[claim] {
+			continue
+		}
 		if v, present := rawClaims[claim]; present {
 			customClaims[claim] = v
 		}
@@ -386,14 +392,22 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		ResolveIdentityPolicy: true,
 		GrantType:             domain.GrantTypeJWTBearer,
 		Scopes:                scopes,
+		// The IdP's policy decision bounds an ID-JAG's scopes, so the
+		// application identity's user-grant ceiling applies rather than its
+		// own allowed_scopes, which would reject scopes the IdP granted (D10).
+		UserGrantBounded: true,
 		// Audience-restrict to the ID-JAG resource(s) (D4). IssueCredential stamps
 		// these verbatim as the aud claim instead of defaulting to the issuer URL.
-		Audience:          resources,
-		UseRS256:          true,
-		SubjectOverride:   userID,
-		UserEmail:         userEmail,
-		UserName:          userName,
-		ApplicationID:     req.ApplicationID,
+		Audience:        resources,
+		UseRS256:        true,
+		SubjectOverride: userID,
+		UserEmail:       userEmail,
+		UserName:        userName,
+		ApplicationID:   req.ApplicationID,
+		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
+		// this client and bound the ID-JAG's own client_id claim to it, so it
+		// is exactly the client the token is issued to.
+		ClientID:          authedClient.ClientID,
 		TTL:               900, // 15 minutes — short-lived, matching the external-IdP paths
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
