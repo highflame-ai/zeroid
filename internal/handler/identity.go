@@ -25,7 +25,7 @@ type CreateIdentityInput struct {
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type within identity type"`
 		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
-		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
 		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy."`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA P-256 public key in PEM format for jwt_bearer grant"`
 		Framework          string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
@@ -119,7 +119,7 @@ type UpdateIdentityInput struct {
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
 		OwnerUserID        string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`
-		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"Deprecated: set scope ceiling on the identity's credential policy"`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
 		CredentialPolicyID *string         `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Empty string resets to tenant default; omit to leave unchanged."`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA public key PEM"`
 		Framework          *string         `json:"framework,omitempty" doc:"Agent framework"`

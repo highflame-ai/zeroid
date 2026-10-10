@@ -92,6 +92,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **OAuth 2.1 Token Issuance** — Full OAuth 2.1 support: `client_credentials`, `jwt_bearer` (RFC 7523), `token_exchange` (RFC 8693) for delegation, `api_key`, `authorization_code` (PKCE), `refresh_token`, `urn:openid:params:grant-type:ciba` (OpenID CIBA Core 1.0).
 - **DPoP Sender-Constrained Tokens** — RFC 9449. Clients may attach a `DPoP` proof JWT to any `/oauth2/token` call; the issued token then carries `cnf.jkt` and `token_type: "DPoP"`. Proof replay is blocked by an atomic `dpop_jti` upsert (DB primary key — no pre-check race). Resource servers retrieve `cnf` via introspection and validate the per-request proof themselves. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
 - **Dynamic Client Registration** — RFC 7591 (`POST /oauth2/register`) gated by an initial access token with the `client:register` scope, plus RFC 7592 management (`GET`/`PUT`/`DELETE /oauth2/register/{client_id}`) authenticated by a one-shot `registration_access_token` (bcrypt-hashed at rest, constant-time lookup). Internal admin-registered clients remain isolated from DCR — the delete path refuses to touch `registration_source = 'internal'`. Full reference: [`docs/dpop-and-dcr.md`](docs/dpop-and-dcr.md).
+- **Scope ceilings** — an identity's `allowed_scopes` is the absolute ceiling of the scopes its tokens can carry (the RFC 7591 client `scope` equivalent); credential policies are reusable bundles that only narrow within it. Every grant intersects the request with every layer that restricts, token exchange narrows at each hop, and a grant whose layers leave nothing is refused rather than minted without scopes. Full reference: [`docs/scope-ceilings.md`](docs/scope-ceilings.md).
 - **Client ID Metadata Documents (CIMD)** — [`draft-ietf-oauth-client-id-metadata-document`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), the MCP Authorization 2026-07-28 preferred default. An agent onboards with **zero pre-registration** by using a stable `https://` URL as its `client_id`; on the `authorization_code` + PKCE flow ZeroID fetches the JSON metadata document that URL publishes, validates it (self-reference match, `redirect_uris` allow-list, `token_endpoint_auth_method` of `none` or `private_key_jwt`), and treats it as an ephemeral client — public PKCE, or key-authenticated against the key set the document publishes — nothing is persisted. The fetch reuses the same DNS-rebinding-safe SSRF-guarded HTTP client as attestation/CIBA (private/loopback/metadata ranges blocked, 5 KiB size cap, timeout), with an optional `allowed_domains` allowlist. Advertised as `client_id_metadata_document_supported` in AS metadata. On by default. Full reference: [`docs/cimd.md`](docs/cimd.md).
 - **CIBA Backchannel Approval** — OpenID Client-Initiated Backchannel Authentication (CIBA Core 1.0). Agent posts to `/oauth2/bc-authorize` with a `binding_message`; the deployer's `BackchannelNotifier` prompts the end user out-of-band (email, Slack, mobile push); user approves or denies; agent receives the resulting token via poll, ping callback, or push delivery. SSRF-guarded outbound callbacks, per-tenant audit, single-use `auth_req_id`s. Per-user targeting via standard `login_hint` (CIBA Core §7.1); role / group / queue targeting via the `group_hint` extension — an opaque deployer-namespaced string (e.g. `"highflame:role:finance_lead"`, `"pd:schedule:P12345"`) that the deployer's `BackchannelNotifier` resolves at fan-out time; first-approver wins via zeroid's existing atomic single-use CAS.
 - **Rich Authorization Requests (RAR)** — RFC 9396. Agents can attach a typed `authorization_details` JSON array to a CIBA `/oauth2/bc-authorize` call describing exactly what is being authorized at finer granularity than `scope` — e.g. `{"type": "tool_call", "tool": "transfer_funds", "amount": 50000}`. The `BackchannelNotifier` receives the parsed typed slice so the approver UX can render a per-action prompt instead of "approve this scope." Per-type schema validation is opt-in via `Server.RegisterAuthorizationDetailValidator(typ, fn)`. JSON and form-encoded bodies both supported. Rejections map to the RFC 9396 `invalid_authorization_details` OAuth error code. Full reference: [`docs/rar.md`](docs/rar.md).
@@ -486,6 +487,7 @@ Full interactive API docs: `GET http://localhost:8899/docs`
 policy = client.credential_policies.create(
     name="budget-optimizer-policy",
     allowed_scopes=["campaigns:read", "campaigns:write", "budget:reallocate"],
+    allowed_grant_types=["api_key"],  # the agent authenticates with its API key only
     max_ttl_seconds=3600,           # tokens expire hourly — no long-lived access
     required_trust_level="first_party",
     max_delegation_depth=0,         # this agent cannot spawn sub-agents
@@ -497,6 +499,7 @@ agent = client.agents.register(
     sub_type="autonomous",
     trust_level="first_party",
     created_by="operations@company.com",  # owner claim in every token
+    credential_policy_id=policy.id,       # the policy bounds the agent's tokens
 )
 
 # Agent runs autonomously. Per-action approvals are replaced by the policy envelope.
@@ -564,26 +567,32 @@ policy = client.credential_policies.create(
     name="sec-ops-policy",
     max_delegation_depth=2,
     allowed_scopes=["alerts:read", "logs:read", "logs:query", "firewall:write"],
+    allowed_grant_types=["api_key", "token_exchange"],  # API-key login + delegation
 )
 
-# Three agents registered with separate identities
+# Three agents registered with separate identities, all under the same policy.
+# The policy bounds each agent's tokens; an agent's own allowed_scopes could
+# narrow it further.
 monitor  = client.agents.register(name="Security Monitor",  
                                   external_id="sec-monitor",
                                   sub_type="orchestrator",  
                                   trust_level="first_party",
-                                  created_by="operations@company.com")
+                                  created_by="operations@company.com",
+                                  credential_policy_id=policy.id)
 
 investigator = client.agents.register(name="Log Investigator", 
                                       external_id="log-investigator",
                                       sub_type="autonomous",    
                                       trust_level="first_party",
-                                      created_by="operations@company.com")
+                                      created_by="operations@company.com",
+                                      credential_policy_id=policy.id)
 
 remediator   = client.agents.register(name="Firewall Agent",    
                                       external_id="fw-remediator",
                                       sub_type="tool_agent",    
                                       trust_level="first_party",
-                                      created_by="operations@company.com")
+                                      created_by="operations@company.com",
+                                      credential_policy_id=policy.id)
 
 # Each agent runs with its own client, initialized with its own api_key.
 # delegate() uses the client's internally managed token as the subject.
