@@ -400,6 +400,106 @@ func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
 	}
 }
 
+// CIBA approver settings: defaults keep standalone deployments unchanged, and
+// both env vars reach the typed fields.
+func TestBackchannelApproverConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Backchannel.RequireApproverIdentity {
+			t.Error("backchannel.require_approver_identity must default to false")
+		}
+		if cfg.Backchannel.EnforceHints != "off" {
+			t.Errorf("backchannel.enforce_hints must default to off, got %q", cfg.Backchannel.EnforceHints)
+		}
+		if cfg.Backchannel.ResolvedRetention != "720h" {
+			t.Errorf("backchannel.resolved_retention must default to 720h, got %q", cfg.Backchannel.ResolvedRetention)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "true")
+		t.Setenv("ZEROID_BACKCHANNEL_ENFORCE_HINTS", "shadow")
+		t.Setenv("ZEROID_BACKCHANNEL_RESOLVED_RETENTION", "48h")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if !cfg.Backchannel.RequireApproverIdentity {
+			t.Error("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY=true did not reach backchannel")
+		}
+		if cfg.Backchannel.ResolvedRetention != "48h" {
+			t.Errorf("ZEROID_BACKCHANNEL_RESOLVED_RETENTION=48h did not reach backchannel, got %q", cfg.Backchannel.ResolvedRetention)
+		}
+		if cfg.Backchannel.EnforceHints != "shadow" {
+			t.Errorf("ZEROID_BACKCHANNEL_ENFORCE_HINTS=shadow did not reach backchannel, got %q", cfg.Backchannel.EnforceHints)
+		}
+	})
+
+	t.Run("bad_bool", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "maybe")
+		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid bool") {
+			t.Fatalf("expected a bool parse error, got %v", err)
+		}
+	})
+
+	t.Run("validate_resolved_retention", func(t *testing.T) {
+		for _, v := range []string{"", "0s", "720h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("resolved_retention=%q must validate, got %v", v, err)
+			}
+		}
+		for _, v := range []string{"30d", "-1h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "backchannel.resolved_retention") {
+				t.Errorf("resolved_retention=%q must be rejected naming the key, got %v", v, err)
+			}
+		}
+	})
+
+	t.Run("validate_enforce_hints", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = true
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q must validate, got %v", mode, err)
+			}
+		}
+		for _, mode := range []string{"", "off"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q without require_approver_identity must validate, got %v", mode, err)
+			}
+		}
+		cfg := baseValidConfig(t)
+		cfg.Backchannel.EnforceHints = "strict"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") {
+			t.Fatalf("enforce_hints=strict must be rejected naming the key, got %v", err)
+		}
+	})
+
+	t.Run("validate_enforce_hints_requires_approver_identity", func(t *testing.T) {
+		for _, mode := range []string{"shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = false
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") ||
+				!strings.Contains(err.Error(), "backchannel.require_approver_identity") {
+				t.Errorf("enforce_hints=%q without require_approver_identity must be rejected naming both keys, got %v", mode, err)
+			}
+		}
+	})
+}
+
 // Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
 // variable the loader actually reads.
 //

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -149,6 +150,16 @@ type IssueRequest struct {
 	// UserEmail and UserName are set for human user tokens.
 	UserEmail string
 	UserName  string
+	// ActClaim, when non-nil, is emitted verbatim as the RFC 8693 "act" claim
+	// (nested actors included), taking precedence over Actors, DelegatedBy and
+	// ActingUserID under either token profile. Used to carry an existing
+	// chain's act unchanged (a CIBA step-up approved into a requesting chain).
+	ActClaim map[string]any
+	// ChannelTrustedCredential reports that the credential presented for this
+	// issuance (API key, OAuth client or public key) was written by a caller
+	// marked with WithTrustedApprovalChannelWrite. ciba:approve is issued only
+	// when it is set; grants that present no such credential leave it false.
+	ChannelTrustedCredential bool
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
@@ -365,6 +376,58 @@ func (s *CredentialService) resolvePrincipal(req IssueRequest) resolvedPrincipal
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
 var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
 
+// scopeRefusedForIdentityType returns the first scope in scopes that may never
+// be issued to an identity of type t, or "" when all are permitted.
+//
+// ciba:approve lets its holder resolve CIBA requests on behalf of a user, so
+// it is reserved for approval-channel services and never issued to agent or
+// MCP server identities.
+func scopeRefusedForIdentityType(t domain.IdentityType, scopes []string) string {
+	if t != domain.IdentityTypeAgent && t != domain.IdentityTypeMCPServer {
+		return ""
+	}
+	for _, sc := range scopes {
+		if sc == domain.ScopeCIBAApprove {
+			return sc
+		}
+	}
+	return ""
+}
+
+// cibaApproveListed reports whether ciba:approve is listed explicitly for this
+// issuance: in the identity's own allowed_scopes, or in the allowed_scopes of
+// the identity policy (the one passed in, else the identity's own or tenant
+// default) or of the per-credential policy. Lookup failures count as not
+// listed.
+func (s *CredentialService) cibaApproveListed(ctx context.Context, req IssueRequest) bool {
+	if req.Identity == nil {
+		return false
+	}
+	if slices.Contains(req.Identity.AllowedScopes, domain.ScopeCIBAApprove) {
+		return true
+	}
+	if s.policySvc == nil {
+		return false
+	}
+	identityPolicyID := req.IdentityPolicyID
+	if identityPolicyID == "" {
+		resolved, err := s.resolveIdentityPolicyID(ctx, req.Identity)
+		if err == nil {
+			identityPolicyID = resolved
+		}
+	}
+	for _, id := range []string{identityPolicyID, req.CredentialPolicyID} {
+		if id == "" {
+			continue
+		}
+		policy, err := s.policySvc.GetPolicy(ctx, id, req.Identity.AccountID, req.Identity.ProjectID)
+		if err == nil && policy != nil && slices.Contains(policy.AllowedScopes, domain.ScopeCIBAApprove) {
+			return true
+		}
+	}
+	return false
+}
+
 // IssueCredential issues a short-lived JWT for an identity.
 //
 // Gate: identities not in a usable status never receive a fresh credential.
@@ -443,6 +506,25 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
+	}
+
+	// Some scopes are never issued to certain identity types, whatever their
+	// scope ceilings say (see scopeRefusedForIdentityType).
+	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
+		return nil, nil, fmt.Errorf("%w: %q is not issued to %s identities", ErrScopesNotAllowed, refused, req.Identity.IdentityType)
+	}
+
+	// ciba:approve is issued only to identities that list it explicitly, on
+	// the identity row or on a credential policy that governs this issuance.
+	// An empty ceiling means "no restriction" for every other scope; it never
+	// yields this one.
+	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !s.cibaApproveListed(ctx, req) {
+		return nil, nil, fmt.Errorf("%w: %q is issued only to identities that list it explicitly", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
+	}
+	// ... and only from a credential written in the trusted approval-channel
+	// context, so a credential obtained any other way never carries it.
+	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !req.ChannelTrustedCredential {
+		return nil, nil, fmt.Errorf("%w: %q is issued only from a credential created by a trusted approval-channel write", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
 	}
 
 	// The identity's allowed_scopes is its absolute ceiling (RFC 7591 §2 client
@@ -608,7 +690,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	rfc8693 := profile == domain.TokenProfileRFC8693
 	// Under rfc8693 an exchanged token's top level describes the principal,
 	// so the actor's own attributes move inside the outermost `act`.
-	actorsInAct := rfc8693 && len(req.Actors) > 0
+	// A verbatim ActClaim from an rfc8693 chain already carries them there.
+	actorsInAct := rfc8693 && (len(req.Actors) > 0 || req.ActClaim != nil)
 
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
@@ -768,7 +851,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// api-key token is a workload-subject token with no actor; the creator
 		// stays identity metadata, carried in owner_user_id and returned by
 		// introspection.
-		if len(req.Actors) > 0 {
+		if req.ActClaim != nil {
+			_ = token.Set("act", req.ActClaim)
+		} else if len(req.Actors) > 0 {
 			_ = token.Set("act", actorChainClaim(req.Actors))
 		}
 	} else {
@@ -776,7 +861,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.
 		//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
 		// These are mutually exclusive per token — a delegated token already has act from the orchestrator.
-		if req.DelegatedBy != "" {
+		if req.ActClaim != nil {
+			_ = token.Set("act", req.ActClaim)
+		} else if req.DelegatedBy != "" {
 			_ = token.Set("act", map[string]string{"sub": req.DelegatedBy})
 		} else if req.ActingUserID != "" {
 			_ = token.Set("act", map[string]string{"sub": req.ActingUserID})
@@ -1102,6 +1189,12 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialExpired)
 	}
 
+	// A credential carrying ciba:approve is rotated only by a trusted
+	// approval-channel caller, checked before anything is revoked.
+	if slices.Contains(old.Scopes, domain.ScopeCIBAApprove) && !TrustedApprovalChannelWrite(ctx) {
+		return nil, nil, ErrApprovalChannelWriteNotTrusted
+	}
+
 	// Revoke the old credential (cascades to descendants and fires the
 	// RevocationNotifier per affected JTI, same as any other revoke path).
 	revoked, err := s.repo.Revoke(ctx, credID, accountID, projectID, "rotated")
@@ -1117,6 +1210,9 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 		TTL:                   old.TTLSeconds,
 		GrantType:             old.GrantType,
 		ResolveIdentityPolicy: true,
+		// An admin rotation by a trusted approval-channel caller may carry
+		// ciba:approve forward.
+		ChannelTrustedCredential: TrustedApprovalChannelWrite(ctx),
 	})
 }
 

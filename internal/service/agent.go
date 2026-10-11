@@ -534,6 +534,12 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 		return nil, fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 	}
 
+	// Checked before the existing keys are revoked, so a refused rotation
+	// leaves them in place (CreateKey applies the same check).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
+
 	// Revoke existing keys.
 	s.revokeKeysByIdentity(ctx, identity.ID, "key rotated")
 

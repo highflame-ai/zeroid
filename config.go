@@ -9,12 +9,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // DefaultAdminPathPrefix is the default URL prefix for admin API routes.
@@ -113,6 +116,49 @@ type BackchannelConfig struct {
 	// register endpoints like https://localhost:9000/. Production deployments
 	// MUST keep this false (see GHSA-599q-j34m-33vc).
 	AllowPrivateNotificationEndpoints bool `koanf:"allow_private_notification_endpoints"`
+
+	// RequireApproverIdentity makes the CIBA approve/deny endpoints take the
+	// approver ONLY from the request context, set by the deployer's
+	// authentication layer via WithApproverIdentity. A call without one gets
+	// 401 invalid_client ("approver identity required"); a body subject_id
+	// that differs from it gets 400 invalid_request. Default false: the body
+	// subject_id is accepted when no context identity is present, which keeps
+	// standalone deployments that authenticate approvers at their edge working.
+	RequireApproverIdentity bool `koanf:"require_approver_identity"`
+
+	// EnforceHints binds the CIBA approver to the request on approve AND deny:
+	// login_hint set → the approver must be that user; four_eyes set → the
+	// approver must not be requester_owner; group_hint set → the
+	// ApproverAuthorizer (Server.SetApproverAuthorizer) must allow, and with
+	// none installed the check fails. shadow and on require
+	// RequireApproverIdentity.
+	//
+	//   off    (default) no checks.
+	//   shadow evaluate, always allow, record shadow_would_deny/shadow_reason on
+	//          the row, log "ciba approver would deny" and count
+	//          ciba_approver_would_deny_total{reason}.
+	//   on     refuse ineligible approvers with 403 access_denied.
+	EnforceHints string `koanf:"enforce_hints"`
+
+	// ResolvedRetention is how long approved, issued and denied requests are
+	// kept after they were resolved, so approval history stays readable
+	// (Go duration, e.g. "720h"). Unresolved requests are still reaped as
+	// soon as they expire, and a retained row is never redeemable again.
+	// Default "720h" (30 days); values below the 10-minute post-approval
+	// redemption grace act as that floor.
+	ResolvedRetention string `koanf:"resolved_retention"`
+}
+
+// resolvedRetention parses ResolvedRetention; empty means the default.
+func (b BackchannelConfig) resolvedRetention() (time.Duration, error) {
+	if b.ResolvedRetention == "" {
+		return postgres.DefaultResolvedRetention, nil
+	}
+	d, err := time.ParseDuration(b.ResolvedRetention)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("backchannel.resolved_retention must be a non-negative Go duration such as \"720h\" (got %q)", b.ResolvedRetention)
+	}
+	return d, nil
 }
 
 // CIMDConfig governs Client ID Metadata Documents
@@ -504,6 +550,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if !service.ValidEnforceHints(c.Backchannel.EnforceHints) {
+		return fmt.Errorf("backchannel.enforce_hints must be one of off, shadow, on (got %q)", c.Backchannel.EnforceHints)
+	}
+	// The binding checks compare against the authenticated approver; with
+	// require_approver_identity off the approver can come from the request
+	// body, so the checks would record a result they did not establish.
+	if service.EnforceHintsActive(c.Backchannel.EnforceHints) && !c.Backchannel.RequireApproverIdentity {
+		return fmt.Errorf("backchannel.enforce_hints=%s requires backchannel.require_approver_identity=true", c.Backchannel.EnforceHints)
+	}
+	if _, err := c.Backchannel.resolvedRetention(); err != nil {
+		return err
+	}
+
 	// token.hmac_secret signs/verifies stateless authorization_code JWTs
 	// (HS256). The authorization_code grant is optional, so the secret is not
 	// globally required — but a weak secret is forgeable, so when one IS set
@@ -730,6 +789,12 @@ func loadDefaults(k *koanf.Koanf) error {
 		"client_auth.allow_private_jwks_endpoints": false,
 		"client_auth.jwks_cache_size":              0,
 
+		// CIBA approver binding — both off so standalone deployments keep
+		// today's approve/deny behaviour until they opt in.
+		"backchannel.require_approver_identity": false,
+		"backchannel.enforce_hints":             "off",
+		"backchannel.resolved_retention":        "720h",
+
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
 
@@ -813,7 +878,10 @@ var envMapping = map[string]string{
 
 	// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
 	// test/dev deployments only. Production MUST leave this false.
-	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS": "backchannel.allow_private_notification_endpoints",
+	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS":   "backchannel.allow_private_notification_endpoints",
+	"ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY": "backchannel.require_approver_identity",
+	"ZEROID_BACKCHANNEL_ENFORCE_HINTS":             "backchannel.enforce_hints",
+	"ZEROID_BACKCHANNEL_RESOLVED_RETENTION":        "backchannel.resolved_retention",
 
 	// CIMD (Client ID Metadata Documents). Enabled by default; disable with
 	// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
@@ -856,6 +924,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_unsafe_dev_stub") ||
 			strings.HasSuffix(configPath, ".trust_forwarded_headers") ||
 			strings.HasSuffix(configPath, ".allow_private_notification_endpoints") ||
+			strings.HasSuffix(configPath, ".require_approver_identity") ||
 			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
