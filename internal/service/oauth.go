@@ -863,6 +863,10 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// RFC 9068 §2.2: the client just authenticated. A resource server
+		// attributing the call (an approval channel's recorded client, for
+		// one) reads this claim, not the identity's WIMSE sub.
+		ClientID: client.ClientID,
 
 		ChannelTrustedCredential: client.ChannelTrusted,
 	}

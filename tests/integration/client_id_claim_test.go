@@ -99,3 +99,29 @@ func TestRefreshedAccessTokenKeepsClientIDClaim(t *testing.T) {
 		"client_id and application_id disagree on the refreshed token — they are "+
 			"both meant to name the client this grant belongs to")
 }
+
+// TestClientCredentialsTokenCarriesClientIDClaim: the client_credentials grant
+// authenticates a registered client, so its token names that client too. Its
+// sub is the identity's WIMSE URI, which a consumer attributing the call to a
+// client (an approval channel, a partner's MCP server) cannot use as one.
+func TestClientCredentialsTokenCarriesClientIDClaim(t *testing.T) {
+	agentID := uid("cid-cc-agent")
+	registerIdentity(t, agentID, []string{"data:read"})
+	client := registerOAuthClient(t, agentID, []string{"data:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+		"scope":         "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	claims := decodeJWTUnsafe(t, decode(t, resp)["access_token"].(string))
+	assert.Equal(t, client.ClientID, claims["client_id"],
+		"RFC 9068 §2.2 `client_id` claim missing on a client_credentials token")
+	assert.NotEqual(t, client.ClientID, claims["sub"],
+		"sub is the identity's WIMSE URI; client_id is the only claim naming the client")
+}

@@ -1121,6 +1121,10 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		UserName:           row.ApprovedSubjectName,
 		CustomClaims:       customClaims,
 		DPoPKeyThumbprint:  dpopKeyThumbprint,
+		// RFC 9068 §2.2: the client that redeemed the grant, which Redeem has
+		// already required to be the one that initiated it. Same value as
+		// backchannel_client_id, kept for existing consumers.
+		ClientID: row.ClientID,
 	}
 	// A request made with a requesting_token is approved INTO that chain:
 	// the token keeps the chain's sub, act and identity claims, and the
