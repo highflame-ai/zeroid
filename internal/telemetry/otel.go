@@ -46,6 +46,11 @@ var (
 	// ceiling rule (human-rooted delegation P1) counts in phase 1 and refuses
 	// in phase 2, so this lists the identities enforcement will affect.
 	WorkloadUnboundedScope metric.Int64Counter
+
+	// CIBAApproverWouldDeny counts CIBA approve/deny calls allowed under
+	// backchannel.enforce_hints=shadow that enforce_hints=on would refuse.
+	// Attribute: reason (low-cardinality refusal code).
+	CIBAApproverWouldDeny metric.Int64Counter
 )
 
 func init() {
@@ -80,6 +85,9 @@ func registerInstruments(m metric.Meter) {
 	)
 	WorkloadUnboundedScope, _ = m.Int64Counter("zeroid.workload.unbounded_scope",
 		metric.WithDescription("Tokens issued for a named scope with no configured scope ceiling (ceiling rule, counted before it is enforced)"),
+	)
+	CIBAApproverWouldDeny, _ = m.Int64Counter("ciba_approver_would_deny_total",
+		metric.WithDescription("CIBA approver checks that would deny under enforce_hints=on (shadow mode)"),
 	)
 }
 

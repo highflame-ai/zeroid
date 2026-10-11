@@ -143,6 +143,9 @@ func (a *API) createPolicyOp(ctx context.Context, input *CreatePolicyInput) (*Po
 		UserGrantScopes:       input.Body.UserGrantScopes,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrPolicyNameConflict) {
 			return nil, huma.Error409Conflict("credential policy with this name already exists")
 		}
@@ -213,6 +216,9 @@ func (a *API) updatePolicyOp(ctx context.Context, input *UpdatePolicyInput) (*Po
 		UserGrantScopes:       input.Body.UserGrantScopes,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrPolicyNotFound) {
 			return nil, huma.Error404NotFound("credential policy not found")
 		}
