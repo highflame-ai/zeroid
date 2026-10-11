@@ -225,7 +225,11 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	}
 	req.Scopes = scopes
 	if cred.IdentityID == nil || *cred.IdentityID == "" {
-		return true, nil
+		// No requesting identity: the token stays anchored to the polling
+		// client's bound identity, if any, and the chokepoint enforces that
+		// identity's ceilings and policy on the chain's scopes, which the
+		// caller's pre-burn checks saw only as the request's own scope.
+		return true, s.boundAnchorGates(ctx, req)
 	}
 
 	ident, err := s.identitySvc.GetIdentity(ctx, *cred.IdentityID, row.AccountID, row.ProjectID)
@@ -302,6 +306,52 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.IdentityPolicyID = ""
 	req.EnforcedIdentityPolicy = policy
 	return true, nil
+}
+
+// boundAnchorGates applies, before the burn, the checks IssueCredential makes
+// against req.Identity and req.IdentityPolicyID when a step-up into a chain
+// with no identity leaves the token anchored to the polling client's bound
+// identity. It mirrors the chokepoint so a deterministic refusal there cannot
+// consume the approval. A request with no anchor (an unbound client) has
+// nothing to check.
+func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueRequest) error {
+	if req.Identity == nil || req.Identity.ID == "" {
+		return nil
+	}
+	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
+		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to the bound identity", refused))
+	}
+	if err := requireScopesWithin(req.Scopes, req.Identity.AllowedScopes, "the bound identity's allowed_scopes"); err != nil {
+		return err
+	}
+	if req.IdentityPolicyID == "" || s.credentialSvc.policySvc == nil {
+		return nil
+	}
+	policy, err := s.credentialSvc.policySvc.GetPolicy(ctx, req.IdentityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+	if err != nil {
+		return oauthServerError("failed to load the bound identity's credential policy", err)
+	}
+	var attestationLevel string
+	if s.credentialSvc.attestationRepo != nil {
+		attestationLevel, _ = s.credentialSvc.attestationRepo.GetHighestVerifiedLevel(ctx, req.Identity.ID)
+	}
+	enforce := EnforcePolicyRequest{
+		TTL:              req.TTL,
+		GrantType:        req.GrantType,
+		Scopes:           req.Scopes,
+		TrustLevel:       req.Identity.TrustLevel,
+		AttestationLevel: attestationLevel,
+		DelegationDepth:  req.DelegationDepth,
+		PrincipalType:    req.PrincipalType,
+		UserGrantBounded: req.UserGrantBounded,
+	}
+	if err := requireScopesWithin(req.Scopes, scopeCeiling(policy, enforce), "the bound identity's credential policy"); err != nil {
+		return err
+	}
+	if perr := s.credentialSvc.policySvc.EnforcePolicy(ctx, policy, enforce); perr != nil {
+		return oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", perr)
+	}
+	return nil
 }
 
 // requestingChainScopes returns the scopes of a token approved into a chain

@@ -61,15 +61,17 @@ func TestCIBAStepUp_KeepsTheChainsScopes(t *testing.T) {
 	reg := post(t, adminPath("/agents/register"), map[string]any{
 		"name": externalID, "external_id": externalID, "sub_type": "tool_agent",
 		"trust_level": "first_party", "created_by": "user-owner-1",
-		"allowed_scopes": []string{"tools:read"},
+		"allowed_scopes": []string{"tools:read", "tools:write"},
 	}, adminHeaders())
 	require.Equal(t, http.StatusCreated, reg.StatusCode)
 	apiKey, _ := decode(t, reg)["api_key"].(string)
-	tr := post(t, "/oauth2/token", map[string]any{"grant_type": "api_key", "api_key": apiKey}, nil)
+	// The requesting token holds less than the identity's ceiling allows, so
+	// only the chain can refuse tools:write below.
+	tr := mintAPIKeyScope(t, apiKey, "tools:read")
 	require.Equal(t, http.StatusOK, tr.StatusCode)
 	agentToken, _ := decode(t, tr)["access_token"].(string)
 	chainScopes := decodeJWTPayload(t, agentToken)["scopes"]
-	require.ElementsMatch(t, []any{"tools:read"}, chainScopes, "the requesting token holds its ceiling")
+	require.ElementsMatch(t, []any{"tools:read"}, chainScopes, "the requesting token holds what it asked for")
 
 	t.Run("openid only redeems with the chain's scopes", func(t *testing.T) {
 		status, body := stepUp(t, testAccountID, testProjectID, adminHeaders(), agentToken, "openid")
@@ -103,6 +105,7 @@ func TestCIBAStepUp_KeepsTheChainsScopes(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, "invalid_scope", body["error"])
 		assert.Contains(t, body["error_description"], "tools:write")
+		assert.Contains(t, body["error_description"], "not held by the requesting token", "the chain, not a ceiling, refuses it")
 		row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
 		assert.Equal(t, domain.BackchannelStatusApproved, row.Status, "a refusal must not consume the approval")
 	})
@@ -183,4 +186,78 @@ func TestCIBAStepUp_PolicyJWTTyp(t *testing.T) {
 	status, body := stepUp(t, tn.account, tn.project, tn.headers, root, "data:read")
 	require.Equal(t, http.StatusOK, status, "poll: %v", body)
 	assert.Equal(t, "JWT", headerTyp(t, body["access_token"].(string)))
+}
+
+// requireRefusedWithoutConsuming polls id and asserts an invalid_scope
+// refusal that leaves the approval redeemable.
+func requireRefusedWithoutConsuming(t *testing.T, c cibaClient, id, requesting, mentions string) {
+	t.Helper()
+	status, body := pollCIBARaw(t, c, id, requesting)
+	require.Equal(t, http.StatusBadRequest, status, "poll: %v", body)
+	assert.Equal(t, "invalid_scope", body["error"])
+	assert.Contains(t, body["error_description"], mentions)
+	row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
+	assert.Equal(t, domain.BackchannelStatusApproved, row.Status, "a refusal must not consume the approval")
+}
+
+// A requesting token that names no identity leaves the token anchored to the
+// polling client's bound identity, whose ceilings the chokepoint applies. The
+// chain's scopes must be checked against them before the burn, not only the
+// request's own scope.
+func TestCIBAStepUp_UnanchoredChainCheckedAgainstTheBoundClientBeforeTheBurn(t *testing.T) {
+	// The requesting token: a root CIBA grant through an unbound client, so
+	// its credential names no identity.
+	unbound := newConfidentialCIBAClient(t)
+	rootID := bcAuthorizeIn(t, unbound, testAccountID, testProjectID, map[string]any{
+		"login_hint": "user-a", "scope": "openid tools:read",
+	})
+	approveAs(t, rootID, "user-a")
+	requesting := pollCIBA(t, unbound, rootID)["access_token"].(string)
+	require.ElementsMatch(t, []any{"openid", "tools:read"}, decodeJWTPayload(t, requesting)["scopes"])
+
+	// The polling client is bound to an identity whose ceiling is openid.
+	idResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id": uid("ciba-bound-narrow"), "owner_user_id": "user-test-owner",
+		"identity_type": "agent", "sub_type": "human_proxy",
+		"allowed_scopes": []string{"openid"}, "trust_level": "first_party",
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	identityID := decode(t, idResp)["id"].(string)
+	clientID := uid("ciba-bound-narrow")
+	clResp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id": clientID, "name": clientID, "confidential": true,
+		"identity_id": identityID,
+		"grant_types": []string{zeroidGrantTypeCIBA},
+		"scopes":      []string{"openid"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, clResp.StatusCode)
+	bound := cibaClient{ID: clientID, Secret: decode(t, clResp)["client_secret"].(string)}
+
+	id := bcAuthorizeIn(t, bound, testAccountID, testProjectID, map[string]any{
+		"login_hint": "user-a", "requesting_token": requesting, "scope": "openid",
+	})
+	approveAs(t, id, "user-a")
+	requireRefusedWithoutConsuming(t, bound, id, requesting, "tools:read")
+}
+
+// ciba:approve is issued only from a trusted approval-channel credential, so
+// an approval never carries it into a chain. A step-up into a chain holding it
+// is refused before the burn.
+func TestCIBAStepUp_ChainHoldingCIBAApproveRefusedBeforeTheBurn(t *testing.T) {
+	ch := registerChannel(t, "approval_channel", "")
+	resp := mintAPIKeyScope(t, ch.APIKey, "ciba:approve")
+	body := decode(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "%v", body)
+	requesting := body["access_token"].(string)
+
+	for _, scope := range []string{"openid", "ciba:approve"} {
+		t.Run("scope="+scope, func(t *testing.T) {
+			c := newConfidentialCIBAClient(t)
+			id := bcAuthorizeIn(t, c, testAccountID, testProjectID, map[string]any{
+				"login_hint": "user-a", "requesting_token": requesting, "scope": scope,
+			})
+			approveAs(t, id, "user-a")
+			requireRefusedWithoutConsuming(t, c, id, requesting, "ciba:approve")
+		})
+	}
 }
