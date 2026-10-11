@@ -2,18 +2,24 @@
 // platform: what ZeroID supports TODAY on the standard paths that
 // highflame-architecture ADR 0042 builds on.
 //
-// These tests pin CURRENT behaviour, gaps included. Each gap assertion names
-// the ADR 0042 decision that is expected to change it. When a feature lands
-// and a test here fails, update the assertion to the new behaviour in the
-// same PR (and drop the "flips with" note), rather than deleting the test.
+// These tests pin CURRENT behaviour, gaps included. Each gap assertion is
+// annotated "Flips with ADR 0042 Dx", naming the decision expected to change
+// it. When a feature lands and a test here fails, update the assertion to the
+// new behaviour in the same PR (and drop the note), rather than deleting the
+// test. Assertions with no note are invariants the ADR keeps.
 //
-//   - Path 1: MCP authorization (authorization code + PKCE, CIMD, RFC 8707),
-//     where a person logs in at an upstream IdP.
-//   - Path 2: the agent acts as itself with a platform-issued workload JWT
-//     (Kubernetes, GitHub OIDC, AWS STS).
-//   - Path 3: the agent acts as itself with client_credentials and
-//     private_key_jwt (the MCP client-credentials extension).
-//   - ID-JAG (ADR 0010): redemption identity semantics.
+// Test names follow the ADR's paths (D3):
+//
+//   - P1a, interactive person: MCP authorization (authorization code + PKCE,
+//     CIMD, RFC 8707) against ZeroID, with sign-in handed to a login surface.
+//   - P1b, enterprise-managed person: an ID-JAG redeemed with jwt-bearer
+//     (ADR 0010).
+//   - P2, agent as itself: client_credentials with private_key_jwt, either
+//     with a key the client registered or with a federated client assertion
+//     from a trusted workload issuer (Kubernetes, AWS STS, SPIFFE, GitHub).
+//
+// The id_token exchange is a person path outside ADR 0042; its client binding
+// (zeroid#385 D13) is pinned at the end of this file.
 package integration_test
 
 import (
@@ -21,6 +27,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -41,17 +48,14 @@ import (
 
 // ── self-contained RSA mock IdP ──────────────────────────────────────────────
 
-// probeRSAIdP is a minimal RS256 issuer. It serves its JWKS at the server root
-// over TLS and counts every request it receives, so a probe can prove that
-// ZeroID never contacted it for anything other than key material.
+// probeRSAIdP is a minimal RS256 issuer. It serves its JWKS at every path over
+// TLS and counts every request it receives, so a test can show whether ZeroID
+// contacted it at all.
 type probeRSAIdP struct {
 	srv  *httptest.Server
 	priv *rsa.PrivateKey
 	kid  string
 	hits atomic.Int64
-	// nonJWKSHits counts requests for any path other than the JWKS root,
-	// such as an /authorize a login-federating AS would redirect to.
-	nonJWKSHits atomic.Int64
 }
 
 func newProbeRSAIdP(t *testing.T) *probeRSAIdP {
@@ -69,11 +73,8 @@ func newProbeRSAIdP(t *testing.T) *probeRSAIdP {
 	body, err := json.Marshal(set)
 	require.NoError(t, err)
 
-	idp.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	idp.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		idp.hits.Add(1)
-		if r.URL.Path != "/" && r.URL.Path != "" {
-			idp.nonJWKSHits.Add(1)
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	}))
@@ -124,12 +125,15 @@ func postSharedToken(t *testing.T, body map[string]any) (int, map[string]any) {
 	return resp.StatusCode, decode(t, resp)
 }
 
-// ── Path 1: standard MCP authorization with an upstream IdP login ───────────
+// ── P1a: interactive person (MCP authorization against ZeroID) ──────────────
 
-// TestIdPAgentBaseline_Path1_ASMetadataAdvertisement records what the RFC 8414 document
-// advertises on the shared server, which has PrincipalResolvers registered and
-// CIMD enabled by default.
-func TestIdPAgentBaseline_Path1_ASMetadataAdvertisement(t *testing.T) {
+// TestIdPAgentBaseline_P1a_ASMetadataAdvertisement records what the RFC 8414
+// document advertises on the shared server, which has PrincipalResolvers
+// registered (so authorization_code is servable) but CIMD disabled.
+//
+// ZeroID's side of ADR 0042 D2's metadata list is already complete here; what
+// D2 still needs is in Firehog, AuthN and Studio, not in this document.
+func TestIdPAgentBaseline_P1a_ASMetadataAdvertisement(t *testing.T) {
 	resp := get(t, "/.well-known/oauth-authorization-server", nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	md := decode(t, resp)
@@ -150,11 +154,13 @@ func TestIdPAgentBaseline_Path1_ASMetadataAdvertisement(t *testing.T) {
 	assert.Equal(t, []any{"urn:ietf:params:oauth:grant-profile:id-jag"}, md["authorization_grant_profiles_supported"])
 	assert.ElementsMatch(t, []any{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		md["token_endpoint_auth_methods_supported"])
+	assert.Subset(t, md["token_endpoint_auth_signing_alg_values_supported"], []any{"ES256", "RS256"},
+		"private_key_jwt clients learn which algorithms to sign with")
 	assert.Equal(t, []any{"code"}, md["response_types_supported"])
 	assert.Equal(t, []any{"S256"}, md["code_challenge_methods_supported"])
 
-	// ZeroID is not an OpenID Provider. Nothing advertises an id_token
-	// response type or an "openid" scope.
+	// ZeroID is not an OpenID Provider: response_types_supported carries only
+	// "code" (asserted above) and there is no scopes_supported naming "openid".
 	assert.NotContains(t, md, "scopes_supported")
 
 	t.Run("CIMD-enabled server with a resolver advertises CIMD", func(t *testing.T) {
@@ -163,6 +169,7 @@ func TestIdPAgentBaseline_Path1_ASMetadataAdvertisement(t *testing.T) {
 		r, err := http.Get(cimdSrv.URL + "/.well-known/oauth-authorization-server")
 		require.NoError(t, err)
 		defer func() { _ = r.Body.Close() }()
+		require.Equal(t, http.StatusOK, r.StatusCode)
 		var cmd map[string]any
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&cmd))
 		assert.Equal(t, true, cmd["client_id_metadata_document_supported"])
@@ -170,10 +177,10 @@ func TestIdPAgentBaseline_Path1_ASMetadataAdvertisement(t *testing.T) {
 	})
 }
 
-// TestIdPAgentBaseline_Path1_ASMetadataWithoutResolver shows that configuring an external
-// (Okta) issuer does not make the authorization_code flow servable. That flow
-// depends only on whether a PrincipalResolver is registered.
-func TestIdPAgentBaseline_Path1_ASMetadataWithoutResolver(t *testing.T) {
+// TestIdPAgentBaseline_P1a_ASMetadataWithoutResolver shows that configuring an
+// external (Okta) issuer does not make the authorization_code flow servable.
+// That flow depends only on whether a PrincipalResolver is registered.
+func TestIdPAgentBaseline_P1a_ASMetadataWithoutResolver(t *testing.T) {
 	okta := newProbeRSAIdP(t)
 	fedSrv, fedHTTP, _ := newFederationServer(t, domain.ExternalIssuerConfig{
 		Issuer:          "https://probe-okta-md.example.test",
@@ -188,9 +195,11 @@ func TestIdPAgentBaseline_Path1_ASMetadataWithoutResolver(t *testing.T) {
 	resp, err := http.Get(fedHTTP.URL + "/.well-known/oauth-authorization-server")
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 	var md map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&md))
 
+	require.Contains(t, md, "grant_types_supported", "the document is populated")
 	assert.NotContains(t, md["grant_types_supported"], "authorization_code",
 		"with an external issuer configured but no resolver, authorization_code is NOT advertised")
 	assert.NotContains(t, md, "client_id_metadata_document_supported",
@@ -199,29 +208,26 @@ func TestIdPAgentBaseline_Path1_ASMetadataWithoutResolver(t *testing.T) {
 	assert.Equal(t, []any{"urn:ietf:params:oauth:grant-profile:id-jag"}, md["authorization_grant_profiles_supported"])
 }
 
-// TestIdPAgentBaseline_Path1_AuthorizeDoesNotFederateLogin covers what a standard MCP
-// client (a browser GET with no Highflame credential) gets from
-// /oauth2/authorize. No arm redirects the user to the upstream OIDC IdP.
-func TestIdPAgentBaseline_Path1_AuthorizeDoesNotFederateLogin(t *testing.T) {
-	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-
-	t.Run("shared server: credential-less browser GET is refused, not sent to an IdP", func(t *testing.T) {
+// TestIdPAgentBaseline_P1a_AuthorizeDoesNotFederateLogin covers what a standard
+// MCP client (a browser GET with no Highflame credential) gets from
+// /oauth2/authorize. ZeroID never redirects the browser to an upstream OIDC
+// IdP itself. The sign-in hand-off ADR 0042 D2 relies on is a resolver
+// returning ErrPrincipalInteractionRequired, which sends the browser to the
+// deployer's login surface (SetInteractiveLoginURL); that hand-off is covered
+// by oauth_authorize_interactive_test.go.
+func TestIdPAgentBaseline_P1a_AuthorizeDoesNotFederateLogin(t *testing.T) {
+	t.Run("shared server: credential-less browser GET is refused back to the client", func(t *testing.T) {
 		query, _ := authorizeGETQuery(t)
 		resp := getAuthorize(t, query, nil)
 		defer func() { _ = resp.Body.Close() }()
 
+		require.Equal(t, http.StatusFound, resp.StatusCode)
 		loc := resp.Header.Get("Location")
-		t.Logf("status=%d location=%q", resp.StatusCode, loc)
-		if loc != "" {
-			u, err := url.Parse(loc)
-			require.NoError(t, err)
-			// The only redirect possible is back to the client with an error.
-			assert.True(t, strings.HasPrefix(loc, testRedirectURI), "redirect goes back to the client only")
-			assert.Equal(t, "access_denied", u.Query().Get("error"))
-			assert.Empty(t, u.Query().Get("code"))
-		} else {
-			assert.Contains(t, []int{http.StatusUnauthorized, http.StatusBadRequest}, resp.StatusCode)
-		}
+		u, err := url.Parse(loc)
+		require.NoError(t, err)
+		assert.True(t, strings.HasPrefix(loc, testRedirectURI+"?"), "redirect goes back to the client only, got %q", loc)
+		assert.Equal(t, "access_denied", u.Query().Get("error"))
+		assert.Empty(t, u.Query().Get("code"))
 	})
 
 	t.Run("federation server: an external issuer configured, no resolver, gives 503 and never contacts the IdP", func(t *testing.T) {
@@ -236,23 +242,30 @@ func TestIdPAgentBaseline_Path1_AuthorizeDoesNotFederateLogin(t *testing.T) {
 		defer fedHTTP.Close()
 		defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
+		// Measured as a delta so a JWKS prefetch at server start (if one is
+		// ever added) cannot make this flaky.
+		before := okta.hits.Load()
 		query, _ := authorizeGETQuery(t)
+		noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		resp, err := noRedirect.Get(fedHTTP.URL + "/oauth2/authorize?" + query.Encode())
 		require.NoError(t, err)
 		defer func() { _ = resp.Body.Close() }()
 
 		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 		assert.Empty(t, resp.Header.Get("Location"), "no redirect to an upstream authorization endpoint")
-		assert.Zero(t, okta.nonJWKSHits.Load(), "ZeroID never contacted the IdP's authorize surface")
+		assert.Equal(t, before, okta.hits.Load(), "ZeroID did not contact the configured IdP while serving authorize")
 	})
 }
 
-// ── Path 2: workload identity federation at /oauth2/token ───────────────────
+// ── P2: the agent acts as itself ─────────────────────────────────────────────
 
-// TestIdPAgentBaseline_Path2_WorkloadJWTOnUnconfiguredServer presents a k8s-SA-shaped JWT
-// through every RFC 7523 / RFC 8693 shape on the shared server, which has NO
-// external issuers configured. It records the error each shape returns.
-func TestIdPAgentBaseline_Path2_WorkloadJWTOnUnconfiguredServer(t *testing.T) {
+// TestIdPAgentBaseline_P2_WorkloadJWTOnUnconfiguredServer presents a
+// k8s-SA-shaped JWT through the RFC 7523 and RFC 8693 grant shapes on the
+// shared server, which has NO external issuers configured, and records the
+// error each returns. None of these grants is where ADR 0042 P2 lands (P2 is
+// client_credentials with a federated client assertion), so these refusals
+// are invariants, not gaps.
+func TestIdPAgentBaseline_P2_WorkloadJWTOnUnconfiguredServer(t *testing.T) {
 	k8s := newProbeRSAIdP(t)
 	const k8sIss = "https://oidc.eks.us-east-1.amazonaws.com/id/PROBE"
 	saTok := k8s.k8sSAToken(t, k8sIss, testIssuer)
@@ -291,18 +304,7 @@ func TestIdPAgentBaseline_Path2_WorkloadJWTOnUnconfiguredServer(t *testing.T) {
 				"account_id":         testAccountID,
 				"project_id":         testProjectID,
 			},
-			wantCode: http.StatusBadRequest, wantErr: "invalid_grant",
-		},
-		{
-			name: "token-exchange subject_token_type=id_token",
-			body: map[string]any{
-				"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-				"subject_token":      saTok,
-				"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-				"account_id":         testAccountID,
-				"project_id":         testProjectID,
-			},
-			wantCode: http.StatusBadRequest, wantErr: "invalid_request", // no external issuers configured
+			wantCode: http.StatusBadRequest, wantErr: "invalid_grant", // broker arm, caller is not a trusted service
 		},
 	}
 	for _, tc := range cases {
@@ -316,16 +318,16 @@ func TestIdPAgentBaseline_Path2_WorkloadJWTOnUnconfiguredServer(t *testing.T) {
 	}
 }
 
-// TestIdPAgentBaseline_Path2_WorkloadJWTViaIDTokenFederation configures a workload
+// TestIdPAgentBaseline_P2_WorkloadJWTWithIssuerConfigured configures a workload
 // platform (Kubernetes) as an external issuer and checks that no grant treats
-// its tokens as a workload credential: jwt-bearer and the broker arm refuse
-// them, and application_id cannot bind one to an agent in another tenant.
-// Flips with ADR 0042 D3/P2, which adds federated client assertions on
-// client_credentials.
-func TestIdPAgentBaseline_Path2_WorkloadJWTViaIDTokenFederation(t *testing.T) {
+// its tokens as a workload credential today.
+func TestIdPAgentBaseline_P2_WorkloadJWTWithIssuerConfigured(t *testing.T) {
 	k8s := newProbeRSAIdP(t)
 	const k8sIss = "https://oidc.eks.us-east-1.amazonaws.com/id/PROBEFED"
 	const aud = "https://zeroid.probe-wif.test"
+	// The federation server's own issuer, which is where an RFC 7523 §2.2
+	// client assertion is addressed.
+	const fedIssuer = "https://federation.zeroid.test"
 
 	fedSrv, fedHTTP, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
 		Issuer:          k8sIss,
@@ -337,7 +339,25 @@ func TestIdPAgentBaseline_Path2_WorkloadJWTViaIDTokenFederation(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	t.Run("jwt-bearer with the same k8s SA token is still refused (no external-issuer arm for non-ID-JAG)", func(t *testing.T) {
+	// Flips with ADR 0042 D8 (federated client assertions from a trusted
+	// workload issuer, a D4 row, mapped to the agent through a D6 binding on
+	// sub). Today a client assertion verifies only against keys a client
+	// registered, so a platform-signed one is refused.
+	t.Run("client_credentials with the k8s SA token as a federated client assertion is refused", func(t *testing.T) {
+		resp := postFederation(t, fedHTTP.URL, map[string]any{
+			"grant_type":            "client_credentials",
+			"client_assertion":      k8s.k8sSAToken(t, k8sIss, fedIssuer),
+			"client_assertion_type": clientAssertionType,
+			"account_id":            fedCfg.AccountID,
+			"project_id":            fedCfg.ProjectID,
+		})
+		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		assert.Equal(t, "invalid_client", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("jwt-bearer with the k8s SA token is refused (only ID-JAGs take the external-issuer arm)", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, map[string]any{
 			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
 			"assertion":  k8s.k8sSAToken(t, k8sIss, aud),
@@ -347,6 +367,7 @@ func TestIdPAgentBaseline_Path2_WorkloadJWTViaIDTokenFederation(t *testing.T) {
 		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
 	})
 
 	t.Run("token-exchange subject_token_type=jwt with the k8s SA token is refused (broker arm)", func(t *testing.T) {
@@ -360,30 +381,13 @@ func TestIdPAgentBaseline_Path2_WorkloadJWTViaIDTokenFederation(t *testing.T) {
 		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		assert.Equal(t, "invalid_grant", resp.Error)
-	})
-
-	t.Run("application_id cannot bind the workload JWT to a registered agent in another tenant", func(t *testing.T) {
-		// application_id resolves against the CALLER-SUPPLIED tenant. A
-		// registered agent in the shared test tenant is not found from
-		// acct-fed-001, so this is refused.
-		ident := registerIdentity(t, uid("probe-wif-agent"), []string{"data:read"})
-		resp := postFederation(t, fedHTTP.URL, map[string]any{
-			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":      k8s.k8sSAToken(t, k8sIss, aud),
-			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-			"account_id":         fedCfg.AccountID,
-			"project_id":         fedCfg.ProjectID,
-			"application_id":     ident.ID,
-		})
-		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-		assert.Equal(t, "invalid_request", resp.Error)
+		assert.Empty(t, resp.AccessToken)
 	})
 }
 
-// ── Path 3: client_credentials with private_key_jwt ──────────────────────────
-
-func TestIdPAgentBaseline_Path3_ClientCredentialsPrivateKeyJWT(t *testing.T) {
+// TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT covers P2 with a key
+// the client registered.
+func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 	clientID := uid("probe-cc-pkjwt")
 	key := generateKey(t)
 
@@ -402,7 +406,7 @@ func TestIdPAgentBaseline_Path3_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 	}, nil)
 	require.Equal(t, http.StatusCreated, reg.StatusCode)
 	regBody := decode(t, reg)
-	assert.Empty(t, regBody["client_secret"], "a key-based client gets no secret")
+	assert.Empty(t, regBody["client_secret"], "a key-based client gets no secret (ADR 0042 D8: no secrets for agents)")
 
 	const mcpResource = "https://gw.example.test/mcp/github"
 
@@ -432,7 +436,8 @@ func TestIdPAgentBaseline_Path3_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 		assert.ElementsMatch(t, []any{"data:read"}, c["scopes"])
 	})
 
-	// Flips with ADR 0042 D5: the tenant comes from the client registration.
+	// Flips with ADR 0042 D5: with a registered key, the tenant comes from the
+	// client's registration.
 	t.Run("account_id/project_id are mandatory request params (tenant is not derived from the client)", func(t *testing.T) {
 		code, body := postSharedToken(t, map[string]any{
 			"grant_type":            "client_credentials",
@@ -453,35 +458,21 @@ func TestIdPAgentBaseline_Path3_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 			"account_id":            testAccountID,
 			"project_id":            testProjectID,
 		})
-		t.Logf("status=%d error=%v desc=%v", code, body["error"], body["error_description"])
-		assert.Equal(t, http.StatusOK, code)
+		require.Equal(t, http.StatusOK, code, "body=%v", body)
+		at, _ := body["access_token"].(string)
+		assert.Equal(t, clientID, decodeIssuedTokenClaims(t, at)["external_id"])
 	})
 
-	// Flips with ADR 0042 D8: CIMD clients gain client_credentials.
-	t.Run("a CIMD URL as client_id cannot use client_credentials", func(t *testing.T) {
-		cimdID := "https://agent.example.test/.well-known/client.json"
-		code, body := postSharedToken(t, map[string]any{
-			"grant_type":            "client_credentials",
-			"client_id":             cimdID,
-			"client_assertion":      clientAssertionFor(t, key, cimdID),
-			"client_assertion_type": clientAssertionType,
-			"account_id":            testAccountID,
-			"project_id":            testProjectID,
-		})
-		t.Logf("status=%d error=%v desc=%v", code, body["error"], body["error_description"])
-		assert.Equal(t, http.StatusUnauthorized, code)
-		assert.Equal(t, "invalid_client", body["error"])
-	})
-
-	// Flips with ADR 0042 D8 for trusted workload issuers (federated client assertions).
-	t.Run("an Okta-signed client_assertion (external issuer key) is not accepted", func(t *testing.T) {
-		// A client_assertion signed by any key outside the client's own
-		// registered jwks/jwks_uri fails, even when iss/sub equal the client_id.
-		okta := newProbeRSAIdP(t)
+	// Not a gap: D8's federated assertions carry the workload issuer as iss
+	// (see TestIdPAgentBaseline_P2_WorkloadJWTWithIssuerConfigured). An
+	// assertion claiming to BE the client must verify against the client's
+	// own keys, now and after ADR 0042.
+	t.Run("a client_assertion signed by a key outside the client's registration is refused", func(t *testing.T) {
+		other := newProbeRSAIdP(t)
 		now := time.Now()
-		assertion := okta.sign(t, "JWT", map[string]any{
+		assertion := other.sign(t, "JWT", map[string]any{
 			"iss": clientID, "sub": clientID, "aud": testIssuer,
-			"iat": now.Unix(), "exp": now.Add(2 * time.Minute).Unix(), "jti": uid("okta-cla"),
+			"iat": now.Unix(), "exp": now.Add(2 * time.Minute).Unix(), "jti": uid("foreign-cla"),
 		})
 		code, body := postSharedToken(t, map[string]any{
 			"grant_type":            "client_credentials",
@@ -493,12 +484,53 @@ func TestIdPAgentBaseline_Path3_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 		})
 		assert.Equal(t, http.StatusUnauthorized, code)
 		assert.Equal(t, "invalid_client", body["error"])
+		assert.Empty(t, body["access_token"])
 	})
 }
 
-// ── ID-JAG (ADR 0010) identity and tenant semantics ─────────────────────────
+// TestIdPAgentBaseline_P2_CIMDClientCredentials runs on a CIMD-enabled server
+// (on the shared one, with CIMD off, the refusal would say nothing about
+// CIMD). The client publishes private_key_jwt keys and declares
+// client_credentials in its metadata document. client_credentials
+// authenticates registry rows only and never resolves a metadata document, so
+// the CIMD URL is an unknown client; CIMD synthesis also drops
+// client_credentials from the declared grants. The same document shape
+// completes authorization_code (TestCIMD_PrivateKeyJWTClient).
+//
+// Flips with ADR 0042 D8: CIMD clients gain client_credentials.
+func TestIdPAgentBaseline_P2_CIMDClientCredentials(t *testing.T) {
+	key := generateKey(t)
+	jwks, err := json.Marshal(clientJWKS(t, key))
+	require.NoError(t, err)
+	doc := fmt.Sprintf(`{
+		"client_id": "%%CLIENT_ID%%",
+		"client_name": "cimd client_credentials probe",
+		"redirect_uris": [%q],
+		"grant_types": ["authorization_code", "client_credentials"],
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks": %s
+	}`, cimdTestRedirectURI, jwks)
+	base, docClient := newCIMDDocumentOrigin(t, doc)
+	srvURL := newCIMDZeroID(t, docClient).URL
+	clientID := base + "/.well-known/oauth-client"
 
-func TestIdPAgentBaseline_IDJAG_IdentityAndTenantSemantics(t *testing.T) {
+	resp := postFederation(t, srvURL, map[string]any{
+		"grant_type":            "client_credentials",
+		"client_id":             clientID,
+		"client_assertion":      cimdAssertionFor(t, key, clientID),
+		"client_assertion_type": clientAssertionType,
+		"account_id":            testAccountID,
+		"project_id":            testProjectID,
+	})
+	t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, "invalid_client", resp.Error)
+	assert.Empty(t, resp.AccessToken)
+}
+
+// ── P1b: ID-JAG (ADR 0010) identity and tenant semantics ────────────────────
+
+func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	upstreamIss := "https://okta.probe-idjag.test"
 	federationAud := "https://zeroid.probe-idjag.test"
 	const mcpResource = "https://mcp.probe-idjag.test"
@@ -548,7 +580,9 @@ func TestIdPAgentBaseline_IDJAG_IdentityAndTenantSemantics(t *testing.T) {
 		}
 	}
 
-	// Flips with ADR 0042 D6: the ID-JAG maps through a binding (act.sub) to the agent row.
+	// Flips with ADR 0042 D6: the ID-JAG maps through a binding on act.sub to
+	// the agent's own identity row, and no binding means invalid_grant rather
+	// than a synthetic identity.
 	t.Run("no application_id: synthetic identity", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, map[string]any{"email": "agent@corp.example"}),
 			fedCfg.AccountID, fedCfg.ProjectID))
@@ -563,6 +597,10 @@ func TestIdPAgentBaseline_IDJAG_IdentityAndTenantSemantics(t *testing.T) {
 		assert.Equal(t, fedCfg.ProjectID, c["project_id"])
 		assert.Equal(t, "id_jag", c["token_exchange"])
 		assert.NotContains(t, c, "identity_id")
+		// zeroid#385 D8: the authenticated redeeming client is named on the token.
+		assert.Equal(t, client.ClientID, c["client_id"])
+		// zeroid#385 D9: RFC 9068 at+jwt typ.
+		assertAccessTokenTyp(t, resp.AccessToken)
 	})
 
 	t.Run("account_id not in allowed_accounts is refused", func(t *testing.T) {
@@ -570,8 +608,11 @@ func TestIdPAgentBaseline_IDJAG_IdentityAndTenantSemantics(t *testing.T) {
 		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
 	})
 
+	// ADR 0042 D3 leaves this open: ZeroID MAY accept a sub_profile=service
+	// ID-JAG if Okta documents third-party issuance, under D4-D7.
 	t.Run("sub_profile=service is accepted (not inspected)", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, map[string]any{"sub_profile": "service"}),
 			fedCfg.AccountID, fedCfg.ProjectID))
@@ -589,9 +630,13 @@ func TestIdPAgentBaseline_IDJAG_IdentityAndTenantSemantics(t *testing.T) {
 	})
 }
 
-// TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience confirms that ZeroID only
-// accepts ID tokens addressed to its configured audience. An Okta ID token
-// minted for some other relying party is refused.
+// ── id_token exchange (a person path, outside ADR 0042) ─────────────────────
+
+// TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience pins the
+// relying-party rules on the id_token exchange: the redeeming client must
+// authenticate, and the ID token must be addressed to ZeroID's configured
+// audience and issued to that client (zeroid#385 D13). An Okta ID token minted
+// for some other relying party is refused even when a client authenticates.
 func TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience(t *testing.T) {
 	upstreamIss := "https://okta.probe-aud.test"
 	federationAud := "https://zeroid.probe-aud.test"
@@ -608,28 +653,55 @@ func TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	exchange := func(aud string) tokenResponse {
+	// The relying party: a registered client whose client_id is the audience
+	// the IdP issues ID tokens to.
+	rp := rpClient(t, federationAud)
+
+	idToken := func(aud string) string {
 		now := time.Now()
-		tok := upstream.SignToken(t, map[string]any{
+		return upstream.SignToken(t, map[string]any{
 			"iss": upstreamIss, "aud": aud, "sub": "00uAUDPROBE",
 			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 		})
-		return postFederation(t, fedHTTP.URL, map[string]any{
+	}
+	exchange := func(tok string, client *oauthClientResp) tokenResponse {
+		body := map[string]any{
 			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
 			"subject_token":      tok,
 			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
 			"account_id":         fedCfg.AccountID,
 			"project_id":         fedCfg.ProjectID,
-		})
+		}
+		if client != nil {
+			body["client_id"] = client.ClientID
+			body["client_secret"] = client.ClientSecret
+		}
+		return postFederation(t, fedHTTP.URL, body)
 	}
 
-	foreign := exchange("0oaSOMEOTHERAPP")
-	t.Logf("foreign aud: status=%d body=%s", foreign.StatusCode, foreign.RawBody)
-	assert.Equal(t, http.StatusBadRequest, foreign.StatusCode)
-	assert.Equal(t, "invalid_grant", foreign.Error)
-	assert.Empty(t, foreign.AccessToken)
+	t.Run("foreign audience is refused, even with client authentication", func(t *testing.T) {
+		foreign := exchange(idToken("0oaSOMEOTHERAPP"), &rp)
+		t.Logf("status=%d body=%s", foreign.StatusCode, foreign.RawBody)
+		assert.Equal(t, http.StatusBadRequest, foreign.StatusCode)
+		assert.Equal(t, "invalid_grant", foreign.Error)
+		assert.Empty(t, foreign.AccessToken)
+	})
 
-	// Control: the same token shape addressed to ZeroID is accepted.
-	ok := exchange(federationAud)
-	assert.Equal(t, http.StatusOK, ok.StatusCode, "body=%s", ok.RawBody)
+	t.Run("an unauthenticated exchange is refused", func(t *testing.T) {
+		anon := exchange(idToken(federationAud), nil)
+		t.Logf("status=%d body=%s", anon.StatusCode, anon.RawBody)
+		assert.Equal(t, http.StatusUnauthorized, anon.StatusCode)
+		assert.Equal(t, "invalid_client", anon.Error)
+		assert.Empty(t, anon.AccessToken)
+	})
+
+	t.Run("control: addressed to ZeroID, redeemed by the client it was issued to", func(t *testing.T) {
+		ok := exchange(idToken(federationAud), &rp)
+		require.Equal(t, http.StatusOK, ok.StatusCode, "body=%s", ok.RawBody)
+		c := decodeIssuedTokenClaims(t, ok.AccessToken)
+		assert.Equal(t, "00uAUDPROBE", c["sub"])
+		assert.Equal(t, upstreamIss, c["user_id_iss"])
+		assert.Equal(t, "external_id_token", c["token_exchange"])
+		assert.Equal(t, rp.ClientID, c["client_id"], "zeroid#385 D8: the relying party is named on the token")
+	})
 }
