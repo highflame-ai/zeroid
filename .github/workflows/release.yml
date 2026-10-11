@@ -234,7 +234,11 @@ jobs:
 
       - name: Run tests
         env:
-          CGO_ENABLED: 0
+          # make test-integration runs `go test -race`, and the race detector
+          # needs cgo ("-race requires cgo"). pr-check.yml's integration job
+          # sets CGO_ENABLED: 1 for the same reason. Binaries are still built
+          # with CGO_ENABLED=0 by goreleaser below.
+          CGO_ENABLED: 1
         shell: bash
         run: |-
           make test-integration
