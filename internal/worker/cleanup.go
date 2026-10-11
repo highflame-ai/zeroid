@@ -196,7 +196,8 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 
 	// CIBA backchannel requests:
 	//   1. Flip pending → expired so an in-flight poll sees expired_token.
-	//   2. Reap rows in a resolved terminal state past expires_at.
+	//   2. Reap unresolved rows past expires_at, and resolved rows once the
+	//      resolved-retention window has passed (see DeleteExpired).
 	// Order matters: sweep first, delete second.
 	if w.backchannelRepo != nil {
 		if n, err := w.backchannelRepo.SweepExpired(ctx, now); err != nil {

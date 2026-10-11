@@ -65,7 +65,7 @@ type RegisterAgentRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	CreatedBy     string
 	PublicKeyPEM  string
 	// CredentialPolicyID is the identity policy — the authority ceiling for
@@ -534,8 +534,14 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 		return nil, fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 	}
 
+	// Checked before the existing keys are revoked, so a refused rotation
+	// leaves them in place (CreateKey applies the same check).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
+
 	// Revoke existing keys.
-	s.revokeKeysByIdentity(ctx, identity.ID)
+	s.revokeKeysByIdentity(ctx, identity.ID, "key rotated")
 
 	createdBy := rotationAttribution(identity, middleware.GetCallerName(ctx))
 
@@ -788,8 +794,8 @@ func rotationAttribution(identity *domain.Identity, callerName string) string {
 	return middleware.SystemCallerPrefix + "key_rotation"
 }
 
-func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID); err != nil {
+func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID, reason string) {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID, revocationActor(ctx, "key_rotation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identityID).Msg("Failed to revoke keys for identity")
 	}
 }

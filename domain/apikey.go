@@ -35,6 +35,7 @@ type APIKey struct {
 	ProjectID          string          `bun:"project_id"               json:"project_id"`
 	IdentityID         string          `bun:"identity_id,type:uuid"    json:"identity_id"`
 	CreatedBy          string          `bun:"created_by"               json:"created_by"`
+	CreatedActor       string          `bun:"created_actor"            json:"-"`
 	Scopes             []string        `bun:"scopes,array"             json:"scopes"`
 	Product            string          `bun:"product"                  json:"product"`
 	Environment        string          `bun:"environment"              json:"environment"`
@@ -51,8 +52,12 @@ type APIKey struct {
 	CredentialPolicyID string          `bun:"credential_policy_id,type:uuid" json:"credential_policy_id"`
 	RateLimitRPS       int             `bun:"rate_limit_rps"           json:"rate_limit_rps,omitempty"`
 	ReplacedBy         string          `bun:"replaced_by,type:uuid,nullzero" json:"replaced_by,omitempty"`
-	CreatedAt          time.Time       `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt          time.Time       `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	// ChannelTrusted records that the key was created by a caller marked with
+	// WithTrustedApprovalChannelWrite. ciba:approve is issued from a key only
+	// when it is set.
+	ChannelTrusted bool      `bun:"channel_trusted,notnull" json:"-"`
+	CreatedAt      time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt      time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // IsExpired reports whether the API key has aged out. A nil ExpiresAt

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -135,11 +136,17 @@ type ObservedIDJAGResourceStore interface {
 	Record(ctx context.Context, accountID, projectID, authorizingISS string, resources []string) error
 }
 
-// Default token TTLs (used when per-client TTL is not configured).
-const (
-	defaultAccessTokenTTLWithRefresh = 3600           // 1 hour when refresh tokens provide continuity
-	defaultAccessTokenTTLNoRefresh   = 90 * 24 * 3600 // 90 days for clients without refresh_token grant
-)
+// defaultUserAccessTokenTTL is the access token lifetime for a person's
+// authorization_code or refresh token when the client sets no TTL of its own:
+// 1 hour, whether or not the client holds the refresh grant (D14).
+//
+// A client without the refresh grant used to get 90 days instead. For a
+// person that is a 90-day sub=alice root: every delegated child is clamped
+// only to it, and revoking her IdP session does not touch it. A client that
+// needs continuity registers for the refresh grant; one that does not
+// re-authorizes. An explicit per-client access_token_ttl is still honoured,
+// within the server's max TTL.
+const defaultUserAccessTokenTTL = 3600
 
 // externalPrincipalAccessTokenTTL is the lifetime (seconds) of the SHORT-LIVED
 // access token issued by the external-principal exchange — 15 minutes, whether
@@ -206,6 +213,49 @@ var reservedClaims = map[string]bool{
 	// trusted-service caller that legitimately sets it. That pre-existing gap
 	// is worth its own change rather than being smuggled into this one.
 	"client_id": true,
+	// Step-up approvals (RFC 9396). Shield honours a `highflame_tool_call`
+	// entry in `authorization_details` only on a CIBA-minted token, and only
+	// when its `approval_id` names a challenge Shield raised — but the claim
+	// must still never be writable through additional_claims, or a token
+	// from another grant could carry an approval nobody gave. ZeroID writes
+	// it only on the CIBA path, from the approved request row
+	// (stampAuthorizationDetails, which also stamps `approval_id` inside
+	// each entry). `approval_id` is reserved at the top level too so no
+	// caller can mint a look-alike.
+	"authorization_details": true,
+	"approval_id":           true,
+	// Agent provenance. Shield projects `origin`, `agent_idp_iss` and
+	// `agent_idp_parent` into context.principal / context.actor, where
+	// policies use them to tell native agents from IdP-registered ones
+	// (e.g. "forbid unless origin == native", or trusting one IdP tenant).
+	// ZeroID does not mint them yet; until it does from the identity row,
+	// nothing may set them, or a caller with an id_token exchange could
+	// claim to be a native agent.
+	"origin":           true,
+	"agent_idp_iss":    true,
+	"agent_idp_parent": true,
+	// Delegation lineage. `mission_id` names the delegation tree a token
+	// belongs to, so audit and revocation that group by mission trust it; a
+	// caller who could set it through additional_claims on the broker,
+	// id_token or ID-JAG paths could graft a token onto someone else's tree.
+	// `principal_type` says whether `sub` is a person or a workload, and is
+	// what a `required_principal_type` policy and every RFC 8693-profile
+	// consumer decide on, so a forged `user` would launder a workload chain
+	// into a human-rooted one. `may_act` (RFC 8693 §4.4) names who may act
+	// for the subject; only the issuer may assert it. `scope` is the RFC 9068
+	// §2.2.3 string form ZeroID emits beside `scopes`, so it must carry the
+	// same authority — never a caller-supplied value.
+	"mission_id":     true,
+	"principal_type": true,
+	"may_act":        true,
+	"scope":          true,
+	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
+	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
+	// neither, so additional_claims is the only way either reaches a signed
+	// token; unreserved, a caller could name any agent and enroll its own key
+	// on it through POST /agents/self/public-key.
+	"identity_id": true,
+	"agent_id":    true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
@@ -419,6 +469,64 @@ func (s *OAuthService) HasTrustedServiceValidator() bool {
 // BackchannelService for the CIBA grant.
 func (s *OAuthService) SetBackchannelService(bc *BackchannelService) {
 	s.backchannelSvc = bc
+	if bc != nil {
+		bc.setRequestingTokenVerifier(s.verifyRequestingToken)
+		bc.setTrustedCallerCheck(s.isTrustedServiceCaller)
+	}
+}
+
+// isTrustedServiceCaller reports whether the deployer's TrustedServiceValidator
+// accepts the current request. False when none is installed.
+func (s *OAuthService) isTrustedServiceCaller(ctx context.Context) bool {
+	v := s.trustedServiceValidator
+	if v == nil {
+		return false
+	}
+	_, err := v(ctx)
+	return err == nil
+}
+
+// verifyRequestingToken verifies a bc-authorize requesting_token: an access
+// token this server issued (signature against its own keys, iss equal to its
+// issuer), unexpired, and backed by an active, unrevoked credential row.
+// The tenant comparison is the caller's.
+func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr string) (*RequestingToken, error) {
+	parsed, err := s.parseToken(tokenStr, true)
+	if err != nil {
+		return nil, fmt.Errorf("requesting_token is not a valid token from this issuer: %w", err)
+	}
+	if iss, _ := parsed.Issuer(); iss != s.issuer {
+		return nil, fmt.Errorf("requesting_token was not issued by this server")
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return nil, fmt.Errorf("requesting_token has no jti")
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil || cred == nil || !active {
+		return nil, fmt.Errorf("requesting_token is not active")
+	}
+	sub, _ := parsed.Subject()
+	rt := &RequestingToken{
+		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
+		DPoPKeyThumbprint: cred.DPoPKeyThumbprint,
+	}
+	if cred.IdentityID != nil {
+		rt.IdentityID = *cred.IdentityID
+	}
+	if act, err := jwt.Get[map[string]any](parsed, "act"); err == nil {
+		rt.ActSubject, _ = act["sub"].(string)
+		if b, merr := json.Marshal(act); merr == nil {
+			rt.Act = b
+		}
+	}
+	if exp, ok := parsed.Expiration(); ok {
+		rt.ExpiresAt = exp
+	}
+	if cid, err := jwt.Get[string](parsed, "client_id"); err == nil {
+		rt.ClientID = cid
+	}
+	return rt, nil
 }
 
 // SetCIMDService wires the Client ID Metadata Document resolver after
@@ -605,6 +713,9 @@ type TokenRequest struct {
 	TrustedService bool
 	// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 	AuthReqID string // opaque handle returned by POST /oauth2/bc-authorize
+	// RequestingToken is the requesting_token a CIBA poll presents when the
+	// bc-authorize request was made with one.
+	RequestingToken string
 	// DPoPKeyThumbprint is the base64url JWK thumbprint of the client's DPoP key.
 	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
 	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
@@ -638,7 +749,16 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
 		return s.jwtBearer(ctx, req)
 	case "urn:ietf:params:oauth:grant-type:token-exchange":
-		return s.tokenExchange(ctx, req)
+		// RFC 8693 §2.2.1 makes issued_token_type REQUIRED on every
+		// token-exchange response. Stamped here, at the one dispatch point,
+		// so all three exchange modes (NHI delegation, the trusted-broker
+		// principal exchange, OIDC ID-token federation) carry it and a new
+		// mode cannot forget to. Every mode issues a ZeroID access token.
+		tok, err := s.tokenExchange(ctx, req)
+		if tok != nil {
+			tok.IssuedTokenType = TokenTypeAccessToken
+		}
+		return tok, err
 	case "api_key":
 		return s.apiKeyGrant(ctx, req)
 	case "authorization_code":
@@ -653,6 +773,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 			AuthReqID:         req.AuthReqID,
 			ClientID:          req.ClientID,
 			ClientSecret:      req.ClientSecret,
+			RequestingToken:   req.RequestingToken,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		})
 	default:
@@ -742,6 +863,12 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// RFC 9068 §2.2: the client just authenticated. A resource server
+		// attributing the call (an approval channel's recorded client, for
+		// one) reads this claim, not the identity's WIMSE sub.
+		ClientID: client.ClientID,
+
+		ChannelTrustedCredential: client.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -854,8 +981,8 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	// Resolve the identity policy — the authority ceiling for scopes, TTL,
-	// grant types, and trust level. Its allowed_scopes and the deprecated
-	// identity.AllowedScopes both narrow the grant (identityScopeCeilings).
+	// grant types, and trust level. Its allowed_scopes and the identity's own
+	// allowed_scopes ceiling both narrow the grant (identityScopeCeilings).
 	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
@@ -867,11 +994,15 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  policy.ID,
-		Scopes:            scopes,
-		GrantType:         domain.GrantTypeJWTBearer,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// The ceiling rule (P1) counts a workload that named a scope no layer capped.
+		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
+		Identity:              identity,
+		IdentityPolicyID:      policy.ID,
+		Scopes:                scopes,
+		GrantType:             domain.GrantTypeJWTBearer,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+
+		ChannelTrustedCredential: identity.PublicKeyChannelTrusted,
 	})
 	if err != nil {
 		return nil, err
@@ -1005,6 +1136,17 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "actor_token iss does not match actor identity WIMSE URI")
 	}
 
+	// RFC 8693 §4.4: a subject token that carries may_act names who may act
+	// for its subject, and this actor must be that party. ZeroID does not
+	// emit may_act yet (when to set it is design question Q7), and it is a
+	// reserved claim callers cannot inject, so this binds only tokens a future
+	// issuance path stamps.
+	if mayAct, err := jwt.Get[map[string]any](subjectParsed, "may_act"); err == nil {
+		if !mayActPermits(mayAct, actorIdentity.WIMSEURI, s.issuer) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token's may_act does not name this actor")
+		}
+	}
+
 	// Step 3: Resolve the actor's identity policy — the authority ceiling
 	// for delegation. Scopes, max_delegation_depth, required_trust_level,
 	// and the token_exchange grant type allow-list are all enforced from
@@ -1016,13 +1158,33 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 
 	// Step 4: Compute the granted scopes as the intersection of
 	// requested ∩ orchestrator.granted ∩ actor.policy.allowed_scopes ∩ the
-	// actor's deprecated identity.AllowedScopes (identityScopeCeilings; an
-	// empty actor ceiling places no restriction). The orchestrator's granted
+	// actor identity's allowed_scopes ceiling (identityScopeCeilings; an
+	// empty layer places no restriction). The orchestrator's granted
 	// scopes remain authoritative for what can be delegated — a sub-agent can
 	// never receive more than its principal currently holds, per RFC 8693
 	// intent.
 	requestedScopes := parseScopeString(req.Scope)
+	// The parent's depth. jwx v4: jwt.Get[float64] replaces the v2 Token.Get
+	// + assertion; JSON numbers decode as float64 regardless of integer intent.
+	var parentDepth int
+	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
+		parentDepth = int(d)
+	}
+	// The child inherits its chain's principal and never re-derives it, so a
+	// person stays the principal at every hop however deep the chain goes.
+	// Resolved before the scope computation: a chain acting for a person is
+	// capped by the actor's user-grant ceiling, not its own authority (D10).
+	parent := s.parentPrincipal(subjectParsed, subjectCred, parentDepth)
 	actorPolicyScopes, actorRowScopes := identityScopeCeilings(actorPolicy, actorIdentity)
+	userGrantCeiling := parent.Type == domain.PrincipalUser
+	if userGrantCeiling {
+		// D10: a token the actor holds for a person is capped by its policy's
+		// user_grant_scopes instead of its policy's allowed_scopes. Empty means
+		// no extra cap from the policy: the person's grant, which the parent's
+		// scopes already carry, bounds the chain. The identity's own
+		// allowed_scopes is its absolute ceiling and still binds.
+		actorPolicyScopes = actorPolicy.UserGrantScopes
+	}
 	orchSet := make(map[string]bool, len(subjectCred.Scopes))
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
@@ -1038,18 +1200,21 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes)
+		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
 	}
 
-	// Step 5: Compute delegation depth (increment from orchestrator's depth).
-	// jwx v4: jwt.Get[float64] replaces the v2 Token.Get + assertion. JSON
-	// numbers decode as float64 regardless of integer intent.
-	var parentDepth int
-	if d, err := jwt.Get[float64](subjectParsed, "delegation_depth"); err == nil {
-		parentDepth = int(d)
-	}
+	// Step 5: the child's delegation depth is the parent's plus one
+	// (parentDepth, read above).
 
+	// The delegating agent, persisted as delegated_by_wimse_uri for the
+	// delegation graph. Under the legacy shape that is the parent's `sub`;
+	// under rfc8693 the parent's `sub` is the principal, and the agent that
+	// delegated is the parent's current actor.
+	parentActors := priorActorsOf(subjectParsed)
 	delegatedBy, _ := subjectParsed.Subject()
+	if len(parentActors) > 0 {
+		delegatedBy = parentActors[0].Sub
+	}
 
 	// Resolve mission_id from the subject_token (issue #81). Prefer the
 	// explicit mission_id claim; fall back to the subject_token's own jti
@@ -1083,6 +1248,36 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
+		// RFC 9068 §2.2 / RFC 8693 §4.3 client_id (D8): the client the token
+		// is issued to, which on an exchange is the actor. For a ZeroID agent
+		// that is its external_id. Emitted for every tenant — it is additive,
+		// unlike the sub/act change the token profile gates.
+		ClientID: actorIdentity.ExternalID,
+	}
+	issue.PrincipalType = parent.Type
+	issue.PrincipalSub = parent.Sub
+	issue.PrincipalIss = parent.Iss
+	// A delegated chain is bounded by its parent, so a user-subject child is
+	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
+	issue.UserGrantBounded = true
+
+	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
+	// outermost, then the parent's actors. A parent with no actors was a root
+	// grant; its client acted for the principal, so it becomes the first
+	// prior actor (T0's client A in the design's three-hop example).
+	issue.Actors = append([]domain.Actor{{
+		Sub:          actorIdentity.WIMSEURI,
+		IdentityType: string(actorIdentity.IdentityType),
+		TrustLevel:   string(actorIdentity.TrustLevel),
+		ExternalID:   actorIdentity.ExternalID,
+	}}, parentActors...)
+	if len(parentActors) == 0 {
+		if cid, _ := jwt.Get[string](subjectParsed, "client_id"); cid != "" {
+			issue.Actors = append(issue.Actors, domain.Actor{Sub: cid})
+		}
+	}
+	if len(issue.Actors) > domain.MaxActorChainDepth {
+		issue.Actors = issue.Actors[:domain.MaxActorChainDepth]
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -1092,6 +1287,81 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// mayActPermits reports whether an RFC 8693 §4.4 may_act claim names actor.
+// The claim's members identify the party the same way `act` does: `sub` must
+// equal the actor's WIMSE URI. When it also names an issuer, that issuer must
+// be ZeroID's own, since ZeroID is what vouches for the actor's identity. A
+// claim that names no subject permits no one (fail closed).
+func mayActPermits(mayAct map[string]any, actorSub, issuer string) bool {
+	sub, _ := mayAct["sub"].(string)
+	if sub == "" || sub != actorSub {
+		return false
+	}
+	if iss, ok := mayAct["iss"]; ok {
+		if s, _ := iss.(string); s != issuer {
+			return false
+		}
+	}
+	return true
+}
+
+// priorActorsOf returns a subject token's RFC 8693 actor chain, current actor
+// first, as prior actors carrying only their `sub`. Only a token issued under
+// the rfc8693 profile has one: the legacy shape's single-level `act` holds a
+// delegating orchestrator or an end user depending on the grant, not an actor
+// chain, so it is not read as one. The profile is recognised by the presence
+// of `principal_type`, which only rfc8693 tokens carry.
+func priorActorsOf(token jwt.Token) []domain.Actor {
+	if _, err := jwt.Get[string](token, "principal_type"); err != nil {
+		return nil
+	}
+	act, err := jwt.Get[map[string]any](token, "act")
+	if err != nil {
+		return nil
+	}
+	var out []domain.Actor
+	for act != nil && len(out) < domain.MaxActorChainDepth {
+		sub, _ := act["sub"].(string)
+		if sub == "" {
+			break
+		}
+		out = append(out, domain.Actor{Sub: sub})
+		next, _ := act["act"].(map[string]any)
+		act = next
+	}
+	return out
+}
+
+// parentPrincipal returns the principal of a subject token's chain, which an
+// exchange passes down unchanged.
+//
+// A parent minted since migration 048 carries its principal on its row. A
+// parent minted before has none, and the design's legacy rule applies:
+//
+//   - At depth 0 the parent's `sub` is genuine — no exchange has rewritten it.
+//     A WIMSE URI there is a workload; anything else is a person, whose issuer
+//     is the upstream IdP's when the token says so.
+//   - Above depth 0 the legacy profile put the actor in `sub`, so the original
+//     principal is lost. The child gets principal_type = unknown, which never
+//     satisfies a principal requirement (fail closed).
+func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *domain.IssuedCredential, parentDepth int) resolvedPrincipal {
+	if subjectCred.PrincipalType != "" {
+		return resolvedPrincipal{Type: subjectCred.PrincipalType, Sub: subjectCred.PrincipalSub, Iss: subjectCred.PrincipalIss}
+	}
+	sub, _ := subjectParsed.Subject()
+	if parentDepth > 0 {
+		return resolvedPrincipal{Type: domain.PrincipalUnknown, Sub: sub, Iss: s.issuer}
+	}
+	if _, _, err := s.parseWIMSEURI(sub); err == nil {
+		return resolvedPrincipal{Type: domain.PrincipalWorkload, Sub: sub, Iss: s.issuer}
+	}
+	iss, _ := jwt.Get[string](subjectParsed, "user_id_iss")
+	if iss == "" {
+		iss = s.issuer
+	}
+	return resolvedPrincipal{Type: domain.PrincipalUser, Sub: sub, Iss: iss}
 }
 
 // externalPrincipalExchange handles RFC 8693 token exchange for externally-authenticated
@@ -1253,19 +1523,22 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
-		GrantType:         domain.GrantTypeTokenExchange,
-		Scopes:            scopes,
-		Audience:          audience,
-		UseRS256:          true,
-		SubjectOverride:   req.UserID,
-		UserEmail:         req.UserEmail,
-		UserName:          req.UserName,
-		ApplicationID:     req.ApplicationID,
-		TTL:               externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		// Bounded only by the trusted caller's request unless a server-defined
+		// audience profile chose the scopes (ceiling rule, P1).
+		RequestBoundedRoot: len(audience) == 0,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
+		GrantType:          domain.GrantTypeTokenExchange,
+		Scopes:             scopes,
+		Audience:           audience,
+		UseRS256:           true,
+		SubjectOverride:    req.UserID,
+		UserEmail:          req.UserEmail,
+		UserName:           req.UserName,
+		ApplicationID:      req.ApplicationID,
+		TTL:                externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
+		CustomClaims:       customClaims,
+		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
@@ -1275,7 +1548,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// needs no separate refresh suppression.
 	bindResourceOnIssue(&issue, req.Resource)
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
@@ -1307,6 +1580,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			Audience:          req.Audience,
 			TTL:               refreshTTL,
 			DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+			// The family records whose issuer vouched for the user, so it
+			// is revoked by the RFC 9493 (issuer, subject) pair.
+			PrincipalIss: cred.PrincipalIss,
 		})
 		if rtErr != nil {
 			// Fail CLOSED: the caller explicitly asked for a refresh token (its
@@ -1504,7 +1780,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	//     ∩ key.scopes               (per-key legacy restriction, if set)
 	//     ∩ key.policy.allowed_scopes (per-credential restriction)
 	//     ∩ identity.policy.allowed_scopes (authority ceiling)
-	//     ∩ identity.allowed_scopes  (deprecated row-level restriction)
+	//     ∩ identity.allowed_scopes  (the identity's absolute ceiling)
 	var keyPolicyScopes []string
 	if sk.CredentialPolicyID != "" && s.credentialSvc.policySvc != nil {
 		// Hard fail rather than silently skip the intersection: a
@@ -1539,8 +1815,11 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		OwnerUserIDOverride: apiKeyOwnerOverride(identity, sk),
 		// Clamp the JWT exp by the API key's own expires_at — a 7-day key
 		// must never mint a 30-day token even if the identity policy allows.
-		CredentialExpiresAt: sk.ExpiresAt,
-		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+		CredentialExpiresAt:   sk.ExpiresAt,
+		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
+		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && len(rowScopes) == 0,
+
+		ChannelTrustedCredential: sk.ChannelTrusted,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -2214,17 +2493,13 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "authorization code has already been used")
 	}
 
-	// Determine access token TTL.
-	// Priority: per-client config > grant-type-based default > server default.
+	// Determine access token TTL: the client's own configuration, else the
+	// short user-subject default (D14).
 	hasRefreshGrant := slices.Contains(oauthClient.GrantTypes, string(domain.GrantTypeRefreshToken))
 
 	ttl := oauthClient.AccessTokenTTL
 	if ttl <= 0 {
-		// No per-client TTL — use grant-type-based defaults.
-		ttl = defaultAccessTokenTTLNoRefresh
-		if hasRefreshGrant {
-			ttl = defaultAccessTokenTTLWithRefresh
-		}
+		ttl = defaultUserAccessTokenTTL
 	}
 
 	// Resolve the carrier identity. The default is a synthetic stub (this
@@ -2263,8 +2538,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	}
 
 	issue := IssueRequest{
-		Identity:          identity,
-		IdentityPolicyID:  identityPolicyID,
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Bounded by the user's consent and the client's registered scopes, so a
+		// linked identity's user-grant ceiling applies, not its own (D10).
+		UserGrantBounded:  true,
 		GrantType:         domain.GrantTypeAuthorizationCode,
 		UseRS256:          true,
 		SubjectOverride:   authCode.UserID,
@@ -2376,6 +2654,10 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// re-stamps the same binding (CAP-IDN-027). Copied forward onto each
 			// successor row, like MissionID.
 			Resources: resourceCeiling,
+			// Seed the family with the principal's issuer, so it is revoked
+			// by the RFC 9493 (issuer, subject) pair and every rotation keeps
+			// the same principal. Copied forward like MissionID.
+			PrincipalIss: cred.PrincipalIss,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
@@ -2546,7 +2828,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	}
 
 	if accessTTL <= 0 {
-		accessTTL = defaultAccessTokenTTLWithRefresh
+		accessTTL = defaultUserAccessTokenTTL
 	}
 
 	// Pre-rotation validation (HIGH — session-bricking fix). The gates that can
@@ -2716,6 +2998,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		Identity:         identity,
 		IdentityPolicyID: identityPolicyID,
 		GrantType:        domain.GrantTypeRefreshToken,
+		// A refresh continues its family's root. An authorization_code family
+		// is bounded by consent (D10's split ceiling applies); a trusted-broker
+		// audience-profile family is bounded only by the broker's request, so
+		// it keeps allowed_scopes, as its root did.
+		UserGrantBounded: oldToken.Audience == "",
 		UseRS256:         true,
 		SubjectOverride:  oldToken.UserID,
 		ApplicationID:    applicationID,
@@ -2743,6 +3030,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// IssueCredential then falls back to defaulting mission_id to the new
 		// credential's own JTI (the pre-fix behavior).
 		MissionID: oldToken.MissionID,
+		// Keep the principal's issuer across rotation, so a user a federated
+		// IdP vouched for is not re-attributed to ZeroID's own issuer. Empty
+		// on a family minted before migration 048: the chokepoint then derives
+		// it as for any other user subject.
+		PrincipalIss: oldToken.PrincipalIss,
 	}
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A
@@ -2846,9 +3138,39 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	// can validate the caller's DPoP proof against the expected thumbprint.
 	// authorization_details is surfaced per RFC 9396 §7 so resource servers
 	// can read the typed RAR grant via introspection without parsing the JWT.
-	for _, claim := range []string{"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details"} {
+	//
+	// client_id is an RFC 7662 §2.2 response member. mission_id, owner_user_id
+	// and user_id were in the token but not here (D2), so a resource server
+	// that introspects instead of verifying locally could not see the delegation
+	// tree or the accountable human, and the TypeScript SDK's introspection type
+	// declared owner_user_id and user_id fields that were always undefined.
+	for _, claim := range []string{
+		"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details",
+		"client_id", "mission_id", "owner_user_id", "user_id",
+	} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v
+		}
+	}
+	// aud is an RFC 7662 §2.2 response member, so a resource server can check
+	// a token was meant for it without parsing the JWT.
+	if aud, ok := parsed.Audience(); ok && len(aud) > 0 {
+		result["aud"] = aud
+	}
+	// The principal comes from the credential row, not the token: legacy
+	// tokens do not carry principal_type, but every credential since migration
+	// 048 records it, so introspection reports it for every tenant. The
+	// principal's identifier is reported beside it because under the legacy
+	// profile an exchanged token's sub is the actor, not the principal, and a
+	// principal_type of user next to an agent's sub would misname the agent as
+	// the person.
+	if cred.PrincipalType != "" {
+		result["principal_type"] = string(cred.PrincipalType)
+		if cred.PrincipalSub != "" {
+			result["principal_sub"] = cred.PrincipalSub
+		}
+		if cred.PrincipalIss != "" {
+			result["principal_iss"] = cred.PrincipalIss
 		}
 	}
 
@@ -3193,14 +3515,15 @@ func parseScopeString(scope string) []string {
 }
 
 // identityScopeCeilings returns an identity's two scope ceilings: its
-// credential policy's allowed_scopes and the deprecated identity-row
-// allowed_scopes. Both bind — they are layers, not alternatives. Treating the
-// row as a fallback read only when the policy is open contradicted
-// IssueCredential, whose dual-read enforces the row unconditionally: an
-// identity whose row was narrower than its policy computed a policy scope as
-// grantable here and was then refused outright there. Letting the policy
-// supersede the row instead would widen authority, since the row is set
-// per-identity and the policy is often a shared tenant default.
+// credential policy's allowed_scopes and the identity's own allowed_scopes,
+// its absolute ceiling (RFC 7591 §2 client `scope`; docs/scope-ceilings.md).
+// Both bind — they are layers, not alternatives. Treating the identity's list
+// as a fallback read only when the policy is open contradicted
+// IssueCredential, which enforces it unconditionally: an identity narrower
+// than its policy computed a policy scope as grantable here and was then
+// refused outright there. Letting the policy supersede it instead would widen
+// authority, since the identity's list is set per identity and the policy is
+// often a shared tenant default.
 //
 // Either may be nil (no restriction from that layer). Pass both to
 // grantScopes as separate ceilings rather than pre-intersecting them: a
@@ -3309,8 +3632,10 @@ func requireGrantableScope(requestedRaw string, granted []string) error {
 // means "no restriction from this layer", so an unrestricted layer is never
 // blamed. They are kept apart because widening a credential policy and
 // widening a registration are different repairs — naming the wrong one is the
-// mistake this whole function exists to prevent.
-func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string) error {
+// mistake this whole function exists to prevent. userGrant says actorPolicy is
+// the policy's user_grant_scopes, the ceiling on what the actor may hold for a
+// person (D10), so the denial names that field rather than allowed_scopes.
+func delegationScopeDenial(requested []string, subjectHolds map[string]bool, actorPolicy, actorRow []string, userGrant bool) error {
 	const base = "requested scopes are not available for delegation"
 
 	// token_exchange is the one grant with no RFC 6749 §3.3 default, so an
@@ -3347,7 +3672,11 @@ func delegationScopeDenial(requested []string, subjectHolds map[string]bool, act
 		reasons = append(reasons, "the subject token does not hold ["+strings.Join(notHeld, " ")+"]")
 	}
 	if len(notPermitted) > 0 {
-		reasons = append(reasons, "the actor's credential policy does not permit ["+strings.Join(notPermitted, " ")+"]")
+		policyTerm := "the actor's credential policy does not permit ["
+		if userGrant {
+			policyTerm = "the actor's credential policy's user_grant_scopes does not permit ["
+		}
+		reasons = append(reasons, policyTerm+strings.Join(notPermitted, " ")+"]")
 	}
 	if len(notRegistered) > 0 {
 		reasons = append(reasons, "the actor identity is not registered for ["+strings.Join(notRegistered, " ")+"]")

@@ -131,6 +131,11 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 		return nil, huma.Error404NotFound("identity not found")
 	}
 
+	// Issuing a credential for an approval channel needs a trusted caller.
+	if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, credentialWriteError(err, "failed to issue credential")
+	}
+
 	grantType := domain.GrantType(input.Body.GrantType)
 	if grantType == "" {
 		grantType = domain.GrantTypeClientCredentials
@@ -143,8 +148,14 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 		GrantType:             grantType,
 		Audience:              input.Body.Audience,
 		ResolveIdentityPolicy: true,
+		// An admin issuance by a trusted approval-channel caller may carry
+		// ciba:approve.
+		ChannelTrustedCredential: service.TrustedApprovalChannelWrite(ctx),
 	})
 	if err != nil {
+		if errors.Is(err, service.ErrScopesNotAllowed) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to issue credential")
 		return nil, huma.Error500InternalServerError("failed to issue credential")
 	}
@@ -246,8 +257,19 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 		return nil, huma.Error404NotFound("identity not found")
 	}
 
+	// Checked before RotateCredential revokes the old credential.
+	if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, credentialWriteError(err, "failed to rotate credential")
+	}
+
 	accessToken, newCred, err := a.credSvc.RotateCredential(ctx, input.ID, tenant.AccountID, tenant.ProjectID, identity)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
+		if errors.Is(err, service.ErrScopesNotAllowed) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		// Terminal-state rejections are client mistakes, not server faults:
 		// map them to 409 so they neither fire 5xx alerting nor tell the
 		// caller to retry something that can never succeed. A dead
@@ -263,4 +285,14 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 	out.Body.Token = accessToken
 	out.Body.Credential = newCred
 	return out, nil
+}
+
+// credentialWriteError maps a refused approval-channel write to 403 and any
+// other failure of the check to 500.
+func credentialWriteError(err error, msg string) error {
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
+	}
+	log.Error().Err(err).Msg(msg)
+	return huma.Error500InternalServerError(msg)
 }

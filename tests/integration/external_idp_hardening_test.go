@@ -127,13 +127,17 @@ func signRSAToken(t *testing.T, alg jwa.SignatureAlgorithm, key *rsa.PrivateKey,
 	return string(signed)
 }
 
-func federationExchangeBody(idToken, accountID, projectID string) map[string]any {
+// federationExchangeBody builds an ID-token exchange, authenticated as the
+// relying party the token was issued to (D13).
+func federationExchangeBody(idToken, accountID, projectID string, rp oauthClientResp) map[string]any {
 	return map[string]any{
 		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
 		"subject_token":      idToken,
 		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
 		"account_id":         accountID,
 		"project_id":         projectID,
+		"client_id":          rp.ClientID,
+		"client_secret":      rp.ClientSecret,
 	}
 }
 
@@ -172,7 +176,7 @@ func TestExternalIDTokenFederation_NoAlgKeyAndAlgVariants(t *testing.T) {
 
 	t.Run("RS256 token with no-alg JWKS key verifies and emits user_id_iss", func(t *testing.T) {
 		idToken := idp.sign(t, validClaims())
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode,
 			"no-alg JWKS key must verify (requires WithInferAlgorithmFromKey); body=%s", resp.RawBody)
 		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
@@ -184,7 +188,7 @@ func TestExternalIDTokenFederation_NoAlgKeyAndAlgVariants(t *testing.T) {
 	t.Run("PS256 token with no-alg JWKS key verifies", func(t *testing.T) {
 		key, kid := idp.signKey()
 		idToken := signRSAToken(t, jwa.PS256(), key, kid, validClaims())
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode,
 			"PS256 over a no-alg RSA key must verify via inference; body=%s", resp.RawBody)
 	})
@@ -219,12 +223,12 @@ func TestExternalIDTokenFederation_CrossTenantRejected(t *testing.T) {
 	})
 
 	t.Run("allowed tenant succeeds", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
 	t.Run("disallowed tenant is rejected (no cross-tenant minting)", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, "acct-evil", "proj-evil"))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, "acct-evil", "proj-evil", rpClient(t, aud)))
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 			"a token must not be exchangeable under a tenant not in allowed_accounts; body=%s", resp.RawBody)
 		require.Empty(t, resp.AccessToken, "no token may be minted for a disallowed tenant")
@@ -265,7 +269,7 @@ func TestExternalIDTokenFederation_VerificationNegatives(t *testing.T) {
 	// Baseline: a clean token mints, so every failure below is the mutation's
 	// doing and not a misconfigured server.
 	t.Run("baseline clean token mints", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, base()), fedCfg.AccountID, fedCfg.ProjectID))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, base()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
@@ -320,7 +324,7 @@ func TestExternalIDTokenFederation_VerificationNegatives(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name+" rejected", func(t *testing.T) {
-			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(tc.token(t), fedCfg.AccountID, fedCfg.ProjectID))
+			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(tc.token(t), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 				"%s must be rejected with 400; body=%s", tc.name, resp.RawBody)
 			require.Empty(t, resp.AccessToken, "%s must not mint a token", tc.name)
@@ -358,13 +362,13 @@ func TestExternalIDTokenFederation_KeyRotation(t *testing.T) {
 	}
 
 	// Sanity: kid-1 (already warm in the cache) verifies.
-	resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID))
+	resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 	require.Equal(t, http.StatusOK, resp.StatusCode, "pre-rotation token must verify; body=%s", resp.RawBody)
 
 	// Upstream rotates to a brand-new key+kid the cache has never seen.
 	idp.rotate(t, "rot-kid-2")
 
-	resp = postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID))
+	resp = postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"post-rotation token must verify after on-demand JWKS refresh; body=%s", resp.RawBody)
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)

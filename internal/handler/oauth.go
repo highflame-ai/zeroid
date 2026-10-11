@@ -139,6 +139,9 @@ type TokenInput struct {
 		RefreshToken string `json:"refresh_token,omitempty" doc:"Refresh token (zid_rt_*)"`
 		// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 		AuthReqID string `json:"auth_req_id,omitempty" doc:"Backchannel auth_req_id returned from /oauth2/bc-authorize"`
+		// RequestingToken proves, on a CIBA poll, that the poller holds the
+		// requesting_token the bc-authorize request was made with.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension (CIBA grant) — required when the bc-authorize request carried a requesting_token: the same token. When that token is DPoP-bound, the poll must also carry a DPoP proof for its key."`
 		// RFC 6749 §3.1: the server MUST ignore unrecognized request
 		// parameters rather than rejecting the request outright.
 		_ struct{} `additionalProperties:"true"`
@@ -762,6 +765,7 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		RedirectURI:         input.Body.RedirectURI,
 		RefreshTokenStr:     input.Body.RefreshToken,
 		AuthReqID:           input.Body.AuthReqID,
+		RequestingToken:     input.Body.RequestingToken,
 		DPoPKeyThumbprint:   dpopThumbprint,
 	})
 	if err != nil {
@@ -866,6 +870,14 @@ type BcAuthorizeInput struct {
 		// to the BackchannelNotifier hook for typed approval-prompt
 		// rendering. Empty / omitted keeps the legacy CIBA flow unchanged.
 		AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty" doc:"RFC 9396 Rich Authorization Requests payload (JSON array of typed objects)"`
+		// FourEyes / RequesterOwner are extension parameters. A string, not
+		// a bool, because form-encoded requests arrive as strings.
+		FourEyes       string `json:"four_eyes,omitempty" doc:"Extension — \"true\" or \"false\". When true, the user named by requester_owner may not approve or deny the request. Requires requester_owner."`
+		RequesterOwner string `json:"requester_owner,omitempty" doc:"Extension — user id of the owner of the requesting identity. Max 255 characters."`
+		// RequestingToken is the access token of the request the approval
+		// is for. Verified (this issuer, active, same tenant); the token
+		// minted on approval keeps its sub and act.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension — the access token (issued by this server, same tenant) of the request being approved. The token minted on approval keeps its subject and actor; the approver is recorded only on the approval record."`
 		// CIBA Core 1.0 §7.1 inherits RFC 6749 §3.1's ignore-unrecognized-params
 		// posture, same as TokenInput/IntrospectInput/OAuthRevokeInput.
 		_ struct{} `additionalProperties:"true"`
@@ -888,6 +900,17 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 			Body:   oauthErrorBody{Error: oautherror.UnsupportedGrantType, ErrorDescription: "CIBA is not enabled on this deployment"},
 		}, nil
 	}
+	var fourEyes bool
+	switch input.Body.FourEyes {
+	case "", "false":
+	case "true":
+		fourEyes = true
+	default:
+		return &BcAuthorizeOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: oautherror.InvalidRequest, ErrorDescription: `four_eyes must be "true" or "false"`},
+		}, nil
+	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
 		ClientID:                input.Body.ClientID,
 		ClientSecret:            input.Body.ClientSecret,
@@ -900,6 +923,9 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		RequestedExpiry:         input.Body.RequestedExpiry,
 		ClientNotificationToken: input.Body.ClientNotificationToken,
 		AuthorizationDetailsRaw: []byte(input.Body.AuthorizationDetails),
+		FourEyes:                fourEyes,
+		RequesterOwner:          input.Body.RequesterOwner,
+		RequestingToken:         input.Body.RequestingToken,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")
@@ -911,10 +937,13 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 
 // BcApproveInput resolves a pending request positively. auth_req_id is the
 // URL path parameter; tenant is read from request headers via TenantContext.
+// The approver is taken from the request context when the deployer's
+// authentication layer set one (zeroid.WithApproverIdentity); subject_id is
+// then optional and, if present, must match it.
 type BcApproveInput struct {
 	AuthReqID string `path:"auth_req_id" required:"true"`
 	Body      struct {
-		SubjectID    string `json:"subject_id" required:"true" doc:"Approved end-user identifier (becomes JWT sub)"`
+		SubjectID    string `json:"subject_id,omitempty" doc:"Approved end-user identifier (becomes JWT sub). Required unless the deployment supplies the authenticated approver; must match it when it does."`
 		SubjectEmail string `json:"subject_email,omitempty" doc:"Approved user email (optional)"`
 		SubjectName  string `json:"subject_name,omitempty" doc:"Approved user display name (optional)"`
 	}
@@ -992,31 +1021,49 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 	return out, nil
 }
 
-// mapBackchannelAdminError converts a service-layer OAuthError into a Huma
-// admin error. The admin endpoints are not OAuth token endpoints, so the
-// RFC 6749 §5.2 error_code/error_description envelope would be misleading
-// here; we use plain HTTP semantics instead.
+// mapBackchannelAdminError converts a service-layer OAuthError into an admin
+// error response.
 //
-// The backchannel service produces only 400 and 500 OAuthErrors — there's
-// no auth surface inside the service (admin auth happens at the handler /
-// edge layer, see bcApproveOp / bcDenyOp). 401 would be returned only if
-// the service started producing invalid_client errors directly, which it
-// doesn't today; if that ever changes, add a case here AND consider
-// whether the failure is really an OAuth client-auth failure (RFC 9728
-// §5.1 breadcrumb applies) or just a misuse of OAuthError shape (it
-// doesn't apply).
+// 4xx responses carry both the problem-details fields the admin API has
+// always returned (title, status, detail) and the OAuth error/
+// error_description pair, so callers can branch on the code (e.g.
+// access_denied for an ineligible approver) without parsing prose.
+//
+// 401 is produced when the approver identity is required but absent. It is
+// not an OAuth client-authentication failure at a token endpoint, so no
+// WWW-Authenticate challenge is attached (the RFC 9728 §5.1 breadcrumb does
+// not apply).
 func mapBackchannelAdminError(err error) error {
 	var oauthErr *service.OAuthError
 	if errors.As(err, &oauthErr) {
 		switch oauthErr.HTTPStatus {
-		case http.StatusBadRequest:
-			return huma.Error400BadRequest(oauthErr.Description)
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+			return &backchannelAdminError{
+				Title:            http.StatusText(oauthErr.HTTPStatus),
+				Status:           oauthErr.HTTPStatus,
+				Detail:           oauthErr.Description,
+				Code:             oauthErr.Code,
+				ErrorDescription: oauthErr.Description,
+			}
 		case http.StatusInternalServerError:
 			return huma.Error500InternalServerError(oauthErr.Description)
 		}
 	}
 	return huma.Error500InternalServerError("backchannel admin request failed")
 }
+
+// backchannelAdminError is the 4xx body for the CIBA approve/deny endpoints.
+// It implements huma.StatusError so Huma writes it as the response body.
+type backchannelAdminError struct {
+	Title            string `json:"title"`
+	Status           int    `json:"status"`
+	Detail           string `json:"detail"`
+	Code             string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+func (e *backchannelAdminError) Error() string  { return e.Code + ": " + e.ErrorDescription }
+func (e *backchannelAdminError) GetStatus() int { return e.Status }
 
 // CIMDClientInfoInput is the client_id whose document to resolve.
 type CIMDClientInfoInput struct {

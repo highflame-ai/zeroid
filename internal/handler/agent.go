@@ -17,11 +17,23 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
+// approvalChannelWriteError maps a write refused for lacking a trusted
+// approval-channel context to 403, or returns nil for any other error.
+func approvalChannelWriteError(err error) error {
+	if errors.Is(err, service.ErrApprovalChannelWriteNotTrusted) {
+		return huma.Error403Forbidden(err.Error())
+	}
+	return nil
+}
+
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
 // Internal details are logged server-side; only generic messages are returned to clients.
 func mapErr(err error) error {
 	if err == nil {
 		return nil
+	}
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
 	}
 	// Typed sentinels first. Service-layer callers wrap with these so
 	// callers see a 400 instead of a 500 on caller-fixable states.
@@ -55,7 +67,7 @@ type RegisterAgentInput struct {
 		Name                     string          `json:"name" required:"true" minLength:"1" doc:"Human-readable name"`
 		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
-		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Operational role"`
+		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Operational role. approval_channel (identity_type service only) marks a CIBA approval channel."`
 		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
 		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
@@ -64,7 +76,7 @@ type RegisterAgentInput struct {
 		Capabilities             json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels                   json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata                 json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
+		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
 		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator"`
 		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
@@ -351,6 +363,9 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		// A collision with a soft-deleted identity is actionable — surface the
 		// existing id so the caller can reactivate it instead of being stuck
 		// behind an opaque 409 for a row hidden from the active registry view.

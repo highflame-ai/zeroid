@@ -231,7 +231,7 @@ claims — see feedback item 3.
 | §6.2 field | ZeroID equivalent | Status |
 |---|---|---|
 | `credential_id` | `jti` | present |
-| `format_version` | — (RFC 9068 `at+jwt` typ header is open work, zeroid#189) | absent |
+| `format_version` | `typ` header: `at+jwt` (RFC 9068 §2.1), or `JWT` where a credential policy keeps an agent's tokens JWT-SVIDs (`jwt_typ`) | present |
 | `agent_id` | `sub` (WIMSE URI) | present |
 | `registration_record_ref` (issuer + id + version + digest) | registration resolved by authoritative same-database lookup at issuance *and* refresh (`IsUsable()` chokepoint) — within a single trust domain this is strictly stronger than a digest reference (always-current, no staleness window). The portable versioned ref matters only for cross-domain verification (federation), which is not this binding's deployment shape | present (co-located binding) |
 | `runtime_instance_id` | — (ZeroID models the logical agent; per-issuance `jti` is the closest analogue) | absent |

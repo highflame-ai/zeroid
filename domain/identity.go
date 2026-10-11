@@ -125,6 +125,11 @@ const (
 
 	// Service sub-types.
 	SubTypeLLMProvider SubType = "llm_provider"
+	// SubTypeApprovalChannel marks a service identity that resolves CIBA
+	// requests on behalf of the users it names (a chat or email bridge, a
+	// customer-built approval UI). Deployers that front the admin API with
+	// several caller classes should let only their most trusted class set it.
+	SubTypeApprovalChannel SubType = "approval_channel"
 )
 
 // agentSubTypes is the set of sub-types valid for identity_type = "agent".
@@ -153,7 +158,8 @@ var applicationSubTypes = map[SubType]bool{
 
 // serviceSubTypes is the set of sub-types valid for identity_type = "service".
 var serviceSubTypes = map[SubType]bool{
-	SubTypeLLMProvider: true,
+	SubTypeLLMProvider:     true,
+	SubTypeApprovalChannel: true,
 }
 
 // ValidForIdentityType reports whether s is a valid sub-type for the given identity type.
@@ -445,15 +451,19 @@ type Identity struct {
 	// identity points at the tenant's default policy unless the creator chose
 	// a more specific one.
 	//
-	// AllowedScopes is deprecated in favour of the identity policy's
-	// allowed_scopes. It is still read as a fallback during the deprecation
-	// window when the identity policy does not restrict scopes (i.e. the
-	// policy's allowed_scopes is empty). New code should set the scope
-	// ceiling on the policy, not on the identity row.
+	// AllowedScopes is the identity's absolute scope ceiling, the equivalent
+	// of RFC 7591 client `scope` metadata: no token for this identity carries
+	// a scope outside it. Credential policies are reusable bundles that narrow
+	// within it. Empty means no ceiling from this layer. See
+	// docs/scope-ceilings.md.
 	OwnerUserID        string   `bun:"owner_user_id,type:varchar(255)" json:"owner_user_id"`
 	CredentialPolicyID string   `bun:"credential_policy_id,type:uuid,nullzero" json:"credential_policy_id,omitempty"`
-	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // Deprecated: set scopes on the identity's credential policy instead.
+	AllowedScopes      []string `bun:"allowed_scopes,array"            json:"allowed_scopes"` // The identity's absolute scope ceiling; see above.
 	PublicKeyPEM       string   `bun:"public_key_pem,type:text"        json:"public_key_pem,omitempty"`
+	// PublicKeyChannelTrusted records that PublicKeyPEM was last written by a
+	// caller marked with WithTrustedApprovalChannelWrite. ciba:approve is
+	// issued on the jwt-bearer grant only when it is set.
+	PublicKeyChannelTrusted bool `bun:"public_key_channel_trusted,notnull" json:"-"`
 
 	// Identity metadata — embedded into JWT claims for downstream services.
 	Framework    string          `bun:"framework,type:varchar(100)"  json:"framework,omitempty"`

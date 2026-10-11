@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"sync"
 	"testing"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
@@ -124,4 +125,22 @@ func signForeignIDJAG(t *testing.T, typ string, claims map[string]any) string {
 // callers in this package only need the claim map for assertions.
 func jwtDecodeSegment(seg string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(seg)
+}
+
+// rpClients caches one relying-party client per ID-token audience.
+var rpClients sync.Map
+
+// rpClient returns the OAuth client registered as the relying party an ID token
+// with this aud was issued to. Since D13 only that client, authenticated, may
+// redeem the token. Its client_id is the audience, as at a real IdP, where an ID
+// token's aud is the relying party's client_id. Registered once per audience;
+// safe across tests because no integration test calls t.Parallel().
+func rpClient(t *testing.T, aud string) oauthClientResp {
+	t.Helper()
+	if c, ok := rpClients.Load(aud); ok {
+		return c.(oauthClientResp)
+	}
+	c := registerOAuthClient(t, aud, nil)
+	rpClients.Store(aud, c)
+	return c
 }

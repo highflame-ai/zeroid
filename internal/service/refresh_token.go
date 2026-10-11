@@ -68,6 +68,11 @@ type RefreshTokenParams struct {
 	// the same binding on the successor access token. Empty ⇒ an unbound
 	// refresh token whose rotation carries no `resource` claim.
 	Resources []string
+	// PrincipalIss is the issuer of the family's user subject — the access
+	// token's principal_iss. Persisted so a person's refresh families are
+	// revoked by the RFC 9493 (issuer, subject) pair, and so the refreshed
+	// token keeps the same principal.
+	PrincipalIss string
 }
 
 // ErrDPoPBindingMismatch is returned when a refresh-token rotation presents a
@@ -109,6 +114,7 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		MissionID:         params.MissionID,
 		Audience:          params.Audience,
 		Resources:         params.Resources,
+		PrincipalIss:      params.PrincipalIss,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -238,6 +244,12 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			// loss of enforcement. TestResourceCeiling_SurvivesTwoRotations
 			// rotates twice to pin exactly this.
 			Resources: c.Resources,
+			// Carry the principal's issuer forward. Lose it and the family
+			// drops out of per-user revocation after its first rotation,
+			// because the (issuer, subject) match no longer finds it, and the
+			// refreshed token falls back to ZeroID's own issuer for a user an
+			// external IdP vouched for.
+			PrincipalIss: c.PrincipalIss,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})

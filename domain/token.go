@@ -50,11 +50,15 @@ type ActorClaims struct {
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
 type AccessToken struct {
 	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"` // "Bearer"
-	ExpiresIn   int    `json:"expires_in"` // seconds
-	Scope       string `json:"scope,omitempty"`
-	JTI         string `json:"jti"`
-	IssuedAt    int64  `json:"iat"`
+	// IssuedTokenType is the RFC 8693 §2.2.1 token type identifier of the
+	// issued token. REQUIRED on a token-exchange response and absent from
+	// every other grant's response, where RFC 6749 §5.1 does not define it.
+	IssuedTokenType string `json:"issued_token_type,omitempty"`
+	TokenType       string `json:"token_type"` // "Bearer"
+	ExpiresIn       int    `json:"expires_in"` // seconds
+	Scope           string `json:"scope,omitempty"`
+	JTI             string `json:"jti"`
+	IssuedAt        int64  `json:"iat"`
 	// Convenience fields — duplicated from JWT so callers don't need to decode.
 	AccountID    string `json:"account_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
@@ -155,6 +159,11 @@ type OAuthClient struct {
 	// status + expires_at — same fail-closed semantics jwt_bearer and
 	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
+
+	// ChannelTrusted records that the client was registered by a caller
+	// marked with WithTrustedApprovalChannelWrite.
+	// ciba:approve is issued on client_credentials only when it is set.
+	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
 
 	// Dynamic Client Registration (RFC 7591/7592)
 	// RegistrationSource is "internal" for clients created via the admin/internal
