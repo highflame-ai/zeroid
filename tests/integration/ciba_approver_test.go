@@ -1139,22 +1139,23 @@ func TestCIBARequestingIdentityPolicy(t *testing.T) {
 		"max_ttl_seconds":      3600,
 	}, adminHeaders())
 	// The identity's own allowed_scopes include tools:admin; its credential
-	// policy does not, so the policy is what refuses it.
+	// policy does not. The requesting token holds tools:read and tools:write.
 	extID := uid("ciba-chain-root")
 	registerIdentityWithPolicy(t, extID, policyID, "", []string{"tools:read", "tools:write", "tools:admin"}, adminHeaders())
-	rootClient := registerOAuthClient(t, extID, []string{"tools:read"})
+	rootClient := registerOAuthClient(t, extID, []string{"tools:read", "tools:write"})
 	rr := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "client_credentials", "account_id": testAccountID, "project_id": testProjectID,
-		"client_id": rootClient.ClientID, "client_secret": rootClient.ClientSecret, "scope": "tools:read",
+		"client_id": rootClient.ClientID, "client_secret": rootClient.ClientSecret, "scope": "tools:read tools:write",
 	}, nil)
 	require.Equal(t, http.StatusOK, rr.StatusCode)
 	rootToken, _ := decode(t, rr)["access_token"].(string)
 	rootClaims := decodeJWTPayload(t, rootToken)
 
-	t.Run("ScopeOutsidePolicy_RefusedWithoutConsumingApproval", func(t *testing.T) {
+	refusedWithoutConsuming := func(t *testing.T, scope string) {
+		t.Helper()
 		c := newConfidentialCIBAClient(t)
 		resp := bcAuthorizeAs(t, c, map[string]any{
-			"login_hint": "user-a", "requesting_token": rootToken, "scope": "tools:admin",
+			"login_hint": "user-a", "requesting_token": rootToken, "scope": scope,
 		})
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		id, _ := decode(t, resp)["auth_req_id"].(string)
@@ -1165,6 +1166,10 @@ func TestCIBARequestingIdentityPolicy(t *testing.T) {
 		require.Equal(t, "invalid_scope", body["error"])
 		row := loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id)
 		require.Equal(t, domain.BackchannelStatusApproved, row.Status, "a refusal must not consume the approval")
+	}
+
+	t.Run("ScopeOutsideChain_RefusedWithoutConsumingApproval", func(t *testing.T) {
+		refusedWithoutConsuming(t, "tools:admin")
 	})
 
 	t.Run("ScopeWithinPolicy_Minted", func(t *testing.T) {
@@ -1180,6 +1185,14 @@ func TestCIBARequestingIdentityPolicy(t *testing.T) {
 		require.Equal(t, rootClaims["sub"], claims["sub"])
 		require.LessOrEqual(t, numClaim(t, claims, "exp"), numClaim(t, rootClaims, "exp"),
 			"the approved token must not outlive the requesting token")
+		require.ElementsMatch(t, []any{"tools:write"}, claims["scopes"])
+	})
+
+	t.Run("ScopeOutsideTightenedPolicy_RefusedWithoutConsumingApproval", func(t *testing.T) {
+		// The chain holds tools:write, but the policy no longer permits it:
+		// the policy is what refuses it.
+		patchCredentialPolicy(t, policyID, map[string]any{"allowed_scopes": []string{"tools:read"}}, adminHeaders())
+		refusedWithoutConsuming(t, "tools:write")
 	})
 }
 

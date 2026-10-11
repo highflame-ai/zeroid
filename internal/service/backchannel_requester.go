@@ -163,7 +163,8 @@ func stampAuthorizationDetails(row *domain.BackchannelAuthRequest) (json.RawMess
 // requestingChainIssue adjusts a CIBA issuance for a row that carries a
 // requesting chain: the token keeps the chain's subject, act (as issued,
 // nested actors included), identity claims and DPoP key binding, carries
-// nothing about the approver, and never outlives the requesting token. When the requesting
+// nothing about the approver, never holds a scope the requesting token does
+// not (see requestingChainScopes), and never outlives it. When the requesting
 // token belongs to an identity, that identity's credential policy governs the
 // result. Every refusal is returned before the caller burns the auth_req_id.
 // Returns ok=false when the row has no requesting chain.
@@ -215,8 +216,20 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if cred.DPoPKeyThumbprint != "" {
 		req.DPoPKeyThumbprint = cred.DPoPKeyThumbprint
 	}
+	// The approval extends the chain, so the token holds the chain's scopes,
+	// never more (RFC 8693: a child never exceeds its parent). The approval
+	// itself grants the authorization_details entry, not scopes.
+	scopes, err := requestingChainScopes(cred.Scopes, req.Scopes)
+	if err != nil {
+		return true, err
+	}
+	req.Scopes = scopes
 	if cred.IdentityID == nil || *cred.IdentityID == "" {
-		return true, nil
+		// No requesting identity: the token stays anchored to the polling
+		// client's bound identity, if any, and the chokepoint enforces that
+		// identity's ceilings and policy on the chain's scopes, which the
+		// caller's pre-burn checks saw only as the request's own scope.
+		return true, s.boundAnchorGates(ctx, req)
 	}
 
 	ident, err := s.identitySvc.GetIdentity(ctx, *cred.IdentityID, row.AccountID, row.ProjectID)
@@ -246,7 +259,17 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if err != nil {
 		return true, oauthServerError("failed to resolve the requesting identity's credential policy", err)
 	}
-	if err := requireScopesWithin(req.Scopes, policy.AllowedScopes, "the requesting identity's credential policy"); err != nil {
+	// A chain acting for a person is capped by the policy's user_grant_scopes
+	// in place of its allowed_scopes (ADR 0041 D2, #385 D10); the identity's
+	// own allowed_scopes, checked above, binds either way. The chain bounds
+	// the person's grant, as on a token exchange, so the split applies to
+	// every user-rooted chain.
+	userGrant := p.Type == domain.PrincipalUser
+	policyCeiling, ceilingName := policy.AllowedScopes, "the requesting identity's credential policy allowed_scopes"
+	if userGrant {
+		policyCeiling, ceilingName = policy.UserGrantScopes, "the requesting identity's credential policy user_grant_scopes"
+	}
+	if err := requireScopesWithin(req.Scopes, policyCeiling, ceilingName); err != nil {
 		return true, err
 	}
 	if policy.MaxTTLSeconds > 0 && req.TTL > policy.MaxTTLSeconds {
@@ -264,17 +287,119 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 			TrustLevel:       ident.TrustLevel,
 			AttestationLevel: attestationLevel,
 			DelegationDepth:  req.DelegationDepth,
+			// The chain's principal, so required_principal_type is judged
+			// against who the chain acts for, and the user-grant ceiling
+			// applies to a person's chain.
+			PrincipalType:    p.Type,
+			UserGrantBounded: userGrant,
 		}); perr != nil {
 			return true, oauthBadRequestCause(oautherror.AccessDenied, "the requesting identity's credential policy refused issuance", perr)
 		}
 	}
 
 	req.Identity = ident
+	req.UserGrantBounded = userGrant
 	// Enforced above against the chain's grant type; the chokepoint would
-	// re-check it against the CIBA grant type instead.
+	// re-check it against the CIBA grant type instead. The policy still
+	// governs the token's non-enforcement choices (typ header, ceiling-rule
+	// counting), so it is handed over without its ID.
 	req.IdentityPolicyID = ""
+	req.EnforcedIdentityPolicy = policy
 	return true, nil
 }
+
+// boundAnchorGates applies, before the burn, the checks IssueCredential makes
+// against req.Identity and req.IdentityPolicyID when a step-up into a chain
+// with no identity leaves the token anchored to the polling client's bound
+// identity. It mirrors the chokepoint so a deterministic refusal there cannot
+// consume the approval. A request with no anchor (an unbound client) has
+// nothing to check.
+func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueRequest) error {
+	if req.Identity == nil || req.Identity.ID == "" {
+		return nil
+	}
+	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
+		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to the bound identity", refused))
+	}
+	if err := requireScopesWithin(req.Scopes, req.Identity.AllowedScopes, "the bound identity's allowed_scopes"); err != nil {
+		return err
+	}
+	if req.IdentityPolicyID == "" || s.credentialSvc.policySvc == nil {
+		return nil
+	}
+	policy, err := s.credentialSvc.policySvc.GetPolicy(ctx, req.IdentityPolicyID, req.Identity.AccountID, req.Identity.ProjectID)
+	if err != nil {
+		return oauthServerError("failed to load the bound identity's credential policy", err)
+	}
+	var attestationLevel string
+	if s.credentialSvc.attestationRepo != nil {
+		attestationLevel, _ = s.credentialSvc.attestationRepo.GetHighestVerifiedLevel(ctx, req.Identity.ID)
+	}
+	enforce := EnforcePolicyRequest{
+		TTL:              req.TTL,
+		GrantType:        req.GrantType,
+		Scopes:           req.Scopes,
+		TrustLevel:       req.Identity.TrustLevel,
+		AttestationLevel: attestationLevel,
+		DelegationDepth:  req.DelegationDepth,
+		PrincipalType:    req.PrincipalType,
+		UserGrantBounded: req.UserGrantBounded,
+	}
+	if err := requireScopesWithin(req.Scopes, scopeCeiling(policy, enforce), "the bound identity's credential policy"); err != nil {
+		return err
+	}
+	if perr := s.credentialSvc.policySvc.EnforcePolicy(ctx, policy, enforce); perr != nil {
+		return oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", perr)
+	}
+	return nil
+}
+
+// requestingChainScopes returns the scopes of a token approved into a chain
+// holding chainScopes, given the scopes the bc-authorize request named.
+//
+// "openid" is the CIBA protocol scope (CIBA Core §7.1 requires it, so a
+// caller such as Shield always sends it); it asks for authentication, not
+// authority, and narrows nothing. Any other requested scope narrows the
+// result to the scopes named. A named scope the chain does not hold is
+// refused with invalid_scope rather than dropped: the approver was shown a
+// request for it, and a silently narrower token would leave the client
+// believing it holds authority it does not. A step-up can never add a scope
+// to its chain.
+//
+// A chain with no scopes is the legacy scopeless shape (an identity with no
+// ceiling anywhere), which downstream reads as unrestricted. The approval
+// then keeps the request's scopes, exactly as a root CIBA grant does, so the
+// token never ends up with no scopes claim where the root grant would carry
+// one; the ceilings checked afterwards still bound it.
+func requestingChainScopes(chainScopes, requested []string) ([]string, error) {
+	if len(chainScopes) == 0 {
+		return requested, nil
+	}
+	held := make(map[string]bool, len(chainScopes))
+	for _, sc := range chainScopes {
+		held[sc] = true
+	}
+	var narrowed []string
+	seen := make(map[string]bool, len(requested))
+	for _, sc := range requested {
+		if sc == cibaProtocolScope || seen[sc] {
+			continue
+		}
+		seen[sc] = true
+		if !held[sc] {
+			return nil, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not held by the requesting token; a step-up cannot add scopes to its chain", sc))
+		}
+		narrowed = append(narrowed, sc)
+	}
+	if len(narrowed) == 0 {
+		return append([]string(nil), chainScopes...), nil
+	}
+	return narrowed, nil
+}
+
+// cibaProtocolScope is the OpenID scope CIBA Core §7.1 requires on every
+// authentication request.
+const cibaProtocolScope = "openid"
 
 // requestingChainPrincipal returns the principal of the chain a step-up is
 // approved into. A requesting credential minted since migration 048 records

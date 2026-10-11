@@ -192,6 +192,15 @@ type IssueRequest struct {
 	// false preserves the prior behavior for every other caller.
 	ResolveIdentityPolicy bool
 
+	// EnforcedIdentityPolicy is the identity's governing policy when the
+	// caller has already enforced it and leaves IdentityPolicyID empty so the
+	// chokepoint does not enforce it again (a CIBA step-up into a requesting
+	// chain, which enforces it against the chain's grant type, not CIBA's).
+	// IssueCredential never enforces it; it uses it only for the choices a
+	// governing policy makes beyond enforcement: the typ header and the
+	// ceiling-rule count. Ignored when IdentityPolicyID resolves a policy.
+	EnforcedIdentityPolicy *domain.CredentialPolicy
+
 	// PrincipalType, PrincipalSub and PrincipalIss name the principal whose
 	// authority the chain uses (RFC 8693 §4.1). Token exchange sets all three
 	// from the parent, because a child inherits its chain's principal and
@@ -212,7 +221,8 @@ type IssueRequest struct {
 
 	// UserGrantBounded marks a grant whose user principal's grant is itself
 	// bounded — a delegated user chain (by its parent), ID-JAG (by the IdP),
-	// authorization_code and refresh (by consent) — so a user-subject token
+	// authorization_code and refresh (by consent), a CIBA step-up into a
+	// requesting chain (by that chain) — so a user-subject token
 	// is capped by the policy's user_grant_scopes instead of allowed_scopes
 	// (D10). Left false on the trusted-broker, ID-token and CIBA roots, which
 	// are bounded only by the caller's request and so keep allowed_scopes
@@ -670,6 +680,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 				return nil, nil, err
 			}
 		}
+	}
+
+	if identityPolicy == nil && req.EnforcedIdentityPolicy != nil {
+		identityPolicy = req.EnforcedIdentityPolicy
 	}
 
 	now := time.Now()

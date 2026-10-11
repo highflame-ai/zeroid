@@ -1129,6 +1129,14 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
 		return nil, cerr
 	}
+	// ciba:approve is issued only from a trusted approval-channel credential,
+	// which a CIBA grant never is, so the chokepoint always refuses it here.
+	// Refuse it before the burn, whether the request named it or a requesting
+	// chain holds it.
+	if slices.Contains(issue.Scopes, domain.ScopeCIBAApprove) {
+		return nil, oauthBadRequest(oautherror.InvalidScope,
+			fmt.Sprintf("scope %q is never issued by a CIBA approval", domain.ScopeCIBAApprove))
+	}
 
 	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
 	// additionally rejects an approved row that has outlived both expires_at
