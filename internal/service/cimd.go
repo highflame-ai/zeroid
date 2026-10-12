@@ -188,9 +188,10 @@ var cimdAllowedAuthMethods = map[string]bool{
 // mint on its own say-so. idJAGBearer is the only place a CIMD client can
 // spend it, and there it also needs an assertion the enterprise IdP signed
 // naming this exact client_id, private_key_jwt client authentication against
-// the document's own key, and an explicit (issuer, client_id) → tenant binding
-// in the issuer's configuration. The NHI self-signed jwt-bearer path never
-// reads a client at all.
+// the document's own key, and a tenant derived from an (issuer, client_id) →
+// identity binding (ADR 0042 D6). That binding does not exist yet, so today the
+// tenant derivation refuses every CIMD client outright (cimdClientTenant). The
+// NHI self-signed jwt-bearer path never reads a client at all.
 //
 // It is applied as an INTERSECTION over the document's list, not as a gate on
 // it. The distinction is the whole of zeroid#344: the invariant worth keeping is
@@ -836,6 +837,10 @@ func applyIDJAGProfileGrantRule(doc *cimdMetadataDocument, kept, dropped []strin
 	if !slices.Contains(doc.AuthorizationGrantProfiles, idJAGGrantProfile) {
 		return kept, dropped
 	}
+	// Checked against the document's DECLARED grant_types, not kept: §8's MUST
+	// is on the client's declaration, and token-exchange is never in kept, so
+	// checking kept here would withdraw jwt-bearer from every conformant
+	// document too.
 	if slices.Contains(doc.GrantTypes, grantTypeTokenExchangeURN) && slices.Contains(doc.GrantTypes, grantTypeJWTBearerURN) {
 		return kept, dropped
 	}
