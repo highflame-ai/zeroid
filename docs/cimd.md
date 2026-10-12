@@ -78,6 +78,12 @@ to carry application state only. ZeroID round-trips it verbatim when present and
 does not require it. It is shown because most clients have somewhere to return
 the user to.
 
+Every authorization response — the success redirect and any error redirect —
+also carries `iss=<issuer>` (RFC 9207), and AS metadata advertises
+`authorization_response_iss_parameter_supported: true`. A client that talks to
+more than one authorization server should compare it with the issuer it started
+the flow against and drop the response on a mismatch (mix-up defense).
+
 **Serving the browser leg *directly* at `/oauth2/authorize` needs a GET-capable
 `PrincipalResolver`, which ZeroID does not ship.** A browser cannot set a custom
 header on a top-level navigation, and the resolver-facing `Form` accessor is
@@ -248,7 +254,7 @@ arrive in a header (`X-API-Key`, or `Authorization: Bearer zid_sk_…`) or a
 cookie — a URL ends up in access logs, browser history, and `Referer`. The
 protocol parameters above are fine there; the credential is not.
 
-ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…`.
+ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…&iss=…`.
 
 ### 3. The client exchanges the code
 

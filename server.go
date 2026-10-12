@@ -533,6 +533,8 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
 	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
+	// Validate() already rejected a malformed value; empty keeps the default.
+	apiHandler.SetRegistrationEndpoint(cfg.Token.RegistrationEndpoint)
 	apiHandler.SetTenantSettingsService(tenantSettingsSvc)
 	// An allow-list is the deployer vetting which hosts may publish a metadata
 	// document, which is what lets a CIMD client be redirected to at all. The
@@ -1420,6 +1422,34 @@ func (s *Server) SetAttestationPermissive(enabled bool) {
 // metadata advertises dpop_bound_access_tokens_required: true.
 func (s *Server) SetDPoPRequired(required bool) {
 	s.apiHandler.SetDPoPRequired(required)
+}
+
+// SetRegistrationEndpoint sets the registration_endpoint advertised in both AS
+// metadata documents (/.well-known/oauth-authorization-server and
+// /.well-known/openid-configuration). It is the programmatic form of
+// token.registration_endpoint (ZEROID_REGISTRATION_ENDPOINT), for embedders that
+// configure the server in code.
+//
+// RFC 8414 §2 lets registration_endpoint be any URL, so a deployment that runs
+// client registration somewhere other than ZeroID's own /oauth2/register — which
+// requires an initial access token and registers machine clients only — can
+// advertise that endpoint instead. Only the advertisement changes; ZeroID's own
+// /oauth2/register stays mounted with its existing gate.
+//
+// The value is checked against the server's configured token.issuer with the
+// same rules as config load: an absolute, canonical https URL without
+// user-info, fragment, whitespace or control characters, with an ASCII host and
+// a port (if any) in 1-65535; http is accepted only for a loopback host or when
+// the issuer is itself http. An invalid value returns an error and leaves the
+// advertised endpoint unchanged. Empty restores the default,
+// {issuer}/oauth2/register. Safe to call at runtime.
+func (s *Server) SetRegistrationEndpoint(endpoint string) error {
+	if err := validateRegistrationEndpoint(endpoint, s.cfg.Token.Issuer); err != nil {
+		return err
+	}
+	s.apiHandler.SetRegistrationEndpoint(endpoint)
+
+	return nil
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
