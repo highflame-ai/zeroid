@@ -61,6 +61,13 @@ token:
   # ZeroID's own /oauth2/register stays mounted.
   # Env: ZEROID_REGISTRATION_ENDPOINT
   # registration_endpoint: "https://app.example.com/oauth/register"
+  # device_authorization_endpoint advertises an RFC 8628 device authorization
+  # endpoint that the embedder serves (ZeroID does not implement the grant).
+  # When set, both AS metadata documents carry device_authorization_endpoint
+  # and grant_types_supported lists urn:ietf:params:oauth:grant-type:device_code;
+  # empty (default) advertises neither. Same URL rules as registration_endpoint.
+  # Env: ZEROID_DEVICE_AUTHORIZATION_ENDPOINT
+  # device_authorization_endpoint: "https://auth.example.com/oauth2/device_authorization"
   # require_dpop makes a valid DPoP proof (RFC 9449) mandatory on every
   # /oauth2/token issuance. Off by default: without a proof the token falls
   # back to Bearer. When true, proof-less issuance is refused with

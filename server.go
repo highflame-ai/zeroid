@@ -535,6 +535,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
 	// Validate() already rejected a malformed value; empty keeps the default.
 	apiHandler.SetRegistrationEndpoint(cfg.Token.RegistrationEndpoint)
+	apiHandler.SetDeviceAuthorizationEndpoint(cfg.Token.DeviceAuthorizationEndpoint)
 	apiHandler.SetTenantSettingsService(tenantSettingsSvc)
 	// An allow-list is the deployer vetting which hosts may publish a metadata
 	// document, which is what lets a CIMD client be redirected to at all. The
@@ -1453,6 +1454,34 @@ func (s *Server) SetRegistrationEndpoint(endpoint string) error {
 		return err
 	}
 	s.apiHandler.SetRegistrationEndpoint(endpoint)
+
+	return nil
+}
+
+// SetDeviceAuthorizationEndpoint sets the device_authorization_endpoint
+// (RFC 8628 §4, an RFC 8414 metadata member) advertised in both AS metadata
+// documents (/.well-known/oauth-authorization-server and
+// /.well-known/openid-configuration). It is the programmatic form of
+// token.device_authorization_endpoint (ZEROID_DEVICE_AUTHORIZATION_ENDPOINT).
+//
+// ZeroID does not implement the device authorization grant. This is for an
+// embedder that serves it beside ZeroID, so clients can discover the endpoint
+// instead of hardcoding it. While set, grant_types_supported also lists
+// urn:ietf:params:oauth:grant-type:device_code; while unset, neither member is
+// advertised. ZeroID's own /oauth2/token does not accept that grant either way —
+// device-code polling is the embedder's to serve.
+//
+// Validation is identical to SetRegistrationEndpoint, against the server's
+// configured token.issuer: an absolute, canonical https URL without user-info,
+// fragment, whitespace or control characters, with an ASCII host and a port (if
+// any) in 1-65535; http only for a loopback host or when the issuer is itself
+// http. Errors never echo user-info. An invalid value returns an error and
+// leaves the advertisement unchanged. Empty unsets it. Safe to call at runtime.
+func (s *Server) SetDeviceAuthorizationEndpoint(endpoint string) error {
+	if err := validateDeviceAuthorizationEndpoint(endpoint, s.cfg.Token.Issuer); err != nil {
+		return err
+	}
+	s.apiHandler.SetDeviceAuthorizationEndpoint(endpoint)
 
 	return nil
 }

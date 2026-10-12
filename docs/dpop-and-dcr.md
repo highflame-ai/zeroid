@@ -140,6 +140,21 @@ When a refresh token is issued in conjunction with a DPoP-bound access token (vi
 
 An **unbound** refresh token (issued without DPoP) is not retroactively bound — even if a later rotation request presents a proof. That decision could change later; today it preserves the explicit user opt-in to DPoP.
 
+### Advertising a device authorization endpoint served beside ZeroID
+
+ZeroID does not implement the RFC 8628 device authorization grant. An embedder that serves it alongside ZeroID — its own `/oauth2/device_authorization` plus device-code polling — can have the AS metadata point clients at it, so they discover the endpoint instead of hardcoding the path:
+
+```yaml
+token:
+  device_authorization_endpoint: "https://auth.example.com/oauth2/device_authorization"   # env: ZEROID_DEVICE_AUTHORIZATION_ENDPOINT
+```
+
+Embedders that configure the server in code call `Server.SetDeviceAuthorizationEndpoint(url) error` instead.
+
+- When set, **both** AS metadata documents carry `device_authorization_endpoint` (RFC 8628 §4) and list `urn:ietf:params:oauth:grant-type:device_code` in `grant_types_supported`. Unset (the default), neither appears.
+- Validation is exactly the `registration_endpoint` rules above: absolute, canonical `https` (or `http` for a loopback host or beside an `http` issuer), no user-info, fragment, whitespace or control characters, ASCII host, port in 1–65535; errors never echo user-info; an invalid value fails config load or is returned by the setter, leaving the previous advertisement in place.
+- Only the advertisement changes. ZeroID's own `/oauth2/token` does not accept the `device_code` grant; the token polling the device flow needs is the embedder's to serve.
+
 ### Limitations / future work
 
 - **CIBA push mode**: the CIBA push delivery path mints a token server-side with no client proof available; those tokens come out as Bearer regardless. CIBA poll mode is fully DPoP-capable today (the poll's `/oauth2/token` call carries the proof normally).

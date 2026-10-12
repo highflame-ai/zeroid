@@ -1023,7 +1023,7 @@ How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, nati
 | PKCE | RFC 7636 | Authorization code flow |
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
-| OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery; `token.device_authorization_endpoint` can advertise an RFC 8628 device authorization endpoint the embedder serves |
 | Authorization Server Issuer Identification | RFC 9207 | `iss` on every `/oauth2/authorize` response (success and error) — client-side mix-up defense; advertised via `authorization_response_iss_parameter_supported` |
 | OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | OpenID Connect Discovery 1.0 | OpenID | `/.well-known/openid-configuration` — the discovery path cloud workload-identity federation (AWS IAM OIDC providers, Azure federated identity credentials, GCP workload identity pools) requires to trust ZeroID as an external issuer. Metadata only: ZeroID is not an OpenID Provider and issues no `id_token` |

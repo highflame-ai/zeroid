@@ -66,6 +66,12 @@ type API struct {
 	// metadata (token.registration_endpoint). Validated by the caller; atomic
 	// for the same reason as dpopRequired.
 	registrationEndpoint atomic.Pointer[string]
+	// deviceAuthorizationEndpoint, when non-nil and non-empty, is advertised as
+	// device_authorization_endpoint (RFC 8628) and adds the device_code grant to
+	// grant_types_supported (token.device_authorization_endpoint). ZeroID serves
+	// no such endpoint itself; an embedder does. Validated by the caller; atomic
+	// for the same reason as dpopRequired.
+	deviceAuthorizationEndpoint atomic.Pointer[string]
 	// cimdPublishersVetted reports whether cimd.allowed_domains names at least
 	// one host, i.e. whether a deployer decided which hosts may publish a
 	// metadata document. It is the gate that lets a CIMD client be treated as
@@ -316,6 +322,25 @@ func (a *API) advertisedRegistrationEndpoint() string {
 	}
 
 	return a.issuer + "/oauth2/register"
+}
+
+// SetDeviceAuthorizationEndpoint sets the device_authorization_endpoint
+// advertised in AS metadata. Empty (the default) advertises no device
+// authorization endpoint and no device_code grant. The value is published
+// verbatim; validation is the caller's job (Server does it). Safe to call at
+// runtime.
+func (a *API) SetDeviceAuthorizationEndpoint(endpoint string) {
+	a.deviceAuthorizationEndpoint.Store(&endpoint)
+}
+
+// advertisedDeviceAuthorizationEndpoint is the configured device authorization
+// endpoint, or "" when none is set.
+func (a *API) advertisedDeviceAuthorizationEndpoint() string {
+	if p := a.deviceAuthorizationEndpoint.Load(); p != nil {
+		return *p
+	}
+
+	return ""
 }
 
 // SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution

@@ -88,3 +88,65 @@ func TestOAuthMetadata_RegistrationEndpointOverride(t *testing.T) {
 		}
 	}
 }
+
+// TestOAuthMetadata_DeviceAuthorizationEndpoint — unset advertises neither the
+// endpoint nor the device_code grant; set advertises both, in the RFC 8414
+// document and in buildASMetadata (the OIDC document's base); clearing removes
+// both again.
+func TestOAuthMetadata_DeviceAuthorizationEndpoint(t *testing.T) {
+	const endpoint = "https://login.example.test/oauth2/device_authorization"
+
+	api := &API{issuer: "https://as.example.test"}
+
+	docs := func() []map[string]any {
+		as, err := api.oauthMetadataOp(context.Background(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return []map[string]any{as.Body, api.buildASMetadata()}
+	}
+
+	hasDeviceGrant := func(d map[string]any) bool {
+		grants, _ := d["grant_types_supported"].([]string)
+		for _, g := range grants {
+			if g == deviceCodeGrantType {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	assertUnset := func(when string) {
+		t.Helper()
+
+		for _, d := range docs() {
+			if _, ok := d["device_authorization_endpoint"]; ok {
+				t.Errorf("%s: device_authorization_endpoint must be absent", when)
+			}
+
+			if hasDeviceGrant(d) {
+				t.Errorf("%s: device_code grant must not be advertised", when)
+			}
+		}
+	}
+
+	assertUnset("default")
+
+	api.SetDeviceAuthorizationEndpoint(endpoint)
+
+	for _, d := range docs() {
+		if got := d["device_authorization_endpoint"]; got != endpoint {
+			t.Errorf("device_authorization_endpoint = %v, want %q", got, endpoint)
+		}
+
+		if !hasDeviceGrant(d) {
+			t.Errorf("grant_types_supported must list %s while the endpoint is set: %v",
+				deviceCodeGrantType, d["grant_types_supported"])
+		}
+	}
+
+	api.SetDeviceAuthorizationEndpoint("")
+	assertUnset("cleared")
+}
