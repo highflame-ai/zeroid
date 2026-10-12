@@ -493,6 +493,8 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	if req.State != "" {
 		q.Set("state", req.State)
 	}
+	// RFC 9207 §2: identify the issuing AS on every authorization response.
+	q.Set("iss", a.issuer)
 	u.RawQuery = q.Encode()
 
 	log.Info().
@@ -695,6 +697,11 @@ func (a *API) failAuthorize(
 	if req.State != "" {
 		q.Set("state", req.State)
 	}
+
+	// RFC 9207 §2 applies to error responses too: a mix-up attacker can just
+	// as well relay an error, and a client checking iss must be able to check
+	// it on every response it gets back from the authorization endpoint.
+	q.Set("iss", a.issuer)
 
 	u.RawQuery = q.Encode()
 

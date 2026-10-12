@@ -532,3 +532,89 @@ func TestSampleConfigEnvVarsAreAllWired(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateRegistrationEndpoint pins token.registration_endpoint's shape
+// rules. The value is published verbatim as registration_endpoint in AS
+// metadata, so anything a client could not safely register against is refused
+// at load rather than advertised.
+func TestValidateRegistrationEndpoint(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantErr string // substring; "" means success
+	}{
+		{"empty_keeps_default", "", ""},
+		{"https", "https://register.example.com/oauth/register", ""},
+		{"https_with_port_and_query", "https://register.example.com:8443/r?tenant=a", ""},
+		{"http_localhost", "http://localhost:3000/register", ""},
+		{"http_loopback_v4", "http://127.0.0.1:3000/register", ""},
+		{"http_loopback_v6", "http://[::1]:3000/register", ""},
+
+		{"http_non_loopback", "http://register.example.com/register", "http is accepted only for a loopback host"},
+		{"http_name_resolving_loopback_is_not_trusted", "http://localhost.example.com/register", "http is accepted only for a loopback host"},
+		{"relative", "/oauth2/register", "absolute URL with a host"},
+		{"no_scheme", "register.example.com/register", "absolute URL with a host"},
+		{"other_scheme", "ftp://register.example.com/register", "must use https"},
+		{"javascript_scheme", "javascript://register.example.com/x", "must use https"},
+		{"userinfo", "https://user:pass@register.example.com/register", "must not contain user-info"},
+		{"fragment", "https://register.example.com/register#x", "must not contain a fragment"},
+		{"empty_fragment", "https://register.example.com/register#", "must not contain a fragment"},
+		{"unparseable", "https://register.example.com/%zz", "must be a valid URL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRegistrationEndpoint(tc.input)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRegistrationEndpoint(%q) unexpected error: %v", tc.input, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateRegistrationEndpoint(%q) = %v, want error containing %q", tc.input, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The env var reaches the typed field, and Validate() runs the check so an
+// invalid value fails config load instead of being advertised.
+func TestRegistrationEndpointConfig(t *testing.T) {
+	t.Run("env_var_wired", func(t *testing.T) {
+		t.Setenv("ZEROID_REGISTRATION_ENDPOINT", "https://register.example.com/register")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.RegistrationEndpoint != "https://register.example.com/register" {
+			t.Errorf("ZEROID_REGISTRATION_ENDPOINT did not reach token.registration_endpoint, got %q", cfg.Token.RegistrationEndpoint)
+		}
+	})
+
+	t.Run("default_empty", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.RegistrationEndpoint != "" {
+			t.Errorf("token.registration_endpoint must default to empty (advertise ZeroID's own), got %q", cfg.Token.RegistrationEndpoint)
+		}
+	})
+
+	t.Run("validate_rejects_invalid", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RegistrationEndpoint = "http://register.example.com/register"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
+			t.Fatalf("Validate must reject a non-loopback http registration endpoint, got: %v", err)
+		}
+	})
+
+	t.Run("validate_accepts_valid", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RegistrationEndpoint = "https://register.example.com/register"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate must accept an https registration endpoint: %v", err)
+		}
+	})
+}

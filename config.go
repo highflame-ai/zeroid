@@ -5,6 +5,7 @@ package zeroid
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -380,6 +381,22 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// RegistrationEndpoint, when set, is advertised as `registration_endpoint`
+	// in the AS metadata documents (/.well-known/oauth-authorization-server and
+	// /.well-known/openid-configuration) in place of ZeroID's own
+	// {Issuer}/oauth2/register. RFC 8414 §2 lets that member be any URL, so a
+	// deployer that runs client registration somewhere else — typically an
+	// interactive registration front end, since ZeroID's own endpoint requires
+	// an initial access token and registers machine clients only — can point
+	// clients at it.
+	//
+	// Empty (the default) keeps {Issuer}/oauth2/register. When set it MUST be an
+	// absolute https URL with no user-info or fragment; plain http is accepted
+	// only for a loopback host (localhost, 127.0.0.0/8, ::1) for local
+	// development. Setting it changes only what is advertised: ZeroID's own
+	// /oauth2/register stays mounted and keeps its initial-access-token gate.
+	RegistrationEndpoint string `koanf:"registration_endpoint"`
+
 	// RequireDPoP makes a valid DPoP proof (RFC 9449) mandatory on every
 	// /oauth2/token issuance: absent proof is refused with invalid_dpop_proof
 	// instead of falling back to a Bearer token, and the AS metadata
@@ -524,6 +541,9 @@ func (c *Config) Validate() error {
 	if err := validateIssuer(c.Token.Issuer); err != nil {
 		return err
 	}
+	if err := validateRegistrationEndpoint(c.Token.RegistrationEndpoint); err != nil {
+		return err
+	}
 
 	// Production-gated hardening. server.env had ZERO readers before this —
 	// it now governs the footgun defaults that are safe in dev but dangerous
@@ -649,6 +669,54 @@ func validateIssuer(s string) error {
 		return fmt.Errorf("token.issuer must not contain a fragment (got %q): RFC 8414 §2 requires the issuer URL to have no fragment component", s)
 	}
 	return nil
+}
+
+// validateRegistrationEndpoint checks token.registration_endpoint. Empty means
+// "advertise ZeroID's own endpoint" and is always valid. Otherwise the value is
+// published verbatim in AS metadata as the place clients register, so it gets
+// the same shape rules as other advertised URLs: absolute, https, no user-info,
+// no fragment. http is tolerated only for a loopback host, so a local stack can
+// point at a registration front end on localhost without TLS.
+func validateRegistrationEndpoint(s string) error {
+	if s == "" {
+		return nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("token.registration_endpoint must be a valid URL (got %q): %w", s, err)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("token.registration_endpoint must be an absolute URL with a host (got %q)", s)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !isLoopbackHost(u.Hostname()) {
+			return fmt.Errorf("token.registration_endpoint must use https (got %q): http is accepted only for a loopback host", s)
+		}
+	default:
+		return fmt.Errorf("token.registration_endpoint must use https (got scheme %q in %q)", u.Scheme, s)
+	}
+	if u.User != nil {
+		return fmt.Errorf("token.registration_endpoint must not contain user-info (got %q)", s)
+	}
+	if u.Fragment != "" || strings.HasSuffix(s, "#") {
+		return fmt.Errorf("token.registration_endpoint must not contain a fragment (got %q)", s)
+	}
+	return nil
+}
+
+// isLoopbackHost reports whether host (as returned by url.URL.Hostname, so
+// without brackets or port) names the local machine: "localhost" or a loopback
+// IP literal. No DNS lookup — a name that merely resolves to 127.0.0.1 is not
+// accepted, because what it resolves to is not under the deployer's control at
+// the client.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // rejectRemovedKeys fails fast if a deployer's config (YAML or env) still sets
@@ -858,6 +926,7 @@ var envMapping = map[string]string{
 
 	// Token
 	"ZEROID_ISSUER":                "token.issuer",
+	"ZEROID_REGISTRATION_ENDPOINT": "token.registration_endpoint",
 	"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 	"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
 	// Evidence clock for issued_credentials (delegation-graph retention).

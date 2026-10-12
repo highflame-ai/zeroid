@@ -361,10 +361,25 @@ A standards-conformant client walks two documents to find the registration endpo
 
 1. `/.well-known/oauth-protected-resource` (RFC 9728) — the *resource server's* metadata. Advertises `resource`, `authorization_servers` (pointers to the AS), `bearer_methods_supported: ["header"]`, `dpop_bound_access_tokens_required: false`. This is the document a 401 with `WWW-Authenticate: Bearer resource_metadata="…"` points the client at.
 2. `/.well-known/oauth-authorization-server` (RFC 8414) — the *authorization server's* metadata, fetched after PRM points the client here. Advertises the actual endpoints:
-   - `registration_endpoint` — set to `{baseURL}/oauth2/register` when DCR is wired (it always is in this build; the endpoint exists but every request 401s if the deployer doesn't mint `client:register`-scoped tokens).
+   - `registration_endpoint` — `{issuer}/oauth2/register` by default (the endpoint always exists in this build; every request 401s if the deployer doesn't mint `client:register`-scoped tokens). A deployer that hosts client registration elsewhere can advertise that URL instead with `token.registration_endpoint` — see [Advertising a registration endpoint hosted elsewhere](#advertising-a-registration-endpoint-hosted-elsewhere).
    - `dpop_signing_alg_values_supported: ["ES256", "RS256"]`.
 
 The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. Publishing both documents lets stock OAuth clients work without ZeroID-specific shimming.
+
+### Advertising a registration endpoint hosted elsewhere
+
+ZeroID's own `/oauth2/register` is built for machine onboarding: it requires an initial access token and accepts only `client_credentials` / `jwt-bearer` clients. An interactive client (an MCP client in a browser, say) that discovers it through AS metadata cannot use it. RFC 8414 §2 puts no constraint on where `registration_endpoint` lives, so a deployment that runs registration for such clients somewhere else — its own front end, typically, which can then create the client however it sees fit — can advertise that URL instead:
+
+```yaml
+token:
+  registration_endpoint: "https://app.example.com/oauth/register"   # env: ZEROID_REGISTRATION_ENDPOINT
+```
+
+Embedders that configure the server in code call `Server.SetRegistrationEndpoint(url) error` instead.
+
+- The override replaces `registration_endpoint` in **both** AS metadata documents (`/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`). Unset, they advertise `{issuer}/oauth2/register` exactly as before.
+- It must be an absolute `https` URL with no user-info or fragment; `http` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `::1`) for local development. An invalid value fails config load (or is returned as an error by the setter) rather than being advertised.
+- Only the advertisement changes. ZeroID's own `/oauth2/register` stays mounted with its initial-access-token gate, and `registration_client_uri` on its responses still points at ZeroID.
 
 ### Limitations / future work
 
@@ -381,7 +396,7 @@ server:
   trust_forwarded_headers: false   # set true when behind a trusted edge proxy (nginx/ALB/etc.) for DPoP htu correctness
 ```
 
-No DCR-specific config knobs — the feature is governed by which clients hold `client:register` scope.
+DCR itself is governed by which clients hold `client:register` scope. The one related knob is `token.registration_endpoint` (`ZEROID_REGISTRATION_ENDPOINT`), which changes only which registration URL AS metadata advertises — see [Advertising a registration endpoint hosted elsewhere](#advertising-a-registration-endpoint-hosted-elsewhere).
 
 ## Operational signals
 
