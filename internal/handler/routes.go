@@ -60,6 +60,12 @@ type API struct {
 	// issuance (token.require_dpop). Atomic because tests toggle it while the
 	// server is handling requests; defaults false (Bearer fallback stands).
 	dpopRequired atomic.Bool
+
+	// registrationEndpoint, when non-nil and non-empty, replaces
+	// {issuer}/oauth2/register as the advertised registration_endpoint in AS
+	// metadata (token.registration_endpoint). Validated by the caller; atomic
+	// for the same reason as dpopRequired.
+	registrationEndpoint atomic.Pointer[string]
 	// cimdPublishersVetted reports whether cimd.allowed_domains names at least
 	// one host, i.e. whether a deployer decided which hosts may publish a
 	// metadata document. It is the gate that lets a CIMD client be treated as
@@ -292,6 +298,24 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 // Safe to call at runtime.
 func (a *API) SetDPoPRequired(required bool) {
 	a.dpopRequired.Store(required)
+}
+
+// SetRegistrationEndpoint sets the registration_endpoint advertised in AS
+// metadata. Empty restores the default, {issuer}/oauth2/register. The value is
+// published verbatim; validation is the caller's job (Server does it). Safe to
+// call at runtime.
+func (a *API) SetRegistrationEndpoint(endpoint string) {
+	a.registrationEndpoint.Store(&endpoint)
+}
+
+// advertisedRegistrationEndpoint is the registration_endpoint value for AS
+// metadata: the configured override when one is set, else ZeroID's own.
+func (a *API) advertisedRegistrationEndpoint() string {
+	if p := a.registrationEndpoint.Load(); p != nil && *p != "" {
+		return *p
+	}
+
+	return a.issuer + "/oauth2/register"
 }
 
 // SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution

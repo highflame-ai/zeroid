@@ -44,6 +44,7 @@ Add one when introducing a feature that implements a spec the project advertises
 | RFC 8693 (Token Exchange) | `token_exchange_compliance_test.go` | Covered |
 | RFC 8725 / BCP 225 (JWT Best Current Practices) | `jws_compliance_test.go` | Partial — §3.1 only, see note |
 | RFC 9110 §11 (HTTP Authentication) | `bearer_compliance_test.go` | Covered — see note |
+| RFC 9207 (Authorization Server Issuer Identification) | `rfc9207_compliance_test.go` | Covered |
 | RFC 9396 (Rich Authorization Requests) | `rar_compliance_test.go` | Covered |
 | RFC 9449 (DPoP) | `dpop_compliance_test.go` | Covered |
 | RFC 9728 (Protected Resource Metadata) | `prm_compliance_test.go`; §5.1 breadcrumb in `www_authenticate_compliance_test.go` | Covered |

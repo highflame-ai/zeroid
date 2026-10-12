@@ -1024,6 +1024,7 @@ How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, nati
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
 | OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| Authorization Server Issuer Identification | RFC 9207 | `iss` on every `/oauth2/authorize` response (success and error) — client-side mix-up defense; advertised via `authorization_response_iss_parameter_supported` |
 | OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | OpenID Connect Discovery 1.0 | OpenID | `/.well-known/openid-configuration` — the discovery path cloud workload-identity federation (AWS IAM OIDC providers, Azure federated identity credentials, GCP workload identity pools) requires to trust ZeroID as an external issuer. Metadata only: ZeroID is not an OpenID Provider and issues no `id_token` |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
@@ -1033,7 +1034,7 @@ How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, nati
 | Rich Authorization Requests | RFC 9396 | Typed `authorization_details` on CIBA bc-authorize for per-action approval prompts (vs scope-string) |
 | DPoP | RFC 9449 | Sender-constrained access tokens — proof-of-possession at `/oauth2/token` and at the resource server |
 | JWK Thumbprint | RFC 7638 | DPoP `cnf.jkt` key binding |
-| Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating |
+| Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating; `token.registration_endpoint` can advertise a registration endpoint hosted elsewhere instead |
 | Client Configuration Endpoint | RFC 7592 | Read/update/delete of dynamically registered clients via `registration_access_token` |
 
 ---
