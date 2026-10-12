@@ -173,10 +173,36 @@ var cimdAllowedAuthMethods = map[string]bool{
 	clientAuthMethodPrivateKeyJWT: true,
 }
 
-// cimdAllowedGrantTypes is the grant-type allow-list for CIMD clients. CIMD is
-// the interactive-onboarding path, so authorization_code (and its refresh
-// companion) are the only sensible grants — client_credentials / token-exchange
-// clients register through the admin or RFC 7591 path instead.
+// cimdAllowedGrantTypes is the grant-type allow-list for CIMD clients.
+// authorization_code and its refresh companion are the obvious entries.
+// client_credentials is here too, and the reason is worth stating because it
+// reads as the opposite call at first glance.
+//
+// What makes a self-asserted client safe is an ADMISSION ACT by the tenant, not
+// the shape of the grant.
+//
+//   - On authorization_code there is no admission at all, and none is needed:
+//     the token's subject is the USER (SubjectOverride), the client is handed a
+//     synthetic in-memory identity carrying only the tenant, and the user's
+//     consent at the authorize leg is the authorization. This is CIMD's whole
+//     point and it is untouched.
+//   - On client_credentials there is no user, so the token has to represent
+//     something else. clientCredentials resolves it by external_id == client_id
+//     within the tenant and refuses with "no identity found" when there is none.
+//     A stranger who publishes a document reaches that refusal: the URL names no
+//     identity anybody created. Admitting the client means an operator
+//     deliberately creating an identity named by that URL, and the authority is
+//     then bounded by that identity's credential policy and row ceilings, on top
+//     of the document's own `scope`.
+//
+// So "a zero-registration client cannot obtain an M2M grant" still holds — it is
+// carried by the identity requirement, not by this list. Excluding
+// client_credentials here ALSO blocked the admitted case, which is the one a
+// deployer actually configures, at no security return.
+//
+// token-exchange and delegation grants stay out. Those derive authority from
+// ANOTHER token rather than from an identity the tenant admitted, so the
+// argument above does not reach them.
 //
 // It is applied as an INTERSECTION over the document's list, not as a gate on
 // it. The distinction is the whole of zeroid#344: the invariant worth keeping is
@@ -192,13 +218,14 @@ var cimdAllowedAuthMethods = map[string]bool{
 //     a synthesized client's GrantTypes is PROVABLY a subset of these two
 //     values. No document can put a third string there. This holds regardless of
 //     what any consumer does with it.
-//  2. Reachability. Only three call sites can ever yield a CIMD-synthesized
-//     client — resolveClientRegistryOrCIMD is called from IssueAuthCode, the
-//     authorization_code exchange, and the refresh_token rotation, and nowhere
-//     else. The other six token-endpoint dispatch arms (jwt-bearer,
-//     token-exchange, api_key, CIBA, ID-JAG, custom grants via RegisterGrant)
-//     either resolve registry-only or never read a client at all, so a CIMD
-//     client_id buys nothing on them.
+//  2. Reachability. Four call sites can yield a CIMD-synthesized client —
+//     IssueAuthCode, the authorization_code exchange, the refresh_token
+//     rotation, and authenticateRegisteredClient when its caller opts in.
+//     clientCredentials is the only caller that opts in, it gates on
+//     client.GrantTypes, and it requires an admitted identity. The remaining
+//     dispatch arms (jwt-bearer, token-exchange, api_key, CIBA, ID-JAG, custom
+//     grants via RegisterGrant) resolve registry-only or never read a client at
+//     all, so a CIMD client_id buys nothing on them.
 //
 // (2) is the contingent half: a future grant that BOTH resolves through
 // resolveClientRegistryOrCIMD AND derives authority from the client would not be
@@ -208,6 +235,7 @@ var cimdAllowedAuthMethods = map[string]bool{
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
+	string(domain.GrantTypeClientCredentials): true,
 }
 
 // cimdCacheEntry memoizes one resolution outcome — a synthesized client on

@@ -205,9 +205,49 @@ func (s *OAuthService) enforceRegisteredClientAuthMethod(
 //     "advertised method that cannot work" this issue exists to eliminate.
 //
 // Routing both through the shared enforcement fixes them together.
-func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req TokenRequest) (*domain.OAuthClient, error) {
-	client, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
+//
+// The client is resolved registry-first with a CIMD fallback, the same order
+// and the same cache the authorization-code path uses. Before that, this
+// function looked the client up in the registry alone, so a client_id that is a
+// metadata document URL was simply absent and every such request ended as
+// "invalid client credentials" with the document never fetched — a client could
+// authenticate on authorization_code and refresh_token but nowhere else,
+// which is the same "advertised method that cannot work" defect described
+// above, one grant along.
+//
+// A CIMD client reaching here must declare private_key_jwt. The other methods
+// are either credential-less (none) or need a secret that a self-asserted
+// document has no way to share.
+//
+// cimdFallback is a property of the CALLER, not of the credential check. A
+// self-asserted document chooses its own grant_types, so only a caller that
+// gates on the resolved client's grant_types may accept one. clientCredentials
+// does. ID-JAG redemption does not, so it passes false and stays registry-only
+// until it does — widening it silently would let a document opt itself into a
+// grant nothing checked it for.
+func (s *OAuthService) authenticateRegisteredClient(
+	ctx context.Context, req TokenRequest, cimdFallback bool,
+) (*domain.OAuthClient, error) {
+	var (
+		client  *domain.OAuthClient
+		viaCIMD bool
+		err     error
+	)
+	if cimdFallback {
+		client, viaCIMD, err = s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
+	} else {
+		client, err = s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
+	}
 	if err != nil {
+		if viaCIMD {
+			// A CIMD sentinel says WHY the document was refused — unreachable,
+			// malformed, domain not allowed. Mapping it gives this path the same
+			// diagnosis the authorization-code path already gives, instead of a
+			// flat "invalid client credentials" that reads as "unknown client"
+			// and sends the operator looking in the registry for a row that was
+			// never meant to exist.
+			return nil, cimdOAuthError(err)
+		}
 		if errors.Is(err, ErrOAuthClientNotFound) {
 			return nil, oauthUnauthorized("invalid client credentials", err)
 		}
@@ -217,6 +257,8 @@ func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req Tok
 	// GetClientByClientID deliberately does not filter on IsActive (its CIMD
 	// callers need the distinction), unlike VerifyClientSecret which did.
 	// Re-apply it here or deactivation stops being a kill switch on this path.
+	// A synthesized CIMD client is always active, so this only ever gates a
+	// registry row.
 	if !client.IsActive {
 		return nil, oauthUnauthorized("invalid client credentials", nil)
 	}
@@ -229,6 +271,18 @@ func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req Tok
 	// private_key_jwt is fully authenticated by the assertion above.
 	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
 		return client, nil
+	}
+	// A CIMD client is synthesized from its published document and has no
+	// registry row, so there is no stored secret to compare against. Reaching
+	// VerifyClientSecret with one would fail as ErrOAuthClientNotFound and
+	// surface as "invalid client credentials", which is the wrong diagnosis:
+	// the document is fine, it simply declared a method that carries no
+	// credential this grant can check. Refuse on the method, and say so.
+	if viaCIMD {
+		return nil, oauthUnauthorized(
+			"client id metadata document declares token_endpoint_auth_method "+
+				string(client.TokenEndpointAuthMethod)+
+				"; a grant that authenticates the client directly requires private_key_jwt", nil)
 	}
 	// Secret-based (or legacy-unset) client: unchanged behaviour, including
 	// VerifyClientSecret's own constant-time compare and active-client gate.

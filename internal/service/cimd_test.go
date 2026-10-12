@@ -917,25 +917,31 @@ func TestEffectiveCIMDGrantTypes(t *testing.T) {
 			wantDropped: []string{"urn:ietf:params:oauth:grant-type:device_code"},
 		},
 		{
-			// The security-relevant case: an M2M grant must not survive into
-			// the synthesized client, because the token endpoint reads exactly
-			// this list when deciding whether to honour client_credentials.
-			name:        "client_credentials is dropped",
-			declared:    []string{"authorization_code", "client_credentials"},
-			wantKept:    []string{"authorization_code"},
-			wantDropped: []string{"client_credentials"},
+			// client_credentials SURVIVES as of the allow-list admission model.
+			// The token endpoint still reads this list, but it is no longer
+			// what keeps a stranger out: the CIMD allowed_domains list is, and
+			// clientCredentials gives a CIMD client a synthetic tenant-only
+			// identity bounded by the document's own scope and the tenant
+			// default credential policy. Demanding a hand-made identity row was
+			// registration by another name.
+			name:     "client_credentials survives",
+			declared: []string{"authorization_code", "client_credentials"},
+			wantKept: []string{"authorization_code", "client_credentials"},
 		},
 		{
+			// Delegation grants stay out, and the reason is not symmetry with
+			// client_credentials: they derive authority from ANOTHER token
+			// rather than from a tenant that admitted the publisher, so the
+			// allow-list says nothing about them.
 			name:        "delegation grants are dropped in both spellings",
 			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
 			wantKept:    []string{"authorization_code"},
 			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
 		},
 		{
-			name:        "duplicates collapse",
-			declared:    []string{"authorization_code", "authorization_code", "refresh_token", "client_credentials", "client_credentials"},
-			wantKept:    []string{"authorization_code", "refresh_token"},
-			wantDropped: []string{"client_credentials"},
+			name:     "duplicates collapse",
+			declared: []string{"authorization_code", "authorization_code", "refresh_token", "client_credentials", "client_credentials"},
+			wantKept: []string{"authorization_code", "refresh_token", "client_credentials"},
 		},
 		{
 			// Order is preserved so the synthesized client (and therefore the
@@ -947,9 +953,9 @@ func TestEffectiveCIMDGrantTypes(t *testing.T) {
 		},
 		{
 			name:        "everything unsupported keeps nothing",
-			declared:    []string{"client_credentials", "device_code"},
+			declared:    []string{"device_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
 			wantKept:    nil,
-			wantDropped: []string{"client_credentials", "device_code"},
+			wantDropped: []string{"device_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
 		},
 	}
 
@@ -985,16 +991,21 @@ func TestSynthesizeCIMDClient_UnsupportedGrantsAreDroppedNotRejected(t *testing.
 	}
 }
 
-// The invariant the old rejection was actually protecting: a zero-registration
-// client must not be able to OBTAIN an M2M or delegation grant. That is carried
-// by what lands in GrantTypes, which the token endpoint gates on — not by
-// refusing to parse a document that merely mentions one.
-func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
+// A self-asserted document must not be able to opt itself into a DELEGATION
+// grant. Those derive authority from another token rather than from a tenant
+// that admitted the publisher, so nothing in the CIMD model bounds them, and
+// most token-endpoint arms carry no grant-type gate of their own.
+//
+// client_credentials is deliberately NOT in this list any more. It is admitted
+// by the CIMD allowed_domains list and bounded by the document's own scope
+// intersected with the tenant default credential policy; requiring a hand-made
+// identity row instead was registration by another name. See
+// TestSynthesizeCIMDClient_ClientCredentialsReachesTheClient.
+func TestSynthesizeCIMDClient_DelegationGrantsNeverReachTheClient(t *testing.T) {
 	url := "https://app.example.com/client.json"
 	now := time.Now()
 
 	for _, forbidden := range []string{
-		"client_credentials",
 		"urn:ietf:params:oauth:grant-type:token-exchange",
 		"urn:ietf:params:oauth:grant-type:jwt-bearer",
 		"api_key",
@@ -1074,6 +1085,12 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 		// Rotation, which re-resolves the document so a republished one acts as
 		// the revocation lever. Gates the CIMD branch at oauth.go:2521.
 		"refreshToken": true,
+		// Direct client authentication, and ONLY when its caller opts in with
+		// cimdFallback=true. It derives no authority itself — it returns the
+		// client for the caller to gate. The opt-in set is pinned separately by
+		// TestCIMDDirectAuthOptInIsBounded below, so this entry cannot become a
+		// way in for a grant that checks nothing.
+		"authenticateRegisteredClient": true,
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -1284,9 +1301,16 @@ func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
 	// ── Bounds that must NOT have moved ──────────────────────────────────────
 
 	t.Run("authority is still bounded to the CIMD grant set", func(t *testing.T) {
-		// The bound that actually constrains a CIMD client. Key-based auth must
-		// not widen it: client_credentials for a self-asserted client removes the
-		// user from the loop and is zeroid#266, a separate decision.
+		// The bound that actually constrains a CIMD client. client_credentials
+		// is now inside that set (zeroid#266): an unattended agent has no
+		// browser, so authorization_code is unavailable to it by construction,
+		// and the alternatives were pre-registration or a long-lived secret —
+		// the two things CIMD exists to remove. Key-based authentication
+		// against the document's published key set is the control.
+		//
+		// Delegation grants are still outside it, and holding a key must not
+		// widen that: they derive authority from another token rather than from
+		// a tenant that admitted the publisher.
 		doc := base()
 		doc.GrantTypes = []string{"authorization_code", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"}
 		c, dropped, err := synthesizeCIMDClient(url, doc, now)
@@ -1298,11 +1322,11 @@ func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
 				t.Errorf("grant %q escaped the CIMD allow-list onto a key-based client", gt)
 			}
 		}
-		if slices.Contains(c.GrantTypes, "client_credentials") {
-			t.Error("client_credentials must NOT become available by holding a key (zeroid#266)")
+		if !slices.Contains(c.GrantTypes, "client_credentials") {
+			t.Error("client_credentials should reach a key-based CIMD client (zeroid#266)")
 		}
-		if !slices.Contains(dropped, "client_credentials") {
-			t.Errorf("client_credentials should be reported dropped, got %v", dropped)
+		if !slices.Contains(dropped, "urn:ietf:params:oauth:grant-type:token-exchange") {
+			t.Errorf("token-exchange should be reported dropped, got %v", dropped)
 		}
 	})
 
@@ -1347,4 +1371,97 @@ func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
 			t.Error("a public CIMD client must be entirely unchanged by zeroid#264")
 		}
 	})
+}
+
+// TestCIMDDirectAuthOptInIsBounded pins WHO may ask authenticateRegisteredClient
+// to resolve a CIMD client.
+//
+// authenticateRegisteredClient is on the allow-list of
+// TestCIMDClientReachabilityIsBounded, but it gates nothing itself: it hands the
+// resolved client back for the caller to check. That check is the whole safety
+// argument, so the opt-in has to be bounded too. Without this, adding
+// `cimdFallback=true` at a new grant would reach a CIMD client with no
+// grant-type gate and no test would fail.
+//
+// A self-asserted document chooses its own grant_types. Only a caller that
+// gates on them may accept one.
+func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
+	// Callers permitted to pass cimdFallback=true.
+	allowed := map[string]bool{
+		// Refuses a client whose document does not list client_credentials
+		// (oauth.go, `slices.Contains(client.GrantTypes, "client_credentials")`),
+		// and separately refuses one carrying no scopes.
+		"clientCredentials": true,
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	funcDecl := regexp.MustCompile(`^func (?:\([^)]*\) )?(\w+)`)
+	call := regexp.MustCompile(`authenticateRegisteredClient\(ctx, req, true\)`)
+	var offenders []string
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		enclosing := "<file scope>"
+		for i, line := range strings.Split(string(body), "\n") {
+			if m := funcDecl.FindStringSubmatch(line); m != nil {
+				enclosing = m[1]
+			}
+			if call.MatchString(line) && !allowed[enclosing] {
+				offenders = append(offenders, fmt.Sprintf("%s:%d in %s()", f, i+1, enclosing))
+			}
+		}
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("cimdFallback=true passed from an unexpected function:\n  %s\n\n"+
+			"That grant can now authenticate a client synthesized from a self-asserted "+
+			"metadata document. Confirm it refuses a client whose document does not list "+
+			"the grant, then add it to `allowed` with a note saying where it checks.",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// The other half of TestSynthesizeCIMDClient_DelegationGrantsNeverReachTheClient:
+// client_credentials DOES reach the synthesized client, in both spellings the
+// token endpoint might compare against.
+//
+// What keeps a stranger out is not this list. It is the CIMD allowed_domains
+// list — empty accepts any public HTTPS publisher, which is the open-ecosystem
+// default, and a configured one accepts only those hosts — plus the fact that
+// clientCredentials bounds the grant by the document's own `scope` and the
+// tenant's default credential policy. A document declaring no `scope` still
+// mints nothing there.
+func TestSynthesizeCIMDClient_ClientCredentialsReachesTheClient(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	now := time.Now()
+
+	client, dropped, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+		ClientID:     url,
+		ClientName:   "N",
+		RedirectURIs: []string{"https://app.example.com/cb"},
+		GrantTypes:   []string{"authorization_code", "client_credentials"},
+		Scope:        "mcp:invoke",
+	}, now)
+	if err != nil {
+		t.Fatalf("document should resolve: %v", err)
+	}
+	if !slices.Contains(client.GrantTypes, "client_credentials") {
+		t.Fatalf("client_credentials did not reach the synthesized client: %v", client.GrantTypes)
+	}
+	if slices.Contains(dropped, "client_credentials") {
+		t.Fatalf("client_credentials was reported dropped: %v", dropped)
+	}
+	// The scope is what bounds it at the token endpoint, so it must survive.
+	if !slices.Contains(client.Scopes, "mcp:invoke") {
+		t.Fatalf("the document's scope did not reach the client: %v", client.Scopes)
+	}
 }

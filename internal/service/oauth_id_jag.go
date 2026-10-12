@@ -186,7 +186,9 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Same shared enforcement client_credentials uses: the registered
 	// token_endpoint_auth_method decides which credential is acceptable, so a
 	// key-based client can redeem an ID-JAG and a secret from one is refused.
-	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	// cimdFallback=false: this path does not gate on the client's declared
+	// grant_types, so a self-asserted document must not resolve here.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
