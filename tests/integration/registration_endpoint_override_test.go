@@ -88,6 +88,15 @@ func TestRegistrationEndpoint_SetterRejectsInvalidAndKeepsPrevious(t *testing.T)
 		"https://user:pw@app.example.test/r",     // user-info
 		"https://app.example.test/r#frag",        // fragment
 		"javascript:alert(1)",                    // not a URL clients can register at
+		" https://app.example.test/r",            // leading whitespace
+		"https://app.example.test/r\n",           // trailing newline
+		"https://app.example.test/a b",           // inner whitespace
+		"https://bücher.example/r",               // non-ASCII host (needs xn-- form)
+		"https://app.example.test:0/r",           // port out of range
+		"https://app.example.test:65536/r",       // port out of range
+		"https://app.example.test:abc/r",         // non-numeric port
+		"HTTPS://app.example.test/r",             // non-canonical scheme
+		"https://App.Example.test/r",             // non-canonical host
 	} {
 		require.Error(t, testZeroIDServer.SetRegistrationEndpoint(bad), "must reject %q", bad)
 	}
@@ -96,6 +105,68 @@ func TestRegistrationEndpoint_SetterRejectsInvalidAndKeepsPrevious(t *testing.T)
 		require.Equal(t, externalRegistrationEndpoint, got,
 			"%s: a rejected value must leave the previous advertisement in place", path)
 	}
+}
+
+// The setter runs against the server's configured (https) issuer: plain http
+// for a non-loopback host is refused there, and an error never quotes a
+// password embedded in the rejected value.
+func TestRegistrationEndpoint_SetterRefusesHTTPBesideHTTPSIssuerAndRedacts(t *testing.T) {
+	require.NoError(t, testZeroIDServer.SetRegistrationEndpoint(""))
+
+	err := testZeroIDServer.SetRegistrationEndpoint("http://app.example.test:3000/oauth/register")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must use https")
+
+	const secret = "hunter2-s3cret"
+	for _, bad := range []string{
+		"https://admin:" + secret + "@app.example.test/r",
+		"https://admin:" + secret + "@app.example.test:abc/r",
+		"http://admin:" + secret + "@app.example.test/r",
+	} {
+		err := testZeroIDServer.SetRegistrationEndpoint(bad)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), secret, "the error must not echo the password")
+	}
+
+	for path, got := range advertisedRegistrationEndpoints(t, testServer.URL) {
+		require.Equal(t, testIssuer+"/oauth2/register", got, "%s: rejected values must not be advertised", path)
+	}
+}
+
+// A deployment whose issuer is plain http (an in-cluster test stack) can
+// advertise an http registration endpoint on another host, both from config
+// and through the setter.
+func TestRegistrationEndpoint_HTTPAllowedBesideHTTPIssuer(t *testing.T) {
+	const (
+		httpIssuer   = "http://zeroid-authn.test:8051"
+		httpEndpoint = "http://zeroid-studio.test:3000/oauth/register"
+	)
+	cfg := newRegistrationEndpointConfig(t, httpEndpoint)
+	cfg.Token.Issuer = httpIssuer
+
+	srv, err := zeroid.NewServer(cfg)
+	require.NoError(t, err, "an http registration endpoint must be accepted beside an http issuer")
+
+	httpSrv := httptest.NewServer(srv.Router())
+	t.Cleanup(httpSrv.Close)
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+
+	for path, got := range advertisedRegistrationEndpoints(t, httpSrv.URL) {
+		require.Equal(t, httpEndpoint, got, "%s must advertise the http endpoint", path)
+	}
+
+	const other = "http://zeroid-front.test:3000/register"
+	require.NoError(t, srv.SetRegistrationEndpoint(other), "the setter must use the server's own http issuer")
+
+	for path, got := range advertisedRegistrationEndpoints(t, httpSrv.URL) {
+		require.Equal(t, other, got, path)
+	}
+
+	// The same http endpoint beside an https issuer is still refused at load.
+	cfg.Token.Issuer = testIssuer
+	_, err = zeroid.NewServer(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "token.registration_endpoint")
 }
 
 // newRegistrationEndpointConfig is a minimal valid config for a second server
@@ -150,6 +221,9 @@ func TestRegistrationEndpoint_InvalidConfigRejectedAtLoad(t *testing.T) {
 		"http://app.example.test/oauth/register",
 		"app.example.test/oauth/register",
 		"https://app.example.test/oauth/register#x",
+		"https://app.example.test/oauth/register ",
+		"https://app.example.test:0/oauth/register",
+		"HTTPS://app.example.test/oauth/register",
 	} {
 		_, err := zeroid.NewServer(newRegistrationEndpointConfig(t, bad))
 		require.Error(t, err, "NewServer must refuse token.registration_endpoint=%q", bad)

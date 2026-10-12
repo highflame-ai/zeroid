@@ -378,7 +378,9 @@ token:
 Embedders that configure the server in code call `Server.SetRegistrationEndpoint(url) error` instead.
 
 - The override replaces `registration_endpoint` in **both** AS metadata documents (`/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`). Unset, they advertise `{issuer}/oauth2/register` exactly as before.
-- It must be an absolute `https` URL with no user-info or fragment; `http` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `::1`) for local development. An invalid value fails config load (or is returned as an error by the setter) rather than being advertised.
+- It must be an absolute `https` URL with no user-info, fragment, whitespace or control characters, an ASCII host (give an internationalized name in its `xn--` form), and a port, if any, in 1–65535. `http` is accepted for a loopback host (`localhost`, `127.0.0.0/8`, `::1`), and for any host when `token.issuer` is itself `http` (an in-cluster test stack, say); with an `https` issuer a non-loopback `http` endpoint is refused.
+- The value is advertised exactly as configured, so it must already be in canonical form: lowercase scheme and host, standard percent-escaping. A non-canonical value (`HTTPS://App.Example.com/…`) is rejected with the canonical form in the error rather than silently rewritten.
+- An invalid value fails config load (or is returned as an error by the setter) rather than being advertised. Errors never echo user-info, so a credential pasted into the URL does not reach the logs.
 - Only the advertisement changes. ZeroID's own `/oauth2/register` stays mounted with its initial-access-token gate, and `registration_client_uri` on its responses still points at ZeroID.
 
 ### Limitations / future work

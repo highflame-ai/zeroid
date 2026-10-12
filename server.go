@@ -1436,12 +1436,15 @@ func (s *Server) SetDPoPRequired(required bool) {
 // advertise that endpoint instead. Only the advertisement changes; ZeroID's own
 // /oauth2/register stays mounted with its existing gate.
 //
-// The value must be an absolute https URL without user-info or fragment (http
-// only for a loopback host). An invalid value returns an error and leaves the
+// The value is checked against the server's configured token.issuer with the
+// same rules as config load: an absolute, canonical https URL without
+// user-info, fragment, whitespace or control characters, with an ASCII host and
+// a port (if any) in 1-65535; http is accepted only for a loopback host or when
+// the issuer is itself http. An invalid value returns an error and leaves the
 // advertised endpoint unchanged. Empty restores the default,
 // {issuer}/oauth2/register. Safe to call at runtime.
 func (s *Server) SetRegistrationEndpoint(endpoint string) error {
-	if err := validateRegistrationEndpoint(endpoint); err != nil {
+	if err := validateRegistrationEndpoint(endpoint, s.cfg.Token.Issuer); err != nil {
 		return err
 	}
 	s.apiHandler.SetRegistrationEndpoint(endpoint)

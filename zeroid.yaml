@@ -54,9 +54,11 @@ token:
   # own {issuer}/oauth2/register, which requires an initial access token and
   # registers machine clients only. Set it when client registration is hosted
   # elsewhere (e.g. an interactive registration front end); RFC 8414 §2 lets
-  # this be any URL. Must be an absolute https URL (http only for localhost /
-  # loopback); an invalid value fails config load. Only the advertisement
-  # changes — ZeroID's own /oauth2/register stays mounted.
+  # this be any URL. Must be an absolute, canonical https URL (lowercase
+  # scheme/host, ASCII host, no user-info/fragment/whitespace); http is
+  # accepted for localhost / loopback, or for any host when issuer is itself
+  # http. An invalid value fails config load. Only the advertisement changes —
+  # ZeroID's own /oauth2/register stays mounted.
   # Env: ZEROID_REGISTRATION_ENDPOINT
   # registration_endpoint: "https://app.example.com/oauth/register"
   # require_dpop makes a valid DPoP proof (RFC 9449) mandatory on every
