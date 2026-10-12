@@ -154,6 +154,30 @@ the request is refused with `invalid_grant`.
 The ID-JAG's `client_id` claim must equal the authenticated client, and the
 grant is single-use (`jti`).
 
+### Client ID Metadata Document clients
+
+A client that is not pre-registered may use its Client ID Metadata Document URL
+as `client_id` (MCP Enterprise-Managed Authorization §5). When `cimd.enabled`
+is on, the grant resolves such a client from its document, after the registry
+(a registry row for the URL always wins, and a deactivated one still blocks
+it). The document must:
+
+- declare `token_endpoint_auth_method: private_key_jwt` and publish its key
+  (`jwks` or `jwks_uri`). The client authenticates with an RFC 7523 §2.2
+  `client_assertion`, and `none` is refused.
+- list `urn:ietf:params:oauth:grant-type:jwt-bearer` in `grant_types`. If it
+  lists `urn:ietf:params:oauth:grant-profile:id-jag` in
+  `authorization_grant_profiles_supported`, it must also list
+  `urn:ietf:params:oauth:grant-type:token-exchange` (draft §8).
+
+**Such a client cannot redeem yet.** Its tenant has to come from an identity its
+URL is bound to (ADR 0042 D6), and that binding does not exist yet. Until it
+does, a CIMD client that passes every check above is refused with
+`invalid_grant`. The request's `account_id`/`project_id` never supply the
+tenant. Today, the way to use a Client Identifier URL on this grant is to
+pre-register it (CIMD §7.2): create an OAuth client whose `client_id` is the
+URL, with `private_key_jwt`, its key, and an `identity_id` in the right tenant.
+
 ## Trusted-service broker (fallback)
 
 ### What it is
