@@ -227,8 +227,8 @@ a conformant JWT-SVID (JWT-SVID
 §2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
 not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
 
-Each tenant issues in one **token profile** (Section 4.4): `legacy`, the
-default, or `rfc8693`, which adopts the RFC 8693 delegation semantics. Claims
+Each tenant issues in one **token profile** (Section 4.4): `rfc8693`, the
+default, which adopts the RFC 8693 delegation semantics, or `legacy`. Claims
 below are common to both unless marked.
 
 ### 4.1 Tenancy and grant claims (always present)
@@ -314,7 +314,7 @@ actor. The person behind a call is `sub` when `principal_type` is `user`;
 otherwise there is none. The agent is `act.sub`, or `sub` when there is no
 `act`. Nested actors are audit history, not grounds for access.
 
-**`legacy` profile (the default).** `act` is a single-level object
+**`legacy` profile (opt-in).** `act` is a single-level object
 `{"sub": "<x>"}` whose meaning depends on the grant: on an exchanged token it
 is the parent's `sub` (the delegating agent, or the person after the first hop),
 and `sub` is the actor; on an `api_key` token it is the key's creator. The full

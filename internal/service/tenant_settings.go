@@ -44,7 +44,7 @@ func NewTenantSettingsService(repo *postgres.TenantSettingsRepository) *TenantSe
 // the old shape after the switch is exactly the inconsistency a staged rollout
 // has to rule out. The lookup is one primary-key read.
 //
-// An error is returned rather than defaulting to legacy, so a database fault
+// An error is returned rather than falling back to the default, so a database fault
 // fails the issuance instead of silently minting in the wrong shape.
 func (s *TenantSettingsService) TokenProfile(ctx context.Context, accountID, projectID string) (domain.TokenProfile, error) {
 	if s == nil || s.repo == nil {
