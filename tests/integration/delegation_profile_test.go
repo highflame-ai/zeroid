@@ -944,7 +944,7 @@ func TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes(t *testing.T) {
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
 	fedTenant := map[string]string{"X-Account-ID": fedCfg.AccountID, "X-Project-ID": fedCfg.ProjectID}
-	client := registerOAuthClient(t, uid("d10-client"), []string{"tools:read", "tools:exec"})
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"tools:read", "tools:exec"})
 
 	appIdentity := func(extra map[string]any) string {
 		body := map[string]any{
