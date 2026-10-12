@@ -150,10 +150,13 @@ type IssueRequest struct {
 	// UserEmail and UserName are set for human user tokens.
 	UserEmail string
 	UserName  string
-	// ActClaim, when non-nil, is emitted verbatim as the RFC 8693 "act" claim
-	// (nested actors included), taking precedence over Actors, DelegatedBy and
-	// ActingUserID under either token profile. Used to carry an existing
-	// chain's act unchanged (a CIBA step-up approved into a requesting chain).
+	// ActClaim, when non-nil, is an existing chain's act as issued (a CIBA
+	// step-up approved into a requesting chain). Under the legacy profile it is
+	// emitted verbatim, nested actors included, taking precedence over
+	// DelegatedBy and ActingUserID. Under the rfc8693 profile Actors takes
+	// precedence over it, and it is emitted only when it is already in the
+	// rfc8693 shape (see rfc8693Act), since the chain may have been minted
+	// under the other profile.
 	ActClaim map[string]any
 	// ChannelTrustedCredential reports that the credential presented for this
 	// issuance (API key, OAuth client or public key) was written by a caller
@@ -213,7 +216,7 @@ type IssueRequest struct {
 	PrincipalSub  string
 	PrincipalIss  string
 
-	// Actors is the RFC 8693 §4.1 actor chain for an exchanged token under the
+	// Actors is the RFC 8693 §4.1 actor chain for a delegated token under the
 	// rfc8693 profile: the current actor first, prior actors after it, most
 	// recent first. Ignored under the legacy profile, which keeps its
 	// single-level `act`. Capped at domain.MaxActorChainDepth.
@@ -272,6 +275,36 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 		nested = a
 	}
 	return nested
+}
+
+// rfc8693Act returns the `act` claim of a token issued under the rfc8693
+// profile, or nil when the token has no actor. An actor chain wins: it is
+// built from identity records, so it is in the rfc8693 shape whatever profile
+// the chain's earlier tokens were minted under. Without one, a verbatim
+// actClaim is used only when it is already in that shape, its outermost level
+// carrying the current actor's attributes. A single-level legacy `act` names a
+// delegating agent or an end user rather than the current actor, so emitting
+// it here would leave the actor's attributes in no claim; the token is then
+// issued without `act` and keeps those attributes at the top level.
+func rfc8693Act(actors []domain.Actor, actClaim map[string]any) map[string]any {
+	if len(actors) > 0 {
+		return actorChainClaim(actors)
+	}
+	if carriesActorAttributes(actClaim) {
+		return actClaim
+	}
+	return nil
+}
+
+// carriesActorAttributes reports whether an `act` claim's outermost level
+// carries the current actor's attributes, which only the rfc8693 shape does.
+func carriesActorAttributes(act map[string]any) bool {
+	for _, k := range []string{"identity_type", "trust_level", "external_id"} {
+		if v, _ := act[k].(string); v != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // recordUnboundedScope implements the ceiling rule's first phase (P1): it
@@ -702,10 +735,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		profile = p
 	}
 	rfc8693 := profile == domain.TokenProfileRFC8693
-	// Under rfc8693 an exchanged token's top level describes the principal,
+	// Under rfc8693 a delegated token's top level describes the principal,
 	// so the actor's own attributes move inside the outermost `act`.
-	// A verbatim ActClaim from an rfc8693 chain already carries them there.
-	actorsInAct := rfc8693 && (len(req.Actors) > 0 || req.ActClaim != nil)
+	var rfc8693ActClaim map[string]any
+	if rfc8693 {
+		rfc8693ActClaim = rfc8693Act(req.Actors, req.ActClaim)
+	}
+	actorsInAct := rfc8693ActClaim != nil
 
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
@@ -865,10 +901,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// api-key token is a workload-subject token with no actor; the creator
 		// stays identity metadata, carried in owner_user_id and returned by
 		// introspection.
-		if req.ActClaim != nil {
-			_ = token.Set("act", req.ActClaim)
-		} else if len(req.Actors) > 0 {
-			_ = token.Set("act", actorChainClaim(req.Actors))
+		if rfc8693ActClaim != nil {
+			_ = token.Set("act", rfc8693ActClaim)
 		}
 	} else {
 		// Legacy "act" claim — two use cases:
