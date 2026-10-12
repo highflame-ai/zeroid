@@ -820,44 +820,30 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
-	// Resolve the identity this token represents.
+	// Resolve the identity this token represents: external_id == client_id
+	// within the tenant the request names. Registration is global, so the
+	// tenant comes from the request, and this row is what ties the client to
+	// it.
 	//
-	// A REGISTERED client is bound to one by external_id == client_id within
-	// the tenant; registration is global, so the tenant comes from the request.
-	//
-	// A CIMD client has no row, and demanding one was registration by another
-	// name — the single thing CIMD exists to remove. It gets a synthetic
-	// identity carrying only the tenant, the same shape authorizationCode
-	// builds for a self-asserted client, and the subject is the document URL
-	// because that is the only durable name such a client has.
-	//
-	// What admits it instead is the CIMD allow-list: an empty allowed_domains
-	// accepts any public HTTPS publisher (the open-ecosystem default), and a
-	// configured one accepts only those hosts, refusing before any outbound
-	// fetch. Authority is then bounded by the document's own `scope` — non-empty,
-	// checked just above — intersected with the tenant's default credential
-	// policy, which ResolveCredentialPolicy supplies below.
-	var identity *domain.Identity
-	subjectOverride := ""
-	if client.RegistrationSource == cimdRegistrationSource {
-		identity = &domain.Identity{
-			AccountID:  req.AccountID,
-			ProjectID:  req.ProjectID,
-			ExternalID: req.ClientID,
-			Status:     domain.IdentityStatusActive,
-		}
-		subjectOverride = req.ClientID
-	} else {
-		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
-		if err != nil {
-			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
-		}
-		if !identity.Status.IsUsable() {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
-		}
-		if identity.IsExpired() {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
-		}
+	// A CIMD client goes through the same lookup, and that is deliberate. CIMD
+	// replaces client REGISTRATION (who the client is, how it authenticates);
+	// it does not grant AUTHORITY. On authorization_code a user's consent is
+	// the authority. client_credentials has no user, so RFC 6749 §4.4 limits it
+	// to resources "under its control, or those of another resource owner that
+	// have been previously arranged with the authorization server". A document
+	// anyone can publish controls no tenant's resources, so the tenant's prior
+	// arrangement is this identity row, named by the document URL. Without it
+	// the caller would choose the tenant, and any publisher could mint into any
+	// tenant.
+	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
+	if err != nil {
+		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+	}
+	if !identity.Status.IsUsable() {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
+	}
+	if identity.IsExpired() {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
 	}
 
 	// Resolve the identity policy — the authority ceiling. Without this
@@ -891,7 +877,6 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		IdentityPolicyID:  policy.ID,
 		Scopes:            scopes,
 		GrantType:         domain.GrantTypeClientCredentials,
-		SubjectOverride:   subjectOverride,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		// RFC 9068 §2.2: the client just authenticated. A resource server
 		// attributing the call (an approval channel's recorded client, for

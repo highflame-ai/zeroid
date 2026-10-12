@@ -917,13 +917,11 @@ func TestEffectiveCIMDGrantTypes(t *testing.T) {
 			wantDropped: []string{"urn:ietf:params:oauth:grant-type:device_code"},
 		},
 		{
-			// client_credentials SURVIVES as of the allow-list admission model.
-			// The token endpoint still reads this list, but it is no longer
-			// what keeps a stranger out: the CIMD allowed_domains list is, and
-			// clientCredentials gives a CIMD client a synthetic tenant-only
-			// identity bounded by the document's own scope and the tenant
-			// default credential policy. Demanding a hand-made identity row was
-			// registration by another name.
+			// client_credentials survives. The token endpoint still reads this
+			// list, but it is not what keeps a stranger out: clientCredentials
+			// requires an identity named by the document URL in the requested
+			// tenant, the "previously arranged" authority RFC 6749 §4.4 asks
+			// for. A document with no admitted identity gets no token.
 			name:     "client_credentials survives",
 			declared: []string{"authorization_code", "client_credentials"},
 			wantKept: []string{"authorization_code", "client_credentials"},
