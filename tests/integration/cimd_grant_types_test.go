@@ -67,12 +67,13 @@ func TestCIMD_DocumentListingAnUnimplementedGrantStillResolves(t *testing.T) {
 	assert.NotContains(t, client.GrantTypes, "urn:ietf:params:oauth:grant-type:device_code")
 }
 
-// The security invariant the old rejection was reaching for, asserted where it
-// actually lives: what reaches the synthesized client's GrantTypes. The token
-// endpoint gates client_credentials on exactly this list, so a grant absent
-// here cannot be obtained — which is what makes dropping safe rather than
-// merely permissive.
-func TestCIMD_M2MGrantInDocumentDoesNotReachTheClient(t *testing.T) {
+// What reaches the synthesized client's GrantTypes. client_credentials is
+// kept: CIMD §4.2 applies to grants without a redirect URL, and what keeps a
+// stranger out of a tenant on that grant is the admitted identity
+// clientCredentials requires (TestIdPAgentBaseline_P2_CIMDClientCredentials),
+// not this list. Delegation grants are dropped: they derive authority from
+// another token, so no admission of the publisher speaks for them.
+func TestCIMD_DelegationGrantInDocumentDoesNotReachTheClient(t *testing.T) {
 	ctx := context.Background()
 
 	cimdSvc, base := newGrantTypesDocServer(t,
@@ -82,9 +83,7 @@ func TestCIMD_M2MGrantInDocumentDoesNotReachTheClient(t *testing.T) {
 	client, err := cimdSvc.ResolveClient(ctx, clientID)
 	require.NoError(t, err, "the document resolves; the unsupported grants are simply dropped")
 
-	assert.Equal(t, []string{"authorization_code"}, client.GrantTypes)
-	assert.NotContains(t, client.GrantTypes, "client_credentials",
-		"a zero-registration client must never be able to obtain an M2M grant")
+	assert.Equal(t, []string{"authorization_code", "client_credentials"}, client.GrantTypes)
 	assert.NotContains(t, client.GrantTypes, "urn:ietf:params:oauth:grant-type:token-exchange")
 }
 

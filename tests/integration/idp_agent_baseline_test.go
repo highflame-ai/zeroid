@@ -491,13 +491,13 @@ func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 // TestIdPAgentBaseline_P2_CIMDClientCredentials runs on a CIMD-enabled server
 // (on the shared one, with CIMD off, the refusal would say nothing about
 // CIMD). The client publishes private_key_jwt keys and declares
-// client_credentials in its metadata document. client_credentials
-// authenticates registry rows only and never resolves a metadata document, so
-// the CIMD URL is an unknown client; CIMD synthesis also drops
-// client_credentials from the declared grants. The same document shape
-// completes authorization_code (TestCIMD_PrivateKeyJWTClient).
+// client_credentials and a scope in its metadata document.
 //
-// Flips with ADR 0042 D8: CIMD clients gain client_credentials.
+// CIMD identifies the client; it does not grant it a tenant. client_credentials
+// has no user to consent, so RFC 6749 §4.4 requires authority "previously
+// arranged with the authorization server": an identity named by the document
+// URL in the requested tenant. Without one the client is refused, whatever
+// tenant it names.
 func TestIdPAgentBaseline_P2_CIMDClientCredentials(t *testing.T) {
 	key := generateKey(t)
 	jwks, err := json.Marshal(clientJWKS(t, key))
@@ -508,24 +508,37 @@ func TestIdPAgentBaseline_P2_CIMDClientCredentials(t *testing.T) {
 		"redirect_uris": [%q],
 		"grant_types": ["authorization_code", "client_credentials"],
 		"token_endpoint_auth_method": "private_key_jwt",
+		"scope": "data:read",
 		"jwks": %s
 	}`, cimdTestRedirectURI, jwks)
 	base, docClient := newCIMDDocumentOrigin(t, doc)
 	srvURL := newCIMDZeroID(t, docClient).URL
 	clientID := base + "/.well-known/oauth-client"
 
-	resp := postFederation(t, srvURL, map[string]any{
-		"grant_type":            "client_credentials",
-		"client_id":             clientID,
-		"client_assertion":      cimdAssertionFor(t, key, clientID),
-		"client_assertion_type": clientAssertionType,
-		"account_id":            testAccountID,
-		"project_id":            testProjectID,
-	})
-	t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
-	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
-	assert.Equal(t, "invalid_client", resp.Error)
-	assert.Empty(t, resp.AccessToken)
+	mint := func(accountID, projectID string) tokenResponse {
+		return postFederation(t, srvURL, map[string]any{
+			"grant_type":            "client_credentials",
+			"client_id":             clientID,
+			"client_assertion":      cimdAssertionFor(t, key, clientID),
+			"client_assertion_type": clientAssertionType,
+			"scope":                 "data:read",
+			"account_id":            accountID,
+			"project_id":            projectID,
+		})
+	}
+
+	// Refused in the tenant it names and in any other: nothing in either
+	// tenant names this URL. Today nothing can. An identity's external_id is a
+	// SPIFFE path segment, which a URL is not, so admitting a CIMD client needs
+	// a binding from the URL to an identity (ADR 0042 D6). When that lands, add
+	// the admitted case here: a token in the admitting tenant and no other.
+	for _, tenant := range [][2]string{{testAccountID, testProjectID}, {"acct-not-admitted", "proj-not-admitted"}} {
+		resp := mint(tenant[0], tenant[1])
+		t.Logf("tenant=%s/%s status=%d body=%s", tenant[0], tenant[1], resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		assert.Equal(t, "invalid_client", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	}
 }
 
 // ── P1b: ID-JAG (ADR 0010) identity and tenant semantics ────────────────────
