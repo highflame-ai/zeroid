@@ -95,16 +95,19 @@ const (
 	// TokenProfileLegacy keeps the claim shape ZeroID has always issued, apart
 	// from purely additive fixes (issued_token_type, client_id, introspection
 	// fields, reserved claims). On an exchange the child's `sub` is the actor
-	// and `act` holds a single level. The default.
+	// and `act` holds a single level. A tenant opts back into it with
+	// PUT /tenant-settings while its consumers still read only this shape.
 	TokenProfileLegacy TokenProfile = "legacy"
 
 	// TokenProfileRFC8693 issues the RFC 8693 delegation shape: `sub` is the
 	// principal for the whole chain, `act` nests the actors with the current
 	// one outermost, `principal_type` says whether `sub` is a person or a
-	// workload, and tokens carry the RFC 9068 `scope` string. A tenant opts in
-	// once its consumers read both shapes.
+	// workload, and tokens carry the RFC 9068 `scope` string.
 	TokenProfileRFC8693 TokenProfile = "rfc8693"
 )
+
+// DefaultTokenProfile is the profile of a tenant that has not chosen one.
+const DefaultTokenProfile = TokenProfileRFC8693
 
 // IsValid reports whether p is a supported token profile.
 func (p TokenProfile) IsValid() bool {

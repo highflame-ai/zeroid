@@ -28,8 +28,9 @@ import (
 const issuedTokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
 
 // hrdTenant is a tenant of its own for one test. Token profile is a tenant
-// setting, so a test that switched the shared test tenant to rfc8693 would
-// change the token shape every later test in the suite sees.
+// setting, so a test that switched the shared test tenant to another profile
+// would change the token shape every later test in the suite sees. An empty
+// profile leaves the tenant with no settings row, on the default (rfc8693).
 type hrdTenant struct {
 	account, project string
 	headers          map[string]string
@@ -175,7 +176,7 @@ func forgetPrincipal(t *testing.T, token string) {
 }
 
 // TestTenantSettings_TokenProfile covers the per-tenant switch: a tenant with
-// no settings is on legacy, an admin can move it to rfc8693, the switch is
+// no settings is on rfc8693, an admin can move it to legacy, the switch is
 // scoped to that tenant alone, and an unknown profile is refused.
 func TestTenantSettings_TokenProfile(t *testing.T) {
 	tn := newTenant(t, "")
@@ -188,27 +189,27 @@ func TestTenantSettings_TokenProfile(t *testing.T) {
 		_ = resp.Body.Close()
 		return body["token_profile"].(string)
 	}
-	assert.Equal(t, "legacy", get(tn.headers), "a tenant with no settings is on legacy")
+	assert.Equal(t, "rfc8693", get(tn.headers), "a tenant with no settings is on rfc8693")
 
-	resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "rfc8693"}, tn.headers)
+	resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "legacy"}, tn.headers)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_ = resp.Body.Close()
-	assert.Equal(t, "rfc8693", get(tn.headers))
-	assert.Equal(t, "legacy", get(other.headers), "the switch is scoped to one tenant")
+	assert.Equal(t, "legacy", get(tn.headers))
+	assert.Equal(t, "rfc8693", get(other.headers), "the switch is scoped to one tenant")
 
 	resp = doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "rfc9999"}, tn.headers)
 	assert.Contains(t, []int{http.StatusBadRequest, http.StatusUnprocessableEntity}, resp.StatusCode, "an unknown profile is refused")
 	_ = resp.Body.Close()
-	assert.Equal(t, "rfc8693", get(tn.headers), "a refused update leaves the setting unchanged")
+	assert.Equal(t, "legacy", get(tn.headers), "a refused update leaves the setting unchanged")
 }
 
 // TestPrincipal_PersistedForEveryTenant: the principal is written for every
 // credential whatever the profile, so a chain minted on legacy today is
 // reachable by per-user revocation when it ships. On an exchange the child
 // inherits the principal — under legacy too, where the token's own `sub` is
-// the actor.
+// the actor, which is why this runs on a legacy tenant.
 func TestPrincipal_PersistedForEveryTenant(t *testing.T) {
-	tn := newTenant(t, "") // legacy
+	tn := newTenant(t, "legacy")
 	scopes := []string{"data:read"}
 	policyID := tn.policy(t, scopes)
 
@@ -233,8 +234,9 @@ func TestPrincipal_PersistedForEveryTenant(t *testing.T) {
 // TestPrincipal_LegacyParentRule covers parents minted before principals were
 // persisted. At depth 0 the parent's sub is genuine; above it, the legacy
 // shape put the actor in sub, so the principal is unknown (fail closed).
+// Such parents were minted in the legacy shape, so the tenant is on legacy.
 func TestPrincipal_LegacyParentRule(t *testing.T) {
-	tn := newTenant(t, "")
+	tn := newTenant(t, "legacy")
 	scopes := []string{"data:read"}
 	policyID := tn.policy(t, scopes)
 
@@ -320,22 +322,39 @@ func TestIntrospection_Fields(t *testing.T) {
 		assert.NotContains(t, got, "owner_user_id", "a claim the token lacks is not invented")
 	}
 	assert.Equal(t, claims["aud"], got["aud"], "aud is an RFC 7662 response member")
-	// principal_type is read from the credential row, so it is reported even
-	// for a legacy-profile token, which does not carry the claim.
-	assert.NotContains(t, claims, "principal_type", "precondition: a legacy token")
-	assert.Equal(t, "workload", got["principal_type"])
-	// Under legacy the exchanged token's sub is the actor, so the principal is
-	// reported on its own: here the root workload, not the actor in sub.
+	// Under the default rfc8693 profile the exchanged token's sub is the
+	// principal — here the root workload — and introspection agrees with it.
 	rootClaims := decodeJWTPayload(t, root)
-	assert.Equal(t, rootClaims["sub"], got["principal_sub"], "the principal is the root, not the actor in sub")
-	assert.NotEqual(t, claims["sub"], got["principal_sub"], "precondition: legacy sub is the actor")
+	assert.Equal(t, "workload", claims["principal_type"], "precondition: an rfc8693 token")
+	assert.Equal(t, "workload", got["principal_type"])
+	assert.Equal(t, rootClaims["sub"], claims["sub"], "precondition: rfc8693 sub is the root")
+	assert.Equal(t, rootClaims["sub"], got["principal_sub"])
 	assert.Equal(t, rootClaims["iss"], got["principal_iss"])
+
+	t.Run("legacy", func(t *testing.T) {
+		tn := newTenant(t, "legacy")
+		policyID := tn.policy(t, scopes)
+		root, rootWIMSE := tn.workloadRoot(t, policyID, scopes)
+		child, _ := tn.exchange(t, policyID, uid("d2-legacy-actor"), scopes, root)
+		claims := decodeJWTPayload(t, child["access_token"].(string))
+		got := introspect(t, child["access_token"].(string))
+		require.Equal(t, true, got["active"])
+		// principal_type is read from the credential row, so it is reported
+		// even for a legacy-profile token, which does not carry the claim.
+		assert.NotContains(t, claims, "principal_type", "precondition: a legacy token")
+		assert.Equal(t, "workload", got["principal_type"])
+		// Under legacy the exchanged token's sub is the actor, so the principal
+		// is reported on its own: here the root workload, not the actor in sub.
+		assert.Equal(t, rootWIMSE, got["principal_sub"], "the principal is the root, not the actor in sub")
+		assert.NotEqual(t, claims["sub"], got["principal_sub"], "precondition: legacy sub is the actor")
+		assert.Equal(t, decodeJWTPayload(t, root)["iss"], got["principal_iss"])
+	})
 }
 
 // TestTokenExchange_ClientIDIsTheActor covers the exchange half of D8: RFC 9068
 // §2.2 and RFC 8693 §4.3 put the client the token was issued to in client_id,
-// and on an exchange that client is the actor. Emitted for every tenant, so
-// this holds under the default legacy profile too. The ID-JAG half is asserted
+// and on an exchange that client is the actor. Emitted for every tenant,
+// whatever its profile. The ID-JAG half is asserted
 // in TestIDJAG_EndToEnd.
 func TestTokenExchange_ClientIDIsTheActor(t *testing.T) {
 	scopes := []string{"data:read"}
@@ -514,12 +533,12 @@ func TestRFC8693_ScopeString(t *testing.T) {
 	assert.ElementsMatch(t, []any{"data:read", "data:write"}, claims["scopes"], "scopes stays until consumers move")
 }
 
-// TestLegacyProfile_Unchanged is the golden check that a tenant on the default
-// profile sees today's claims, apart from the additive fixes (issued_token_type,
-// client_id): the actor in `sub`, a single-level `act`, identity attributes at
-// the top level, no principal_type and no scope string.
+// TestLegacyProfile_Unchanged is the golden check that a tenant opted into the
+// legacy profile sees the legacy claims, apart from the additive fixes
+// (issued_token_type, client_id): the actor in `sub`, a single-level `act`,
+// identity attributes at the top level, no principal_type and no scope string.
 func TestLegacyProfile_Unchanged(t *testing.T) {
-	tn := newTenant(t, "")
+	tn := newTenant(t, "legacy")
 	scopes := []string{"data:read"}
 	policyID := tn.policy(t, scopes)
 
@@ -672,14 +691,14 @@ func TestAccessTokenTyp_PolicyToggle(t *testing.T) {
 	})
 
 	t.Run("legacy defaults to at+jwt too", func(t *testing.T) {
-		tn := newTenant(t, "")
+		tn := newTenant(t, "legacy")
 		policyID := tn.policy(t, scopes)
 		root, _ := tn.workloadRoot(t, policyID, scopes)
 		assert.Equal(t, "at+jwt", headerTyp(t, root), "the typ default does not depend on the token profile")
 	})
 
 	t.Run("legacy policy choosing JWT keeps the token a JWT-SVID", func(t *testing.T) {
-		tn := newTenant(t, "")
+		tn := newTenant(t, "legacy")
 		policyID := tn.policyWith(t, scopes, map[string]any{"jwt_typ": "JWT"})
 		root, _ := tn.workloadRoot(t, policyID, scopes)
 		assert.Equal(t, "JWT", headerTyp(t, root))
@@ -753,7 +772,7 @@ func TestRFC8693Profile_APIKeyHasNoActor(t *testing.T) {
 	})
 
 	t.Run("legacy: act.sub is still the creator", func(t *testing.T) {
-		tn := newTenant(t, "")
+		tn := newTenant(t, "legacy")
 		token, _ := tn.apiKeyRoot(t, scopes)
 		act, ok := decodeJWTPayload(t, token)["act"].(map[string]any)
 		require.True(t, ok, "legacy api-key tokens keep act")
@@ -826,7 +845,7 @@ func TestRequiredPrincipalType_BlocksLaundering(t *testing.T) {
 // legacy parent has an unknown principal, which never satisfies a user
 // requirement — the human may have been in that chain, but nothing proves it.
 func TestRequiredPrincipalType_LegacyParentFailsClosed(t *testing.T) {
-	tn := newTenant(t, "")
+	tn := newTenant(t, "legacy")
 	scopes := []string{"data:read"}
 	openPolicy := tn.policy(t, scopes)
 	userOnly := tn.policyWith(t, scopes, map[string]any{"required_principal_type": "user"})
@@ -1138,14 +1157,14 @@ func TestUserSubject_NoNinetyDayTTL(t *testing.T) {
 	assert.Empty(t, body["refresh_token"], "a no-refresh client re-authorizes instead")
 }
 
-// TestProfileSwitch_RevokesLongLivedUserTokens: switching a tenant to rfc8693
-// revokes its user-subject access tokens longer-lived than the short default,
-// so 90-day roots minted under the old default do not outlive the switch
+// TestProfileSwitch_RevokesLongLivedUserTokens: switching a tenant from legacy
+// to rfc8693 revokes its user-subject access tokens longer-lived than the
+// short default, so 90-day roots minted under legacy do not outlive the switch
 // (D14). Short-lived ones are left alone, other tenants are untouched, and
 // repeating the request is safe.
 func TestProfileSwitch_RevokesLongLivedUserTokens(t *testing.T) {
-	tn := newTenant(t, "")
-	other := newTenant(t, "")
+	tn := newTenant(t, "legacy")
+	other := newTenant(t, "legacy")
 	longClient := ensureAuthCodeClient(t, 90*24*3600)
 	shortClient := ensureAuthCodeClient(t, 0)
 
@@ -1207,7 +1226,7 @@ func TestForwardAuth_RFC8693Headers(t *testing.T) {
 	})
 
 	t.Run("legacy exchanged token", func(t *testing.T) {
-		tn := newTenant(t, "")
+		tn := newTenant(t, "legacy")
 		policyID := tn.policy(t, scopes)
 		root, alice := tn.userRoot(t, scopes)
 		extB := uid("hrd-fa-lb")

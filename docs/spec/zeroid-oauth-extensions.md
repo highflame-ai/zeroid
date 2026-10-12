@@ -324,6 +324,7 @@ Tokens are told apart by `principal_type`, which only the `rfc8693` profile
 emits.
 
 The profile is a per-tenant setting (`PUT /tenant-settings`, `token_profile`).
+A tenant that has not set one is on `rfc8693`.
 Switching a tenant to `rfc8693` revokes its user-subject access tokens
 longer-lived than the short default, cascading to their descendants.
 

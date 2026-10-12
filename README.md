@@ -124,9 +124,9 @@ ZeroID covers every agentic deployment pattern — from a single autonomous agen
 
 ### Token profiles
 
-Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `legacy`.
+Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `rfc8693`; set `legacy` for a tenant whose consumers still read only the older shape.
 
-| | `legacy` (default) | `rfc8693` |
+| | `legacy` | `rfc8693` (default) |
 |---|---|---|
 | `sub` on an exchanged token | the actor (the sub-agent) | the principal the whole chain acts for — a person or the root workload — fixed at every hop (RFC 8693 §4.1) |
 | `act` | one level; its meaning depends on the grant | nested agents, current one outermost; the person is never an actor |
