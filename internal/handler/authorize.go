@@ -83,7 +83,9 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //     presence, S256) — after 3.5 so their failures can redirect, before
 //     step 4 so a doomed request never reaches a login surface.
 //  4. Walk the registered PrincipalResolver chain. First non-nil
-//     Principal wins. No matches → access_denied.
+//     Principal wins. No matches → access_denied. A resolver reporting
+//     ErrPrincipalAccessDenied → access_denied redirect on GET and POST
+//     (see denyAuthorize).
 //  5. Intersect (caller-requested scope ∩ resolver-narrowed scope) —
 //     the service layer intersects again with the client's registered
 //     scope, so the issued code carries the narrowest authority.
@@ -103,7 +105,8 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // writeAuthorizeError, because there is no validated redirect_uri to
 // trust yet. Everything after it goes through failAuthorize, which
 // redirects on GET and keeps JSON on POST (see that function for why the
-// method matters).
+// method matters) — except a resource owner's explicit denial, which
+// redirects on both methods (see denyAuthorize).
 //
 // Ordering was the whole difficulty, and it was upstream of this
 // handler's own steps: principal resolution used to run before any client
@@ -366,6 +369,21 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 			log.Warn().Str("client_id", req.ClientID).Msg("/oauth2/authorize called but no PrincipalResolver is registered")
 			writeAuthorizeError(w, http.StatusServiceUnavailable, oautherror.ServerError,
 				"/oauth2/authorize is not configured on this deployment: no PrincipalResolver registered")
+			return
+		}
+		if errors.Is(err, service.ErrPrincipalAccessDenied) {
+			// The resolver authenticated the request and the resource owner
+			// declined it. Not a failure of the request — an answer to it, and
+			// one only zeroid can deliver, because only zeroid has validated the
+			// redirect_uri it must travel to. Checked before the interaction
+			// sentinel so a resolver that wraps both still ends the flow rather
+			// than restarting a login the user has just declined.
+			log.Info().
+				Str("resolver", resolverName).
+				Str("client_id", req.ClientID).
+				Msg("resource owner denied the authorization request")
+			a.denyAuthorize(w, req, oauthClient)
+
 			return
 		}
 		if errors.Is(err, service.ErrPrincipalInteractionRequired) {
@@ -671,10 +689,57 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || a.refusesRedirectTo(client, req.RedirectURI) {
-		writeAuthorizeError(w, status, jsonCode, description)
-
+	if r.Method == http.MethodGet && a.redirectAuthorizeError(w, req, client, redirectCode, description) {
 		return
+	}
+
+	writeAuthorizeError(w, status, jsonCode, description)
+}
+
+// accessDeniedDescription is the error_description sent when a resolver reports
+// that the resource owner declined. Fixed text on purpose: the resolver's error
+// may carry deployer-internal detail (who the user was, which consent record
+// matched), and none of that belongs in a URL the client and its logs receive.
+const accessDeniedDescription = "the resource owner denied the request"
+
+// denyAuthorize reports ErrPrincipalAccessDenied: the resource owner was
+// authenticated and declined.
+//
+// It redirects on POST as well as GET, which is the one place this endpoint does
+// so for an error, and the reason is who the POST caller is in this case. The
+// sentinel only arises when a resolver has authenticated a request, and the POST
+// shape that produces it is a login/consent front end posting a signed statement
+// of the user's decision server-to-server. On approval that front end receives
+// the code redirect and hands its Location to the browser; on denial it must be
+// able to do the same with the error redirect, and it cannot build that redirect
+// itself — zeroid alone has validated client_id and redirect_uri. failAuthorize's
+// reason for keeping POST on JSON (a CLI that parses JSON errors) does not apply:
+// a CLI resolver never returns this sentinel, so no existing caller sees a change.
+//
+// refusesRedirectTo still governs, identically to failAuthorize: a self-asserted
+// client with an unvetted remote redirect_uri gets a JSON access_denied body
+// instead of a Location. 403 rather than 401 on that path because nothing failed
+// to authenticate — the owner was identified and said no.
+func (a *API) denyAuthorize(w http.ResponseWriter, req *service.AuthorizeRequest, client *domain.OAuthClient) {
+	if a.redirectAuthorizeError(w, req, client, oautherror.AccessDenied, accessDeniedDescription) {
+		return
+	}
+
+	writeAuthorizeError(w, http.StatusForbidden, oautherror.AccessDenied, accessDeniedDescription)
+}
+
+// redirectAuthorizeError writes the RFC 6749 §4.1.2.1 error redirect — 302 to
+// the validated redirect_uri with error, error_description, state (if sent) and
+// iss — and reports true. It writes nothing and reports false when the
+// destination must not be redirected to (refusesRedirectTo) or does not parse,
+// leaving the caller to answer with JSON. Method policy is the caller's: this
+// function does not look at the request method.
+func (a *API) redirectAuthorizeError(
+	w http.ResponseWriter, req *service.AuthorizeRequest,
+	client *domain.OAuthClient, redirectCode, description string,
+) bool {
+	if a.refusesRedirectTo(client, req.RedirectURI) {
+		return false
 	}
 
 	u, err := url.Parse(req.RedirectURI)
@@ -685,9 +750,8 @@ func (a *API) failAuthorize(
 		// never guess at a redirect target.
 		log.Error().Err(err).Str("redirect_uri", req.RedirectURI).
 			Msg("validated redirect_uri failed url.Parse on the error path")
-		writeAuthorizeError(w, status, jsonCode, description)
 
-		return
+		return false
 	}
 
 	q := u.Query()
@@ -708,6 +772,8 @@ func (a *API) failAuthorize(
 	w.Header().Set("Location", u.String())
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusFound)
+
+	return true
 }
 
 // nqchar coerces a description to RFC 6749 §4.1.2.1's NQCHAR set —

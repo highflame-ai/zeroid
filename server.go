@@ -1025,6 +1025,11 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     no target set, or on a POST, it degrades to access_denied. A
 //     resolver that wants the chain to continue must return
 //     ErrPrincipalNotApplicable instead.
+//   - A resolver returning ErrPrincipalAccessDenied (or wrapping it) →
+//     returns (nil, resolverName, err) and STOPS the chain. The handler
+//     redirects to the client's validated redirect_uri with
+//     error=access_denied on GET and POST alike; see
+//     ErrPrincipalAccessDenied.
 //   - Any other resolver error → returns (nil, resolverName, err). The
 //     chain stops at the first such error; the handler reports it the
 //     same way as the no-match case (access_denied / 401), without

@@ -345,9 +345,9 @@ func (a *API) SetCIMDPublishersVetted(vetted bool) {
 
 // refusesRedirectTo reports whether redirectURI is a destination this deployment
 // declines to send a user agent to on behalf of client. The single predicate
-// behind both failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's
-// refusal, so the two cannot drift: they answer the same question about the same
-// request.
+// behind the §4.1.2.1 carve-out (redirectAuthorizeError, used by failAuthorize
+// and denyAuthorize) and redirectToInteractiveLogin's refusal, so they cannot
+// drift: they answer the same question about the same request.
 //
 // The question is whether the destination can reach a THIRD PARTY the client
 // chose for itself. Three ways it cannot, in the order they matter:

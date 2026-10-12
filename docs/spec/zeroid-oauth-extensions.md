@@ -1220,7 +1220,9 @@ redirecting to the client's registered `redirect_uri`. ZeroID does that for
 registered clients and **deliberately does not for CIMD clients whose publishing
 host is not on an allow-list**, which answer with an RFC 6749 §5.2 JSON body
 instead. The interactive-authentication redirect
-(`ErrPrincipalInteractionRequired`) is likewise refused for them.
+(`ErrPrincipalInteractionRequired`) is likewise refused for them, as is the
+`access_denied` redirect for a resource owner's explicit denial
+(`ErrPrincipalAccessDenied`), which otherwise is issued on POST as well as GET.
 
 The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
 self-asserted, and with no `allowed_domains` allow-list (Section 12.7, the default)

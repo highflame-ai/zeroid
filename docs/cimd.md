@@ -117,6 +117,19 @@ usually the better one:
    its published JWKS. The browser never reaches this endpoint, so no GET-capable
    resolver is needed.
 
+   The surface also owns consent, so it needs a way to report "the user said
+   no". The client still expects RFC 6749 §4.1.2.1's `error=access_denied`
+   redirect, and the surface cannot build it — only ZeroID has validated
+   `client_id` and `redirect_uri`. Have the assertion carry the decision, and on
+   a denial return `ErrPrincipalAccessDenied` from the resolver (after verifying
+   the assertion — never for an unauthenticated request). ZeroID answers the POST
+   with a 302 to the validated `redirect_uri` carrying `error=access_denied`, the
+   request's `state` and `iss`, and the surface forwards that `Location` to the
+   browser exactly as it forwards the code redirect on approval. This is the only
+   error ZeroID redirects on POST. The self-asserted-client rule below still
+   applies: where the destination is refused, the denial comes back as a JSON
+   `access_denied` body instead.
+
    What route 2 does **not** remove is authorization-request CSRF — it moves it
    to your surface. An attacker can still navigate a victim's browser to that
    surface with an attacker-published `client_id`; if it authenticates from a
