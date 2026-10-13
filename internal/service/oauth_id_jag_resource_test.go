@@ -1,6 +1,7 @@
 package service
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -108,5 +109,51 @@ func TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope(t *testing.T) {
 	}
 	if _, present := bare["privilege_scope"]; present {
 		t.Error("privilege_scope must be absent when the IdP did not supply it")
+	}
+}
+
+// TestIDJAGActors names the redeeming application identity as the single
+// current actor, with the attributes token exchange gives its actor, and
+// names no actor for the synthetic carrier, which has no identity row.
+func TestIDJAGActors(t *testing.T) {
+	t.Parallel()
+
+	agent := &domain.Identity{
+		ID:           "id-1",
+		WIMSEURI:     "spiffe://example.test/acct/proj/agent/agent-1",
+		ExternalID:   "agent-1",
+		IdentityType: domain.IdentityTypeAgent,
+		TrustLevel:   domain.TrustLevel("verified_third_party"),
+	}
+	got := idJAGActors(agent)
+	want := []domain.Actor{{
+		Sub:          agent.WIMSEURI,
+		IdentityType: "agent",
+		TrustLevel:   "verified_third_party",
+		ExternalID:   "agent-1",
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("idJAGActors(agent) = %+v, want %+v", got, want)
+	}
+	act := actorChainClaim(got)
+	if act["sub"] != agent.WIMSEURI || act["external_id"] != "agent-1" ||
+		act["identity_type"] != "agent" || act["trust_level"] != "verified_third_party" {
+		t.Fatalf("act = %v, want the agent and its attributes", act)
+	}
+	if _, nested := act["act"]; nested {
+		t.Fatalf("act = %v, want a single actor", act)
+	}
+
+	synthetic := &domain.Identity{
+		AccountID:    "acct",
+		ProjectID:    "proj",
+		IdentityType: domain.IdentityTypeService,
+		Status:       domain.IdentityStatusActive,
+	}
+	if got := idJAGActors(synthetic); got != nil {
+		t.Fatalf("idJAGActors(synthetic) = %+v, want nil", got)
+	}
+	if got := idJAGActors(nil); got != nil {
+		t.Fatalf("idJAGActors(nil) = %+v, want nil", got)
 	}
 }
