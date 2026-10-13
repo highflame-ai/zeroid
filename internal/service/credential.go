@@ -726,7 +726,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// The tenant's token profile decides the claim shape. A read failure
 	// fails the issuance: minting in the wrong shape after a tenant has
 	// switched is the inconsistency a staged rollout has to rule out.
-	profile := domain.TokenProfileLegacy
+	profile := domain.DefaultTokenProfile
 	if s.tenantSettings != nil {
 		p, err := s.tenantSettings.TokenProfile(ctx, req.Identity.AccountID, req.Identity.ProjectID)
 		if err != nil {

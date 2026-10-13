@@ -414,11 +414,13 @@ class TestOAuthClientCredentialsAndDelegation:
             )
             assert delegated.access_token
 
-            # 7. Introspect: delegated token carries the act (delegation) chain.
+            # 7. Introspect: under the default rfc8693 profile `sub` stays the
+            #    chain's principal (the orchestrator, a workload) and the
+            #    delegated tool agent is the current actor in `act`.
             introspection = client.tokens.introspect(delegated.access_token)
             assert introspection.active is True
-            assert introspection.sub == tool_agent.wimse_uri
-            assert introspection.act and introspection.act.get("sub") == orchestrator.wimse_uri
+            assert introspection.sub == orchestrator.wimse_uri
+            assert introspection.act and introspection.act.get("sub") == tool_agent.wimse_uri
 
             # 8. Revoke → inactive. RFC 7009 authenticates the client, and this
             #    flow has one — the confidential client from step 3.

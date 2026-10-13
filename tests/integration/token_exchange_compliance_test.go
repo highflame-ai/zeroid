@@ -147,8 +147,10 @@ func TestRFC8693_S2_2_ResponseContainsAccessTokenAndTokenType(t *testing.T) {
 // ── RFC 8693 §4 — Issued-token claims ──────────────────────────────────────
 
 func TestRFC8693_S4_2_ActClaimChainsDelegation(t *testing.T) {
-	// RFC 8693 §4.2: "act ... A JSON object that contains claims about a
-	//   distinct chained delegating principal." The actor (orchestrator)
+	// RFC 8693 §4.1: "act ... provides a means within a JWT to express that
+	//   delegation has occurred and identify the acting party to whom
+	//   authority has been delegated." The subject_token's principal (the
+	//   orchestrator) stays the token's sub; the acting party (the sub-agent)
 	//   MUST appear in the act claim of the issued delegated token.
 	f := setupTokenExchangeFixture(t)
 	actorAssertion := buildAssertion(t, f.SubAgentKey, f.SubAgentWIMSEURI)
@@ -163,13 +165,13 @@ func TestRFC8693_S4_2_ActClaimChainsDelegation(t *testing.T) {
 
 	intro := introspect(t, delegated)
 	require.Equal(t, true, intro["active"])
-	assert.Equal(t, f.SubAgentWIMSEURI, intro["sub"],
-		"delegated token's sub MUST be the actor (sub-agent)")
+	assert.Equal(t, f.OrchestratorWIMSEURI, intro["sub"],
+		"delegated token's sub MUST be the subject_token's principal (orchestrator)")
 
 	act, ok := intro["act"].(map[string]any)
 	require.True(t, ok, "delegated token MUST carry act claim")
-	assert.Equal(t, f.OrchestratorWIMSEURI, act["sub"],
-		"act.sub MUST equal the delegating principal's identifier (orchestrator's WIMSE URI)")
+	assert.Equal(t, f.SubAgentWIMSEURI, act["sub"],
+		"act.sub MUST equal the acting party's identifier (sub-agent's WIMSE URI)")
 }
 
 // ── RFC 8693 — Revoked subject_token rejected ──────────────────────────────

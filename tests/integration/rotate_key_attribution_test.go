@@ -9,6 +9,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Rotation attribution reaches a token only as the api_key grant's act.sub,
+// which the legacy profile emits and the rfc8693 profile (the default) drops,
+// because a key's creator is not an actor. Every test here therefore runs its
+// agent in a tenant of its own set to legacy.
+
+// legacyAgent registers an agent in a fresh legacy-profile tenant and returns
+// it with the tenant's headers.
+func legacyAgent(t *testing.T, prefix string) (agentRegistration, map[string]string) {
+	t.Helper()
+	tn := newTenant(t, "legacy")
+	return registerAgentInTenant(t, uid(prefix), tn.headers), tn.headers
+}
+
 // actSub returns the act.sub claim of a token minted from apiKey, or "" when
 // the token carries no act claim. act.sub is the human the credential acts
 // for — the first link in the "which human initiated this action" chain.
@@ -29,10 +42,13 @@ func actSub(t *testing.T, apiKey string) string {
 }
 
 // rotate performs POST /agents/registry/{id}/rotate-key with extra headers
-// merged over adminHeaders, and returns the new API key.
-func rotate(t *testing.T, agentID string, extra map[string]string) string {
+// merged over the tenant's headers, and returns the new API key.
+func rotate(t *testing.T, tenant map[string]string, agentID string, extra map[string]string) string {
 	t.Helper()
-	headers := adminHeaders()
+	headers := map[string]string{}
+	for k, v := range tenant {
+		headers[k] = v
+	}
 	for k, v := range extra {
 		headers[k] = v
 	}
@@ -66,10 +82,10 @@ func setIdentityAttribution(t *testing.T, identityID, ownerUserID, createdBy str
 // from a rotated key named the rotation subsystem instead of a human. The
 // human→agent link was lost, silently, on a routine operational action.
 func TestRotateKeyPreservesHumanAttribution(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-attribution"))
+	reg, tenant := legacyAgent(t, "rotate-attribution")
 	setIdentityAttribution(t, reg.AgentID, "owner-alice", "registrant-carol")
 
-	rotatedKey := rotate(t, reg.AgentID, nil)
+	rotatedKey := rotate(t, tenant, reg.AgentID, nil)
 	got := actSub(t, rotatedKey)
 
 	assert.Equal(t, "owner-alice", got,
@@ -88,10 +104,10 @@ func TestRotateKeyPreservesHumanAttribution(t *testing.T) {
 // The operator is not lost: RotateKey logs created_by, and identity_audit_logs
 // records the X-User-ID caller separately.
 func TestRotateKeyPrefersOwnerOverRotationOperator(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-owner-wins"))
+	reg, tenant := legacyAgent(t, "rotate-owner-wins")
 	setIdentityAttribution(t, reg.AgentID, "owner-alice", "registrant-carol")
 
-	rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
+	rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
 	assert.Equal(t, "owner-alice", actSub(t, rotatedKey),
 		"the rotation operator must not displace the accountable owner in act.sub")
 }
@@ -103,10 +119,10 @@ func TestRotateKeyPrefersOwnerOverRotationOperator(t *testing.T) {
 // COALESCE(NULLIF(owner_user_id, ”), created_by); rotation must not stamp the
 // system literal over attribution sitting one column away.
 func TestRotateKeyFallsBackToIdentityCreatedBy(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-createdby-fallback"))
+	reg, tenant := legacyAgent(t, "rotate-createdby-fallback")
 	setIdentityAttribution(t, reg.AgentID, "", "registrant-carol")
 
-	rotatedKey := rotate(t, reg.AgentID, nil)
+	rotatedKey := rotate(t, tenant, reg.AgentID, nil)
 	assert.Equal(t, "registrant-carol", actSub(t, rotatedKey),
 		"with no owner, act.sub should fall back to the identity's created_by")
 }
@@ -115,10 +131,10 @@ func TestRotateKeyFallsBackToIdentityCreatedBy(t *testing.T) {
 // row names nobody, but a human performed the rotation. Naming them beats
 // naming a subsystem.
 func TestRotateKeyFallsBackToRotationCaller(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-caller-fallback"))
+	reg, tenant := legacyAgent(t, "rotate-caller-fallback")
 	setIdentityAttribution(t, reg.AgentID, "", "")
 
-	rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
+	rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
 	assert.Equal(t, "sre-bob", actSub(t, rotatedKey),
 		"with no human on the row, act.sub should name the rotation caller")
 }
@@ -128,10 +144,10 @@ func TestRotateKeyFallsBackToRotationCaller(t *testing.T) {
 // with ILIKE 'system:%' depend on the string, and it is assembled by
 // concatenation, so an assertion on the whole value is what pins it.
 func TestRotateKeySystemPrincipalWhenNoHumanKnown(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-no-human"))
+	reg, tenant := legacyAgent(t, "rotate-no-human")
 	setIdentityAttribution(t, reg.AgentID, "", "")
 
-	rotatedKey := rotate(t, reg.AgentID, nil)
+	rotatedKey := rotate(t, tenant, reg.AgentID, nil)
 	assert.Equal(t, "system:key_rotation", actSub(t, rotatedKey),
 		"with no human anywhere, act.sub should be the system principal verbatim")
 }
@@ -149,10 +165,10 @@ func TestRotateKeyRejectsSpoofedSystemCaller(t *testing.T) {
 	spoofs := []string{"system:key_rotation", "System:key_rotation", "SYSTEM:expired_sweep"}
 
 	t.Run("via X-User-ID header", func(t *testing.T) {
-		reg := registerAgent(t, uid("rotate-spoof-header"))
+		reg, tenant := legacyAgent(t, "rotate-spoof-header")
 		setIdentityAttribution(t, reg.AgentID, "owner-alice", "")
 		for _, spoof := range spoofs {
-			rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": spoof})
+			rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": spoof})
 			assert.Equal(t, "owner-alice", actSub(t, rotatedKey),
 				"spoofed X-User-ID %q must not reach act.sub", spoof)
 		}
@@ -160,10 +176,10 @@ func TestRotateKeyRejectsSpoofedSystemCaller(t *testing.T) {
 
 	t.Run("via owner_user_id and created_by columns", func(t *testing.T) {
 		for _, spoof := range spoofs {
-			reg := registerAgent(t, uid("rotate-spoof-column"))
+			reg, tenant := legacyAgent(t, "rotate-spoof-column")
 			setIdentityAttribution(t, reg.AgentID, spoof, spoof)
 
-			rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
+			rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
 			assert.Equal(t, "sre-bob", actSub(t, rotatedKey),
 				"spoofed column value %q must be skipped in favour of a real human", spoof)
 		}
@@ -181,7 +197,7 @@ func TestRotateKeyRejectsSpoofedSystemCaller(t *testing.T) {
 // candidate and the oversized value is genuinely exercised rather than
 // short-circuited by a higher-precedence source.
 func TestRotateKeyOversizedCallerDoesNotLockOutAgent(t *testing.T) {
-	reg := registerAgent(t, uid("rotate-oversized-caller"))
+	reg, tenant := legacyAgent(t, "rotate-oversized-caller")
 	setIdentityAttribution(t, reg.AgentID, "", "")
 
 	oversized := make([]byte, 300)
@@ -191,7 +207,7 @@ func TestRotateKeyOversizedCallerDoesNotLockOutAgent(t *testing.T) {
 
 	// rotate() requires 200: an unbounded value reaches the INSERT, fails it,
 	// and returns 500 with every key already revoked.
-	rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": string(oversized)})
+	rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": string(oversized)})
 	assert.Equal(t, "system:key_rotation", actSub(t, rotatedKey),
 		"an oversized caller must be skipped, leaving the honest system principal")
 }
@@ -212,10 +228,10 @@ func TestRotateKeyRejectsMalformedColumnAttribution(t *testing.T) {
 		"whitespace only": "   ",
 	} {
 		t.Run(name, func(t *testing.T) {
-			reg := registerAgent(t, uid("rotate-malformed-column"))
+			reg, tenant := legacyAgent(t, "rotate-malformed-column")
 			setIdentityAttribution(t, reg.AgentID, malformed, malformed)
 
-			rotatedKey := rotate(t, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
+			rotatedKey := rotate(t, tenant, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
 			assert.Equal(t, "sre-bob", actSub(t, rotatedKey),
 				"malformed column value %q must be skipped in favour of a real human", malformed)
 		})
