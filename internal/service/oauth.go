@@ -3632,6 +3632,10 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// deliberate exclusion of CIMD clients: introspection has no redirect_uri
 	// binding to protect it, so a self-published metadata document must not be
 	// able to satisfy this gate and turn introspection into a token oracle.
+	// That holds even for a VALID assertion from a CIMD client: it proves only
+	// control of the document URL, which anyone can have. (Revocation accepts
+	// such a client in RevokeForClient, where the action is confined to the
+	// client's own tokens; introspection has no such confinement.)
 	if clientAssertionPresented(assertion, assertionType) {
 		if clientSecret != "" {
 			return oauthUnauthorized(
@@ -3707,10 +3711,10 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// safe because redirect_uri binding protects the flow; token INSPECTION
 	// has no equivalent binding, so it stays registry-only.
 	//
-	// Revocation does accept a public CIMD client_id, but not through here:
-	// RevokeForClient handles that case BEFORE calling this function, and
-	// only revokes a token issued to that same client_id. Do not widen this
-	// branch to cover it — it would reach introspection too.
+	// Revocation does accept CIMD clients, but not through here:
+	// RevokeForClient handles them BEFORE calling this function, and only
+	// revokes a token issued to that same client_id. Do not widen this
+	// function to cover them — it would reach introspection too.
 	if clientSecret == "" {
 		publicClient, err := s.oauthClientSvc.GetPublicClient(ctx, clientID)
 		if err != nil {

@@ -43,20 +43,23 @@ const revocationFailedDescription = "the token could not be revoked; retry the r
 //
 // Two authorization paths, and the split is the point:
 //
-//   - A public CIMD client identifying itself by client_id alone (RFC 7009
-//     §2.1 lets a public client do exactly that). It has no registry row, so
-//     VerifyPresentedClientAuth — which is shared with introspection and stays
-//     registry-only there — refuses it. Here it is accepted, but the
+//   - A CIMD client. It has no registry row, so VerifyPresentedClientAuth —
+//     which is shared with introspection and stays registry-only there —
+//     refuses it. Here it is resolved through its metadata document and
+//     authenticated as its document declares: a public client ("none") by its
+//     client_id alone (RFC 7009 §2.1), a confidential one (private_key_jwt) by
+//     an RFC 7523 §2.2 assertion against the document's keys. Either way the
 //     revocation is then CONSTRAINED to tokens issued to that same client_id,
 //     for both token types: an access token only if its verified `client_id`
 //     claim names the client, a refresh token only if its row was issued to
 //     the client (and then with its whole family and the access tokens issued
 //     from it, as for any client). That constraint is what makes accepting a
-//     self-published identity safe on this endpoint: anyone can name a CIMD
-//     URL, so naming one may only ever reach tokens that URL's client already
-//     holds. Introspection has no equivalent constraint to apply — it answers
-//     a question about the token rather than acting on the caller's own
-//     grant — which is why it keeps refusing unauthenticated CIMD client_ids.
+//     self-published identity safe on this endpoint: anyone can publish a
+//     document (with keys of their choosing) at a URL they control, so being
+//     that URL may only ever reach tokens that URL's client already holds.
+//     Introspection has no equivalent constraint — it answers questions about
+//     any token presented — which is why it keeps refusing CIMD clients,
+//     authenticated or not.
 //
 //   - Everything else: VerifyPresentedClientAuth, then RevokeToken with the
 //     client the request identified. Refresh tokens are confined to that
@@ -91,38 +94,59 @@ func revocationFailure(err error) error {
 	return oauthServerError(revocationFailedDescription, err)
 }
 
-// authorizeCIMDRevoker decides whether a revocation request is a public CIMD
-// client identifying itself by client_id alone.
+// authorizeCIMDRevoker decides whether a revocation request comes from a CIMD
+// client, and if so authenticates it.
 //
 // Returns:
-//   - ("", nil) when the request is not that shape — credentials presented,
-//     no client_id, CIMD disabled, the client_id is not CIMD-shaped, or the
-//     registry holds a row for it (a registry row always wins, see
-//     resolveClientRegistryOrCIMD). The caller falls through to the existing
-//     VerifyPresentedClientAuth path, which handles all of those as before.
-//   - (clientID, nil) when the client_id resolves through CIMD to a PUBLIC
-//     client. The caller must constrain revocation to tokens issued to it.
-//   - an invalid_client error when the client_id is CIMD-shaped but does not
-//     resolve (disallowed domain, fetch failure, invalid document) or resolves
-//     to a client that must authenticate (private_key_jwt). Both were refused
-//     before this path existed and still are.
+//   - ("", nil) when the request is not a CIMD client's — a client_secret
+//     presented, no client identifier at all, CIMD disabled, the identifier is
+//     not CIMD-shaped, or the registry holds a row for it (a registry row
+//     always wins, see resolveClientRegistryOrCIMD). The caller falls through
+//     to the existing VerifyPresentedClientAuth path, which handles all of
+//     those exactly as before.
+//   - (clientID, nil) when the identifier resolves through CIMD and the client
+//     authenticates as its document declares. The caller must constrain
+//     revocation to tokens issued to it.
+//   - an invalid_client error when the identifier is CIMD-shaped but does not
+//     resolve (disallowed domain, fetch failure, invalid document), or the
+//     client does not authenticate as declared (a private_key_jwt client with
+//     no or a bad assertion; a public client presenting an assertion).
 //
-// Resolution goes through resolveClientRegistryOrCIMD, so allowed_domains,
-// the SSRF-guarded fetch, the document validation and the resolution cache
-// are exactly the ones the authorization_code and refresh_token flows use.
-// Nothing about the resolved client is used except its public-ness and its
-// client_id: in particular its grant_types grant nothing here, because the
-// only action available is revoking a token this client already holds.
+// The client is identified by client_id, or — when that is omitted and an
+// assertion is presented — by the assertion's iss, the same RFC 7523 §3
+// fallback the token endpoint and VerifyPresentedClientAuth apply. The
+// unverified iss only selects which document's keys the assertion is checked
+// against; verifyClientAssertion then requires iss == that client_id.
+//
+// Resolution goes through resolveClientRegistryOrCIMD and authentication
+// through verifyConfidentialClientAuth: the same allowed_domains policy, fetch,
+// document validation and cache, and the same assertion rules (accepted aud
+// values, alg allow-list, exp bounds, jti single-use, key discovery from the
+// document's jwks / jwks_uri), that the authorization_code and refresh_token
+// grants apply to a CIMD client. Nothing is forked. In particular the accepted
+// aud set is acceptedClientAssertionAudiences — the issuer identifier and the
+// token endpoint URL — exactly as for a registered private_key_jwt client at
+// this endpoint; the revocation endpoint URL is not added, because RFC 7523 §3
+// asks aud to identify the authorization server and widening that set only
+// here would make one endpoint disagree with the rest.
+//
+// Nothing about the resolved client is used beyond its client_id and how it
+// authenticates: its grant_types grant nothing here, because the only action
+// available is revoking a token this client already holds.
 func (s *OAuthService) authorizeCIMDRevoker(ctx context.Context, req RevocationRequest) (string, error) {
-	if req.ClientID == "" || req.ClientSecret != "" ||
-		clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType) {
+	if req.ClientSecret != "" || !s.cimdSvc.Enabled() {
 		return "", nil
 	}
-	if !s.cimdSvc.Enabled() || !IsCIMDClientID(req.ClientID) {
+	clientID := req.ClientID
+	assertionPresented := clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType)
+	if clientID == "" && assertionPresented {
+		clientID, _ = ClientIDFromAssertion(req.ClientAssertion)
+	}
+	if clientID == "" || !IsCIMDClientID(clientID) {
 		return "", nil
 	}
 
-	client, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
+	client, viaCIMD, err := s.resolveClientRegistryOrCIMD(ctx, clientID)
 	if !viaCIMD {
 		// Registry row, registry miss, or a registry error: all of these are
 		// VerifyPresentedClientAuth's to decide, as they were before.
@@ -133,36 +157,44 @@ func (s *OAuthService) authorizeCIMDRevoker(ctx context.Context, req RevocationR
 		// The cause (which may describe our fetch) stays server-side.
 		return "", oauthUnauthorized("client authentication required", err)
 	}
-	if err := cimdRevokerMustBePublic(client); err != nil {
+	if err := s.authenticateCIMDRevoker(ctx, client, clientID, req.ClientAssertion, req.ClientAssertionType); err != nil {
 		return "", err
 	}
 	return client.ClientID, nil
 }
 
-// cimdRevokerMustBePublic refuses a resolved CIMD client that is required to
-// authenticate. A document declaring private_key_jwt describes a confidential
-// client (zeroid#348): presenting its client_id alone proves nothing, so it is
-// refused exactly as a registered private_key_jwt client without an assertion
-// is. Only a document declaring "none" — a public client — gets the RFC 7009
-// §2.1 client_id-only identification.
-func cimdRevokerMustBePublic(client *domain.OAuthClient) error {
+// authenticateCIMDRevoker authenticates a resolved CIMD client as its document
+// declares, with the function the authorization_code and refresh_token grants
+// use for the same client (verifyConfidentialClientAuth):
+//
+//   - private_key_jwt: a valid RFC 7523 §2.2 assertion signed by a key the
+//     document publishes is required; none, or a bad one, is refused. This is
+//     a confidential client (zeroid#348) and its client_id alone proves
+//     nothing.
+//   - none: a public client, identified by its client_id alone (RFC 7009
+//     §2.1). An assertion is refused — nothing vetted a key for it.
+//
+// No secret is passed: a CIMD client cannot have one, and a request carrying
+// one never reaches here (authorizeCIMDRevoker sends it to the registry path).
+func (s *OAuthService) authenticateCIMDRevoker(
+	ctx context.Context, client *domain.OAuthClient, clientID, assertion, assertionType string,
+) error {
 	if client == nil {
 		return oauthUnauthorized("client authentication required", nil)
 	}
-	if err := rejectUnimplementedClientAuth(client); err != nil {
-		return err
-	}
-	if client.RequiresClientAuthentication() {
-		return oauthUnauthorized(
-			"client metadata document declares token_endpoint_auth_method \""+
-				client.TokenEndpointAuthMethod+"\"; the client must authenticate", nil)
-	}
-	return nil
+	return s.verifyConfidentialClientAuth(ctx, client, clientID, "", assertion, assertionType)
 }
 
 // tokenIssuedToClient reports whether a verified token's `client_id` claim
 // names clientID. An empty clientID never matches, so an absent claim cannot
 // be satisfied by an absent caller identity.
+//
+// parsed must come from parseToken, which has verified the signature against
+// our own keys. The claim is set at issuance from the client the grant
+// authenticated or resolved and is reserved against additional_claims, so the
+// caller cannot influence it; for a CIMD client it is the document URL itself.
+// A token without the claim is not attributable to any client and is never
+// revoked on a CIMD client's behalf.
 func tokenIssuedToClient(parsed jwt.Token, clientID string) bool {
 	if parsed == nil || clientID == "" {
 		return false

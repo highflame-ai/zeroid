@@ -11,8 +11,10 @@
 //   - naming a CIMD client_id reaches ONLY that client's tokens: another
 //     client's token answers 200 (RFC 7009 §2.2) and stays active;
 //   - introspection still refuses an unauthenticated CIMD client_id;
-//   - a CIMD client that declares private_key_jwt is confidential and is still
-//     refused without its assertion;
+//   - a CIMD client that declares private_key_jwt is confidential: it revokes
+//     its own tokens with a valid RFC 7523 §2.2 assertion (same rules as the
+//     token endpoint) and is refused without one;
+//   - introspection refuses a CIMD client even when it authenticates;
 //   - a CIMD client_id whose document does not resolve is still refused.
 //
 // Run in isolation:
@@ -22,6 +24,7 @@ package integration_test
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,7 +33,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -193,16 +199,11 @@ func TestCIMDRevoke_PublicClient(t *testing.T) {
 	})
 }
 
-// A document declaring private_key_jwt describes a CONFIDENTIAL client. Its
-// client_id alone proves nothing, so the RFC 7009 §2.1 public-client
-// identification must not extend to it — even for its own token.
-func TestCIMDRevoke_ConfidentialClientWithoutAssertionIsRefused(t *testing.T) {
-	key := generateKey(t)
-	base, docClient := newCIMDDocumentOrigin(t, privateKeyJWTDoc(t, key))
-	srvURL := newCIMDZeroID(t, docClient).URL
-	introspectAs := cimdRevokeIntrospector(t, srvURL)
-	clientID := base + "/" + uid("pkjwt") + ".json"
-
+// cimdPrivateKeyJWTAccessToken runs the confidential-client
+// authorization_code flow for clientID (a private_key_jwt document published
+// with key) and returns the access token.
+func cimdPrivateKeyJWTAccessToken(t *testing.T, srvURL, clientID string, key *ecdsa.PrivateKey) string {
+	t.Helper()
 	verifier, challenge := buildPKCEPair(t)
 	code := authorizeAndGetCode(t, srvURL, clientID, challenge)
 	tok := postFederation(t, srvURL, map[string]any{
@@ -216,14 +217,164 @@ func TestCIMDRevoke_ConfidentialClientWithoutAssertionIsRefused(t *testing.T) {
 	})
 	require.Equal(t, http.StatusOK, tok.StatusCode, "fixture: %s", tok.RawBody)
 	require.Equal(t, clientID, decodeIssuedTokenClaims(t, tok.AccessToken)["client_id"],
-		"fixture: the token is this client's own, so only authentication can refuse it")
+		"fixture: the token must carry the client_id it was issued to")
+	return tok.AccessToken
+}
 
-	status, body := postFormTo(t, srvURL, "/oauth2/token/revoke",
-		url.Values{"token": {tok.AccessToken}, "client_id": {clientID}}, nil)
-	require.Equal(t, http.StatusUnauthorized, status,
-		"a private_key_jwt CIMD client presenting no assertion must be refused: %v", body)
-	assert.Equal(t, "invalid_client", body["error"])
-	assert.Contains(t, body["error_description"], "private_key_jwt",
-		"the refusal must come from the declared method, not some unrelated failure")
-	assert.Equal(t, true, introspectAs(tok.AccessToken)["active"])
+// cimdAssertionWithAud is cimdAssertionFor with an explicit aud.
+func cimdAssertionWithAud(t *testing.T, key *ecdsa.PrivateKey, clientID, aud string) string {
+	t.Helper()
+	now := time.Now()
+	tok, err := jwt.NewBuilder().
+		Issuer(clientID).
+		Subject(clientID).
+		Audience([]string{aud}).
+		IssuedAt(now).
+		Expiration(now.Add(2 * time.Minute)).
+		JwtID(uid("cimd-cla")).
+		Build()
+	require.NoError(t, err)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), key))
+	require.NoError(t, err)
+	return string(signed)
+}
+
+// A document declaring private_key_jwt describes a CONFIDENTIAL client
+// (zeroid#348). It revokes by authenticating with an RFC 7523 §2.2 assertion
+// signed by a key its document publishes — under the same rules the token
+// endpoint applies to it — and, like a public CIMD client, only ever reaches
+// tokens issued to it. Its client_id alone proves nothing and is refused.
+func TestCIMDRevoke_ConfidentialClient(t *testing.T) {
+	key := generateKey(t)
+	base, docClient := newCIMDDocumentOrigin(t, privateKeyJWTDoc(t, key))
+	srvURL := newCIMDZeroID(t, docClient).URL
+	introspectAs := cimdRevokeIntrospector(t, srvURL)
+	revoke := func(form url.Values) (int, map[string]any) {
+		t.Helper()
+		return postFormTo(t, srvURL, "/oauth2/token/revoke", form, nil)
+	}
+
+	t.Run("revokes its own token with a valid assertion", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := revoke(url.Values{
+			"token": {token}, "client_id": {clientID},
+			"client_assertion": {cimdAssertionFor(t, key, clientID)}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusOK, status, "an authenticated CIMD client must revoke its own token: %v", body)
+		assert.Equal(t, false, introspectAs(token)["active"])
+	})
+
+	// The token endpoint URL is the RFC 7523 §3 conventional aud; the issuer
+	// identifier (above) is what most libraries send. Both are accepted, as for
+	// a registered private_key_jwt client.
+	t.Run("accepts the token endpoint URL as aud", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-aud") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := revoke(url.Values{
+			"token": {token}, "client_id": {clientID},
+			"client_assertion":      {cimdAssertionWithAud(t, key, clientID, cimdTestIssuer+"/oauth2/token")},
+			"client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		assert.Equal(t, false, introspectAs(token)["active"])
+	})
+
+	// RFC 7523 §3: the assertion's iss identifies the client, so conformant
+	// libraries omit client_id.
+	t.Run("identifies the client from the assertion when client_id is omitted", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-iss") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := revoke(url.Values{
+			"token":            {token},
+			"client_assertion": {cimdAssertionFor(t, key, clientID)}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		assert.Equal(t, false, introspectAs(token)["active"])
+	})
+
+	// Authentication proves only "I am this URL" — anyone can publish a
+	// document with their own key — so it buys no more than the public case:
+	// only this client's own tokens.
+	t.Run("cannot revoke another client's token even when authenticated", func(t *testing.T) {
+		victimID := base + "/" + uid("pkjwt-victim") + ".json"
+		otherID := base + "/" + uid("pkjwt-other") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, victimID, key)
+
+		status, body := revoke(url.Values{
+			"token": {token}, "client_id": {otherID},
+			"client_assertion": {cimdAssertionFor(t, key, otherID)}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusOK, status, "RFC 7009 §2.2: still 200: %v", body)
+		assert.Equal(t, true, introspectAs(token)["active"],
+			"an authenticated CIMD client must not revoke a token issued to a different client")
+	})
+
+	t.Run("is refused without an assertion", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-bare") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := revoke(url.Values{"token": {token}, "client_id": {clientID}})
+		require.Equal(t, http.StatusUnauthorized, status,
+			"a private_key_jwt CIMD client presenting no assertion must be refused: %v", body)
+		assert.Equal(t, "invalid_client", body["error"])
+		assert.Contains(t, body["error_description"], "private_key_jwt",
+			"the refusal must come from the declared method, not some unrelated failure")
+		assert.Equal(t, true, introspectAs(token)["active"])
+	})
+
+	t.Run("is refused with an assertion signed by a key the document does not publish", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-foreign") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := revoke(url.Values{
+			"token": {token}, "client_id": {clientID},
+			"client_assertion": {cimdAssertionFor(t, generateKey(t), clientID)}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusUnauthorized, status, "%v", body)
+		assert.Equal(t, "invalid_client", body["error"])
+		assert.Equal(t, true, introspectAs(token)["active"])
+	})
+
+	t.Run("is refused when the assertion is replayed", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-replay") + ".json"
+		first := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+		second := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+		assertion := cimdAssertionFor(t, key, clientID)
+
+		status, _ := revoke(url.Values{
+			"token": {first}, "client_id": {clientID},
+			"client_assertion": {assertion}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusOK, status)
+
+		status, body := revoke(url.Values{
+			"token": {second}, "client_id": {clientID},
+			"client_assertion": {assertion}, "client_assertion_type": {clientAssertionType},
+		})
+		require.Equal(t, http.StatusUnauthorized, status, "a client assertion is single-use: %v", body)
+		assert.Equal(t, true, introspectAs(second)["active"])
+	})
+
+	// Introspection stays closed to CIMD clients even when they authenticate.
+	// Unlike revocation it has no ownership constraint to apply — it answers
+	// about any token presented — and authenticating as a CIMD client proves
+	// only control of a URL, which anyone can have. Admitting it would make
+	// introspection a token oracle for anyone with a web server.
+	t.Run("introspection refuses it even with a valid assertion", func(t *testing.T) {
+		clientID := base + "/" + uid("pkjwt-introspect") + ".json"
+		token := cimdPrivateKeyJWTAccessToken(t, srvURL, clientID, key)
+
+		status, body := postFormTo(t, srvURL, "/oauth2/token/introspect", url.Values{
+			"token": {token}, "client_id": {clientID},
+			"client_assertion": {cimdAssertionFor(t, key, clientID)}, "client_assertion_type": {clientAssertionType},
+		}, nil)
+		require.Equal(t, http.StatusUnauthorized, status,
+			"an authenticated CIMD client must still not introspect: %v", body)
+		assert.Equal(t, "invalid_client", body["error"])
+		assert.NotContains(t, body, "active", "no token information may leak on refusal")
+	})
 }
