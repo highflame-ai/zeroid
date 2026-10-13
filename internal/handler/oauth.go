@@ -29,7 +29,9 @@ type TokenInput struct {
 	DPoPProof string `header:"DPoP" doc:"DPoP proof JWT (RFC 9449)"`
 	// Authorization carries OPTIONAL client_secret_basic credentials
 	// (RFC 6749 §2.3.1). Body client_id/client_secret remain the
-	// client_secret_post path; using both at once is rejected per §2.3.
+	// client_secret_post path; using both methods at once is rejected per
+	// §2.3. A body client_id equal to the Basic id is an identifier, not a
+	// second method, and is accepted (see resolveBasicClientAuth).
 	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
 	Body          struct {
 		GrantType    string `json:"grant_type" required:"true" doc:"OAuth grant type"`
@@ -281,7 +283,8 @@ type IntrospectInput struct {
 	// Authorization carries OPTIONAL client_secret_basic credentials
 	// (RFC 6749 §2.3.1: `Basic base64(urlencode(id):urlencode(secret))`).
 	// Body client_id/client_secret remain the client_secret_post path; a
-	// request using both methods at once is rejected per RFC 6749 §2.3.
+	// request using both methods at once is rejected per RFC 6749 §2.3. A
+	// body client_id equal to the Basic id is accepted (resolveBasicClientAuth).
 	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
 	Body          struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to introspect"`
@@ -431,12 +434,50 @@ func resolveAssertion(assertion, subject string) (string, error) {
 // effective credentials plus whether the Basic header was the source (drives
 // the RFC 6749 §5.2 WWW-Authenticate echo on failure).
 //
-// Per RFC 6749 §2.3 a client MUST NOT use more than one method in a single
-// request — presenting both is rejected as invalid_request. Non-Basic
-// Authorization schemes are ignored (treated as not presented) so bearer
-// headers from generic middleware don't break the anonymous internal path.
-// Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
-func resolveBasicClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
+// One method per request. RFC 6749 §2.3: "The client MUST NOT use more than
+// one authentication method in each request." OAuth 2.1
+// (draft-ietf-oauth-v2-1-14 §2.4) keeps the rule and states its purpose: "to
+// prevent a conflict of which authentication mechanism is authoritative for the
+// request". So alongside a Basic header this refuses, as invalid_request (RFC
+// 6749 §5.2: "utilizes more than one mechanism for authenticating the client"):
+//
+//   - a body client_secret — that is client_secret_post, a second method;
+//   - a body client_assertion / client_assertion_type — that is RFC 7523 §2.2
+//     private_key_jwt, a second method. Refused here rather than left to the
+//     service because the service only sees the merged secret: a Basic header
+//     carrying an EMPTY password plus an assertion would otherwise reach it as
+//     "no secret, one assertion" and pass as a single method.
+//
+// A body client_id on its own is NOT a method. It is an identifier: RFC 6749
+// §3.2.1 says "A client MAY use the "client_id" request parameter to identify
+// itself when sending requests to the token endpoint", and OAuth 2.1 §3.2.2
+// lists client_id as an OPTIONAL token-request parameter separate from client
+// authentication. The reference MCP SDK sends exactly this shape — Basic plus a
+// body client_id — so refusing it broke every partner on that SDK before the
+// grant was even read (highflame-firehog#700). When the two identifiers agree
+// there is one credential and one client, so nothing is ambiguous and the
+// request is accepted. When they disagree the request names two clients; that
+// is refused rather than resolved by a precedence rule, for the same reason as
+// two methods: a precedence rule is what an attacker uses to get the identity
+// they did not authenticate as evaluated.
+//
+// (RFC 6749 §2.3.1 also lets client_secret_post omit an empty secret, so a bare
+// client_id can be read as client_secret_post with an empty password. That
+// reading only matters when it would change who is authenticated or with what;
+// with matching ids it changes neither, and the only secret evaluated is the
+// one in the Basic header.)
+//
+// Non-Basic Authorization schemes are ignored (treated as not presented) so
+// bearer headers from generic middleware don't break the anonymous internal
+// path. Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1, so
+// the comparison with the body client_id is made AFTER decoding — an id the
+// client percent-encoded in the header still matches its plain body form.
+//
+// Error descriptions never echo request values (zeroid#221): both identifiers
+// are caller-controlled, and the description is reflected to the caller.
+func resolveBasicClientAuth(
+	authorization, bodyClientID, bodyClientSecret, bodyClientAssertion, bodyClientAssertionType string,
+) (clientID, clientSecret string, viaBasic bool, err error) {
 	badRequest := func(desc string) *service.OAuthError {
 		return &service.OAuthError{Code: oautherror.InvalidRequest, Description: desc, HTTPStatus: http.StatusBadRequest}
 	}
@@ -444,7 +485,7 @@ func resolveBasicClientAuth(authorization, bodyClientID, bodyClientSecret string
 	if len(authorization) < len(prefix) || !strings.EqualFold(authorization[:len(prefix)], prefix) {
 		return bodyClientID, bodyClientSecret, false, nil
 	}
-	if bodyClientID != "" || bodyClientSecret != "" {
+	if bodyClientSecret != "" || bodyClientAssertion != "" || bodyClientAssertionType != "" {
 		return "", "", true, badRequest("only one client authentication method may be used per request (RFC 6749 §2.3)")
 	}
 	raw, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(authorization[len(prefix):]))
@@ -459,6 +500,10 @@ func resolveBasicClientAuth(authorization, bodyClientID, bodyClientSecret string
 	secret, secErr := url.QueryUnescape(secret)
 	if idErr != nil || secErr != nil {
 		return "", "", true, badRequest("malformed Basic authorization header")
+	}
+	if bodyClientID != "" && bodyClientID != id {
+		return "", "", true, badRequest(
+			"client_id in the request body does not match the client identifier in the Basic authorization header")
 	}
 	return id, secret, true, nil
 }
@@ -709,9 +754,11 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 	}
 
 	// client_secret_basic (Authorization header) or client_secret_post (body).
-	// Presenting both is invalid_request per RFC 6749 §2.3.
+	// Presenting two methods is invalid_request per RFC 6749 §2.3; a body
+	// client_id that merely repeats the Basic id is not a second method.
 	clientID, clientSecret, viaBasic, basicErr := resolveBasicClientAuth(
-		input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	if basicErr != nil {
 		code, desc, status := extractOAuthError(basicErr)
 		out := &TokenOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}
@@ -791,7 +838,9 @@ func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*Intros
 	// (Authorization header) or client_secret_post (body). When credentials are
 	// presented they MUST verify; a bad secret is rejected with invalid_client.
 	// When absent, the existing internal/tenant-header access path is preserved.
-	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	if err == nil {
 		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	}
@@ -818,7 +867,9 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
 	// "always 200" contract holds (including for unknown/already-revoked tokens
 	// and anonymous internal-path callers).
-	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	if err == nil {
 		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	}

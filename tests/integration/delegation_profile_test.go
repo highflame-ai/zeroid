@@ -992,6 +992,126 @@ func TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes(t *testing.T) {
 	})
 }
 
+// TestIDJAG_RedeemingAgentIsCurrentActor: an ID-JAG redeemed with an
+// application_id names that identity as the current actor under rfc8693
+// (RFC 8693 §4.1), with the attributes token exchange gives its actor, while
+// `sub` stays the person. Legacy output and the synthetic carrier (no
+// application_id) carry no act.
+func TestIDJAG_RedeemingAgentIsCurrentActor(t *testing.T) {
+	upstreamIss := "https://corp-idp.act416.test"
+	federationAud := "https://zeroid.act416.test"
+	const mcpResource = "https://mcp-server.act416.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer: upstreamIss, JWKSURI: upstream.JWKSURL(), Audience: federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	client := registerOAuthClient(t, uid("act416-client"), []string{"tools:read"})
+
+	// The account is pinned by AllowedAccounts, so each case gets a project of
+	// its own: the token profile is a tenant setting, and switching the shared
+	// federation project would change the shape other tests see.
+	tenant := func(profile string) hrdTenant {
+		tn := hrdTenant{account: fedCfg.AccountID, project: uid("act416-proj")}
+		tn.headers = map[string]string{"X-Account-ID": tn.account, "X-Project-ID": tn.project}
+		if profile != "" {
+			resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": profile}, tn.headers)
+			require.Equal(t, http.StatusOK, resp.StatusCode, "set token_profile=%s", profile)
+			_ = resp.Body.Close()
+		}
+		return tn
+	}
+	// agent registers an application identity and returns its id, WIMSE URI
+	// and external_id.
+	agent := func(tn hrdTenant) (string, string, string) {
+		policyID := createRichCredentialPolicy(t, map[string]any{
+			"name":                 uid("act416-policy"),
+			"allowed_grant_types":  []string{"jwt_bearer"},
+			"allowed_scopes":       []string{"tools:read"},
+			"max_delegation_depth": 5,
+			"max_ttl_seconds":      3600,
+		}, tn.headers)
+		extID := uid("act416-agent")
+		resp := post(t, adminPath("/identities"), map[string]any{
+			"external_id":          extID,
+			"identity_type":        "agent",
+			"trust_level":          "unverified",
+			"owner_user_id":        "user-test-owner",
+			"credential_policy_id": policyID,
+		}, tn.headers)
+		require.Equal(t, http.StatusCreated, resp.StatusCode, "register %s", extID)
+		got := decode(t, resp)
+		_ = resp.Body.Close()
+		return got["id"].(string), got["wimse_uri"].(string), extID
+	}
+	redeem := func(tn hrdTenant, person, applicationID string) map[string]any {
+		now := time.Now()
+		idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+			"iss": upstreamIss, "aud": federationAud, "sub": person,
+			"client_id": client.ClientID, "jti": uid("act416-jti"),
+			"resource": mcpResource, "scope": "tools:read",
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		})
+		body := map[string]any{
+			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": idjag,
+			"account_id": tn.account, "project_id": tn.project,
+			"client_id": client.ClientID, "client_secret": client.ClientSecret,
+		}
+		if applicationID != "" {
+			body["application_id"] = applicationID
+		}
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		return decodeIssuedTokenClaims(t, resp.AccessToken)
+	}
+
+	t.Run("rfc8693 names the agent as the current actor", func(t *testing.T) {
+		tn := tenant("rfc8693")
+		appID, wimse, extID := agent(tn)
+		alice := uid("act416-alice")
+		claims := redeem(tn, alice, appID)
+
+		assert.Equal(t, alice, claims["sub"], "sub stays the person")
+		assert.Equal(t, "user", claims["principal_type"])
+		assert.Equal(t, client.ClientID, claims["client_id"])
+		assert.Equal(t, []string{wimse}, actChain(t, claims), "the agent is the single current actor")
+		act := claims["act"].(map[string]any)
+		assert.Equal(t, extID, act["external_id"])
+		assert.Equal(t, "agent", act["identity_type"])
+		assert.Equal(t, "unverified", act["trust_level"])
+		assert.NotContains(t, claims, "external_id", "the actor's attributes are not at the top level")
+		assert.NotContains(t, claims, "identity_type", "the actor's attributes are not at the top level")
+		assert.NotContains(t, claims, "trust_level", "the actor's attributes are not at the top level")
+	})
+
+	t.Run("rfc8693 without an application_id names no actor", func(t *testing.T) {
+		tn := tenant("rfc8693")
+		alice := uid("act416-alice")
+		claims := redeem(tn, alice, "")
+		assert.Equal(t, alice, claims["sub"])
+		assert.Equal(t, "user", claims["principal_type"])
+		assert.NotContains(t, claims, "act", "the synthetic carrier has no identity to name")
+	})
+
+	t.Run("legacy is unchanged", func(t *testing.T) {
+		tn := tenant("")
+		appID, _, extID := agent(tn)
+		alice := uid("act416-alice")
+		claims := redeem(tn, alice, appID)
+		assert.Equal(t, alice, claims["sub"])
+		assert.NotContains(t, claims, "act", "legacy emits no act for an ID-JAG")
+		assert.NotContains(t, claims, "principal_type")
+		assert.Equal(t, extID, claims["external_id"], "legacy keeps the identity's attributes at the top level")
+		assert.Equal(t, "agent", claims["identity_type"])
+	})
+}
+
 // TestWorkloadSubject_EmptyCeilingCountedNotRefused pins the ceiling rule's
 // phase-1 behaviour (P1): an agent with no scope ceiling that names a scope is
 // still issued it — the rule only counts it (zeroid_workload_unbounded_scope;
