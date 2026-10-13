@@ -79,7 +79,7 @@ external_issuers:
     claim_mapping:
       user_id: sub # required
       email: email # optional
-    allowed_accounts: ["acct-prod"] # empty = any tenant
+    allowed_accounts: ["acct-prod"] # REQUIRED, non-empty; an empty list is refused at startup
     propagate_claims: ["auth_time", "acr", "amr"]
 ```
 
@@ -110,6 +110,49 @@ For each request:
 `TrustedServiceValidator` is not consulted on this path — the JWKS
 signature check, issuer allowlist, and audience binding are the trust
 proof.
+
+## Enterprise-Managed Authorization (ID-JAG)
+
+The same `external_issuers` entries also back the MCP Enterprise-Managed
+Authorization profile (draft-ietf-oauth-identity-assertion-authz-grant). The
+client redeems an Identity Assertion JWT Authorization Grant that its
+enterprise IdP issued with `aud` = ZeroID's issuer.
+
+### Request shape
+
+```
+POST /oauth2/token
+  grant_type  = urn:ietf:params:oauth:grant-type:jwt-bearer
+  assertion   = <ID-JAG, JWS typ oauth-id-jag+jwt>
+  + client authentication as registered (client_secret_basic / _post, or
+    private_key_jwt with client_assertion + client_assertion_type)
+  resource    = <optional; narrows the ID-JAG's resource claim>
+  application_id = <optional>
+```
+
+This is the request draft §4.4 and the MCP extension §5 define. It carries
+**no `account_id` or `project_id`**, and none is needed.
+
+### How the tenant is derived
+
+The tenant is derived from server-side facts and never chosen by the caller:
+
+- the **account** must be one of the issuer's `allowed_accounts`, and
+- the **account and project** come from the authenticated client's
+  registration: the identity its `identity_id` links to.
+
+So a client that redeems ID-JAGs must be created with `identity_id` set to an
+identity in the tenant its tokens belong to. A client that links no identity,
+or links one outside the issuer's `allowed_accounts`, or one that is not active,
+is refused with `invalid_grant`. An issuer with several `allowed_accounts` never
+lets the request pick one.
+
+`account_id` and `project_id` are still accepted for compatibility, but they
+are only checked: when present, each must equal the derived value, otherwise
+the request is refused with `invalid_grant`.
+
+The ID-JAG's `client_id` claim must equal the authenticated client, and the
+grant is single-use (`jti`).
 
 ## Trusted-service broker (fallback)
 
