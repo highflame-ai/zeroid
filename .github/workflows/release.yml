@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release (vX.Y.Z). Empty uses svu's next version."
+        description: "Version to release (vX.Y.Z). Empty uses the next version this module path can tag."
         required: false
         type: string
   push:
@@ -84,10 +84,16 @@ jobs:
         shell: bash
         run: |-
           go install github.com/caarlos0/svu/v3@latest
-          EXPECTED="$(svu next)"
+          RAW="$(svu next)"
+          # Same version cut-release already published. A feat!: makes svu
+          # ask for v2, which Go rejects on a module path with no /v2 suffix.
+          # Comparing the tag to raw svu next would fail this job after the
+          # tag already exists.
+          EXPECTED="$(make -s --no-print-directory releasable-version)"
           ACTUAL="${{ env.RELEASE_TAG }}"
           echo "Published tag : ${ACTUAL}"
-          echo "svu next      : ${EXPECTED}"
+          echo "svu next      : ${RAW}"
+          echo "releasable    : ${EXPECTED}"
           # sort -V picks the highest of the two; if EXPECTED is
           # higher, ACTUAL is too low and a feat: was likely missed.
           HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${ACTUAL}" | sort -V | tail -1)"
@@ -376,17 +382,19 @@ jobs:
           git fetch origin --tags --force
           go install github.com/caarlos0/svu/v3@latest
 
-          EXPECTED="$(svu next)"
+          RAW="$(svu next)"
           CURRENT="$(svu current)"
+          EXPECTED="$(make -s --no-print-directory releasable-version)"
           echo "svu current : ${CURRENT}"
-          echo "svu next    : ${EXPECTED}"
+          echo "svu next    : ${RAW}"
+          echo "releasable  : ${EXPECTED}"
 
           if [[ -n "${INPUT_VERSION}" ]] && ! printf '%s' "${INPUT_VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::Version must match vMAJOR.MINOR.PATCH; got ${INPUT_VERSION}"
             exit 1
           fi
           if [[ -z "${INPUT_VERSION}" ]]; then
-            if [[ "${EXPECTED}" == "${CURRENT}" ]]; then
+            if [[ "${RAW}" == "${CURRENT}" ]]; then
               echo "::error::No feat: or fix: commits since ${CURRENT}. Nothing to release."
               exit 1
             fi
@@ -405,6 +413,16 @@ jobs:
             exit 1
           fi
           echo "Valid version format: ${VERSION}"
+
+          VER_MAJOR="${VERSION#v}"
+          VER_MAJOR="${VER_MAJOR%%.*}"
+          EXP_MAJOR="${EXPECTED#v}"
+          EXP_MAJOR="${EXP_MAJOR%%.*}"
+          if [[ "${VER_MAJOR}" -ge 2 && "${EXP_MAJOR}" -lt 2 ]]; then
+            echo "::error::${VERSION} is not a valid Go module version for this path. Go only allows v0 or v1 until the module path ends in /v${VER_MAJOR}."
+            echo "::error::Leave the version empty. This release is ${EXPECTED}."
+            exit 1
+          fi
 
           if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
             echo "::error::Tag ${VERSION} already exists. Refusing to move it."
