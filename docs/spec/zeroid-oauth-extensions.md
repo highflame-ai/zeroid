@@ -509,6 +509,24 @@ control. Rotation of an already-enrolled key additionally **REQUIRES** a
 new — so possession of a stolen access token alone cannot swap an enrolled
 key.
 
+An administrator can also supply the key as `public_key_pem` on
+`POST /agents/register`, `POST /identities`, `PATCH /agents/registry/{id}`
+(admin recovery, no proof-of-possession) and `PATCH /identities/{id}`. On every
+path the value **MUST** be a PEM `PUBLIC KEY` block holding an SPKI EC P-256
+key; anything else (an RSA or P-384 key, a private-key block, non-PEM text) is
+rejected with `400` and a detail of the form `invalid public_key_pem: must be a
+PEM-encoded P-256 (ES256) public key: <reason>`. On the two `PATCH` paths an
+empty or omitted value leaves the enrolled key unchanged; no admin path clears
+one.
+
+The agent registry (`GET /agents/registry`, `GET /agents/registry/{id}`, and
+every agent write response, including `POST /agents/self/public-key`) never
+returns the PEM. It reports enrollment as `has_public_key` (boolean, always
+present) and `public_key_thumbprint`: the RFC 7638 JWK SHA-256 thumbprint of the
+enrolled key, base64url without padding — the same form as a DPoP `cnf.jkt`,
+and **not** the SPKI-DER hash used for `nkt` above — omitted when no key is
+enrolled. `GET /identities/{id}` still returns `public_key_pem` itself.
+
 ### 5.4 `mission_id` — delegation-tree identifier
 
 `mission_id` is an opaque, stable identifier shared by every credential in a

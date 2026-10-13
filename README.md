@@ -1000,6 +1000,10 @@ only when `Server.EnsureClient` is called with a marked context.
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 
+`public_key_pem` on the agent and identity write paths must be an SPKI EC P-256 (ES256) key; anything else is a `400` naming the reason.
+The agent registry never returns the PEM: each agent carries `has_public_key` and, when a key is enrolled, `public_key_thumbprint` (its RFC 7638 JWK SHA-256 thumbprint, base64url).
+See [§5.3 of the extensions spec](docs/spec/zeroid-oauth-extensions.md#53-nhi-delegation-requires-an-actor-proof-of-possession) for the details.
+
 Full interactive docs at `GET /docs` when running.
 
 ---

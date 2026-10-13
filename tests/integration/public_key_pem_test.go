@@ -5,8 +5,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -99,4 +102,76 @@ func TestPublicKeyPEM_EmptyLeavesKeyUnchanged(t *testing.T) {
 
 	got := decode(t, get(t, adminPath("/identities/"+identity.ID), adminHeaders()))
 	assert.Equal(t, keyPEM, got["public_key_pem"])
+}
+
+// jwkThumbprintP256 is an independent RFC 7638 computation for a P-256 key.
+func jwkThumbprintP256(t *testing.T, k *ecdsa.PrivateKey) string {
+	t.Helper()
+	x := make([]byte, 32)
+	y := make([]byte, 32)
+	k.PublicKey.X.FillBytes(x)
+	k.PublicKey.Y.FillBytes(y)
+	canonical := fmt.Sprintf(`{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}`,
+		base64.RawURLEncoding.EncodeToString(x), base64.RawURLEncoding.EncodeToString(y))
+	sum := sha256.Sum256([]byte(canonical))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// TestAgentRegistry_ReportsEnrolledKey: every agent registry response says
+// whether a delegation key is enrolled and which one, without returning the PEM.
+func TestAgentRegistry_ReportsEnrolledKey(t *testing.T) {
+	key := generateKey(t)
+	want := jwkThumbprintP256(t, key)
+
+	withKey := uid("pk-reg-with")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":           withKey,
+		"external_id":    withKey,
+		"created_by":     "test-user",
+		"public_key_pem": ecPublicKeyPEM(t, key),
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	registered := decode(t, resp)["identity"].(map[string]any)
+	withKeyID := registered["id"].(string)
+
+	without := registerAgent(t, uid("pk-reg-without"))
+
+	assertKey := func(t *testing.T, agent map[string]any, has bool, thumbprint string) {
+		t.Helper()
+		assert.Equal(t, has, agent["has_public_key"])
+		if thumbprint == "" {
+			assert.NotContains(t, agent, "public_key_thumbprint")
+		} else {
+			assert.Equal(t, thumbprint, agent["public_key_thumbprint"])
+		}
+		assert.NotContains(t, agent, "public_key_pem", "the agent registry never returns the PEM")
+	}
+
+	t.Run("register response", func(t *testing.T) {
+		assertKey(t, registered, true, want)
+	})
+	t.Run("get", func(t *testing.T) {
+		assertKey(t, decode(t, get(t, adminPath("/agents/registry/"+withKeyID), adminHeaders())), true, want)
+		assertKey(t, decode(t, get(t, adminPath("/agents/registry/"+without.AgentID), adminHeaders())), false, "")
+	})
+	t.Run("list", func(t *testing.T) {
+		body := decode(t, get(t, adminPath("/agents/registry?search=pk-reg-&limit=100"), adminHeaders()))
+		seen := map[string]map[string]any{}
+		for _, a := range body["agents"].([]any) {
+			agent := a.(map[string]any)
+			seen[agent["id"].(string)] = agent
+		}
+		require.Contains(t, seen, withKeyID)
+		require.Contains(t, seen, without.AgentID)
+		assertKey(t, seen[withKeyID], true, want)
+		assertKey(t, seen[without.AgentID], false, "")
+	})
+	t.Run("patch force-set", func(t *testing.T) {
+		next := generateKey(t)
+		resp := doRequest(t, http.MethodPatch, adminPath("/agents/registry/"+without.AgentID), map[string]any{
+			"public_key_pem": ecPublicKeyPEM(t, next),
+		}, adminHeaders())
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assertKey(t, decode(t, resp), true, jwkThumbprintP256(t, next))
+	})
 }
