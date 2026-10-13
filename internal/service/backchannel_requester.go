@@ -161,8 +161,9 @@ func stampAuthorizationDetails(row *domain.BackchannelAuthRequest) (json.RawMess
 }
 
 // requestingChainIssue adjusts a CIBA issuance for a row that carries a
-// requesting chain: the token keeps the chain's subject, act (as issued,
-// nested actors included), identity claims and DPoP key binding, carries
+// requesting chain: the token keeps the chain's subject, actors (nested
+// actors included, in the shape of the profile it is minted under), identity
+// claims and DPoP key binding, carries
 // nothing about the approver, never holds a scope the requesting token does
 // not (see requestingChainScopes), and never outlives it. When the requesting
 // token belongs to an identity, that identity's credential policy governs the
@@ -176,8 +177,8 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.UserEmail = ""
 	req.UserName = ""
 	req.ParentJTI = row.RequestingJTI
+	var act map[string]any
 	if row.RequestingAct != "" {
-		var act map[string]any
 		if err := json.Unmarshal([]byte(row.RequestingAct), &act); err != nil {
 			return true, oauthServerError("failed to decode the requesting token's act claim", err)
 		}
@@ -298,6 +299,13 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	}
 
 	req.Identity = ident
+	// The rfc8693 profile carries the requesting identity's attributes in the
+	// outermost act. They are re-derived from its record rather than read from
+	// the chain's act, which is in the legacy shape when the chain was minted
+	// before the tenant switched profile. A root (depth 0) has no actor chain.
+	if cred.DelegationDepth > 0 {
+		req.Actors = requestingChainActors(ident, act, p.Sub)
+	}
 	req.UserGrantBounded = userGrant
 	// Enforced above against the chain's grant type; the chokepoint would
 	// re-check it against the CIBA grant type instead. The policy still
@@ -306,6 +314,45 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.IdentityPolicyID = ""
 	req.EnforcedIdentityPolicy = policy
 	return true, nil
+}
+
+// requestingChainActors returns the RFC 8693 §4.1 actor chain of a token
+// approved into a delegated chain: the requesting identity as the current
+// actor, with its attributes from its record, then the chain's prior actors
+// taken from act, the requesting token's act claim as issued.
+//
+// An act in the rfc8693 shape has the current actor outermost and the prior
+// actors nested under it; they carry over unchanged. An act in the legacy
+// shape is a single level naming the agent that delegated or an end user. The
+// agent (a WIMSE URI) becomes the one prior actor unless it is the chain's
+// principal, which is `sub` and never an actor; an end user never does.
+func requestingChainActors(ident *domain.Identity, act map[string]any, principalSub string) []domain.Actor {
+	actors := []domain.Actor{{
+		Sub:          ident.WIMSEURI,
+		IdentityType: string(ident.IdentityType),
+		TrustLevel:   string(ident.TrustLevel),
+		ExternalID:   ident.ExternalID,
+	}}
+	if act == nil {
+		return actors
+	}
+	if !carriesActorAttributes(act) {
+		sub, _ := act["sub"].(string)
+		if strings.HasPrefix(sub, "spiffe://") && sub != principalSub && sub != ident.WIMSEURI {
+			actors = append(actors, domain.Actor{Sub: sub})
+		}
+		return actors
+	}
+	prior, _ := act["act"].(map[string]any)
+	for prior != nil && len(actors) < domain.MaxActorChainDepth {
+		sub, _ := prior["sub"].(string)
+		if sub == "" {
+			break
+		}
+		actors = append(actors, domain.Actor{Sub: sub})
+		prior, _ = prior["act"].(map[string]any)
+	}
+	return actors
 }
 
 // boundAnchorGates applies, before the burn, the checks IssueCredential makes
