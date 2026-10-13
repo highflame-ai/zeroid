@@ -70,6 +70,47 @@ func TestExtractMappedClaimString(t *testing.T) {
 	})
 }
 
+// TestRefuseWorkloadSubject covers the workload markers the ID-token exchange
+// refuses, so a machine token is never minted as principal_type=user, and the
+// person shapes it must keep accepting.
+func TestRefuseWorkloadSubject(t *testing.T) {
+	cases := []struct {
+		name    string
+		claims  map[string]any
+		userID  string
+		refused bool
+	}{
+		{"person sub", map[string]any{"sub": "00uABC"}, "00uABC", false},
+		{"Entra delegated token (idtyp=user)", map[string]any{"sub": "abc", "idtyp": "user"}, "abc", false},
+		{"Entra app-only token", map[string]any{"sub": "sp-object-id", "idtyp": "app"}, "sp-object-id", true},
+		{"idtyp compared case-insensitively", map[string]any{"sub": "x", "idtyp": "App"}, "x", true},
+		{"Kubernetes service account sub", map[string]any{"sub": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
+		{"Kubernetes service account in mapped user_id only", map[string]any{"sub": "opaque", "uid": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
+		{"SPIFFE ID sub", map[string]any{"sub": "spiffe://example.org/ns/prod/sa/api"}, "spiffe://example.org/ns/prod/sa/api", true},
+		{"SPIFFE scheme compared case-insensitively", map[string]any{"sub": "SPIFFE://example.org/w"}, "SPIFFE://example.org/w", true},
+		{"SPIFFE ID in sub, person in mapped user_id", map[string]any{"sub": "spiffe://example.org/w", "oid": "person"}, "person", true},
+		{"lookalike that is not a marker", map[string]any{"sub": "user:system:serviceaccount:x"}, "user:system:serviceaccount:x", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseWorkloadSubject(tc.claims, tc.userID)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("expected a person token to be accepted, got %v", err)
+				}
+				return
+			}
+			var oauthErr *OAuthError
+			if !errors.As(err, &oauthErr) {
+				t.Fatalf("expected *OAuthError, got %T: %v", err, err)
+			}
+			if oauthErr.Code != "invalid_grant" || oauthErr.HTTPStatus != http.StatusBadRequest {
+				t.Errorf("got %s/%d, want invalid_grant/400", oauthErr.Code, oauthErr.HTTPStatus)
+			}
+		})
+	}
+}
+
 // TestCheckExternalIDTokenAlg verifies that the algorithm gate refuses
 // none/HS* family tokens up front and respects the configured allow-list.
 //
