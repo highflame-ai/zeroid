@@ -146,10 +146,9 @@ func TestAuthorizePOST_OtherResolverErrorsUnchanged(t *testing.T) {
 	require.Equal(t, "invalid_client", body["error"])
 }
 
-// A self-asserted (CIMD) client with a remote redirect_uri, on a deployment with
-// no vetted publishers, is a destination ZeroID declines to redirect to — so the
-// denial is reported as JSON, exactly as every other post-3.5 failure is for
-// that client. A loopback redirect_uri on the same server is redirected.
+// A self-asserted (CIMD) client's denial is redirected to its validated
+// redirect_uri, remote or loopback: cimd.allowed_domains is enforced at document
+// resolution (#412), so a client that reached the resolver was admitted.
 func TestAuthorize_AccessDeniedSelfAssertedClient(t *testing.T) {
 	const remoteRedirect = "https://app.cimd-deny.example.test/cb"
 
@@ -176,16 +175,11 @@ func TestAuthorize_AccessDeniedSelfAssertedClient(t *testing.T) {
 		}
 	}
 
-	t.Run("remote redirect_uri gets JSON", func(t *testing.T) {
+	t.Run("remote redirect_uri is redirected", func(t *testing.T) {
 		resp := cimdAuthorize(t, srvURL, form(remoteRedirect))
 
-		require.Equal(t, http.StatusForbidden, resp.StatusCode)
-		require.Empty(t, resp.Header.Get("Location"),
-			"an unvetted self-asserted destination must not be redirected to")
-
-		var body map[string]string
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
-		require.Equal(t, "access_denied", body["error"])
+		q := requireAccessDeniedRedirect(t, resp, remoteRedirect, cimdTestIssuer)
+		require.Equal(t, "cimd-deny-state", q.Get("state"))
 	})
 
 	t.Run("loopback redirect_uri is redirected", func(t *testing.T) {

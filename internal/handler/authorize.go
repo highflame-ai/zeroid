@@ -716,10 +716,12 @@ const accessDeniedDescription = "the resource owner denied the request"
 // reason for keeping POST on JSON (a CLI that parses JSON errors) does not apply:
 // a CLI resolver never returns this sentinel, so no existing caller sees a change.
 //
-// refusesRedirectTo still governs, identically to failAuthorize: a self-asserted
-// client with an unvetted remote redirect_uri gets a JSON access_denied body
-// instead of a Location. 403 rather than 401 on that path because nothing failed
-// to authenticate — the owner was identified and said no.
+// refusesRedirectTo still governs, identically to failAuthorize: where it
+// refuses the destination, the answer is a JSON access_denied body instead of a
+// Location. 403 rather than 401 on that path because nothing failed to
+// authenticate — the owner was identified and said no. cimd.allowed_domains is
+// not a redirect gate here: it is enforced once, at document resolution, so a
+// self-asserted client that reached a resolver has already been admitted.
 func (a *API) denyAuthorize(w http.ResponseWriter, req *service.AuthorizeRequest, client *domain.OAuthClient) {
 	if a.redirectAuthorizeError(w, req, client, oautherror.AccessDenied, accessDeniedDescription) {
 		return

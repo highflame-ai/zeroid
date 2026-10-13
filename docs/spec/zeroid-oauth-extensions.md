@@ -227,8 +227,8 @@ a conformant JWT-SVID (JWT-SVID
 §2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
 not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
 
-Each tenant issues in one **token profile** (Section 4.4): `legacy`, the
-default, or `rfc8693`, which adopts the RFC 8693 delegation semantics. Claims
+Each tenant issues in one **token profile** (Section 4.4): `rfc8693`, the
+default, which adopts the RFC 8693 delegation semantics, or `legacy`. Claims
 below are common to both unless marked.
 
 ### 4.1 Tenancy and grant claims (always present)
@@ -314,7 +314,7 @@ actor. The person behind a call is `sub` when `principal_type` is `user`;
 otherwise there is none. The agent is `act.sub`, or `sub` when there is no
 `act`. Nested actors are audit history, not grounds for access.
 
-**`legacy` profile (the default).** `act` is a single-level object
+**`legacy` profile (opt-in).** `act` is a single-level object
 `{"sub": "<x>"}` whose meaning depends on the grant: on an exchanged token it
 is the parent's `sub` (the delegating agent, or the person after the first hop),
 and `sub` is the actor; on an `api_key` token it is the key's creator. The full
@@ -324,6 +324,7 @@ Tokens are told apart by `principal_type`, which only the `rfc8693` profile
 emits.
 
 The profile is a per-tenant setting (`PUT /tenant-settings`, `token_profile`).
+A tenant that has not set one is on `rfc8693`.
 Switching a tenant to `rfc8693` revokes its user-subject access tokens
 longer-lived than the short default, cascading to their descendants.
 
@@ -1213,49 +1214,27 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Error reporting is not redirected to an unvetted remote destination
+### 12.5 Error reporting and redirects for CIMD clients
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
-redirecting to the client's registered `redirect_uri`. ZeroID does that for
-registered clients and **deliberately does not for CIMD clients whose publishing
-host is not on an allow-list**, which answer with an RFC 6749 §5.2 JSON body
-instead. The interactive-authentication redirect
-(`ErrPrincipalInteractionRequired`) is likewise refused for them, as is the
-`access_denied` redirect for a resource owner's explicit denial
-(`ErrPrincipalAccessDenied`), which otherwise is issued on POST as well as GET.
+redirecting to the client's `redirect_uri`. ZeroID does that for registered and
+CIMD clients alike, once the client and `redirect_uri` have been validated (step
+3.5 of `/oauth2/authorize`). The interactive-authentication redirect
+(`ErrPrincipalInteractionRequired`) and the `access_denied` redirect for a
+resource owner's explicit denial (`ErrPrincipalAccessDenied`, issued on POST as
+well as GET) follow the same rule. Only a request with no resolvable client is
+answered with an RFC 6749 §5.2 JSON body instead.
 
-The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
-self-asserted, and with no `allowed_domains` allow-list (Section 12.7, the default)
-any host may publish a document naming any destination — so the redirect target is
-attacker-chosen. Honouring §4.1.2.1 there yields an unauthenticated open redirect
-from the authorization server's own origin, because the failure being reported is
-precisely "no credential was presented".
+`cimd.allowed_domains` (Section 12.7) is enforced in exactly one place: document
+resolution. A host that is not listed never resolves, so a CIMD client that reaches
+a redirect has already been admitted by the deployer's policy; gating the redirect
+again would ask the same question twice.
 
-Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, and
-both redirects apply again — the error redirect and the interactive-login one,
-which are the same check. The discriminator is registration provenance
-(`registration_source`) qualified by that allow-list, not the CIMD mechanism.
-
-A loopback `http://` or private-use `redirect_uri` is **exempt from both
-refusals**, whatever the allow-list says. Those destinations resolve on the
-requester's own device, so the redirect has no remote hop and no third-party
-recipient — the property RFC 8252 §7.3 already relies on to accept such callbacks
-from unregistered native clients. The carve-out's premise is a remote
-attacker-chosen destination and does not hold for them.
-
-This is what makes a browser-driven CIMD client — the MCP 2025-11-25 case —
-completable. The ordinary desktop/CLI client publishes loopback callbacks and is
-therefore unaffected: it reaches the login surface and completes with no
-allow-list. A deployment serving CIMD clients whose callbacks are remote
-`https://` URLs **MUST** set `cimd.allowed_domains`, or those clients can never
-sign a user in.
-
-`allowed_domains` is deployment-wide, with no tenant dimension, so this
-re-enablement is meaningful only where the deployment serves a single tenant. A
-multi-tenant deployment cannot scope it per `(account_id, project_id)` — and the
-tenant is unknown at the point a CIMD document is resolved, since resolution
-precedes principal resolution by design (Section 12.5's whole premise). See
-zeroid#286.
+What the open-ecosystem default gives up: with an empty allow-list, any public
+https host may publish a document naming any destination, so an unauthenticated
+caller can make `/oauth2/authorize` emit a §4.1.2.1 error redirect to a host they
+chose. That is the open-redirect surface an open ecosystem has. A deployer who
+does not want it sets `cimd.allowed_domains`.
 
 ### 12.6 Caching
 

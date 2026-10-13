@@ -236,7 +236,11 @@ cimd:
 
 # Direct OIDC IdP federation (issue #88).
 # Each entry registers a trusted upstream issuer for RFC 8693 token exchange
-# with subject_token_type=urn:ietf:params:oauth:token-type:id_token.
+# with subject_token_type=urn:ietf:params:oauth:token-type:id_token, and for
+# ID-JAG redemption (jwt-bearer, MCP Enterprise-Managed Authorization). On the
+# ID-JAG grant the tenant is derived, not sent: the account must be in
+# allowed_accounts AND be the tenant of the identity the authenticated client's
+# registration links to (identity_id). See docs/identity-model.md.
 # When empty (default), only the broker path remains available.
 # external_issuers:
 #   - issuer:           "https://auth.example.okta.com"

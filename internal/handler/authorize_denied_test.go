@@ -81,13 +81,13 @@ func TestDenyAuthorize_NoStateWhenNoneSent(t *testing.T) {
 	}
 }
 
-// The self-asserted carve-out applies unchanged: an unvetted remote destination
-// gets a JSON access_denied, never a Location.
+// Where refusesRedirectTo refuses the destination, the denial is a JSON
+// access_denied, never a Location.
 func TestDenyAuthorize_RefusedDestinationGetsJSON(t *testing.T) {
 	api := &API{issuer: "https://as.example.test"}
 
+	// The only refused destination left after #412: no client to reason about.
 	for name, client := range map[string]func() *domain.OAuthClient{
-		"self-asserted client, remote redirect_uri": func() *domain.OAuthClient { return cimdClient() },
 		"nil client": func() *domain.OAuthClient { return nil },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -147,5 +147,35 @@ func TestFailAuthorize_POSTStillJSON(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
+// A self-asserted client's remote redirect_uri is redirected to: the publisher
+// was admitted at document resolution (cimd.allowed_domains), so the denial
+// travels to the client like any other §4.1.2.1 error.
+func TestDenyAuthorize_SelfAssertedRemoteIsRedirected(t *testing.T) {
+	api := &API{issuer: "https://as.example.test"}
+	req := saRequest()
+	client := cimdClient()
+	client.RedirectURIs = []string{req.RedirectURI}
+
+	rec := httptest.NewRecorder()
+	api.denyAuthorize(rec, req, client)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rec.Code)
+	}
+
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("Location did not parse: %v", err)
+	}
+
+	if got := loc.Query().Get("error"); got != oautherror.AccessDenied {
+		t.Errorf("error = %q, want access_denied", got)
+	}
+
+	if got := loc.Query().Get("iss"); got != "https://as.example.test" {
+		t.Errorf("iss = %q", got)
 	}
 }

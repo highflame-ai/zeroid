@@ -145,7 +145,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if req.ClientID == "" {
 		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
 	}
-	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	// cimdFallback=false: this path does not gate on the client's declared
+	// grant_types, so a self-asserted document must not resolve here.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +173,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
 	if !ok || userID == "" {
 		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", cfg.ClaimMapping["user_id"]))
+	}
+	if err := refuseWorkloadSubject(rawClaims, userID); err != nil {
+		return nil, err
 	}
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
@@ -523,6 +528,34 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 		return tv.String(), true
 	}
 	return "", false
+}
+
+// refuseWorkloadSubject rejects a subject_token that names a workload rather
+// than a person. This grant mints with the mapped user_id as the subject, so the
+// token carries principal_type=user, which resource servers read as "a person
+// authorized this chain". A configured issuer can also sign tokens for machines,
+// and exchanged here one would pass any check that requires a human behind the
+// chain. Workloads authenticate as clients instead (RFC 7523 §2.2), which mints
+// a workload principal.
+//
+// Until an issuer's kind is part of its configuration, this recognizes the
+// well-known workload shapes: an Entra app-only token (idtyp=app), a Kubernetes
+// service-account subject, and a SPIFFE ID. Both `sub` and the mapped user_id
+// are checked, since the mapping may point at a claim other than `sub`.
+func refuseWorkloadSubject(claims map[string]any, userID string) error {
+	if idtyp, _ := claims["idtyp"].(string); strings.EqualFold(idtyp, "app") {
+		return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an app-only token (idtyp=app); this grant accepts person tokens only")
+	}
+	sub, _ := claims["sub"].(string)
+	for _, id := range []string{sub, userID} {
+		if strings.HasPrefix(id, "system:serviceaccount:") {
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token names a Kubernetes service account; this grant accepts person tokens only")
+		}
+		if len(id) >= len("spiffe://") && strings.EqualFold(id[:len("spiffe://")], "spiffe://") {
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token names a SPIFFE ID; this grant accepts person tokens only")
+		}
+	}
+	return nil
 }
 
 // extractMappedClaimStrings reads a claim that may be either a space-delimited
