@@ -157,6 +157,10 @@ type cimdMetadataDocument struct {
 	// RFC 7591 §2 permits exactly one of the two.
 	JWKS    json.RawMessage `json:"jwks"`
 	JWKSURI string          `json:"jwks_uri"`
+	// draft-ietf-oauth-identity-assertion-authz-grant-04 §8: the authorization
+	// grant profiles the client implements. Read only to apply that section's
+	// grant_types rule; see synthesizeCIMDClient.
+	AuthorizationGrantProfiles []string `json:"authorization_grant_profiles_supported"`
 }
 
 // cimdAllowedAuthMethods are the token_endpoint_auth_method values a CIMD
@@ -175,8 +179,19 @@ var cimdAllowedAuthMethods = map[string]bool{
 
 // cimdAllowedGrantTypes is the grant-type allow-list for CIMD clients. CIMD is
 // the interactive-onboarding path, so authorization_code (and its refresh
-// companion) are the only sensible grants — client_credentials / token-exchange
+// companion) are the sensible grants — client_credentials / token-exchange
 // clients register through the admin or RFC 7591 path instead.
+//
+// jwt-bearer is the one addition, and only for ID-JAG redemption (MCP
+// Enterprise-Managed Authorization §5: an unregistered client "can use its
+// Client ID Metadata Document as its client ID"). It does not let a CIMD client
+// mint on its own say-so. idJAGBearer is the only place a CIMD client can
+// spend it, and there it also needs an assertion the enterprise IdP signed
+// naming this exact client_id, private_key_jwt client authentication against
+// the document's own key, and a tenant derived from an (issuer, client_id) →
+// identity binding (ADR 0042 D6). That binding does not exist yet, so today the
+// tenant derivation refuses every CIMD client outright (cimdClientTenant). The
+// NHI self-signed jwt-bearer path never reads a client at all.
 //
 // It is applied as an INTERSECTION over the document's list, not as a gate on
 // it. The distinction is the whole of zeroid#344: the invariant worth keeping is
@@ -189,26 +204,39 @@ var cimdAllowedAuthMethods = map[string]bool{
 // because only the first is unconditional:
 //
 //  1. effectiveCIMDGrantTypes filters through this map by exact string match, so
-//     a synthesized client's GrantTypes is PROVABLY a subset of these two
-//     values. No document can put a third string there. This holds regardless of
-//     what any consumer does with it.
-//  2. Reachability. Only three call sites can ever yield a CIMD-synthesized
-//     client — resolveClientRegistryOrCIMD is called from IssueAuthCode, the
-//     authorization_code exchange, and the refresh_token rotation, and nowhere
-//     else. The other six token-endpoint dispatch arms (jwt-bearer,
-//     token-exchange, api_key, CIBA, ID-JAG, custom grants via RegisterGrant)
-//     either resolve registry-only or never read a client at all, so a CIMD
-//     client_id buys nothing on them.
+//     a synthesized client's GrantTypes is PROVABLY a subset of these three
+//     values. No document can put a fourth string there. This holds regardless
+//     of what any consumer does with it.
+//  2. Reachability. resolveClientRegistryOrCIMD is called from IssueAuthCode,
+//     the authorization_code exchange, the refresh_token rotation, and
+//     authenticateRegisteredClient, and nowhere else. The last resolves a CIMD
+//     client only when its caller opts in, and the only caller that does is
+//     ID-JAG redemption, which requires jwt-bearer in the kept set. The other
+//     token-endpoint dispatch arms (NHI jwt-bearer, token-exchange, api_key,
+//     client_credentials, CIBA, custom grants via RegisterGrant) either resolve
+//     registry-only or never read a client at all, so a CIMD client_id buys
+//     nothing on them.
 //
 // (2) is the contingent half: a future grant that BOTH resolves through
 // resolveClientRegistryOrCIMD AND derives authority from the client would not be
 // covered by any grant-type check, because most arms have none. A ratchet test
-// (TestCIMDClientReachabilityIsBounded) fails if a fourth call site appears, so
-// that assumption cannot rot silently.
+// (TestCIMDClientReachabilityIsBounded) fails if a new call site appears, so
+// that assumption cannot rot silently. The fourth call site,
+// authenticateRegisteredClient, resolves a CIMD client only for a caller that
+// opts in, and TestCIMDDirectAuthOptInIsBounded pins which callers do: today,
+// only idJAGBearer, which gates on jwt-bearer being in the kept set.
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
+	grantTypeJWTBearerURN:                     true,
 }
+
+// grantTypeJWTBearerURN and grantTypeTokenExchangeURN are the RFC 7523 / RFC
+// 8693 grant type URNs as they appear in client metadata grant_types.
+const (
+	grantTypeJWTBearerURN     = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+	grantTypeTokenExchangeURN = "urn:ietf:params:oauth:grant-type:token-exchange"
+)
 
 // cimdCacheEntry memoizes one resolution outcome — a synthesized client on
 // success, the resolution error on failure (negative caching, short TTL).
@@ -792,6 +820,38 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 	return kept, dropped
 }
 
+// applyIDJAGProfileGrantRule enforces draft-ietf-oauth-identity-assertion-
+// authz-grant-04 §8 on a document that claims the ID-JAG profile: "A client
+// that includes urn:ietf:params:oauth:grant-profile:id-jag in
+// authorization_grant_profiles_supported for this specification MUST also
+// include both urn:ietf:params:oauth:grant-type:token-exchange and
+// urn:ietf:params:oauth:grant-type:jwt-bearer in its grant_types".
+//
+// A document that claims the profile without both grants contradicts itself
+// about how it redeems an ID-JAG, so jwt-bearer is withdrawn from the kept set
+// and reported as dropped. Narrowed, not rejected, for the same reason as
+// effectiveCIMDGrantTypes: the document is published to every AS at once, and
+// its authorization_code use here is unaffected. token-exchange itself is
+// never kept; the client spends it at its IdP, not here.
+func applyIDJAGProfileGrantRule(doc *cimdMetadataDocument, kept, dropped []string) ([]string, []string) {
+	if !slices.Contains(doc.AuthorizationGrantProfiles, idJAGGrantProfile) {
+		return kept, dropped
+	}
+	// Checked against the document's DECLARED grant_types, not kept: §8's MUST
+	// is on the client's declaration, and token-exchange is never in kept, so
+	// checking kept here would withdraw jwt-bearer from every conformant
+	// document too.
+	if slices.Contains(doc.GrantTypes, grantTypeTokenExchangeURN) && slices.Contains(doc.GrantTypes, grantTypeJWTBearerURN) {
+		return kept, dropped
+	}
+	i := slices.Index(kept, grantTypeJWTBearerURN)
+	if i < 0 {
+		return kept, dropped
+	}
+	kept = slices.Delete(slices.Clone(kept), i, i+1)
+	return kept, append(dropped, grantTypeJWTBearerURN)
+}
+
 // synthesizeCIMDClient validates the document against the fetch URL and turns it
 // into an ephemeral public OAuth client. Pure (no I/O, no logging) so it is
 // unit-testable in isolation. `now` timestamps the synthesized record.
@@ -838,7 +898,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// client is more AUTHENTICATED, not more AUTHORIZED. Its authority is
 	// bounded by exactly the two things that bounded it before, neither of which
 	// this touches — cimdAllowedGrantTypes (a provable subset of
-	// {authorization_code, refresh_token}) and the three-call-site reachability
+	// {authorization_code, refresh_token, jwt-bearer}) and the reachability
 	// bound that TestCIMDClientReachabilityIsBounded pins. In particular
 	// client_credentials stays refused; granting it to a self-asserted client is
 	// zeroid#266 and is a genuinely different question, because it removes the
@@ -874,6 +934,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// unsupported entries are dropped, and only a missing authorization_code is
 	// fatal. See effectiveCIMDGrantTypes for why.
 	grantTypes, dropped := effectiveCIMDGrantTypes(doc.GrantTypes)
+	grantTypes, dropped = applyIDJAGProfileGrantRule(doc, grantTypes, dropped)
 	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
 		return nil, nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
 	}

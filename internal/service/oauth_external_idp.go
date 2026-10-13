@@ -145,7 +145,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if req.ClientID == "" {
 		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
 	}
-	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	// cimdFallback=false: this path does not gate on the client's declared
+	// grant_types, so a self-asserted document must not resolve here.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}

@@ -52,6 +52,13 @@ const (
 	tProj     = "proj-a"
 )
 
+const tCIMD = "https://client.example.test/client.json"
+
+func cimdClient(clientID string) *domain.OAuthClient {
+	return &domain.OAuthClient{ClientID: clientID, RegistrationSource: domain.RegistrationSourceCIMD,
+		TokenEndpointAuthMethod: clientAuthMethodPrivateKeyJWT, IsActive: true}
+}
+
 func activeIdentity(acct, proj string) *domain.Identity {
 	return &domain.Identity{ID: tLinkedID, AccountID: acct, ProjectID: proj, Status: domain.IdentityStatusActive}
 }
@@ -210,11 +217,55 @@ func TestDeriveIDJAGTenant(t *testing.T) {
 			store:    &fakeIdentityStore{err: errors.New("connection reset")},
 			wantCode: "server_error", wantStatus: http.StatusInternalServerError,
 		},
+
+		// ── CIMD clients (firehog#701): no D6 binding exists yet ─────────────
+		//
+		// Every one of these is refused. None of the inputs a CIMD client
+		// arrives with may choose a tenant: not the request, not a single
+		// allowed account, not the document.
+		{
+			name:     "CIMD client, single allowed account, no request fields → invalid_grant",
+			allowed:  []string{tAcctA},
+			client:   cimdClient(tCIMD),
+			store:    &fakeIdentityStore{rows: map[string]*domain.Identity{tLinkedID: activeIdentity(tAcctA, tProj)}},
+			wantCode: "invalid_grant", wantStatus: http.StatusBadRequest, wantNoQuery: true,
+		},
+		{
+			name:       "CIMD client naming an allowed tenant on the request → invalid_grant",
+			allowed:    []string{tAcctA},
+			client:     cimdClient(tCIMD),
+			store:      &fakeIdentityStore{},
+			reqAccount: tAcctA, reqProject: tProj,
+			wantCode: "invalid_grant", wantStatus: http.StatusBadRequest, wantNoQuery: true,
+		},
+		{
+			name:       "CIMD client naming a tenant the issuer does not allow → invalid_grant",
+			allowed:    []string{tAcctA},
+			client:     cimdClient(tCIMD),
+			store:      &fakeIdentityStore{},
+			reqAccount: tAcctB, reqProject: tProj,
+			wantCode: "invalid_grant", wantStatus: http.StatusBadRequest, wantNoQuery: true,
+		},
+		{
+			name: "CIMD client carrying an identity_id is still not trusted for one",
+			// A synthesized client never has one; if one ever appeared it must
+			// not become a tenant source for a self-asserted client.
+			allowed: []string{tAcctA},
+			client: func() *domain.OAuthClient {
+				c := cimdClient(tCIMD)
+				id := tLinkedID
+				c.IdentityID = &id
+				return c
+			}(),
+			store:    &fakeIdentityStore{rows: map[string]*domain.Identity{tLinkedID: activeIdentity(tAcctA, tProj)}},
+			wantCode: "invalid_grant", wantStatus: http.StatusBadRequest, wantNoQuery: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := deriveIDJAGTenant(context.Background(), tIssuer, tc.allowed, tc.client,
+			cfg := &domain.ExternalIssuerConfig{Issuer: tIssuer, AllowedAccounts: tc.allowed}
+			got, err := deriveIDJAGTenant(context.Background(), cfg, tc.client,
 				tc.store.lookup, tc.reqAccount, tc.reqProject)
 
 			if tc.wantNoQuery && tc.store.calls != 0 {
@@ -245,7 +296,8 @@ func TestDeriveIDJAGTenant(t *testing.T) {
 // refusal does not tell the caller which tenant it should have sent.
 func TestDeriveIDJAGTenant_ErrorsDoNotEchoTheDerivedTenant(t *testing.T) {
 	store := &fakeIdentityStore{rows: map[string]*domain.Identity{tLinkedID: activeIdentity(tAcctA, tProj)}}
-	_, err := deriveIDJAGTenant(context.Background(), tIssuer, []string{tAcctA, tAcctB},
+	cfg := &domain.ExternalIssuerConfig{Issuer: tIssuer, AllowedAccounts: []string{tAcctA, tAcctB}}
+	_, err := deriveIDJAGTenant(context.Background(), cfg,
 		linkedClient(tLinkedID), store.lookup, tAcctB, "proj-x")
 	var oe *OAuthError
 	if !errors.As(err, &oe) {
