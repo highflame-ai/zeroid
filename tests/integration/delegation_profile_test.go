@@ -944,7 +944,7 @@ func TestIDJAG_ApplicationAllowedScopesDoNotRejectIdPScopes(t *testing.T) {
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
 	fedTenant := map[string]string{"X-Account-ID": fedCfg.AccountID, "X-Project-ID": fedCfg.ProjectID}
-	client := registerOAuthClient(t, uid("d10-client"), []string{"tools:read", "tools:exec"})
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"tools:read", "tools:exec"})
 
 	appIdentity := func(extra map[string]any) string {
 		body := map[string]any{
@@ -1012,8 +1012,6 @@ func TestIDJAG_RedeemingAgentIsCurrentActor(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	client := registerOAuthClient(t, uid("act416-client"), []string{"tools:read"})
-
 	// The account is pinned by AllowedAccounts, so each case gets a project of
 	// its own: the token profile is a tenant setting, and switching the shared
 	// federation project would change the shape other tests see.
@@ -1050,7 +1048,12 @@ func TestIDJAG_RedeemingAgentIsCurrentActor(t *testing.T) {
 		_ = resp.Body.Close()
 		return got["id"].(string), got["wimse_uri"].(string), extID
 	}
+	// client is the most recent case's client, for the client_id assertion.
+	var client oauthClientResp
 	redeem := func(tn hrdTenant, person, applicationID string) map[string]any {
+		// The ID-JAG tenant is derived from the client's linked identity (ADR
+		// 0042 D5), so each case's client is registered in that case's tenant.
+		client = registerTenantBoundClient(t, tn.account, tn.project, []string{"tools:read"})
 		now := time.Now()
 		idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
 			"iss": upstreamIss, "aud": federationAud, "sub": person,

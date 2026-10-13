@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -43,6 +44,35 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetByIDInAccounts retrieves an identity by its UUID, provided it belongs to
+// one of accountIDs. The project is not constrained: it is read FROM the row.
+//
+// It exists for one caller shape, where the id is a server-held reference and
+// the tenant is what the lookup is meant to discover: an OAuth client's
+// identity_id link, resolved against an external issuer's allowed_accounts on
+// the ID-JAG grant. The account constraint is applied in SQL, so a link into a
+// tenant the issuer does not admit is indistinguishable from no row at all and
+// nothing outside the admitted set is ever loaded. Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the project too.
+//
+// An empty accountIDs matches nothing. It short-circuits to sql.ErrNoRows
+// rather than emitting `IN ()`.
+func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, accountIDs []string) (*domain.Identity, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("failed to get identity: %w", sql.ErrNoRows)
+	}
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id IN (?)", bun.List(accountIDs)).
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity: %w", err)

@@ -148,7 +148,9 @@ func TestBasicAuthBodyClientID_ReferenceSDKRedeemsIDJAG(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	client := registerOAuthClient(t, uid("basic-bodyid-idjag"), []string{"data:read"})
+	// The ID-JAG tenant is derived from the client's linked identity (ADR 0042
+	// D5, highflame-firehog#630), so the client is registered with one.
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read", "tools:read"})
 
 	now := time.Now()
 	idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
@@ -170,11 +172,8 @@ func TestBasicAuthBodyClientID_ReferenceSDKRedeemsIDJAG(t *testing.T) {
 		"client_id":  {client.ClientID},
 		"resource":   {mcpResource},
 		"scope":      {"tools:read"},
-		// ZeroID-specific tenant binding, which the ID-JAG grant currently
-		// requires and the reference SDK does not send. Orthogonal to client
-		// authentication, so it is added here to isolate the #700 behaviour.
-		"account_id": {fedCfg.AccountID},
-		"project_id": {fedCfg.ProjectID},
+		// No account_id/project_id: the tenant comes from the client's
+		// registration, so this is exactly what the reference SDK sends.
 	}
 
 	req, err := http.NewRequest(http.MethodPost, fedHTTPSrv.URL+"/oauth2/token", strings.NewReader(form.Encode()))

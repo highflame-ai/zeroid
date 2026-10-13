@@ -140,9 +140,11 @@ func idJAGActors(identity *domain.Identity) []domain.Actor {
 // ZeroID token travels downstream to Firehog/Shield (ADR 0010 D5).
 //
 // Fail closed (OAuth invalid_grant, never mint) when: the issuer is not a
-// configured external issuer, the AllowedAccounts tenant binding does not permit
-// the request, signature/claim validation fails, the external identity cannot be
-// mapped, or the `resource` audience claim is absent (D3, D4).
+// configured external issuer, no tenant can be derived from the issuer's
+// AllowedAccounts and the authenticated client's registration (or the request
+// names a different one; see deriveIDJAGTenant), signature/claim validation
+// fails, the external identity cannot be mapped, or the `resource` audience
+// claim is absent (D3, D4).
 func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
 		// No external issuers configured → ID-JAG federation is disabled. The
@@ -150,13 +152,9 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// ID-JAG against, so fail closed rather than fall back to any other path.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG federation is not configured (no external issuers)")
 	}
-	// account_id / project_id are caller-supplied form fields (same as the
-	// id_token-exchange path) — they are the tenant the AllowedAccounts binding
-	// gates against. Tenant cannot be derived from the ID-JAG: it is born at the
-	// corporate IdP, which has no notion of a Highflame tenant.
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for the ID-JAG jwt-bearer grant")
-	}
+	// No account_id / project_id requirement. The tenant is derived below from
+	// the issuer and the authenticated client (ADR 0042 D5); a conformant
+	// client sends neither field (draft §4.4, EMA §5).
 
 	// Peek at the assertion to extract iss without verifying — we need iss to
 	// look up which IdP's JWKS to validate against. (typ was already confirmed
@@ -187,13 +185,6 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 	cfg := entry.Config
 
-	// Tenant binding — the only thing that ties an upstream ID-JAG to a
-	// Highflame tenant. AllowedAccounts is required+non-empty at config load;
-	// a request whose account_id is not listed fails closed (D3).
-	if !cfg.AccountAllowed(req.AccountID) {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
-	}
-
 	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
 	// not be redeemable by another party: the draft (with §9.1) requires
 	// redemption to come from an authenticated confidential client. Require
@@ -211,6 +202,21 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if err != nil {
 		return nil, err
 	}
+
+	// Tenant binding (ADR 0042 D5). Derived from the issuer's allowed_accounts
+	// and the authenticated client's registration, never chosen by the request;
+	// a request that also names a tenant must name this one. Runs before the
+	// assertion is verified because it needs neither, and before the jti is
+	// consumed so a refused tenant does not burn the grant. From here on
+	// req.AccountID / req.ProjectID ARE the derived tenant, so every later use
+	// (identity resolution, the mint, the observed-resource inventory) reads
+	// the derived value and nothing can reach back to what the caller sent.
+	tenant, err := deriveIDJAGTenant(ctx, upstreamIss, cfg.AllowedAccounts, authedClient,
+		s.identitySvc.repo.GetByIDInAccounts, req.AccountID, req.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	req.AccountID, req.ProjectID = tenant.AccountID, tenant.ProjectID
 
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
