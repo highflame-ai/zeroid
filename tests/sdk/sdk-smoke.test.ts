@@ -395,11 +395,13 @@ describe("OAuth client credentials + delegation", () => {
       });
       expect(delegated.access_token).toBeTruthy();
 
-      // 7. Introspect: delegated token carries the act (delegation) chain.
+      // 7. Introspect: under the default rfc8693 profile `sub` stays the
+      //    chain's principal (the orchestrator, a workload) and the
+      //    delegated tool agent is the current actor in `act`.
       const introspection = await client.tokens.introspect(delegated.access_token);
       expect(introspection.active).toBe(true);
-      expect(introspection.sub).toBe(toolAgent.wimse_uri);
-      expect(introspection.act?.sub).toBe(orchestrator.wimse_uri);
+      expect(introspection.sub).toBe(orchestrator.wimse_uri);
+      expect(introspection.act?.sub).toBe(toolAgent.wimse_uri);
 
       // 8. Revoke → inactive. RFC 7009 authenticates the client, and the TS
       // SDK's tokens.revoke cannot carry client credentials yet (its body is

@@ -548,7 +548,9 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	client := registerOAuthClient(t, uid("probe-idjag-client"), []string{"tools:read"})
+	// ADR 0042 D5: the client's registration carries the tenant (it links an
+	// identity in acct-fed-001), which is how the grant derives it.
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"tools:read"})
 
 	sign := func(t *testing.T, extra map[string]any) string {
 		t.Helper()
@@ -605,6 +607,34 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 
 	t.Run("account_id not in allowed_accounts is refused", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, nil), "acct-not-allowed", "proj-x"))
+		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	})
+
+	// ADR 0042 D5: with two allowed accounts the request still cannot choose.
+	// Naming the OTHER admitted account is a mismatch, not a selection.
+	t.Run("naming another allowed account is refused", func(t *testing.T) {
+		resp := postFederation(t, fedHTTP.URL, body(sign(t, nil), "acct-fed-002", fedCfg.ProjectID))
+		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	})
+
+	// Two allowed accounts and a client that names no tenant: ambiguous, so
+	// refused, whatever the request says.
+	t.Run("several allowed accounts and no client tenant is refused", func(t *testing.T) {
+		unlinked := registerOAuthClient(t, uid("probe-idjag-unlinked"), []string{"tools:read"})
+		resp := postFederation(t, fedHTTP.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     sign(t, map[string]any{"client_id": unlinked.ClientID}),
+			"account_id":    fedCfg.AccountID,
+			"project_id":    fedCfg.ProjectID,
+			"client_id":     unlinked.ClientID,
+			"client_secret": unlinked.ClientSecret,
+		})
 		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		assert.Equal(t, "invalid_grant", resp.Error)

@@ -1245,9 +1245,16 @@ func TestCIBAApprovedTokenKeepsActClaim(t *testing.T) {
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 
 		// A chain recorded with nested actors (act.act) is reproduced as is.
+		// Under the default rfc8693 profile only a chain that carries the
+		// current actor's attributes is copied; one without them is rebuilt
+		// from the requesting identity (TestCIBAStepUp_LegacyChainAfterSwitchToRFC8693).
+		childAct := childClaims["act"].(map[string]any)
 		nested := map[string]any{
-			"sub": childClaims["act"].(map[string]any)["sub"],
-			"act": map[string]any{"sub": "spiffe://upstream.example.test/orchestrator", "act": map[string]any{"sub": "user-origin"}},
+			"sub":           childAct["sub"],
+			"identity_type": childAct["identity_type"],
+			"trust_level":   childAct["trust_level"],
+			"external_id":   childAct["external_id"],
+			"act":           map[string]any{"sub": "spiffe://upstream.example.test/orchestrator", "act": map[string]any{"sub": "user-origin"}},
 		}
 		raw, err := json.Marshal(nested)
 		require.NoError(t, err)

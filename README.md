@@ -124,9 +124,9 @@ ZeroID covers every agentic deployment pattern — from a single autonomous agen
 
 ### Token profiles
 
-Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `legacy`.
+Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `rfc8693`; set `legacy` for a tenant whose consumers still read only the older shape.
 
-| | `legacy` (default) | `rfc8693` |
+| | `legacy` | `rfc8693` (default) |
 |---|---|---|
 | `sub` on an exchanged token | the actor (the sub-agent) | the principal the whole chain acts for — a person or the root workload — fixed at every hop (RFC 8693 §4.1) |
 | `act` | one level; its meaning depends on the grant | nested agents, current one outermost; the person is never an actor |
@@ -353,14 +353,14 @@ delegated = client.tokens.delegate(
     scope="data:read",
 )
 
-# Under the default legacy profile the delegated token carries:
-#   sub:              spiffe://.../agent/data-fetcher   ← who is acting
-#   owner:            ops@company.com                   ← who provisioned this agent
-#   act.sub:          spiffe://.../agent/orchestrator-1 ← which agent delegated
+# Under the default rfc8693 profile the delegated token carries:
+#   sub:              spiffe://.../agent/orchestrator-1 ← the chain's principal
+#   act.sub:          spiffe://.../agent/data-fetcher   ← who is acting now
+#   owner:            ops@company.com                   ← who provisioned the actor
 #   scope:            data:read                         ← capped by intersection
 #   delegation_depth: 1
-# Under the rfc8693 profile sub stays the orchestrator (the chain's principal)
-# and act.sub is data-fetcher, the current actor. See "Token profiles".
+# Under the legacy profile sub is data-fetcher and act.sub is orchestrator-1.
+# See "Token profiles".
 ```
 
 </details>
@@ -418,8 +418,8 @@ const delegated = await client.tokens.delegate({
   actor_token: actorToken,
   scope: "data:read",
 });
-// delegated.access_token carries sub=data-fetcher, act.sub=orchestrator-1,
-// scope=data:read, delegation_depth=1
+// delegated.access_token carries sub=orchestrator-1 (the principal),
+// act.sub=data-fetcher (the current actor), scope=data:read, delegation_depth=1
 ```
 
 </details>
@@ -460,8 +460,8 @@ const session = await client.tokens.sessionFromRequest(request.headers);
 
 session.requireScope("data:read");             // throws ZeroIDError if scope missing
 session.requireTrust("verified_third_party");  // throws ZeroIDError if trust too low
-// session.sub              → "spiffe://..."
-// session.act?.sub         → orchestrator's WIMSE URI
+// session.sub              → the chain's principal
+// session.act?.sub         → the current actor (rfc8693 profile)
 ```
 
 </details>
@@ -630,14 +630,14 @@ investigator_token = monitor_client.tokens.delegate(
     actor_token=build_jwt_assertion(investigator_private_key, investigator.identity.wimse_uri),
     scope="logs:read logs:query",
 )
-# investigator_token: sub=log-investigator, act.sub=sec-monitor, depth=1
+# investigator_token: sub=sec-monitor, act.sub=log-investigator, depth=1
 
 # Investigator confirms breach → delegates remediation (depth 2, at the cap)
 remediator_token = investigator_client.tokens.delegate(
     actor_token=build_jwt_assertion(remediator_private_key, remediator.identity.wimse_uri),
     scope="firewall:write",
 )
-# remediator_token: sub=fw-remediator, act.sub=log-investigator, depth=2
+# remediator_token: sub=sec-monitor, act={sub: fw-remediator, act: {sub: log-investigator}}, depth=2
 
 # Incident resolved. Deactivate the monitor — the entire downstream chain is invalidated.
 client.agents.deactivate(monitor.identity.id)
@@ -651,7 +651,7 @@ client.agents.deactivate(monitor.identity.id)
 
 **Without ZeroID:** The agent logs into travel and HR systems as Alice (using her OAuth token). There's no distinction between Alice booking travel herself and the agent doing it on her behalf. Alice can't revoke just the agent's access — she'd have to revoke her own session.
 
-**With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries its own identity in `sub`, Alice's identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
+**With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries Alice's identity in `sub`, its own identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
 
 ```python
 # Alice authenticates via authorization_code + PKCE
@@ -664,8 +664,8 @@ assistant_token = client.tokens.issue_token_exchange(
     actor_token=build_jwt_assertion(assistant_private_key, assistant.identity.wimse_uri),
     scope="calendar:read travel:book expenses:submit",
 )
-# assistant_token: sub=travel-assistant, act.sub=alice@company.com, depth=1
-# Travel and HR systems see act.sub → book in Alice's name, charge her cost center
+# assistant_token: sub=alice@company.com, principal_type=user, act.sub=travel-assistant, depth=1
+# Travel and HR systems see sub → book in Alice's name, charge her cost center
 
 # Alice decides she wants to handle this herself — revoke just the agent's token.
 # Her own session is untouched.
@@ -884,8 +884,8 @@ graph TD
 | Flow | Algorithm | Default TTL | Subject | User Claims |
 |------|-----------|-------------|---------|-------------|
 | NHI (`client_credentials` / `jwt_bearer`) | ES256 | 1 hour | WIMSE URI | `owner_user_id` = registrant |
-| SDK (`api_key`) | RS256 | 1 hour | WIMSE URI | `act.sub` = developer using SDK |
-| Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI | `act.sub` = orchestrator URI |
+| SDK (`api_key`) | RS256 | 1 hour | WIMSE URI | `owner_user_id`; no `act` (legacy: `act.sub` = key creator) |
+| Delegated (`token_exchange`) | ES256 | 1 hour | Chain principal (legacy: sub-agent WIMSE URI) | `act.sub` = sub-agent, prior actors nested (legacy: `act.sub` = orchestrator) |
 | CLI (`authorization_code`) | RS256 | 90 days | User ID | — |
 | MCP (`authorization_code` + refresh) | RS256 | 1 hour | User ID | — |
 | CIBA (`urn:openid:params:grant-type:ciba`) | RS256 | 15 min | Approving user ID | `email`, `name`, `backchannel_client_id`, `token_exchange="ciba"` |
