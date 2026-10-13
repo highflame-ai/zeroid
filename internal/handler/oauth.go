@@ -318,7 +318,11 @@ type OAuthRevokeInput struct {
 	// IntrospectInput (RFC 7009 §2.1 client authorization).
 	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
 	Body          struct {
-		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to revoke"`
+		Token string `json:"token" required:"true" minLength:"1" doc:"Access token (JWT) or refresh token to revoke"`
+		// TokenTypeHint is RFC 7009 §2.1's optional hint. It only orders the
+		// lookups; both token types are always tried, and an unknown value is
+		// ignored (§2.2).
+		TokenTypeHint string `json:"token_type_hint,omitempty" doc:"Optional hint: access_token or refresh_token (RFC 7009 §2.1)"`
 		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7009 §2.1
 		// authorization). Same accept-and-verify posture as introspection.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
@@ -338,8 +342,10 @@ type OAuthRevokeOutput struct {
 	Body            struct {
 		Revoked bool `json:"revoked"`
 		// Error / ErrorDescription are populated only when presented client
-		// credentials fail verification (invalid_client). On every other path
-		// the RFC 7009 §2.2 "always 200" contract holds.
+		// credentials fail verification (invalid_client) or the server failed
+		// to carry out the revocation (server_error). Unknown, invalid or
+		// already-revoked tokens — and tokens issued to another client — get
+		// the RFC 7009 §2.2 200, all with the same body.
 		Error            string `json:"error,omitempty"`
 		ErrorDescription string `json:"error_description,omitempty"`
 	}
@@ -887,7 +893,20 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 		return out, nil
 	}
 
-	_ = a.oauthSvc.Revoke(ctx, input.Body.Token)
+	// clientID is the client the request identified, verified above (or "" for
+	// a caller that identified none); it restricts refresh-token revocation to
+	// the client's own tokens.
+	if err := a.oauthSvc.RevokeToken(ctx, input.Body.Token, input.Body.TokenTypeHint, clientID); err != nil {
+		// A lookup or revocation failed server-side. Answering 200 here would
+		// tell the client its token is dead when it may not be (RFC 7009 §2.1:
+		// the client must not use the token after a 200). Report the failure
+		// instead; the cause stays in the server log.
+		log.Error().Err(err).Msg("oauth2 revocation failed")
+		out := &OAuthRevokeOutput{Status: http.StatusInternalServerError}
+		out.Body.Error = oautherror.ServerError
+		out.Body.ErrorDescription = "the token could not be revoked; retry the request"
+		return out, nil
+	}
 	out := &OAuthRevokeOutput{Status: http.StatusOK}
 	out.Body.Revoked = true
 	return out, nil
