@@ -892,6 +892,8 @@ graph TD
 | **DPoP-bound** (any grant + `DPoP` header) | — (modifier) | — (inherits grant) | — (inherits grant) | adds `cnf.jkt` claim; response `token_type: "DPoP"` |
 | **DCR client_credentials** | ES256 | 1 hour | DCR client's WIMSE URI (when bound) | identical claims to internal `client_credentials`; client's `registration_source` distinguishes provenance for audit |
 
+**Refresh token rotation:** every `refresh_token` grant rotates — the presented refresh token is consumed and a new one is returned, in the same token family. A refresh token can be used once. Presenting one that has already been rotated is treated as a sign that the family has leaked ([RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700#section-4.14.2)): ZeroID revokes every refresh token in the family, including the newest, along with the access tokens issued from the family (and their delegated descendants), and answers `invalid_grant`, the same response as any other unusable refresh token. This applies however soon after the rotation the old token comes back, so two concurrent refreshes with one token leave the family revoked: one request rotates, the other's presentation revokes the family. Clients should serialise refreshes and keep only the newest refresh token. If the server fails after consuming the token but before answering, it puts the presented token back, so retrying with it rotates normally.
+
 ---
 
 ## API Reference

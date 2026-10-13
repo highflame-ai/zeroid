@@ -14,11 +14,16 @@ const (
 	RefreshTokenStateActive  = "active"
 	RefreshTokenStateRevoked = "revoked"
 
-	// RefreshTokenReuseGraceWindow is how long after a token is revoked that a
-	// subsequent presentation is treated as a concurrent retry rather than a
-	// replay attack. Within this window, family revocation is suppressed so
-	// legitimate multi-tab or network-retry scenarios don't kill the session.
-	// Outside the window, reuse detection fires as normal (RFC 6749 §10.4).
+	// RefreshTokenReuseGraceWindow is how far behind now the cleanup worker
+	// lags its refresh-token expiry sweep, so a row is never deleted at the
+	// instant reuse detection might still look it up.
+	//
+	// It no longer suppresses reuse detection. Presenting a rotated-out refresh
+	// token revokes its whole family however soon after the rotation it
+	// arrives (RFC 9700 §4.14.2): the server cannot tell a client's retry from
+	// a replay of a stolen token, and a window in which the newest token in the
+	// family survives a replay is a window in which whichever party rotated
+	// first keeps the session. The name is kept for compatibility.
 	RefreshTokenReuseGraceWindow = 10 * time.Second
 )
 

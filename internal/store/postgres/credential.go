@@ -192,6 +192,32 @@ func (r *CredentialRepository) ListActiveLongLivedUserAccessTokenIDs(ctx context
 	return ids, nil
 }
 
+// RefreshFamilyCredential identifies one active access token issued under a
+// refresh-token family, with the tenant scalars the revoke cascade guards on.
+type RefreshFamilyCredential struct {
+	ID        string `bun:"id"`
+	AccountID string `bun:"account_id"`
+	ProjectID string `bun:"project_id"`
+}
+
+// ListActiveByRefreshFamily returns the active (not revoked, not expired)
+// access tokens issued under the given refresh-token family. Backed by the
+// partial index idx_issued_credentials_refresh_family_id (migration 055).
+func (r *CredentialRepository) ListActiveByRefreshFamily(ctx context.Context, familyID string) ([]RefreshFamilyCredential, error) {
+	var rows []RefreshFamilyCredential
+	err := dbOrTx(ctx, r.db).NewSelect().
+		Model((*domain.IssuedCredential)(nil)).
+		Column("id", "account_id", "project_id").
+		Where("refresh_family_id = ?", familyID).
+		Where("is_revoked = FALSE").
+		Where("expires_at > NOW()").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list access tokens for refresh family: %w", err)
+	}
+	return rows, nil
+}
+
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
 	var rows []RevokedCredential

@@ -1549,6 +1549,14 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// needs no separate refresh suppression.
 	bindResourceOnIssue(&issue, req.Resource)
 
+	// Fix the refresh family's id before minting, when step 6 will issue a
+	// refresh token, so this access token is revoked along with the family.
+	var refreshFamilyID string
+	if req.IssueRefreshToken && len(audience) > 0 && s.refreshTokenSvc != nil {
+		refreshFamilyID = NewRefreshFamilyID()
+		issue.RefreshFamilyID = refreshFamilyID
+	}
+
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, oauthServerError("failed to issue external principal token", err)
@@ -1584,6 +1592,8 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			// The family records whose issuer vouched for the user, so it
 			// is revoked by the RFC 9493 (issuer, subject) pair.
 			PrincipalIss: cred.PrincipalIss,
+			// The id already stamped on the access token above.
+			FamilyID: refreshFamilyID,
 		})
 		if rtErr != nil {
 			// Fail CLOSED: the caller explicitly asked for a refresh token (its
@@ -2543,35 +2553,6 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	issue := IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		// Bounded by the user's consent and the client's registered scopes, so a
-		// linked identity's user-grant ceiling applies, not its own (D10).
-		UserGrantBounded:  true,
-		GrantType:         domain.GrantTypeAuthorizationCode,
-		UseRS256:          true,
-		SubjectOverride:   authCode.UserID,
-		ApplicationID:     authCode.ClientID,
-		ClientID:          authCode.ClientID,
-		TTL:               ttl,
-		Scopes:            authCode.Scopes,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	}
-
-	bindResourceOnIssue(&issue, boundResources)
-
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
-	if err != nil {
-		return nil, err
-	}
-
-	accessToken.AccountID = authCode.AccountID
-	accessToken.ProjectID = authCode.ProjectID
-	accessToken.UserID = authCode.UserID
-
-	var refreshFamilyID string
-
 	// A resource-bound exchange IS now issued a refresh token (CAP-IDN-027,
 	// amending CAP-IDN-026).
 	//
@@ -2641,6 +2622,43 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		issueRefresh = false
 	}
 
+	// The refresh family's id is fixed BEFORE the access token is minted so the
+	// access token carries it (issued_credentials.refresh_family_id): revoking
+	// the family — refresh-token reuse, or this code being replayed — then
+	// revokes this access token as well, not just the refresh tokens.
+	var refreshFamilyID string
+	if issueRefresh && s.refreshTokenSvc != nil {
+		refreshFamilyID = NewRefreshFamilyID()
+	}
+
+	issue := IssueRequest{
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Bounded by the user's consent and the client's registered scopes, so a
+		// linked identity's user-grant ceiling applies, not its own (D10).
+		UserGrantBounded:  true,
+		GrantType:         domain.GrantTypeAuthorizationCode,
+		UseRS256:          true,
+		SubjectOverride:   authCode.UserID,
+		ApplicationID:     authCode.ClientID,
+		ClientID:          authCode.ClientID,
+		TTL:               ttl,
+		Scopes:            authCode.Scopes,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		RefreshFamilyID:   refreshFamilyID,
+	}
+
+	bindResourceOnIssue(&issue, boundResources)
+
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
+	if err != nil {
+		return nil, err
+	}
+
+	accessToken.AccountID = authCode.AccountID
+	accessToken.ProjectID = authCode.ProjectID
+	accessToken.UserID = authCode.UserID
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if issueRefresh && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
@@ -2664,12 +2682,16 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// by the RFC 9493 (issuer, subject) pair and every rotation keeps
 			// the same principal. Copied forward like MissionID.
 			PrincipalIss: cred.PrincipalIss,
+			// The id already stamped on the access token above.
+			FamilyID: refreshFamilyID,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
+			// No family exists, so there is nothing for replay detection to
+			// revoke by it; the access token is still revoked by its JTI.
+			refreshFamilyID = ""
 		} else {
 			accessToken.RefreshToken = rtResult.RawToken
-			refreshFamilyID = rtResult.FamilyID
 		}
 	}
 
@@ -2712,6 +2734,28 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 		} else if count > 0 {
 			log.Warn().Str("family_id", *record.RefreshFamilyID).Int64("count", count).Msg("Auth code replay: revoked refresh token family from original exchange")
 		}
+		// And every access token minted under that family — the exchange's own
+		// and each one a refresh produced since — not just the one recorded on
+		// the code.
+		s.revokeRefreshFamilyAccessTokens(ctx, *record.RefreshFamilyID, "auth_code_replay")
+	}
+}
+
+// revokeRefreshFamilyAccessTokens revokes the active access tokens issued
+// under a refresh-token family (with their delegated descendants). Best
+// effort: the family's refresh tokens are already revoked by the caller, and a
+// failure here is logged rather than changing the response.
+func (s *OAuthService) revokeRefreshFamilyAccessTokens(ctx context.Context, familyID, reason string) {
+	if familyID == "" || s.credentialSvc == nil {
+		return
+	}
+	n, err := s.credentialSvc.RevokeByRefreshFamily(ctx, familyID, reason)
+	if err != nil {
+		log.Error().Err(err).Str("family_id", familyID).Str("reason", reason).Msg("Failed to revoke access tokens issued under refresh token family")
+		return
+	}
+	if n > 0 {
+		log.Warn().Str("family_id", familyID).Int("count", n).Str("reason", reason).Msg("Revoked access tokens issued under refresh token family")
 	}
 }
 
@@ -2850,9 +2894,9 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	//
 	// A failed peek means the token is NOT active (expired, revoked, or
 	// unknown). We deliberately DO NOT reject here — instead we fall through to
-	// RotateRefreshToken, whose claim path distinguishes the reuse grace window
-	// from a genuine RFC 6749 §10.4 replay (and revokes the family on the
-	// latter). Short-circuiting on the peek would silence reuse detection.
+	// RotateRefreshToken, whose claim path recognises an already-rotated token
+	// and revokes its family (RFC 9700 §4.14.2). Short-circuiting on the peek
+	// would silence reuse detection.
 	var (
 		identity         *domain.Identity
 		identityPolicyID string
@@ -2919,10 +2963,9 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 
 	// Pre-rotation gates passed (or the token was already inactive — in which
 	// case rotation's claim path returns the right error / fires reuse
-	// detection). NOW consume the token and mint the successor. The remaining
-	// failure surface (IssueCredential) is the only post-claim step; if it fails
-	// the successor was already inserted in the rotation transaction, so the
-	// client's retry trips the grace window rather than reuse detection.
+	// detection). NOW consume the token and mint the successor. If a post-claim
+	// step fails, the deferred RestoreRotation below puts the presented token
+	// back, so the client's retry rotates instead of tripping reuse detection.
 	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL, req.DPoPKeyThumbprint)
 	if err != nil {
 		// A DPoP binding mismatch is a proof failure, not an invalid refresh
@@ -2932,16 +2975,43 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if errors.Is(err, ErrDPoPBindingMismatch) {
 			return nil, oauthBadRequest(oautherror.InvalidDPoPProof, "refresh token is DPoP-bound; the presented proof does not match the original key")
 		}
+		// An already-rotated token was presented (RFC 9700 §4.14.2). Rotation
+		// has revoked the family's refresh tokens; revoke the access tokens
+		// minted under it too. The response is the same invalid_grant as any
+		// other unusable refresh token, so it does not reveal the detection.
+		var reuse *RefreshTokenReuseError
+		if errors.As(err, &reuse) {
+			s.revokeRefreshFamilyAccessTokens(ctx, reuse.FamilyID, "refresh_token_reuse")
+		}
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid or expired refresh token", err)
 	}
+
+	// From here the presented token is consumed and its successor stored, but
+	// the client has not been given the successor. If anything below fails,
+	// put the presented token back: the client will retry with it, and without
+	// the restore that retry would be indistinguishable from reuse and would
+	// revoke the family over a server-side failure.
+	issued := false
+	defer func() {
+		if issued {
+			return
+		}
+		// Detached from the request context: a client that disconnected is
+		// exactly the one that will come back and retry.
+		restoreCtx := context.WithoutCancel(ctx)
+		if _, restoreErr := s.refreshTokenSvc.RestoreRotation(restoreCtx, oldToken, newRT); restoreErr != nil {
+			log.Error().Err(restoreErr).Str("family_id", oldToken.FamilyID).
+				Msg("Failed to restore refresh token after a failed refresh; the client's retry will be treated as reuse")
+		}
+	}()
 
 	// The peek-time identity resolution is the authoritative one. If the peek
 	// missed (rare: a benign race where the row activated between peek and
 	// claim) re-run the identity gate against the freshly claimed row so the
 	// gate is never skipped — the post-claim failure window here is acceptable
-	// because it only triggers on that race, and a gate failure now lands the
-	// caller in the grace window (successor already minted) rather than a
-	// permanent family revocation. A human session (no IdentityID) falls
+	// because it only triggers on that race, and a gate failure here restores
+	// the presented token (see the deferred RestoreRotation) rather than
+	// leaving the client to trip reuse detection. A human session (no IdentityID) falls
 	// through to a synthetic carrier with no policy to resolve.
 	if identity == nil {
 		identity = &domain.Identity{
@@ -3041,6 +3111,9 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// on a family minted before migration 048: the chokepoint then derives
 		// it as for any other user subject.
 		PrincipalIss: oldToken.PrincipalIss,
+		// Tie the access token to the family, so revoking the family (reuse
+		// detection, authorization-code replay) revokes it as well.
+		RefreshFamilyID: oldToken.FamilyID,
 	}
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A
@@ -3063,6 +3136,24 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, refreshIssue)
 	if err != nil {
 		return nil, err
+	}
+	issued = true
+
+	// Close the race with a concurrent presentation of the same token. The
+	// loser of the rotation claim revokes the family's refresh tokens and then
+	// the family's access tokens — but this access token may have been
+	// inserted after that sweep ran. Checking the successor now covers it:
+	// if the family was revoked before this check, revoke the family's access
+	// tokens again (this one included); if it was revoked after, this access
+	// token was already committed and the loser's sweep sees it. Either way no
+	// access token from a revoked family survives. The response is still the
+	// successful one — this request won the rotation — but what it carries is
+	// already revoked, as RFC 9700 §4.14.2 requires.
+	if active, checkErr := s.refreshTokenSvc.IsRefreshTokenActive(ctx, newRT.RawToken); checkErr != nil {
+		log.Error().Err(checkErr).Str("family_id", oldToken.FamilyID).
+			Msg("Failed to re-check refresh token family after rotation")
+	} else if !active {
+		s.revokeRefreshFamilyAccessTokens(ctx, oldToken.FamilyID, "refresh_token_reuse")
 	}
 
 	accessToken.AccountID = oldToken.AccountID

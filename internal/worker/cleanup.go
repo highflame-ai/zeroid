@@ -170,13 +170,13 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 
 	// Refresh tokens: under rotation every refresh inserts a successor row and
 	// revokes its predecessor, so the table grows linearly with token traffic
-	// if never swept. Delete rows whose expires_at is past the reuse-detection
-	// grace window. Reuse detection (service/refresh_token.go) consults
-	// recently-revoked rows for RefreshTokenReuseGraceWindow after revocation to
-	// distinguish a benign concurrent retry from a replay attack; lagging the
-	// cutoff by that window guarantees we never delete a row reuse detection
-	// could still need. Expiry is the bound (rotation revokes well before
-	// expires_at), so a row past expires_at - graceWindow is safe to reap.
+	// if never swept. Delete rows whose expires_at is past now minus
+	// RefreshTokenReuseGraceWindow. Reuse detection (service/refresh_token.go)
+	// looks up rotated-out rows so that presenting one revokes its family; a
+	// rotated-out row keeps its original expires_at, so it remains consultable
+	// for the token's whole lifetime, and the lag keeps the sweep from racing a
+	// lookup at the instant of expiry. Once a row is past expiry, presenting it
+	// is answered as "expired" anyway, so it is safe to reap.
 	refreshRepo := postgres.NewRefreshTokenRepository(w.db)
 	if n, err := refreshRepo.DeleteExpired(ctx, now.Add(-domain.RefreshTokenReuseGraceWindow)); err != nil {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired refresh tokens")

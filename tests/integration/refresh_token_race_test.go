@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,26 +18,17 @@ import (
 	"github.com/uptrace/bun"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// TestRefreshTokenConcurrentRotation closes the RFC 6749 §6 rotation race:
-// concurrent POSTs with the same refresh token must not both issue a successor.
-// Exactly one request wins; the rest are rejected. Additionally, the winner's
-// new refresh token MUST survive the race — late-arriving sibling requests
-// that see the original as "revoked" must not trip family revocation against
-// the fresh successor (handled via the reuse grace window).
-//
-// Before the fix, the read-check-revoke sequence ran under READ COMMITTED
-// (despite a comment claiming "serializable"), so both rotations passed the
-// active check before either committed the revocation — both then minted new
-// tokens, bypassing reuse detection entirely.
-func TestRefreshTokenConcurrentRotation(t *testing.T) {
-	const concurrency = 10
-
+// exchangeMCPCode runs an authorization_code exchange for the MCP test client
+// (which holds the refresh_token grant) and returns the access and refresh
+// tokens.
+func exchangeMCPCode(t *testing.T, userID string) (accessToken, refreshToken string) {
+	t.Helper()
 	verifier, challenge := buildPKCEPair(t)
-	code := buildAuthCode(t, testMCPClientID, "user-race-001", testRedirectURI, challenge, []string{"data:read"})
-
+	code := buildAuthCode(t, testMCPClientID, userID, testRedirectURI, challenge, []string{"data:read"})
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "authorization_code",
 		"client_id":     testMCPClientID,
@@ -44,14 +37,55 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 		"redirect_uri":  testRedirectURI,
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	refreshToken := decode(t, resp)["refresh_token"].(string)
+	body := decode(t, resp)
+	accessToken, _ = body["access_token"].(string)
+	refreshToken, _ = body["refresh_token"].(string)
+	require.NotEmpty(t, accessToken)
 	require.NotEmpty(t, refreshToken)
+	return accessToken, refreshToken
+}
+
+// refreshMCP presents a refresh token for the MCP test client and returns the
+// status and decoded body.
+func refreshMCP(t *testing.T, refreshToken string) (int, map[string]any) {
+	t.Helper()
+	status, raw := rotateRaw(t, refreshToken)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(raw, &body), "refresh response must be JSON: %s", raw)
+	return status, body
+}
+
+// TestRefreshTokenConcurrentRotation pins the rotation race (RFC 6749 §6) and
+// its RFC 9700 §4.14.2 consequence. Concurrent POSTs with the same refresh
+// token: exactly one wins the claim and gets a successor; the rest present a
+// token that has by then been rotated, which is the reuse signal, so the
+// family is revoked — the winner's successor and every access token issued
+// from the family included.
+//
+// Before the claim was made atomic, both rotations could pass the active check
+// before either committed, both minted successors, and reuse detection never
+// fired at all.
+func TestRefreshTokenConcurrentRotation(t *testing.T) {
+	// Two is the case the guarantee is hardest for: with a single loser there
+	// is exactly one revocation sweep, and the winner's access token may be
+	// minted after it. Ten exercises the claim under heavier contention. The
+	// two-way race is repeated because the interleaving is timing-dependent.
+	for i := range 10 {
+		t.Run(fmt.Sprintf("two-way/%d", i), func(t *testing.T) { assertConcurrentRotation(t, 2) })
+	}
+	t.Run("ten-way", func(t *testing.T) { assertConcurrentRotation(t, 10) })
+}
+
+func assertConcurrentRotation(t *testing.T, concurrency int) {
+	originalAT, refreshToken := exchangeMCPCode(t, uid("user-race"))
 
 	var (
 		successes   int32
 		failures    int32
-		winnerTokMu sync.Mutex
-		winnerTok   string
+		winnerMu    sync.Mutex
+		winnerRT    string
+		winnerAT    string
+		loserErrors []string
 		wg          sync.WaitGroup
 	)
 	start := make(chan struct{})
@@ -60,19 +94,18 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 		wg.Go(func() {
 			<-start
 			status, body := rotateRaw(t, refreshToken)
+			var parsed map[string]any
+			_ = json.Unmarshal(body, &parsed)
+			winnerMu.Lock()
+			defer winnerMu.Unlock()
 			if status == http.StatusOK {
 				atomic.AddInt32(&successes, 1)
-				// Capture the winner's successor token for the post-race assertion.
-				var parsed map[string]any
-				if err := json.Unmarshal(body, &parsed); err == nil {
-					if rt, ok := parsed["refresh_token"].(string); ok {
-						winnerTokMu.Lock()
-						winnerTok = rt
-						winnerTokMu.Unlock()
-					}
-				}
+				winnerRT, _ = parsed["refresh_token"].(string)
+				winnerAT, _ = parsed["access_token"].(string)
 			} else {
 				atomic.AddInt32(&failures, 1)
+				e, _ := parsed["error"].(string)
+				loserErrors = append(loserErrors, e)
 			}
 		})
 	}
@@ -80,129 +113,302 @@ func TestRefreshTokenConcurrentRotation(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	// Primary invariant: exactly one successor minted.
-	assert.Equal(t, int32(1), atomic.LoadInt32(&successes),
+	// Exactly one successor minted.
+	require.Equal(t, int32(1), atomic.LoadInt32(&successes),
 		"exactly one concurrent rotation should succeed")
 	assert.Equal(t, int32(concurrency-1), atomic.LoadInt32(&failures),
 		"all other concurrent rotations should be rejected")
+	for _, e := range loserErrors {
+		assert.Equal(t, "invalid_grant", e, "a losing rotation is answered invalid_grant")
+	}
 
-	// Secondary invariant (grace window): the winner's new refresh token must
-	// survive — losing siblings that saw the original as revoked must not have
-	// tripped family revocation against it.
-	require.NotEmpty(t, winnerTok, "should have captured the winner's refresh_token")
-	status, _ := rotateRaw(t, winnerTok)
-	assert.Equal(t, http.StatusOK, status,
-		"winner's successor token must remain usable after the race (grace window protects it)")
+	// The losers presented a rotated token, so the family is revoked: the
+	// winner's successor no longer rotates...
+	require.NotEmpty(t, winnerRT, "should have captured the winner's refresh_token")
+	status, body := refreshMCP(t, winnerRT)
+	assert.Equal(t, http.StatusBadRequest, status,
+		"the winner's successor must be revoked with its family once a rotated token was presented")
+	assert.Equal(t, "invalid_grant", body["error"])
+
+	// ...and no access token issued from the family is still active: neither
+	// the authorization_code exchange's nor the one the winner just received
+	// (which may have been minted after the losers' revocation sweep ran).
+	assert.False(t, introspect(t, originalAT)["active"].(bool),
+		"the authorization_code access token must be revoked with the family")
+	require.NotEmpty(t, winnerAT)
+	assert.False(t, introspect(t, winnerAT)["active"].(bool),
+		"the winner's access token must be revoked with the family")
 }
 
-// TestRefreshTokenReuseWithinGraceWindowProtectsFamily verifies that a replay
-// arriving within the grace window returns a benign "already rotated" error
-// without nuking the family. Simulates a legitimate concurrent-retry scenario
-// (multi-tab, network retry) where the second request loses but the session —
-// represented by the freshly issued successor — must survive.
-func TestRefreshTokenReuseWithinGraceWindowProtectsFamily(t *testing.T) {
-	verifier, challenge := buildPKCEPair(t)
-	code := buildAuthCode(t, testMCPClientID, "user-grace-within", testRedirectURI, challenge, []string{"data:read"})
-
-	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "authorization_code",
-		"client_id":     testMCPClientID,
-		"code":          code,
-		"code_verifier": verifier,
-		"redirect_uri":  testRedirectURI,
-	}, nil)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	rt1 := decode(t, resp)["refresh_token"].(string)
-
-	// First rotation: succeeds, yields rt2.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt1,
-		"client_id":     testMCPClientID,
-	}, nil)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	rt2 := decode(t, resp)["refresh_token"].(string)
-	require.NotEmpty(t, rt2)
-
-	// Replay rt1 immediately — within grace window.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt1,
-		"client_id":     testMCPClientID,
-	}, nil)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
-
-	// rt2 MUST still be alive — grace window suppresses family revocation.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt2,
-		"client_id":     testMCPClientID,
-	}, nil)
-	assert.Equal(t, http.StatusOK, resp.StatusCode,
-		"rt2 must remain usable: replay within grace window is treated as concurrent retry, not reuse")
-}
-
-// TestRefreshTokenReuseOutsideGraceWindowRevokesFamily verifies that a replay
-// arriving after the grace window fires the full RFC 6749 §10.4 reuse-detection
-// response: the entire family is revoked.
+// TestRefreshTokenConcurrentRotation_WinnerMintsAfterRevocation forces the
+// interleaving the timing-dependent race above rarely produces: the loser
+// revokes the family — refresh tokens, then the family's access tokens —
+// BEFORE the winner has inserted its access token. The loser's sweep cannot
+// see a row that does not exist yet, so only the winner's own re-check after
+// minting stops that access token surviving the family.
 //
-// Rather than sleeping for the grace window duration, the test backdates the
-// revoked_at column directly via testDB to simulate a delayed replay.
-func TestRefreshTokenReuseOutsideGraceWindowRevokesFamily(t *testing.T) {
+// The ordering is forced by holding a SHARE lock on issued_credentials: reads
+// (the loser's sweep) proceed, inserts (the winner's access token) wait. Safe
+// because no integration test runs in parallel.
+func TestRefreshTokenConcurrentRotation_WinnerMintsAfterRevocation(t *testing.T) {
 	ctx := context.Background()
+	exchangeAT, refreshToken := exchangeMCPCode(t, uid("user-race-late-mint"))
 
-	verifier, challenge := buildPKCEPair(t)
-	code := buildAuthCode(t, testMCPClientID, "user-grace-outside", testRedirectURI, challenge, []string{"data:read"})
-
-	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "authorization_code",
-		"client_id":     testMCPClientID,
-		"code":          code,
-		"code_verifier": verifier,
-		"redirect_uri":  testRedirectURI,
-	}, nil)
+	// Retire the exchange's own access token first, so the loser's sweep finds
+	// nothing to update and is not itself held by the lock below.
+	resp := post(t, "/oauth2/token/revoke", map[string]any{"token": exchangeAT}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	rt1 := decode(t, resp)["refresh_token"].(string)
+	_ = resp.Body.Close()
+	require.False(t, introspect(t, exchangeAT)["active"].(bool))
 
-	// First rotation: succeeds, yields rt2.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt1,
-		"client_id":     testMCPClientID,
-	}, nil)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	rt2 := decode(t, resp)["refresh_token"].(string)
-	require.NotEmpty(t, rt2)
-
-	// Backdate rt1's revoked_at past the grace window so the next replay hits
-	// the reuse-detection path.
-	backdate := time.Now().Add(-2 * domain.RefreshTokenReuseGraceWindow)
-	_, err := testDB.NewUpdate().
-		Model((*domain.RefreshToken)(nil)).
-		Set("revoked_at = ?", backdate).
-		Where("user_id = ?", "user-grace-outside").
-		Where("state = ?", domain.RefreshTokenStateRevoked).
-		Exec(ctx)
+	tx, err := testDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			require.NoError(t, tx.Rollback())
+		}
+	}
+	t.Cleanup(release)
+	_, err = tx.ExecContext(ctx, "LOCK TABLE issued_credentials IN SHARE MODE")
 	require.NoError(t, err)
 
-	// Replay rt1 — now outside grace window → family revocation fires.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt1,
-		"client_id":     testMCPClientID,
-	}, nil)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
+	type result struct {
+		status int
+		body   map[string]any
+	}
+	results := make(chan result, 2)
+	for range 2 {
+		go func() {
+			status, raw := rotateRaw(t, refreshToken)
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			results <- result{status, body}
+		}()
+	}
 
-	// rt2 must now be dead — the family was revoked as a unit.
-	resp = post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "refresh_token",
-		"refresh_token": rt2,
-		"client_id":     testMCPClientID,
-	}, nil)
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
-		"rt2 must be revoked once reuse was detected on its sibling rt1 outside the grace window")
+	// The loser never touches issued_credentials for writing on this path, so
+	// it answers while the winner is still blocked on its insert.
+	var loser result
+	select {
+	case loser = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("neither rotation returned while the winner's insert was held")
+	}
+	require.Equal(t, http.StatusBadRequest, loser.status, "the first answer must be the loser's")
+	assert.Equal(t, "invalid_grant", loser.body["error"])
+
+	release()
+	var winner result
+	select {
+	case winner = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the winner did not complete after the lock was released")
+	}
+	require.Equal(t, http.StatusOK, winner.status, "exactly one rotation succeeds")
+
+	winnerAT, _ := winner.body["access_token"].(string)
+	winnerRT, _ := winner.body["refresh_token"].(string)
+	require.NotEmpty(t, winnerAT)
+	assert.False(t, introspect(t, winnerAT)["active"].(bool),
+		"an access token minted after its family was revoked must not survive")
+	status, _ := refreshMCP(t, winnerRT)
+	assert.Equal(t, http.StatusBadRequest, status, "the winner's successor is revoked with the family")
+}
+
+// TestRefreshTokenReuseRevokesFamilyImmediately pins RFC 9700 §4.14.2 for the
+// sequential case. A client rotates rt1 → rt2, then rt1 is presented again,
+// straight away. The replay is refused, and the newest token in the family
+// (rt2) must be refused too, along with every access token minted from the
+// family. There is no window after a rotation in which a replay is waved
+// through as a retry: the server cannot tell which party holds rt2.
+func TestRefreshTokenReuseRevokesFamilyImmediately(t *testing.T) {
+	at1, rt1 := exchangeMCPCode(t, uid("user-reuse-immediate"))
+
+	status, body := refreshMCP(t, rt1)
+	require.Equal(t, http.StatusOK, status)
+	rt2, _ := body["refresh_token"].(string)
+	at2, _ := body["access_token"].(string)
+	require.NotEmpty(t, rt2)
+	require.NotEmpty(t, at2)
+	require.True(t, introspect(t, at2)["active"].(bool), "precondition: the refreshed access token is active")
+
+	// The response to the replay is byte-for-byte the response to a token the
+	// server has never seen: it must not tell the presenter that reuse was
+	// detected.
+	unknownStatus, unknownBody := refreshMCP(t, "zid_rt_"+uid("never-issued"))
+
+	status, body = refreshMCP(t, rt1)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_grant", body["error"])
+	assert.Equal(t, unknownStatus, status, "a replay is answered like any unusable refresh token")
+	assert.Equal(t, unknownBody, body, "a replay is answered like any unusable refresh token")
+
+	status, body = refreshMCP(t, rt2)
+	assert.Equal(t, http.StatusBadRequest, status,
+		"rt2 must be revoked once its rotated-out predecessor was presented again")
+	assert.Equal(t, "invalid_grant", body["error"])
+
+	assert.False(t, introspect(t, at1)["active"].(bool),
+		"the access token from the authorization_code exchange must be revoked with the family")
+	assert.False(t, introspect(t, at2)["active"].(bool),
+		"the access token minted by the refresh must be revoked with the family")
+}
+
+// TestRefreshTokenReuseLeavesOtherFamiliesAlone bounds the revocation: reuse
+// in one family revokes that family only — another session of the same user
+// and client keeps working.
+func TestRefreshTokenReuseLeavesOtherFamiliesAlone(t *testing.T) {
+	user := uid("user-reuse-isolation")
+	_, victimRT := exchangeMCPCode(t, user)
+	otherAT, otherRT := exchangeMCPCode(t, user)
+
+	status, _ := refreshMCP(t, victimRT)
+	require.Equal(t, http.StatusOK, status)
+	status, _ = refreshMCP(t, victimRT) // reuse → victim family revoked
+	require.Equal(t, http.StatusBadRequest, status)
+
+	assert.True(t, introspect(t, otherAT)["active"].(bool),
+		"an access token from another family must survive")
+	status, _ = refreshMCP(t, otherRT)
+	assert.Equal(t, http.StatusOK, status, "another family of the same user must still rotate")
+}
+
+// TestRefreshTokenRetryAfterServerFailureRotates drives RestoreRotation end
+// to end through the refresh grant. The server consumes the presented token,
+// then fails to mint the access token (forced here by a trigger that rejects
+// the insert for this one user). The client never received a successor, so it
+// retries with the token it holds — and that retry must rotate normally rather
+// than be treated as reuse and revoke the family.
+func TestRefreshTokenRetryAfterServerFailureRotates(t *testing.T) {
+	ctx := context.Background()
+	user := uid("user-restore-e2e")
+	at1, rt1 := exchangeMCPCode(t, user)
+
+	fn := "zeroid_test_fail_refresh_" + strings.ReplaceAll(uid(""), "-", "_")
+	_, err := testDB.ExecContext(ctx, fmt.Sprintf(`
+CREATE FUNCTION %[1]s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.grant_type = 'refresh_token' AND NEW.principal_sub = '%[2]s' THEN
+		RAISE EXCEPTION 'forced failure for %[2]s';
+	END IF;
+	RETURN NEW;
+END $$;
+CREATE TRIGGER %[1]s BEFORE INSERT ON issued_credentials
+	FOR EACH ROW EXECUTE FUNCTION %[1]s();`, fn, user))
+	require.NoError(t, err)
+	dropped := false
+	drop := func() {
+		if !dropped {
+			dropped = true
+			_, err := testDB.ExecContext(ctx, fmt.Sprintf(
+				"DROP TRIGGER IF EXISTS %[1]s ON issued_credentials; DROP FUNCTION IF EXISTS %[1]s();", fn))
+			require.NoError(t, err)
+		}
+	}
+	t.Cleanup(drop)
+
+	status, _ := refreshMCP(t, rt1)
+	require.GreaterOrEqual(t, status, 500, "precondition: access-token issuance failed after the rotation")
+
+	drop()
+
+	status, body := refreshMCP(t, rt1)
+	require.Equal(t, http.StatusOK, status,
+		"the retry with the presented token must rotate, not be treated as reuse: %v", body)
+	rt2, _ := body["refresh_token"].(string)
+	require.NotEmpty(t, rt2)
+
+	assert.True(t, introspect(t, at1)["active"].(bool), "the family was not revoked")
+	status, _ = refreshMCP(t, rt2)
+	assert.Equal(t, http.StatusOK, status, "the family keeps rotating")
+}
+
+// TestRefreshTokenRestoreRotation pins the one retry that must NOT be treated
+// as reuse: the server consumed the presented token and stored a successor,
+// then failed before answering. RestoreRotation puts the presented token back
+// so the client's retry with it rotates normally — and refuses to resurrect
+// anything once the family has been revoked.
+func TestRefreshTokenRestoreRotation(t *testing.T) {
+	ctx := context.Background()
+	svc := service.NewRefreshTokenService(postgres.NewRefreshTokenRepository(testDB), testDB)
+
+	issue := func(t *testing.T) string {
+		t.Helper()
+		res, err := svc.IssueRefreshToken(ctx, &service.RefreshTokenParams{
+			ClientID:  testMCPClientID,
+			AccountID: testAccountID,
+			ProjectID: testProjectID,
+			UserID:    uid("user-restore"),
+			Scopes:    "data:read",
+		})
+		require.NoError(t, err)
+		return res.RawToken
+	}
+
+	t.Run("an unused successor is undone and the presented token rotates again", func(t *testing.T) {
+		raw := issue(t)
+		claimed, successor, err := svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.NoError(t, err)
+
+		restored, err := svc.RestoreRotation(ctx, claimed, successor)
+		require.NoError(t, err)
+		assert.True(t, restored)
+
+		active, err := svc.IsRefreshTokenActive(ctx, raw)
+		require.NoError(t, err)
+		assert.True(t, active, "the presented token is active again")
+		active, err = svc.IsRefreshTokenActive(ctx, successor.RawToken)
+		require.NoError(t, err)
+		assert.False(t, active, "the undone successor is gone")
+
+		_, next, err := svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.NoError(t, err, "the retry rotates instead of tripping reuse detection")
+		active, err = svc.IsRefreshTokenActive(ctx, next.RawToken)
+		require.NoError(t, err)
+		assert.True(t, active, "the family survives the retry")
+	})
+
+	t.Run("nothing is restored once reuse revoked the family", func(t *testing.T) {
+		raw := issue(t)
+		claimed, successor, err := svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.NoError(t, err)
+
+		_, _, err = svc.RotateRefreshToken(ctx, raw, 0, "")
+		var reuse *service.RefreshTokenReuseError
+		require.ErrorAs(t, err, &reuse, "presenting the rotated token is reuse")
+		assert.Equal(t, claimed.FamilyID, reuse.FamilyID)
+
+		restored, err := svc.RestoreRotation(ctx, claimed, successor)
+		require.NoError(t, err)
+		assert.False(t, restored, "a revoked family must not be brought back")
+
+		for _, tok := range []string{raw, successor.RawToken} {
+			active, err := svc.IsRefreshTokenActive(ctx, tok)
+			require.NoError(t, err)
+			assert.False(t, active)
+		}
+	})
+
+	t.Run("a successor that was itself rotated is not undone", func(t *testing.T) {
+		raw := issue(t)
+		claimed, successor, err := svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.NoError(t, err)
+		_, third, err := svc.RotateRefreshToken(ctx, successor.RawToken, 0, "")
+		require.NoError(t, err)
+
+		restored, err := svc.RestoreRotation(ctx, claimed, successor)
+		require.NoError(t, err)
+		assert.False(t, restored)
+
+		active, err := svc.IsRefreshTokenActive(ctx, raw)
+		require.NoError(t, err)
+		assert.False(t, active, "the original stays consumed")
+		active, err = svc.IsRefreshTokenActive(ctx, third.RawToken)
+		require.NoError(t, err)
+		assert.True(t, active, "the live token is untouched")
+	})
 }
 
 // TestRefreshTokenRotationRollbackOnInsertFailure verifies that when the
