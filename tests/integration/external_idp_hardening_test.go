@@ -374,3 +374,61 @@ func TestExternalIDTokenFederation_KeyRotation(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	require.Equal(t, iss, claims["user_id_iss"])
 }
+
+// TestExternalIDTokenFederation_WorkloadSubjectRefused covers #415: the
+// ID-token exchange mints principal_type=user, which resource servers read as a
+// person behind the chain, so a subject_token that names a workload is refused
+// with invalid_grant rather than minted as a person. One case per recognized
+// marker, plus a person token from the same issuer that still mints as a user.
+func TestExternalIDTokenFederation_WorkloadSubjectRefused(t *testing.T) {
+	iss := "https://workload.idp.test"
+	aud := "https://zeroid.federation.test"
+
+	idp := newFakeRSAIdP(t, "wl-kid-1", true)
+	defer idp.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          iss,
+		JWKSURI:         idp.JWKSURL(),
+		Audience:        aud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	token := func(extra map[string]any) string {
+		now := time.Now()
+		c := map[string]any{
+			"iss": iss, "aud": aud, "sub": uid("wl-person"),
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return idp.sign(t, c)
+	}
+
+	t.Run("person token mints principal_type=user", func(t *testing.T) {
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(token(map[string]any{"idtyp": "user"}), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "user", principalOf(t, resp.AccessToken).Type)
+	})
+
+	cases := []struct {
+		name  string
+		extra map[string]any
+	}{
+		{"Entra app-only token (idtyp=app)", map[string]any{"idtyp": "app"}},
+		{"Kubernetes service account subject", map[string]any{"sub": "system:serviceaccount:prod:builder"}},
+		{"SPIFFE ID subject", map[string]any{"sub": "spiffe://example.org/ns/prod/sa/builder"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" refused", func(t *testing.T) {
+			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(token(tc.extra), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+			require.Equal(t, "invalid_grant", resp.Error)
+			require.Empty(t, resp.AccessToken, "a workload subject must not be minted as a person")
+		})
+	}
+}
