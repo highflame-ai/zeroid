@@ -340,3 +340,39 @@ func TestIDJAGBearer_NoTenantFieldsRequired(t *testing.T) {
 // closed", "missing resource fails closed", plus the D2a replay / missing-jti
 // and D2b bad-secret / client_id-mismatch cases), where a full server with a
 // real DB authenticates the client first and then reaches each deeper gate.
+
+// TestRequireCIMDClientFitForIDJAG pins the two document-level gates a CIMD
+// client must pass to redeem an ID-JAG (firehog#701).
+func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
+	fit := func() *domain.OAuthClient {
+		return &domain.OAuthClient{
+			ClientID:                "https://client.example.test/client.json",
+			RegistrationSource:      domain.RegistrationSourceCIMD,
+			TokenEndpointAuthMethod: clientAuthMethodPrivateKeyJWT,
+			GrantTypes:              []string{"authorization_code", grantTypeJWTBearerURN},
+			IsActive:                true,
+		}
+	}
+
+	if err := requireCIMDClientFitForIDJAG(fit()); err != nil {
+		t.Fatalf("a private_key_jwt document listing jwt-bearer must pass: %v", err)
+	}
+
+	t.Run("auth method none is refused (draft §9.1, ADR 0010 D2b)", func(t *testing.T) {
+		c := fit()
+		c.TokenEndpointAuthMethod = "none"
+		requireInvalidClient(t, requireCIMDClientFitForIDJAG(c))
+	})
+
+	t.Run("no jwt-bearer in grant_types is unauthorized_client", func(t *testing.T) {
+		c := fit()
+		c.GrantTypes = []string{"authorization_code"}
+		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+	})
+
+	t.Run("the short jwt_bearer form does not count", func(t *testing.T) {
+		c := fit()
+		c.GrantTypes = []string{"authorization_code", "jwt_bearer"}
+		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+	})
+}
