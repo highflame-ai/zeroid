@@ -105,6 +105,27 @@ func buildIDJAGCustomClaims(
 	return customClaims
 }
 
+// idJAGActors returns the RFC 8693 §4.1 actor chain for an ID-JAG-minted
+// token: the redeeming application identity as the single current actor, in
+// the same shape token exchange gives its actor. The token's `sub` is the
+// person, so without this a resource server sees an undelegated person token
+// and cannot tell two agents acting for the same person apart.
+//
+// The synthetic carrier (no application_id, so no identity row) has no WIMSE
+// URI to name and yields no actor. Only the rfc8693 profile reads Actors; the
+// legacy shape is unchanged.
+func idJAGActors(identity *domain.Identity) []domain.Actor {
+	if identity == nil || identity.ID == "" || identity.WIMSEURI == "" {
+		return nil
+	}
+	return []domain.Actor{{
+		Sub:          identity.WIMSEURI,
+		IdentityType: string(identity.IdentityType),
+		TrustLevel:   string(identity.TrustLevel),
+		ExternalID:   identity.ExternalID,
+	}}
+}
+
 // idJAGBearer mints an audience-restricted ZeroID access token from an MCP
 // ID-JAG presented at POST /oauth2/token with
 // grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer (ADR 0010 D2-D4).
@@ -407,7 +428,11 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
 		// this client and bound the ID-JAG's own client_id claim to it, so it
 		// is exactly the client the token is issued to.
-		ClientID:          authedClient.ClientID,
+		ClientID: authedClient.ClientID,
+		// The redeeming agent is the current actor (RFC 8693 §4.1). Built
+		// after the trust_level mapping above, so act.trust_level carries the
+		// value the legacy shape emits at the top level.
+		Actors:            idJAGActors(identity),
 		TTL:               900, // 15 minutes — short-lived, matching the external-IdP paths
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
