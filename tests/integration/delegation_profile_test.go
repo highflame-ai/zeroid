@@ -1119,7 +1119,7 @@ func TestIDJAG_RedeemingAgentIsCurrentActor(t *testing.T) {
 	})
 
 	t.Run("legacy is unchanged", func(t *testing.T) {
-		tn := tenant("")
+		tn := tenant("legacy")
 		appID, _, extID := agent(tn)
 		alice := uid("act416-alice")
 		claims := redeem(tn, alice, appID)
