@@ -786,8 +786,16 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
+	// RFC 6749 §4.4.2: the client MUST authenticate. Checked first, so nothing
+	// below (tenant derivation included) runs for an anonymous caller.
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("client_credentials requires client authentication", nil)
+	}
+
+	// Naming half a tenant is malformed whichever way the tenant is decided.
+	if (req.AccountID == "") != (req.ProjectID == "") {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"account_id and project_id must be sent together, or both omitted")
 	}
 
 	// Authenticate the client with whatever its REGISTERED method requires —
@@ -819,11 +827,42 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
-	// Resolve the identity for this client (external_id == client_id within the tenant).
-	// Tenant comes from the token request — client registration is global.
-	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
-	if err != nil {
-		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+	// Resolve the identity this token is for.
+	//
+	// A request that names a tenant keeps the original rule: the identity whose
+	// external_id is the client_id within that tenant.
+	//
+	// A request that names none, which is every conformant client (RFC 6749
+	// §4.4.2 defines only grant_type and scope), gets the identity the client's
+	// REGISTRATION links to (identity_id), and that identity's tenant. The link
+	// is written by an administrator inside the identity's own tenant, so the
+	// caller cannot steer it. There is deliberately no fallback to a
+	// cross-tenant external_id search: anyone in another tenant can create an
+	// identity with this client's id as its external_id, and a search would let
+	// them make the answer ambiguous or, for a client with no identity yet,
+	// decide it.
+	var identity *domain.Identity
+	if req.AccountID != "" {
+		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+		}
+	} else {
+		if client.IdentityID == nil || *client.IdentityID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"this client's registration links no identity, so its tenant cannot be derived; "+
+					"link one (identity_id) or send account_id and project_id")
+		}
+		identity, err = s.identitySvc.repo.GetLinkedByID(ctx, *client.IdentityID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, oauthUnauthorized("the client's linked identity no longer exists", err)
+			}
+			return nil, oauthServerError("failed to resolve the client's linked identity", err)
+		}
+		if identity.AccountID == "" || identity.ProjectID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "the client's linked identity has no complete tenant")
+		}
 	}
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
