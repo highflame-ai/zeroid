@@ -696,6 +696,20 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		require.NoError(t, err)
 		requireRefused(t, p.exchange(t, tok, nil), "invalid_grant")
 	})
+	t.Run("an Entra access token without scp (azpacr marks it)", func(t *testing.T) {
+		requireRefused(t, p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"azpacr": "2", "roles": []string{"Agent.Run"}}), nil), "invalid_grant")
+	})
+	t.Run("an ID-JAG presented as an ID token", func(t *testing.T) {
+		typ := "oauth-id-jag+jwt"
+		tok, _, err := p.f.idp.Mint(mockidp.MintRequest{Profile: mockidp.ProfileEntraIDToken, Tenant: p.tid, HeaderTyp: &typ,
+			Claims: map[string]any{"aud": p.appID, "oid": p.aliceOID}})
+		require.NoError(t, err)
+		requireRefused(t, p.exchange(t, tok, nil), "invalid_grant")
+	})
+	t.Run("an ID token carrying the person's app roles is accepted", func(t *testing.T) {
+		resp := p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"roles": []string{"Approver"}}), nil)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	})
 	t.Run("an ID token presented by a client that is not its audience", func(t *testing.T) {
 		other := p.tn.agent(t)
 		otherApp := uid("app-other")

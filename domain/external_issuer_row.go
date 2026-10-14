@@ -155,6 +155,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if templatedIssuer(e.Issuer) {
 		return issuerInvalid("invalid_issuer", "issuer %q is a template; use the tenant's own issuer", e.Issuer)
 	}
+	if e.Kind == IssuerKindPerson && slices.Contains(WorkloadOnlyIssuers, CanonicalIssuer(e.Issuer)) {
+		return issuerInvalid("invalid_issuer", "issuer %q issues workload tokens only; it can be a workload issuer, not a person issuer", e.Issuer)
+	}
 	if e.Kind == IssuerKindPerson && EntraMultiTenantIssuer(e.Issuer) {
 		return issuerInvalid("invalid_issuer",
 			"issuer %q is an Entra multi-tenant endpoint; a person issuer must be one tenant (https://login.microsoftonline.com/<tenant-id>/v2.0)", e.Issuer)
@@ -332,6 +335,16 @@ func EntraMultiTenantIssuer(iss string) bool {
 		return true
 	}
 	return false
+}
+
+// WorkloadOnlyIssuers name no people, so they are never person issuers.
+var WorkloadOnlyIssuers = []string{"https://token.actions.githubusercontent.com"}
+
+// CanonicalIssuer is iss without trailing slashes: the form issuer
+// uniqueness, locking and the shared list compare on. Tokens are still
+// matched against the row's issuer exactly.
+func CanonicalIssuer(iss string) string {
+	return strings.TrimRight(strings.TrimSpace(iss), "/")
 }
 
 // DefaultSharedIssuers is the platform's shared-issuer list when the

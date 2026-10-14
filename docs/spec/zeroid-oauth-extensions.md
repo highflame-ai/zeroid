@@ -634,11 +634,13 @@ upstream ID token. The mode:
   library honors but does not require them). A 60-second clock skew is tolerated.
 - **MUST** accept only a token that is positively an ID token: `iss`, `sub`,
   `aud`, `exp` and `iat` present, and no access-token marker (`scp`, `scope`,
-  or a JWS `typ` of `at+jwt` / `application/at+jwt`, RFC 9068 §2.1). Together
+  Entra's `azpacr`/`appidacr`, or a JWS `typ` of `at+jwt` / `application/at+jwt`
+  (RFC 9068 §2.1) or `oauth-id-jag+jwt`). Together
   with the relying-party check above this separates an ID token from an access
   token a trusted issuer also signs.
 - **MUST** accept only an issuer of kind `person`, and refuse a workload
-  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID)
+  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID,
+  a GitHub Actions `repo:` subject)
   with `invalid_grant`, since the minted token carries `principal_type=user`.
 - **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
   Section 7.2) and outside the issuer's configured `algorithms` (default

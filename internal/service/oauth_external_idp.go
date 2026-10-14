@@ -66,6 +66,8 @@ func requireIDToken(raw string, verified jwt.Token) error {
 		switch strings.ToLower(hdr.Typ) {
 		case "at+jwt", "application/at+jwt":
 			return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an access token (typ at+jwt), not an ID token")
+		case idJAGTyp:
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an ID-JAG; redeem it with the jwt-bearer grant")
 		}
 	}
 	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat"} {
@@ -73,7 +75,10 @@ func requireIDToken(raw string, verified jwt.Token) error {
 			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token is not an ID token: it has no %s claim", claim))
 		}
 	}
-	for _, claim := range []string{"scp", "scope"} {
+	// Entra stamps azpacr (v2) or appidacr (v1) on every access token, the
+	// app-only ones included, and never on an ID token. roles alone is not
+	// a marker: Entra ID tokens carry a user's app roles in it.
+	for _, claim := range []string{"scp", "scope", "azpacr", "appidacr"} {
 		if verified.Has(claim) {
 			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token carries %s, which marks an access token, not an ID token", claim))
 		}
@@ -668,6 +673,9 @@ func refuseWorkloadSubject(claims map[string]any, userID string) error {
 	}
 	sub, _ := claims["sub"].(string)
 	for _, id := range []string{sub, userID} {
+		if strings.HasPrefix(id, "repo:") {
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a GitHub Actions workflow; this grant accepts person tokens only")
+		}
 		if strings.HasPrefix(id, "system:serviceaccount:") {
 			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a Kubernetes service account; this grant accepts person tokens only")
 		}

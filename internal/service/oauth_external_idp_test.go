@@ -88,6 +88,7 @@ func TestRefuseWorkloadSubject(t *testing.T) {
 		{"Kubernetes service account sub", map[string]any{"sub": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
 		{"Kubernetes service account in mapped user_id only", map[string]any{"sub": "opaque", "uid": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
 		{"SPIFFE ID sub", map[string]any{"sub": "spiffe://example.org/ns/prod/sa/api"}, "spiffe://example.org/ns/prod/sa/api", true},
+		{"GitHub Actions workflow sub", map[string]any{"sub": "repo:acme/app:ref:refs/heads/main"}, "repo:acme/app:ref:refs/heads/main", true},
 		{"SPIFFE scheme compared case-insensitively", map[string]any{"sub": "SPIFFE://example.org/w"}, "SPIFFE://example.org/w", true},
 		{"SPIFFE ID in sub, person in mapped user_id", map[string]any{"sub": "spiffe://example.org/w", "oid": "person"}, "person", true},
 		{"lookalike that is not a marker", map[string]any{"sub": "user:system:serviceaccount:x"}, "user:system:serviceaccount:x", false},
@@ -226,13 +227,18 @@ func TestRequireIDToken(t *testing.T) {
 	if err := requireIDToken(raw, tok); err != nil {
 		t.Fatalf("an ID token is accepted: %v", err)
 	}
-	for _, typ := range []string{"at+jwt", "application/at+jwt", "AT+JWT"} {
+	c := idToken()
+	c["roles"] = []string{"Approver"}
+	if raw, tok := sign("JWT", c); requireIDToken(raw, tok) != nil {
+		t.Fatal("an ID token may carry the user's app roles")
+	}
+	for _, typ := range []string{"at+jwt", "application/at+jwt", "AT+JWT", "oauth-id-jag+jwt"} {
 		raw, tok := sign(typ, idToken())
 		if err := requireIDToken(raw, tok); err == nil {
 			t.Fatalf("typ %s marks an access token", typ)
 		}
 	}
-	for _, claim := range []string{"scp", "scope"} {
+	for _, claim := range []string{"scp", "scope", "azpacr", "appidacr"} {
 		c := idToken()
 		c[claim] = "mail.read"
 		raw, tok := sign("JWT", c)

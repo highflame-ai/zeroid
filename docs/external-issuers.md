@@ -59,6 +59,7 @@ The built-in shared list is `https://accounts.google.com`, `https://token.action
 `federation.shared_issuers` replaces it.
 
 A person row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant endpoints, which name no single tenant.
+A person row also refuses an issuer that only issues workload tokens (GitHub Actions, `https://token.actions.githubusercontent.com`).
 
 ### Presets
 
@@ -123,8 +124,9 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
    This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
    Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
    The `aud` is accepted because an enabled binding on the row has the `client_id` as subject key (the binding is the audience rule), or because it is in the row's `audiences`.
-2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker (`scp`, `scope`, or a `typ` of `at+jwt` or `application/at+jwt`).
-3. The issuer row is `person`, and the subject is not a workload (static issuers too): no Entra `idtyp=app`, no `system:serviceaccount:` subject, no SPIFFE ID.
+2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker: no `scp`, `scope`, `azpacr` or `appidacr` (Entra stamps one of the last two on every access token, app-only ones included), and no `typ` of `at+jwt`, `application/at+jwt` or `oauth-id-jag+jwt`.
+   `roles` alone is not a marker: Entra ID tokens carry a user's app roles in it.
+3. The issuer row is `person`, and the subject is not a workload (static issuers too): no Entra `idtyp=app`, no `system:serviceaccount:` subject, no SPIFFE ID, no GitHub Actions `repo:` subject.
 4. An enabled binding maps the client's `client_id` under the row to an identity, which is the agent.
    If the client's registration links an identity, it must be that one.
    The account is the row's and the project is the agent's; a request's `account_id`, `project_id` or `application_id` must match.

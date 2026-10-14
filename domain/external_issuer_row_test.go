@@ -58,6 +58,14 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.Issuer = "https://login.microsoftonline.com/common/v2.0"
 			e.ClaimConstraints = map[string][]string{"tid": {"t"}}
 		}, v: IssuerValidation{Shared: true}},
+		{name: "GitHub Actions as a person issuer", mutate: func(e *ExternalIssuer) {
+			e.Issuer = "https://token.actions.githubusercontent.com/"
+		}, v: IssuerValidation{Shared: true}, want: "invalid_issuer"},
+		{name: "GitHub Actions as a workload issuer", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.Issuer = "https://token.actions.githubusercontent.com"
+			e.ClaimConstraints = map[string][]string{"repository_owner": {"acme"}}
+		}, v: IssuerValidation{Shared: true}},
 		{name: "http jwks_uri", mutate: func(e *ExternalIssuer) { e.JWKSURI = "http://acme.okta.com/keys" }, want: "invalid_jwks_uri"},
 		{name: "person row without audiences (bindings admit client ids)", mutate: func(e *ExternalIssuer) { e.Audiences = nil }},
 		{name: "workload row without audiences", mutate: func(e *ExternalIssuer) {
