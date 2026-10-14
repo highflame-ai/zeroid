@@ -185,16 +185,18 @@ var ErrPrincipalInteractionRequired = errors.New("zeroid: principal requires int
 // one was sent) and the RFC 9207 iss parameter. Unlike every other failure at
 // this endpoint, that redirect is issued on POST as well as GET: the POST
 // caller here is the front end, and its job is to forward the Location to the
-// user agent. Where zeroid declines to redirect to the destination at all — a
-// self-asserted client with a remote redirect_uri and no vetted publishers —
-// it answers with a JSON access_denied body instead.
+// user agent. That holds for self-asserted (CIMD) clients too, remote
+// redirect_uri included: cimd.allowed_domains is enforced when the document
+// resolves, before any resolver runs. A JSON access_denied body (403) is only
+// a defensive fallback for a destination zeroid cannot redirect to at all.
+// It also stops the resolver chain, and it outranks both
+// ErrPrincipalNotApplicable and ErrPrincipalInteractionRequired when an error
+// matches more than one sentinel.
 //
 // Only return it for a request the resolver has authenticated. A credential
 // that fails to verify is an ordinary error, and a request the resolver does
 // not handle is ErrPrincipalNotApplicable; a resolver that reported denial for
 // an unauthenticated request would let anyone produce the error redirect.
-//
-// Returning it stops the chain.
 var ErrPrincipalAccessDenied = errors.New("zeroid: resource owner denied the request")
 
 // ErrNoResolversRegistered is the sentinel Server.resolvePrincipal

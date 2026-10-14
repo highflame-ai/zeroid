@@ -123,9 +123,9 @@ usually the better one:
    with a 302 to the validated `redirect_uri` carrying `error=access_denied`, the
    request's `state` and `iss`, and the surface forwards that `Location` to the
    browser exactly as it forwards the code redirect on approval. This is the only
-   error ZeroID redirects on POST. The self-asserted-client rule below still
-   applies: where the destination is refused, the denial comes back as a JSON
-   `access_denied` body instead.
+   error ZeroID redirects on POST, and it reaches a CIMD client's `redirect_uri`
+   like every other redirect (see below): the client was admitted when its
+   document resolved.
 
    What route 2 does **not** remove is authorization-request CSRF — it moves it
    to your surface. An attacker can still navigate a victim's browser to that
