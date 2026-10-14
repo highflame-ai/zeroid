@@ -64,8 +64,8 @@ func TestBindAgent(t *testing.T) {
 	if err != nil || got.ID != "agent-1" {
 		t.Fatalf("bound agent: %v %v", got, err)
 	}
-	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", &domain.OAuthClient{ClientID: "c"}, federatedGrantIDJAG); err != nil || got.ID != "agent-1" {
-		t.Fatalf("a client with no link takes the binding: %v %v", got, err)
+	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", nil, federatedGrantIDJAG); err != nil || got.ID != "agent-1" {
+		t.Fatalf("no client to check (CIMD path passes nil-safe): %v %v", got, err)
 	}
 
 	for name, tc := range map[string]struct {
@@ -79,7 +79,8 @@ func TestBindAgent(t *testing.T) {
 		"discovered agent (D7)":    {key: "okta-client-2", msg: "is discovered"},
 		"pending agent (D7)":       {key: "okta-client-3", msg: "is pending"},
 		"identity in another acct": {key: "okta-client-4", msg: "no identity in the issuer's account"},
-		"client bound elsewhere":   {key: "okta-client-1", client: linked("agent-9"), msg: "different identity"},
+		"client bound elsewhere":   {key: "okta-client-1", client: linked("agent-9"), msg: "not registered to the agent"},
+		"client linked to nothing": {key: "okta-client-1", client: &domain.OAuthClient{ClientID: "c"}, msg: "not registered to the agent"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := bindAgent(ctx, bindings, lookup, row, tc.key, tc.client, federatedGrantIDJAG)

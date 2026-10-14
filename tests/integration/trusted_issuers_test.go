@@ -246,6 +246,27 @@ func (f *dbFederation) bind(t *testing.T, tn tiTenant, rowID, subjectKey, identi
 	return f.call(t, http.MethodPost, "/external-issuers/"+rowID+"/bindings", body, tn.headers)
 }
 
+// keyClient registers a private_key_jwt client in tn, linked to identityID
+// when it is non-empty, and returns its key.
+func keyClient(t *testing.T, tn tiTenant, clientID, identityID string) *ecdsa.PrivateKey {
+	t.Helper()
+	key := generateKey(t)
+	body := map[string]any{
+		"client_id":                  clientID,
+		"name":                       clientID,
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, key),
+		"grant_types":                []string{"urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+	}
+	if identityID != "" {
+		body["identity_id"] = identityID
+	}
+	resp := post(t, adminPath("/oauth/clients"), body, tn.headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "register client %s", clientID)
+	_ = resp.Body.Close()
+	return key
+}
+
 func clientCreds(t *testing.T, clientID string, key *ecdsa.PrivateKey) map[string]any {
 	t.Helper()
 	return map[string]any{
@@ -747,9 +768,9 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		require.Equal(t, http.StatusCreated, status, "%v", body)
 		_, err := testDB.NewUpdate().Table("external_issuer_bindings").Set("enabled = true").Where("id = ?", body["id"]).Exec(context.Background())
 		require.NoError(t, err)
-		rp := rpClient(t, app)
+		key := keyClient(t, p.tn, app, discovered)
 		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": app})),
-			clientCreds(t, app, rp.Key)))
+			clientCreds(t, app, key)))
 		requireRefused(t, resp, "invalid_grant")
 		assert.Contains(t, resp.RawBody, "discovered", "the refusal names the state")
 	})
@@ -772,6 +793,29 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		status, _ = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"enabled": true}, p.tn.headers)
 		require.Equal(t, http.StatusOK, status)
 		assert.Equal(t, http.StatusOK, p.exchange(t, good(), nil).StatusCode, "re-enabled at the next request")
+	})
+	t.Run("another account registering the agent's app id as its own client cannot redeem", func(t *testing.T) {
+		// A binds app Y but has not created its client yet; B registers a
+		// private_key_jwt client named Y, unlinked or linked to B's agent,
+		// and presents A's leaked ID token (aud = Y).
+		appY := uid("app-y")
+		status, body := p.f.bind(t, p.tn, p.rowID, appY, p.agent.id, false)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		b := newTITenant(t)
+		leaked := p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": appY})
+		unlinked := keyClient(t, b, appY, "")
+		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(leaked), clientCreds(t, appY, unlinked)))
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "not registered to the agent")
+
+		appZ := uid("app-z")
+		status, body = p.f.bind(t, p.tn, p.rowID, appZ, p.agent.id, false)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		bAgent := b.agent(t)
+		linkedToB := keyClient(t, b, appZ, bAgent.id)
+		resp = postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": appZ})),
+			clientCreds(t, appZ, linkedToB)))
+		requireRefused(t, resp, "invalid_grant")
 	})
 	t.Run("idp_sub cannot be supplied by the caller", func(t *testing.T) {
 		resp := p.exchange(t, good(), map[string]any{"additional_claims": map[string]any{
@@ -890,11 +934,11 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 		require.Equal(t, http.StatusCreated, status, "%v", body)
 		_, err := testDB.NewUpdate().Table("external_issuer_bindings").Set("enabled = true").Where("id = ?", body["id"]).Exec(context.Background())
 		require.NoError(t, err)
-		client := rpClient(t, key)
+		clientKey := keyClient(t, p.tn, key, discovered)
 		resp := postFederation(t, p.f.http.URL, merged(map[string]any{
 			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
 			"assertion":  p.idJAG(t, map[string]any{"client_id": key, "act": map[string]any{"sub": key}}),
-		}, clientCreds(t, key, client.Key)))
+		}, clientCreds(t, key, clientKey)))
 		requireRefused(t, resp, "invalid_grant")
 		assert.Contains(t, resp.RawBody, "discovered", "the refusal names the state")
 	})

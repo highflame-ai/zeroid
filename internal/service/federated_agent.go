@@ -74,10 +74,13 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 		}
 		return nil, oauthServerError("failed to load the agent's identity", err)
 	}
-	if client != nil && !client.SelfAsserted() && client.IdentityID != nil && *client.IdentityID != identity.ID {
-		recordUnmatchedAgent(ctx, row, subjectKey, grant, "client_mismatch")
+	// A registered client must be linked to exactly the bound agent. client_id
+	// is a global namespace any tenant can register into, so an unlinked
+	// client named after another tenant's app id must not inherit its agent.
+	if client != nil && !client.SelfAsserted() && (client.IdentityID == nil || *client.IdentityID != identity.ID) {
+		recordUnmatchedAgent(ctx, row, subjectKey, grant, "client_not_linked")
 		return nil, oauthBadRequest(oautherror.InvalidGrant,
-			"the authenticated client is registered to a different identity than the agent's binding")
+			"the authenticated client is not registered to the agent the credential is bound to")
 	}
 	if identity.Status != domain.IdentityStatusActive {
 		recordAgentNotAdopted(ctx, row, identity, grant)
