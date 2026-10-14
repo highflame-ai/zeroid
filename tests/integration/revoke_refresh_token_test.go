@@ -9,6 +9,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // revokeStatus posts an RFC 7009 revocation request and returns the status and
@@ -272,4 +276,29 @@ func TestRevokeRefreshToken_AssertionOnlyClientIsConfined(t *testing.T) {
 	assert.True(t, introspect(t, at)["active"].(bool), "another client's access token is untouched")
 	status, _ = refreshMCP(t, rt)
 	assert.Equal(t, http.StatusOK, status, "another client's refresh token still works")
+}
+
+// The refresh-token reuse grace window covers rotation only. A refresh token
+// revoked at the revocation endpoint moments ago, presented again, is not a
+// concurrent retry: it is refused as reuse (its family is already revoked),
+// never with the grace window's benign "already rotated".
+func TestRevokeRefreshToken_NoReuseGraceAfterRevocation(t *testing.T) {
+	ctx := context.Background()
+	setRefreshReuseGrace(t, domain.RefreshTokenReuseGraceWindow)
+	_, rt := exchangeMCPCode(t, uid("user-revoke-rt-no-grace"))
+
+	status, _ := revokeStatus(t, map[string]any{"token": rt, "client_id": testMCPClientID})
+	require.Equal(t, http.StatusOK, status)
+
+	svc := service.NewRefreshTokenService(postgres.NewRefreshTokenRepository(testDB), testDB)
+	_, _, err := svc.RotateRefreshToken(ctx, rt, 0, "")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, service.ErrRefreshTokenAlreadyRotated,
+		"a token revoked at the revocation endpoint gets no reuse grace")
+	var reuse *service.RefreshTokenReuseError
+	assert.ErrorAs(t, err, &reuse, "presenting it again is reuse of a revoked family")
+
+	status, body := refreshMCP(t, rt)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_grant", body["error"])
 }
