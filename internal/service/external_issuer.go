@@ -118,9 +118,9 @@ func (s *ExternalIssuerService) IsShared(iss string) bool {
 }
 
 func isSharedIssuer(list []string, iss string) bool {
-	norm := strings.TrimRight(iss, "/")
+	canon := domain.CanonicalIssuer(iss)
 	for _, sh := range list {
-		if strings.TrimRight(sh, "/") == norm {
+		if domain.CanonicalIssuer(sh) == canon {
 			return true
 		}
 	}
@@ -210,10 +210,10 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	}
 
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
-		if err := s.repo.LockIssuer(ctx, row.Issuer); err != nil {
+		if err := s.repo.LockIssuer(ctx, domain.CanonicalIssuer(row.Issuer)); err != nil {
 			return err
 		}
-		existing, err := s.repo.ListByIssuer(ctx, row.Issuer)
+		existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(row.Issuer))
 		if err != nil {
 			return err
 		}
@@ -245,12 +245,15 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 }
 
 // uniquenessConflict applies ADR 0042 D4 to a candidate row against the rows
-// already stored for its issuer (other than itself).
+// already stored for its issuer, compared canonically (other than itself).
 //
 //   - A customer-unique issuer belongs to one account at most, whatever the
 //     constraints, and has at most one row per kind.
-//   - A shared issuer may repeat across accounts, but never with the same
-//     kind and constraints twice.
+//   - A shared issuer may repeat, in any account, but two rows of one kind
+//     must never both match a token: their constraints must not overlap.
+//     Equal sets are the obvious case; a superset, or constraints on
+//     different claims, would let one account's row shadow another's (the
+//     grant refuses a token two rows match), so they conflict too.
 func uniquenessConflict(existing []*domain.ExternalIssuer, row *domain.ExternalIssuer, shared bool) bool {
 	for _, e := range existing {
 		if e.ID == row.ID {
@@ -259,11 +262,30 @@ func uniquenessConflict(existing []*domain.ExternalIssuer, row *domain.ExternalI
 		if !shared && e.AccountID != row.AccountID {
 			return true
 		}
-		if e.Kind == row.Kind && e.ConstraintsKey == row.ConstraintsKey {
+		if e.Kind != row.Kind {
+			continue
+		}
+		if !shared || constraintsOverlap(e.ClaimConstraints, row.ClaimConstraints) {
 			return true
 		}
 	}
 	return false
+}
+
+// constraintsOverlap reports whether one token could satisfy both
+// equality-constraint sets: every claim they both constrain has a value in
+// common. Two sets on disjoint claims overlap (a token can carry both).
+func constraintsOverlap(a, b map[string][]string) bool {
+	for claim, av := range a {
+		bv, both := b[claim]
+		if !both {
+			continue
+		}
+		if !slices.ContainsFunc(av, func(v string) bool { return slices.Contains(bv, v) }) {
+			return false
+		}
+	}
+	return true
 }
 
 // List returns accountID's issuers. In config mode it returns the static
@@ -337,7 +359,7 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		}
 	}
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
-		if err := s.repo.LockIssuer(ctx, current.Issuer); err != nil {
+		if err := s.repo.LockIssuer(ctx, domain.CanonicalIssuer(current.Issuer)); err != nil {
 			return err
 		}
 		r, err := s.repo.Get(ctx, id, accountID)
@@ -352,7 +374,7 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 			return validationToAPIError(err)
 		}
 		r.ConstraintsKey = r.UniquenessKey(shared)
-		existing, err := s.repo.ListByIssuer(ctx, r.Issuer)
+		existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(r.Issuer))
 		if err != nil {
 			return err
 		}

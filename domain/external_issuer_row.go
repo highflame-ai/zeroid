@@ -112,6 +112,12 @@ type IssuerValidation struct {
 	Shared bool
 }
 
+// unpinnableClaims cannot pin an issuer to a customer: every token carries
+// them, and iss and aud are checked separately. A constraint on one would
+// only let a shared-issuer row look distinct from another while matching
+// the same tokens.
+var unpinnableClaims = []string{"iss", "aud", "exp", "iat", "nbf", "jti"}
+
 // knownMappingKeys are the claim_mapping targets a grant reads.
 var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "role", "privilege_scope", "scope", "trust_level"}
 
@@ -193,6 +199,10 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 		return issuerInvalid("invalid_claim_mapping", "a person issuer needs claim_mapping.user_id, the claim that carries the person's user key")
 	}
 	for claim, values := range e.ClaimConstraints {
+		if slices.Contains(unpinnableClaims, claim) {
+			return issuerInvalid("invalid_claim_constraints",
+				"claim_constraints.%s pins nothing: every token carries it with no customer-specific value", claim)
+		}
 		if strings.TrimSpace(claim) == "" || len(values) == 0 || slices.Contains(values, "") {
 			return issuerInvalid("invalid_claim_constraints", "claim_constraints.%s must list at least one non-empty value", claim)
 		}

@@ -64,6 +64,20 @@ func (r *ExternalIssuerRepository) ListByIssuer(ctx context.Context, issuer stri
 	return rows, nil
 }
 
+// ListByCanonicalIssuer returns every row whose issuer is canon up to
+// trailing slashes, in any account: the set uniqueness is decided over.
+func (r *ExternalIssuerRepository) ListByCanonicalIssuer(ctx context.Context, canon string) ([]*domain.ExternalIssuer, error) {
+	var rows []*domain.ExternalIssuer
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&rows).
+		Where("rtrim(issuer, '/') = ?", canon).
+		OrderExpr("created_at, id").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list issuer rows: %w", err)
+	}
+	return rows, nil
+}
+
 // CountByAccount returns how many rows an account has.
 func (r *ExternalIssuerRepository) CountByAccount(ctx context.Context, accountID string) (int, error) {
 	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.ExternalIssuer)(nil)).

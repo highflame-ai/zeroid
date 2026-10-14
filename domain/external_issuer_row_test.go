@@ -81,6 +81,12 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.Kind = IssuerKindWorkload
 			e.ClaimMapping = map[string]string{}
 		}},
+		{name: "constraint on aud pins nothing", mutate: func(e *ExternalIssuer) {
+			e.ClaimConstraints = map[string][]string{"aud": {"x"}}
+		}, want: "invalid_claim_constraints"},
+		{name: "constraint on iss pins nothing", mutate: func(e *ExternalIssuer) {
+			e.ClaimConstraints = map[string][]string{"iss": {"https://acme.okta.com"}}
+		}, want: "invalid_claim_constraints"},
 		{name: "empty constraint", mutate: func(e *ExternalIssuer) {
 			e.ClaimConstraints = map[string][]string{"hd": {}}
 		}, want: "invalid_claim_constraints"},

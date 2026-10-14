@@ -39,9 +39,14 @@ CREATE TABLE IF NOT EXISTS external_issuers (
     updated_at              TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
 
--- Also the per-grant lookup index (issuer is its leading column).
+-- Uniqueness compares issuers without trailing slashes, so "https://x/"
+-- and "https://x" are one issuer. Overlapping shared-issuer constraints are
+-- checked by the writer under the advisory lock.
 CREATE UNIQUE INDEX IF NOT EXISTS external_issuers_issuer_kind_constraints_uq
-    ON external_issuers (issuer, kind, constraints_key);
+    ON external_issuers (rtrim(issuer, '/'), kind, constraints_key);
+-- The per-grant lookup matches a token's iss exactly.
+CREATE INDEX IF NOT EXISTS external_issuers_issuer_idx
+    ON external_issuers (issuer);
 CREATE INDEX IF NOT EXISTS external_issuers_account_idx
     ON external_issuers (account_id);
 

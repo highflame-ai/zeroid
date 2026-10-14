@@ -51,10 +51,16 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 
 - An issuer unique to one customer (an Entra tenant, an Okta org, an AWS account's STS issuer, a cluster, a SPIFFE trust domain) is trusted by **one account at most**, whatever its claim constraints.
 - Only an issuer on the platform's shared list may appear in several accounts, and only with claim constraints that pin it to the customer.
-  Two rows of the same kind with the same constraints are refused.
+  Two rows of the same kind, in any accounts, must never both match one token: their constraints must not **overlap**.
+  Two equality-constraint sets overlap when every claim they both constrain has a value in common; sets on different claims overlap, since one token can carry both.
+  So a second account cannot shadow the first with a superset (`{hd: [acme.com], email_verified: [true]}` beside `{hd: [acme.com]}`), and must pin a claim the first pins, to a different value.
+- Constraints on claims every token carries (`iss`, `aud`, `exp`, `iat`, `nbf`, `jti`) are refused: they pin nothing.
 - An issuer has at most one row per kind in its account, so an Entra tenant can be both the account's `person` issuer and its `workload` issuer.
 
-Writers check these rules under a per-issuer Postgres advisory lock, backed by a unique index on `(issuer, kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the constraints for a shared one.
+Issuers are compared without trailing slashes, so `https://acme.okta.com/` and `https://acme.okta.com` are one issuer; a token's `iss` is still matched against the row exactly.
+Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the constraints for a shared one.
+
+**Known limitation.** Nothing proves that an account owns the values it pins (`hd`, `tid`, `repository_owner`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
 The built-in shared list is `https://accounts.google.com`, `https://token.actions.githubusercontent.com`, Entra's `common`, `organizations` and `consumers` v2.0 endpoints, and the Microsoft consumer tenant `9188040d-6c67-4c5b-b112-36a304b66dad`.
 `federation.shared_issuers` replaces it.
 

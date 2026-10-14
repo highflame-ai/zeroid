@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	zeroid "github.com/highflame-ai/zeroid"
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/mockidp"
 	"github.com/highflame-ai/zeroid/pkg/authjwt"
 )
@@ -55,7 +57,9 @@ func newDBFederation(t *testing.T) *dbFederation {
 	idp.SetBaseURL(idpSrv.URL)
 
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
-	f.srv, f.http = newDBFederationServer(t)
+	// One mock Entra tenant stands in for a shared issuer (like
+	// accounts.google.com), beside the built-in list.
+	f.srv, f.http = newDBFederationServer(t, append(slices.Clone(domain.DefaultSharedIssuers), idp.EntraIssuer(sharedTenant))...)
 	f.srv.SetFederatedPersonResolver(func(_ context.Context, r zeroid.FederatedPersonRequest) (string, error) {
 		f.resolverCalls.Add(1)
 		f.mu.Lock()
@@ -71,7 +75,7 @@ func newDBFederation(t *testing.T) *dbFederation {
 
 // newDBFederationServer starts a ZeroID reading issuer rows, on the shared
 // database, as federationIssuer.
-func newDBFederationServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
+func newDBFederationServer(t *testing.T, sharedIssuers ...string) (*zeroid.Server, *httptest.Server) {
 	t.Helper()
 	require.NoError(t, initFederationKeyMaterial())
 	cfg := zeroid.Config{
@@ -88,7 +92,7 @@ func newDBFederationServer(t *testing.T) (*zeroid.Server, *httptest.Server) {
 		Telemetry:   zeroid.TelemetryConfig{Enabled: false},
 		Logging:     zeroid.LoggingConfig{Level: "warn"},
 		WIMSEDomain: testWIMSE,
-		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true},
+		Federation:  zeroid.FederationConfig{IssuerStore: "db", AllowPrivateEndpoints: true, SharedIssuers: sharedIssuers},
 	}
 	insecure := &http.Client{
 		Timeout:   5 * time.Second,
@@ -1061,4 +1065,58 @@ func TestTrustedIssuers_BindingsByIdentity(t *testing.T) {
 	status, body := f.call(t, http.MethodGet, "/external-issuers/bindings?identity_id=not-a-uuid", nil, a.headers)
 	assert.Equal(t, http.StatusBadRequest, status)
 	assert.Equal(t, "invalid_identity_id", body["code"])
+}
+
+// sharedTenant is the mock Entra tenant configured as a shared issuer.
+const sharedTenant = "99999999-0000-0000-0000-000000000000"
+
+// TestTrustedIssuers_SharedIssuerOverlap: on a shared issuer, a second
+// account cannot add constraints that a token matching the first account's
+// row could also satisfy, which would make every such grant ambiguous.
+func TestTrustedIssuers_SharedIssuerOverlap(t *testing.T) {
+	f := newDBFederation(t)
+	a, b := newTITenant(t), newTITenant(t)
+	create := func(tn tiTenant, c map[string][]string) (int, map[string]any) {
+		return f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+			"kind": "person", "issuer": f.idp.EntraIssuer(sharedTenant), "jwks_uri": f.idp.EntraJWKSURI(sharedTenant),
+			"claim_mapping": map[string]string{"user_id": "oid"}, "claim_constraints": c,
+		}, tn.headers)
+	}
+	status, body := create(a, map[string][]string{"hd": {"acme.com"}})
+	require.Equal(t, http.StatusCreated, status, "%v", body)
+	for name, c := range map[string]map[string][]string{
+		"the same set":                    {"hd": {"acme.com"}},
+		"a superset shadowing A's tokens": {"hd": {"acme.com"}, "email_verified": {"true"}},
+		"a constraint on another claim":   {"tid": {"t1"}},
+	} {
+		t.Run("refused: "+name, func(t *testing.T) {
+			status, body := create(b, c)
+			assert.Equal(t, http.StatusConflict, status, "%v", body)
+			assert.Equal(t, "issuer_already_trusted", body["code"])
+		})
+	}
+	t.Run("a pin on a claim every token carries is refused", func(t *testing.T) {
+		status, body := create(b, map[string][]string{"hd": {"beta.com"}, "aud": {federationIssuer}})
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_claim_constraints", body["code"])
+	})
+	t.Run("a disjoint pin is allowed", func(t *testing.T) {
+		status, body := create(b, map[string][]string{"hd": {"beta.com"}})
+		assert.Equal(t, http.StatusCreated, status, "%v", body)
+	})
+}
+
+// TestTrustedIssuers_TrailingSlashIsOneIssuer: "https://x/" and "https://x"
+// are one issuer for ownership.
+func TestTrustedIssuers_TrailingSlashIsOneIssuer(t *testing.T) {
+	f := newDBFederation(t)
+	a, b := newTITenant(t), newTITenant(t)
+	tid := uid("slash-tid")
+	f.entraRow(t, a, tid, nil)
+	status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+		"kind": "person", "issuer": f.idp.EntraIssuer(tid) + "/", "jwks_uri": f.idp.EntraJWKSURI(tid),
+		"claim_mapping": map[string]string{"user_id": "oid"},
+	}, b.headers)
+	assert.Equal(t, http.StatusConflict, status, "%v", body)
+	assert.Equal(t, "issuer_already_trusted", body["code"])
 }
