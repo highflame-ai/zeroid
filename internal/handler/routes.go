@@ -317,9 +317,9 @@ func (a *API) SetCIMDEnabled(enabled bool) {
 }
 
 // refusesRedirectTo reports whether this deployment declines to send a user
-// agent somewhere on behalf of client. The single predicate behind both
-// failAuthorize's §4.1.2.1 carve-out and redirectToInteractiveLogin's refusal,
-// so the two cannot drift.
+// agent somewhere on behalf of client. The single predicate behind the §4.1.2.1
+// carve-out (redirectAuthorizeError, used by failAuthorize and denyAuthorize)
+// and redirectToInteractiveLogin's refusal, so they cannot drift.
 //
 // It used to add a second gate for self-asserted clients: a remote https
 // redirect_uri was refused unless cimd.allowed_domains named the publisher.

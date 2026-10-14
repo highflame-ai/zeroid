@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -364,6 +365,19 @@ func runTests(m *testing.M) int {
 			return nil, zeroid.ErrPrincipalInteractionRequired
 		}
 
+		// Denial trigger: stands in for a consent front end reporting that the
+		// authenticated user declined.
+		// "with-interaction" joins it with ErrPrincipalInteractionRequired, to
+		// pin that the denial wins: the handler must not restart a login the
+		// user has just declined.
+		switch req.Header("X-Test-Access-Denied") {
+		case "":
+		case "with-interaction":
+			return nil, errors.Join(zeroid.ErrPrincipalInteractionRequired, zeroid.ErrPrincipalAccessDenied)
+		default:
+			return nil, zeroid.ErrPrincipalAccessDenied
+		}
+
 		acct := req.Header("X-Test-Principal-Account")
 		if acct == "" {
 			return nil, zeroid.ErrPrincipalNotApplicable
@@ -389,6 +403,8 @@ func runTests(m *testing.M) int {
 	//                            principal has no scope restriction of its
 	//                            own — see Principal.Scopes)
 	//   test_principal_reject  → "true" returns a non-sentinel error
+	//   test_principal_deny    → "true" returns ErrPrincipalAccessDenied,
+	//                            wrapped (resolvers may wrap it)
 	//   (anything else)        → ErrPrincipalNotApplicable
 	//
 	// Registered second, after the header stub above; it reads req.Form, so
@@ -396,6 +412,9 @@ func runTests(m *testing.M) int {
 	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		if req.Form("test_principal_reject") == "true" {
 			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")
+		}
+		if req.Form("test_principal_deny") == "true" {
+			return nil, fmt.Errorf("stub consent: user declined: %w", zeroid.ErrPrincipalAccessDenied)
 		}
 		acct := req.Form("test_principal_account")
 		if acct == "" {
