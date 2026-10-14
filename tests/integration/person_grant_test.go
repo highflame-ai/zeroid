@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -575,4 +576,65 @@ func TestPersonGrant_IDJAGRefusalKeepsTheJTI(t *testing.T) {
 	assert.Equal(t, "invalid_grant", resp.Error)
 	assert.Contains(t, resp.RawBody, "already been redeemed")
 	assert.Len(t, grants.callsFor(user), 2, "the replay never reached the resolver")
+}
+
+// TestPersonGrant_CIBAPushRefusalIsDelivered: a push-mode client cannot poll,
+// so a ceiling refusal is delivered to its notification endpoint as a CIBA
+// Core §12 error (access_denied; transaction_failed when the resolver fails).
+func TestPersonGrant_CIBAPushRefusalIsDelivered(t *testing.T) {
+	grants := installPersonGrants(t, zeroid.PersonGrantModeEnforce, testZeroIDServer)
+	capt := newCapturingRoundTripper()
+	testZeroIDServer.SetBackchannelPingTransport(capt)
+	testZeroIDServer.SetBackchannelPingDispatchSync(true)
+	t.Cleanup(func() {
+		testZeroIDServer.SetBackchannelPingDispatchSync(false)
+		testZeroIDServer.SetBackchannelPingTransport(nil)
+	})
+
+	for _, tc := range []struct {
+		name     string
+		grant    *zeroid.PersonGrant
+		err      error
+		wantCode string
+	}{
+		{"refused", &zeroid.PersonGrant{Scopes: []string{"pg:c"}}, nil, "access_denied"},
+		{"resolver failed", nil, errors.New("role store unreachable"), "transaction_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientID := uid("pg-push")
+			endpoint := "https://push.example.test/" + clientID
+			require.NoError(t, testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+				ClientID:                     clientID,
+				Name:                         clientID,
+				GrantTypes:                   []string{"client_credentials"},
+				RedirectURIs:                 []string{testRedirectURI},
+				ClientNotificationEndpoint:   endpoint,
+				BackchannelTokenDeliveryMode: "push",
+			}))
+			user := uid("pg-push-user")
+			grants.set(user, tc.grant, tc.err)
+
+			resp := post(t, "/oauth2/bc-authorize", map[string]any{
+				"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
+				"login_hint": user, "scope": "pg:a", "client_notification_token": "push-bearer",
+			}, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			id := decode(t, resp)["auth_req_id"].(string)
+			approveInTenant(t, id, user, adminHeaders())
+
+			var delivered []map[string]any
+			for _, cb := range capt.requests() {
+				if cb.URL != endpoint {
+					continue
+				}
+				var payload map[string]any
+				require.NoError(t, json.Unmarshal([]byte(cb.Body), &payload))
+				delivered = append(delivered, payload)
+			}
+			require.Len(t, delivered, 1, "the refusal is delivered exactly once")
+			assert.Equal(t, tc.wantCode, delivered[0]["error"])
+			assert.Equal(t, id, delivered[0]["auth_req_id"])
+			assert.NotContains(t, delivered[0], "access_token")
+		})
+	}
 }

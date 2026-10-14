@@ -179,7 +179,10 @@ enforcement would affect before turning it on.
 
   Every grant decides before consuming its single-use credential (the code,
   the refresh token, the approved `auth_req_id`, the ID-JAG `jti`), so a
-  refused request can be retried once the role is restored.
+  refused request can be retried once the role is restored. A CIBA push-mode
+  client cannot poll, so it is sent the refusal at its notification endpoint
+  as a CIBA Core §12 error: `access_denied`, or `transaction_failed` when the
+  resolver fails (§12 defines no other codes).
 - A refresh family keeps the scopes the person consented to. Each refresh
   applies the current ceiling, so a role change takes effect at the next
   refresh. Outstanding access tokens keep their scopes until they expire.
