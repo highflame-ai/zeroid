@@ -131,6 +131,9 @@ func newCIMDZeroID(t *testing.T, docClient *http.Client) *httptest.Server {
 	require.NoError(t, err, "build CIMD test server")
 
 	srv.RegisterPrincipalResolver("cimd-test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
+		if req.Form("test_principal_deny") == "true" {
+			return nil, zeroid.ErrPrincipalAccessDenied
+		}
 		acct := req.Form("test_principal_account")
 		if acct == "" {
 			return nil, zeroid.ErrPrincipalNotApplicable

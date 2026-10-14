@@ -81,6 +81,22 @@ func TestRFC9207_S2_ErrorResponseCarriesIss(t *testing.T) {
 		"the error response must carry exactly one iss, equal to the issuer identifier")
 }
 
+func TestRFC9207_S2_PostErrorResponseCarriesIss(t *testing.T) {
+	// RFC 9207 §2: "This parameter MUST be included in ... error responses."
+	//   The one error redirect the POST leg emits — a resolver reporting that
+	//   the resource owner denied the request — is an authorization response
+	//   like any other and carries iss too.
+	form, _ := authorizeBaseForm(t)
+	form.Set("test_principal_deny", "true")
+
+	resp := postAuthorize(t, form)
+	defer func() { _ = resp.Body.Close() }()
+
+	loc := authorizeRedirect(t, resp)
+	require.Equal(t, "access_denied", loc.Query().Get("error"))
+	require.Equal(t, []string{testIssuer}, loc.Query()["iss"])
+}
+
 func TestRFC9207_S2_ParameterValidationErrorCarriesIss(t *testing.T) {
 	// RFC 9207 §2 applies to every error redirect, including one raised by
 	//   request validation after the client and redirect_uri checked out
