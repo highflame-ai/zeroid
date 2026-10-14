@@ -143,8 +143,8 @@ func (r *ExternalIssuerRepository) List(ctx context.Context, accountID string) (
 	return rows, nil
 }
 
-// Update rewrites a row's mutable columns and bumps updated_at, which also
-// retires its cached JWKS client.
+// Update rewrites a row's mutable columns and bumps updated_at. Cached JWKS
+// clients are keyed by (jwks_uri, refresh interval), not by row version.
 func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.ExternalIssuer) error {
 	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(row).
 		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",

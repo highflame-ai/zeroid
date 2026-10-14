@@ -69,6 +69,15 @@ func TestBindAgent(t *testing.T) {
 		t.Fatalf("no client to check (CIMD path passes nil-safe): %v %v", got, err)
 	}
 
+	// A CIMD client has no registration to link. It is held instead by the
+	// ID-JAG itself: act.sub and client_id are both IdP-signed, and
+	// client_id must equal the authenticated client (idJAGBearer), so only
+	// an ID-JAG the IdP issued to this client for this agent gets here.
+	cimd := &domain.OAuthClient{ClientID: "https://agent.example/cimd.json", RegistrationSource: domain.RegistrationSourceCIMD}
+	if got, err := bindAgent(ctx, bindings, lookup, row, "okta-client-1", cimd, federatedGrantIDJAG); err != nil || got.ID != "agent-1" {
+		t.Fatalf("a CIMD client takes the binding of the IdP-signed act.sub: %v %v", got, err)
+	}
+
 	for name, tc := range map[string]struct {
 		key    string
 		client *domain.OAuthClient

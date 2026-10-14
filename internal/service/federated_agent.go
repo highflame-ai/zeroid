@@ -78,6 +78,9 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 	// A registered client must be linked to exactly the bound agent. client_id
 	// is a global namespace any tenant can register into, so an unlinked
 	// client named after another tenant's app id must not inherit its agent.
+	// A CIMD client (P1b only) has no registration; the IdP-signed ID-JAG
+	// binds it instead: its client_id must be this client and act.sub this
+	// agent.
 	if client != nil && !client.SelfAsserted() && (client.IdentityID == nil || *client.IdentityID != identity.ID) {
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "client_not_linked")
 		return nil, oauthBadRequest(oautherror.InvalidGrant,
