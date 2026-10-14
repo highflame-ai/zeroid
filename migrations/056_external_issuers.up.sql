@@ -3,6 +3,11 @@
 -- docs/external-issuers.md describes the model; this file only states the
 -- constraints the database holds itself.
 --
+-- Ordering: 055 (refresh-token family, PRs #421-#423) must be applied before
+-- this. golang-migrate never applies a version below the current one, so a
+-- database that reached 056 first would skip 055. If this lands first,
+-- renumber at merge.
+--
 -- New, empty tables: no rewrite or backfill. lock_timeout bounds the FK
 -- validation's brief lock on identities.
 SET LOCAL lock_timeout = '3s';

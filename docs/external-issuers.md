@@ -353,6 +353,12 @@ On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` cl
 
 ### `DELETE /external-issuers/{id}/bindings/{binding_id}` → 204
 
+## Migration ordering
+
+The tables are migration 056.
+Migration 055 (the refresh-token family, PRs #421 to #423) must be applied before it: golang-migrate never applies a version below the database's current one, so a database that reached 056 first would silently skip 055.
+If this change merges before 055, renumber it at merge.
+
 ## Audit
 
 Every insert, update and delete of a row or binding writes `identity_audit_logs` (`table_name` `external_issuers` or `external_issuer_bindings`, actions `INSERT_EXTERNAL_ISSUER`, `UPDATE_EXTERNAL_ISSUER`, `DELETE_EXTERNAL_ISSUER`, `INSERT_ISSUER_BINDING`, ...), with the actor from `X-User-ID` and the binding's identity as `identity_id`.
