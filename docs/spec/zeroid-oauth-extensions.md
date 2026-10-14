@@ -449,7 +449,8 @@ policy, never less.
 Somewhere in a chain, something other than the requester must bound the scopes.
 ZeroID counts, per identity, tokens issued for a named scope with no configured
 ceiling — a workload whose every ceiling was empty, or a request-bounded user
-root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` — as
+root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` and
+whose person-grant ceiling (Section 5.1c) was not enforced — as
 `zeroid_workload_unbounded_scope_total`. These are not yet refused.
 
 ### 5.1c A person's ceiling (person-grant resolver)

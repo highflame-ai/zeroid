@@ -73,6 +73,8 @@ func TestCeilingRule_CountsUnboundedNamedScopes(t *testing.T) {
 		{"request-bounded user root, no policy ceiling", IssueRequest{Scopes: named, RequestBoundedRoot: true}, user, &domain.CredentialPolicy{}, "user"},
 		{"request-bounded user root, allowed_scopes set", IssueRequest{Scopes: named, RequestBoundedRoot: true}, user, &domain.CredentialPolicy{AllowedScopes: named}, ""},
 		{"request-bounded user root, user_grant_scopes set", IssueRequest{Scopes: named, RequestBoundedRoot: true}, user, &domain.CredentialPolicy{UserGrantScopes: named}, ""},
+		{"request-bounded user root, person ceiling enforced", IssueRequest{Scopes: named, RequestBoundedRoot: true, personGrant: &personGrantDecision{enforced: true}}, user, &domain.CredentialPolicy{}, ""},
+		{"request-bounded user root, person ceiling only shadowed", IssueRequest{Scopes: named, RequestBoundedRoot: true, personGrant: &personGrantDecision{}}, user, &domain.CredentialPolicy{}, "user"},
 		{"the workload rule does not apply to a user", IssueRequest{Scopes: named, ScopeCeilingUnbounded: true}, user, nil, ""},
 		{"the root rule does not apply to a workload", IssueRequest{Scopes: named, RequestBoundedRoot: true}, workload, nil, ""},
 	} {

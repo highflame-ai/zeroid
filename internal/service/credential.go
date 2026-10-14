@@ -329,7 +329,8 @@ func carriesActorAttributes(act map[string]any) bool {
 //     it asked for (api_key, NHI jwt_bearer).
 //   - A user-subject root bounded only by the caller's request (trusted
 //     broker, ID-token exchange, CIBA) whose governing policy sets neither
-//     allowed_scopes nor user_grant_scopes, and no Cedar decision exists yet.
+//     allowed_scopes nor user_grant_scopes, no person-grant ceiling was
+//     enforced, and no Cedar decision exists yet.
 //
 // Phase 2 refuses these with invalid_scope behind
 // workload_subject_requires_ceiling. Counting first, per identity, lets
@@ -343,7 +344,8 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 	case req.ScopeCeilingUnbounded && principal.Type == domain.PrincipalWorkload:
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
-		bounded := len(req.Identity.AllowedScopes) > 0
+		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
+		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
 		}

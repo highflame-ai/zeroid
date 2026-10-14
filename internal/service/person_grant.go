@@ -87,11 +87,13 @@ type personGrantHook struct {
 }
 
 // personGrantDecision is the resolver's decision for one person mint.
-// requested is what was asked, scopes what is issued.
+// requested is what was asked, scopes what is issued; enforced says the
+// ceiling bounded them, which the ceiling rule counts as a bound.
 type personGrantDecision struct {
 	requested []string
 	scopes    []string
 	roles     []string
+	enforced  bool
 }
 
 // personGrantState holds the installed hook. Kept apart from the
@@ -189,7 +191,7 @@ func (s *CredentialService) decidePersonGrant(ctx context.Context, req *IssueReq
 		if outcome == "denied" {
 			return ErrPersonScopeDenied
 		}
-		d.scopes = granted
+		d.scopes, d.enforced = granted, true
 	}
 	req.Scopes = d.scopes
 	req.personGrant = d

@@ -161,6 +161,8 @@ enforcement would affect before turning it on.
 - A refresh family keeps the scopes the person consented to. Each refresh
   applies the current ceiling, so a role change takes effect at the next
   refresh. Outstanding access tokens keep their scopes until they expire.
+- An enforced ceiling bounds a person's root for the ceiling rule, so such a
+  root is no longer counted in `zeroid_workload_unbounded_scope_total`.
 - The resolver's roles are stamped as the RFC 9068 §2.2.3.1 `roles` claim on
   the person's own token, in shadow and enforce. Tokens delegated from it do
   not inherit them, and no caller can set `roles`.
