@@ -998,6 +998,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Scope:       strings.Join(req.Scopes, " "),
 		JTI:         jti,
 		IssuedAt:    now.Unix(),
+		// The tenant the JWT's account_id/project_id claims carry, named on
+		// the response for every grant. Several grants derive the tenant
+		// rather than read it from the request (jwt-bearer from the
+		// assertion's identity, token-exchange from the subject token,
+		// client_credentials from a client's linked identity), so without
+		// this an embedder attributing issuance from the response with a
+		// request-body fallback (AuthN's metering) has no tenant at all.
+		AccountID: req.Identity.AccountID,
+		ProjectID: req.Identity.ProjectID,
 	}
 
 	return accessToken, cred, nil

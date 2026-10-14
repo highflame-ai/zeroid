@@ -341,7 +341,7 @@ func TestIDJAGBearer_NoTenantFieldsRequired(t *testing.T) {
 // and D2b bad-secret / client_id-mismatch cases), where a full server with a
 // real DB authenticates the client first and then reaches each deeper gate.
 
-// TestRequireCIMDClientFitForIDJAG pins the two document-level gates a CIMD
+// TestRequireCIMDClientFitForIDJAG pins the document-level gates a CIMD
 // client must pass to redeem an ID-JAG (firehog#701).
 func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
 	fit := func() *domain.OAuthClient {
@@ -364,15 +364,20 @@ func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
 		requireInvalidClient(t, requireCIMDClientFitForIDJAG(c))
 	})
 
-	t.Run("no jwt-bearer in grant_types is unauthorized_client", func(t *testing.T) {
+	// WSO2's MCP playground publishes exactly this grant list and redeems
+	// ID-JAGs with it. The list is the publisher's own unauthenticated claim,
+	// so leaving jwt-bearer out is not a reason to refuse.
+	t.Run("a document that does not list jwt-bearer passes", func(t *testing.T) {
 		c := fit()
-		c.GrantTypes = []string{"authorization_code"}
-		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+		c.GrantTypes = []string{"authorization_code", "refresh_token"}
+		if err := requireCIMDClientFitForIDJAG(c); err != nil {
+			t.Fatalf("must pass: %v", err)
+		}
 	})
 
-	t.Run("the short jwt_bearer form does not count", func(t *testing.T) {
+	t.Run("a document contradicting its ID-JAG profile claim is unauthorized_client (draft §8)", func(t *testing.T) {
 		c := fit()
-		c.GrantTypes = []string{"authorization_code", "jwt_bearer"}
+		c.IDJAGProfileContradicted = true
 		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
 	})
 }
