@@ -53,9 +53,12 @@ type CreateOAuthClientInput struct {
 
 		// IdentityID optionally binds this client to an agent identity.
 		// When set, authorization_code and refresh_token grants gate token
-		// issuance on the linked identity's status + expires_at. The
-		// identity must exist in the caller's tenant (validated below).
-		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to — gates authorization_code and refresh_token grants on the linked identity's status and expires_at"`
+		// issuance on the linked identity's status + expires_at, and the
+		// link decides the identity AND tenant that client_credentials and
+		// ID-JAG tokens are minted for (a request naming another tenant is
+		// refused). The identity must exist in the caller's tenant
+		// (validated below).
+		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to. Gates authorization_code and refresh_token grants on the linked identity's status and expires_at, and decides the identity and tenant (account_id/project_id) that client_credentials and ID-JAG tokens are minted for: such a request may omit account_id/project_id, and one that names a different tenant is refused"`
 
 		// CIBA (OpenID CIBA Core 1.0) — registered callback for ping/push notifications.
 		// Must be HTTPS. Empty when the client only uses polling mode.
