@@ -217,10 +217,6 @@ func pruneEmptyClaims(body map[string]any) map[string]any {
 	return body
 }
 
-// deviceCodeGrantType is the RFC 8628 §3.4 grant type, advertised in
-// grant_types_supported only when a device authorization endpoint is set.
-const deviceCodeGrantType = "urn:ietf:params:oauth:grant-type:device_code"
-
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
 	return &OAuthMetadataOutput{Body: pruneEmptyClaims(a.buildASMetadata())}, nil
 }
@@ -391,20 +387,6 @@ func (a *API) buildASMetadata() map[string]any {
 		// the members above: with no servable flow there are no authorization
 		// responses to describe.
 		body["authorization_response_iss_parameter_supported"] = true
-	}
-
-	// RFC 8628 device authorization grant. ZeroID does not serve it; an
-	// embedder that does (token.device_authorization_endpoint) advertises the
-	// endpoint here — RFC 8628 §4 registers device_authorization_endpoint as an
-	// RFC 8414 member — together with the grant type the endpoint feeds, so a
-	// client discovers both rather than hardcoding a path. Read ONCE so the two
-	// members cannot disagree. Unset, neither appears: advertising the grant
-	// without an endpoint, or the reverse, would be a promise nothing keeps.
-	if device := a.advertisedDeviceAuthorizationEndpoint(); device != "" {
-		body["device_authorization_endpoint"] = device
-
-		grants, _ := body["grant_types_supported"].([]string)
-		body["grant_types_supported"] = append(grants, deviceCodeGrantType)
 	}
 
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support

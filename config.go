@@ -403,20 +403,6 @@ type TokenConfig struct {
 	// initial-access-token gate.
 	RegistrationEndpoint string `koanf:"registration_endpoint"`
 
-	// DeviceAuthorizationEndpoint, when set, is advertised as
-	// `device_authorization_endpoint` (RFC 8628 §4, registered for RFC 8414) in
-	// both AS metadata documents, and `urn:ietf:params:oauth:grant-type:device_code`
-	// is added to grant_types_supported. ZeroID does not implement the device
-	// authorization grant itself; this is for an embedder that serves it
-	// alongside ZeroID and wants clients to discover it rather than hardcode
-	// the path.
-	//
-	// Empty (the default) advertises neither. When set it follows exactly the
-	// rules for RegistrationEndpoint: an absolute, canonical https URL (http for
-	// a loopback host or beside an http Issuer), no user-info, fragment,
-	// whitespace or control characters, an ASCII host and a port in 1-65535.
-	DeviceAuthorizationEndpoint string `koanf:"device_authorization_endpoint"`
-
 	// RequireDPoP makes a valid DPoP proof (RFC 9449) mandatory on every
 	// /oauth2/token issuance: absent proof is refused with invalid_dpop_proof
 	// instead of falling back to a Bearer token, and the AS metadata
@@ -562,9 +548,6 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := validateRegistrationEndpoint(c.Token.RegistrationEndpoint, c.Token.Issuer); err != nil {
-		return err
-	}
-	if err := validateDeviceAuthorizationEndpoint(c.Token.DeviceAuthorizationEndpoint, c.Token.Issuer); err != nil {
 		return err
 	}
 
@@ -719,66 +702,52 @@ func validateIssuer(s string) error {
 // Error messages never echo user-info: a mistyped credential in the URL must not
 // end up in logs.
 func validateRegistrationEndpoint(s, issuer string) error {
-	return validateAdvertisedEndpoint("token.registration_endpoint", s, issuer)
-}
-
-// validateDeviceAuthorizationEndpoint checks token.device_authorization_endpoint
-// with exactly the rules validateRegistrationEndpoint applies: the value is
-// likewise published verbatim in AS metadata, so it must be a clean, canonical
-// absolute URL. Empty means "not advertised" and is always valid.
-func validateDeviceAuthorizationEndpoint(s, issuer string) error {
-	return validateAdvertisedEndpoint("token.device_authorization_endpoint", s, issuer)
-}
-
-// validateAdvertisedEndpoint is the shared body of the endpoint-override
-// validators. key names the config key in every error message.
-func validateAdvertisedEndpoint(key, s, issuer string) error {
 	if s == "" {
 		return nil
 	}
 	shown := redactUserinfo(s)
 	for _, r := range s {
 		if unicode.IsSpace(r) || unicode.IsControl(r) {
-			return fmt.Errorf(key+" must not contain whitespace or control characters (got %q)", shown)
+			return fmt.Errorf("token.registration_endpoint must not contain whitespace or control characters (got %q)", shown)
 		}
 	}
 	u, err := url.Parse(s)
 	if err != nil {
-		return fmt.Errorf(key+" must be a valid URL (got %q): %w", shown, unwrapURLError(err))
+		return fmt.Errorf("token.registration_endpoint must be a valid URL (got %q): %w", shown, unwrapURLError(err))
 	}
 	if u.User != nil {
-		return fmt.Errorf(key+" must not contain user-info (got %q)", shown)
+		return fmt.Errorf("token.registration_endpoint must not contain user-info (got %q)", shown)
 	}
 	if u.Host == "" || u.Hostname() == "" {
-		return fmt.Errorf(key+" must be an absolute URL with a host (got %q)", shown)
+		return fmt.Errorf("token.registration_endpoint must be an absolute URL with a host (got %q)", shown)
 	}
 	switch u.Scheme {
 	case "https":
 	case "http":
 		if !isLoopbackHost(u.Hostname()) && !issuerIsHTTP(issuer) {
-			return fmt.Errorf(key+" must use https (got %q): http is accepted only for a loopback host or when token.issuer is itself http", shown)
+			return fmt.Errorf("token.registration_endpoint must use https (got %q): http is accepted only for a loopback host or when token.issuer is itself http", shown)
 		}
 	default:
-		return fmt.Errorf(key+" must use https (got scheme %q in %q)", u.Scheme, shown)
+		return fmt.Errorf("token.registration_endpoint must use https (got scheme %q in %q)", u.Scheme, shown)
 	}
 	if u.Fragment != "" || strings.HasSuffix(s, "#") {
-		return fmt.Errorf(key+" must not contain a fragment (got %q)", shown)
+		return fmt.Errorf("token.registration_endpoint must not contain a fragment (got %q)", shown)
 	}
 	for i := 0; i < len(u.Hostname()); i++ {
 		if u.Hostname()[i] >= utf8.RuneSelf {
-			return fmt.Errorf(key+" host must be ASCII (got %q): give an internationalized domain name in its xn-- form", shown)
+			return fmt.Errorf("token.registration_endpoint host must be ASCII (got %q): give an internationalized domain name in its xn-- form", shown)
 		}
 	}
 	if strings.HasSuffix(u.Host, ":") || u.Port() != "" {
 		port, perr := strconv.Atoi(u.Port())
 		if perr != nil || port < 1 || port > 65535 {
-			return fmt.Errorf(key+" port must be a number from 1 to 65535 (got %q)", shown)
+			return fmt.Errorf("token.registration_endpoint port must be a number from 1 to 65535 (got %q)", shown)
 		}
 	}
 	canonical := *u
 	canonical.Host = strings.ToLower(u.Host)
 	if c := canonical.String(); c != s {
-		return fmt.Errorf(key+" must be in canonical form (got %q, want %q): the value is advertised verbatim", shown, c)
+		return fmt.Errorf("token.registration_endpoint must be in canonical form (got %q, want %q): the value is advertised verbatim", shown, c)
 	}
 	return nil
 }
@@ -1041,10 +1010,8 @@ var envMapping = map[string]string{
 	// Token
 	"ZEROID_ISSUER":                "token.issuer",
 	"ZEROID_REGISTRATION_ENDPOINT": "token.registration_endpoint",
-	// RFC 8628 device authorization endpoint served by the embedder; advertised only.
-	"ZEROID_DEVICE_AUTHORIZATION_ENDPOINT": "token.device_authorization_endpoint",
-	"ZEROID_TOKEN_TTL_SECONDS":             "token.default_ttl",
-	"ZEROID_MAX_TOKEN_TTL_SECONDS":         "token.max_ttl",
+	"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
+	"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
 	// Evidence clock for issued_credentials (delegation-graph retention).
 	"ZEROID_TOKEN_AUDIT_RETENTION_DAYS": "token.audit_retention_days",
 	// HMAC secret signs/verifies stateless authorization_code JWTs (HS256).

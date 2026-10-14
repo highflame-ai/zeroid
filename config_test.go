@@ -592,34 +592,23 @@ func TestValidateRegistrationEndpoint(t *testing.T) {
 		{"uppercase_host", "https://Register.Example.com/r", "", "canonical form"},
 		{"non_ascii_path", "https://register.example.com/régister", "", "canonical form"},
 	}
-	// token.device_authorization_endpoint is advertised verbatim the same way,
-	// so it shares every rule; each error names the key that was wrong.
-	validators := map[string]func(s, issuer string) error{
-		"token.registration_endpoint":         validateRegistrationEndpoint,
-		"token.device_authorization_endpoint": validateDeviceAuthorizationEndpoint,
-	}
-	for key, validate := range validators {
-		for _, tc := range cases {
-			t.Run(key+"/"+tc.name, func(t *testing.T) {
-				issuer := tc.issuer
-				if issuer == "" {
-					issuer = httpsIssuer
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issuer := tc.issuer
+			if issuer == "" {
+				issuer = httpsIssuer
+			}
+			err := validateRegistrationEndpoint(tc.input, issuer)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRegistrationEndpoint(%q, %q) unexpected error: %v", tc.input, issuer, err)
 				}
-				err := validate(tc.input, issuer)
-				if tc.wantErr == "" {
-					if err != nil {
-						t.Fatalf("%s: validate(%q, %q) unexpected error: %v", key, tc.input, issuer, err)
-					}
-					return
-				}
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("%s: validate(%q, %q) = %v, want error containing %q", key, tc.input, issuer, err, tc.wantErr)
-				}
-				if !strings.HasPrefix(err.Error(), key+" ") {
-					t.Fatalf("%s: error must name its own key, got %v", key, err)
-				}
-			})
-		}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateRegistrationEndpoint(%q, %q) = %v, want error containing %q", tc.input, issuer, err, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -655,9 +644,8 @@ func TestURLValidatorsDoNotEchoCredentials(t *testing.T) {
 	}
 	for _, in := range inputs {
 		for name, err := range map[string]error{
-			"registration_endpoint":         validateRegistrationEndpoint(in, "https://auth.example.com"),
-			"device_authorization_endpoint": validateDeviceAuthorizationEndpoint(in, "https://auth.example.com"),
-			"issuer":                        validateIssuer(in),
+			"registration_endpoint": validateRegistrationEndpoint(in, "https://auth.example.com"),
+			"issuer":                validateIssuer(in),
 		} {
 			if err == nil {
 				t.Errorf("%s: %q unexpectedly accepted", name, in)
@@ -740,56 +728,6 @@ func TestRegistrationEndpointConfig(t *testing.T) {
 		cfg.Token.Issuer = "https://highflame-authn:8051"
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
 			t.Fatalf("Validate must refuse an http registration endpoint beside an https issuer, got: %v", err)
-		}
-	})
-}
-
-// token.device_authorization_endpoint: the env var reaches the typed field, it
-// defaults to empty (nothing advertised), and Validate() applies the shared
-// endpoint rules against token.issuer.
-func TestDeviceAuthorizationEndpointConfig(t *testing.T) {
-	const endpoint = "https://login.example.com/oauth2/device_authorization"
-
-	t.Run("env_var_wired", func(t *testing.T) {
-		t.Setenv("ZEROID_DEVICE_AUTHORIZATION_ENDPOINT", endpoint)
-		cfg, err := LoadConfig("")
-		if err != nil {
-			t.Fatalf("LoadConfig failed: %v", err)
-		}
-		if cfg.Token.DeviceAuthorizationEndpoint != endpoint {
-			t.Errorf("ZEROID_DEVICE_AUTHORIZATION_ENDPOINT did not reach token.device_authorization_endpoint, got %q", cfg.Token.DeviceAuthorizationEndpoint)
-		}
-	})
-
-	t.Run("default_empty", func(t *testing.T) {
-		cfg, err := LoadConfig("")
-		if err != nil {
-			t.Fatalf("LoadConfig failed: %v", err)
-		}
-		if cfg.Token.DeviceAuthorizationEndpoint != "" {
-			t.Errorf("token.device_authorization_endpoint must default to empty, got %q", cfg.Token.DeviceAuthorizationEndpoint)
-		}
-	})
-
-	t.Run("validate_rejects_invalid", func(t *testing.T) {
-		cfg := baseValidConfig(t)
-		cfg.Token.DeviceAuthorizationEndpoint = "http://login.example.com/oauth2/device_authorization"
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "token.device_authorization_endpoint") {
-			t.Fatalf("Validate must reject a non-loopback http device authorization endpoint, got: %v", err)
-		}
-	})
-
-	t.Run("validate_uses_issuer_scheme", func(t *testing.T) {
-		cfg := baseValidConfig(t)
-		cfg.Token.Issuer = "http://authn.internal:8051"
-		cfg.Token.DeviceAuthorizationEndpoint = "http://authn.internal:8051/oauth2/device_authorization"
-		if err := cfg.Validate(); err != nil {
-			t.Fatalf("Validate must accept an http endpoint beside an http issuer: %v", err)
-		}
-		cfg.Token.Issuer = "https://authn.internal:8051"
-		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.device_authorization_endpoint") {
-			t.Fatalf("Validate must refuse an http endpoint beside an https issuer, got: %v", err)
 		}
 	})
 }
