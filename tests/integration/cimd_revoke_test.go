@@ -7,9 +7,12 @@
 // refused, because revocation shared introspection's registry-only gate. These
 // tests pin the split:
 //
-//   - a public CIMD client revokes a token issued to it;
-//   - naming a CIMD client_id reaches ONLY that client's tokens: another
-//     client's token answers 200 (RFC 7009 §2.2) and stays active;
+//   - a public CIMD client revokes a token issued to it — an access token, or
+//     a refresh token together with its family and the access tokens issued
+//     from it;
+//   - naming a CIMD client_id reaches ONLY that client's tokens, access and
+//     refresh alike: another client's token answers 200 (RFC 7009 §2.2) and
+//     stays active;
 //   - introspection still refuses an unauthenticated CIMD client_id;
 //   - a CIMD client that declares private_key_jwt is confidential: it revokes
 //     its own tokens with a valid RFC 7523 §2.2 assertion (same rules as the
@@ -376,5 +379,113 @@ func TestCIMDRevoke_ConfidentialClient(t *testing.T) {
 			"an authenticated CIMD client must still not introspect: %v", body)
 		assert.Equal(t, "invalid_client", body["error"])
 		assert.NotContains(t, body, "active", "no token information may leak on refusal")
+	})
+}
+
+// cimdPublicRefreshDoc is a PUBLIC CIMD document that also declares the
+// refresh_token grant, so the authorization_code exchange returns a refresh
+// token.
+var cimdPublicRefreshDoc = fmt.Sprintf(`{
+	"client_id": "%%CLIENT_ID%%",
+	"client_name": "cimd public refresh client",
+	"redirect_uris": [%q],
+	"grant_types": ["authorization_code", "refresh_token"],
+	"token_endpoint_auth_method": "none"
+}`, cimdTestRedirectURI)
+
+// cimdTokenPair splits a successful token response into its access and
+// refresh tokens.
+func cimdTokenPair(t *testing.T, tok tokenResponse) (accessToken, refreshToken string) {
+	t.Helper()
+	require.Equal(t, http.StatusOK, tok.StatusCode, "%s", tok.RawBody)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(tok.RawBody), &body))
+	refreshToken, _ = body["refresh_token"].(string)
+	require.NotEmpty(t, refreshToken, "fixture: the document declares refresh_token, so one must be issued: %s", tok.RawBody)
+	return tok.AccessToken, refreshToken
+}
+
+// cimdPublicTokens runs the public-client authorization_code flow for
+// clientID and returns the access and refresh tokens.
+func cimdPublicTokens(t *testing.T, srvURL, clientID string) (accessToken, refreshToken string) {
+	t.Helper()
+	verifier, challenge := buildPKCEPair(t)
+	code := authorizeAndGetCode(t, srvURL, clientID, challenge)
+	return cimdTokenPair(t, postFederation(t, srvURL, map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     clientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  cimdTestRedirectURI,
+	}))
+}
+
+// cimdPublicRefresh presents refreshToken for clientID at the token endpoint.
+func cimdPublicRefresh(t *testing.T, srvURL, clientID, refreshToken string) tokenResponse {
+	t.Helper()
+	return postFederation(t, srvURL, map[string]any{
+		"grant_type":    "refresh_token",
+		"client_id":     clientID,
+		"refresh_token": refreshToken,
+	})
+}
+
+// A refresh token is the long-lived half of a CIMD client's grant, so the
+// revocation endpoint must reach it (RFC 7009 §2) — under the same ownership
+// rule as the access token: naming a CIMD client_id only ever reaches tokens
+// issued to that client.
+func TestCIMDRevoke_PublicClientRefreshToken(t *testing.T) {
+	base, docClient := newCIMDDocumentOrigin(t, cimdPublicRefreshDoc)
+	srvURL := newCIMDZeroID(t, docClient).URL
+	introspectAs := cimdRevokeIntrospector(t, srvURL)
+
+	for _, hint := range []string{"", "refresh_token", "access_token"} {
+		t.Run("revokes its own refresh token, its family and its access tokens/hint="+hint, func(t *testing.T) {
+			clientID := base + "/" + uid("rt-owner") + ".json"
+			at1, rt1 := cimdPublicTokens(t, srvURL, clientID)
+			at2, rt2 := cimdTokenPair(t, cimdPublicRefresh(t, srvURL, clientID, rt1))
+			require.Equal(t, true, introspectAs(at2)["active"], "baseline: the refreshed token is live")
+
+			form := url.Values{"token": {rt2}, "client_id": {clientID}}
+			if hint != "" {
+				form.Set("token_type_hint", hint)
+			}
+			status, body := postFormTo(t, srvURL, "/oauth2/token/revoke", form, nil)
+			require.Equal(t, http.StatusOK, status,
+				"a public CIMD client must be able to revoke its own refresh token: %v", body)
+			assert.Equal(t, true, body["revoked"])
+
+			// Access tokens first: presenting the revoked refresh token below is
+			// itself reuse, which would revoke them too and mask a missing
+			// cascade here.
+			assert.Equal(t, false, introspectAs(at1)["active"],
+				"the exchange's access token is revoked with the grant (RFC 7009 §2.1 SHOULD)")
+			assert.Equal(t, false, introspectAs(at2)["active"],
+				"the refreshed access token is revoked with the grant (RFC 7009 §2.1 SHOULD)")
+
+			refreshed := cimdPublicRefresh(t, srvURL, clientID, rt2)
+			assert.Equal(t, http.StatusBadRequest, refreshed.StatusCode, "a revoked refresh token must not refresh: %s", refreshed.RawBody)
+			assert.Equal(t, "invalid_grant", refreshed.Error)
+		})
+	}
+
+	t.Run("cannot revoke another client's refresh token", func(t *testing.T) {
+		victimID := base + "/" + uid("rt-victim") + ".json"
+		attackerID := base + "/" + uid("rt-other") + ".json"
+		at, rt := cimdPublicTokens(t, srvURL, victimID)
+
+		// A token that was never issued is the baseline: a foreign token must
+		// be answered exactly like it, so the endpoint reveals nothing.
+		_, unknownBody := postFormTo(t, srvURL, "/oauth2/token/revoke",
+			url.Values{"token": {"zid_rt_" + uid("never-issued")}, "client_id": {attackerID}}, nil)
+		status, body := postFormTo(t, srvURL, "/oauth2/token/revoke",
+			url.Values{"token": {rt}, "client_id": {attackerID}, "token_type_hint": {"refresh_token"}}, nil)
+		require.Equal(t, http.StatusOK, status, "RFC 7009 §2.2: still 200: %v", body)
+		assert.Equal(t, unknownBody, body, "a foreign refresh token is answered like an unknown one")
+
+		assert.Equal(t, true, introspectAs(at)["active"], "the victim's access token is untouched")
+		refreshed := cimdPublicRefresh(t, srvURL, victimID, rt)
+		assert.Equal(t, http.StatusOK, refreshed.StatusCode,
+			"a CIMD client_id must not revoke a refresh token issued to a different client: %s", refreshed.RawBody)
 	})
 }
