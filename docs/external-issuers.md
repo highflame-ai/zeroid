@@ -320,7 +320,7 @@ Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_cl
 `issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
 Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
 A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
-The whole row is re-validated, and constraint changes on a shared issuer are re-checked for uniqueness.
+The whole row is re-validated and re-checked for uniqueness, except for a patch that changes only `display_name` and `enabled`, so rows stay manageable when the deployment's rules move under them (an issuer dropped from the shared list leaves rows in several accounts that can still be disabled).
 
 ### `POST /external-issuers/{id}/refresh` → 200
 

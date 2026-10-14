@@ -1342,3 +1342,32 @@ func TestTrustedIssuers_BindingVsIssuerDelete(t *testing.T) {
 		assert.Zero(t, n, "round %d: a live binding under a deleted issuer", round)
 	}
 }
+
+// TestTrustedIssuers_DroppedFromSharedList: rows left in several accounts
+// when an issuer leaves the shared list can still be renamed and disabled,
+// while a substantive change is refused.
+func TestTrustedIssuers_DroppedFromSharedList(t *testing.T) {
+	f := newDBFederation(t)
+	a, b := newTITenant(t), newTITenant(t)
+	var ids []string
+	for i, tn := range []tiTenant{a, b} {
+		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+			"kind": "person", "issuer": f.idp.EntraIssuer(sharedTenant),
+			"claim_mapping":     map[string]string{"user_id": "oid"},
+			"claim_constraints": map[string][]string{"hd": {fmt.Sprintf("c%d.example", i)}},
+		}, tn.headers)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		ids = append(ids, body["id"].(string))
+	}
+	// A replica whose shared list no longer names the mock tenant.
+	_, plain := newDBFederationServer(t)
+	call := func(body map[string]any) (int, map[string]any) {
+		return callJSON(t, plain.URL, http.MethodPatch, "/external-issuers/"+ids[0], body, a.headers)
+	}
+	status, body := call(map[string]any{"display_name": "renamed"})
+	assert.Equal(t, http.StatusOK, status, "%v", body)
+	status, body = call(map[string]any{"enabled": false})
+	assert.Equal(t, http.StatusOK, status, "%v", body)
+	status, body = call(map[string]any{"audiences": []string{"x"}})
+	assert.Equal(t, http.StatusConflict, status, "a substantive change re-checks uniqueness: %v", body)
+}

@@ -373,17 +373,25 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
 		r.Normalize()
-		pin := s.sharedPin(r.Issuer)
-		if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin}); err != nil {
-			return validationToAPIError(err)
-		}
-		r.ConstraintsKey = r.UniquenessKey(pin)
-		existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(r.Issuer))
-		if err != nil {
-			return err
-		}
-		if uniquenessConflict(existing, r, pin) {
-			return errIssuerAlreadyTrusted
+		// A rename or an enable/disable changes nothing uniqueness or
+		// validation decide on. Skipping both keeps such rows manageable when
+		// the deployment's rules moved under them (an issuer dropped from the
+		// shared list leaves rows in several accounts).
+		if !p.onlyNameOrEnabled() {
+			pin := s.sharedPin(r.Issuer)
+			if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin}); err != nil {
+				return validationToAPIError(err)
+			}
+			r.ConstraintsKey = r.UniquenessKey(pin)
+			existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(r.Issuer))
+			if err != nil {
+				return err
+			}
+			if uniquenessConflict(existing, r, pin) {
+				return errIssuerAlreadyTrusted
+			}
+		} else if r.DisplayName = strings.TrimSpace(r.DisplayName); len(r.DisplayName) > 255 {
+			return issuerErr(http.StatusBadRequest, "invalid_request", "display_name is at most 255 characters")
 		}
 		if err := s.repo.Update(ctx, r); err != nil {
 			if isDuplicateKeyError(err) {
@@ -398,6 +406,13 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		return nil, check, err
 	}
 	return row, check, nil
+}
+
+// onlyNameOrEnabled reports whether p changes nothing but display_name and
+// enabled.
+func (p IssuerPatch) onlyNameOrEnabled() bool {
+	return p.Audiences == nil && p.Algorithms == nil && p.ClaimMapping == nil && p.PropagateClaims == nil &&
+		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil
 }
 
 func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
