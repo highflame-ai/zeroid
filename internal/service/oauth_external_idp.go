@@ -240,7 +240,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	// The person must be a member of the tenant (ADR 0042 D5a); the token's
-	// sub becomes the deployer's user id and the IdP pair moves to idp_iss/idp_sub.
+	// sub becomes the deployer's user id and the IdP pair moves to user_idp_iss/user_idp_sub.
 	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
 		GrantType:       PersonGrantExternalIDToken,
 		AccountID:       req.AccountID,

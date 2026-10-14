@@ -11,7 +11,7 @@ func TestResolveFederatedPerson(t *testing.T) {
 	ctx := context.Background()
 	req := FederatedPersonRequest{GrantType: PersonGrantIDJAG, AccountID: "a", ProjectID: "p", Issuer: "https://idp", Subject: "oid-1"}
 
-	t.Run("no resolver, static issuer: sub is the IdP subject, no idp_sub", func(t *testing.T) {
+	t.Run("no resolver, static issuer: sub is the IdP subject, no user_idp_sub", func(t *testing.T) {
 		s := &OAuthService{}
 		got, err := s.resolveFederatedPerson(ctx, false, req)
 		if err != nil || got.sub != "oid-1" || got.idpSub != "" {
@@ -25,7 +25,7 @@ func TestResolveFederatedPerson(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
-	t.Run("resolver maps the person; the IdP subject moves to idp_sub", func(t *testing.T) {
+	t.Run("resolver maps the person; the IdP subject moves to user_idp_sub", func(t *testing.T) {
 		s := &OAuthService{}
 		var seen FederatedPersonRequest
 		s.SetFederatedPersonResolver(func(_ context.Context, r FederatedPersonRequest) (string, error) {
@@ -78,7 +78,7 @@ func TestResolveFederatedPerson(t *testing.T) {
 }
 
 // A resolved person's sub is the deployer's user, so user_id_iss (sub's
-// issuer) must not stay the IdP's; the IdP pair moves to idp_iss/idp_sub.
+// issuer) must not stay the IdP's; the IdP pair moves to user_idp_iss/user_idp_sub.
 func TestFederatedPersonApply(t *testing.T) {
 	req := IssueRequest{SubjectOverride: "oid-1", CustomClaims: map[string]any{"user_id_iss": "https://idp", "token_exchange": "id_jag"}}
 	federatedPerson{sub: "user_hf_1", idpIss: "https://idp", idpSub: "oid-1"}.apply(&req)
@@ -121,7 +121,7 @@ func TestEmailVerified(t *testing.T) {
 }
 
 func TestReservedClaims_IdPSub(t *testing.T) {
-	if !reservedClaims["idp_iss"] || !reservedClaims["idp_sub"] || !reservedClaims["user_id_iss"] {
-		t.Fatal("idp_iss, idp_sub and user_id_iss are written only by ZeroID")
+	if !reservedClaims["user_idp_iss"] || !reservedClaims["user_idp_sub"] || !reservedClaims["user_id_iss"] {
+		t.Fatal("user_idp_iss, user_idp_sub and user_id_iss are written only by ZeroID")
 	}
 }

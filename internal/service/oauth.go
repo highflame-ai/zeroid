@@ -195,7 +195,7 @@ var reservedClaims = map[string]bool{
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
 	// The IdP's issuer and subject for a person ZeroID resolved to the
 	// deployer's user (ADR 0042 D5a); only the federated grants write them.
-	"idp_iss": true, "idp_sub": true,
+	"user_idp_iss": true, "user_idp_sub": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to
@@ -1288,12 +1288,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
 	issue.UserGrantBounded = true
 
-	// The principal's IdP pair (idp_iss, idp_sub) describes sub, which the
+	// The principal's IdP pair (user_idp_iss, user_idp_sub) describes sub, which the
 	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
 	// from the verified parent; never from the request.
 	if parent.Type == domain.PrincipalUser {
-		idpIss, _ := jwt.Get[string](subjectParsed, "idp_iss")
-		idpSub, _ := jwt.Get[string](subjectParsed, "idp_sub")
+		idpIss, _ := jwt.Get[string](subjectParsed, "user_idp_iss")
+		idpSub, _ := jwt.Get[string](subjectParsed, "user_idp_sub")
 		if idpIss != "" && idpSub != "" {
 			issue.IdPIssuer, issue.IdPSubject = idpIss, idpSub
 		}

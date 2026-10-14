@@ -64,7 +64,7 @@ func (s *OAuthService) SetFederatedPersonResolver(fn FederatedPersonResolver) {
 }
 
 // federatedPerson is the result of resolving a person: the token's sub and,
-// when a resolver mapped it, the IdP's pair for idp_iss and idp_sub.
+// when a resolver mapped it, the IdP's pair for user_idp_iss and user_idp_sub.
 type federatedPerson struct {
 	sub    string
 	idpIss string
@@ -73,7 +73,7 @@ type federatedPerson struct {
 
 // apply sets the person on req. A resolved person's sub is the deployer's
 // user, whose issuer is ZeroID's: user_id_iss names sub's issuer, so the
-// IdP's issuer moves to idp_iss with idp_sub (ADR 0042 D5a), and the token
+// IdP's issuer moves to user_idp_iss with user_idp_sub (ADR 0042 D5a), and the token
 // carries the same user_id_iss as other person grants.
 func (p federatedPerson) apply(req *IssueRequest) {
 	req.SubjectOverride = p.sub

@@ -578,8 +578,8 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 
 	assert.Equal(t, "user_hf_alice", claims["sub"], "sub is the person's Highflame user id (D5a)")
 	assert.Equal(t, federationIssuer, claims["user_id_iss"], "sub's issuer is ZeroID's, as on authorization_code")
-	assert.Equal(t, p.aliceOID, claims["idp_sub"], "the IdP subject (Entra oid) rides in idp_sub")
-	assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["idp_iss"], "with the IdP's issuer in idp_iss")
+	assert.Equal(t, p.aliceOID, claims["user_idp_sub"], "the IdP subject (Entra oid) rides in user_idp_sub")
+	assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["user_idp_iss"], "with the IdP's issuer in user_idp_iss")
 	assert.Equal(t, "user", claims["principal_type"])
 	assert.Equal(t, p.tn.account, claims["account_id"], "account from the issuer row (D5)")
 	assert.Equal(t, p.tn.project, claims["project_id"], "project from the bound agent (D5)")
@@ -612,8 +612,8 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 		assert.Equal(t, "user", child["principal_type"])
 		assert.Equal(t, []string{p.agent.wimse}, actChain(t, child), "the same agent re-scoping adds no actor level")
 		assert.Nil(t, child["delegation_depth"], "nor any delegation depth")
-		assert.Equal(t, p.aliceOID, child["idp_sub"], "the principal's IdP pair travels with sub")
-		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["idp_iss"])
+		assert.Equal(t, p.aliceOID, child["user_idp_sub"], "the principal's IdP pair travels with sub")
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["user_idp_iss"])
 		assert.Equal(t, p.tn.account, child["account_id"])
 	})
 	t.Run("a different agent is a new actor and a new level", func(t *testing.T) {
@@ -628,8 +628,8 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 		child := decodeIssuedTokenClaims(t, ex.AccessToken)
 		assert.Equal(t, []string{sub.wimse, p.agent.wimse}, actChain(t, child))
 		assert.EqualValues(t, 1, child["delegation_depth"])
-		assert.Equal(t, p.aliceOID, child["idp_sub"])
-		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["idp_iss"])
+		assert.Equal(t, p.aliceOID, child["user_idp_sub"])
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["user_idp_iss"])
 		assert.Equal(t, "user_hf_alice", child["sub"])
 	})
 }
@@ -648,7 +648,7 @@ func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
 	require.Equal(t, http.StatusOK, person.StatusCode, "body=%s", person.RawBody)
 	root := decodeIssuedTokenClaims(t, person.AccessToken)
 	assert.Equal(t, "user_hf_alice", root["sub"])
-	assert.Equal(t, p.aliceSub, root["idp_sub"], "a legacy person root carries the pair: its sub is the person")
+	assert.Equal(t, p.aliceSub, root["user_idp_sub"], "a legacy person root carries the pair: its sub is the person")
 	assert.NotContains(t, root, "principal_type")
 
 	exchange := func(key *ecdsa.PrivateKey, wimse string) map[string]any {
@@ -665,8 +665,8 @@ func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
 	assert.EqualValues(t, 1, same["delegation_depth"], "legacy is unchanged: every exchange adds a level")
 	assert.Equal(t, p.agent.wimse, same["sub"], "legacy puts the actor in sub")
 	assert.Equal(t, map[string]any{"sub": "user_hf_alice"}, same["act"], "legacy act names the delegating parent's sub, as before")
-	assert.NotContains(t, same, "idp_sub", "the IdP pair describes the person, not a legacy sub")
-	assert.NotContains(t, same, "idp_iss")
+	assert.NotContains(t, same, "user_idp_sub", "the IdP pair describes the person, not a legacy sub")
+	assert.NotContains(t, same, "user_idp_iss")
 
 	other := p.tn.agent(t)
 	child := exchange(other.key, other.wimse)
@@ -830,13 +830,13 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 			clientCreds(t, appZ, linkedToB)))
 		requireRefused(t, resp, "invalid_grant")
 	})
-	t.Run("idp_sub cannot be supplied by the caller", func(t *testing.T) {
+	t.Run("user_idp_sub cannot be supplied by the caller", func(t *testing.T) {
 		resp := p.exchange(t, good(), map[string]any{"additional_claims": map[string]any{
-			"idp_sub": "forged", "idp_iss": "forged", "user_id_iss": "forged"}})
+			"user_idp_sub": "forged", "user_idp_iss": "forged", "user_id_iss": "forged"}})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
-		assert.Equal(t, p.aliceOID, claims["idp_sub"])
-		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["idp_iss"])
+		assert.Equal(t, p.aliceOID, claims["user_idp_sub"])
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["user_idp_iss"])
 		assert.Equal(t, federationIssuer, claims["user_id_iss"])
 	})
 }
@@ -913,8 +913,8 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	assert.Equal(t, "user_hf_alice", claims["sub"])
 	assert.Equal(t, federationIssuer, claims["user_id_iss"])
-	assert.Equal(t, p.aliceSub, claims["idp_sub"])
-	assert.Equal(t, p.f.idp.OktaIssuer(), claims["idp_iss"])
+	assert.Equal(t, p.aliceSub, claims["user_idp_sub"])
+	assert.Equal(t, p.f.idp.OktaIssuer(), claims["user_idp_iss"])
 	assert.Equal(t, "user", claims["principal_type"])
 	assert.Equal(t, p.tn.account, claims["account_id"])
 	assert.Equal(t, p.tn.project, claims["project_id"])

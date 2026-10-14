@@ -181,7 +181,7 @@ type FederatedPersonRequest = service.FederatedPersonRequest
 
 // FederatedPersonResolver maps the person in an IdP token to the deployer's
 // user id, which becomes the minted token's sub; the IdP subject is carried
-// in the reserved idp_iss and idp_sub claims, and user_id_iss becomes
+// in the reserved user_idp_iss and user_idp_sub claims, and user_id_iss becomes
 // ZeroID's issuer, since it names sub's issuer (ADR 0042 D5a). Install with
 // Server.SetFederatedPersonResolver. Return ErrPersonNotMember for a person
 // who is not a member of the account (invalid_grant); any other error, an
