@@ -37,7 +37,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
           token: ${{ steps.token.outputs.token }}
-          persist-credentials: false
+          persist-credentials: true
 
       - name: Setup Go
         uses: actions/setup-go@v6
