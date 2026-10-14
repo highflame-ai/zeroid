@@ -41,6 +41,20 @@ func (r *ExternalIssuerRepository) LockIssuer(ctx context.Context, issuer string
 	return nil
 }
 
+// LockAccount serialises issuer writers for one account until the
+// transaction ends, so the per-account cap holds under concurrent creates.
+// Take it before LockIssuer.
+func (r *ExternalIssuerRepository) LockAccount(ctx context.Context, accountID string) error {
+	if !hasTx(ctx) {
+		return errors.New("LockAccount requires a transaction")
+	}
+	_, err := dbOrTx(ctx, r.db).ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended(?, 4200057))", accountID)
+	if err != nil {
+		return fmt.Errorf("failed to lock account issuers: %w", err)
+	}
+	return nil
+}
+
 // SetAuditActor names who makes this transaction's writes, for the audit
 // trigger (the only way a DELETE can record it).
 func (r *ExternalIssuerRepository) SetAuditActor(ctx context.Context, actor string) error {

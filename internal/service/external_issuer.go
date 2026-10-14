@@ -210,6 +210,9 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	}
 
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
+		if err := s.repo.LockAccount(ctx, accountID); err != nil {
+			return err
+		}
 		if err := s.repo.LockIssuer(ctx, domain.CanonicalIssuer(row.Issuer)); err != nil {
 			return err
 		}
@@ -326,6 +329,9 @@ func staticIssuerView(c domain.ExternalIssuerConfig, accountID string) *domain.E
 func (s *ExternalIssuerService) Get(ctx context.Context, accountID, id string) (*domain.ExternalIssuer, error) {
 	if err := s.requireDB(); err != nil {
 		return nil, err
+	}
+	if !validUUID(id) {
+		return nil, errIssuerNotFound
 	}
 	row, err := s.repo.Get(ctx, id, accountID)
 	if err != nil {

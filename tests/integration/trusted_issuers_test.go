@@ -376,6 +376,12 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		_, list := f.call(t, http.MethodGet, "/external-issuers", nil, b.headers)
 		assert.Empty(t, list["items"])
 	})
+	t.Run("a malformed id is not found, not a server error", func(t *testing.T) {
+		for _, path := range []string{"/external-issuers/abc", "/external-issuers/abc/bindings", "/external-issuers/abc/bindings/def"} {
+			status, body := f.call(t, http.MethodGet, path, nil, a.headers)
+			assert.Equal(t, http.StatusNotFound, status, "%s: %v", path, body)
+		}
+	})
 	t.Run("list is the account's rows", func(t *testing.T) {
 		status, list := f.call(t, http.MethodGet, "/external-issuers", nil, a.headers)
 		require.Equal(t, http.StatusOK, status)
@@ -1119,4 +1125,38 @@ func TestTrustedIssuers_TrailingSlashIsOneIssuer(t *testing.T) {
 	}, b.headers)
 	assert.Equal(t, http.StatusConflict, status, "%v", body)
 	assert.Equal(t, "issuer_already_trusted", body["code"])
+}
+
+// TestTrustedIssuers_AccountCapUnderConcurrency: concurrent creates of
+// different issuers in one account never exceed the cap.
+func TestTrustedIssuers_AccountCapUnderConcurrency(t *testing.T) {
+	f := newDBFederation(t)
+	tn := newTITenant(t)
+	for i := 0; i < 18; i++ {
+		f.entraRow(t, tn, uid("cap-tid"), nil)
+	}
+	var wg sync.WaitGroup
+	statuses := make([]int, 6)
+	for i := range statuses {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tid := uid("cap-race")
+			statuses[i], _ = f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+				"kind": "person", "issuer": f.idp.EntraIssuer(tid), "jwks_uri": f.idp.EntraJWKSURI(tid),
+				"claim_mapping": map[string]string{"user_id": "oid"},
+			}, tn.headers)
+		}(i)
+	}
+	wg.Wait()
+	created := 0
+	for _, st := range statuses {
+		if st == http.StatusCreated {
+			created++
+		}
+	}
+	assert.Equal(t, 2, created, "statuses %v", statuses)
+	n, err := testDB.NewSelect().Table("external_issuers").Where("account_id = ?", tn.account).Count(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 20, n)
 }
