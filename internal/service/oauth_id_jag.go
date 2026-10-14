@@ -228,12 +228,32 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// req.AccountID / req.ProjectID ARE the derived tenant, so every later use
 	// (identity resolution, the mint, the observed-resource inventory) reads
 	// the derived value and nothing can reach back to what the caller sent.
-	tenant, err := deriveIDJAGTenant(ctx, &cfg, authedClient,
-		s.identitySvc.repo.GetByIDInAccounts, req.AccountID, req.ProjectID)
-	if err != nil {
-		return nil, err
+	//
+	// For an issuer row the agent is the ID-JAG's act.sub mapped through an
+	// enabled binding (ADR 0042 D6), and the tenant is that identity's; a
+	// registered client linked to another identity is refused. This also
+	// gives a CIMD client its tenant.
+	var boundAgent *domain.Identity
+	if entry.Row != nil {
+		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, actorSubject(rawClaims), authedClient, federatedGrantIDJAG)
+		if err != nil {
+			return nil, err
+		}
+		if err := federatedTenant(boundAgent, req.AccountID, req.ProjectID); err != nil {
+			return nil, err
+		}
+		if req.ApplicationID != "" && req.ApplicationID != boundAgent.ID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG's act.sub is bound to")
+		}
+		req.AccountID, req.ProjectID = boundAgent.AccountID, boundAgent.ProjectID
+	} else {
+		tenant, err := deriveIDJAGTenant(ctx, &cfg, authedClient,
+			s.identitySvc.repo.GetByIDInAccounts, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, err
+		}
+		req.AccountID, req.ProjectID = tenant.AccountID, tenant.ProjectID
 	}
-	req.AccountID, req.ProjectID = tenant.AccountID, tenant.ProjectID
 
 	// Identity mapping (D3). user_id is required (validated at config load);
 	// resolve the external subject through ClaimMapping. Fail closed when it is
@@ -332,9 +352,12 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Resolve the application identity if requested (IDOR-guarded, same as the
 	// id_token-exchange path); otherwise synthesize a service identity for the
 	// external principal.
-	identity, err := s.resolveExternalPrincipalIdentity(ctx, req)
-	if err != nil {
-		return nil, err
+	identity := boundAgent
+	if identity == nil {
+		identity, err = s.resolveExternalPrincipalIdentity(ctx, req)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Map IdP group/role claims into Cedar principal attributes (D3). These are

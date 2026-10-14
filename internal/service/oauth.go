@@ -62,6 +62,9 @@ type OAuthService struct {
 	// Nil when no external_issuers are configured — direct federation is
 	// disabled in that case and only the broker path remains.
 	externalIssuerRegistry *ExternalIssuerRegistry
+	// issuerBindings maps federated agents to identities when issuers are
+	// account rows (ADR 0042 D6). Nil in static mode.
+	issuerBindings issuerBindingSource
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService

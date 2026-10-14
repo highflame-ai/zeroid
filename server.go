@@ -462,6 +462,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		}
 		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, jwksOpts...)
 		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
+		oauthSvc.SetIssuerBindings(externalIssuerRepo)
 		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).
 			Msg("Trusted issuers are per-account rows (federation.issuer_store=db)")
 	} else if len(cfg.ExternalIssuers) > 0 {

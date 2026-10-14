@@ -129,18 +129,22 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if req.SubjectToken == "" {
 		return nil, oauthBadRequest("invalid_request", "subject_token is required")
 	}
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
-	}
-
 	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.SubjectToken, "subject_token", oautherror.InvalidRequest)
 	if err != nil {
 		return nil, err
 	}
 	cfg := entry.Config
 
-	if !cfg.AccountAllowed(req.AccountID) {
-		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
+	// An issuer row derives the tenant from the agent's binding (ADR 0042
+	// D5). Only a static issuer, in standalone ZeroID, takes it from the
+	// caller, inside its allowed_accounts.
+	if entry.Row == nil {
+		if req.AccountID == "" || req.ProjectID == "" {
+			return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
+		}
+		if !cfg.AccountAllowed(req.AccountID) {
+			return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
+		}
 	}
 
 	// D13: only the relying party an ID token was issued to may redeem it, and
@@ -195,12 +199,34 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
 
-	// Resolve the application identity if requested. Same IDOR-guarded
-	// lookup the broker path uses — falling back to a synthetic service
-	// identity when no application_id is provided.
-	identity, err := s.resolveExternalPrincipalIdentity(ctx, req)
-	if err != nil {
-		return nil, err
+	// The agent. For an issuer row it is the identity the presenting client
+	// is bound to under that row (D6: on P1c the subject key is the client_id,
+	// which is the ID token's aud), and the tenant is that identity's.
+	// Static issuers keep the caller-named application, or a synthetic
+	// carrier.
+	var (
+		identity *domain.Identity
+		actors   []domain.Actor
+	)
+	if entry.Row != nil {
+		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
+		if err != nil {
+			return nil, err
+		}
+		if err := federatedTenant(identity, req.AccountID, req.ProjectID); err != nil {
+			return nil, err
+		}
+		if req.ApplicationID != "" && req.ApplicationID != identity.ID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the presenting client is bound to")
+		}
+		req.AccountID, req.ProjectID = identity.AccountID, identity.ProjectID
+		// The bound agent is the current actor (ADR 0043 D2), as on ID-JAG.
+		actors = idJAGActors(identity)
+	} else {
+		identity, err = s.resolveExternalPrincipalIdentity(ctx, req)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Build provenance claims. user_id_iss is the headline addition: it
@@ -281,6 +307,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		// bound to the ID token's aud/azp (D13), so it is the client the
 		// token is issued to.
 		ClientID:          authedClient.ClientID,
+		Actors:            actors,
 		TTL:               900, // 15 minutes — same short-lived posture as the broker path
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
