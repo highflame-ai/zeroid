@@ -83,7 +83,9 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 //     presence, S256) — after 3.5 so their failures can redirect, before
 //     step 4 so a doomed request never reaches a login surface.
 //  4. Walk the registered PrincipalResolver chain. First non-nil
-//     Principal wins. No matches → access_denied.
+//     Principal wins. No matches → access_denied. A resolver reporting
+//     ErrPrincipalAccessDenied → access_denied redirect on GET and POST
+//     (see denyAuthorize).
 //  5. Intersect (caller-requested scope ∩ resolver-narrowed scope) —
 //     the service layer intersects again with the client's registered
 //     scope, so the issued code carries the narrowest authority.
@@ -103,7 +105,8 @@ func (a *API) registerAuthorizeRoute(router chi.Router) {
 // writeAuthorizeError, because there is no validated redirect_uri to
 // trust yet. Everything after it goes through failAuthorize, which
 // redirects on GET and keeps JSON on POST (see that function for why the
-// method matters).
+// method matters) — except a resource owner's explicit denial, which
+// redirects on both methods (see denyAuthorize).
 //
 // Ordering was the whole difficulty, and it was upstream of this
 // handler's own steps: principal resolution used to run before any client
@@ -368,6 +371,21 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 				"/oauth2/authorize is not configured on this deployment: no PrincipalResolver registered")
 			return
 		}
+		if errors.Is(err, service.ErrPrincipalAccessDenied) {
+			// The resolver authenticated the request and the resource owner
+			// declined it. Not a failure of the request — an answer to it, and
+			// one only zeroid can deliver, because only zeroid has validated the
+			// redirect_uri it must travel to. Checked before the interaction
+			// sentinel so a resolver that wraps both still ends the flow rather
+			// than restarting a login the user has just declined.
+			log.Info().
+				Str("resolver", resolverName).
+				Str("client_id", req.ClientID).
+				Msg("resource owner denied the authorization request")
+			a.denyAuthorize(w, req, oauthClient)
+
+			return
+		}
 		if errors.Is(err, service.ErrPrincipalInteractionRequired) {
 			// The resolver recognised this as a request a human could satisfy
 			// but found nobody signed in. Send them somewhere they can, if the
@@ -513,22 +531,16 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 // redirectToInteractiveLogin sends the user agent to the deployer's login
 // surface, returning true when it handled the response.
 //
-// Returns false — leaving the caller to refuse — in the three cases where a
-// redirect is not the right answer:
+// Returns false — leaving the caller to refuse — when a redirect is not the
+// right answer:
 //
 //   - Not a GET. There is no user agent in a POST exchange to send anywhere; the
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
-//   - A self-asserted (CIMD) client heading for an unvetted REMOTE destination.
-//     Sending a user through the deployment's real login page on behalf of such a
-//     client is the more damaging half of the same problem failAuthorize declines:
-//     the victim authenticates for real, and the flow resumes toward an
-//     attacker-published redirect_uri. A loopback or private-use redirect_uri is
-//     not that — the code lands on the user's own machine — so those proceed, which
-//     is what keeps the native/CLI/MCP browser leg working. Setting
-//     cimd.allowed_domains lifts the refusal for remote hosts too. See
-//     refusesRedirectTo.
+//   - refusesRedirectTo declines the client (no resolvable client). A CIMD
+//     client is not refused here: cimd.allowed_domains is enforced when its
+//     document resolves, so a client that reached this point was admitted.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -629,32 +641,11 @@ func (a *API) redirectToInteractiveLogin(
 // v1. Redirecting those would break them for no benefit, and there is no user
 // agent in that exchange to redirect anyway.
 //
-// It also keeps the JSON body for a SELF-ASSERTED client, and that one is a
-// deliberate deviation from §4.1.2.1 rather than a gap.
-//
-// §4.1.2.1's redirect rule rests on "registered" meaning a party somebody vetted.
-// CIMD removes registration by design: the redirect_uris come from a document the
-// requester published, CIMD is on by default, and allowed_domains ships empty, so
-// the destination is attacker-CHOSEN rather than merely attacker-supplied. Under
-// those conditions honouring the rule turns this endpoint into an unauthenticated
-// redirector — reachable with no credential, since the failure being reported IS
-// "you have no credential" — with the authorization server's own origin as the
-// first hop. Three independent reviews flagged it; the deviation is the
-// deliberate answer.
-//
-// What it costs: a CIMD client driving a browser cannot learn its error from the
-// callback and must read the JSON body instead, which is exactly the ergonomic
-// problem #279 set out to fix, kept for the one client class whose redirect
-// target nobody vetted. Registered and dynamically-registered clients — where
-// somebody did — are unaffected and get the conformant redirect.
-//
-// Two things narrow that deviation, because it is provenance-and-reach, not the
-// CIMD feature itself. A loopback or private-use redirect_uri is redirected
-// normally — it delivers to the caller's own device, so there is no third party
-// to hand an error or a code to, which is the same reasoning RFC 8252 §7.3 uses
-// to accept those callbacks from unregistered native clients. And setting
-// cimd.allowed_domains restores redirects to remote hosts as well, by
-// re-establishing the vetting the rule assumes. See docs/cimd.md.
+// The GET redirect applies to CIMD clients exactly as to registered ones:
+// cimd.allowed_domains is enforced once, when the document resolves, and a
+// client that got this far was admitted. The cost of the open default (empty
+// allow-list) is that anyone can publish a document whose redirect_uri this
+// redirects to; docs/spec/zeroid-oauth-extensions.md §12.5 records that trade.
 //
 // jsonCode vs redirectCode: the wire code sometimes has to differ between the
 // two shapes. A failed resolver is invalid_client to a programmatic POST caller
@@ -671,10 +662,59 @@ func (a *API) failAuthorize(
 	w http.ResponseWriter, r *http.Request, req *service.AuthorizeRequest,
 	client *domain.OAuthClient, status int, jsonCode, redirectCode, description string,
 ) {
-	if r.Method != http.MethodGet || a.refusesRedirectTo(client, req.RedirectURI) {
-		writeAuthorizeError(w, status, jsonCode, description)
-
+	if r.Method == http.MethodGet && a.redirectAuthorizeError(w, req, client, redirectCode, description) {
 		return
+	}
+
+	writeAuthorizeError(w, status, jsonCode, description)
+}
+
+// accessDeniedDescription is the error_description sent when a resolver reports
+// that the resource owner declined. Fixed text on purpose: the resolver's error
+// may carry deployer-internal detail (who the user was, which consent record
+// matched), and none of that belongs in a URL the client and its logs receive.
+const accessDeniedDescription = "the resource owner denied the request"
+
+// denyAuthorize reports ErrPrincipalAccessDenied: the resource owner was
+// authenticated and declined.
+//
+// It redirects on POST as well as GET, which is the one place this endpoint does
+// so for an error, and the reason is who the POST caller is in this case. The
+// sentinel only arises when a resolver has authenticated a request, and the POST
+// shape that produces it is a login/consent front end posting a signed statement
+// of the user's decision server-to-server. On approval that front end receives
+// the code redirect and hands its Location to the browser; on denial it must be
+// able to do the same with the error redirect, and it cannot build that redirect
+// itself — zeroid alone has validated client_id and redirect_uri. failAuthorize's
+// reason for keeping POST on JSON (a CLI that parses JSON errors) does not apply:
+// a CLI resolver never returns this sentinel, so no existing caller sees a change.
+//
+// refusesRedirectTo still governs, identically to failAuthorize: where it
+// refuses the destination, the answer is a JSON access_denied body instead of a
+// Location. 403 rather than 401 on that path because nothing failed to
+// authenticate — the owner was identified and said no. cimd.allowed_domains is
+// not a redirect gate here: it is enforced once, at document resolution, so a
+// self-asserted client that reached a resolver has already been admitted.
+func (a *API) denyAuthorize(w http.ResponseWriter, req *service.AuthorizeRequest, client *domain.OAuthClient) {
+	if a.redirectAuthorizeError(w, req, client, oautherror.AccessDenied, accessDeniedDescription) {
+		return
+	}
+
+	writeAuthorizeError(w, http.StatusForbidden, oautherror.AccessDenied, accessDeniedDescription)
+}
+
+// redirectAuthorizeError writes the RFC 6749 §4.1.2.1 error redirect — 302 to
+// the validated redirect_uri with error, error_description, state (if sent) and
+// iss — and reports true. It writes nothing and reports false when the
+// destination must not be redirected to (refusesRedirectTo) or does not parse,
+// leaving the caller to answer with JSON. Method policy is the caller's: this
+// function does not look at the request method.
+func (a *API) redirectAuthorizeError(
+	w http.ResponseWriter, req *service.AuthorizeRequest,
+	client *domain.OAuthClient, redirectCode, description string,
+) bool {
+	if a.refusesRedirectTo(client, req.RedirectURI) {
+		return false
 	}
 
 	u, err := url.Parse(req.RedirectURI)
@@ -685,9 +725,8 @@ func (a *API) failAuthorize(
 		// never guess at a redirect target.
 		log.Error().Err(err).Str("redirect_uri", req.RedirectURI).
 			Msg("validated redirect_uri failed url.Parse on the error path")
-		writeAuthorizeError(w, status, jsonCode, description)
 
-		return
+		return false
 	}
 
 	q := u.Query()
@@ -708,6 +747,8 @@ func (a *API) failAuthorize(
 	w.Header().Set("Location", u.String())
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusFound)
+
+	return true
 }
 
 // nqchar coerces a description to RFC 6749 §4.1.2.1's NQCHAR set —
