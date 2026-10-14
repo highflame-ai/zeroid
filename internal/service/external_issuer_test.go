@@ -162,7 +162,19 @@ func TestExternalIssuerCheck(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Error != "discovery_private_address" {
+		if got.Error != "discovery_unreachable" {
+			t.Fatalf("check = %+v; a private address is not told apart (no internal-DNS oracle)", got)
+		}
+	})
+	t.Run("discovery does not follow redirects", func(t *testing.T) {
+		target := issuerServer(t, "", http.StatusOK, testJWKS(t, "k1"))
+		var redirector *httptest.Server
+		redirector = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
+		}))
+		defer redirector.Close()
+		got, _ := svc.Check(ctx, redirector.URL)
+		if got.Error != "discovery_unreachable" {
 			t.Fatalf("check = %+v", got)
 		}
 	})

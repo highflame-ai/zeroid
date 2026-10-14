@@ -531,8 +531,24 @@ func ssrfGuardedTransport(allowPrivate func() bool) *http.Transport {
 // should wrap it with their own context.
 func NewSSRFGuardedHTTPClient(allowPrivate bool) *http.Client {
 	return &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: ssrfGuardedTransport(func() bool { return allowPrivate }),
+		Timeout:       10 * time.Second,
+		Transport:     ssrfGuardedTransport(func() bool { return allowPrivate }),
+		CheckRedirect: guardedRedirect(allowPrivate),
+	}
+}
+
+// ErrInsecureRedirect is returned for a redirect the guarded client refuses.
+var ErrInsecureRedirect = errors.New("redirect refused: not https, or too many")
+
+// guardedRedirect follows at most 3 redirects, and only to https unless
+// private endpoints are allowed (local development over http). Each hop is
+// still dialled through the guarded transport.
+func guardedRedirect(allowPrivate bool) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 || (req.URL.Scheme != "https" && !allowPrivate) {
+			return ErrInsecureRedirect
+		}
+		return nil
 	}
 }
 

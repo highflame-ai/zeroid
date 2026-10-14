@@ -221,13 +221,11 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
 | 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
-| 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched |
+| 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
 | 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
 | 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri` |
-| 422 | `discovery_private_address` | The issuer resolves to a private or reserved address |
-| 422 | `jwks_unreachable` | The JWKS could not be fetched (no upstream detail is returned) |
+| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned) |
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
-| 422 | `jwks_private_address` | The JWKS host resolves to a private or reserved address |
 | 422 | `shared_issuer_requires_constraints` | A shared issuer without `claim_constraints` |
 | 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
 | 422 | `identity_not_found` | `identity_id` names no identity in this account |

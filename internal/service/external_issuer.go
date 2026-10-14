@@ -535,17 +535,24 @@ func (s *ExternalIssuerService) discover(ctx context.Context, iss string) (strin
 		return "", unreachable
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := s.httpClient.Do(req)
+	// Discovery is served at the issuer itself (Entra and Okta do not
+	// redirect), so a redirect is refused rather than followed.
+	noRedirect := *s.httpClient
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := noRedirect.Do(req)
 	if err != nil {
+		// A private address is reported as unreachable: a distinct answer
+		// would let an admin probe internal DNS. The log keeps the reason.
+		reason := "unreachable"
 		if errors.Is(err, attestation.ErrPrivateAttestationEndpoint) {
-			return "", issuerErr(http.StatusUnprocessableEntity, "discovery_private_address",
-				"the issuer resolves to a private or reserved address")
+			reason = "private_address"
 		}
-		log.Debug().Err(err).Str("issuer", iss).Msg("issuer discovery failed")
+		log.Info().Err(err).Str("issuer", iss).Str("reason", reason).Msg("issuer discovery failed")
 		return "", unreachable
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
+		log.Info().Str("issuer", iss).Int("status", resp.StatusCode).Msg("issuer discovery failed")
 		return "", unreachable
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryBytes+1))
@@ -576,11 +583,8 @@ func (s *ExternalIssuerService) requireJWKS(ctx context.Context, jwksURI string)
 	check := s.probeJWKS(ctx, jwksURI)
 	if check.Error != "" {
 		msg := "the issuer's JWKS could not be fetched"
-		switch check.Error {
-		case "jwks_empty":
+		if check.Error == "jwks_empty" {
 			msg = "the issuer's JWKS has no usable signing keys"
-		case "jwks_private_address":
-			msg = "the issuer's JWKS resolves to a private or reserved address"
 		}
 		return check, issuerErr(http.StatusUnprocessableEntity, check.Error, msg)
 	}
@@ -599,11 +603,10 @@ func (s *ExternalIssuerService) probeJWKS(ctx context.Context, jwksURI string) *
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		// Folded into unreachable, as for discovery; the log keeps why.
 		out.Error = "jwks_unreachable"
-		if errors.Is(err, attestation.ErrPrivateAttestationEndpoint) {
-			out.Error = "jwks_private_address"
-		}
-		log.Debug().Err(err).Str("jwks_uri", jwksURI).Msg("JWKS probe failed")
+		log.Info().Err(err).Str("jwks_uri", jwksURI).
+			Bool("private_address", errors.Is(err, attestation.ErrPrivateAttestationEndpoint)).Msg("JWKS probe failed")
 		return out
 	}
 	defer func() { _ = resp.Body.Close() }()
