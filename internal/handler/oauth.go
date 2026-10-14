@@ -895,7 +895,13 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 
 	// clientID is the client the request identified, verified above (or "" for
 	// a caller that identified none); it restricts refresh-token revocation to
-	// the client's own tokens.
+	// the client's own tokens. A private_key_jwt client may omit client_id and
+	// be identified by its assertion's iss (RFC 7523 §3), which
+	// VerifyPresentedClientAuth has just authenticated; it is confined the
+	// same as one that sent client_id.
+	if clientID == "" && input.Body.ClientAssertion != "" {
+		clientID, _ = service.ClientIDFromAssertion(input.Body.ClientAssertion)
+	}
 	if err := a.oauthSvc.RevokeToken(ctx, input.Body.Token, input.Body.TokenTypeHint, clientID); err != nil {
 		// A lookup or revocation failed server-side. Answering 200 here would
 		// tell the client its token is dead when it may not be (RFC 7009 §2.1:

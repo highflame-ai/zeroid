@@ -165,3 +165,40 @@ func TestRevokeAccessTokenWithRefreshHint(t *testing.T) {
 	status, _ = refreshMCP(t, rt)
 	assert.Equal(t, http.StatusOK, status)
 }
+
+// A registered private_key_jwt client may omit client_id: RFC 7523 §3 carries
+// it in the assertion's iss, and the endpoint authenticates the client from
+// that. The client so identified is still only allowed to revoke its own
+// refresh tokens. Before, the confinement keyed on the body's client_id alone,
+// so leaving it out turned an authenticated client into an unconfined one —
+// which matters most where anonymous revocation is switched off.
+func TestRevokeRefreshToken_AssertionOnlyClientIsConfined(t *testing.T) {
+	clientID := uid("pkjwt-revoker")
+	key := generateKey(t)
+	reg := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":                  clientID,
+		"name":                       clientID + "-client",
+		"confidential":               false,
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, key),
+		"grant_types":                []string{"authorization_code", "refresh_token"},
+		"redirect_uris":              []string{testRedirectURI},
+		"scopes":                     []string{"data:read"},
+	}, nil)
+	require.Equal(t, http.StatusCreated, reg.StatusCode)
+	_ = reg.Body.Close()
+
+	at, rt := exchangeMCPCode(t, uid("user-revoke-rt-assertion"))
+
+	status, body := revokeStatus(t, map[string]any{
+		"token":                 rt,
+		"token_type_hint":       "refresh_token",
+		"client_assertion":      clientAssertionFor(t, key, clientID),
+		"client_assertion_type": clientAssertionType,
+	})
+	require.Equal(t, http.StatusOK, status, "%v", body)
+
+	assert.True(t, introspect(t, at)["active"].(bool), "another client's access token is untouched")
+	status, _ = refreshMCP(t, rt)
+	assert.Equal(t, http.StatusOK, status, "another client's refresh token still works")
+}
