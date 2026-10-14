@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -869,6 +872,39 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 			clientCreds(t, appZ, linkedToB)))
 		requireRefused(t, resp, "invalid_grant")
 	})
+	t.Run("a forged token is refused before any binding is read (no events, no state)", func(t *testing.T) {
+		forge := func(aud string) string {
+			key, err := rsa.GenerateKey(rand.Reader, 2048)
+			require.NoError(t, err)
+			now := time.Now()
+			tok, err := jwt.NewBuilder().Issuer(p.f.idp.EntraIssuer(p.tid)).Subject("x").Audience([]string{aud}).
+				Claim("oid", p.aliceOID).Claim("tid", p.tid).IssuedAt(now).Expiration(now.Add(time.Minute)).Build()
+			require.NoError(t, err)
+			hdr := jws.NewHeaders()
+			require.NoError(t, hdr.Set(jws.KeyIDKey, "entra-mock-key"))
+			signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), key, jws.WithProtectedHeaders(hdr)))
+			require.NoError(t, err)
+			return string(signed)
+		}
+		// A client with no binding: an unmatched-agent event would follow a
+		// binding read; the refusal must be the signature instead.
+		app := uid("app-forge")
+		rp := rpClient(t, app)
+		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(forge(app)), clientCreds(t, app, rp.Key)))
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "verification failed")
+		assert.NotContains(t, resp.RawBody, "binding")
+
+		// A client bound to a discovered agent: the state must not leak.
+		discovered := p.tn.discoveredAgent(t)
+		appD := uid("app-forge-d")
+		status, body := p.f.bind(t, p.tn, p.rowID, appD, discovered, false)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		key := keyClient(t, p.tn, appD, discovered)
+		resp = postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(forge(appD)), clientCreds(t, appD, key)))
+		requireRefused(t, resp, "invalid_grant")
+		assert.NotContains(t, resp.RawBody, "discovered")
+	})
 	t.Run("user_idp_sub cannot be supplied by the caller", func(t *testing.T) {
 		resp := p.exchange(t, good(), map[string]any{"additional_claims": map[string]any{
 			"user_idp_sub": "forged", "user_idp_iss": "forged", "user_id_iss": "forged"}})
@@ -1232,4 +1268,30 @@ func TestTrustedIssuers_KeysComeFromDiscovery(t *testing.T) {
 		assert.Equal(t, http.StatusUnprocessableEntity, status, "%v", body)
 		assert.Equal(t, "discovery_issuer_mismatch", body["code"])
 	})
+}
+
+// TestTrustedIssuers_ForgedIDJAGRaisesNoEvent: an ID-JAG that fails
+// verification is refused before its act.sub is looked up.
+func TestTrustedIssuers_ForgedIDJAGRaisesNoEvent(t *testing.T) {
+	p := newP1B(t)
+	discovered := p.tn.discoveredAgent(t)
+	sub := uid("0oa-forge")
+	status, body := p.f.bind(t, p.tn, p.rowID, sub, discovered, false)
+	require.Equal(t, http.StatusCreated, status, "%v", body)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	now := time.Now()
+	tok, err := jwt.NewBuilder().Issuer(p.f.idp.OktaIssuer()).Subject(p.aliceSub).Audience([]string{federationIssuer}).
+		Claim("client_id", p.clientID).Claim("act", map[string]any{"sub": sub}).Claim("resource", "https://gw").
+		JwtID(uid("jti")).IssuedAt(now).Expiration(now.Add(time.Minute)).Build()
+	require.NoError(t, err)
+	hdr := jws.NewHeaders()
+	require.NoError(t, hdr.Set(jws.KeyIDKey, "okta-mock-key"))
+	require.NoError(t, hdr.Set(jws.TypeKey, "oauth-id-jag+jwt"))
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.RS256(), key, jws.WithProtectedHeaders(hdr)))
+	require.NoError(t, err)
+	resp := p.redeem(t, string(signed), nil)
+	requireRefused(t, resp, "invalid_grant")
+	assert.Contains(t, resp.RawBody, "verification failed")
+	assert.NotContains(t, resp.RawBody, "discovered")
 }

@@ -132,7 +132,7 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
    This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
    Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
-   The `aud` is accepted because an enabled binding on the row has the `client_id` as subject key (the binding is the audience rule), or because it is in the row's `audiences`.
+   The `aud` is accepted because it names the presenting `client_id`, which must then be the subject key of an enabled binding on the row (rule 4; the binding is the audience rule), or because it is in the row's `audiences`.
 2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker: no `scp`, `scope`, `azpacr` or `appidacr` (Entra stamps one of the last two on every access token, app-only ones included), and no `typ` of `at+jwt`, `application/at+jwt` or `oauth-id-jag+jwt`.
    `roles` alone is not a marker: Entra ID tokens carry a user's app roles in it.
 3. The issuer row is `person`, and the subject is not a workload (static issuers too): no Entra `idtyp=app`, no `system:serviceaccount:` subject, no SPIFFE ID, no GitHub Actions `repo:` subject.
@@ -156,7 +156,7 @@ Every check, including person resolution, runs before the ID-JAG's `jti` is cons
 ### Refusals that are events
 
 - **Unmatched agent** (ADR 0027): no `act.sub`, no binding, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
-  On the ID-token exchange the binding is resolved before the token is verified, so these are recorded there too.
+  On both grants the binding is read only after the token's signature and the checks that need no binding have passed, so a forged token raises no event under an account and learns nothing of its bindings.
   Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
 - **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
 

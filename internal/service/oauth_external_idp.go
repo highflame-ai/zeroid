@@ -169,16 +169,12 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 			return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
 				"a client secret is not accepted", nil)
 		}
-		// The agent is the identity the presenting client is bound to under
-		// the row (D6: on P1c the subject key is the client_id). Resolved
-		// before the token is verified so a refusal is recorded as an
-		// unmatched or unadopted agent, and the binding is then the audience
-		// rule (D3a): its client_id, which idTokenIssuedTo requires in aud,
-		// is an accepted audience beside the row's optional audiences.
-		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
-		if err != nil {
-			return nil, err
-		}
+		// The binding is the audience rule (D3a): the presenting client_id,
+		// which idTokenIssuedTo requires in aud, is accepted beside the row's
+		// optional audiences, and bindFederatedAgent below refuses a client
+		// with no enabled binding. The binding is read only after the token
+		// is verified, so a forged token cannot raise events under the
+		// account or learn its binding state.
 		bindingAudiences = []string{authedClient.ClientID}
 	} else {
 		// A static issuer, in standalone ZeroID, takes the tenant from the
@@ -219,10 +215,16 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
 
-	// For an issuer row the tenant is the bound agent's (D5). Static issuers
-	// keep the caller-named application, or a synthetic carrier.
+	// For an issuer row the agent is the identity the presenting client is
+	// bound to under the row (D6: on P1c the subject key is the client_id),
+	// and the tenant is that identity's (D5). Static issuers keep the
+	// caller-named application, or a synthetic carrier.
 	var actors []domain.Actor
 	if entry.Row != nil {
+		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
+		if err != nil {
+			return nil, err
+		}
 		if err := federatedTenant(identity, req.AccountID, req.ProjectID); err != nil {
 			return nil, err
 		}
