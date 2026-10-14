@@ -432,10 +432,12 @@ func SharedPin(list []SharedIssuer, iss string) (string, bool) {
 	return "", false
 }
 
-// ValidateSharedIssuers checks a configured shared-issuer list.
-func ValidateSharedIssuers(list []SharedIssuer) error {
+// ValidateSharedIssuers checks a configured shared-issuer list. allowHTTP
+// admits http issuers, as federation.allow_private_endpoints does for rows
+// (local development against a mock IdP).
+func ValidateSharedIssuers(list []SharedIssuer, allowHTTP bool) error {
 	for i, sh := range list {
-		if err := checkIssuerURL(sh.Issuer, false); err != nil {
+		if err := checkIssuerURL(sh.Issuer, allowHTTP); err != nil {
 			return fmt.Errorf("shared_issuers[%d].issuer %v", i, err)
 		}
 		if sh.PinClaim == "" || slices.Contains(unpinnableClaims, sh.PinClaim) {

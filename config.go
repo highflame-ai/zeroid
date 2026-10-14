@@ -631,7 +631,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
 	}
 
-	if err := domain.ValidateSharedIssuers(c.Federation.SharedIssuers); err != nil {
+	if err := domain.ValidateSharedIssuers(c.Federation.SharedIssuers, c.Federation.AllowPrivateEndpoints); err != nil {
 		return fmt.Errorf("federation.%w", err)
 	}
 	switch c.Federation.IssuerStore {

@@ -785,4 +785,12 @@ func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "http://mockidp:8080/google", PinClaim: "hd"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an http shared issuer needs allow_private_endpoints")
+	}
+	cfg.Federation.AllowPrivateEndpoints = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("local mock as a shared issuer: %v", err)
+	}
 }

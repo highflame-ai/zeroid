@@ -176,7 +176,7 @@ func TestExternalIssuerConstraintsMatch(t *testing.T) {
 }
 
 func TestValidateSharedIssuers(t *testing.T) {
-	if err := ValidateSharedIssuers(DefaultSharedIssuers); err != nil {
+	if err := ValidateSharedIssuers(DefaultSharedIssuers, false); err != nil {
 		t.Fatal(err)
 	}
 	for _, bad := range [][]SharedIssuer{
@@ -184,9 +184,16 @@ func TestValidateSharedIssuers(t *testing.T) {
 		{{Issuer: "https://x", PinClaim: "aud"}},
 		{{Issuer: "http://x", PinClaim: "hd"}},
 	} {
-		if ValidateSharedIssuers(bad) == nil {
+		if ValidateSharedIssuers(bad, false) == nil {
 			t.Fatalf("%v must be refused", bad)
 		}
+	}
+	local := []SharedIssuer{{Issuer: "http://mockidp:8080/google", PinClaim: "hd"}}
+	if err := ValidateSharedIssuers(local, true); err != nil {
+		t.Fatalf("with private endpoints allowed an http shared issuer is accepted: %v", err)
+	}
+	if ValidateSharedIssuers([]SharedIssuer{{Issuer: "http://x"}}, true) == nil {
+		t.Fatal("allowHTTP never waives the pinning claim")
 	}
 }
 
