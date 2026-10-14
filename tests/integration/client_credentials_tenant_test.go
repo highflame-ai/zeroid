@@ -70,6 +70,11 @@ func TestClientCredentials_TenantDerivedFromLinkedIdentity(t *testing.T) {
 		claims := decodeIssuedTokenClaims(t, body["access_token"].(string))
 		require.Equal(t, acct, claims["account_id"])
 		require.Equal(t, proj, claims["project_id"])
+
+		// The request named no tenant, so the response is the only place an
+		// embedder attributing issuance (AuthN's metering) can learn it.
+		require.Equal(t, acct, body["account_id"], "response must name the derived tenant")
+		require.Equal(t, proj, body["project_id"], "response must name the derived tenant")
 	})
 
 	t.Run("a client linking no identity is told how to fix it", func(t *testing.T) {
