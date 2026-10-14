@@ -135,6 +135,17 @@ type APIKeyResolution = service.APIKeyResolution
 // See internal/service/person_grant.go for the field docs.
 type PersonGrantRequest = service.PersonGrantRequest
 
+// PersonGrantRequest.GrantType values. Compare against these rather than raw
+// strings.
+const (
+	PersonGrantAuthorizationCode = service.PersonGrantAuthorizationCode
+	PersonGrantRefreshToken      = service.PersonGrantRefreshToken
+	PersonGrantCIBA              = service.PersonGrantCIBA
+	PersonGrantIDJAG             = service.PersonGrantIDJAG
+	PersonGrantExternalPrincipal = service.PersonGrantExternalPrincipal
+	PersonGrantExternalIDToken   = service.PersonGrantExternalIDToken
+)
+
 // PersonGrant is a PersonGrantResolver's answer: the person's scope ceiling
 // and the roles stamped as the RFC 9068 §2.2.3.1 `roles` claim. An empty
 // Scopes grants nothing.

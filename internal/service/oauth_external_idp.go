@@ -269,6 +269,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		TTL:               900, // 15 minutes — same short-lived posture as the broker path
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		PersonGrantType:   PersonGrantExternalIDToken,
 	}
 	// RFC 8707 resource binding (CAP-IDN-026). token-exchange forks THREE ways —
 	// this id_token federation path, the trusted external-principal exchange, and

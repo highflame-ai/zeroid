@@ -220,6 +220,16 @@ func personMints(f *personGrantFederation) map[string]personMint {
 	}
 }
 
+// personGrantTypes is the GrantType the resolver sees for each person mint.
+var personGrantTypes = map[string]string{
+	"authorization_code":          zeroid.PersonGrantAuthorizationCode,
+	"refresh_token":               zeroid.PersonGrantRefreshToken,
+	"external_principal_exchange": zeroid.PersonGrantExternalPrincipal,
+	"ciba_root":                   zeroid.PersonGrantCIBA,
+	"id_jag":                      zeroid.PersonGrantIDJAG,
+	"id_token_exchange":           zeroid.PersonGrantExternalIDToken,
+}
+
 // TestPersonGrant_SixGrants runs each person grant end to end against the
 // ceiling in both modes.
 func TestPersonGrant_SixGrants(t *testing.T) {
@@ -260,6 +270,7 @@ func TestPersonGrant_SixGrants(t *testing.T) {
 					calls := grants.callsFor(user)
 					require.NotEmpty(t, calls, "the resolver is consulted")
 					assert.Equal(t, requested, calls[len(calls)-1].RequestedScopes)
+					assert.Equal(t, personGrantTypes[name], calls[len(calls)-1].GrantType)
 
 					switch tc.wantStatus {
 					case http.StatusOK:
@@ -311,7 +322,7 @@ func TestPersonGrant_AuthorizeRefusesEarly(t *testing.T) {
 		assert.Empty(t, q.Get("code"))
 		calls := grants.callsFor(user)
 		require.Len(t, calls, 1)
-		assert.Equal(t, "authorization_code", calls[0].GrantType)
+		assert.Equal(t, zeroid.PersonGrantAuthorizationCode, calls[0].GrantType)
 		assert.Equal(t, []string{"pg:a", "pg:b"}, calls[0].RequestedScopes)
 	})
 
@@ -427,7 +438,7 @@ func TestPersonGrant_ChainsDoNotConsultIt(t *testing.T) {
 	calls := grants.callsFor(alice)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "member", calls[0].TrustedRole, "the broker's asserted role reaches the resolver")
-	assert.Equal(t, "token_exchange", calls[0].GrantType)
+	assert.Equal(t, zeroid.PersonGrantExternalPrincipal, calls[0].GrantType)
 
 	child, _ := tn.exchange(t, policyID, uid("pg-agent"), scopes, root)
 	childClaims := decodeJWTPayload(t, child["access_token"].(string))

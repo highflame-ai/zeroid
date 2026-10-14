@@ -31,11 +31,22 @@ const (
 	PersonGrantModeEnforce PersonGrantMode = "enforce"
 )
 
+// PersonGrantRequest.GrantType values, one per grant that mints for a person.
+// The two token exchanges are told apart by the names their tokens' own
+// token_exchange claim already uses.
+const (
+	PersonGrantAuthorizationCode = string(domain.GrantTypeAuthorizationCode)
+	PersonGrantRefreshToken      = string(domain.GrantTypeRefreshToken)
+	PersonGrantCIBA              = string(domain.GrantTypeCIBA)
+	PersonGrantIDJAG             = string(domain.GrantTypeJWTBearer)
+	PersonGrantExternalPrincipal = "external_principal"
+	PersonGrantExternalIDToken   = "external_id_token"
+)
+
 // PersonGrantRequest describes one token about to be minted for a person.
 type PersonGrantRequest struct {
-	// GrantType is the grant minting the token (authorization_code,
-	// refresh_token, the CIBA URN, jwt_bearer for ID-JAG, token_exchange for
-	// the trusted-broker and ID-token exchanges).
+	// GrantType names the grant minting the token: one of the PersonGrant*
+	// constants.
 	GrantType string
 	AccountID string
 	ProjectID string
@@ -159,7 +170,7 @@ func (s *CredentialService) decidePersonGrant(ctx context.Context, req *IssueReq
 	}
 
 	pr := PersonGrantRequest{
-		GrantType:       string(req.GrantType),
+		GrantType:       personGrantType(*req),
 		AccountID:       req.Identity.AccountID,
 		ProjectID:       req.Identity.ProjectID,
 		UserID:          principal.Sub,
@@ -196,6 +207,15 @@ func (s *CredentialService) decidePersonGrant(ctx context.Context, req *IssueReq
 	req.Scopes = d.scopes
 	req.personGrant = d
 	return nil
+}
+
+// personGrantType names req's grant for the resolver. The two exchanges share
+// the token_exchange grant type, so they name themselves.
+func personGrantType(req IssueRequest) string {
+	if req.PersonGrantType != "" {
+		return req.PersonGrantType
+	}
+	return string(req.GrantType)
 }
 
 // applyPersonCeiling returns requested ∩ ceiling, in request order, and

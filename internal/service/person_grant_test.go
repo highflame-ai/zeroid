@@ -93,9 +93,19 @@ func personGrantShapes() map[string]IssueRequest {
 		"refresh_token":      {Identity: tenant(), GrantType: domain.GrantTypeRefreshToken, SubjectOverride: "alice", ClientID: "cli", PrincipalIss: "https://zeroid.test"},
 		"ciba_root":          {Identity: tenant(), GrantType: domain.GrantTypeCIBA, SubjectOverride: "alice", ClientID: "ciba-client"},
 		"id_jag":             {Identity: tenant(), GrantType: domain.GrantTypeJWTBearer, SubjectOverride: "alice", ClientID: "agent", CustomClaims: map[string]any{"user_id_iss": "https://idp.test"}},
-		"id_token_exchange":  {Identity: tenant(), GrantType: domain.GrantTypeTokenExchange, SubjectOverride: "alice", ClientID: "rp", CustomClaims: map[string]any{"user_id_iss": "https://idp.test"}},
-		"broker_exchange":    {Identity: tenant(), GrantType: domain.GrantTypeTokenExchange, SubjectOverride: "alice", TrustedRole: "member", Audience: []string{"codeoid"}},
+		"id_token_exchange":  {Identity: tenant(), GrantType: domain.GrantTypeTokenExchange, SubjectOverride: "alice", ClientID: "rp", CustomClaims: map[string]any{"user_id_iss": "https://idp.test"}, PersonGrantType: PersonGrantExternalIDToken},
+		"broker_exchange":    {Identity: tenant(), GrantType: domain.GrantTypeTokenExchange, SubjectOverride: "alice", TrustedRole: "member", Audience: []string{"codeoid"}, PersonGrantType: PersonGrantExternalPrincipal},
 	}
+}
+
+// personGrantTypes is the GrantType the resolver sees for each shape.
+var personGrantTypes = map[string]string{
+	"authorization_code": "authorization_code",
+	"refresh_token":      "refresh_token",
+	"ciba_root":          "urn:openid:params:grant-type:ciba",
+	"id_jag":             "jwt_bearer",
+	"id_token_exchange":  "external_id_token",
+	"broker_exchange":    "external_principal",
 }
 
 // TestPersonGrant_SixGrants applies the ceiling to each person grant's
@@ -156,7 +166,7 @@ func TestPersonGrant_SixGrants(t *testing.T) {
 				err := svc.decidePersonGrant(context.Background(), &req)
 
 				require.Len(t, got, 1, "the resolver is called once per person mint")
-				assert.Equal(t, string(shape.GrantType), got[0].GrantType)
+				assert.Equal(t, personGrantTypes[grant], got[0].GrantType)
 				assert.Equal(t, "acct", got[0].AccountID)
 				assert.Equal(t, "alice", got[0].UserID)
 				assert.Equal(t, requested, got[0].RequestedScopes)
@@ -191,7 +201,7 @@ func TestPersonGrant_SixGrants(t *testing.T) {
 				require.Len(t, lines, len(tc.wantCounted), "one person_scope_ceiling_violation line per counted outcome")
 				for _, l := range lines {
 					assert.Equal(t, string(tc.mode), l["mode"])
-					assert.Equal(t, string(shape.GrantType), l["grant_type"])
+					assert.Equal(t, personGrantTypes[grant], l["grant_type"])
 					if tc.mode == PersonGrantModeShadow {
 						assert.Equal(t, "warn", l["level"], "shadow findings are warnings")
 					}

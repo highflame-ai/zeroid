@@ -252,6 +252,11 @@ type IssueRequest struct {
 	// role lookup. Set by no other grant.
 	TrustedRole string
 
+	// PersonGrantType names the grant to the person-grant resolver when the
+	// grant type alone does not: PersonGrantExternalPrincipal or
+	// PersonGrantExternalIDToken. Empty elsewhere.
+	PersonGrantType string
+
 	// personGrant is the person-grant decision already made for these scopes
 	// by a grant that had to decide before burning a single-use credential.
 	personGrant *personGrantDecision

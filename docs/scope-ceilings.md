@@ -133,6 +133,18 @@ requested scopes (after every other layer narrowed them, or their default)
 and, on the external-principal exchange only, the role the trusted service
 asserted. It returns a ceiling and the person's roles.
 
+`GrantType` is one of these constants. The two token exchanges share a grant
+type, so they are named by the value of their tokens' `token_exchange` claim.
+
+| Grant | Constant | Value |
+|---|---|---|
+| `authorization_code` | `PersonGrantAuthorizationCode` | `authorization_code` |
+| `refresh_token` | `PersonGrantRefreshToken` | `refresh_token` |
+| Root CIBA | `PersonGrantCIBA` | `urn:openid:params:grant-type:ciba` |
+| ID-JAG | `PersonGrantIDJAG` | `jwt_bearer` |
+| Trusted external-principal exchange | `PersonGrantExternalPrincipal` | `external_principal` |
+| ID-token exchange | `PersonGrantExternalIDToken` | `external_id_token` |
+
 **Modes.**
 
 | Mode | Scopes issued | A request the ceiling leaves empty | Resolver error |

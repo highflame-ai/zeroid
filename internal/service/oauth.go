@@ -1544,6 +1544,7 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		CustomClaims:       customClaims,
 		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
 		TrustedRole:        req.Role,
+		PersonGrantType:    PersonGrantExternalPrincipal,
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
