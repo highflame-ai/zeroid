@@ -1001,7 +1001,8 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET, POST | `/external-issuers` | List or add the account's trusted issuers ([contract](docs/external-issuers.md#admin-api)) |
 | GET, PATCH, DELETE | `/external-issuers/{id}` | Read, change or remove a trusted issuer |
 | POST | `/external-issuers/check` | Probe an issuer's JWKS |
-| GET, POST | `/external-issuers/{id}/bindings` | List or add credential bindings (optionally creating the agent's OAuth client) |
+| GET | `/external-issuers/bindings` | List the account's credential bindings across issuers (`?identity_id=`) |
+| GET, POST | `/external-issuers/{id}/bindings` | List (`?identity_id=`) or add credential bindings (optionally creating the agent's OAuth client) |
 | GET, PATCH, DELETE | `/external-issuers/{id}/bindings/{binding_id}` | Read, enable/disable or remove a binding |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |

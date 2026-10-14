@@ -905,3 +905,46 @@ func TestTrustedIssuers_NonMemberDoesNotBurnIDJAG(t *testing.T) {
 	requireRefused(t, p.redeem(t, jag, nil), "invalid_grant")
 	assert.True(t, strings.Contains(p.redeem(t, jag, nil).RawBody, "already been redeemed"))
 }
+
+// TestTrustedIssuers_BindingsByIdentity: one query answers "which bindings
+// does this agent have" across every issuer of the account.
+func TestTrustedIssuers_BindingsByIdentity(t *testing.T) {
+	f := newDBFederation(t)
+	a, b := newTITenant(t), newTITenant(t)
+	entra := f.entraRow(t, a, uid("bbi-tid"), nil)["id"].(string)
+	okta := f.oktaRow(t, a)["id"].(string)
+	agent, other := a.agent(t), a.agent(t)
+	for _, bind := range []struct{ row, key, id string }{
+		{entra, uid("app"), agent.id}, {okta, uid("0oa"), agent.id}, {entra, uid("app"), other.id},
+	} {
+		status, body := f.bind(t, a, bind.row, bind.key, bind.id, false)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+	}
+	identities := func(list map[string]any) []string {
+		var out []string
+		for _, it := range list["items"].([]any) {
+			out = append(out, it.(map[string]any)["identity_id"].(string))
+		}
+		return out
+	}
+
+	status, list := f.call(t, http.MethodGet, "/external-issuers/bindings?identity_id="+agent.id, nil, a.headers)
+	require.Equal(t, http.StatusOK, status, "%v", list)
+	assert.Equal(t, []string{agent.id, agent.id}, identities(list), "both issuers' bindings for the agent")
+
+	status, list = f.call(t, http.MethodGet, "/external-issuers/bindings", nil, a.headers)
+	require.Equal(t, http.StatusOK, status)
+	assert.Len(t, list["items"], 3, "no filter: every binding of the account")
+
+	status, list = f.call(t, http.MethodGet, "/external-issuers/"+entra+"/bindings?identity_id="+other.id, nil, a.headers)
+	require.Equal(t, http.StatusOK, status)
+	assert.Equal(t, []string{other.id}, identities(list), "per-issuer list takes the same filter")
+
+	status, list = f.call(t, http.MethodGet, "/external-issuers/bindings?identity_id="+agent.id, nil, b.headers)
+	require.Equal(t, http.StatusOK, status)
+	assert.Empty(t, list["items"], "another account sees none")
+
+	status, body := f.call(t, http.MethodGet, "/external-issuers/bindings?identity_id=not-a-uuid", nil, a.headers)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_identity_id", body["code"])
+}

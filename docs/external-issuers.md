@@ -189,7 +189,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
 | 400 | `invalid_jwks_uri` | Not an absolute https URL |
-| 400 | `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
@@ -305,7 +305,20 @@ The answer is a probe result, never an upstream body:
 `error` is `jwks_unreachable`, `jwks_empty` or `jwks_private_address`.
 Only an invalid URL is a 400.
 
+### `GET /external-issuers/bindings` → 200
+
+The account's bindings across all its issuers, in one query.
+`?identity_id=<uuid>` returns only that identity's, which is how to answer "which credentials map to this agent" without walking every issuer.
+
+```json
+{"items": [ <binding>, ... ]}
+```
+
+A malformed `identity_id` is 400 `invalid_identity_id`; on a `config` server the route answers `issuer_store_config`.
+
 ### `GET /external-issuers/{id}/bindings` → 200
+
+One issuer's bindings; takes the same `?identity_id=` filter.
 
 ```json
 {"items": [ <binding>, ... ]}

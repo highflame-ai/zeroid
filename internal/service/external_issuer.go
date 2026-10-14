@@ -691,12 +691,29 @@ func identityJWKS(identity *domain.Identity) (json.RawMessage, error) {
 	return json.Marshal(set)
 }
 
-// ListBindings returns an issuer's bindings.
-func (s *ExternalIssuerService) ListBindings(ctx context.Context, accountID, issuerID string) ([]*domain.IssuerBinding, error) {
+// ListBindings returns an issuer's bindings, or only identityID's when it
+// is non-empty.
+func (s *ExternalIssuerService) ListBindings(ctx context.Context, accountID, issuerID, identityID string) ([]*domain.IssuerBinding, error) {
+	if identityID != "" && !validUUID(identityID) {
+		return nil, issuerErr(http.StatusBadRequest, "invalid_identity_id", "identity_id must be a UUID")
+	}
 	if _, err := s.Get(ctx, accountID, issuerID); err != nil {
 		return nil, err
 	}
-	return s.repo.ListBindings(ctx, issuerID, accountID)
+	return s.repo.ListBindings(ctx, accountID, issuerID, identityID)
+}
+
+// ListAccountBindings returns the account's bindings under every issuer, or
+// only identityID's when it is non-empty: one query where a caller would
+// otherwise walk every issuer.
+func (s *ExternalIssuerService) ListAccountBindings(ctx context.Context, accountID, identityID string) ([]*domain.IssuerBinding, error) {
+	if err := s.requireDB(); err != nil {
+		return nil, err
+	}
+	if identityID != "" && !validUUID(identityID) {
+		return nil, issuerErr(http.StatusBadRequest, "invalid_identity_id", "identity_id must be a UUID")
+	}
+	return s.repo.ListBindings(ctx, accountID, "", identityID)
 }
 
 // GetBinding returns one binding.

@@ -170,14 +170,18 @@ func (r *ExternalIssuerRepository) GetBinding(ctx context.Context, id, issuerID,
 	return b, nil
 }
 
-// ListBindings returns an issuer row's bindings.
-func (r *ExternalIssuerRepository) ListBindings(ctx context.Context, issuerID, accountID string) ([]*domain.IssuerBinding, error) {
+// ListBindings returns an account's bindings, narrowed to one issuer row
+// and/or one identity when those are non-empty.
+func (r *ExternalIssuerRepository) ListBindings(ctx context.Context, accountID, issuerID, identityID string) ([]*domain.IssuerBinding, error) {
 	var out []*domain.IssuerBinding
-	err := dbOrTx(ctx, r.db).NewSelect().Model(&out).
-		Where("issuer_id = ?", issuerID).
-		Where("account_id = ?", accountID).
-		OrderExpr("created_at, id").
-		Scan(ctx)
+	q := dbOrTx(ctx, r.db).NewSelect().Model(&out).Where("account_id = ?", accountID)
+	if issuerID != "" {
+		q = q.Where("issuer_id = ?", issuerID)
+	}
+	if identityID != "" {
+		q = q.Where("identity_id = ?", identityID)
+	}
+	err := q.OrderExpr("created_at, id").Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list bindings: %w", err)
 	}

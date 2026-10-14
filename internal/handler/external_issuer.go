@@ -204,6 +204,15 @@ type bindingListOutput struct {
 	}
 }
 
+type bindingListInput struct {
+	ID         string `path:"id" doc:"Issuer row id"`
+	IdentityID string `query:"identity_id" doc:"Only this identity's bindings"`
+}
+
+type accountBindingListInput struct {
+	IdentityID string `query:"identity_id" doc:"Only this identity's bindings"`
+}
+
 type bindingIDInput struct {
 	ID        string `path:"id" doc:"Issuer row id"`
 	BindingID string `path:"binding_id" doc:"Binding id"`
@@ -228,6 +237,8 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 		Path: "/external-issuers/{id}", Summary: "Stop trusting an issuer", Tags: tags,
 		DefaultStatus: http.StatusNoContent}, a.deleteExternalIssuerOp)
 
+	huma.Register(api, huma.Operation{OperationID: "list-account-issuer-bindings", Method: http.MethodGet,
+		Path: "/external-issuers/bindings", Summary: "List the account's credential bindings across issuers", Tags: tags}, a.listAccountBindingsOp)
 	huma.Register(api, huma.Operation{OperationID: "list-issuer-bindings", Method: http.MethodGet,
 		Path: "/external-issuers/{id}/bindings", Summary: "List an issuer's credential bindings", Tags: tags}, a.listBindingsOp)
 	huma.Register(api, huma.Operation{OperationID: "create-issuer-binding", Method: http.MethodPost,
@@ -343,21 +354,37 @@ func (a *API) deleteExternalIssuerOp(ctx context.Context, input *externalIssuerI
 	return nil, nil
 }
 
-func (a *API) listBindingsOp(ctx context.Context, input *externalIssuerIDInput) (*bindingListOutput, error) {
+func (a *API) listBindingsOp(ctx context.Context, input *bindingListInput) (*bindingListOutput, error) {
 	account, _, err := issuerTenant(ctx)
 	if err != nil {
 		return nil, err
 	}
-	items, err := a.externalIssuerSvc.ListBindings(ctx, account, input.ID)
+	items, err := a.externalIssuerSvc.ListBindings(ctx, account, input.ID, input.IdentityID)
 	if err != nil {
 		return nil, issuerProblemFrom(err, "list bindings")
 	}
+	return bindingList(items), nil
+}
+
+func (a *API) listAccountBindingsOp(ctx context.Context, input *accountBindingListInput) (*bindingListOutput, error) {
+	account, _, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	items, err := a.externalIssuerSvc.ListAccountBindings(ctx, account, input.IdentityID)
+	if err != nil {
+		return nil, issuerProblemFrom(err, "list bindings")
+	}
+	return bindingList(items), nil
+}
+
+func bindingList(items []*domain.IssuerBinding) *bindingListOutput {
 	out := &bindingListOutput{}
 	out.Body.Items = make([]BindingView, 0, len(items))
 	for _, b := range items {
 		out.Body.Items = append(out.Body.Items, bindingView(b, nil))
 	}
-	return out, nil
+	return out
 }
 
 func (a *API) createBindingOp(ctx context.Context, input *struct {
