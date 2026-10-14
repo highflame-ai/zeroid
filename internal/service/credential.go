@@ -46,6 +46,9 @@ type CredentialService struct {
 	// claim shape of every token this service issues. Nil-safe: when unset,
 	// every tenant is on the legacy profile.
 	tenantSettings *TenantSettingsService
+	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
+	// consulted for every person root. Nil-safe: unset, nothing changes.
+	personGrant personGrantState
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -243,6 +246,20 @@ type IssueRequest struct {
 	// which counts in phase 1 and refuses in phase 2.
 	ScopeCeilingUnbounded bool
 	RequestBoundedRoot    bool
+
+	// TrustedRole is the role a trusted service asserted on the external
+	// principal exchange, handed to the person-grant resolver so it can skip a
+	// role lookup. Set by no other grant.
+	TrustedRole string
+
+	// PersonGrantType names the grant to the person-grant resolver when the
+	// grant type alone does not: PersonGrantExternalPrincipal or
+	// PersonGrantExternalIDToken. Empty elsewhere.
+	PersonGrantType string
+
+	// personGrant is the person-grant decision already made for these scopes
+	// by a grant that had to decide before burning a single-use credential.
+	personGrant *personGrantDecision
 }
 
 // actorChainClaim renders an actor chain as the nested RFC 8693 §4.1 `act`
@@ -317,7 +334,8 @@ func carriesActorAttributes(act map[string]any) bool {
 //     it asked for (api_key, NHI jwt_bearer).
 //   - A user-subject root bounded only by the caller's request (trusted
 //     broker, ID-token exchange, CIBA) whose governing policy sets neither
-//     allowed_scopes nor user_grant_scopes, and no Cedar decision exists yet.
+//     allowed_scopes nor user_grant_scopes, no person-grant ceiling was
+//     enforced, and no Cedar decision exists yet.
 //
 // Phase 2 refuses these with invalid_scope behind
 // workload_subject_requires_ceiling. Counting first, per identity, lets
@@ -331,7 +349,8 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 	case req.ScopeCeilingUnbounded && principal.Type == domain.PrincipalWorkload:
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
-		bounded := len(req.Identity.AllowedScopes) > 0
+		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
+		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
 		}
@@ -555,6 +574,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
 
+	// The principal is decided first: the person-grant ceiling applies only
+	// to a person root, and a policy can require a user subject
+	// (required_principal_type).
+	principal := s.resolvePrincipal(req)
+
+	// A person's own token is bounded by the deployer's ceiling for that
+	// person (ADR 0041 D15) before any other check sees its scopes.
+	if err := s.decidePersonGrant(ctx, &req); err != nil {
+		return nil, nil, err
+	}
+
 	// Some scopes are never issued to certain identity types, whatever their
 	// scope ceilings say (see scopeRefusedForIdentityType).
 	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
@@ -629,10 +659,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// that when the key inherits the identity policy verbatim (the common
 	// case: CredentialPolicyID == IdentityPolicyID), so the hot path pays
 	// for exactly one enforcement pass.
-	// The principal is decided before enforcement because a policy can require
-	// a user subject (required_principal_type).
-	principal := s.resolvePrincipal(req)
-
+	//
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
 	var identityPolicy *domain.CredentialPolicy
@@ -881,6 +908,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// CustomClaims, and the lineage a token is grafted onto must come from the
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
+
+	// RFC 9068 §2.2.3.1 `roles`: the person grant's roles, on a person root
+	// only. Removed from every other token, so nothing below a root and no
+	// caller-supplied claim can carry it.
+	_ = token.Remove("roles")
+	if isPersonRoot(req, principal) && req.personGrant != nil && len(req.personGrant.roles) > 0 {
+		_ = token.Set("roles", req.personGrant.roles)
+	}
 
 	if rfc8693 {
 		// The principal's type is a private claim (RFC 7519 §4.3): no standard

@@ -180,4 +180,9 @@ const (
 	// push-delivery auth_req_id, redeeming an already-redeemed code) where
 	// no other code applies.
 	AccessDenied = "access_denied"
+
+	// TransactionFailed is the CIBA Core §12 push-error code for an
+	// unexpected condition that prevented the server from completing the
+	// request.
+	TransactionFailed = "transaction_failed"
 )

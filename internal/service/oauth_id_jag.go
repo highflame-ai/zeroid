@@ -395,35 +395,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 	scopes, _ := extractMappedClaimStrings(rawClaims, scopeClaim)
 
-	// Single-use enforcement (ADR 0010 D2a) — CONSUMED LAST, only after every
-	// other check (D2b client auth + client_id binding, ID-JAG validation,
-	// identity mapping, resource, policy resolution) has passed and immediately
-	// before issuance. A request that fails an earlier check must NOT consume the
-	// jti, or an attacker could burn a victim's single-use grant by deliberately
-	// failing a later-but-not-last check. The store INSERT is the atomic
-	// check-and-mark: a replay surfaces as ErrIDJAGReplay.
-	if s.idJAGReplayStore == nil {
-		// Fail closed: ID-JAG is single-use and we cannot enforce that without a
-		// replay store. Never mint while replay protection is unavailable.
-		return nil, oauthServerError("ID-JAG replay store is not configured", nil)
-	}
-	jti, ok := verified.JwtID()
-	if !ok || jti == "" {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
-	}
-	// expires_at is the ID-JAG's own exp: past it the grant fails its exp check
-	// before the jti is consulted, so the row is no longer load-bearing and the
-	// cleanup worker may reap it. validateExternalAssertion already required exp
-	// to be present, so this lookup succeeds.
-	jtiExpiry, _ := verified.Expiration()
-	if err := s.idJAGReplayStore.Insert(ctx, jti, jtiExpiry); err != nil {
-		if errors.Is(err, postgres.ErrIDJAGReplay) {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
-		}
-		return nil, oauthServerError("failed to record ID-JAG single-use jti", err)
-	}
-
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+	issue := IssueRequest{
 		Identity:         identity,
 		IdentityPolicyID: identityPolicyID,
 		// Govern the synthetic-carrier path (no application_id → no identity row
@@ -456,7 +428,49 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		TTL:               900, // 15 minutes — short-lived, matching the external-IdP paths
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	})
+	}
+	// Single-use enforcement (ADR 0010 D2a) — CONSUMED LAST, only after every
+	// other check (D2b client auth + client_id binding, ID-JAG validation,
+	// identity mapping, resource, policy resolution) has passed and immediately
+	// before issuance. A request that fails an earlier check must NOT consume the
+	// jti, or an attacker could burn a victim's single-use grant by deliberately
+	// failing a later-but-not-last check. The store INSERT is the atomic
+	// check-and-mark: a replay surfaces as ErrIDJAGReplay.
+	if s.idJAGReplayStore == nil {
+		// Fail closed: ID-JAG is single-use and we cannot enforce that without a
+		// replay store. Never mint while replay protection is unavailable.
+		return nil, oauthServerError("ID-JAG replay store is not configured", nil)
+	}
+	jti, ok := verified.JwtID()
+	if !ok || jti == "" {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
+	}
+	// expires_at is the ID-JAG's own exp: past it the grant fails its exp check
+	// before the jti is consulted, so the row is no longer load-bearing and the
+	// cleanup worker may reap it. validateExternalAssertion already required exp
+	// to be present, so this lookup succeeds.
+	jtiExpiry, _ := verified.Expiration()
+	// The person's ceiling can refuse too, so it is decided before the burn
+	// and reused at the mint. A replay is refused first, so it never reaches
+	// the deployer's resolver; Insert below is still the single-use gate.
+	redeemed, err := s.idJAGReplayStore.Redeemed(ctx, jti)
+	if err != nil {
+		return nil, oauthServerError("failed to check ID-JAG single-use jti", err)
+	}
+	if redeemed {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+	}
+	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
+	}
+	if err := s.idJAGReplayStore.Insert(ctx, jti, jtiExpiry); err != nil {
+		if errors.Is(err, postgres.ErrIDJAGReplay) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+		}
+		return nil, oauthServerError("failed to record ID-JAG single-use jti", err)
+	}
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}

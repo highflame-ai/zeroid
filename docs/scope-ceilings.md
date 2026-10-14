@@ -69,6 +69,7 @@ Layers, each optional; an empty layer places no restriction:
 | The OAuth client's registered scopes | `client_credentials` and `authorization_code` |
 | The subject token's scopes | token exchange: a child never exceeds its parent |
 | The person's grant (resolver, IdP, consent) | tokens minted for a person |
+| The person's ceiling (`PersonGrantResolver`, below) | a person's own token, when the deployer installs one |
 
 Rules:
 
@@ -105,8 +106,96 @@ Rules:
 | API key with its own policy | The key's policy must be a subset of the identity's policy; the identity ceiling then applies on top |
 | `client_credentials`, `jwt_bearer`, `api_key` | Scopes = request ∩ client or key scopes ∩ key policy ∩ identity policy ∩ identity ceiling; an omitted request gets the narrowest layer; nothing left is refused |
 | Token exchange (agent to sub-agent) | Scopes = request ∩ the subject token's scopes ∩ the actor's policy ∩ the actor's ceiling; every hop narrows; a denial names the layer that excluded each scope. When the chain acts for a person, the actor's policy term is its `user_grant_scopes`; the actor's ceiling still binds |
-| `authorization_code`, refresh, ID-JAG, ID-token exchange, broker exchange, CIBA | Scopes come from the person's grant and the client; when an identity is linked, a requested scope outside its ceiling or policy is refused at issuance rather than narrowed |
+| `authorization_code`, refresh, ID-JAG, ID-token exchange, broker exchange, CIBA | Scopes come from the person's grant and the client; when an identity is linked, a requested scope outside its ceiling or policy is refused at issuance rather than narrowed. With a person-grant resolver in enforce mode they are also narrowed to the person's ceiling |
+| A person's role is reduced | The next refresh is narrowed to the new ceiling, or refused with `invalid_grant` without consuming the refresh token; restoring the role restores the family's scopes |
 | CIBA step-up into a requesting chain (`requesting_token`) | Scopes = the requesting token's scopes: `openid` or no scope keeps them, other named scopes narrow to those, and a named scope the chain does not hold is refused. The requesting identity's ceiling and policy are re-checked against the current layers (its `user_grant_scopes` when the chain acts for a person), and a scope now outside them is refused. A requesting token with no identity is bounded by the polling client's bound identity instead |
 | Refresh after a ceiling or policy changed | The refreshed token is re-checked against the current layers; a scope now outside them fails the refresh |
 | Ceiling or policy changed with tokens outstanding | Issued tokens keep their scopes until they expire; new grants and new delegations use the current layers |
 | No layer restricts | An omitted request mints a token without a `scopes` claim, as before |
+
+## A person's ceiling
+
+ZeroID does not know a deployer's roles, so it cannot decide which scopes a
+person may hold. A deployer that can supplies a `PersonGrantResolver` with
+`Server.SetPersonGrantResolver(fn, mode)`. Highflame's deployment uses it to
+apply each role's scopes (ADR 0041 D15).
+
+**Which tokens.** Every grant that mints for a person consults it:
+`authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG, ID-token
+exchange and the trusted external-principal exchange. These are the tokens
+whose `principal_type` ZeroID derives as `user` itself. Token exchange and a
+CIBA step-up into an existing chain carry that chain's principal; they are
+bounded by the chain (RFC 8693) and never consult the resolver.
+
+**What it returns.** For each mint the resolver gets the grant type, tenant,
+person (`sub` and the issuer that vouched for them), client, audience, the
+requested scopes (after every other layer narrowed them, or their default)
+and, on the external-principal exchange only, the role the trusted service
+asserted. It returns a ceiling and the person's roles.
+
+The resolver runs on the token request's path, under its context. It must
+honour the context's deadline and cancellation, and should cache role
+lookups: a slow resolver slows every person mint, and in enforce mode one
+that fails or times out refuses them.
+
+`GrantType` is one of these constants. The two token exchanges share a grant
+type, so they are named by the value of their tokens' `token_exchange` claim.
+
+| Grant | Constant | Value |
+|---|---|---|
+| `authorization_code` | `PersonGrantAuthorizationCode` | `authorization_code` |
+| `refresh_token` | `PersonGrantRefreshToken` | `refresh_token` |
+| Root CIBA | `PersonGrantCIBA` | `urn:openid:params:grant-type:ciba` |
+| ID-JAG | `PersonGrantIDJAG` | `jwt_bearer` |
+| Trusted external-principal exchange | `PersonGrantExternalPrincipal` | `external_principal` |
+| ID-token exchange | `PersonGrantExternalIDToken` | `external_id_token` |
+
+**Modes.**
+
+| Mode | Scopes issued | A request the ceiling leaves empty | Resolver error |
+|---|---|---|---|
+| `off` (default) | unchanged; the resolver is not called | issued | — |
+| `shadow` | unchanged | issued | issued |
+| `enforce` | request ∩ ceiling | refused | refused (`server_error`) |
+
+`SetPersonGrantResolver` rejects a nil resolver with shadow or enforce, and
+an empty or unknown mode, leaving the hook as it was; only an explicit `off`
+removes it, so a wiring mistake cannot turn the ceiling off unnoticed.
+
+In shadow and enforce, a narrowing, a refusal and a resolver error are
+counted in `zeroid_person_scope_ceiling_total` (by mode and outcome) and
+logged as `person_scope_ceiling_violation`. The metric counts decisions, not
+tokens: in enforce mode an `authorization_code` is decided at
+`/oauth2/authorize` and again at the token endpoint, and a refused request
+that is retried is decided again. Shadow lets a deployer see who
+enforcement would affect before turning it on.
+
+**Rules.**
+
+- An empty ceiling grants nothing. This differs from `Principal.Scopes` and
+  the other layers, where empty means no restriction: a person with no role
+  holds no scopes.
+- `openid` asks for authentication, not authority, so the ceiling never
+  removes it, and a request for `openid` alone is never refused.
+- Refusals, by where they happen:
+
+  | Grant | The ceiling leaves nothing | The resolver fails (enforce) |
+  |---|---|---|
+  | `/oauth2/authorize` (enforce only) | `invalid_scope` (RFC 6749 §4.1.2.1) | `server_error` |
+  | `authorization_code`, `refresh_token` at the token endpoint | `invalid_grant`: the grant's authority changed after consent, so the client should re-authorize | `server_error` |
+  | Root CIBA, ID-JAG, ID-token exchange, external-principal exchange | `invalid_scope` (RFC 6749 §5.2) | `server_error` |
+
+  Every grant decides before consuming its single-use credential (the code,
+  the refresh token, the approved `auth_req_id`, the ID-JAG `jti`), so a
+  refused request can be retried once the role is restored. A CIBA push-mode
+  client cannot poll, so it is sent the refusal at its notification endpoint
+  as a CIBA Core §12 error: `access_denied`, or `transaction_failed` when the
+  resolver fails (§12 defines no other codes).
+- A refresh family keeps the scopes the person consented to. Each refresh
+  applies the current ceiling, so a role change takes effect at the next
+  refresh. Outstanding access tokens keep their scopes until they expire.
+- An enforced ceiling bounds a person's root for the ceiling rule, so such a
+  root is no longer counted in `zeroid_workload_unbounded_scope_total`.
+- The resolver's roles are stamped as the RFC 9068 §2.2.3.1 `roles` claim on
+  the person's own token, in shadow and enforce. Tokens delegated from it do
+  not inherit them, and no caller can set `roles`.

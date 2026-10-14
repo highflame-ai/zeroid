@@ -12,6 +12,10 @@ import (
 
 // ClaimsEnricher is called during JWT issuance to add custom claims.
 // The claims map already contains standard ZeroID claims; the enricher may add or override entries.
+//
+// Deprecated: issuance has never invoked registered enrichers; Server.OnClaimsIssue
+// stores them and nothing reads them. A person's roles and scope ceiling are
+// supplied through Server.SetPersonGrantResolver.
 type ClaimsEnricher func(claims map[string]any, identity *domain.Identity, grantType domain.GrantType)
 
 // GrantHandler implements a custom OAuth2 grant type.
@@ -121,6 +125,54 @@ var ErrNoResolversRegistered = service.ErrNoResolversRegistered
 // See internal/service/oauth.go (APIKeyResolution definition) for the
 // canonical doc comment + field-level semantics.
 type APIKeyResolution = service.APIKeyResolution
+
+// PersonGrantRequest describes one token about to be minted for a person:
+// by authorization_code, refresh_token, a root CIBA grant, ID-JAG, ID-token
+// exchange or the trusted external-principal exchange. Token exchange and a
+// CIBA step-up into an existing chain are not person mints and never reach
+// the resolver.
+//
+// See internal/service/person_grant.go for the field docs.
+type PersonGrantRequest = service.PersonGrantRequest
+
+// PersonGrantRequest.GrantType values. Compare against these rather than raw
+// strings.
+const (
+	PersonGrantAuthorizationCode = service.PersonGrantAuthorizationCode
+	PersonGrantRefreshToken      = service.PersonGrantRefreshToken
+	PersonGrantCIBA              = service.PersonGrantCIBA
+	PersonGrantIDJAG             = service.PersonGrantIDJAG
+	PersonGrantExternalPrincipal = service.PersonGrantExternalPrincipal
+	PersonGrantExternalIDToken   = service.PersonGrantExternalIDToken
+)
+
+// PersonGrant is a PersonGrantResolver's answer: the person's scope ceiling
+// and the roles stamped as the RFC 9068 §2.2.3.1 `roles` claim. An empty
+// Scopes grants nothing.
+type PersonGrant = service.PersonGrant
+
+// PersonGrantResolver supplies a person's scope ceiling and roles, so ZeroID
+// can bound a person's tokens by a role model it does not know. Install with
+// Server.SetPersonGrantResolver. The issued scope is the request (or its
+// default) ∩ Scopes; a request that leaves nothing is refused. Returning an
+// error, or panicking, fails the grant closed in enforce mode. See
+// docs/scope-ceilings.md, "A person's ceiling".
+type PersonGrantResolver = service.PersonGrantResolver
+
+// PersonGrantMode is off, shadow (resolve and count, never narrow or refuse)
+// or enforce.
+type PersonGrantMode = service.PersonGrantMode
+
+const (
+	PersonGrantModeOff     = service.PersonGrantModeOff
+	PersonGrantModeShadow  = service.PersonGrantModeShadow
+	PersonGrantModeEnforce = service.PersonGrantModeEnforce
+)
+
+// ErrPersonScopeDenied is the cause when a person's ceiling leaves none of the
+// requested scopes. The token endpoint answers invalid_scope (invalid_grant on
+// authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
+var ErrPersonScopeDenied = service.ErrPersonScopeDenied
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before
