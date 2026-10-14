@@ -77,7 +77,9 @@ type AuthorizeRequest = service.AuthorizeRequest
 // PrincipalResolver authenticates the caller at /oauth2/authorize.
 // Registered via Server.RegisterPrincipalResolver and tried in
 // registration order; the first resolver to return a non-nil Principal
-// wins. Return ErrPrincipalNotApplicable to defer to the next resolver;
+// wins. Return ErrPrincipalNotApplicable to defer to the next resolver,
+// ErrPrincipalInteractionRequired to start a login, or
+// ErrPrincipalAccessDenied to report that the resource owner declined;
 // any other error fails the request with 401 invalid_client.
 //
 // See internal/service/principal.go for the canonical doc comment.
@@ -100,6 +102,18 @@ var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 // SetInteractiveLoginURL for the contract, including that it only applies on GET
 // and degrades to access_denied when no target is configured.
 var ErrPrincipalInteractionRequired = service.ErrPrincipalInteractionRequired
+
+// ErrPrincipalAccessDenied is the sentinel a PrincipalResolver returns after
+// authenticating a request whose resource owner declined it (a "Deny" on a
+// consent screen). zeroid stops the chain and redirects to the client's
+// validated redirect_uri with error=access_denied, state and iss, per RFC 6749
+// §4.1.2.1 — on POST as well as GET, so a login/consent front end that posts
+// the outcome server-to-server receives a Location it can hand to the browser.
+// Wrapping is allowed (errors.Is).
+//
+// See internal/service/principal.go for the canonical doc comment, including
+// when zeroid answers with JSON instead.
+var ErrPrincipalAccessDenied = service.ErrPrincipalAccessDenied
 
 // ErrNoResolversRegistered is the sentinel surfaced by zeroid when
 // /oauth2/authorize is reached but no PrincipalResolver has been
