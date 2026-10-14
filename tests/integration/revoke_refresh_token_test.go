@@ -151,6 +151,77 @@ CREATE TRIGGER %[1]s BEFORE UPDATE ON refresh_tokens
 	assert.Equal(t, http.StatusOK, status, "precondition of the assertion above: the token was in fact still live")
 }
 
+// failAccessTokenRevocation installs a trigger that makes revoking the access
+// token with the given jti fail, and returns a function that removes it (also
+// run at cleanup).
+func failAccessTokenRevocation(t *testing.T, jti string) func() {
+	t.Helper()
+	ctx := context.Background()
+	fn := "zeroid_test_fail_at_revoke_" + strings.ReplaceAll(uid(""), "-", "_")
+	_, err := testDB.ExecContext(ctx, fmt.Sprintf(`
+CREATE FUNCTION %[1]s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.jti = '%[2]s' AND NEW.is_revoked THEN
+		RAISE EXCEPTION 'forced failure for %[2]s';
+	END IF;
+	RETURN NEW;
+END $$;
+CREATE TRIGGER %[1]s BEFORE UPDATE ON issued_credentials
+	FOR EACH ROW EXECUTE FUNCTION %[1]s();`, fn, jti))
+	require.NoError(t, err)
+	dropped := false
+	drop := func() {
+		if !dropped {
+			dropped = true
+			_, err := testDB.ExecContext(ctx, fmt.Sprintf(
+				"DROP TRIGGER IF EXISTS %[1]s ON issued_credentials; DROP FUNCTION IF EXISTS %[1]s();", fn))
+			require.NoError(t, err)
+		}
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// Revoking a refresh token is two writes: the family's refresh tokens, then
+// the access tokens issued from the family. When the second fails, the
+// endpoint must not answer 200 — the client would drop an access token that is
+// still live. A retry with the same (now revoked) refresh token finishes the
+// job.
+func TestRevokeRefreshToken_AccessTokenCascadeFailureIsNotReportedAsSuccess(t *testing.T) {
+	at, rt := exchangeMCPCode(t, uid("user-revoke-rt-cascade-fail"))
+	drop := failAccessTokenRevocation(t, decodeJWTPayload(t, at)["jti"].(string))
+
+	status, body := revokeStatus(t, map[string]any{"token": rt, "client_id": testMCPClientID})
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.Equal(t, "server_error", body["error"])
+	assert.NotEqual(t, true, body["revoked"])
+
+	drop()
+	require.True(t, introspect(t, at)["active"].(bool),
+		"precondition of the assertion above: the access token was in fact still live")
+
+	status, body = revokeStatus(t, map[string]any{"token": rt, "client_id": testMCPClientID})
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.False(t, introspect(t, at)["active"].(bool), "the retry revokes the family's access token")
+	status, _ = refreshMCP(t, rt)
+	assert.Equal(t, http.StatusBadRequest, status)
+}
+
+// The same holds for an access token presented directly.
+func TestRevokeAccessToken_ServerFailureIsNotReportedAsSuccess(t *testing.T) {
+	at, _ := exchangeMCPCode(t, uid("user-revoke-at-fail"))
+	drop := failAccessTokenRevocation(t, decodeJWTPayload(t, at)["jti"].(string))
+
+	status, body := revokeStatus(t, map[string]any{"token": at, "client_id": testMCPClientID})
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.Equal(t, "server_error", body["error"])
+	assert.NotEqual(t, true, body["revoked"])
+
+	drop()
+	assert.True(t, introspect(t, at)["active"].(bool),
+		"precondition of the assertion above: the access token was in fact still live")
+}
+
 // A wrong hint does not stop the search (RFC 7009 §2.1): an access token
 // presented with token_type_hint=refresh_token is still revoked.
 func TestRevokeAccessTokenWithRefreshHint(t *testing.T) {
