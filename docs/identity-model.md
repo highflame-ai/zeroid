@@ -50,15 +50,15 @@ POST /oauth2/token
   account_id           = <tenant>
   project_id           = <tenant>
   scope                = <optional>
-  + private_key_jwt client authentication as the ID token's relying party
+  + client authentication as the ID token's relying party
 ```
 
 `application_id` is optional. When present it must resolve to an active
 identity in the caller's tenant — same IDOR guard the broker path uses.
 
 The redeeming client must be the ID token's relying party (its `client_id` in
-`aud`, and equal to `azp` when present) and must authenticate with
-`private_key_jwt`; a client secret is refused (ADR 0042 D3a). The subject
+`aud`, and equal to `azp` when present) and authenticates with its registered
+method (with issuer rows, `private_key_jwt` only, ADR 0042 D3a). The subject
 token must be positively an ID token: `iss`, `sub`, `aud`, `exp` and `iat`
 present, and no `scp`, `scope` or `typ` of `at+jwt`. Workload subjects (Entra
 `idtyp=app`, Kubernetes service accounts, SPIFFE IDs) are refused, and an entry

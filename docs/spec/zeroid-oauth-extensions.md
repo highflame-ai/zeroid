@@ -614,8 +614,10 @@ upstream ID token. The mode:
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
   here — the JWKS signature check, issuer allowlist, audience binding and
   client binding below *are* the trust anchor.
-- **MUST** authenticate the redeeming client with `private_key_jwt` (absent
-  client credentials, or a client secret → `invalid_client`; ADR 0042 D3a), and
+- **MUST** authenticate the redeeming client (absent client credentials →
+  `invalid_client`) with its registered method; with per-account issuer rows
+  only `private_key_jwt` is accepted and a client secret is `invalid_client`
+  (ADR 0042 D3a); static issuers (standalone) keep secrets. And
   **MUST** redeem only for the relying party the ID token was issued to (OpenID
   Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
   token's `aud` values, `azp`, if present, must equal it, and a token with

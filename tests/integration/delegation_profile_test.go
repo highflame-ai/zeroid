@@ -1198,9 +1198,14 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, status)
 		assert.Equal(t, "invalid_client", body["error"])
 	})
-	t.Run("a relying party authenticating with a secret is refused (ADR 0042 D3a)", func(t *testing.T) {
+	t.Run("a static issuer keeps the client's registered method, secrets included", func(t *testing.T) {
+		// ADR 0042 D3a's secret-free rule is for issuer rows; standalone
+		// ZeroID on static config keeps main's client authentication.
 		secretRP := registerOAuthClient(t, uid("d13-secret-rp"), nil)
-		status, body := redeem(idToken(map[string]any{"aud": secretRP.ClientID}), &secretRP)
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, secretRP.ClientID}, "azp": secretRP.ClientID}), &secretRP)
+		assert.Equal(t, http.StatusOK, status, "body=%v", body)
+		status, body = redeem(idToken(map[string]any{"aud": []string{aud, secretRP.ClientID}, "azp": secretRP.ClientID}),
+			&oauthClientResp{ClientID: secretRP.ClientID, ClientSecret: "wrong"})
 		assert.Equal(t, http.StatusUnauthorized, status)
 		assert.Equal(t, "invalid_client", body["error"])
 	})

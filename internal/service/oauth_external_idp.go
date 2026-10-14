@@ -152,11 +152,6 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 	cfg := entry.Config
 
-	if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
-		return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
-			"a client secret is not accepted", nil)
-	}
-
 	var (
 		identity         *domain.Identity
 		bindingAudiences []string
