@@ -170,8 +170,7 @@ func TestExternalIssuerCheck(t *testing.T) {
 	})
 	t.Run("discovery does not follow redirects", func(t *testing.T) {
 		target := issuerServer(t, "", http.StatusOK, testJWKS(t, "k1"))
-		var redirector *httptest.Server
-		redirector = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, target.URL+r.URL.Path, http.StatusFound)
 		}))
 		defer redirector.Close()
