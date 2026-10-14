@@ -12,6 +12,9 @@ on:
       - ".dockerignore"
       - ".github/**"
 
+env:
+  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+
 jobs:
   highflame-semantic-release:
     permissions:
