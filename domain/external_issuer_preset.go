@@ -52,8 +52,13 @@ func applyEntraPreset(e *ExternalIssuer) error {
 	if len(e.Algorithms) == 0 {
 		e.Algorithms = []string{"RS256"}
 	}
-	// oid, not sub: Entra's sub is pairwise per application.
-	fillMapping(e, map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"})
+	// oid, not sub: Entra's sub is pairwise per application. The identity
+	// claims are pinned: a user-settable claim there would let an IdP user
+	// take over another person's link (nOAuth).
+	if err := pinMapping(e, map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov"}); err != nil {
+		return err
+	}
+	fillMapping(e, map[string]string{"name": "name"})
 	if e.ClaimConstraints == nil {
 		e.ClaimConstraints = map[string][]string{}
 	}
@@ -77,7 +82,30 @@ func applyOktaPreset(e *ExternalIssuer) error {
 	if len(e.Algorithms) == 0 {
 		e.Algorithms = []string{"RS256"}
 	}
-	fillMapping(e, map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified", "name": "name"})
+	if err := pinMapping(e, map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified"}); err != nil {
+		return err
+	}
+	fillMapping(e, map[string]string{"name": "name"})
+	return nil
+}
+
+// IdentityMappingKeys decide who a token's person is: the user key, and the
+// email and its verification that first-sight linking trusts. They are
+// fixed at create (ADR 0042 D5a).
+var IdentityMappingKeys = []string{"user_id", "email", "email_verified"}
+
+// pinMapping sets keys a preset fixes, refusing a request that names
+// another claim for one of them.
+func pinMapping(e *ExternalIssuer, pinned map[string]string) error {
+	if e.ClaimMapping == nil {
+		e.ClaimMapping = map[string]string{}
+	}
+	for k, v := range pinned {
+		if got, set := e.ClaimMapping[k]; set && got != v {
+			return issuerInvalid("invalid_claim_mapping", "this preset fixes claim_mapping.%s to %q", k, v)
+		}
+		e.ClaimMapping[k] = v
+	}
 	return nil
 }
 

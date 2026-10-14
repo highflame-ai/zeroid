@@ -183,13 +183,22 @@ func TestApplyIssuerPreset(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	t.Run("entra keeps a caller's mapping", func(t *testing.T) {
-		e := &ExternalIssuer{Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0", ClaimMapping: map[string]string{"user_id": "sub"}}
-		if err := ApplyIssuerPreset(e, IssuerPresetEntra); err != nil {
-			t.Fatal(err)
+	t.Run("entra pins the identity claims (nOAuth)", func(t *testing.T) {
+		for _, m := range []map[string]string{{"user_id": "preferred_username"}, {"email": "upn"}, {"email_verified": "email_verified"}} {
+			e := &ExternalIssuer{Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0", ClaimMapping: m}
+			if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetEntra)); got != "invalid_claim_mapping" {
+				t.Fatalf("%v: code = %q", m, got)
+			}
 		}
-		if e.ClaimMapping["user_id"] != "sub" {
-			t.Fatal("a preset never overrides a value the request set")
+		e := &ExternalIssuer{Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0", ClaimMapping: map[string]string{"user_id": "oid", "name": "given_name"}}
+		if err := ApplyIssuerPreset(e, IssuerPresetEntra); err != nil || e.ClaimMapping["name"] != "given_name" {
+			t.Fatalf("the pinned value itself and other keys are accepted: %v %v", err, e.ClaimMapping)
+		}
+	})
+	t.Run("okta pins the identity claims", func(t *testing.T) {
+		e := &ExternalIssuer{Issuer: "https://acme.okta.com", ClaimMapping: map[string]string{"user_id": "email"}}
+		if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetOkta)); got != "invalid_claim_mapping" {
+			t.Fatalf("code = %q", got)
 		}
 	})
 	for _, iss := range []string{

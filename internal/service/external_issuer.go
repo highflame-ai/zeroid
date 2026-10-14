@@ -372,6 +372,17 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 	if err != nil {
 		return nil, nil, notFoundOr(err, errIssuerNotFound)
 	}
+	// The claims that say who a person is never change after create:
+	// remapping the user key, or the email linking trusts, to a claim an IdP
+	// user can set would let them take over existing links (nOAuth).
+	if p.ClaimMapping != nil {
+		for _, k := range domain.IdentityMappingKeys {
+			if (*p.ClaimMapping)[k] != current.ClaimMapping[k] {
+				return nil, nil, issuerErr(http.StatusUnprocessableEntity, "claim_mapping_immutable",
+					"claim_mapping.user_id, email and email_verified are fixed when the issuer is created; delete and re-create it to change them")
+			}
+		}
+	}
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
 		if err := s.repo.LockIssuer(ctx, domain.CanonicalIssuer(current.Issuer)); err != nil {
 			return err

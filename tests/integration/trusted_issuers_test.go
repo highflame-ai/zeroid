@@ -416,6 +416,19 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		assert.Equal(t, false, body["reachable"])
 		assert.Equal(t, "discovery_unreachable", body["error"])
 	})
+	t.Run("the identity claims are fixed after create (nOAuth)", func(t *testing.T) {
+		for _, k := range []string{"user_id", "email", "email_verified"} {
+			m := map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"}
+			m[k] = "preferred_username"
+			status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{"claim_mapping": m}, a.headers)
+			assert.Equal(t, http.StatusUnprocessableEntity, status, "%s: %v", k, body)
+			assert.Equal(t, "claim_mapping_immutable", body["code"])
+		}
+		status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{"claim_mapping": map[string]string{
+			"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "given_name"}}, a.headers)
+		require.Equal(t, http.StatusOK, status, "other keys stay editable: %v", body)
+		assert.Equal(t, "given_name", body["claim_mapping"].(map[string]any)["name"])
+	})
 	t.Run("patch changes mutable fields only", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{
 			"display_name": "renamed", "audiences": []string{app1, app2},

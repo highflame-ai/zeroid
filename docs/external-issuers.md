@@ -69,7 +69,7 @@ A person row also refuses an issuer that only issues workload tokens (GitHub Act
 
 ### Presets
 
-`preset` fills only the fields the request leaves unset.
+`preset` fills only the fields the request leaves unset, except the identity claims, which it pins: a request naming another claim for `user_id`, `email` or `email_verified` is refused (`invalid_claim_mapping`).
 
 | Preset | Issuer | Fills |
 |---|---|---|
@@ -229,6 +229,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
 | 422 | `jwks_private_address` | The JWKS host resolves to a private or reserved address |
 | 422 | `shared_issuer_requires_constraints` | A shared issuer without `claim_constraints` |
+| 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
 | 422 | `identity_not_found` | `identity_id` names no identity in this account |
 | 422 | `identity_has_no_public_key` | `oauth_client` was requested but the identity has no EC P-256 key |
 | 500 | `internal_error` | Anything else |
@@ -309,6 +310,8 @@ The issuer, without `jwks_check`.
 
 Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `enabled`; absent fields are unchanged.
 `issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
+Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
+A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
 The whole row is re-validated, and constraint changes on a shared issuer are re-checked for uniqueness.
 
 ### `POST /external-issuers/{id}/refresh` → 200
