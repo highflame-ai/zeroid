@@ -80,54 +80,89 @@ func testJWKS(t *testing.T, kid string) string {
 	return string(raw)
 }
 
+// issuerServer serves a discovery document at /.well-known/openid-configuration
+// naming docIssuer (the server's own URL when empty) and keys at /keys.
+func issuerServer(t *testing.T, docIssuer string, keysStatus int, keysBody string) *httptest.Server {
+	t.Helper()
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			iss := docIssuer
+			if iss == "" {
+				iss = srv.URL
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"issuer": iss, "jwks_uri": srv.URL + "/keys"})
+		case "/keys":
+			w.WriteHeader(keysStatus)
+			_, _ = w.Write([]byte(keysBody))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 func TestExternalIssuerCheck(t *testing.T) {
 	svc := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{
 		Store: IssuerStoreDB, AllowPrivateEndpoints: true, HTTPClient: http.DefaultClient,
 	})
 	ctx := context.Background()
 
-	t.Run("reachable", func(t *testing.T) {
-		srv := jwksServer(t, http.StatusOK, testJWKS(t, "k1"))
+	t.Run("discovery, then keys", func(t *testing.T) {
+		srv := issuerServer(t, "", http.StatusOK, testJWKS(t, "k1"))
 		got, err := svc.Check(ctx, srv.URL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !got.Reachable || got.KeyCount != 1 || len(got.KIDs) != 1 || got.KIDs[0] != "k1" || got.Error != "" {
+		if !got.Reachable || got.KeyCount != 1 || got.KIDs[0] != "k1" || got.Error != "" || got.JWKSURI != srv.URL+"/keys" {
 			t.Fatalf("check = %+v", got)
 		}
 	})
-	t.Run("upstream error body is not echoed", func(t *testing.T) {
-		srv := jwksServer(t, http.StatusInternalServerError, "secret internal detail")
-		got, err := svc.Check(ctx, srv.URL)
-		if err != nil {
-			t.Fatal(err)
+	t.Run("a discovery document naming another issuer is refused", func(t *testing.T) {
+		srv := issuerServer(t, "https://victim.example", http.StatusOK, testJWKS(t, "k1"))
+		got, _ := svc.Check(ctx, srv.URL)
+		if got.Error != "discovery_issuer_mismatch" || got.Reachable {
+			t.Fatalf("check = %+v", got)
 		}
+	})
+	t.Run("no discovery document", func(t *testing.T) {
+		srv := issuerServer(t, "", http.StatusOK, "")
+		got, _ := svc.Check(ctx, srv.URL+"/nothing-here")
+		if got.Error != "discovery_unreachable" {
+			t.Fatalf("check = %+v", got)
+		}
+	})
+	t.Run("upstream key error body is not echoed", func(t *testing.T) {
+		srv := issuerServer(t, "", http.StatusInternalServerError, "secret internal detail")
+		got, _ := svc.Check(ctx, srv.URL)
 		raw, _ := json.Marshal(got)
 		if got.Reachable || got.Error != "jwks_unreachable" || strings.Contains(string(raw), "secret") {
 			t.Fatalf("check = %s", raw)
 		}
 	})
-	t.Run("empty", func(t *testing.T) {
-		srv := jwksServer(t, http.StatusOK, `{"keys":[]}`)
+	t.Run("empty keys", func(t *testing.T) {
+		srv := issuerServer(t, "", http.StatusOK, `{"keys":[]}`)
 		got, _ := svc.Check(ctx, srv.URL)
 		if got.Error != "jwks_empty" {
 			t.Fatalf("check = %+v", got)
 		}
 	})
-	t.Run("invalid url is an error", func(t *testing.T) {
+	t.Run("an invalid issuer is an error", func(t *testing.T) {
 		_, err := svc.Check(ctx, "ftp://x")
 		var apiErr *IssuerAPIError
-		if !errors.As(err, &apiErr) || apiErr.Code != "invalid_jwks_uri" || apiErr.Status != http.StatusBadRequest {
+		if !errors.As(err, &apiErr) || apiErr.Code != "invalid_issuer" || apiErr.Status != http.StatusBadRequest {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("the default client refuses a private address", func(t *testing.T) {
 		guarded := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{Store: IssuerStoreDB})
-		got, err := guarded.Check(ctx, "https://127.0.0.1:1/keys")
+		got, err := guarded.Check(ctx, "https://127.0.0.1:1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Error != "jwks_private_address" {
+		if got.Error != "discovery_private_address" {
 			t.Fatalf("check = %+v", got)
 		}
 	})

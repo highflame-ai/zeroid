@@ -142,7 +142,7 @@ func (r *ExternalIssuerRepository) List(ctx context.Context, accountID string) (
 // retires its cached JWKS client.
 func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.ExternalIssuer) error {
 	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(row).
-		Column("display_name", "jwks_uri", "audiences", "algorithms", "claim_mapping", "propagate_claims",
+		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",
 			"claim_constraints", "constraints_key", "max_token_age_seconds", "jwks_cache_ttl_seconds",
 			"enabled", "updated_by").
 		Set("updated_at = clock_timestamp()").
@@ -155,6 +155,24 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("failed to update issuer: %w", sql.ErrNoRows)
+	}
+	return nil
+}
+
+// SetJWKSURI moves a row to a re-discovered key set.
+func (r *ExternalIssuerRepository) SetJWKSURI(ctx context.Context, row *domain.ExternalIssuer) error {
+	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(row).
+		Column("jwks_uri", "updated_by").
+		Set("updated_at = clock_timestamp()").
+		Where("id = ?", row.ID).
+		Where("account_id = ?", row.AccountID).
+		Returning("*").
+		Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to update issuer keys: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("failed to update issuer keys: %w", sql.ErrNoRows)
 	}
 	return nil
 }

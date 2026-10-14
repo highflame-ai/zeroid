@@ -110,6 +110,16 @@ type IssuerValidation struct {
 	AllowHTTP bool
 	// Shared reports whether the issuer is on the platform's shared list.
 	Shared bool
+	// JWKSURIPending skips jwks_uri, which is discovered after validation.
+	JWKSURIPending bool
+}
+
+// ValidateIssuerURL checks an issuer or JWKS URL the way Validate does.
+func ValidateIssuerURL(raw string, allowHTTP bool) error {
+	if err := checkIssuerURL(raw, allowHTTP); err != nil {
+		return issuerInvalid("invalid_issuer", "issuer %v", err)
+	}
+	return nil
 }
 
 // unpinnableClaims cannot pin an issuer to a customer: every token carries
@@ -168,8 +178,10 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 		return issuerInvalid("invalid_issuer",
 			"issuer %q is an Entra multi-tenant endpoint; a person issuer must be one tenant (https://login.microsoftonline.com/<tenant-id>/v2.0)", e.Issuer)
 	}
-	if err := checkIssuerURL(e.JWKSURI, v.AllowHTTP); err != nil {
-		return issuerInvalid("invalid_jwks_uri", "jwks_uri %v", err)
+	if !v.JWKSURIPending {
+		if err := checkIssuerURL(e.JWKSURI, v.AllowHTTP); err != nil {
+			return issuerInvalid("invalid_jwks_uri", "jwks_uri %v", err)
+		}
 	}
 	// A person row may leave audiences empty: on the ID-token exchange an
 	// enabled binding admits its client_id as the audience, and an ID-JAG's

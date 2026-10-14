@@ -23,7 +23,7 @@ federation:
   shared_issuers: []               # empty = the built-in list below
 ```
 
-`allow_private_endpoints` relaxes the SSRF guard on issuer rows' JWKS fetches and admits `http` issuer and JWKS URLs.
+`allow_private_endpoints` relaxes the SSRF guard on issuer rows' discovery and JWKS fetches and admits `http` issuer and JWKS URLs.
 It exists for local development against `cmd/zeroid-mockidp` and is a deployment setting, never a row field.
 Production keeps it false.
 Static entries keep their own `allow_private_endpoints`.
@@ -36,7 +36,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 |---|---|
 | `issuer` | The `iss` tokens carry, matched exactly. https. |
 | `kind` | `person`: an IdP whose ID-JAGs and ID tokens name people. `workload`: a client-assertion issuer (P2, not yet accepted by any grant). |
-| `jwks_uri` | https. Fetched through the SSRF-guarded client. |
+| `jwks_uri` | Never supplied by the caller. ZeroID reads it from the issuer's OpenID discovery document, `{issuer}/.well-known/openid-configuration`, whose `issuer` must equal the row's issuer exactly (OpenID Connect Discovery §4.3); both fetches go through the SSRF-guarded client. It changes only through `POST /external-issuers/{id}/refresh`, which re-reads discovery. A caller-chosen key set would let an admin sign tokens for anyone their IdP's issuer names. |
 | `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
 | `algorithms` | A subset of RS256, ES256, PS256. |
 | `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `role`, `privilege_scope`, `scope`, `trust_level`. |
@@ -73,8 +73,8 @@ A person row also refuses an issuer that only issues workload tokens (GitHub Act
 
 | Preset | Issuer | Fills |
 |---|---|---|
-| `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `jwks_uri` `.../<tid>/discovery/v2.0/keys`, `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, and the constraint `tid: [<tid>]` |
-| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `jwks_uri` (`/oauth2/v1/keys` or `/v1/keys`), `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name` |
+| `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, and the constraint `tid: [<tid>]` |
+| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name` |
 | `generic` or absent | any | nothing |
 
 The user key is `oid` for Entra because Entra's `sub` is pairwise per application, so one person would carry a different `sub` in every agent's app.
@@ -208,7 +208,6 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
-| 400 | `invalid_jwks_uri` | Not an absolute https URL |
 | 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
@@ -219,6 +218,10 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
 | 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
+| 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched |
+| 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
+| 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri` |
+| 422 | `discovery_private_address` | The issuer resolves to a private or reserved address |
 | 422 | `jwks_unreachable` | The JWKS could not be fetched (no upstream detail is returned) |
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
 | 422 | `jwks_private_address` | The JWKS host resolves to a private or reserved address |
@@ -249,7 +252,6 @@ On a `config` server the items are the static entries that admit the account, wi
   "issuer": "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0",
   "display_name": "Contoso Entra",
   "audiences": [],
-  "jwks_uri": "optional with a preset",
   "algorithms": ["RS256"],
   "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
   "propagate_claims": ["auth_time"],
@@ -262,9 +264,10 @@ On a `config` server the items are the static entries that admit the account, wi
 }
 ```
 
-Only `kind` and `issuer` are always required; `jwks_uri` and `claim_mapping.user_id` (person) are required unless a preset fills them, and `audiences` is required on a workload row.
+Only `kind` and `issuer` are always required; `claim_mapping.user_id` (person) is required unless a preset fills it, and `audiences` is required on a workload row.
+`jwks_uri` is not accepted (422, an unknown field): it comes from the issuer's discovery document.
 A person row needs no audiences: add each agent with a binding (below), whose subject key is its app id.
-The JWKS is fetched before the row is written, and an unreachable or empty one is refused (422).
+The discovery document and the JWKS are fetched before the row is written; a refusal is a 422 with a `discovery_*` or `jwks_*` code.
 The response is the issuer:
 
 ```json
@@ -299,10 +302,14 @@ The issuer, without `jwks_check`.
 
 ### `PATCH /external-issuers/{id}` → 200
 
-Any of `display_name`, `jwks_uri`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `enabled`; absent fields are unchanged.
-`issuer`, `kind` and `source` never change (an unknown field is a 422); delete and re-create instead.
-A changed `jwks_uri` is probed first and the response carries `jwks_check`.
+Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `enabled`; absent fields are unchanged.
+`issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
 The whole row is re-validated, and constraint changes on a shared issuer are re-checked for uniqueness.
+
+### `POST /external-issuers/{id}/refresh` → 200
+
+Re-reads the issuer's discovery document and, when it names a different `jwks_uri`, probes that key set and moves the row to it.
+The response is the issuer with `jwks_check`; a discovery or key-set refusal is the same 422 as on create.
 
 ### `DELETE /external-issuers/{id}` → 204
 
@@ -311,19 +318,19 @@ Deletes the row and its bindings.
 ### `POST /external-issuers/check` → 200
 
 ```json
-{"jwks_uri": "https://.../keys"}
+{"issuer": "https://acme.okta.com"}
 ```
 
-or `{"issuer": "...", "preset": "entra"}` to probe the URI a preset would derive.
+Runs what a create would fetch: the discovery document, then the key set it names.
 The answer is a probe result, never an upstream body:
 
 ```json
-{"reachable": true, "key_count": 1, "kids": ["k1"], "checked_at": "..."}
-{"reachable": false, "key_count": 0, "kids": [], "error": "jwks_unreachable", "checked_at": "..."}
+{"jwks_uri": "https://acme.okta.com/oauth2/v1/keys", "reachable": true, "key_count": 1, "kids": ["k1"], "checked_at": "..."}
+{"reachable": false, "key_count": 0, "kids": [], "error": "discovery_issuer_mismatch", "checked_at": "..."}
 ```
 
-`error` is `jwks_unreachable`, `jwks_empty` or `jwks_private_address`.
-Only an invalid URL is a 400.
+`error` is one of the `discovery_*` or `jwks_*` codes above.
+Only an invalid issuer URL is a 400.
 
 ### `GET /external-issuers/bindings` → 200
 
@@ -406,6 +413,7 @@ Every insert, update and delete of a row or binding writes `identity_audit_logs`
 ## Not yet
 
 - Federated client assertions (P2) do not read workload rows yet.
+- Every issuer row needs OpenID discovery at `{issuer}/.well-known/openid-configuration` (Entra, Okta, Google, GitHub Actions, AWS STS and Kubernetes service-account issuer discovery all serve it). An issuer without it, such as a bare SPIFFE trust-domain bundle endpoint, cannot be a row yet.
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
 - Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.

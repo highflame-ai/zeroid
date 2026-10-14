@@ -59,7 +59,6 @@ For an Entra-shaped person issuer, create a row with the generic preset (the `en
 {
   "kind": "person",
   "issuer": "http://mockidp:8080/entra/11111111-2222-3333-4444-555555555555/v2.0",
-  "jwks_uri": "http://mockidp:8080/entra/11111111-2222-3333-4444-555555555555/discovery/v2.0/keys",
   "algorithms": ["RS256"],
   "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
   "claim_constraints": {"tid": ["11111111-2222-3333-4444-555555555555"]}

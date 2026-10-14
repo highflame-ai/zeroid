@@ -56,11 +56,10 @@ func issuerTenant(ctx context.Context) (string, string, error) {
 
 // ExternalIssuerCreateBody is POST /external-issuers.
 type ExternalIssuerCreateBody struct {
-	Preset              string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Fill IdP-fixed fields from the issuer: entra (jwks_uri, RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (jwks_uri, RS256, user key sub). Never overrides a field the request sets. Neither needs audiences: bind each agent's app id instead."`
+	Preset              string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Check the issuer's shape and fill IdP-fixed fields: entra (RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (RS256, user key sub). Never overrides a field the request sets. jwks_uri always comes from the issuer's discovery document. Neither needs audiences: bind each agent's app id instead."`
 	Kind                string              `json:"kind" enum:"person,workload" doc:"person: an IdP whose ID-JAGs and ID tokens name people. workload: a client-assertion issuer."`
-	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https."`
+	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https. Its {issuer}/.well-known/openid-configuration must name this issuer and the jwks_uri ZeroID uses."`
 	DisplayName         string              `json:"display_name,omitempty"`
-	JWKSURI             string              `json:"jwks_uri,omitempty" doc:"https. Required unless a preset derives it."`
 	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
 	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, PS256. Default all three."`
 	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, role, privilege_scope, scope, trust_level."`
@@ -77,7 +76,6 @@ type ExternalIssuerCreateBody struct {
 // unchanged; issuer, kind and source never change.
 type ExternalIssuerPatchBody struct {
 	DisplayName         *string              `json:"display_name,omitempty"`
-	JWKSURI             *string              `json:"jwks_uri,omitempty"`
 	Audiences           *[]string            `json:"audiences,omitempty"`
 	Algorithms          *[]string            `json:"algorithms,omitempty"`
 	ClaimMapping        *map[string]string   `json:"claim_mapping,omitempty"`
@@ -150,9 +148,7 @@ type externalIssuerIDInput struct {
 
 type externalIssuerCheckInput struct {
 	Body struct {
-		JWKSURI string `json:"jwks_uri,omitempty"`
-		Issuer  string `json:"issuer,omitempty" doc:"With preset, derives jwks_uri when it is absent."`
-		Preset  string `json:"preset,omitempty" enum:"entra,okta,generic"`
+		Issuer string `json:"issuer" doc:"The issuer to probe: its discovery document, then the key set it names."`
 	}
 }
 
@@ -233,6 +229,8 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 		Path: "/external-issuers/{id}", Summary: "Get a trusted issuer", Tags: tags}, a.getExternalIssuerOp)
 	huma.Register(api, huma.Operation{OperationID: "update-external-issuer", Method: http.MethodPatch,
 		Path: "/external-issuers/{id}", Summary: "Update a trusted issuer", Tags: tags}, a.updateExternalIssuerOp)
+	huma.Register(api, huma.Operation{OperationID: "refresh-external-issuer", Method: http.MethodPost,
+		Path: "/external-issuers/{id}/refresh", Summary: "Re-read an issuer's discovery document and keys", Tags: tags}, a.refreshExternalIssuerOp)
 	huma.Register(api, huma.Operation{OperationID: "delete-external-issuer", Method: http.MethodDelete,
 		Path: "/external-issuers/{id}", Summary: "Stop trusting an issuer", Tags: tags,
 		DefaultStatus: http.StatusNoContent}, a.deleteExternalIssuerOp)
@@ -281,7 +279,7 @@ func (a *API) createExternalIssuerOp(ctx context.Context, input *struct {
 	b := input.Body
 	row, check, err := a.externalIssuerSvc.Create(ctx, account, actor, service.IssuerInput{
 		Preset: b.Preset, Kind: domain.IssuerKind(b.Kind), Issuer: b.Issuer, DisplayName: b.DisplayName,
-		JWKSURI: b.JWKSURI, Audiences: b.Audiences, Algorithms: b.Algorithms, ClaimMapping: b.ClaimMapping,
+		Audiences: b.Audiences, Algorithms: b.Algorithms, ClaimMapping: b.ClaimMapping,
 		PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds,
 		Source: domain.IssuerSource(b.Source), SourceRef: b.SourceRef, Enabled: b.Enabled,
@@ -296,15 +294,7 @@ func (a *API) checkExternalIssuerOp(ctx context.Context, input *externalIssuerCh
 	if _, _, err := issuerTenant(ctx); err != nil {
 		return nil, err
 	}
-	uri := input.Body.JWKSURI
-	if uri == "" && input.Body.Issuer != "" {
-		derived, err := a.externalIssuerSvc.DeriveJWKSURI(input.Body.Preset, input.Body.Issuer)
-		if err != nil {
-			return nil, issuerProblemFrom(err, "check external issuer")
-		}
-		uri = derived
-	}
-	check, err := a.externalIssuerSvc.Check(ctx, uri)
+	check, err := a.externalIssuerSvc.Check(ctx, input.Body.Issuer)
 	if err != nil {
 		return nil, issuerProblemFrom(err, "check external issuer")
 	}
@@ -333,12 +323,24 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 	}
 	b := input.Body
 	row, check, err := a.externalIssuerSvc.Update(ctx, account, input.ID, actor, service.IssuerPatch{
-		DisplayName: b.DisplayName, JWKSURI: b.JWKSURI, Audiences: b.Audiences, Algorithms: b.Algorithms,
+		DisplayName: b.DisplayName, Audiences: b.Audiences, Algorithms: b.Algorithms,
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, Enabled: b.Enabled,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")
+	}
+	return &externalIssuerOutput{Body: issuerView(row, check)}, nil
+}
+
+func (a *API) refreshExternalIssuerOp(ctx context.Context, input *externalIssuerIDInput) (*externalIssuerOutput, error) {
+	account, actor, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row, check, err := a.externalIssuerSvc.Refresh(ctx, account, input.ID, actor)
+	if err != nil {
+		return nil, issuerProblemFrom(err, "refresh external issuer")
 	}
 	return &externalIssuerOutput{Body: issuerView(row, check)}, nil
 }

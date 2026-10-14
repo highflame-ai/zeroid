@@ -49,9 +49,6 @@ func applyEntraPreset(e *ExternalIssuer) error {
 		return issuerInvalid("invalid_issuer",
 			"an Entra issuer is https://login.microsoftonline.com/<tenant-id>/v2.0, with the tenant's GUID")
 	}
-	if e.JWKSURI == "" {
-		e.JWKSURI = "https://" + entraHost + "/" + tid + "/discovery/v2.0/keys"
-	}
 	if len(e.Algorithms) == 0 {
 		e.Algorithms = []string{"RS256"}
 	}
@@ -74,15 +71,8 @@ func applyOktaPreset(e *ExternalIssuer) error {
 		return issuerInvalid("invalid_issuer", "an Okta issuer is https://<org>.okta.com or https://<org>.okta.com/oauth2/<server-id>")
 	}
 	e.Issuer = iss
-	if e.JWKSURI == "" {
-		switch {
-		case u.Path == "":
-			e.JWKSURI = iss + "/oauth2/v1/keys"
-		case strings.HasPrefix(u.Path, "/oauth2/") && strings.Count(u.Path, "/") == 2:
-			e.JWKSURI = iss + "/v1/keys"
-		default:
-			return issuerInvalid("invalid_issuer", "an Okta issuer is https://<org>.okta.com or https://<org>.okta.com/oauth2/<server-id>")
-		}
+	if u.Path != "" && (!strings.HasPrefix(u.Path, "/oauth2/") || strings.Count(u.Path, "/") != 2) {
+		return issuerInvalid("invalid_issuer", "an Okta issuer is https://<org>.okta.com or https://<org>.okta.com/oauth2/<server-id>")
 	}
 	if len(e.Algorithms) == 0 {
 		e.Algorithms = []string{"RS256"}

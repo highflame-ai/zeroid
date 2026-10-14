@@ -216,7 +216,6 @@ func (f *dbFederation) entraRow(t *testing.T, tn tiTenant, tenantID string, audi
 		"kind":              "person",
 		"display_name":      "Mock Entra",
 		"issuer":            f.idp.EntraIssuer(tenantID),
-		"jwks_uri":          f.idp.EntraJWKSURI(tenantID),
 		"audiences":         audiences,
 		"algorithms":        []string{"RS256"},
 		"claim_mapping":     map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
@@ -229,9 +228,8 @@ func (f *dbFederation) entraRow(t *testing.T, tn tiTenant, tenantID string, audi
 func (f *dbFederation) oktaRow(t *testing.T, tn tiTenant) map[string]any {
 	t.Helper()
 	status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-		"kind":     "person",
-		"issuer":   f.idp.OktaIssuer(),
-		"jwks_uri": f.idp.OktaJWKSURI(),
+		"kind":   "person",
+		"issuer": f.idp.OktaIssuer(),
 		// No audiences: an ID-JAG's audience is ZeroID's issuer.
 		"claim_mapping": map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified"},
 	}, tn.headers)
@@ -337,7 +335,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 
 	t.Run("the same issuer and kind again in the account is refused", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "person", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{"x"},
+			"kind": "person", "issuer": iss, "audiences": []string{"x"},
 			"claim_mapping": map[string]string{"user_id": "oid"},
 		}, a.headers)
 		assert.Equal(t, http.StatusConflict, status)
@@ -345,7 +343,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 	})
 	t.Run("a second account trusting the same unique issuer is refused, without naming the first", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "person", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{"x"},
+			"kind": "person", "issuer": iss, "audiences": []string{"x"},
 			"claim_mapping": map[string]string{"user_id": "oid"},
 		}, b.headers)
 		assert.Equal(t, http.StatusConflict, status)
@@ -354,14 +352,14 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 	})
 	t.Run("a second account cannot hold the issuer under the other kind either", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "workload", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{"x"},
+			"kind": "workload", "issuer": iss, "audiences": []string{"x"},
 		}, b.headers)
 		assert.Equal(t, http.StatusConflict, status)
 		assert.Equal(t, "issuer_already_trusted", body["code"])
 	})
 	t.Run("the same issuer as a workload issuer of the same account is allowed", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "workload", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{federationIssuer},
+			"kind": "workload", "issuer": iss, "audiences": []string{federationIssuer},
 		}, a.headers)
 		assert.Equal(t, http.StatusCreated, status, "%v", body)
 	})
@@ -393,14 +391,14 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		status int
 		code   string
 	}{
-		"not a URL":                 {map[string]any{"kind": "person", "issuer": "ftp://x", "jwks_uri": "https://x/k", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
-		"HS256":                     {map[string]any{"kind": "person", "issuer": "https://hs.example", "jwks_uri": "https://hs.example/k", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
-		"workload with no audience": {map[string]any{"kind": "workload", "issuer": "https://na.example", "jwks_uri": "https://na.example/k"}, 400, "invalid_audiences"},
+		"not a URL":                 {map[string]any{"kind": "person", "issuer": "ftp://x", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
+		"HS256":                     {map[string]any{"kind": "person", "issuer": "https://hs.example", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
+		"workload with no audience": {map[string]any{"kind": "workload", "issuer": "https://na.example"}, 400, "invalid_audiences"},
 		"entra common":              {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
 		"shared issuer without constraints": {map[string]any{"kind": "person", "issuer": "https://accounts.google.com",
-			"jwks_uri": "https://www.googleapis.com/oauth2/v3/certs", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
-		"unreachable keys": {map[string]any{"kind": "person", "issuer": "https://dead.example", "jwks_uri": "https://127.0.0.1:1/keys",
-			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "jwks_unreachable"},
+			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
+		"unreachable discovery": {map[string]any{"kind": "person", "issuer": "https://127.0.0.1:1",
+			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "discovery_unreachable"},
 	} {
 		t.Run("refused: "+name, func(t *testing.T) {
 			status, body := f.call(t, http.MethodPost, "/external-issuers", tc.body, a.headers)
@@ -409,14 +407,14 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		})
 	}
 	t.Run("check probes a JWKS and reports keys only", func(t *testing.T) {
-		status, body := f.call(t, http.MethodPost, "/external-issuers/check", map[string]any{"jwks_uri": f.idp.OktaJWKSURI()}, a.headers)
+		status, body := f.call(t, http.MethodPost, "/external-issuers/check", map[string]any{"issuer": f.idp.OktaIssuer()}, a.headers)
 		require.Equal(t, http.StatusOK, status)
 		assert.Equal(t, true, body["reachable"])
 		assert.Equal(t, []any{"okta-mock-key"}, body["kids"])
-		status, body = f.call(t, http.MethodPost, "/external-issuers/check", map[string]any{"jwks_uri": "https://127.0.0.1:1/x"}, a.headers)
+		status, body = f.call(t, http.MethodPost, "/external-issuers/check", map[string]any{"issuer": "https://127.0.0.1:1"}, a.headers)
 		require.Equal(t, http.StatusOK, status)
 		assert.Equal(t, false, body["reachable"])
-		assert.Equal(t, "jwks_unreachable", body["error"])
+		assert.Equal(t, "discovery_unreachable", body["error"])
 	})
 	t.Run("patch changes mutable fields only", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{
@@ -498,7 +496,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 
 	t.Run("a config-mode server refuses writes", func(t *testing.T) {
 		status, body := callJSON(t, testServer.URL, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "person", "issuer": "https://cfg.example", "jwks_uri": "https://cfg.example/k", "audiences": []string{"a"},
+			"kind": "person", "issuer": "https://cfg.example", "audiences": []string{"a"},
 			"claim_mapping": map[string]string{"user_id": "sub"},
 		}, a.headers)
 		assert.Equal(t, http.StatusConflict, status)
@@ -524,7 +522,7 @@ func TestTrustedIssuers_UniquenessRace(t *testing.T) {
 				tn := newTITenant(t)
 				kind := []string{"person", "workload"}[i]
 				statuses[i], _ = f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-					"kind": kind, "issuer": f.idp.EntraIssuer(tid), "jwks_uri": f.idp.EntraJWKSURI(tid),
+					"kind": kind, "issuer": f.idp.EntraIssuer(tid),
 					"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "oid"},
 				}, tn.headers)
 			}(i)
@@ -799,7 +797,7 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 	})
 	t.Run("a token from a workload-kind issuer", func(t *testing.T) {
 		status, body := p.f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "workload", "issuer": p.f.idp.K8sIssuer(), "jwks_uri": p.f.idp.K8sJWKSURI(), "audiences": []string{p.appID},
+			"kind": "workload", "issuer": p.f.idp.K8sIssuer(), "audiences": []string{p.appID},
 		}, p.tn.headers)
 		require.Equal(t, http.StatusCreated, status, "%v", body)
 		k8s := p.f.mint(t, mockidp.ProfileK8sServiceAccount, map[string]any{"aud": p.appID})
@@ -984,7 +982,7 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 	})
 	t.Run("a workload-kind issuer", func(t *testing.T) {
 		status, body := p.f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "workload", "issuer": p.f.idp.K8sIssuer(), "jwks_uri": p.f.idp.K8sJWKSURI(), "audiences": []string{federationIssuer},
+			"kind": "workload", "issuer": p.f.idp.K8sIssuer(), "audiences": []string{federationIssuer},
 		}, p.tn.headers)
 		require.Equal(t, http.StatusCreated, status, "%v", body)
 		typ := "oauth-id-jag+jwt"
@@ -1084,7 +1082,7 @@ func TestTrustedIssuers_SharedIssuerOverlap(t *testing.T) {
 	a, b := newTITenant(t), newTITenant(t)
 	create := func(tn tiTenant, c map[string][]string) (int, map[string]any) {
 		return f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-			"kind": "person", "issuer": f.idp.EntraIssuer(sharedTenant), "jwks_uri": f.idp.EntraJWKSURI(sharedTenant),
+			"kind": "person", "issuer": f.idp.EntraIssuer(sharedTenant),
 			"claim_mapping": map[string]string{"user_id": "oid"}, "claim_constraints": c,
 		}, tn.headers)
 	}
@@ -1120,7 +1118,7 @@ func TestTrustedIssuers_TrailingSlashIsOneIssuer(t *testing.T) {
 	tid := uid("slash-tid")
 	f.entraRow(t, a, tid, nil)
 	status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-		"kind": "person", "issuer": f.idp.EntraIssuer(tid) + "/", "jwks_uri": f.idp.EntraJWKSURI(tid),
+		"kind": "person", "issuer": f.idp.EntraIssuer(tid) + "/",
 		"claim_mapping": map[string]string{"user_id": "oid"},
 	}, b.headers)
 	assert.Equal(t, http.StatusConflict, status, "%v", body)
@@ -1143,7 +1141,7 @@ func TestTrustedIssuers_AccountCapUnderConcurrency(t *testing.T) {
 			defer wg.Done()
 			tid := uid("cap-race")
 			statuses[i], _ = f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-				"kind": "person", "issuer": f.idp.EntraIssuer(tid), "jwks_uri": f.idp.EntraJWKSURI(tid),
+				"kind": "person", "issuer": f.idp.EntraIssuer(tid),
 				"claim_mapping": map[string]string{"user_id": "oid"},
 			}, tn.headers)
 		}(i)
@@ -1159,4 +1157,48 @@ func TestTrustedIssuers_AccountCapUnderConcurrency(t *testing.T) {
 	n, err := testDB.NewSelect().Table("external_issuers").Where("account_id = ?", tn.account).Count(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, 20, n)
+}
+
+// TestTrustedIssuers_KeysComeFromDiscovery is the forge attack: an admin
+// cannot point a trusted issuer at a key set of their own, at create or
+// later, so they cannot sign tokens their IdP's issuer would name.
+func TestTrustedIssuers_KeysComeFromDiscovery(t *testing.T) {
+	f := newDBFederation(t)
+	tn := newTITenant(t)
+
+	t.Run("jwks_uri is not accepted at create", func(t *testing.T) {
+		status, _ := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+			"kind": "person", "issuer": f.idp.OktaIssuer(), "jwks_uri": "https://attacker.example/keys",
+			"claim_mapping": map[string]string{"user_id": "sub"},
+		}, tn.headers)
+		assert.Equal(t, http.StatusUnprocessableEntity, status, "an unknown field")
+	})
+	row := f.oktaRow(t, tn)
+	id := row["id"].(string)
+	assert.Equal(t, f.idp.OktaJWKSURI(), row["jwks_uri"], "the key set the issuer's discovery names")
+
+	t.Run("jwks_uri is not patchable", func(t *testing.T) {
+		status, _ := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{"jwks_uri": "https://attacker.example/keys"}, tn.headers)
+		assert.Equal(t, http.StatusUnprocessableEntity, status)
+		_, got := f.call(t, http.MethodGet, "/external-issuers/"+id, nil, tn.headers)
+		assert.Equal(t, f.idp.OktaJWKSURI(), got["jwks_uri"])
+	})
+	t.Run("refresh re-reads discovery", func(t *testing.T) {
+		status, got := f.call(t, http.MethodPost, "/external-issuers/"+id+"/refresh", nil, tn.headers)
+		require.Equal(t, http.StatusOK, status, "%v", got)
+		assert.Equal(t, f.idp.OktaJWKSURI(), got["jwks_uri"])
+		assert.Equal(t, true, got["jwks_check"].(map[string]any)["reachable"])
+	})
+	t.Run("a discovery document naming another issuer is refused", func(t *testing.T) {
+		liar := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"issuer": f.idp.OktaIssuer(), "jwks_uri": f.idp.OktaJWKSURI()})
+		}))
+		defer liar.Close()
+		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+			"kind": "person", "issuer": liar.URL, "claim_mapping": map[string]string{"user_id": "sub"},
+		}, newTITenant(t).headers)
+		assert.Equal(t, http.StatusUnprocessableEntity, status, "%v", body)
+		assert.Equal(t, "discovery_issuer_mismatch", body["code"])
+	})
 }

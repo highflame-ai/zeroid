@@ -62,6 +62,8 @@ var (
 // JWKSCheck is the result of probing an issuer's JWKS. It never carries an
 // upstream response body.
 type JWKSCheck struct {
+	// JWKSURI is the key set the issuer's discovery document names.
+	JWKSURI   string    `json:"jwks_uri,omitempty"`
 	Reachable bool      `json:"reachable"`
 	KeyCount  int       `json:"key_count"`
 	KIDs      []string  `json:"kids"`
@@ -141,7 +143,6 @@ type IssuerInput struct {
 	Kind             domain.IssuerKind
 	Issuer           string
 	DisplayName      string
-	JWKSURI          string
 	Audiences        []string
 	Algorithms       []string
 	ClaimMapping     map[string]string
@@ -154,11 +155,10 @@ type IssuerInput struct {
 	Enabled          *bool
 }
 
-// IssuerPatch is an update. Nil fields are unchanged; issuer, kind, source
-// and account never change.
+// IssuerPatch is an update. Nil fields are unchanged; issuer, kind, source,
+// account and jwks_uri (re-derived by Refresh) never change.
 type IssuerPatch struct {
 	DisplayName      *string
-	JWKSURI          *string
 	Audiences        *[]string
 	Algorithms       *[]string
 	ClaimMapping     *map[string]string
@@ -180,7 +180,6 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		Issuer:              in.Issuer,
 		Kind:                in.Kind,
 		DisplayName:         in.DisplayName,
-		JWKSURI:             in.JWKSURI,
 		Audiences:           slices.Clone(in.Audiences),
 		Algorithms:          slices.Clone(in.Algorithms),
 		ClaimMapping:        cloneStringMap(in.ClaimMapping),
@@ -199,11 +198,28 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	}
 	row.Normalize()
 	shared := s.IsShared(row.Issuer)
-	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, Shared: shared}); err != nil {
+	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, Shared: shared, JWKSURIPending: true}); err != nil {
 		return nil, nil, validationToAPIError(err)
 	}
 	row.ConstraintsKey = row.UniquenessKey(shared)
 
+	// A conflict is answered before anything is fetched; the transaction
+	// below re-checks under the lock.
+	existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(row.Issuer))
+	if err != nil {
+		return nil, nil, err
+	}
+	if uniquenessConflict(existing, row, shared) {
+		return nil, nil, errIssuerAlreadyTrusted
+	}
+
+	// The keys come from the issuer's own discovery document, never from the
+	// caller: a caller-chosen key set would let an admin sign tokens for any
+	// person their IdP's issuer names (ADR 0042 D4).
+	row.JWKSURI, err = s.discover(ctx, row.Issuer)
+	if err != nil {
+		return nil, nil, err
+	}
 	check, err := s.requireJWKS(ctx, row.JWKSURI)
 	if err != nil {
 		return nil, check, err
@@ -356,14 +372,6 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 	if err != nil {
 		return nil, nil, notFoundOr(err, errIssuerNotFound)
 	}
-	if p.JWKSURI != nil && strings.TrimSpace(*p.JWKSURI) != current.JWKSURI {
-		if err := s.checkURL(strings.TrimSpace(*p.JWKSURI)); err != nil {
-			return nil, nil, err
-		}
-		if check, err = s.requireJWKS(ctx, strings.TrimSpace(*p.JWKSURI)); err != nil {
-			return nil, check, err
-		}
-	}
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
 		if err := s.repo.LockIssuer(ctx, domain.CanonicalIssuer(current.Issuer)); err != nil {
 			return err
@@ -405,9 +413,6 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
 	if p.DisplayName != nil {
 		r.DisplayName = *p.DisplayName
-	}
-	if p.JWKSURI != nil {
-		r.JWKSURI = *p.JWKSURI
 	}
 	if p.Audiences != nil {
 		r.Audiences = slices.Clone(*p.Audiences)
@@ -453,35 +458,106 @@ func (s *ExternalIssuerService) Delete(ctx context.Context, accountID, id, actor
 	return err
 }
 
-// Check probes a JWKS URI with the SSRF-guarded client. A fetch failure is a
-// result (Reachable false), not an error; only an invalid URL is an error.
-func (s *ExternalIssuerService) Check(ctx context.Context, jwksURI string) (*JWKSCheck, error) {
-	jwksURI = strings.TrimSpace(jwksURI)
-	if err := s.checkURL(jwksURI); err != nil {
+// Check runs what Create would fetch for issuer: its discovery document,
+// then the key set it names, through the SSRF-guarded client. A fetch
+// failure is a result (Reachable false, Error set), not an error; only an
+// invalid issuer URL is an error.
+func (s *ExternalIssuerService) Check(ctx context.Context, issuer string) (*JWKSCheck, error) {
+	issuer = strings.TrimSpace(issuer)
+	if err := domain.ValidateIssuerURL(issuer, s.cfg.AllowPrivateEndpoints); err != nil {
+		return nil, validationToAPIError(err)
+	}
+	jwksURI, err := s.discover(ctx, issuer)
+	if err != nil {
+		var apiErr *IssuerAPIError
+		if errors.As(err, &apiErr) {
+			return &JWKSCheck{Error: apiErr.Code, KIDs: []string{}, CheckedAt: time.Now().UTC()}, nil
+		}
 		return nil, err
 	}
 	return s.probeJWKS(ctx, jwksURI), nil
 }
 
-// DeriveJWKSURI returns the JWKS URI a preset derives for issuer, or "".
-func (s *ExternalIssuerService) DeriveJWKSURI(preset, issuer string) (string, error) {
-	row := &domain.ExternalIssuer{Issuer: issuer, Kind: domain.IssuerKindPerson}
-	if err := domain.ApplyIssuerPreset(row, preset); err != nil {
-		return "", validationToAPIError(err)
+// Refresh re-reads an issuer's discovery document and moves the row to the
+// key set it now names, after probing it. The only way jwks_uri changes.
+func (s *ExternalIssuerService) Refresh(ctx context.Context, accountID, id, actor string) (*domain.ExternalIssuer, *JWKSCheck, error) {
+	row, err := s.Get(ctx, accountID, id)
+	if err != nil {
+		return nil, nil, err
 	}
-	return row.JWKSURI, nil
+	jwksURI, err := s.discover(ctx, row.Issuer)
+	if err != nil {
+		return nil, nil, err
+	}
+	check, err := s.requireJWKS(ctx, jwksURI)
+	if err != nil {
+		return nil, check, err
+	}
+	if jwksURI == row.JWKSURI {
+		return row, check, nil
+	}
+	row.JWKSURI = jwksURI
+	row.UpdatedBy = actor
+	err = s.inTx(ctx, actor, func(ctx context.Context) error {
+		return notFoundOr(s.repo.SetJWKSURI(ctx, row), errIssuerNotFound)
+	})
+	if err != nil {
+		return nil, check, err
+	}
+	log.Info().Str("account_id", accountID).Str("id", id).Str("jwks_uri", jwksURI).Msg("external issuer keys re-discovered")
+	return row, check, nil
 }
 
-func (s *ExternalIssuerService) checkURL(raw string) error {
-	probe := &domain.ExternalIssuer{
-		Issuer: "https://placeholder.invalid", Kind: domain.IssuerKindWorkload, JWKSURI: raw,
-		Audiences: []string{"x"},
+// maxDiscoveryBytes bounds a discovery document.
+const maxDiscoveryBytes = 256 << 10
+
+// discover fetches iss's OpenID discovery document and returns the jwks_uri
+// it names. The document's issuer must equal iss exactly (OpenID Connect
+// Discovery §4.3), so a document served elsewhere cannot vouch for it.
+func (s *ExternalIssuerService) discover(ctx context.Context, iss string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	unreachable := issuerErr(http.StatusUnprocessableEntity, "discovery_unreachable",
+		"the issuer's OpenID discovery document could not be fetched")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(iss, "/")+"/.well-known/openid-configuration", nil)
+	if err != nil {
+		return "", unreachable
 	}
-	probe.Normalize()
-	if err := probe.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints}); err != nil {
-		return validationToAPIError(err)
+	req.Header.Set("Accept", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		if errors.Is(err, attestation.ErrPrivateAttestationEndpoint) {
+			return "", issuerErr(http.StatusUnprocessableEntity, "discovery_private_address",
+				"the issuer resolves to a private or reserved address")
+		}
+		log.Debug().Err(err).Str("issuer", iss).Msg("issuer discovery failed")
+		return "", unreachable
 	}
-	return nil
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", unreachable
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDiscoveryBytes+1))
+	if err != nil || len(body) > maxDiscoveryBytes {
+		return "", unreachable
+	}
+	var doc struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || doc.JWKSURI == "" {
+		return "", issuerErr(http.StatusUnprocessableEntity, "discovery_invalid",
+			"the issuer's discovery document names no jwks_uri")
+	}
+	if doc.Issuer != iss {
+		return "", issuerErr(http.StatusUnprocessableEntity, "discovery_issuer_mismatch",
+			"the discovery document at the issuer names a different issuer")
+	}
+	if err := domain.ValidateIssuerURL(doc.JWKSURI, s.cfg.AllowPrivateEndpoints); err != nil {
+		return "", issuerErr(http.StatusUnprocessableEntity, "discovery_invalid",
+			"the issuer's discovery document names an unusable jwks_uri")
+	}
+	return doc.JWKSURI, nil
 }
 
 // requireJWKS probes and turns an unusable key set into a 422.
@@ -501,7 +577,7 @@ func (s *ExternalIssuerService) requireJWKS(ctx context.Context, jwksURI string)
 }
 
 func (s *ExternalIssuerService) probeJWKS(ctx context.Context, jwksURI string) *JWKSCheck {
-	out := &JWKSCheck{CheckedAt: time.Now().UTC(), KIDs: []string{}}
+	out := &JWKSCheck{JWKSURI: jwksURI, CheckedAt: time.Now().UTC(), KIDs: []string{}}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURI, nil)

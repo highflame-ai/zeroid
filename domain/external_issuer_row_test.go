@@ -156,8 +156,8 @@ func TestApplyIssuerPreset(t *testing.T) {
 		if err := ApplyIssuerPreset(e, IssuerPresetEntra); err != nil {
 			t.Fatal(err)
 		}
-		if e.JWKSURI != "https://login.microsoftonline.com/"+tid+"/discovery/v2.0/keys" {
-			t.Fatalf("jwks_uri = %s", e.JWKSURI)
+		if e.JWKSURI != "" {
+			t.Fatalf("jwks_uri = %s; it comes from discovery, never a preset", e.JWKSURI)
 		}
 		if e.ClaimMapping["user_id"] != "oid" || e.ClaimMapping["email_verified"] != "xms_edov" {
 			t.Fatalf("mapping = %v", e.ClaimMapping)
@@ -166,7 +166,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 			t.Fatalf("tid constraint = %v", got)
 		}
 		e.Normalize()
-		if err := e.Validate(IssuerValidation{}); err != nil {
+		if err := e.Validate(IssuerValidation{JWKSURIPending: true}); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -204,7 +204,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 		if err := ApplyIssuerPreset(e, IssuerPresetOkta); err != nil {
 			t.Fatal(err)
 		}
-		if e.Issuer != "https://acme.okta.com" || e.JWKSURI != "https://acme.okta.com/oauth2/v1/keys" {
+		if e.Issuer != "https://acme.okta.com" || e.JWKSURI != "" {
 			t.Fatalf("issuer %s jwks %s", e.Issuer, e.JWKSURI)
 		}
 		if len(e.Audiences) != 0 {
@@ -219,8 +219,13 @@ func TestApplyIssuerPreset(t *testing.T) {
 		if err := ApplyIssuerPreset(e, IssuerPresetOkta); err != nil {
 			t.Fatal(err)
 		}
-		if e.JWKSURI != "https://acme.okta.com/oauth2/aus1/v1/keys" {
+		if e.JWKSURI != "" {
 			t.Fatalf("jwks %s", e.JWKSURI)
+		}
+	})
+	t.Run("okta refuses a deeper path", func(t *testing.T) {
+		if got := issuerCode(ApplyIssuerPreset(&ExternalIssuer{Issuer: "https://acme.okta.com/oauth2/aus1/extra"}, IssuerPresetOkta)); got != "invalid_issuer" {
+			t.Fatalf("code = %q", got)
 		}
 	})
 	t.Run("unknown preset", func(t *testing.T) {
