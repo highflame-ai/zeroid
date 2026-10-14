@@ -1026,7 +1026,8 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     resolver that wants the chain to continue must return
 //     ErrPrincipalNotApplicable instead.
 //   - A resolver returning ErrPrincipalAccessDenied (or wrapping it) →
-//     returns (nil, resolverName, err) and STOPS the chain. The handler
+//     returns (nil, resolverName, err) and STOPS the chain — even when the
+//     error also matches ErrPrincipalNotApplicable. The handler
 //     redirects to the client's validated redirect_uri with
 //     error=access_denied on GET and POST alike; see
 //     ErrPrincipalAccessDenied.
@@ -1047,7 +1048,11 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	for _, r := range resolvers {
 		p, err := r.fn(ctx, req)
 		if err != nil {
-			if errors.Is(err, ErrPrincipalNotApplicable) {
+			// A denial is terminal and outranks "not applicable": an error
+			// matching both (errors.Join, or a %w of each) must not hand the
+			// request to a later resolver that could authenticate it and issue
+			// the code the resource owner just declined.
+			if errors.Is(err, ErrPrincipalNotApplicable) && !errors.Is(err, ErrPrincipalAccessDenied) {
 				continue
 			}
 			return nil, r.name, err
