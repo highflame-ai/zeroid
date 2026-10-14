@@ -90,17 +90,11 @@ func requireIDToken(raw string, verified jwt.Token) error {
 // token, returned as issued_token_type on every token-exchange response.
 const TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
 
-// ErrUnknownExternalIssuer is returned when a token-exchange request carries
-// an upstream `iss` that is not in the deployer-configured external_issuers
-// allowlist. Wrapped onto the *OAuthError so callers can branch with
-// errors.Is while the handler still maps the OAuth error code via errors.As.
-//
-// We classify this as `invalid_request` (RFC 6749 §5.2) rather than
-// `invalid_grant`: the token may be perfectly valid against its real issuer;
-// the failure is that the deployer has not configured this IdP. Per the RFC,
-// `invalid_grant` covers credentials that "are invalid, expired, revoked"
-// against a trust config the server does have — not credentials whose issuer
-// the server has never been told to trust.
+// ErrUnknownExternalIssuer is the cause when a person grant's token names an
+// issuer nobody trusts. It is wrapped onto the *OAuthError so callers can
+// branch with errors.Is; on the wire it is the same generic invalid_grant as
+// every other issuer refusal (resolvePersonIssuer), so a probe cannot tell an
+// unknown issuer from a disabled or workload one.
 var ErrUnknownExternalIssuer = errors.New("issuer is not a configured external issuer")
 
 // SetExternalIssuerRegistry installs a registry of trusted external IdPs.

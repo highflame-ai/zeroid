@@ -608,9 +608,11 @@ A request selects this mode with `subject_token_type =
 urn:ietf:params:oauth:token-type:id_token` and `subject_token` set to the
 upstream ID token. The mode:
 
-- Is gated by a deployer-configured allowlist of **external issuers**
-  (`external_issuers`), keyed by the upstream `iss`. A token whose `iss` is not
-  configured **MUST** be rejected (`invalid_request`). The
+- Is gated by trusted **external issuers** (the static `external_issuers` list,
+  or per-account issuer rows), keyed by the upstream `iss`. The client is
+  authenticated first; a token whose `iss` is not trusted, or names a disabled
+  or workload issuer, **MUST** be rejected with one generic `invalid_grant`, so
+  an unverified token cannot reveal which issuers are trusted. The
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
   here — the JWKS signature check, issuer allowlist, audience binding and
   client binding below *are* the trust anchor.

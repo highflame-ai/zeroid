@@ -316,7 +316,7 @@ func TestExternalIDTokenFederation_VerificationNegatives(t *testing.T) {
 		}},
 		{"unknown issuer", func(t *testing.T) string {
 			c := base()
-			c["iss"] = "https://stranger.idp.test" // not configured → invalid_request
+			c["iss"] = "https://stranger.idp.test" // not configured → generic invalid_grant
 			return idp.sign(t, c)
 		}},
 	}
