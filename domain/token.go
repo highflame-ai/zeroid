@@ -166,7 +166,10 @@ type OAuthClient struct {
 	// this client carry the identity_id forward (refresh_tokens.identity_id
 	// already exists) and gate token issuance on the linked identity's
 	// status + expires_at — same fail-closed semantics jwt_bearer and
-	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	// api_key paths have. It also decides the identity and tenant that
+	// client_credentials and ID-JAG tokens are minted for: the request need
+	// not name a tenant, and one naming a different tenant is refused.
+	// Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
 
 	// ChannelTrusted records that the client was registered by a caller

@@ -1212,10 +1212,14 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 
 // TestCIMDDirectAuthOptInIsBounded pins which callers may resolve a CIMD
 // client through authenticateRegisteredClient. A self-asserted document picks
-// its own grant_types, so only a caller that gates on them may opt in.
-// idJAGBearer does (an IdP-signed ID-JAG must name the client). Every
-// other caller must pass a literal false; anything else fails here, so the
-// opt-in cannot widen silently.
+// its own grant_types, so they authorize nothing: a caller may opt in only if
+// the authority it grants rests on something the document's publisher cannot
+// choose. idJAGBearer qualifies: the client must prove the document's key
+// (private_key_jwt), an IdP-signed ID-JAG must name this exact client_id, and
+// the tenant is derived server-side. It does NOT require jwt-bearer in the
+// document's grant_types; it refuses only a document that contradicts itself
+// about the ID-JAG profile (draft §8). Every other caller must pass a literal
+// false; anything else fails here, so the opt-in cannot widen silently.
 func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
 	allowed := map[string]bool{
 		// ID-JAG redemption (MCP Enterprise-Managed Authorization §5). Gates
@@ -1264,7 +1268,8 @@ func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
 	}
 	if len(offenders) > 0 {
 		t.Errorf("authenticateRegisteredClient may resolve a CIMD client from an unexpected caller:\n  %s\n\n"+
-			"Pass a literal false, or confirm the caller gates on the resolved client's grant_types "+
+			"Pass a literal false, or confirm the authority the caller grants rests on something "+
+			"the document's publisher cannot choose (its grant_types are self-asserted and do not count) "+
 			"and add it to `allowed` with a note saying how.",
 			strings.Join(offenders, "\n  "))
 	}
