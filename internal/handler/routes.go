@@ -46,6 +46,9 @@ type API struct {
 	// profile). Set with SetTenantSettingsService; the routes are registered
 	// only when it is non-nil.
 	tenantSettingsSvc *service.TenantSettingsService
+	// externalIssuerSvc backs /external-issuers (ADR 0042 D4). Set with
+	// SetExternalIssuerService; the routes are registered only when non-nil.
+	externalIssuerSvc *service.ExternalIssuerService
 	db                *bun.DB
 	issuer            string
 	startTime         time.Time
@@ -417,6 +420,9 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
 	a.registerObservedResourceRoutes(api)
+	if a.externalIssuerSvc != nil {
+		a.registerExternalIssuerRoutes(api)
+	}
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

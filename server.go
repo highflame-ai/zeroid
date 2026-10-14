@@ -566,6 +566,15 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Validate() already rejected a malformed value; empty keeps the default.
 	apiHandler.SetRegistrationEndpoint(cfg.Token.RegistrationEndpoint)
 	apiHandler.SetTenantSettingsService(tenantSettingsSvc)
+	apiHandler.SetExternalIssuerService(service.NewExternalIssuerService(externalIssuerRepo, identityRepo.GetByIDInAccounts, oauthClientSvc,
+		service.ExternalIssuerServiceConfig{
+			Store:                 issuerStore,
+			ZeroIDIssuer:          cfg.Token.Issuer,
+			SharedIssuers:         cfg.Federation.SharedIssuers,
+			AllowPrivateEndpoints: cfg.Federation.AllowPrivateEndpoints,
+			StaticIssuers:         cfg.ExternalIssuers,
+			HTTPClient:            options.externalIssuerHTTPClient,
+		}))
 	// An allow-list is the deployer vetting which hosts may publish a metadata
 	// document, which is what lets a CIMD client be redirected to at all. The
 	// EFFECTIVE count, for the same reason the startup log uses it: the raw
