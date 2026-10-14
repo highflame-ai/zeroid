@@ -1,32 +1,12 @@
 name: Release Build - Zeroid
 
-# Run workflow bumps the nested-module pins to svu's next version, pushes
-# that commit to main, then creates the GitHub release on that same
-# commit. The tag is created only after go.mod names it.
-#
-# The tag push then tags pkg/jwks, pkg/dpop and pkg/authjwt, tests,
-# builds binaries, and triggers highflame-cloud. The cloud workflow
-# clones that tag. It receives RELEASE_VER after the tag exists.
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (vX.Y.Z). Empty uses the next version this module path can tag."
-        required: false
-        type: string
   push:
     tags:
       - "v*.*.*"
 
 env:
-  GO_VER: "1.27.0"
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
-  # release.tag_name is the git tag (e.g. v1.7.0) — what consumers
-  # `go get`. Not release.name, which is the human-readable display
-  # title and can be customised in the UI to something like
-  # "v1.7.0 — PKCE PrincipalResolver" that would fail the tag-format
-  # regex. tag_name is the load-bearing identifier for every gate in
-  # this workflow.
   RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
   DEVOPS_REPO: "highflame-cloud"
   DEVOPS_BRANCH: "main"
@@ -34,7 +14,6 @@ env:
 
 jobs:
   highflame-validate:
-    if: github.event_name == 'push'
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -64,8 +43,8 @@ jobs:
       - name: Setup Golang Version
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
+          go-version-file: go.mod
+          cache: true
 
       # svu (caarlos0/svu) computes the semver bump implied by commit
       # messages since the last `v*` tag. Highflame's commit-prefix
@@ -163,7 +142,6 @@ jobs:
           echo "✓ make release-prep version matches release tag ${TAG}"
 
   tag-submodules:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -210,7 +188,6 @@ jobs:
           done
 
   highflame-sast:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -225,18 +202,8 @@ jobs:
       - name: Setup Golang Version
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Cache Go modules and build cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VER }}-
+          go-version-file: go.mod
+          cache: true
 
       - name: Run tests
         env:
@@ -250,7 +217,6 @@ jobs:
           make test-integration
 
   highflame-goreleaser:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
@@ -267,18 +233,8 @@ jobs:
       - name: Setup Golang Version
         uses: actions/setup-go@v6
         with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Cache Go modules and build cache
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VER }}-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VER }}-
+          go-version-file: go.mod
+          cache: true
 
       - name: Create APP token
         uses: actions/create-github-app-token@v3
@@ -298,7 +254,6 @@ jobs:
           args: release --clean
 
   highflame-trigger:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
@@ -332,122 +287,3 @@ jobs:
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
             --ref ${{ env.DEVOPS_BRANCH }} \
             -f RELEASE_VER=${{ env.RELEASE_TAG }}
-
-  # Manual run, before any tag exists. release-prep commits first; the
-  # release is created on that commit, so the tag and the cloud clone see
-  # the same go.mod. The app token is what makes `release: published` run
-  # afterwards. The default workflow token would not.
-  cut-release:
-    if: github.event_name == 'workflow_dispatch'
-    concurrency:
-      group: zeroid-cut-release
-      cancel-in-progress: false
-    permissions:
-      contents: read
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Create APP token
-        uses: actions/create-github-app-token@v3
-        id: app
-        with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
-          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      - name: Checkout main
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-          fetch-tags: true
-          token: ${{ steps.app.outputs.token }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VER }}
-          cache: false
-
-      - name: Install GitHub CLI
-        run: sudo apt install gh -y
-
-      - name: Bump pins and publish the release
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-          APP_SLUG: ${{ steps.app.outputs.app-slug }}
-          INPUT_VERSION: ${{ inputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin --tags --force
-          go install github.com/caarlos0/svu/v3@latest
-
-          RAW="$(svu next)"
-          CURRENT="$(svu current)"
-          EXPECTED="$(make -s --no-print-directory releasable-version)"
-          echo "svu current : ${CURRENT}"
-          echo "svu next    : ${RAW}"
-          echo "releasable  : ${EXPECTED}"
-
-          if [[ -n "${INPUT_VERSION}" ]] && ! printf '%s' "${INPUT_VERSION}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Version must match vMAJOR.MINOR.PATCH; got ${INPUT_VERSION}"
-            exit 1
-          fi
-          if [[ -z "${INPUT_VERSION}" ]]; then
-            if [[ "${RAW}" == "${CURRENT}" ]]; then
-              echo "::error::No feat: or fix: commits since ${CURRENT}. Nothing to release."
-              exit 1
-            fi
-            VERSION="${EXPECTED}"
-          else
-            VERSION="${INPUT_VERSION}"
-            HIGHEST="$(printf '%s\n%s\n' "${EXPECTED}" "${VERSION}" | sort -V | tail -1)"
-            if [[ "${VERSION}" != "${EXPECTED}" && "${HIGHEST}" != "${VERSION}" ]]; then
-              echo "::error::${VERSION} is below svu's next version ${EXPECTED}."
-              exit 1
-            fi
-          fi
-
-          if [[ ! "${VERSION}" =~ ${REGEX_PATTERN} ]]; then
-            echo "::error::Invalid version format: ${VERSION}"
-            exit 1
-          fi
-          echo "Valid version format: ${VERSION}"
-
-          VER_MAJOR="${VERSION#v}"
-          VER_MAJOR="${VER_MAJOR%%.*}"
-          EXP_MAJOR="${EXPECTED#v}"
-          EXP_MAJOR="${EXP_MAJOR%%.*}"
-          if [[ "${VER_MAJOR}" -ge 2 && "${EXP_MAJOR}" -lt 2 ]]; then
-            echo "::error::${VERSION} is not a valid Go module version for this path. Go only allows v0 or v1 until the module path ends in /v${VER_MAJOR}."
-            echo "::error::Leave the version empty. This release is ${EXPECTED}."
-            exit 1
-          fi
-
-          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-            echo "::error::Tag ${VERSION} already exists. Refusing to move it."
-            exit 1
-          fi
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Release ${VERSION} already exists. Refusing to move it."
-            exit 1
-          fi
-          echo "Releasing ${VERSION}"
-
-          make release-prep VERSION="${VERSION}"
-          git add -- go.mod pkg/authjwt/go.mod go.sum pkg/authjwt/go.sum go.work.sum
-          if ! git diff --quiet; then
-            echo "::error::release-prep changed files other than the module pins:"
-            git status --porcelain
-            exit 1
-          fi
-          if ! git diff --cached --quiet; then
-            git config user.name "${APP_SLUG}[bot]"
-            git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-            git commit -m "devops: point nested-module pins at ${VERSION}"
-            git push origin HEAD:main
-          fi
-
-          SHA="$(git rev-parse HEAD)"
-          echo "Publishing ${VERSION} at ${SHA}"
-          gh release create "${VERSION}" --target "${SHA}" --title "${VERSION}" --generate-notes

@@ -78,10 +78,17 @@ func (s *OAuthService) RevokeForClient(ctx context.Context, req RevocationReques
 	if err := s.VerifyPresentedClientAuth(ctx, req.ClientID, req.ClientSecret, req.ClientAssertion, req.ClientAssertionType); err != nil {
 		return err
 	}
-	// req.ClientID is the client just verified (or "" for a caller that
+	// clientID is the client just verified (or "" for a caller that
 	// identified none); it confines refresh-token revocation to that client's
-	// own tokens.
-	return revocationFailure(s.RevokeToken(ctx, req.Token, req.TokenTypeHint, req.ClientID))
+	// own tokens. A private_key_jwt client may omit client_id and be
+	// identified by its assertion's iss (RFC 7523 §3), which
+	// VerifyPresentedClientAuth has just authenticated; it is confined the
+	// same as one that sent client_id.
+	clientID := req.ClientID
+	if clientID == "" && req.ClientAssertion != "" {
+		clientID, _ = ClientIDFromAssertion(req.ClientAssertion)
+	}
+	return revocationFailure(s.RevokeToken(ctx, req.Token, req.TokenTypeHint, clientID))
 }
 
 // revocationFailure logs a server-side revocation failure and turns it into

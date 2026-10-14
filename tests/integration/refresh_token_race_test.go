@@ -3,6 +3,8 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -521,4 +523,81 @@ func rotateRaw(t *testing.T, refreshToken string) (int, []byte) {
 		return resp.StatusCode, nil
 	}
 	return resp.StatusCode, respBody
+}
+
+// TestRefreshTokenRevokeFamilyRacingRestore pins that a family revocation
+// cannot be undone by a RestoreRotation committing at the same moment.
+//
+// RestoreRotation deletes the unused successor and reactivates the presented
+// token in one transaction. A family revocation's UPDATE ... WHERE
+// state='active' takes its snapshot before that transaction commits, so it
+// sees the presented token as revoked (not a target) and the successor as
+// active; it then blocks on the successor's row lock, finds the row deleted
+// once the restore commits, and returns having revoked nothing — while the
+// presented token is active again. Reuse detection, auth-code replay and
+// RFC 7009 revocation would all report a revoked family that still has a
+// usable refresh token.
+//
+// The interleaving is forced: the restore runs inside a transaction this test
+// holds open, the revocation is started and observed waiting on its lock, and
+// only then is the restore committed.
+func TestRefreshTokenRevokeFamilyRacingRestore(t *testing.T) {
+	ctx := context.Background()
+	repo := postgres.NewRefreshTokenRepository(testDB)
+	svc := service.NewRefreshTokenService(repo, testDB)
+
+	issued, err := svc.IssueRefreshToken(ctx, &service.RefreshTokenParams{
+		ClientID:  testMCPClientID,
+		AccountID: testAccountID,
+		ProjectID: testProjectID,
+		UserID:    uid("user-restore-race"),
+		Scopes:    "data:read",
+	})
+	require.NoError(t, err)
+	claimed, successor, err := svc.RotateRefreshToken(ctx, issued.RawToken, 0, "")
+	require.NoError(t, err)
+
+	tx, err := testDB.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	committed := false
+	t.Cleanup(func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	})
+	successorHash := sha256.Sum256([]byte(successor.RawToken))
+	restored, err := repo.RestoreClaimed(ctx, tx, claimed.ID, claimed.FamilyID, hex.EncodeToString(successorHash[:]))
+	require.NoError(t, err)
+	require.True(t, restored, "the restore itself must apply")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RevokeFamily(ctx, claimed.FamilyID, "refresh_token_reuse")
+		done <- err
+	}()
+
+	// Wait until the revocation is blocked on the restore's row lock, so its
+	// snapshot predates the restore's commit.
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := testDB.NewRaw(
+			"SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE ?",
+			"%"+claimed.FamilyID+"%",
+		).Scan(ctx, &waiting)
+		return err == nil && waiting > 0
+	}, 10*time.Second, 10*time.Millisecond, "the family revocation never waited on the restore")
+
+	require.NoError(t, tx.Commit())
+	committed = true
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the family revocation did not finish after the restore committed")
+	}
+
+	active, err := svc.IsRefreshTokenActive(ctx, issued.RawToken)
+	require.NoError(t, err)
+	assert.False(t, active, "a token the restore reactivated must not survive the family revocation")
 }

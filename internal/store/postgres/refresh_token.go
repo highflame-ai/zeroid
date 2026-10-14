@@ -188,20 +188,35 @@ func (r *RefreshTokenRepository) DeleteExpired(ctx context.Context, before time.
 // RevocationNotifier event per revoked token. Refresh tokens are opaque (hashed)
 // and carry no JWT id, so the row's UUID (RefreshToken.ID) serves as the stable,
 // unique revocation handle.
+//
+// The UPDATE runs twice, because one pass can race RestoreClaimed. A restore
+// deletes the unused successor and reactivates the presented token in one
+// transaction. If the first pass takes its snapshot before that transaction
+// commits, it sees the presented token as revoked (not a target) and the
+// successor as active; it blocks on the successor's row lock, finds the row
+// deleted once the restore commits, and revokes nothing — leaving the
+// presented token active in a family the caller believes is revoked. Any
+// restore that touches this family has either committed by the time the first
+// pass returns (the pass waited on its lock) or found the successor revoked
+// and changed nothing, so the second pass, with a fresh snapshot, sees every
+// row a restore reactivated. TestRefreshTokenRevokeFamilyRacingRestore forces
+// that interleaving.
 func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID string) ([]*domain.RefreshToken, error) {
-	now := time.Now()
-
 	var revoked []*domain.RefreshToken
-	err := r.db.NewUpdate().
-		Model(&revoked).
-		Set("state = ?", domain.RefreshTokenStateRevoked).
-		Set("revoked_at = ?", now).
-		Where("family_id = ?", familyID).
-		Where("state = ?", domain.RefreshTokenStateActive).
-		Returning("*").
-		Scan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)
+	for range 2 {
+		var pass []*domain.RefreshToken
+		err := r.db.NewUpdate().
+			Model(&pass).
+			Set("state = ?", domain.RefreshTokenStateRevoked).
+			Set("revoked_at = ?", time.Now()).
+			Where("family_id = ?", familyID).
+			Where("state = ?", domain.RefreshTokenStateActive).
+			Returning("*").
+			Scan(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)
+		}
+		revoked = append(revoked, pass...)
 	}
 
 	return revoked, nil
