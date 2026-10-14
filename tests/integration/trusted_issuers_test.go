@@ -327,6 +327,13 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		assert.Equal(t, "issuer_already_trusted", body["code"])
 		assert.NotContains(t, fmt.Sprint(body), a.account)
 	})
+	t.Run("a second account cannot hold the issuer under the other kind either", func(t *testing.T) {
+		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+			"kind": "workload", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{"x"},
+		}, b.headers)
+		assert.Equal(t, http.StatusConflict, status)
+		assert.Equal(t, "issuer_already_trusted", body["code"])
+	})
 	t.Run("the same issuer as a workload issuer of the same account is allowed", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
 			"kind": "workload", "issuer": iss, "jwks_uri": f.idp.EntraJWKSURI(tid), "audiences": []string{federationIssuer},
@@ -470,11 +477,12 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 
 // TestTrustedIssuers_UniquenessRace pins that the per-issuer lock, not
 // request timing, decides who trusts an issuer: two accounts adding the same
-// issuer at once get exactly one row.
+// issuer at once get exactly one row. They ask for different kinds, which no
+// unique index separates, so only the lock can.
 func TestTrustedIssuers_UniquenessRace(t *testing.T) {
 	f := newDBFederation(t)
 	tid := uid("race-tid")
-	for round := 0; round < 5; round++ {
+	for round := 0; round < 10; round++ {
 		tid := fmt.Sprintf("%s-%d", tid, round)
 		var wg sync.WaitGroup
 		statuses := make([]int, 2)
@@ -483,8 +491,9 @@ func TestTrustedIssuers_UniquenessRace(t *testing.T) {
 			go func(i int) {
 				defer wg.Done()
 				tn := newTITenant(t)
+				kind := []string{"person", "workload"}[i]
 				statuses[i], _ = f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-					"kind": "person", "issuer": f.idp.EntraIssuer(tid), "jwks_uri": f.idp.EntraJWKSURI(tid),
+					"kind": kind, "issuer": f.idp.EntraIssuer(tid), "jwks_uri": f.idp.EntraJWKSURI(tid),
 					"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "oid"},
 				}, tn.headers)
 			}(i)
