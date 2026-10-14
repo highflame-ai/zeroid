@@ -57,6 +57,30 @@ func refreshMCP(t *testing.T, refreshToken string) (int, map[string]any) {
 	return status, body
 }
 
+// setRefreshReuseGrace sets the shared test server's refresh-token reuse
+// grace window for one test and restores the default afterwards. Safe because
+// no integration test runs in parallel.
+func setRefreshReuseGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	testZeroIDServer.SetRefreshReuseGrace(d)
+	t.Cleanup(func() { testZeroIDServer.SetRefreshReuseGrace(domain.RefreshTokenReuseGraceWindow) })
+}
+
+// backdateRotation moves a rotated-out refresh token's revocation time into
+// the past, so presenting it again is judged against the reuse grace window as
+// if that much time had passed since the rotation.
+func backdateRotation(t *testing.T, rawRefreshToken string, by time.Duration) {
+	t.Helper()
+	h := sha256.Sum256([]byte(rawRefreshToken))
+	res, err := testDB.ExecContext(context.Background(),
+		"UPDATE refresh_tokens SET revoked_at = revoked_at - make_interval(secs => ?) WHERE token_hash = ? AND state = 'revoked'",
+		by.Seconds(), hex.EncodeToString(h[:]))
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n, "backdateRotation: the token must be a rotated-out (revoked) row")
+}
+
 // TestRefreshTokenConcurrentRotation pins the rotation race (RFC 6749 §6) and
 // its RFC 9700 §4.14.2 consequence. Concurrent POSTs with the same refresh
 // token: exactly one wins the claim and gets a successor; the rest present a
@@ -67,18 +91,35 @@ func refreshMCP(t *testing.T, refreshToken string) (int, map[string]any) {
 // Before the claim was made atomic, both rotations could pass the active check
 // before either committed, both minted successors, and reuse detection never
 // fired at all.
+//
+// This is the strict posture (token.refresh_reuse_grace_seconds = 0). With
+// the default grace window, see TestRefreshTokenConcurrentRotationWithinGrace.
 func TestRefreshTokenConcurrentRotation(t *testing.T) {
+	setRefreshReuseGrace(t, 0)
 	// Two is the case the guarantee is hardest for: with a single loser there
 	// is exactly one revocation sweep, and the winner's access token may be
 	// minted after it. Ten exercises the claim under heavier contention. The
 	// two-way race is repeated because the interleaving is timing-dependent.
 	for i := range 10 {
-		t.Run(fmt.Sprintf("two-way/%d", i), func(t *testing.T) { assertConcurrentRotation(t, 2) })
+		t.Run(fmt.Sprintf("two-way/%d", i), func(t *testing.T) { assertConcurrentRotation(t, 2, true) })
 	}
-	t.Run("ten-way", func(t *testing.T) { assertConcurrentRotation(t, 10) })
+	t.Run("ten-way", func(t *testing.T) { assertConcurrentRotation(t, 10, true) })
 }
 
-func assertConcurrentRotation(t *testing.T, concurrency int) {
+// TestRefreshTokenConcurrentRotationWithinGrace is the same race under the
+// default reuse grace window: the losers present a token rotated out moments
+// ago in a family that is still live, which is a concurrent retry (several
+// tabs or processes sharing one refresh token). They are refused, nothing is
+// revoked, and the winner's session carries on.
+func TestRefreshTokenConcurrentRotationWithinGrace(t *testing.T) {
+	setRefreshReuseGrace(t, domain.RefreshTokenReuseGraceWindow)
+	for i := range 5 {
+		t.Run(fmt.Sprintf("two-way/%d", i), func(t *testing.T) { assertConcurrentRotation(t, 2, false) })
+	}
+	t.Run("ten-way", func(t *testing.T) { assertConcurrentRotation(t, 10, false) })
+}
+
+func assertConcurrentRotation(t *testing.T, concurrency int, strict bool) {
 	originalAT, refreshToken := exchangeMCPCode(t, uid("user-race"))
 
 	var (
@@ -124,9 +165,23 @@ func assertConcurrentRotation(t *testing.T, concurrency int) {
 		assert.Equal(t, "invalid_grant", e, "a losing rotation is answered invalid_grant")
 	}
 
+	require.NotEmpty(t, winnerRT, "should have captured the winner's refresh_token")
+	require.NotEmpty(t, winnerAT)
+	if !strict {
+		// Within the grace window the losers were concurrent retries: the
+		// family is intact, every access token stays active, and the winner's
+		// successor rotates.
+		assert.True(t, introspect(t, originalAT)["active"].(bool),
+			"a concurrent retry within the grace window must not revoke the family")
+		assert.True(t, introspect(t, winnerAT)["active"].(bool),
+			"the winner's access token survives a concurrent retry")
+		status, body := refreshMCP(t, winnerRT)
+		assert.Equal(t, http.StatusOK, status, "the winner's successor still rotates: %v", body)
+		return
+	}
+
 	// The losers presented a rotated token, so the family is revoked: the
 	// winner's successor no longer rotates...
-	require.NotEmpty(t, winnerRT, "should have captured the winner's refresh_token")
 	status, body := refreshMCP(t, winnerRT)
 	assert.Equal(t, http.StatusBadRequest, status,
 		"the winner's successor must be revoked with its family once a rotated token was presented")
@@ -137,7 +192,6 @@ func assertConcurrentRotation(t *testing.T, concurrency int) {
 	// (which may have been minted after the losers' revocation sweep ran).
 	assert.False(t, introspect(t, originalAT)["active"].(bool),
 		"the authorization_code access token must be revoked with the family")
-	require.NotEmpty(t, winnerAT)
 	assert.False(t, introspect(t, winnerAT)["active"].(bool),
 		"the winner's access token must be revoked with the family")
 }
@@ -153,6 +207,8 @@ func assertConcurrentRotation(t *testing.T, concurrency int) {
 // (the loser's sweep) proceed, inserts (the winner's access token) wait. Safe
 // because no integration test runs in parallel.
 func TestRefreshTokenConcurrentRotation_WinnerMintsAfterRevocation(t *testing.T) {
+	// The loser revokes the family only outside the reuse grace window.
+	setRefreshReuseGrace(t, 0)
 	ctx := context.Background()
 	exchangeAT, refreshToken := exchangeMCPCode(t, uid("user-race-late-mint"))
 
@@ -220,12 +276,13 @@ func TestRefreshTokenConcurrentRotation_WinnerMintsAfterRevocation(t *testing.T)
 }
 
 // TestRefreshTokenReuseRevokesFamilyImmediately pins RFC 9700 §4.14.2 for the
-// sequential case. A client rotates rt1 → rt2, then rt1 is presented again,
-// straight away. The replay is refused, and the newest token in the family
-// (rt2) must be refused too, along with every access token minted from the
-// family. There is no window after a rotation in which a replay is waved
-// through as a retry: the server cannot tell which party holds rt2.
+// sequential case with the grace window disabled
+// (token.refresh_reuse_grace_seconds = 0). A client rotates rt1 → rt2, then
+// rt1 is presented again, straight away. The replay is refused, and the
+// newest token in the family (rt2) must be refused too, along with every
+// access token minted from the family.
 func TestRefreshTokenReuseRevokesFamilyImmediately(t *testing.T) {
+	setRefreshReuseGrace(t, 0)
 	at1, rt1 := exchangeMCPCode(t, uid("user-reuse-immediate"))
 
 	status, body := refreshMCP(t, rt1)
@@ -258,10 +315,121 @@ func TestRefreshTokenReuseRevokesFamilyImmediately(t *testing.T) {
 		"the access token minted by the refresh must be revoked with the family")
 }
 
+// rotateOnce runs an authorization_code exchange and one refresh, returning
+// the exchange's tokens (at1, rt1 — rt1 now rotated out) and the refresh's
+// (at2, rt2).
+func rotateOnce(t *testing.T, user string) (at1, rt1, at2, rt2 string) {
+	t.Helper()
+	at1, rt1 = exchangeMCPCode(t, uid(user))
+	status, body := refreshMCP(t, rt1)
+	require.Equal(t, http.StatusOK, status)
+	at2, _ = body["access_token"].(string)
+	rt2, _ = body["refresh_token"].(string)
+	require.NotEmpty(t, at2)
+	require.NotEmpty(t, rt2)
+	return at1, rt1, at2, rt2
+}
+
+// TestRefreshTokenReuseWithinGrace pins the reuse grace window
+// (token.refresh_reuse_grace_seconds, default 10s). Presenting a token that
+// was rotated out moments ago, in a family that is still live, is a concurrent
+// retry: refused with the same invalid_grant as any unusable refresh token,
+// nothing issued, and nothing revoked.
+func TestRefreshTokenReuseWithinGrace(t *testing.T) {
+	setRefreshReuseGrace(t, domain.RefreshTokenReuseGraceWindow)
+	at1, rt1, at2, rt2 := rotateOnce(t, "user-reuse-grace")
+
+	unknownStatus, unknownBody := refreshMCP(t, "zid_rt_"+uid("never-issued"))
+	status, body := refreshMCP(t, rt1)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_grant", body["error"])
+	assert.Equal(t, unknownStatus, status, "a retry is answered like any unusable refresh token")
+	assert.Equal(t, unknownBody, body, "a retry is answered like any unusable refresh token")
+	assert.NotContains(t, body, "access_token", "nothing is issued to the retry")
+
+	assert.True(t, introspect(t, at1)["active"].(bool), "the family's access tokens are untouched")
+	assert.True(t, introspect(t, at2)["active"].(bool), "the successor's access token is untouched")
+	status, body = refreshMCP(t, rt2)
+	assert.Equal(t, http.StatusOK, status, "the successor still rotates: %v", body)
+}
+
+// TestRefreshTokenReuseAfterGrace: the same presentation once the window has
+// passed is reuse, and revokes the family and its access tokens. The window is
+// the configured one, not a constant: a rotation 60s ago is still within a
+// 300s window and already outside a 30s one.
+func TestRefreshTokenReuseAfterGrace(t *testing.T) {
+	t.Run("outside the default window", func(t *testing.T) {
+		setRefreshReuseGrace(t, domain.RefreshTokenReuseGraceWindow)
+		at1, rt1, at2, rt2 := rotateOnce(t, "user-reuse-after-grace")
+		backdateRotation(t, rt1, time.Hour)
+
+		status, body := refreshMCP(t, rt1)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+		assert.False(t, introspect(t, at1)["active"].(bool), "the exchange's access token is revoked with the family")
+		assert.False(t, introspect(t, at2)["active"].(bool), "the refreshed access token is revoked with the family")
+		status, _ = refreshMCP(t, rt2)
+		assert.Equal(t, http.StatusBadRequest, status, "the newest refresh token is revoked with the family")
+	})
+
+	t.Run("60s ago is within a 300s window", func(t *testing.T) {
+		setRefreshReuseGrace(t, 300*time.Second)
+		_, rt1, at2, rt2 := rotateOnce(t, "user-reuse-long-grace")
+		backdateRotation(t, rt1, 60*time.Second)
+
+		status, _ := refreshMCP(t, rt1)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.True(t, introspect(t, at2)["active"].(bool), "within the configured window nothing is revoked")
+		status, _ = refreshMCP(t, rt2)
+		assert.Equal(t, http.StatusOK, status)
+	})
+
+	t.Run("60s ago is outside a 30s window", func(t *testing.T) {
+		setRefreshReuseGrace(t, 30*time.Second)
+		_, rt1, at2, rt2 := rotateOnce(t, "user-reuse-short-grace")
+		backdateRotation(t, rt1, 60*time.Second)
+
+		status, _ := refreshMCP(t, rt1)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.False(t, introspect(t, at2)["active"].(bool), "outside the configured window the family is revoked")
+		status, _ = refreshMCP(t, rt2)
+		assert.Equal(t, http.StatusBadRequest, status)
+	})
+}
+
+// TestRefreshTokenReuseGraceOnlyCoversRotation: a token revoked by anything
+// other than rotation gets no grace, however recently it was revoked. Here the
+// family is revoked directly (as reuse detection, RFC 7009 revocation and
+// authorization-code replay all do, through RevokeFamily) — which revokes its
+// refresh tokens but not its access tokens. Presenting the just-revoked newest
+// token must then be treated as reuse, which revokes the family's access
+// tokens; a grace refusal would leave them active.
+func TestRefreshTokenReuseGraceOnlyCoversRotation(t *testing.T) {
+	ctx := context.Background()
+	setRefreshReuseGrace(t, domain.RefreshTokenReuseGraceWindow)
+	_, _, at2, rt2 := rotateOnce(t, "user-reuse-grace-family-revoked")
+
+	repo := postgres.NewRefreshTokenRepository(testDB)
+	h := sha256.Sum256([]byte(rt2))
+	row, err := repo.GetByTokenHashIncludingRevoked(ctx, hex.EncodeToString(h[:]))
+	require.NoError(t, err)
+	n, err := service.NewRefreshTokenService(repo, testDB).RevokeFamily(ctx, row.FamilyID, "test")
+	require.NoError(t, err)
+	require.Positive(t, n)
+	require.True(t, introspect(t, at2)["active"].(bool), "precondition: revoking the refresh tokens left the access token")
+
+	status, body := refreshMCP(t, rt2)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_grant", body["error"])
+	assert.False(t, introspect(t, at2)["active"].(bool),
+		"a token revoked with its family is reuse even seconds later: no grace, the family's access tokens are revoked")
+}
+
 // TestRefreshTokenReuseLeavesOtherFamiliesAlone bounds the revocation: reuse
 // in one family revokes that family only — another session of the same user
 // and client keeps working.
 func TestRefreshTokenReuseLeavesOtherFamiliesAlone(t *testing.T) {
+	setRefreshReuseGrace(t, 0)
 	user := uid("user-reuse-isolation")
 	_, victimRT := exchangeMCPCode(t, user)
 	otherAT, otherRT := exchangeMCPCode(t, user)
@@ -372,7 +540,25 @@ func TestRefreshTokenRestoreRotation(t *testing.T) {
 		assert.True(t, active, "the family survives the retry")
 	})
 
+	t.Run("a retry within the grace window leaves the rotation restorable", func(t *testing.T) {
+		raw := issue(t)
+		claimed, successor, err := svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.NoError(t, err)
+
+		_, _, err = svc.RotateRefreshToken(ctx, raw, 0, "")
+		require.ErrorIs(t, err, service.ErrRefreshTokenAlreadyRotated, "within the window it is a concurrent retry")
+
+		restored, err := svc.RestoreRotation(ctx, claimed, successor)
+		require.NoError(t, err)
+		assert.True(t, restored, "the retry revoked nothing, so the unused successor can still be undone")
+		active, err := svc.IsRefreshTokenActive(ctx, raw)
+		require.NoError(t, err)
+		assert.True(t, active)
+	})
+
 	t.Run("nothing is restored once reuse revoked the family", func(t *testing.T) {
+		svc.SetReuseGrace(0)
+		t.Cleanup(func() { svc.SetReuseGrace(domain.RefreshTokenReuseGraceWindow) })
 		raw := issue(t)
 		claimed, successor, err := svc.RotateRefreshToken(ctx, raw, 0, "")
 		require.NoError(t, err)

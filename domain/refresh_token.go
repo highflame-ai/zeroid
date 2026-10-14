@@ -14,17 +14,36 @@ const (
 	RefreshTokenStateActive  = "active"
 	RefreshTokenStateRevoked = "revoked"
 
-	// RefreshTokenReuseGraceWindow is how far behind now the cleanup worker
-	// lags its refresh-token expiry sweep, so a row is never deleted at the
-	// instant reuse detection might still look it up.
+	// DefaultRefreshTokenReuseGraceSeconds is the default for
+	// token.refresh_reuse_grace_seconds: how long after a refresh token is
+	// ROTATED OUT a second presentation of it is treated as a concurrent retry
+	// (several tabs or processes sharing one refresh token, a client retry
+	// loop) rather than as reuse. Within the window the presentation is
+	// refused with invalid_grant and nothing else happens: the successor, and
+	// the session, survive. After it, presenting the rotated-out token revokes
+	// the whole family and the access tokens issued from it (RFC 9700
+	// §4.14.2). The grace applies only to rotation: a token revoked any other
+	// way (family revoked by reuse detection, RFC 7009 revocation,
+	// authorization-code replay) is refused with no grace.
 	//
-	// It no longer suppresses reuse detection. Presenting a rotated-out refresh
-	// token revokes its whole family however soon after the rotation it
-	// arrives (RFC 9700 §4.14.2): the server cannot tell a client's retry from
-	// a replay of a stolen token, and a window in which the newest token in the
-	// family survives a replay is a window in which whichever party rotated
-	// first keeps the session. The name is kept for compatibility.
-	RefreshTokenReuseGraceWindow = 10 * time.Second
+	// The trade-off: a stolen rotated-out token presented within the window
+	// does not revoke the family, so whichever party rotated first keeps the
+	// session. 0 disables the grace (strict RFC 9700 behaviour).
+	DefaultRefreshTokenReuseGraceSeconds = 10
+
+	// MaxRefreshTokenReuseGraceSeconds bounds token.refresh_reuse_grace_seconds.
+	// A longer window is a longer stretch in which a replayed refresh token
+	// does not trigger family revocation.
+	MaxRefreshTokenReuseGraceSeconds = 300
+
+	// RefreshTokenReuseGraceWindow is the DEFAULT reuse grace window
+	// (DefaultRefreshTokenReuseGraceSeconds) as a duration. The window in
+	// force is configurable (token.refresh_reuse_grace_seconds; read it with
+	// TokenConfig.RefreshReuseGrace), so do not treat this as the live value.
+	// It is also the minimum the cleanup worker lags its refresh-token expiry
+	// sweep, so a row is never deleted at the instant reuse detection might
+	// still look it up.
+	RefreshTokenReuseGraceWindow = DefaultRefreshTokenReuseGraceSeconds * time.Second
 )
 
 // RefreshToken is the Bun model for the refresh_tokens table.

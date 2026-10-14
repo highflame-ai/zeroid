@@ -1,11 +1,15 @@
 package zeroid
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // TestValidateWIMSEDomain pins the SPIFFE §2.2 / RFC 1123 rules. The error
@@ -728,6 +732,75 @@ func TestRegistrationEndpointConfig(t *testing.T) {
 		cfg.Token.Issuer = "https://highflame-authn:8051"
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
 			t.Fatalf("Validate must refuse an http registration endpoint beside an https issuer, got: %v", err)
+		}
+	})
+}
+
+// TestRefreshReuseGraceConfig pins token.refresh_reuse_grace_seconds: unset
+// keeps the default (so a Config built in code, as embedders do, does not
+// silently go strict), 0 disables the grace, and Validate refuses negative or
+// over-long windows. The env var reaches the field.
+func TestRefreshReuseGraceConfig(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	t.Run("unset is the default", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RefreshReuseGraceSeconds = nil
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unset grace must validate: %v", err)
+		}
+		if got := cfg.Token.RefreshReuseGrace(); got != domain.RefreshTokenReuseGraceWindow {
+			t.Fatalf("unset grace = %v, want the default %v", got, domain.RefreshTokenReuseGraceWindow)
+		}
+	})
+	for _, ok := range []int{0, 1, domain.MaxRefreshTokenReuseGraceSeconds} {
+		t.Run(fmt.Sprintf("%d accepted", ok), func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Token.RefreshReuseGraceSeconds = intPtr(ok)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("grace %d must validate: %v", ok, err)
+			}
+			if got := cfg.Token.RefreshReuseGrace(); got != time.Duration(ok)*time.Second {
+				t.Fatalf("grace %d resolved to %v", ok, got)
+			}
+		})
+	}
+	for _, bad := range []int{-1, domain.MaxRefreshTokenReuseGraceSeconds + 1} {
+		t.Run(fmt.Sprintf("%d rejected", bad), func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Token.RefreshReuseGraceSeconds = intPtr(bad)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "token.refresh_reuse_grace_seconds must be between 0 and 300") {
+				t.Fatalf("grace %d must be rejected, got: %v", bad, err)
+			}
+		})
+	}
+	t.Run("env var reaches the config", func(t *testing.T) {
+		t.Setenv("ZEROID_REFRESH_REUSE_GRACE_SECONDS", "0")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Token.RefreshReuseGraceSeconds == nil || *cfg.Token.RefreshReuseGraceSeconds != 0 {
+			t.Fatalf("ZEROID_REFRESH_REUSE_GRACE_SECONDS=0 did not reach token.refresh_reuse_grace_seconds: %v", cfg.Token.RefreshReuseGraceSeconds)
+		}
+		if cfg.Token.RefreshReuseGrace() != 0 {
+			t.Fatal("0 must disable the grace")
+		}
+	})
+	t.Run("loaded default is 10", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Token.RefreshReuseGrace() != 10*time.Second {
+			t.Fatalf("default grace = %v, want 10s", cfg.Token.RefreshReuseGrace())
+		}
+	})
+	t.Run("non-integer env var fails loud", func(t *testing.T) {
+		t.Setenv("ZEROID_REFRESH_REUSE_GRACE_SECONDS", "ten")
+		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid integer") {
+			t.Fatalf("expected a not-a-valid-integer error, got %v", err)
 		}
 	})
 }
