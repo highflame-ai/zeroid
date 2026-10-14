@@ -32,6 +32,12 @@ DPoP: eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7...
 grant_type=client_credentials&client_id=...&client_secret=...&account_id=...&project_id=...&scope=payments:write
 ```
 
+`account_id` and `project_id` may be omitted when the client was registered
+with an `identity_id`: the token is then for that linked identity, in its
+tenant. A linked client that does send them must name the linked identity's
+tenant, or the request is refused with `invalid_request`. A client without a
+link must send both.
+
 Response:
 
 ```json
@@ -39,7 +45,9 @@ Response:
   "access_token": "eyJ0eXAi...",
   "token_type":   "DPoP",
   "expires_in":   3600,
-  "scope":        "payments:write"
+  "scope":        "payments:write",
+  "account_id":   "...",
+  "project_id":   "..."
 }
 ```
 

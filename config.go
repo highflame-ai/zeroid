@@ -188,15 +188,13 @@ type CIMDConfig struct {
 	//   cimd:
 	//     allowed_domains: ["client.example.com", "apps.acme.dev"]
 	//
-	// It is not only a fetch lever. It also decides whether a CIMD client is a
-	// destination this AS will redirect a user agent to — both the RFC 6749
-	// §4.1.2.1 error redirect and the interactive-login redirect are refused for
-	// a self-asserted client heading for a REMOTE https destination while this is
-	// empty. Loopback and private-use callbacks are exempt — they deliver to the
-	// requester's own device — so the ordinary desktop/CLI MCP client is
-	// unaffected and completes with no allowlist. Set this if you serve CIMD
-	// clients whose callbacks are remote https URLs; without it they can never
-	// sign a user in.
+	// It is enforced only when a document resolves; there is no second gate at
+	// redirect time. A CIMD client that resolved is redirected to (code, RFC 6749
+	// §4.1.2.1 error, interactive-login and access_denied redirects) exactly
+	// like a registered client. With this empty, any public host may publish a
+	// document naming any https destination, so an unauthenticated caller can
+	// make /oauth2/authorize emit an error redirect to a host of their choosing
+	// — the open-redirect surface of an open ecosystem. Set this to close it.
 	//
 	// Listing a host asserts that you vet who publishes there, and ZeroID holds
 	// the destination to the same bar: an https redirect_uri must be on the

@@ -211,7 +211,9 @@ var cimdAllowedAuthMethods = map[string]bool{
 //     the authorization_code exchange, the refresh_token rotation, and
 //     authenticateRegisteredClient, and nowhere else. The last resolves a CIMD
 //     client only when its caller opts in, and the only caller that does is
-//     ID-JAG redemption, which requires jwt-bearer in the kept set. The other
+//     ID-JAG redemption, which needs an IdP-signed ID-JAG naming this client_id
+//     and a server-derived tenant, so the document's own say-so buys nothing
+//     there. The other
 //     token-endpoint dispatch arms (NHI jwt-bearer, token-exchange, api_key,
 //     client_credentials, CIBA, custom grants via RegisterGrant) either resolve
 //     registry-only or never read a client at all, so a CIMD client_id buys
@@ -224,7 +226,8 @@ var cimdAllowedAuthMethods = map[string]bool{
 // that assumption cannot rot silently. The fourth call site,
 // authenticateRegisteredClient, resolves a CIMD client only for a caller that
 // opts in, and TestCIMDDirectAuthOptInIsBounded pins which callers do: today,
-// only idJAGBearer, which gates on jwt-bearer being in the kept set.
+// only idJAGBearer, whose authority comes from the IdP-signed ID-JAG rather than
+// from the document.
 var cimdAllowedGrantTypes = map[string]bool{
 	string(domain.GrantTypeAuthorizationCode): true,
 	string(domain.GrantTypeRefreshToken):      true,
@@ -820,6 +823,20 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 	return kept, dropped
 }
 
+// idJAGProfileContradicted reports whether doc claims the ID-JAG grant profile
+// without declaring both grants §8 requires. Checked against the document's
+// DECLARED grant_types, not the kept set: §8's MUST is on the client's
+// declaration, and token-exchange is never kept, so checking kept would flag
+// every conformant document too. A document that does not claim the profile
+// is never contradicted, whatever it lists.
+func idJAGProfileContradicted(doc *cimdMetadataDocument) bool {
+	if !slices.Contains(doc.AuthorizationGrantProfiles, idJAGGrantProfile) {
+		return false
+	}
+	return !slices.Contains(doc.GrantTypes, grantTypeTokenExchangeURN) ||
+		!slices.Contains(doc.GrantTypes, grantTypeJWTBearerURN)
+}
+
 // applyIDJAGProfileGrantRule enforces draft-ietf-oauth-identity-assertion-
 // authz-grant-04 §8 on a document that claims the ID-JAG profile: "A client
 // that includes urn:ietf:params:oauth:grant-profile:id-jag in
@@ -834,14 +851,7 @@ func effectiveCIMDGrantTypes(declared []string) (kept, dropped []string) {
 // its authorization_code use here is unaffected. token-exchange itself is
 // never kept; the client spends it at its IdP, not here.
 func applyIDJAGProfileGrantRule(doc *cimdMetadataDocument, kept, dropped []string) ([]string, []string) {
-	if !slices.Contains(doc.AuthorizationGrantProfiles, idJAGGrantProfile) {
-		return kept, dropped
-	}
-	// Checked against the document's DECLARED grant_types, not kept: §8's MUST
-	// is on the client's declaration, and token-exchange is never in kept, so
-	// checking kept here would withdraw jwt-bearer from every conformant
-	// document too.
-	if slices.Contains(doc.GrantTypes, grantTypeTokenExchangeURN) && slices.Contains(doc.GrantTypes, grantTypeJWTBearerURN) {
+	if !idJAGProfileContradicted(doc) {
 		return kept, dropped
 	}
 	i := slices.Index(kept, grantTypeJWTBearerURN)
@@ -935,6 +945,7 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	// fatal. See effectiveCIMDGrantTypes for why.
 	grantTypes, dropped := effectiveCIMDGrantTypes(doc.GrantTypes)
 	grantTypes, dropped = applyIDJAGProfileGrantRule(doc, grantTypes, dropped)
+	profileContradicted := idJAGProfileContradicted(doc)
 	if !slices.Contains(grantTypes, string(domain.GrantTypeAuthorizationCode)) {
 		return nil, nil, fmt.Errorf("%w: grant_types must include authorization_code", ErrCIMDInvalidDocument)
 	}
@@ -981,21 +992,22 @@ func synthesizeCIMDClient(clientID string, doc *cimdMetadataDocument, now time.T
 	}
 
 	return &domain.OAuthClient{
-		ClientID:                clientID,
-		Name:                    name,
-		ClientURI:               cimdDisplayURI(doc.ClientURI),
-		LogoURI:                 cimdDisplayURI(doc.LogoURI),
-		ClientType:              clientType,
-		TokenEndpointAuthMethod: authMethod,
-		JWKS:                    jwks,
-		JWKSURI:                 jwksURI,
-		GrantTypes:              grantTypes,
-		RedirectURIs:            doc.RedirectURIs,
-		Scopes:                  scopes,
-		RegistrationSource:      cimdRegistrationSource,
-		IsActive:                true,
-		CreatedAt:               now,
-		UpdatedAt:               now,
+		ClientID:                 clientID,
+		Name:                     name,
+		ClientURI:                cimdDisplayURI(doc.ClientURI),
+		LogoURI:                  cimdDisplayURI(doc.LogoURI),
+		ClientType:               clientType,
+		TokenEndpointAuthMethod:  authMethod,
+		JWKS:                     jwks,
+		JWKSURI:                  jwksURI,
+		GrantTypes:               grantTypes,
+		RedirectURIs:             doc.RedirectURIs,
+		Scopes:                   scopes,
+		RegistrationSource:       cimdRegistrationSource,
+		IsActive:                 true,
+		CreatedAt:                now,
+		UpdatedAt:                now,
+		IDJAGProfileContradicted: profileContradicted,
 	}, dropped, nil
 }
 

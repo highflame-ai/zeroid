@@ -298,6 +298,10 @@ var defaultAudienceScopeProfiles = map[string][]string{
 	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
 	// the api-key exchange flow (which widens its own request), the embed-handoff
 	// token is used verbatim, so this server-side profile is the only lever.
+	// `settings:*` drive the Settings screen and `fleet:read` the fleet board —
+	// without them those surfaces fail "Missing scope: settings:read" (#400).
+	// Together this is codeoid's full scope set (its protocol ALL_SCOPES): the
+	// embedded UI is the user's own workspace, with the owner's reach.
 	audienceCodeoid: {
 		"session:list",
 		"session:create",
@@ -314,6 +318,9 @@ var defaultAudienceScopeProfiles = map[string][]string{
 		"pipeline:create",
 		"pipeline:answer",
 		"pipeline:manage",
+		"settings:read",
+		"settings:write",
+		"fleet:read",
 	},
 	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
 	// to register a per-sandbox identity on the user's behalf.
@@ -343,6 +350,9 @@ var allowedProfileScopes = map[string]bool{
 	"pipeline:create":   true,
 	"pipeline:answer":   true,
 	"pipeline:manage":   true,
+	"settings:read":     true,
+	"settings:write":    true,
+	"fleet:read":        true,
 }
 
 // ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
@@ -794,8 +804,16 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
+	// RFC 6749 §4.4.2: the client MUST authenticate. Checked first, so nothing
+	// below (tenant derivation included) runs for an anonymous caller.
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("client_credentials requires client authentication", nil)
+	}
+
+	// Naming half a tenant is malformed whichever way the tenant is decided.
+	if (req.AccountID == "") != (req.ProjectID == "") {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"account_id and project_id must be sent together, or both omitted")
 	}
 
 	// Authenticate the client with whatever its REGISTERED method requires —
@@ -827,11 +845,59 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
-	// Resolve the identity for this client (external_id == client_id within the tenant).
-	// Tenant comes from the token request — client registration is global.
-	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
-	if err != nil {
-		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+	// Resolve the identity this token is for.
+	//
+	// A client whose REGISTRATION links an identity (identity_id) mints for
+	// that identity, in that identity's tenant, whether or not the request
+	// names a tenant. The link is written by an administrator inside the
+	// identity's own tenant, so the caller cannot steer it. A request that
+	// does name a tenant must name the link's (the rule ADR 0042 D5 applies to
+	// the ID-JAG grant); otherwise the request is refused rather than quietly
+	// minted into the other tenant's external_id match, which would let the
+	// caller pick between two identities. A conformant client (RFC 6749
+	// §4.4.2 defines only grant_type and scope) names none.
+	//
+	// A client with no link keeps the original rule: the request must name a
+	// tenant, and the token is for the identity whose external_id is the
+	// client_id within it. There is deliberately no cross-tenant external_id
+	// search for such a client: anyone in another tenant can create an
+	// identity with this client's id as its external_id, and a search would
+	// let them make the answer ambiguous or, for a client with no identity
+	// yet, decide it.
+	var identity *domain.Identity
+	if client.IdentityID != nil && *client.IdentityID != "" {
+		identity, err = s.identitySvc.repo.GetLinkedByID(ctx, *client.IdentityID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, oauthUnauthorized("the client's linked identity no longer exists", err)
+			}
+			return nil, oauthServerError("failed to resolve the client's linked identity", err)
+		}
+		if identity.AccountID == "" || identity.ProjectID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "the client's linked identity has no complete tenant")
+		}
+		// The messages do not echo the linked tenant: the caller either
+		// already knows it or has no business learning it from an error.
+		if req.AccountID != "" && req.AccountID != identity.AccountID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"account_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+		if req.ProjectID != "" && req.ProjectID != identity.ProjectID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"project_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+	} else {
+		if req.AccountID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"this client's registration links no identity, so its tenant cannot be derived; "+
+					"link one (identity_id) or send account_id and project_id")
+		}
+		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+		}
 	}
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
@@ -881,6 +947,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
+	// IssueCredential names the identity's tenant on the response, so a
+	// caller that sent none still learns which tenant it minted into.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
