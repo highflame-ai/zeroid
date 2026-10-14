@@ -230,12 +230,13 @@ func requireInvalidClient(t *testing.T, err error) {
 // The following tests exercise idJAGBearer's fail-closed gates that fire BEFORE
 // any token mint — so they need only a registry, no DB / CredentialService.
 //
-// Gate order (idJAGBearer): external-issuers configured → tenant fields present
-// → issuer lookup → tenant binding (AllowedAccounts) → D2b confidential client
-// auth → ID-JAG signature/claim validation → D2b client_id binding → identity
+// Gate order (idJAGBearer): external-issuers configured → issuer lookup → D2b
+// confidential client auth → derived tenant (ADR 0042 D5, deriveIDJAGTenant)
+// → ID-JAG signature/claim validation → D2b client_id binding → identity
 // mapping → resource (D4) → … → D2a single-use jti (consumed LAST). The
-// UnknownIssuer and TenantBinding gates fire BEFORE client auth, so those tests
-// need no client. Everything from ID-JAG validation onward (bad signature,
+// UnknownIssuer gate fires BEFORE client auth, so it needs no client; the
+// tenant derivation is pure and is covered row by row in
+// oauth_id_jag_tenant_test.go. Everything from ID-JAG validation onward (bad signature,
 // missing resource, unmappable identity, client_id binding, jti replay) is now
 // gated behind D2b client auth, which requires a real oauth_clients row — so the
 // fail-closed coverage for those gates lives in the integration suite
@@ -303,7 +304,11 @@ func TestIDJAGBearer_NoClientAuth_InvalidClient(t *testing.T) {
 	requireInvalidClient(t, err)
 }
 
-func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
+// TestIDJAGBearer_NoTenantFieldsRequired pins #630: a request carrying no
+// account_id / project_id — the only shape a conformant client sends (draft
+// §4.4, MCP EMA §5) — is no longer refused for omitting them. It proceeds to
+// client authentication, which is the first gate it can fail here.
+func TestIDJAGBearer_NoTenantFieldsRequired(t *testing.T) {
 	const acct = "acct-idjag"
 	registry, jwks, iss, aud := idJAGTestRegistry(t, acct)
 
@@ -318,13 +323,12 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 	})
 
 	svc := &OAuthService{externalIssuerRegistry: registry}
-	// account_id NOT in AllowedAccounts → fail closed before any verification.
-	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Assertion: idjag,
-		AccountID: "acct-not-allowed",
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
+	_, err := svc.idJAGBearer(context.Background(), TokenRequest{Assertion: idjag})
+	var oe *OAuthError
+	if errors.As(err, &oe) && oe.Code == "invalid_request" {
+		t.Fatalf("a request without account_id/project_id must not be invalid_request: %v", err)
+	}
+	requireInvalidClient(t, err)
 }
 
 // NOTE: the deep-gate fail-closed unit tests that previously lived here —
@@ -336,3 +340,39 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 // closed", "missing resource fails closed", plus the D2a replay / missing-jti
 // and D2b bad-secret / client_id-mismatch cases), where a full server with a
 // real DB authenticates the client first and then reaches each deeper gate.
+
+// TestRequireCIMDClientFitForIDJAG pins the two document-level gates a CIMD
+// client must pass to redeem an ID-JAG (firehog#701).
+func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
+	fit := func() *domain.OAuthClient {
+		return &domain.OAuthClient{
+			ClientID:                "https://client.example.test/client.json",
+			RegistrationSource:      domain.RegistrationSourceCIMD,
+			TokenEndpointAuthMethod: clientAuthMethodPrivateKeyJWT,
+			GrantTypes:              []string{"authorization_code", grantTypeJWTBearerURN},
+			IsActive:                true,
+		}
+	}
+
+	if err := requireCIMDClientFitForIDJAG(fit()); err != nil {
+		t.Fatalf("a private_key_jwt document listing jwt-bearer must pass: %v", err)
+	}
+
+	t.Run("auth method none is refused (draft §9.1, ADR 0010 D2b)", func(t *testing.T) {
+		c := fit()
+		c.TokenEndpointAuthMethod = "none"
+		requireInvalidClient(t, requireCIMDClientFitForIDJAG(c))
+	})
+
+	t.Run("no jwt-bearer in grant_types is unauthorized_client", func(t *testing.T) {
+		c := fit()
+		c.GrantTypes = []string{"authorization_code"}
+		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+	})
+
+	t.Run("the short jwt_bearer form does not count", func(t *testing.T) {
+		c := fit()
+		c.GrantTypes = []string{"authorization_code", "jwt_bearer"}
+		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+	})
+}

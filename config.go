@@ -4,12 +4,16 @@
 package zeroid
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
@@ -380,6 +384,25 @@ type TokenConfig struct {
 	DefaultTTL int    `koanf:"default_ttl"`
 	MaxTTL     int    `koanf:"max_ttl"`
 
+	// RegistrationEndpoint, when set, is advertised as `registration_endpoint`
+	// in the AS metadata documents (/.well-known/oauth-authorization-server and
+	// /.well-known/openid-configuration) in place of ZeroID's own
+	// {Issuer}/oauth2/register. RFC 8414 §2 lets that member be any URL, so a
+	// deployer that runs client registration somewhere else — typically an
+	// interactive registration front end, since ZeroID's own endpoint requires
+	// an initial access token and registers machine clients only — can point
+	// clients at it.
+	//
+	// Empty (the default) keeps {Issuer}/oauth2/register. When set it MUST be an
+	// absolute https URL in canonical form (lowercase scheme and host) with no
+	// user-info, fragment, whitespace or control characters, an ASCII host
+	// (internationalized names in xn-- form) and a port, if any, in 1-65535.
+	// Plain http is accepted for a loopback host (localhost, 127.0.0.0/8, ::1),
+	// or for any host when Issuer is itself http. Setting it changes only what
+	// is advertised: ZeroID's own /oauth2/register stays mounted and keeps its
+	// initial-access-token gate.
+	RegistrationEndpoint string `koanf:"registration_endpoint"`
+
 	// RequireDPoP makes a valid DPoP proof (RFC 9449) mandatory on every
 	// /oauth2/token issuance: absent proof is refused with invalid_dpop_proof
 	// instead of falling back to a Bearer token, and the AS metadata
@@ -524,6 +547,9 @@ func (c *Config) Validate() error {
 	if err := validateIssuer(c.Token.Issuer); err != nil {
 		return err
 	}
+	if err := validateRegistrationEndpoint(c.Token.RegistrationEndpoint, c.Token.Issuer); err != nil {
+		return err
+	}
 
 	// Production-gated hardening. server.env had ZERO readers before this —
 	// it now governs the footgun defaults that are safe in dev but dangerous
@@ -619,17 +645,20 @@ func validateIssuer(s string) error {
 		return fmt.Errorf("token.issuer is required: it is the JWT iss claim, the RFC 8414 §3 discovery anchor, and the URL prefix for every endpoint the server advertises; see TokenConfig.Issuer")
 	}
 	if strings.HasSuffix(s, "/") {
-		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", s)
+		return fmt.Errorf("token.issuer must not have a trailing slash (got %q): per RFC 8414 §3 a trailing slash MUST be removed before constructing the metadata URL", redactUserinfo(s))
 	}
 	u, err := url.Parse(s)
 	if err != nil {
-		return fmt.Errorf("token.issuer must be a valid URL (got %q): %w", s, err)
+		return fmt.Errorf("token.issuer must be a valid URL (got %q): %w", redactUserinfo(s), unwrapURLError(err))
 	}
+	// From here on the value parsed, so quote it with any user-info redacted:
+	// a credential pasted into the issuer must not be echoed into logs.
+	shown := redactUserinfo(s)
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("token.issuer must use http or https scheme (got %q in %q)", u.Scheme, s)
+		return fmt.Errorf("token.issuer must use http or https scheme (got %q in %q)", u.Scheme, shown)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("token.issuer must have a host (got %q)", s)
+		return fmt.Errorf("token.issuer must have a host (got %q)", shown)
 	}
 	if u.User != nil {
 		// Issuer URLs with embedded user-info (https://user:pass@host) are
@@ -640,15 +669,137 @@ func validateIssuer(s string) error {
 		// composition rules for OAuth identifiers. Error message kept
 		// short so it fits one terminal line; rationale lives in this
 		// comment for code readers.
-		return fmt.Errorf("token.issuer must not contain user-info (got %q)", s)
+		return fmt.Errorf("token.issuer must not contain user-info (got %q)", shown)
 	}
 	if u.RawQuery != "" {
-		return fmt.Errorf("token.issuer must not contain query parameters (got %q): RFC 8414 §2 requires the issuer URL to have no query component", s)
+		return fmt.Errorf("token.issuer must not contain query parameters (got %q): RFC 8414 §2 requires the issuer URL to have no query component", shown)
 	}
 	if u.Fragment != "" {
-		return fmt.Errorf("token.issuer must not contain a fragment (got %q): RFC 8414 §2 requires the issuer URL to have no fragment component", s)
+		return fmt.Errorf("token.issuer must not contain a fragment (got %q): RFC 8414 §2 requires the issuer URL to have no fragment component", shown)
 	}
 	return nil
+}
+
+// validateRegistrationEndpoint checks token.registration_endpoint against the
+// configured issuer. Empty means "advertise ZeroID's own endpoint" and is always
+// valid. Otherwise the value is published verbatim in AS metadata as the place
+// clients register, so it must already be a clean, canonical absolute URL:
+//
+//   - https, or http when the host is a literal loopback (localhost, 127.0.0.0/8,
+//     ::1) or the issuer itself is http — a deployment whose issuer is plain
+//     http (an in-cluster test stack, say) gains nothing by being refused an
+//     http registration endpoint beside it. With an https issuer a non-loopback
+//     http endpoint is still refused.
+//   - no user-info, no fragment.
+//   - no whitespace or control characters anywhere.
+//   - an ASCII host (an internationalized name must be given in its xn-- form).
+//   - a port, when present, numeric and in 1-65535.
+//   - canonical: the value must equal its normalized form (lowercase scheme and
+//     host, RFC 3986 escaping). A non-canonical value is rejected with the
+//     canonical form in the error rather than silently rewritten, so what is
+//     configured is exactly what clients see.
+//
+// Error messages never echo user-info: a mistyped credential in the URL must not
+// end up in logs.
+func validateRegistrationEndpoint(s, issuer string) error {
+	if s == "" {
+		return nil
+	}
+	shown := redactUserinfo(s)
+	for _, r := range s {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("token.registration_endpoint must not contain whitespace or control characters (got %q)", shown)
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("token.registration_endpoint must be a valid URL (got %q): %w", shown, unwrapURLError(err))
+	}
+	if u.User != nil {
+		return fmt.Errorf("token.registration_endpoint must not contain user-info (got %q)", shown)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("token.registration_endpoint must be an absolute URL with a host (got %q)", shown)
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !isLoopbackHost(u.Hostname()) && !issuerIsHTTP(issuer) {
+			return fmt.Errorf("token.registration_endpoint must use https (got %q): http is accepted only for a loopback host or when token.issuer is itself http", shown)
+		}
+	default:
+		return fmt.Errorf("token.registration_endpoint must use https (got scheme %q in %q)", u.Scheme, shown)
+	}
+	if u.Fragment != "" || strings.HasSuffix(s, "#") {
+		return fmt.Errorf("token.registration_endpoint must not contain a fragment (got %q)", shown)
+	}
+	for i := 0; i < len(u.Hostname()); i++ {
+		if u.Hostname()[i] >= utf8.RuneSelf {
+			return fmt.Errorf("token.registration_endpoint host must be ASCII (got %q): give an internationalized domain name in its xn-- form", shown)
+		}
+	}
+	if strings.HasSuffix(u.Host, ":") || u.Port() != "" {
+		port, perr := strconv.Atoi(u.Port())
+		if perr != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("token.registration_endpoint port must be a number from 1 to 65535 (got %q)", shown)
+		}
+	}
+	canonical := *u
+	canonical.Host = strings.ToLower(u.Host)
+	if c := canonical.String(); c != s {
+		return fmt.Errorf("token.registration_endpoint must be in canonical form (got %q, want %q): the value is advertised verbatim", shown, c)
+	}
+	return nil
+}
+
+// issuerIsHTTP reports whether the configured issuer uses the http scheme.
+func issuerIsHTTP(issuer string) bool {
+	u, err := url.Parse(issuer)
+	return err == nil && u.Scheme == "http"
+}
+
+// redactUserinfo returns s with any user-info in its authority replaced by
+// "redacted", so a URL carrying credentials can be quoted in an error message.
+// It works on the raw string rather than a parsed URL because it also has to
+// cover values that fail to parse.
+func redactUserinfo(s string) string {
+	i := strings.Index(s, "://")
+	if i < 0 {
+		return s
+	}
+	start := i + len("://")
+	end := len(s)
+	if j := strings.IndexAny(s[start:], "/?#"); j >= 0 {
+		end = start + j
+	}
+	at := strings.LastIndex(s[start:end], "@")
+	if at < 0 {
+		return s
+	}
+	return s[:start] + "redacted" + s[start+at:]
+}
+
+// unwrapURLError strips the *url.Error wrapper, whose message repeats the full
+// input URL (user-info included), leaving only the underlying cause.
+func unwrapURLError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
+}
+
+// isLoopbackHost reports whether host (as returned by url.URL.Hostname, so
+// without brackets or port) names the local machine: "localhost" or a loopback
+// IP literal. No DNS lookup — a name that merely resolves to 127.0.0.1 is not
+// accepted, because what it resolves to is not under the deployer's control at
+// the client.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // rejectRemovedKeys fails fast if a deployer's config (YAML or env) still sets
@@ -858,6 +1009,7 @@ var envMapping = map[string]string{
 
 	// Token
 	"ZEROID_ISSUER":                "token.issuer",
+	"ZEROID_REGISTRATION_ENDPOINT": "token.registration_endpoint",
 	"ZEROID_TOKEN_TTL_SECONDS":     "token.default_ttl",
 	"ZEROID_MAX_TOKEN_TTL_SECONDS": "token.max_ttl",
 	// Evidence clock for issued_credentials (delegation-graph retention).

@@ -48,6 +48,19 @@ token:
   issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
+  # registration_endpoint overrides the registration_endpoint advertised in
+  # AS metadata (/.well-known/oauth-authorization-server and
+  # /.well-known/openid-configuration). Empty (default) advertises ZeroID's
+  # own {issuer}/oauth2/register, which requires an initial access token and
+  # registers machine clients only. Set it when client registration is hosted
+  # elsewhere (e.g. an interactive registration front end); RFC 8414 §2 lets
+  # this be any URL. Must be an absolute, canonical https URL (lowercase
+  # scheme/host, ASCII host, no user-info/fragment/whitespace); http is
+  # accepted for localhost / loopback, or for any host when issuer is itself
+  # http. An invalid value fails config load. Only the advertisement changes —
+  # ZeroID's own /oauth2/register stays mounted.
+  # Env: ZEROID_REGISTRATION_ENDPOINT
+  # registration_endpoint: "https://app.example.com/oauth/register"
   # require_dpop makes a valid DPoP proof (RFC 9449) mandatory on every
   # /oauth2/token issuance. Off by default: without a proof the token falls
   # back to Bearer. When true, proof-less issuance is refused with
@@ -216,7 +229,11 @@ cimd:
 
 # Direct OIDC IdP federation (issue #88).
 # Each entry registers a trusted upstream issuer for RFC 8693 token exchange
-# with subject_token_type=urn:ietf:params:oauth:token-type:id_token.
+# with subject_token_type=urn:ietf:params:oauth:token-type:id_token, and for
+# ID-JAG redemption (jwt-bearer, MCP Enterprise-Managed Authorization). On the
+# ID-JAG grant the tenant is derived, not sent: the account must be in
+# allowed_accounts AND be the tenant of the identity the authenticated client's
+# registration links to (identity_id). See docs/identity-model.md.
 # When empty (default), only the broker path remains available.
 # external_issuers:
 #   - issuer:           "https://auth.example.okta.com"

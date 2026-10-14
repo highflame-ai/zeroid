@@ -805,7 +805,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// VerifyClientSecret directly and consult the registered method nowhere,
 	// which both accepted a secret from a key-based client and made a
 	// secretless key-based client unable to authenticate here at all.
-	client, err := s.authenticateRegisteredClient(ctx, req)
+	// cimdFallback=false: client_credentials does not admit CIMD clients.
+	client, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2143,7 +2144,12 @@ func checkAuthorizeClientPolicy(
 //     client_type gates to the returned row.
 //   - CIMD resolution runs only when the registry genuinely has NO row, CIMD
 //     is enabled, and the client_id is CIMD-shaped (https:// URL with a path).
-//     The synthesized client is always an active public PKCE client.
+//     The synthesized client is always active. It is a public PKCE client
+//     when its document declares token_endpoint_auth_method "none", and a
+//     confidential one that must authenticate with private_key_jwt against
+//     the document's own keys when it declares that (zeroid#264). Callers that
+//     authenticate the client directly go through authenticateRegisteredClient,
+//     which accepts only the latter.
 //   - An operational registry error is returned as-is — fail closed; a DB
 //     outage must not be misread as "unregistered".
 //

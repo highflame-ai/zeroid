@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -105,6 +106,27 @@ func buildIDJAGCustomClaims(
 	return customClaims
 }
 
+// idJAGActors returns the RFC 8693 §4.1 actor chain for an ID-JAG-minted
+// token: the redeeming application identity as the single current actor, in
+// the same shape token exchange gives its actor. The token's `sub` is the
+// person, so without this a resource server sees an undelegated person token
+// and cannot tell two agents acting for the same person apart.
+//
+// The synthetic carrier (no application_id, so no identity row) has no WIMSE
+// URI to name and yields no actor. Only the rfc8693 profile reads Actors; the
+// legacy shape is unchanged.
+func idJAGActors(identity *domain.Identity) []domain.Actor {
+	if identity == nil || identity.ID == "" || identity.WIMSEURI == "" {
+		return nil
+	}
+	return []domain.Actor{{
+		Sub:          identity.WIMSEURI,
+		IdentityType: string(identity.IdentityType),
+		TrustLevel:   string(identity.TrustLevel),
+		ExternalID:   identity.ExternalID,
+	}}
+}
+
 // idJAGBearer mints an audience-restricted ZeroID access token from an MCP
 // ID-JAG presented at POST /oauth2/token with
 // grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer (ADR 0010 D2-D4).
@@ -119,9 +141,11 @@ func buildIDJAGCustomClaims(
 // ZeroID token travels downstream to Firehog/Shield (ADR 0010 D5).
 //
 // Fail closed (OAuth invalid_grant, never mint) when: the issuer is not a
-// configured external issuer, the AllowedAccounts tenant binding does not permit
-// the request, signature/claim validation fails, the external identity cannot be
-// mapped, or the `resource` audience claim is absent (D3, D4).
+// configured external issuer, no tenant can be derived from the issuer's
+// AllowedAccounts and the authenticated client's registration (or the request
+// names a different one; see deriveIDJAGTenant), signature/claim validation
+// fails, the external identity cannot be mapped, or the `resource` audience
+// claim is absent (D3, D4).
 func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
 		// No external issuers configured → ID-JAG federation is disabled. The
@@ -129,13 +153,9 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// ID-JAG against, so fail closed rather than fall back to any other path.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG federation is not configured (no external issuers)")
 	}
-	// account_id / project_id are caller-supplied form fields (same as the
-	// id_token-exchange path) — they are the tenant the AllowedAccounts binding
-	// gates against. Tenant cannot be derived from the ID-JAG: it is born at the
-	// corporate IdP, which has no notion of a Highflame tenant.
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for the ID-JAG jwt-bearer grant")
-	}
+	// No account_id / project_id requirement. The tenant is derived below from
+	// the issuer and the authenticated client (ADR 0042 D5); a conformant
+	// client sends neither field (draft §4.4, EMA §5).
 
 	// Peek at the assertion to extract iss without verifying — we need iss to
 	// look up which IdP's JWKS to validate against. (typ was already confirmed
@@ -166,13 +186,6 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 	cfg := entry.Config
 
-	// Tenant binding — the only thing that ties an upstream ID-JAG to a
-	// Highflame tenant. AllowedAccounts is required+non-empty at config load;
-	// a request whose account_id is not listed fails closed (D3).
-	if !cfg.AccountAllowed(req.AccountID) {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
-	}
-
 	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
 	// not be redeemable by another party: the draft (with §9.1) requires
 	// redemption to come from an authenticated confidential client. Require
@@ -186,9 +199,21 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Same shared enforcement client_credentials uses: the registered
 	// token_endpoint_auth_method decides which credential is acceptable, so a
 	// key-based client can redeem an ID-JAG and a secret from one is refused.
-	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	//
+	// A client that is not pre-registered may use its Client ID Metadata
+	// Document URL as its client_id (MCP Enterprise-Managed Authorization §5),
+	// so this grant opts into the CIMD fallback. A registry row for the URL
+	// still wins over its document, and a deactivated row still blocks it.
+	// The opt-in is safe only because of the gate right after it: the
+	// document must declare private_key_jwt and list jwt-bearer.
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, true)
 	if err != nil {
 		return nil, err
+	}
+	if authedClient.SelfAsserted() {
+		if err := requireCIMDClientFitForIDJAG(authedClient); err != nil {
+			return nil, err
+		}
 	}
 
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,
@@ -213,6 +238,22 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if idJAGClientID != authedClient.ClientID {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG client_id does not match the authenticated client")
 	}
+
+	// Tenant binding (ADR 0042 D5). Derived from the issuer's allowed_accounts
+	// and the authenticated client's registration, never chosen by the request;
+	// a request that also names a tenant must name this one. Runs after the
+	// client_id binding, so a CIMD client is held to the same binding before
+	// its missing tenant is reported, and before the jti is consumed so a
+	// refused tenant does not burn the grant. From here on
+	// req.AccountID / req.ProjectID ARE the derived tenant, so every later use
+	// (identity resolution, the mint, the observed-resource inventory) reads
+	// the derived value and nothing can reach back to what the caller sent.
+	tenant, err := deriveIDJAGTenant(ctx, &cfg, authedClient,
+		s.identitySvc.repo.GetByIDInAccounts, req.AccountID, req.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	req.AccountID, req.ProjectID = tenant.AccountID, tenant.ProjectID
 
 	// Identity mapping (D3). user_id is required (validated at config load);
 	// resolve the external subject through ClaimMapping. Fail closed when it is
@@ -407,7 +448,11 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
 		// this client and bound the ID-JAG's own client_id claim to it, so it
 		// is exactly the client the token is issued to.
-		ClientID:          authedClient.ClientID,
+		ClientID: authedClient.ClientID,
+		// The redeeming agent is the current actor (RFC 8693 §4.1). Built
+		// after the trust_level mapping above, so act.trust_level carries the
+		// value the legacy shape emits at the top level.
+		Actors:            idJAGActors(identity),
 		TTL:               900, // 15 minutes — short-lived, matching the external-IdP paths
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
@@ -481,4 +526,32 @@ func (s *OAuthService) recordObservedResources(
 			Strs("resources", resources).
 			Msg("failed to record observed ID-JAG resources (token was still issued)")
 	}
+}
+
+// requireCIMDClientFitForIDJAG gates a Client ID Metadata Document client on
+// the ID-JAG grant. It runs after the client has authenticated, so every
+// refusal here is about what the document declared, not who the caller is.
+//
+//   - token_endpoint_auth_method must be private_key_jwt. The profile "SHOULD
+//     only be supported for confidential clients" (draft-ietf-oauth-identity-
+//     assertion-authz-grant-04 §9.1), ADR 0010 D2b requires an authenticated
+//     redeeming client, and a document can carry no shared secret (CIMD §4.1),
+//     so a key is the only credential it can have. authenticateRegisteredClient
+//     already refuses a CIMD client with any other method; this re-states it at
+//     the grant that depends on it.
+//   - grant_types must include jwt-bearer. A self-asserted document chooses its
+//     own grants, and this is the gate that makes the opt-in to CIMD resolution
+//     safe (see authenticateRegisteredClient). The kept set has already had
+//     §8's rule applied: a document claiming the ID-JAG profile without both
+//     token-exchange and jwt-bearer lost jwt-bearer at synthesis.
+func requireCIMDClientFitForIDJAG(client *domain.OAuthClient) error {
+	if client.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+		return oauthUnauthorized(
+			"a client metadata document client must authenticate with private_key_jwt to redeem an ID-JAG", nil)
+	}
+	if !slices.Contains(client.GrantTypes, grantTypeJWTBearerURN) {
+		return oauthBadRequest(oautherror.UnauthorizedClient,
+			"the client metadata document does not list "+grantTypeJWTBearerURN+" in grant_types")
+	}
+	return nil
 }

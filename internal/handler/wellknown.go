@@ -328,8 +328,11 @@ func (a *API) buildASMetadata() map[string]any {
 		// member is the advertised subset clients are expected to use.
 		"token_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
 
-		// RFC 7591 dynamic client registration.
-		"registration_endpoint": a.issuer + "/oauth2/register",
+		// RFC 7591 dynamic client registration. ZeroID's own endpoint unless
+		// the deployer advertises one hosted elsewhere
+		// (token.registration_endpoint) — RFC 8414 §2 puts no constraint on
+		// where this URL lives.
+		"registration_endpoint": a.advertisedRegistrationEndpoint(),
 
 		// RFC 9449 — Demonstrating Proof of Possession (DPoP). Algorithms the
 		// token endpoint will accept on the DPoP header. Symmetric algs are
@@ -377,6 +380,13 @@ func (a *API) buildASMetadata() map[string]any {
 		// the accurate values when the flow IS servable.
 		body["response_types_supported"] = []string{"code"}
 		body["code_challenge_methods_supported"] = []string{"S256"}
+
+		// RFC 9207 §3 — every authorization response /oauth2/authorize
+		// redirects (success and error alike) carries iss=<issuer>, so a
+		// client talking to more than one AS can detect a mix-up. Same gate as
+		// the members above: with no servable flow there are no authorization
+		// responses to describe.
+		body["authorization_response_iss_parameter_supported"] = true
 	}
 
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
