@@ -94,9 +94,16 @@ curl -s -X POST "$ZEROID_BASE_URL/oauth/clients" \
     "name": "my-agent-client",
     "confidential": true,
     "grant_types": ["client_credentials"],
-    "scopes": ["data:read", "data:write"]
+    "scopes": ["data:read", "data:write"],
+    "identity_id": "<identity.id from the registration above>"
   }'
 ```
+
+`identity_id` links the client to the identity its tokens are for. With it,
+the token request below needs no tenant: the token is for that identity, in its
+tenant. Without it, the token request must also send `account_id` and
+`project_id`, and the token is for the identity whose `external_id` equals the
+`client_id` in that tenant.
 
 **Response (201 Created):**
 
