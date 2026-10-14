@@ -510,3 +510,69 @@ func TestPersonGrant_RefusedCodeIsNotConsumed(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, "the refused redemption did not consume the code; body=%v", body)
 	assert.ElementsMatch(t, []any{"pg:a"}, decodeJWTPayload(t, body["access_token"].(string))["scopes"])
 }
+
+// TestPersonGrant_CIBARefusalKeepsTheApproval: a root CIBA grant refused by
+// the ceiling does not consume the person's approval; the same auth_req_id
+// redeems once the role is restored.
+func TestPersonGrant_CIBARefusalKeepsTheApproval(t *testing.T) {
+	grants := installPersonGrants(t, zeroid.PersonGrantModeEnforce, testZeroIDServer)
+	user := uid("pg-ciba-retry")
+	c := newConfidentialCIBAClient(t)
+	resp := bcAuthorizeAs(t, c, map[string]any{"login_hint": user, "scope": "pg:a"})
+	body := decode(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "bc-authorize: %v", body)
+	id := body["auth_req_id"].(string)
+	approveInTenant(t, id, user, adminHeaders())
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:c"}}, nil)
+	status, polled := pollCIBARaw(t, c, id)
+	require.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_scope", polled["error"])
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:a"}}, nil)
+	status, polled = pollCIBARaw(t, c, id)
+	require.Equal(t, http.StatusOK, status, "the refusal did not consume the approval; body=%v", polled)
+	assert.ElementsMatch(t, []any{"pg:a"}, decodeJWTPayload(t, polled["access_token"].(string))["scopes"])
+}
+
+// TestPersonGrant_IDJAGRefusalKeepsTheJTI: an ID-JAG refused by the ceiling
+// does not burn its single-use jti, and a replay is refused before the
+// resolver is called.
+func TestPersonGrant_IDJAGRefusalKeepsTheJTI(t *testing.T) {
+	f := newPersonGrantFederation(t)
+	grants := installPersonGrants(t, zeroid.PersonGrantModeEnforce, f.srv)
+	user := uid("pg-jag-retry")
+	now := time.Now()
+	idjag := f.upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+		"iss": f.iss, "aud": f.aud, "sub": user,
+		"client_id": f.jagClient.ClientID, "jti": uid("pg-jti"),
+		"resource": "https://mcp.person-grant.test", "scope": "pg:a",
+		"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+	})
+	redeem := func(t *testing.T) tokenResponse {
+		t.Helper()
+		return postFederation(t, f.url, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     idjag,
+			"account_id":    f.cfg.AccountID,
+			"project_id":    f.cfg.ProjectID,
+			"client_id":     f.jagClient.ClientID,
+			"client_secret": f.jagClient.ClientSecret,
+		})
+	}
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:c"}}, nil)
+	resp := redeem(t)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, "invalid_scope", resp.Error)
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:a"}}, nil)
+	resp = redeem(t)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the refusal did not burn the jti; body=%s", resp.RawBody)
+
+	resp = redeem(t)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, "invalid_grant", resp.Error)
+	assert.Contains(t, resp.RawBody, "already been redeemed")
+	assert.Len(t, grants.callsFor(user), 2, "the replay never reached the resolver")
+}
