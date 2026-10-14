@@ -918,7 +918,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// idp_iss / idp_sub: like mission_id, only ever the grant's own values.
 	_ = token.Remove("idp_iss")
 	_ = token.Remove("idp_sub")
-	if req.IdPSubject != "" {
+	// Only on a token whose sub is the person: under legacy an exchanged
+	// token's sub is the actor.
+	if req.IdPSubject != "" && principal.Type == domain.PrincipalUser && (rfc8693 || req.SubjectOverride != "") {
 		_ = token.Set("idp_iss", req.IdPIssuer)
 		_ = token.Set("idp_sub", req.IdPSubject)
 	}

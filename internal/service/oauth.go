@@ -1233,6 +1233,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if len(parentActors) > 0 {
 		delegatedBy = parentActors[0].Sub
 	}
+	// An agent exchanging a token it already acts on (a person token from
+	// ID-JAG or the ID-token exchange names it as act) is re-scoping, not
+	// delegating: no new actor level and no added depth.
+	sameActor := isCurrentActor(subjectParsed, subjectCred, parentActors, actorIdentity)
+	childDepth := parentDepth + 1
+	if sameActor {
+		childDepth = parentDepth
+		delegatedBy = delegatorBefore(subjectParsed, parentActors)
+	}
 
 	// Resolve mission_id from the subject_token (issue #81). Prefer the
 	// explicit mission_id claim; fall back to the subject_token's own jti
@@ -1262,7 +1271,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		GrantType:           domain.GrantTypeTokenExchange,
 		DelegatedBy:         delegatedBy,
 		ParentJTI:           subjectJTI,
-		DelegationDepth:     parentDepth + 1,
+		DelegationDepth:     childDepth,
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
@@ -1279,17 +1288,32 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
 	issue.UserGrantBounded = true
 
+	// The principal's IdP pair (idp_iss, idp_sub) describes sub, which the
+	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
+	// from the verified parent; never from the request.
+	if parent.Type == domain.PrincipalUser {
+		idpIss, _ := jwt.Get[string](subjectParsed, "idp_iss")
+		idpSub, _ := jwt.Get[string](subjectParsed, "idp_sub")
+		if idpIss != "" && idpSub != "" {
+			issue.IdPIssuer, issue.IdPSubject = idpIss, idpSub
+		}
+	}
+
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
 	// outermost, then the parent's actors. A parent with no actors was a root
 	// grant; its client acted for the principal, so it becomes the first
-	// prior actor (T0's client A in the design's three-hop example).
+	// prior actor (T0's client A in the design's three-hop example). When the
+	// actor already is the parent's current actor, it replaces itself.
+	if sameActor && len(parentActors) > 0 {
+		parentActors = parentActors[1:]
+	}
 	issue.Actors = append([]domain.Actor{{
 		Sub:          actorIdentity.WIMSEURI,
 		IdentityType: string(actorIdentity.IdentityType),
 		TrustLevel:   string(actorIdentity.TrustLevel),
 		ExternalID:   actorIdentity.ExternalID,
 	}}, parentActors...)
-	if len(parentActors) == 0 {
+	if len(parentActors) == 0 && !sameActor {
 		if cid, _ := jwt.Get[string](subjectParsed, "client_id"); cid != "" {
 			issue.Actors = append(issue.Actors, domain.Actor{Sub: cid})
 		}
@@ -1305,6 +1329,42 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// isCurrentActor reports whether actor is already the subject token's
+// current actor (ADR 0043 D2): its act.sub under rfc8693; under legacy, the
+// identity the token was issued to, when that token acts for someone (it has
+// an act, or a sub other than the identity's own).
+func isCurrentActor(subject jwt.Token, cred *domain.IssuedCredential, parentActors []domain.Actor, actor *domain.Identity) bool {
+	if len(parentActors) > 0 {
+		return parentActors[0].Sub == actor.WIMSEURI
+	}
+	if _, err := jwt.Get[string](subject, "principal_type"); err == nil {
+		return false
+	}
+	if cred.IdentityID == nil || *cred.IdentityID != actor.ID {
+		return false
+	}
+	sub, _ := subject.Subject()
+	return subject.Has("act") || sub != actor.WIMSEURI
+}
+
+// delegatorBefore names who delegated to the parent's current actor, for a
+// re-scoping exchange that keeps that actor: the next prior actor, else the
+// legacy act.sub, else the parent's sub.
+func delegatorBefore(subject jwt.Token, parentActors []domain.Actor) string {
+	if len(parentActors) > 1 {
+		return parentActors[1].Sub
+	}
+	if len(parentActors) == 0 {
+		if act, err := jwt.Get[map[string]any](subject, "act"); err == nil {
+			if sub, _ := act["sub"].(string); sub != "" {
+				return sub
+			}
+		}
+	}
+	sub, _ := subject.Subject()
+	return sub
 }
 
 // mayActPermits reports whether an RFC 8693 §4.4 may_act claim names actor.

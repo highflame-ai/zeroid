@@ -169,6 +169,9 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
 
 The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceiling)) then sees the resolved user id.
 
+When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
+`idp_iss` and `idp_sub` travel with `sub` onto every exchanged `rfc8693` token; a different agent becomes a new actor level as usual.
+
 ## Admin API
 
 The routes are on the admin router (`server.admin_path_prefix`), behind the deployer's admin authentication.

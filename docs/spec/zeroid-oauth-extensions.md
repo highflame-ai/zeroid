@@ -478,6 +478,19 @@ The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
 
+An exchange whose actor already **is** the subject token's current actor (ADR
+0043 D2: its `act.sub` under `rfc8693`; under legacy, the identity the token was
+issued to when it acts for someone) is a re-scoping, not a delegation: the
+actor replaces itself as the current actor rather than nesting, and
+`delegation_depth` does not increase. This is the agent narrowing the person
+token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
+still links the child for cascade revocation.
+
+The principal's IdP pair, `idp_iss` and `idp_sub` (Section 4.6), is copied from
+the verified subject token onto every exchanged token whose `sub` is that
+person (`rfc8693`), like `user_id_iss`; it describes the principal, never an
+actor, and remains reserved.
+
 ### 5.3 NHI delegation requires an actor proof-of-possession
 
 For NHI → NHI delegation, both `subject_token` (the orchestrator's active

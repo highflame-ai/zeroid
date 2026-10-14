@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lestrrat-go/jwx/v4/jwt"
+
 	"github.com/highflame-ai/zeroid/domain"
 )
 
@@ -107,5 +109,51 @@ func TestActorSubject(t *testing.T) {
 	}
 	if actorSubject(map[string]any{"act": "0oa1"}) != "" || actorSubject(nil) != "" {
 		t.Fatal("a malformed or absent act names no agent")
+	}
+}
+
+func TestIsCurrentActor(t *testing.T) {
+	sign := func(claims map[string]any) jwt.Token {
+		tok := jwt.New()
+		for k, v := range claims {
+			_ = tok.Set(k, v)
+		}
+		return tok
+	}
+	agentA := &domain.Identity{ID: "a", WIMSEURI: "spiffe://d/acct/proj/agent/a"}
+	idA := "a"
+	credA := &domain.IssuedCredential{IdentityID: &idA}
+
+	rfcPerson := sign(map[string]any{"sub": "user_1", "principal_type": "user", "act": map[string]any{"sub": agentA.WIMSEURI}})
+	actors := priorActorsOf(rfcPerson)
+	if !isCurrentActor(rfcPerson, credA, actors, agentA) {
+		t.Fatal("rfc8693: act.sub is the actor")
+	}
+	if isCurrentActor(rfcPerson, credA, actors, &domain.Identity{ID: "b", WIMSEURI: "spiffe://d/acct/proj/agent/b"}) {
+		t.Fatal("rfc8693: another agent is a new actor")
+	}
+	rfcCode := sign(map[string]any{"sub": "user_1", "principal_type": "user", "client_id": "c"})
+	if isCurrentActor(rfcCode, credA, priorActorsOf(rfcCode), agentA) {
+		t.Fatal("rfc8693: a root with no act has no current actor")
+	}
+	legacyPerson := sign(map[string]any{"sub": "user_1"})
+	if !isCurrentActor(legacyPerson, credA, nil, agentA) {
+		t.Fatal("legacy: the identity a person token was issued to acts for the person")
+	}
+	legacyWorkload := sign(map[string]any{"sub": agentA.WIMSEURI})
+	if isCurrentActor(legacyWorkload, credA, nil, agentA) {
+		t.Fatal("legacy: a workload's own root token has no actor")
+	}
+	idB := "b"
+	if isCurrentActor(legacyPerson, &domain.IssuedCredential{IdentityID: &idB}, nil, agentA) {
+		t.Fatal("legacy: a token issued to another identity")
+	}
+
+	if got := delegatorBefore(rfcPerson, actors); got != "user_1" {
+		t.Fatalf("delegatorBefore = %q", got)
+	}
+	chain := sign(map[string]any{"sub": "user_1", "principal_type": "user", "act": map[string]any{"sub": "B", "act": map[string]any{"sub": "A"}}})
+	if got := delegatorBefore(chain, priorActorsOf(chain)); got != "A" {
+		t.Fatalf("delegatorBefore = %q", got)
 	}
 }

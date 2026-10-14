@@ -589,9 +589,65 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 		assert.Equal(t, "user_hf_alice", child["sub"], "the chain's principal is the person")
 		assert.Equal(t, federationIssuer, child["user_id_iss"], "the chain keeps sub's issuer")
 		assert.Equal(t, "user", child["principal_type"])
-		assert.Equal(t, p.agent.wimse, actChain(t, child)[0])
+		assert.Equal(t, []string{p.agent.wimse}, actChain(t, child), "the same agent re-scoping adds no actor level")
+		assert.Nil(t, child["delegation_depth"], "nor any delegation depth")
+		assert.Equal(t, p.aliceOID, child["idp_sub"], "the principal's IdP pair travels with sub")
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["idp_iss"])
 		assert.Equal(t, p.tn.account, child["account_id"])
 	})
+	t.Run("a different agent is a new actor and a new level", func(t *testing.T) {
+		sub := p.tn.agent(t)
+		ex := postFederation(t, p.f.http.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": resp.AccessToken,
+			"actor_token":   actorAssertion(t, sub.key, sub.wimse),
+			"scope":         "tools:read",
+		})
+		require.Equal(t, http.StatusOK, ex.StatusCode, "body=%s", ex.RawBody)
+		child := decodeIssuedTokenClaims(t, ex.AccessToken)
+		assert.Equal(t, []string{sub.wimse, p.agent.wimse}, actChain(t, child))
+		assert.EqualValues(t, 1, child["delegation_depth"])
+		assert.Equal(t, p.aliceOID, child["idp_sub"])
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), child["idp_iss"])
+		assert.Equal(t, "user_hf_alice", child["sub"])
+	})
+}
+
+// TestTrustedIssuers_ReScopeLegacyProfile: under the legacy profile the
+// same agent exchanging its person token adds no depth either, and the
+// IdP pair is not stamped on a token whose sub is the agent.
+func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
+	p := newP1B(t)
+	resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "legacy"}, p.tn.headers)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	person := p.redeem(t, p.idJAG(t, nil), nil)
+	require.Equal(t, http.StatusOK, person.StatusCode, "body=%s", person.RawBody)
+	root := decodeIssuedTokenClaims(t, person.AccessToken)
+	assert.Equal(t, "user_hf_alice", root["sub"])
+	assert.Equal(t, p.aliceSub, root["idp_sub"], "a legacy person root carries the pair: its sub is the person")
+	assert.NotContains(t, root, "principal_type")
+
+	exchange := func(key *ecdsa.PrivateKey, wimse string) map[string]any {
+		ex := postFederation(t, p.f.http.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": person.AccessToken,
+			"actor_token":   actorAssertion(t, key, wimse),
+			"scope":         "tools:read",
+		})
+		require.Equal(t, http.StatusOK, ex.StatusCode, "body=%s", ex.RawBody)
+		return decodeIssuedTokenClaims(t, ex.AccessToken)
+	}
+	same := exchange(p.agent.key, p.agent.wimse)
+	assert.Nil(t, same["delegation_depth"], "the same agent re-scoping adds no depth")
+	assert.Equal(t, p.agent.wimse, same["sub"], "legacy puts the actor in sub")
+	assert.NotContains(t, same, "idp_sub", "the IdP pair describes the person, not a legacy sub")
+	assert.NotContains(t, same, "idp_iss")
+
+	other := p.tn.agent(t)
+	child := exchange(other.key, other.wimse)
+	assert.EqualValues(t, 1, child["delegation_depth"], "a different agent is a delegation")
 }
 
 func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
