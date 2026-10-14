@@ -146,25 +146,9 @@ func idJAGActors(identity *domain.Identity) []domain.Actor {
 // fails, the external identity cannot be mapped, or the `resource` audience
 // claim is absent (D3, D4).
 func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
-		// No external issuers configured → ID-JAG federation is disabled. The
-		// IdP is the trust anchor; without one there is nothing to validate the
-		// ID-JAG against, so fail closed rather than fall back to any other path.
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG federation is not configured (no external issuers)")
-	}
 	// No account_id / project_id requirement. The tenant is derived below from
 	// the issuer and the authenticated client (ADR 0042 D5); a conformant
 	// client sends neither field (draft §4.4, EMA §5).
-
-	// Unknown issuer. Unlike the id_token-exchange path (invalid_request,
-	// because the failure is a deployer-config gap), ADR 0010 D3 mandates
-	// fail-closed with invalid_grant here: an ID-JAG from an unconfigured IdP
-	// cannot be mapped to a Highflame principal.
-	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.Assertion, "ID-JAG assertion", oautherror.InvalidGrant)
-	if err != nil {
-		return nil, err
-	}
-	cfg := entry.Config
 
 	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
 	// not be redeemable by another party: the draft (with §9.1) requires
@@ -195,6 +179,20 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 			return nil, err
 		}
 	}
+
+	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
+		// No external issuers configured → ID-JAG federation is disabled. The
+		// IdP is the trust anchor; without one there is nothing to validate the
+		// ID-JAG against, so fail closed rather than fall back to any other path.
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG federation is not configured (no external issuers)")
+	}
+	// Any issuer refusal is one generic invalid_grant (ADR 0010 D3 fails
+	// closed here); resolved only after the client authenticated.
+	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.Assertion, "ID-JAG assertion")
+	if err != nil {
+		return nil, err
+	}
+	cfg := entry.Config
 
 	// Verify the ID-JAG against its IdP — signature (JWKS), iss, aud, exp/nbf,
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with

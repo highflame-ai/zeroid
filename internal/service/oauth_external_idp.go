@@ -15,10 +15,13 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/internal/telemetry"
 )
 
 // externalIDTokenClockSkew is the leeway allowed when validating the upstream
@@ -123,22 +126,63 @@ func (s *OAuthService) SetExternalIssuerRegistry(r *ExternalIssuerRegistry) {
 // check + issuer allowlist + audience binding are the proof of trust.
 // That bypass is intentional and the entire point of the new path.
 func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
-		return nil, oauthBadRequest("invalid_request", "no external issuers are configured for direct OIDC federation")
-	}
 	if req.SubjectToken == "" {
 		return nil, oauthBadRequest("invalid_request", "subject_token is required")
 	}
-	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.SubjectToken, "subject_token", oautherror.InvalidRequest)
+
+	// D13: only the relying party an ID token was issued to may redeem it, and
+	// it must authenticate as that client. Authenticated first, so nothing
+	// about the token's issuer is looked up or revealed to an anonymous
+	// caller. cimdFallback=false: this path does not gate on the client's
+	// declared grant_types, so a self-asserted document must not resolve here.
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
+	}
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
+		return nil, oauthBadRequest("invalid_request", "no external issuers are configured for direct OIDC federation")
+	}
+	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.SubjectToken, "subject_token")
 	if err != nil {
 		return nil, err
 	}
 	cfg := entry.Config
 
-	// An issuer row derives the tenant from the agent's binding (ADR 0042
-	// D5). Only a static issuer, in standalone ZeroID, takes it from the
-	// caller, inside its allowed_accounts.
-	if entry.Row == nil {
+	if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+		return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
+			"a client secret is not accepted", nil)
+	}
+
+	var (
+		identity         *domain.Identity
+		bindingAudiences []string
+	)
+	if entry.Row != nil {
+		// ADR 0042 D3a rule 1 (issuer rows): the relying party proves itself
+		// with a key, never a shared secret, so an agent needs no Highflame
+		// secret (D8). Static issuers keep the client's registered method.
+		if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+			return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
+				"a client secret is not accepted", nil)
+		}
+		// The agent is the identity the presenting client is bound to under
+		// the row (D6: on P1c the subject key is the client_id). Resolved
+		// before the token is verified so a refusal is recorded as an
+		// unmatched or unadopted agent, and the binding is then the audience
+		// rule (D3a): its client_id, which idTokenIssuedTo requires in aud,
+		// is an accepted audience beside the row's optional audiences.
+		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
+		if err != nil {
+			return nil, err
+		}
+		bindingAudiences = []string{authedClient.ClientID}
+	} else {
+		// A static issuer, in standalone ZeroID, takes the tenant from the
+		// caller, inside its allowed_accounts (D5 is for issuer rows).
 		if req.AccountID == "" || req.ProjectID == "" {
 			return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
 		}
@@ -147,47 +191,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		}
 	}
 
-	// D13: only the relying party an ID token was issued to may redeem it, and
-	// it must authenticate as that client. Without this, anyone holding a
-	// person's ID token could mint a token with that person as sub. Same
-	// shared client authentication ID-JAG uses, so the client's registered
-	// token_endpoint_auth_method decides which credential it must present.
-	if req.ClientID == "" {
-		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
-	}
-	// cimdFallback=false: this path does not gate on the client's declared
-	// grant_types, so a self-asserted document must not resolve here.
-	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
-	if err != nil {
-		return nil, err
-	}
-	// ADR 0042 D3a rule 1: the relying party proves itself with a key, never
-	// a shared secret, so an agent needs no Highflame secret (D8).
-	if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
-		return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
-			"a client secret is not accepted", nil)
-	}
-
-	// Verify the upstream ID token against its configured IdP — signature
-	// (JWKS), iss, aud, exp/nbf, alg allow-list, MaxTokenAge, and the
-	// presence of sub/exp/iat. This is the #88 federation substrate, shared
-	// verbatim with the ID-JAG jwt-bearer path (validateExternalAssertion).
-	// "subject_token" is the field name in the error strings because that is
-	// what an id_token-exchange caller presents.
-	// On an issuer row the binding is the audience rule (ADR 0042 D3a, D6): an
-	// enabled binding for the presenting client makes its client_id, which
-	// idTokenIssuedTo requires in aud, an accepted audience. The row's own
-	// audiences are an optional extra allowlist.
-	var bindingAudiences []string
-	if entry.Row != nil && s.issuerBindings != nil {
-		b, err := s.issuerBindings.EnabledBinding(ctx, entry.Row.ID, authedClient.ClientID)
-		if err != nil {
-			return nil, oauthServerError("failed to read the agent's credential binding", err)
-		}
-		if b != nil {
-			bindingAudiences = []string{authedClient.ClientID}
-		}
-	}
+	// Verify the upstream ID token against its IdP — signature (JWKS), iss,
+	// aud, exp/nbf, alg allow-list, MaxTokenAge, and the presence of
+	// sub/exp/iat. Shared verbatim with the ID-JAG path.
 	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub, bindingAudiences...)
 	if err != nil {
 		return nil, err
@@ -213,20 +219,10 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
 
-	// The agent. For an issuer row it is the identity the presenting client
-	// is bound to under that row (D6: on P1c the subject key is the client_id,
-	// which is the ID token's aud), and the tenant is that identity's.
-	// Static issuers keep the caller-named application, or a synthetic
-	// carrier.
-	var (
-		identity *domain.Identity
-		actors   []domain.Actor
-	)
+	// For an issuer row the tenant is the bound agent's (D5). Static issuers
+	// keep the caller-named application, or a synthetic carrier.
+	var actors []domain.Actor
 	if entry.Row != nil {
-		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
-		if err != nil {
-			return nil, err
-		}
 		if err := federatedTenant(identity, req.AccountID, req.ProjectID); err != nil {
 			return nil, err
 		}
@@ -384,9 +380,12 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 // resolvePersonIssuer reads the token's issuer and resolves the trusted
 // person issuer it must verify against (ADR 0042 D4: person grants accept
-// only enabled person rows). An issuer nobody trusts is unknownCode, which
-// differs by path; a workload, disabled or unmatched issuer is invalid_grant.
-func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName, unknownCode string) (*ExternalIssuerEntry, string, error) {
+// only enabled person rows). Every refusal is one generic invalid_grant on
+// the wire, since the token is not verified yet: telling an unknown issuer
+// from a disabled, workload or unmatched one would let a probe learn which
+// IdPs a deployment trusts. The reason is logged and counted. Callers
+// authenticate the client first.
+func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName string) (*ExternalIssuerEntry, string, error) {
 	peeked, err := jwt.ParseInsecure([]byte(token))
 	if err != nil {
 		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+" is malformed", err)
@@ -396,20 +395,26 @@ func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName
 		return nil, "", oauthBadRequest(oautherror.InvalidGrant, fieldName+" missing iss claim")
 	}
 	entry, err := s.externalIssuerRegistry.ResolvePerson(ctx, iss, tokenClaimsAsMap(peeked))
-	switch {
-	case err == nil:
+	if err == nil {
 		return entry, iss, nil
-	case errors.Is(err, ErrUnknownExternalIssuer):
-		return nil, "", oauthBadRequestCause(unknownCode, fmt.Sprintf("issuer %s is not a configured external issuer", iss), err)
-	case errors.Is(err, errIssuerNotPerson):
-		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant,
-			fmt.Sprintf("issuer %s is not trusted for person grants (it is a workload issuer)", iss), err)
-	case errors.Is(err, errIssuerDisabled):
-		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("issuer %s is disabled", iss), err)
-	case errors.Is(err, errIssuerConstraints), errors.Is(err, errIssuerAmbiguous):
-		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+" does not match exactly one trusted issuer for "+iss, err)
 	}
-	return nil, "", oauthServerError("failed to resolve the external issuer", err)
+	if errors.Is(err, errIssuerLookupFailed) {
+		return nil, "", oauthServerError("failed to resolve the external issuer", err)
+	}
+	reason := "unknown"
+	switch {
+	case errors.Is(err, errIssuerNotPerson):
+		reason = "workload_issuer"
+	case errors.Is(err, errIssuerDisabled):
+		reason = "disabled"
+	case errors.Is(err, errIssuerConstraints):
+		reason = "constraints"
+	case errors.Is(err, errIssuerAmbiguous):
+		reason = "ambiguous"
+	}
+	telemetry.FederationIssuerRefused.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+	log.Info().Err(err).Str("issuer", iss).Str("reason", reason).Msg("federation_issuer_refused")
+	return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+"'s issuer is not trusted for this grant", err)
 }
 
 // validateExternalAssertion runs the #88 external-IdP validation substrate

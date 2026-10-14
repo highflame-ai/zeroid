@@ -145,81 +145,49 @@ func TestCheckExternalIDTokenAlg(t *testing.T) {
 	}
 }
 
-// TestExternalIDTokenExchange_UnknownIssuerWrapsSentinel verifies the dual
-// signaling path for the unknown-issuer case: the OAuth handler picks up the
-// error code via errors.As on *OAuthError, while service-layer callers can
-// branch with errors.Is(ErrUnknownExternalIssuer).
-func TestExternalIDTokenExchange_UnknownIssuerWrapsSentinel(t *testing.T) {
-	// Build a registry that knows iss=A but not iss=B.
-	jwks := newFakeJWKSServer(t, "kid-1")
-	defer jwks.Close()
-
-	cfg := domain.ExternalIssuerConfig{
-		Issuer:          "https://known.example.test",
-		JWKSURI:         jwks.URL(),
-		Audience:        "https://zeroid.example.test",
-		ClaimMapping:    map[string]string{"user_id": "sub"},
-		AllowedAccounts: []string{"acct"},
+// TestResolvePersonIssuer_OneGenericRefusal pins that an unverified
+// token's issuer refusals are indistinguishable on the wire (one
+// invalid_grant) while the cause stays in the chain for logs and callers.
+func TestResolvePersonIssuer_OneGenericRefusal(t *testing.T) {
+	jwksSrv := newFakeJWKSServer(t, "kid-1")
+	defer jwksSrv.Close()
+	const iss = "https://idp.example.test"
+	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{issuerRow("r1", "acct", iss, domain.IssuerKindPerson, jwksSrv.URL())}}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)))}
+	defer svc.externalIssuerRegistry.Close()
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	token := func(issuer string) string {
+		tok, _ := jwt.NewBuilder().Issuer(issuer).Subject("alice").IssuedAt(time.Now()).Expiration(time.Now().Add(time.Minute)).Build()
+		signed, _ := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
+		return string(signed)
 	}
-	cfg.Defaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validate cfg: %v", err)
+	var descriptions []string
+	check := func(name, issuer string, sentinel error) {
+		t.Helper()
+		_, _, err := svc.resolvePersonIssuer(context.Background(), token(issuer), "subject_token")
+		var oe *OAuthError
+		if !errors.As(err, &oe) || oe.Code != "invalid_grant" || oe.HTTPStatus != http.StatusBadRequest {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("%s: cause %v not in chain", name, sentinel)
+		}
+		descriptions = append(descriptions, oe.Description)
 	}
-	registry, err := NewExternalIssuerRegistry(
-		context.Background(),
-		[]domain.ExternalIssuerConfig{cfg},
-		authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)),
-	)
-	if err != nil {
-		t.Fatalf("NewExternalIssuerRegistry: %v", err)
-	}
-	defer registry.Close()
-
-	// Mint a JWT whose iss is *not* the configured one. Lookup should miss
-	// and the federation path should return before any signature work.
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	tok, err := jwt.NewBuilder().
-		Issuer("https://stranger.example.test").
-		Subject("alice").
-		IssuedAt(time.Now()).
-		Expiration(time.Now().Add(5 * time.Minute)).
-		Build()
-	if err != nil {
-		t.Fatalf("build token: %v", err)
-	}
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
-	if err != nil {
-		t.Fatalf("sign token: %v", err)
-	}
-
-	svc := &OAuthService{externalIssuerRegistry: registry}
-	_, err = svc.externalIDTokenExchange(context.Background(), TokenRequest{
-		SubjectToken: string(signed),
-		AccountID:    "acct",
-		ProjectID:    "proj",
+	check("unknown", "https://stranger.example.test", ErrUnknownExternalIssuer)
+	rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled = false })
+	check("disabled", iss, errIssuerDisabled)
+	rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled, r[0].Kind = true, domain.IssuerKindWorkload })
+	check("workload", iss, errIssuerNotPerson)
+	rows.set(func(r []*domain.ExternalIssuer) {
+		r[0].Kind = domain.IssuerKindPerson
+		r[0].ClaimConstraints = map[string][]string{"tid": {"t"}}
 	})
-	if err == nil {
-		t.Fatalf("expected error for unknown issuer, got nil")
-	}
-
-	// Handler path: errors.As on *OAuthError must yield invalid_request / 400.
-	var oauthErr *OAuthError
-	if !errors.As(err, &oauthErr) {
-		t.Fatalf("expected *OAuthError in chain, got %T: %v", err, err)
-	}
-	if oauthErr.Code != "invalid_request" {
-		t.Errorf("Code = %q, want invalid_request", oauthErr.Code)
-	}
-	if oauthErr.HTTPStatus != http.StatusBadRequest {
-		t.Errorf("HTTPStatus = %d, want 400", oauthErr.HTTPStatus)
-	}
-
-	// Caller path: errors.Is on the sentinel must succeed.
-	if !errors.Is(err, ErrUnknownExternalIssuer) {
-		t.Errorf("expected errors.Is(err, ErrUnknownExternalIssuer) to be true; chain = %v", err)
+	check("constraints", iss, errIssuerConstraints)
+	for _, d := range descriptions[1:] {
+		if d != descriptions[0] {
+			t.Fatalf("refusals differ on the wire: %q vs %q", d, descriptions[0])
+		}
 	}
 }
 
@@ -281,5 +249,24 @@ func TestRequireIDToken(t *testing.T) {
 		if !errors.As(err, &oe) || oe.Code != "invalid_grant" {
 			t.Fatalf("missing %s must be invalid_grant, got %v", claim, err)
 		}
+	}
+}
+
+// TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth: an
+// anonymous exchange is invalid_client before any issuer lookup.
+func TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
+	rows := &fakeIssuerRows{}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true)}
+	defer svc.externalIssuerRegistry.Close()
+	tok, _ := jwt.NewBuilder().Issuer("https://probe.example.test").Subject("alice").Build()
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signed, _ := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
+	_, err := svc.externalIDTokenExchange(context.Background(), TokenRequest{SubjectToken: string(signed)})
+	var oe *OAuthError
+	if !errors.As(err, &oe) || oe.Code != "invalid_client" {
+		t.Fatalf("err = %v, want invalid_client", err)
+	}
+	if rows.calls != 0 {
+		t.Fatalf("issuer looked up %d times before client authentication", rows.calls)
 	}
 }

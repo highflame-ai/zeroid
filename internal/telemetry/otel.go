@@ -69,6 +69,11 @@ var (
 	// bound agent is not active (ADR 0042 D7): the adoption queue's demand.
 	// Attributes: account_id, grant_type, status.
 	FederationAgentNotAdopted metric.Int64Counter
+
+	// FederationIssuerRefused counts person grants whose token issuer was
+	// unknown, a workload issuer, disabled, or matched no single row. The
+	// wire answer is one generic invalid_grant. Attribute: reason.
+	FederationIssuerRefused metric.Int64Counter
 )
 
 func init() {
@@ -115,6 +120,9 @@ func registerInstruments(m metric.Meter) {
 	)
 	FederationAgentNotAdopted, _ = m.Int64Counter("zeroid.federation.agent_not_adopted",
 		metric.WithDescription("Federated grants refused because the bound agent identity is not active"),
+	)
+	FederationIssuerRefused, _ = m.Int64Counter("zeroid.federation.issuer_refused",
+		metric.WithDescription("Federated person grants refused at issuer resolution, by reason"),
 	)
 }
 

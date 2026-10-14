@@ -90,12 +90,17 @@ The subject key is the value the credential carries at runtime:
 | ID-token exchange (P1c) | the presenting client's `client_id`, which is the ID token's `aud` |
 
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
-A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active, so a discovered agent's binding turns on at adoption.
+A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
+ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an agent's bindings when an org admin adopts or activates it.
+Until then the mint refuses it as not adopted (D7), naming the state.
 
 ## The person grants with issuer rows
 
 Both grants resolve the issuer first: the token's `iss` must have an **enabled `person`** row whose claim constraints the token satisfies.
-An unknown issuer is `invalid_request` on the ID-token exchange and `invalid_grant` on ID-JAG, as before; a workload, disabled or unmatched row is `invalid_grant`.
+The client authenticates first; nothing about the token's issuer is looked up for an anonymous caller.
+Every issuer refusal (unknown, workload row, disabled row, no or several rows matching its constraints) is then the same `invalid_grant` ("…'s issuer is not trusted for this grant"), since the token is not verified yet and a distinct answer would tell a probe which IdPs are trusted.
+The reason is logged as `federation_issuer_refused` and counted in `zeroid.federation.issuer_refused{reason}`.
+This also applies to static issuers, where an unknown issuer on the ID-token exchange used to be `invalid_request`.
 The token's `aud` must name an accepted audience: on the ID-token exchange the presenting client's `client_id` when an enabled binding on the row has it as subject key, on ID-JAG ZeroID's issuer, and on both any value in the row's `audiences`.
 
 ### P1c: the ID-token exchange
@@ -138,9 +143,10 @@ Every check, including person resolution, runs before the ID-JAG's `jti` is cons
 
 ### Refusals that are events
 
-- **Unmatched agent** (ADR 0027): no `act.sub`, no enabled binding, a binding to no identity in the account, or a client linked to a different identity.
+- **Unmatched agent** (ADR 0027): no `act.sub`, no binding, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
+  On the ID-token exchange the binding is resolved before the token is verified, so these are recorded there too.
   Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
-- **Agent not adopted** (D7): the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
+- **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
 
 ZeroID has no event bus; an embedder that needs ADR 0027 findings reads these.
 

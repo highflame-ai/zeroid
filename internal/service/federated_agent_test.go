@@ -16,9 +16,9 @@ import (
 
 type fakeBindings map[string]*domain.IssuerBinding
 
-func (f fakeBindings) EnabledBinding(_ context.Context, issuerID, subjectKey string) (*domain.IssuerBinding, error) {
-	if b, ok := f[issuerID+"|"+subjectKey]; ok && b.Enabled {
-		return b, nil
+func (f fakeBindings) BindingsFor(_ context.Context, issuerID, subjectKey string) ([]*domain.IssuerBinding, error) {
+	if b, ok := f[issuerID+"|"+subjectKey]; ok {
+		return []*domain.IssuerBinding{b}, nil
 	}
 	return nil, nil
 }
@@ -55,6 +55,7 @@ func TestBindAgent(t *testing.T) {
 		"row-1|okta-client-3": {IdentityID: "agent-3", Enabled: true},
 		"row-1|okta-client-4": {IdentityID: "agent-4", Enabled: true},
 		"row-1|disabled":      {IdentityID: "agent-1", Enabled: false},
+		"row-1|disc-disabled": {IdentityID: "agent-2", Enabled: false},
 	}
 	lookup := identityLookupOf(active, discovered, pending, foreign)
 	ctx := context.Background()
@@ -73,14 +74,15 @@ func TestBindAgent(t *testing.T) {
 		client *domain.OAuthClient
 		msg    string
 	}{
-		"no act.sub":               {key: "", msg: "names no agent"},
-		"no binding":               {key: "okta-client-9", msg: "no enabled binding"},
-		"disabled binding":         {key: "disabled", msg: "no enabled binding"},
-		"discovered agent (D7)":    {key: "okta-client-2", msg: "is discovered"},
-		"pending agent (D7)":       {key: "okta-client-3", msg: "is pending"},
-		"identity in another acct": {key: "okta-client-4", msg: "no identity in the issuer's account"},
-		"client bound elsewhere":   {key: "okta-client-1", client: linked("agent-9"), msg: "not registered to the agent"},
-		"client linked to nothing": {key: "okta-client-1", client: &domain.OAuthClient{ClientID: "c"}, msg: "not registered to the agent"},
+		"no act.sub":       {key: "", msg: "names no agent"},
+		"no binding":       {key: "okta-client-9", msg: "no enabled binding"},
+		"disabled binding": {key: "disabled", client: linked("agent-1"), msg: "no enabled binding"},
+		"disabled binding, discovered agent (D7 named)": {key: "disc-disabled", client: linked("agent-2"), msg: "is discovered"},
+		"discovered agent (D7)":                         {key: "okta-client-2", msg: "is discovered"},
+		"pending agent (D7)":                            {key: "okta-client-3", msg: "is pending"},
+		"identity in another acct":                      {key: "okta-client-4", msg: "no identity in the issuer's account"},
+		"client bound elsewhere":                        {key: "okta-client-1", client: linked("agent-9"), msg: "not registered to the agent"},
+		"client linked to nothing":                      {key: "okta-client-1", client: &domain.OAuthClient{ClientID: "c"}, msg: "not registered to the agent"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := bindAgent(ctx, bindings, lookup, row, tc.key, tc.client, federatedGrantIDJAG)

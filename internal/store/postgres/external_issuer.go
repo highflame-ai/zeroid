@@ -222,20 +222,19 @@ func (r *ExternalIssuerRepository) DeleteBinding(ctx context.Context, id, issuer
 	return nil
 }
 
-// EnabledBinding returns the enabled binding for (issuer row, subject key),
-// or (nil, nil) when there is none. The per-grant lookup.
-func (r *ExternalIssuerRepository) EnabledBinding(ctx context.Context, issuerID, subjectKey string) (*domain.IssuerBinding, error) {
-	b := &domain.IssuerBinding{}
-	err := dbOrTx(ctx, r.db).NewSelect().Model(b).
+// BindingsFor returns every binding for (issuer row, subject key), the
+// enabled one first. The per-grant lookup: the disabled ones say why a
+// credential maps to no usable agent.
+func (r *ExternalIssuerRepository) BindingsFor(ctx context.Context, issuerID, subjectKey string) ([]*domain.IssuerBinding, error) {
+	var out []*domain.IssuerBinding
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&out).
 		Where("issuer_id = ?", issuerID).
 		Where("subject_key = ?", subjectKey).
-		Where("enabled").
+		OrderExpr("enabled DESC, created_at DESC").
+		Limit(10).
 		Scan(ctx)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to read binding: %w", err)
+		return nil, fmt.Errorf("failed to read bindings: %w", err)
 	}
-	return b, nil
+	return out, nil
 }

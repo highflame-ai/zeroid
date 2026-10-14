@@ -18,7 +18,7 @@ import (
 // issuerBindingSource reads credential bindings;
 // *postgres.ExternalIssuerRepository.
 type issuerBindingSource interface {
-	EnabledBinding(ctx context.Context, issuerID, subjectKey string) (*domain.IssuerBinding, error)
+	BindingsFor(ctx context.Context, issuerID, subjectKey string) ([]*domain.IssuerBinding, error)
 }
 
 // SetIssuerBindings installs the binding store the federated person grants
@@ -57,15 +57,16 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "no_subject_key")
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "the credential names no agent to bind (no act.sub)")
 	}
-	binding, err := bindings.EnabledBinding(ctx, row.ID, subjectKey)
+	all, err := bindings.BindingsFor(ctx, row.ID, subjectKey)
 	if err != nil {
 		return nil, oauthServerError("failed to read the agent's credential binding", err)
 	}
-	if binding == nil {
+	if len(all) == 0 {
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "no_binding")
 		return nil, oauthBadRequest(oautherror.InvalidGrant,
 			fmt.Sprintf("no enabled binding maps agent %q under issuer %s to an identity", subjectKey, row.Issuer))
 	}
+	binding := all[0]
 	identity, err := lookup(ctx, binding.IdentityID, []string{row.AccountID})
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -82,10 +83,18 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 		return nil, oauthBadRequest(oautherror.InvalidGrant,
 			"the authenticated client is not registered to the agent the credential is bound to")
 	}
+	// D7 before the enabled flag: a discovered agent's binding is disabled
+	// until the deployer enables it at adoption, and that refusal is the
+	// adoption queue's demand.
 	if identity.Status != domain.IdentityStatusActive {
 		recordAgentNotAdopted(ctx, row, identity, grant)
 		return nil, oauthBadRequest(oautherror.InvalidGrant,
 			fmt.Sprintf("agent identity is %s; tokens are minted only for an adopted (active) identity", identity.Status))
+	}
+	if !binding.Enabled {
+		recordUnmatchedAgent(ctx, row, subjectKey, grant, "binding_disabled")
+		return nil, oauthBadRequest(oautherror.InvalidGrant,
+			fmt.Sprintf("no enabled binding maps agent %q under issuer %s to an identity", subjectKey, row.Issuer))
 	}
 	if identity.IsExpired() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")

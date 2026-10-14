@@ -725,15 +725,15 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		resp := p.exchange(t, good(), map[string]any{"account_id": p.tn.account, "project_id": p.tn.project})
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
-	t.Run("a presenting client with no binding is not an audience of the row", func(t *testing.T) {
+	t.Run("a presenting client with no binding is an unmatched agent, before its token is read", func(t *testing.T) {
 		app := uid("app-unbound")
 		rp := rpClient(t, app)
 		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": app})),
 			clientCreds(t, app, rp.Key)))
 		requireRefused(t, resp, "invalid_grant")
-		assert.Contains(t, resp.RawBody, "aud is not one this issuer is trusted for")
+		assert.Contains(t, resp.RawBody, "no enabled binding")
 	})
-	t.Run("a disabled binding no longer admits its client as an audience", func(t *testing.T) {
+	t.Run("a disabled binding no longer admits its client", func(t *testing.T) {
 		other := p.tn.agent(t)
 		app := uid("app-disabled")
 		status, body := p.f.bind(t, p.tn, p.rowID, app, other.id, true)
@@ -747,7 +747,7 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		require.Equal(t, http.StatusOK, status)
 		resp := exchange()
 		requireRefused(t, resp, "invalid_grant")
-		assert.Contains(t, resp.RawBody, "aud is not one this issuer is trusted for")
+		assert.Contains(t, resp.RawBody, "no enabled binding")
 	})
 	t.Run("a presenting client with no binding", func(t *testing.T) {
 		loneApp := uid("app-lone")
@@ -762,12 +762,11 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		discovered := p.tn.discoveredAgent(t)
 		app := uid("app-unadopted")
 		_, _ = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"audiences": []string{p.appID, app}}, p.tn.headers)
-		// Discovery writes the binding; force it enabled as a stale or direct
-		// write would, to show the mint still refuses (D7).
+		// The binding is created disabled (D6) until the deployer enables it at
+		// adoption; the mint still names the state (D7).
 		status, body := p.f.bind(t, p.tn, p.rowID, app, discovered, false)
 		require.Equal(t, http.StatusCreated, status, "%v", body)
-		_, err := testDB.NewUpdate().Table("external_issuer_bindings").Set("enabled = true").Where("id = ?", body["id"]).Exec(context.Background())
-		require.NoError(t, err)
+		require.Equal(t, false, body["enabled"])
 		key := keyClient(t, p.tn, app, discovered)
 		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": app})),
 			clientCreds(t, app, key)))
@@ -782,7 +781,7 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		k8s := p.f.mint(t, mockidp.ProfileK8sServiceAccount, map[string]any{"aud": p.appID})
 		resp := p.exchange(t, k8s, nil)
 		requireRefused(t, resp, "invalid_grant")
-		assert.Contains(t, resp.RawBody, "workload issuer")
+		assert.Contains(t, resp.RawBody, "issuer is not trusted for this grant", "one generic refusal")
 	})
 	t.Run("a disabled issuer, on every replica at the next request", func(t *testing.T) {
 		_, replica := newDBFederationServer(t)
@@ -932,8 +931,7 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 		key := uid("0oa-disc")
 		status, body := p.f.bind(t, p.tn, p.rowID, key, discovered, false)
 		require.Equal(t, http.StatusCreated, status, "%v", body)
-		_, err := testDB.NewUpdate().Table("external_issuer_bindings").Set("enabled = true").Where("id = ?", body["id"]).Exec(context.Background())
-		require.NoError(t, err)
+		require.Equal(t, false, body["enabled"], "created disabled; the mint still names the state (D7)")
 		clientKey := keyClient(t, p.tn, key, discovered)
 		resp := postFederation(t, p.f.http.URL, merged(map[string]any{
 			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
