@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -366,7 +367,14 @@ func runTests(m *testing.M) int {
 
 		// Denial trigger: stands in for a consent front end reporting that the
 		// authenticated user declined.
-		if req.Header("X-Test-Access-Denied") != "" {
+		// "with-interaction" joins it with ErrPrincipalInteractionRequired, to
+		// pin that the denial wins: the handler must not restart a login the
+		// user has just declined.
+		switch req.Header("X-Test-Access-Denied") {
+		case "":
+		case "with-interaction":
+			return nil, errors.Join(zeroid.ErrPrincipalInteractionRequired, zeroid.ErrPrincipalAccessDenied)
+		default:
 			return nil, zeroid.ErrPrincipalAccessDenied
 		}
 

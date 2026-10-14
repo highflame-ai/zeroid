@@ -61,6 +61,20 @@ func TestAuthorizeGET_AccessDeniedRedirects(t *testing.T) {
 	require.Equal(t, "get-state-abc", q.Get("state"))
 }
 
+// A resolver whose error matches both ErrPrincipalAccessDenied and
+// ErrPrincipalInteractionRequired gets the denial, not a trip to the login
+// surface (which this harness configures, so the wrong order would redirect
+// there).
+func TestAuthorizeGET_AccessDeniedOutranksInteractionRequired(t *testing.T) {
+	query, _ := authorizeGETQuery(t)
+
+	resp := getAuthorize(t, query, map[string]string{"X-Test-Access-Denied": "with-interaction"})
+	defer func() { _ = resp.Body.Close() }()
+
+	q := requireAccessDeniedRedirect(t, resp, testRedirectURI, testIssuer)
+	require.Equal(t, "get-state-abc", q.Get("state"))
+}
+
 // POST redirects too — the one POST error that does, because the caller is the
 // front end that forwards the Location to the browser.
 func TestAuthorizePOST_AccessDeniedRedirects(t *testing.T) {
