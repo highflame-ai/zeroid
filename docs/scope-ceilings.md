@@ -169,11 +169,17 @@ enforcement would affect before turning it on.
   holds no scopes.
 - `openid` asks for authentication, not authority, so the ceiling never
   removes it, and a request for `openid` alone is never refused.
-- A refusal is `invalid_scope` (RFC 6749 §5.2), and `invalid_grant` on
-  refresh, where the client should re-authorize. In enforce mode
-  `/oauth2/authorize` checks too, so the refusal reaches the client there
-  (RFC 6749 §4.1.2.1) rather than consuming the code. CIBA, ID-JAG and
-  refresh decide before consuming their single-use credential.
+- Refusals, by where they happen:
+
+  | Grant | The ceiling leaves nothing | The resolver fails (enforce) |
+  |---|---|---|
+  | `/oauth2/authorize` (enforce only) | `invalid_scope` (RFC 6749 §4.1.2.1) | `server_error` |
+  | `authorization_code`, `refresh_token` at the token endpoint | `invalid_grant`: the grant's authority changed after consent, so the client should re-authorize | `server_error` |
+  | Root CIBA, ID-JAG, ID-token exchange, external-principal exchange | `invalid_scope` (RFC 6749 §5.2) | `server_error` |
+
+  Every grant decides before consuming its single-use credential (the code,
+  the refresh token, the approved `auth_req_id`, the ID-JAG `jti`), so a
+  refused request can be retried once the role is restored.
 - A refresh family keeps the scopes the person consented to. Each refresh
   applies the current ceiling, so a role change takes effect at the next
   refresh. Outstanding access tokens keep their scopes until they expire.

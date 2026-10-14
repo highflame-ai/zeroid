@@ -171,7 +171,7 @@ const (
 
 // ErrPersonScopeDenied is the cause when a person's ceiling leaves none of the
 // requested scopes. The token endpoint answers invalid_scope (invalid_grant on
-// refresh) and /oauth2/authorize redirects with invalid_scope.
+// authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
 var ErrPersonScopeDenied = service.ErrPersonScopeDenied
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.

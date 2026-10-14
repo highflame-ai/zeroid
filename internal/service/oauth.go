@@ -2499,6 +2499,22 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, err
 	}
 
+	// The person's ceiling, also before Consume: a refusal leaves the code
+	// redeemable within its lifetime once the role is restored. invalid_grant,
+	// as on refresh: the grant's authority changed after consent. The
+	// decision is handed to the mint below.
+	probe := IssueRequest{
+		Identity:        &domain.Identity{AccountID: authCode.AccountID, ProjectID: authCode.ProjectID},
+		GrantType:       domain.GrantTypeAuthorizationCode,
+		SubjectOverride: authCode.UserID,
+		ClientID:        authCode.ClientID,
+		Audience:        boundResources,
+		Scopes:          authCode.Scopes,
+	}
+	if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+	}
+
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
 	// Placed after all validation (client, redirect_uri, PKCE) so an
 	// attacker who intercepts a code but doesn't know the verifier cannot
@@ -2583,13 +2599,14 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		TTL:               ttl,
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		personGrant:       probe.personGrant,
 	}
 
 	bindResourceOnIssue(&issue, boundResources)
 
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
-		return nil, err
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
 	}
 
 	accessToken.AccountID = authCode.AccountID

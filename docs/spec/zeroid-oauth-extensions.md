@@ -460,7 +460,8 @@ person (`authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG,
 ID-token exchange, the trusted external-principal exchange) is then issued
 with scope = request (or its default) ∩ the ceiling the resolver returns for
 that person, and a request that leaves nothing is refused with
-`invalid_scope` (`invalid_grant` on refresh). An empty ceiling grants
+`invalid_scope` (`invalid_grant` on `authorization_code` and refresh at the
+token endpoint; `invalid_scope` at the authorization endpoint). An empty ceiling grants
 nothing; `openid` is never removed. Token exchange and a CIBA step-up carry
 their chain's principal and are not consulted. A shadow mode counts what
 enforcement would change without changing it. The resolver's roles are

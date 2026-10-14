@@ -235,7 +235,7 @@ var personGrantTypes = map[string]string{
 func TestPersonGrant_SixGrants(t *testing.T) {
 	f := newPersonGrantFederation(t)
 	requested := []string{"pg:a", "pg:b"}
-	deniedCode := map[string]string{"refresh_token": "invalid_grant"}
+	deniedCode := map[string]string{"authorization_code": "invalid_grant", "refresh_token": "invalid_grant"}
 
 	for _, tc := range []struct {
 		name       string
@@ -481,4 +481,32 @@ func TestPersonGrant_RolesIsReserved(t *testing.T) {
 		grants.set(user, &zeroid.PersonGrant{Roles: []string{"member"}}, nil)
 		assert.Equal(t, []any{"member"}, mint(t, user)["roles"])
 	})
+}
+
+// TestPersonGrant_RefusedCodeIsNotConsumed: a code refused at the token
+// endpoint (the role changed after authorize) can be redeemed once the role
+// is restored, within the code's lifetime.
+func TestPersonGrant_RefusedCodeIsNotConsumed(t *testing.T) {
+	grants := installPersonGrants(t, zeroid.PersonGrantModeEnforce, testZeroIDServer)
+	user := uid("pg-code")
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testCLIClientID, user, testRedirectURI, challenge, []string{"pg:a"})
+	redeem := func(t *testing.T) (int, map[string]any) {
+		t.Helper()
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type": "authorization_code", "client_id": testCLIClientID,
+			"code": code, "code_verifier": verifier, "redirect_uri": testRedirectURI,
+		}, nil)
+		return resp.StatusCode, decode(t, resp)
+	}
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:c"}}, nil)
+	status, body := redeem(t)
+	require.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_grant", body["error"])
+
+	grants.set(user, &zeroid.PersonGrant{Scopes: []string{"pg:a"}}, nil)
+	status, body = redeem(t)
+	require.Equal(t, http.StatusOK, status, "the refused redemption did not consume the code; body=%v", body)
+	assert.ElementsMatch(t, []any{"pg:a"}, decodeJWTPayload(t, body["access_token"].(string))["scopes"])
 }
