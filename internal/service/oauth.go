@@ -290,6 +290,10 @@ var defaultAudienceScopeProfiles = map[string][]string{
 	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
 	// the api-key exchange flow (which widens its own request), the embed-handoff
 	// token is used verbatim, so this server-side profile is the only lever.
+	// `settings:*` drive the Settings screen and `fleet:read` the fleet board —
+	// without them those surfaces fail "Missing scope: settings:read" (#400).
+	// Together this is codeoid's full scope set (its protocol ALL_SCOPES): the
+	// embedded UI is the user's own workspace, with the owner's reach.
 	audienceCodeoid: {
 		"session:list",
 		"session:create",
@@ -306,6 +310,9 @@ var defaultAudienceScopeProfiles = map[string][]string{
 		"pipeline:create",
 		"pipeline:answer",
 		"pipeline:manage",
+		"settings:read",
+		"settings:write",
+		"fleet:read",
 	},
 	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
 	// to register a per-sandbox identity on the user's behalf.
@@ -335,6 +342,9 @@ var allowedProfileScopes = map[string]bool{
 	"pipeline:create":   true,
 	"pipeline:answer":   true,
 	"pipeline:manage":   true,
+	"settings:read":     true,
+	"settings:write":    true,
+	"fleet:read":        true,
 }
 
 // ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
