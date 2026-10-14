@@ -70,6 +70,7 @@ func (r *ExternalIssuerRepository) ListByIssuer(ctx context.Context, issuer stri
 	var rows []*domain.ExternalIssuer
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&rows).
 		Where("issuer = ?", issuer).
+		Where("deleted_at IS NULL").
 		OrderExpr("created_at, id").
 		Scan(ctx)
 	if err != nil {
@@ -84,6 +85,7 @@ func (r *ExternalIssuerRepository) ListByCanonicalIssuer(ctx context.Context, ca
 	var rows []*domain.ExternalIssuer
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&rows).
 		Where("rtrim(issuer, '/') = ?", canon).
+		Where("deleted_at IS NULL").
 		OrderExpr("created_at, id").
 		Scan(ctx)
 	if err != nil {
@@ -96,6 +98,7 @@ func (r *ExternalIssuerRepository) ListByCanonicalIssuer(ctx context.Context, ca
 func (r *ExternalIssuerRepository) CountByAccount(ctx context.Context, accountID string) (int, error) {
 	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.ExternalIssuer)(nil)).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		Count(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count issuers: %w", err)
@@ -118,6 +121,7 @@ func (r *ExternalIssuerRepository) Get(ctx context.Context, id, accountID string
 	err := dbOrTx(ctx, r.db).NewSelect().Model(row).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issuer: %w", err)
@@ -130,6 +134,7 @@ func (r *ExternalIssuerRepository) List(ctx context.Context, accountID string) (
 	var rows []*domain.ExternalIssuer
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&rows).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		OrderExpr("created_at, id").
 		Scan(ctx)
 	if err != nil {
@@ -148,6 +153,7 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
+		Where("deleted_at IS NULL").
 		Returning("*").
 		Exec(ctx)
 	if err != nil {
@@ -166,6 +172,7 @@ func (r *ExternalIssuerRepository) SetJWKSURI(ctx context.Context, row *domain.E
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
+		Where("deleted_at IS NULL").
 		Returning("*").
 		Exec(ctx)
 	if err != nil {
@@ -177,17 +184,32 @@ func (r *ExternalIssuerRepository) SetJWKSURI(ctx context.Context, row *domain.E
 	return nil
 }
 
-// Delete removes a row and, by cascade, its bindings.
+// Delete soft-deletes a row and its live bindings. Requires a transaction.
 func (r *ExternalIssuerRepository) Delete(ctx context.Context, id, accountID string) error {
-	res, err := dbOrTx(ctx, r.db).NewDelete().Model((*domain.ExternalIssuer)(nil)).
+	if !hasTx(ctx) {
+		return errors.New("Delete requires a transaction")
+	}
+	db := dbOrTx(ctx, r.db)
+	res, err := db.NewUpdate().Model((*domain.ExternalIssuer)(nil)).
+		Set("deleted_at = clock_timestamp()").
+		Set("enabled = false").
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to delete issuer: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("failed to delete issuer: %w", sql.ErrNoRows)
+	}
+	if _, err := db.NewUpdate().Model((*domain.IssuerBinding)(nil)).
+		Set("deleted_at = clock_timestamp()").
+		Set("enabled = false").
+		Where("issuer_id = ?", id).
+		Where("deleted_at IS NULL").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("failed to delete the issuer's bindings: %w", err)
 	}
 	return nil
 }
@@ -209,6 +231,7 @@ func (r *ExternalIssuerRepository) GetBinding(ctx context.Context, id, issuerID,
 		Where("id = ?", id).
 		Where("issuer_id = ?", issuerID).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get binding: %w", err)
@@ -220,7 +243,7 @@ func (r *ExternalIssuerRepository) GetBinding(ctx context.Context, id, issuerID,
 // and/or one identity when those are non-empty.
 func (r *ExternalIssuerRepository) ListBindings(ctx context.Context, accountID, issuerID, identityID string) ([]*domain.IssuerBinding, error) {
 	var out []*domain.IssuerBinding
-	q := dbOrTx(ctx, r.db).NewSelect().Model(&out).Where("account_id = ?", accountID)
+	q := dbOrTx(ctx, r.db).NewSelect().Model(&out).Where("account_id = ?", accountID).Where("deleted_at IS NULL")
 	if issuerID != "" {
 		q = q.Where("issuer_id = ?", issuerID)
 	}
@@ -237,10 +260,11 @@ func (r *ExternalIssuerRepository) ListBindings(ctx context.Context, accountID, 
 // UpdateBinding rewrites a binding's enabled flag.
 func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.IssuerBinding) error {
 	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(b).
-		Column("enabled", "updated_by").
+		Column("enabled", "explicitly_disabled", "updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", b.ID).
 		Where("account_id = ?", b.AccountID).
+		Where("deleted_at IS NULL").
 		Returning("*").
 		Exec(ctx)
 	if err != nil {
@@ -252,12 +276,15 @@ func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.
 	return nil
 }
 
-// DeleteBinding removes a binding.
+// DeleteBinding soft-deletes a binding.
 func (r *ExternalIssuerRepository) DeleteBinding(ctx context.Context, id, issuerID, accountID string) error {
-	res, err := dbOrTx(ctx, r.db).NewDelete().Model((*domain.IssuerBinding)(nil)).
+	res, err := dbOrTx(ctx, r.db).NewUpdate().Model((*domain.IssuerBinding)(nil)).
+		Set("deleted_at = clock_timestamp()").
+		Set("enabled = false").
 		Where("id = ?", id).
 		Where("issuer_id = ?", issuerID).
 		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to delete binding: %w", err)
@@ -276,6 +303,7 @@ func (r *ExternalIssuerRepository) BindingsFor(ctx context.Context, issuerID, su
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&out).
 		Where("issuer_id = ?", issuerID).
 		Where("subject_key = ?", subjectKey).
+		Where("deleted_at IS NULL").
 		OrderExpr("enabled DESC, created_at DESC").
 		Limit(10).
 		Scan(ctx)

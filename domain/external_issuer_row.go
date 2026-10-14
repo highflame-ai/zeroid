@@ -71,6 +71,7 @@ type ExternalIssuer struct {
 	UpdatedBy           string              `bun:"updated_by,notnull"                        json:"updated_by"`
 	CreatedAt           time.Time           `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt           time.Time           `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+	DeletedAt           *time.Time          `bun:"deleted_at"                                json:"-"`
 }
 
 // IssuerBinding maps a credential's runtime subject key, under one issuer
@@ -78,17 +79,33 @@ type ExternalIssuer struct {
 type IssuerBinding struct {
 	bun.BaseModel `bun:"table:external_issuer_bindings,alias:eib"`
 
-	ID         string    `bun:"id,pk,type:uuid,default:gen_random_uuid()" json:"id"`
-	AccountID  string    `bun:"account_id,notnull"                        json:"account_id"`
-	IssuerID   string    `bun:"issuer_id,type:uuid,notnull"               json:"issuer_id"`
-	SubjectKey string    `bun:"subject_key,notnull"                       json:"subject_key"`
-	IdentityID string    `bun:"identity_id,type:uuid,notnull"             json:"identity_id"`
-	Enabled    bool      `bun:"enabled,notnull"                           json:"enabled"`
-	CreatedBy  string    `bun:"created_by,notnull"                        json:"created_by"`
-	UpdatedBy  string    `bun:"updated_by,notnull"                        json:"updated_by"`
-	CreatedAt  time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt  time.Time `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+	ID         string `bun:"id,pk,type:uuid,default:gen_random_uuid()" json:"id"`
+	AccountID  string `bun:"account_id,notnull"                        json:"account_id"`
+	IssuerID   string `bun:"issuer_id,type:uuid,notnull"               json:"issuer_id"`
+	SubjectKey string `bun:"subject_key,notnull"                       json:"subject_key"`
+	IdentityID string `bun:"identity_id,type:uuid,notnull"             json:"identity_id"`
+	Enabled    bool   `bun:"enabled,notnull"                           json:"enabled"`
+	// ExplicitlyDisabled records an admin's decision to disable, as opposed
+	// to disabled only because the identity was not active yet.
+	ExplicitlyDisabled bool       `bun:"explicitly_disabled,notnull" json:"explicitly_disabled"`
+	DeletedAt          *time.Time `bun:"deleted_at"                  json:"-"`
+	CreatedBy          string     `bun:"created_by,notnull"                        json:"created_by"`
+	UpdatedBy          string     `bun:"updated_by,notnull"                        json:"updated_by"`
+	CreatedAt          time.Time  `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt          time.Time  `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
 }
+
+// Length caps. URLs and subject keys sit in btree indexes (about 2.7 kB per
+// entry); the rest bound what a row carries.
+const (
+	MaxIssuerURLBytes   = 2000
+	MaxSubjectKeyBytes  = 2000
+	maxClaimNameBytes   = 128
+	maxClaimValueBytes  = 256
+	maxClaimValues      = 50
+	maxConstraintClaims = 20
+	maxAudiences        = 50
+)
 
 // IssuerValidationError is a refused issuer write. Code is the stable
 // machine-readable reason documented in docs/external-issuers.md.
@@ -189,6 +206,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if e.Kind == IssuerKindWorkload && len(e.Audiences) == 0 {
 		return issuerInvalid("invalid_audiences", "a workload issuer needs at least one audience")
 	}
+	if len(e.Audiences) > maxAudiences || slices.ContainsFunc(e.Audiences, func(a string) bool { return len(a) > MaxIssuerURLBytes }) {
+		return issuerInvalid("invalid_audiences", "at most %d audiences of at most %d bytes", maxAudiences, MaxIssuerURLBytes)
+	}
 	for _, alg := range e.Algorithms {
 		if !ExternalIssuerAlgorithmAllowed(alg) {
 			return issuerInvalid("invalid_algorithms", "algorithm %q is not supported (allowed: RS256, ES256, PS256)", alg)
@@ -200,6 +220,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 		}
 	}
 	for k, claim := range e.ClaimMapping {
+		if len(claim) > maxClaimNameBytes {
+			return issuerInvalid("invalid_claim_mapping", "claim_mapping.%s is longer than %d bytes", k, maxClaimNameBytes)
+		}
 		if !slices.Contains(knownMappingKeys, k) {
 			return issuerInvalid("invalid_claim_mapping", "claim_mapping key %q is not recognised", k)
 		}
@@ -210,7 +233,15 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if e.Kind == IssuerKindPerson && e.ClaimMapping["user_id"] == "" {
 		return issuerInvalid("invalid_claim_mapping", "a person issuer needs claim_mapping.user_id, the claim that carries the person's user key")
 	}
+	if len(e.ClaimConstraints) > maxConstraintClaims {
+		return issuerInvalid("invalid_claim_constraints", "at most %d constrained claims", maxConstraintClaims)
+	}
 	for claim, values := range e.ClaimConstraints {
+		if len(claim) > maxClaimNameBytes || len(values) > maxClaimValues ||
+			slices.ContainsFunc(values, func(v string) bool { return len(v) > maxClaimValueBytes }) {
+			return issuerInvalid("invalid_claim_constraints",
+				"claim_constraints: names up to %d bytes, up to %d values of up to %d bytes each", maxClaimNameBytes, maxClaimValues, maxClaimValueBytes)
+		}
 		if slices.Contains(unpinnableClaims, claim) {
 			return issuerInvalid("invalid_claim_constraints",
 				"claim_constraints.%s pins nothing: every token carries it with no customer-specific value", claim)
@@ -330,8 +361,8 @@ func checkIssuerURL(raw string, allowHTTP bool) error {
 	if u.Scheme != "https" && (u.Scheme != "http" || !allowHTTP) {
 		return fmt.Errorf("must be an https URL, got %q", raw)
 	}
-	if len(raw) > 2048 {
-		return fmt.Errorf("is longer than 2048 characters")
+	if len(raw) > MaxIssuerURLBytes {
+		return fmt.Errorf("is longer than %d bytes", MaxIssuerURLBytes)
 	}
 	return nil
 }

@@ -450,6 +450,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		status, body = f.bind(t, a, id, "app-discovered", discovered, false)
 		require.Equal(t, http.StatusCreated, status, "%v", body)
 		assert.Equal(t, false, body["enabled"], "a discovered agent's binding is created disabled (D6)")
+		assert.Equal(t, false, body["explicitly_disabled"], "awaiting adoption, not disabled by an admin")
 		status, body = f.call(t, http.MethodPatch, "/external-issuers/"+id+"/bindings/"+body["id"].(string), map[string]any{"enabled": true}, a.headers)
 		assert.Equal(t, http.StatusConflict, status)
 		assert.Equal(t, "identity_not_active", body["code"])
@@ -468,18 +469,35 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		status, body = f.call(t, http.MethodPatch, "/external-issuers/"+id+"/bindings/"+bindingID, map[string]any{"enabled": false}, a.headers)
 		require.Equal(t, http.StatusOK, status)
 		assert.Equal(t, false, body["enabled"])
+		assert.Equal(t, true, body["explicitly_disabled"], "an admin's disable is recorded, so adoption won't undo it")
+		status, body = f.call(t, http.MethodPatch, "/external-issuers/"+id+"/bindings/"+bindingID, map[string]any{"enabled": true}, a.headers)
+		require.Equal(t, http.StatusOK, status)
+		assert.Equal(t, false, body["explicitly_disabled"])
+		status, body = f.call(t, http.MethodPost, "/external-issuers/"+id+"/bindings",
+			map[string]any{"subject_key": uid("app-off"), "identity_id": other.id, "enabled": false}, a.headers)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		assert.Equal(t, true, body["explicitly_disabled"], "created disabled on purpose")
 		status, _ = f.call(t, http.MethodDelete, "/external-issuers/"+id+"/bindings/"+bindingID, nil, a.headers)
 		assert.Equal(t, http.StatusNoContent, status)
 	})
 
-	t.Run("delete removes the row and its bindings", func(t *testing.T) {
+	t.Run("delete soft-deletes the row and its bindings, and the issuer can be trusted again", func(t *testing.T) {
 		status, _ := f.call(t, http.MethodDelete, "/external-issuers/"+id, nil, a.headers)
 		require.Equal(t, http.StatusNoContent, status)
 		status, _ = f.call(t, http.MethodGet, "/external-issuers/"+id, nil, a.headers)
 		assert.Equal(t, http.StatusNotFound, status)
-		n, err := testDB.NewSelect().Table("external_issuer_bindings").Where("issuer_id = ?", id).Count(context.Background())
+		live, err := testDB.NewSelect().Table("external_issuer_bindings").Where("issuer_id = ?", id).Where("deleted_at IS NULL").Count(context.Background())
 		require.NoError(t, err)
-		assert.Zero(t, n)
+		assert.Zero(t, live, "no live bindings")
+		kept, err := testDB.NewSelect().Table("external_issuer_bindings").Where("issuer_id = ?", id).Count(context.Background())
+		require.NoError(t, err)
+		assert.Positive(t, kept, "rows are kept, deleted")
+		_, list := f.call(t, http.MethodGet, "/external-issuers/bindings", nil, a.headers)
+		for _, it := range list["items"].([]any) {
+			assert.NotEqual(t, id, it.(map[string]any)["issuer_id"], "deleted bindings are not listed")
+		}
+		again := f.entraRow(t, a, tid, nil)
+		assert.NotEqual(t, id, again["id"], "a deleted row no longer holds its unique slot")
 	})
 
 	t.Run("every write is audited with its actor", func(t *testing.T) {
@@ -489,7 +507,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 			Where("table_name IN ('external_issuers', 'external_issuer_bindings')").
 			Scan(context.Background(), &actions)
 		require.NoError(t, err)
-		for _, want := range []string{"INSERT_EXTERNAL_ISSUER", "UPDATE_EXTERNAL_ISSUER", "DELETE_EXTERNAL_ISSUER", "INSERT_ISSUER_BINDING", "DELETE_ISSUER_BINDING"} {
+		for _, want := range []string{"INSERT_EXTERNAL_ISSUER", "UPDATE_EXTERNAL_ISSUER", "DELETE_EXTERNAL_ISSUER", "INSERT_ISSUER_BINDING", "UPDATE_ISSUER_BINDING", "DELETE_ISSUER_BINDING"} {
 			assert.Contains(t, actions, want)
 		}
 	})

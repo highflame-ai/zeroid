@@ -99,6 +99,8 @@ The subject key is the value the credential carries at runtime:
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
 A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
 ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an agent's bindings when an org admin adopts or activates it.
+Each binding carries `explicitly_disabled`: true when an admin disabled it (`PATCH {"enabled": false}`) or created it with `"enabled": false`, false when it is disabled only because its identity was not active yet.
+At adoption the deployer enables only bindings with `explicitly_disabled: false`, so adoption never undoes an admin's decision; `PATCH {"enabled": true}` clears it.
 Until then the mint refuses it as not adopted (D7), naming the state.
 
 ## The person grants with issuer rows
@@ -230,6 +232,8 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 422 | `identity_has_no_public_key` | `oauth_client` was requested but the identity has no EC P-256 key |
 | 500 | `internal_error` | Anything else |
 
+Sizes: `issuer` and each audience at most 2000 bytes, at most 50 audiences, `subject_key` at most 2000 bytes, claim names at most 128 bytes, at most 20 constrained claims with at most 50 values of at most 256 bytes each.
+
 A malformed body (wrong type, unknown field, missing `kind`/`issuer`) is huma's own 422 `application/problem+json` with `errors[]` and no `code`.
 
 ### `GET /external-issuers`
@@ -313,7 +317,9 @@ The response is the issuer with `jwks_check`; a discovery or key-set refusal is 
 
 ### `DELETE /external-issuers/{id}` → 204
 
-Deletes the row and its bindings.
+Soft-deletes the row and its bindings (`deleted_at`; audited as `DELETE_*`).
+They disappear from every read and grant at once, and stop holding the issuer: the same account, or another, may trust it again.
+An identity that is hard-deleted (only a purge of a never-adopted discovered identity does that) takes its bindings with it.
 
 ### `POST /external-issuers/check` → 200
 
@@ -375,6 +381,7 @@ On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` cl
   "subject_key": "<agent app id>",
   "identity_id": "9a0e...",
   "enabled": true,
+  "explicitly_disabled": false,
   "created_by": "user_abc",
   "updated_by": "user_abc",
   "created_at": "...",
@@ -394,6 +401,8 @@ On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` cl
 ```
 
 ### `DELETE /external-issuers/{id}/bindings/{binding_id}` → 204
+
+Soft-deletes the binding.
 
 ## Migration ordering
 

@@ -169,23 +169,26 @@ type BindingCreateBody struct {
 // BindingView is a binding, with the presenting client when one was created
 // or confirmed.
 type BindingView struct {
-	ID          string                       `json:"id"`
-	AccountID   string                       `json:"account_id"`
-	IssuerID    string                       `json:"issuer_id"`
-	SubjectKey  string                       `json:"subject_key"`
-	IdentityID  string                       `json:"identity_id"`
-	Enabled     bool                         `json:"enabled"`
-	CreatedBy   string                       `json:"created_by"`
-	UpdatedBy   string                       `json:"updated_by"`
-	CreatedAt   time.Time                    `json:"created_at"`
-	UpdatedAt   time.Time                    `json:"updated_at"`
-	OAuthClient *service.BindingClientResult `json:"oauth_client,omitempty"`
+	ID         string `json:"id"`
+	AccountID  string `json:"account_id"`
+	IssuerID   string `json:"issuer_id"`
+	SubjectKey string `json:"subject_key"`
+	IdentityID string `json:"identity_id"`
+	Enabled    bool   `json:"enabled"`
+	// ExplicitlyDisabled: an admin disabled it (or created it disabled). The
+	// deployer enables at adoption only bindings where this is false.
+	ExplicitlyDisabled bool                         `json:"explicitly_disabled"`
+	CreatedBy          string                       `json:"created_by"`
+	UpdatedBy          string                       `json:"updated_by"`
+	CreatedAt          time.Time                    `json:"created_at"`
+	UpdatedAt          time.Time                    `json:"updated_at"`
+	OAuthClient        *service.BindingClientResult `json:"oauth_client,omitempty"`
 }
 
 func bindingView(b *domain.IssuerBinding, client *service.BindingClientResult) BindingView {
 	return BindingView{
 		ID: b.ID, AccountID: b.AccountID, IssuerID: b.IssuerID, SubjectKey: b.SubjectKey, IdentityID: b.IdentityID,
-		Enabled: b.Enabled, CreatedBy: b.CreatedBy, UpdatedBy: b.UpdatedBy, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		Enabled: b.Enabled, ExplicitlyDisabled: b.ExplicitlyDisabled, CreatedBy: b.CreatedBy, UpdatedBy: b.UpdatedBy, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
 		OAuthClient: client,
 	}
 }

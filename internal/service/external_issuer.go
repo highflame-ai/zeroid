@@ -671,8 +671,9 @@ func (s *ExternalIssuerService) CreateBinding(ctx context.Context, accountID, is
 		return nil, nil, err
 	}
 	in.SubjectKey = strings.TrimSpace(in.SubjectKey)
-	if in.SubjectKey == "" || len(in.SubjectKey) > 2048 {
-		return nil, nil, issuerErr(http.StatusBadRequest, "invalid_subject_key", "subject_key is required (at most 2048 characters)")
+	if in.SubjectKey == "" || len(in.SubjectKey) > domain.MaxSubjectKeyBytes {
+		return nil, nil, issuerErr(http.StatusBadRequest, "invalid_subject_key",
+			fmt.Sprintf("subject_key is required (at most %d bytes)", domain.MaxSubjectKeyBytes))
 	}
 	if !validUUID(issuerID) {
 		return nil, nil, errIssuerNotFound
@@ -697,6 +698,9 @@ func (s *ExternalIssuerService) CreateBinding(ctx context.Context, accountID, is
 	b := &domain.IssuerBinding{
 		AccountID: accountID, IssuerID: issuerID, SubjectKey: in.SubjectKey,
 		IdentityID: identity.ID, Enabled: enabled, CreatedBy: actor, UpdatedBy: actor,
+		// Asked for disabled: an admin's decision, which adoption must not
+		// undo. Disabled only for a non-active identity is not.
+		ExplicitlyDisabled: in.Enabled != nil && !*in.Enabled,
 	}
 	var clientRes *BindingClientResult
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
@@ -853,6 +857,7 @@ func (s *ExternalIssuerService) SetBindingEnabled(ctx context.Context, accountID
 		}
 	}
 	b.Enabled = enabled
+	b.ExplicitlyDisabled = !enabled
 	b.UpdatedBy = actor
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
 		if err := s.repo.UpdateBinding(ctx, b); err != nil {

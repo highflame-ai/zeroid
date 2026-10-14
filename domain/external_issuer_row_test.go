@@ -2,6 +2,8 @@ package domain
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +99,17 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.Issuer = "https://accounts.google.com"
 			e.ClaimConstraints = map[string][]string{"hd": {"acme.com"}}
 		}, v: IssuerValidation{Shared: true}},
+		{name: "issuer too long", mutate: func(e *ExternalIssuer) {
+			e.Issuer = "https://acme.okta.com/" + strings.Repeat("a", MaxIssuerURLBytes)
+		}, want: "invalid_issuer"},
+		{name: "constraint value too long", mutate: func(e *ExternalIssuer) {
+			e.ClaimConstraints = map[string][]string{"hd": {strings.Repeat("a", 300)}}
+		}, want: "invalid_claim_constraints"},
+		{name: "too many audiences", mutate: func(e *ExternalIssuer) {
+			for i := 0; i < 51; i++ {
+				e.Audiences = append(e.Audiences, fmt.Sprintf("a%d", i))
+			}
+		}, want: "invalid_audiences"},
 		{name: "token age too long", mutate: func(e *ExternalIssuer) { e.MaxTokenAgeSeconds = 7200 }, want: "invalid_max_token_age"},
 		{name: "jwks ttl too short", mutate: func(e *ExternalIssuer) { e.JWKSCacheTTLSeconds = 5 }, want: "invalid_jwks_cache_ttl"},
 		{name: "connector without ref", mutate: func(e *ExternalIssuer) { e.Source = IssuerSourceConnector }, want: "invalid_source"},
