@@ -1472,8 +1472,14 @@ func (s *Server) SetRegistrationEndpoint(endpoint string) error {
 // embedder that serves it beside ZeroID, so clients can discover the endpoint
 // instead of hardcoding it. While set, grant_types_supported also lists
 // urn:ietf:params:oauth:grant-type:device_code; while unset, neither member is
-// advertised. ZeroID's own /oauth2/token does not accept that grant either way —
-// device-code polling is the embedder's to serve.
+// advertised. ZeroID's own /oauth2/token does not accept that grant either way,
+// and a RegisterGrant handler cannot serve it (GrantRequest carries no
+// device_code). RFC 8628 §3.4 has the client poll the advertised
+// token_endpoint, which is ZeroID's /oauth2/token, so the embedder must answer
+// grant_type=urn:ietf:params:oauth:grant-type:device_code at that URL itself
+// (in front of ZeroID's router). A device flow polled anywhere else is not
+// RFC 8628, and advertising it here would point standard clients at a flow
+// they cannot complete.
 //
 // Validation is identical to SetRegistrationEndpoint, against the server's
 // configured token.issuer: an absolute, canonical https URL without user-info,
