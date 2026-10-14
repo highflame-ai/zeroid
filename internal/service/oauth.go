@@ -929,18 +929,12 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
+	// IssueCredential names the identity's tenant on the response, so a
+	// caller that sent none still learns which tenant it minted into.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
 	}
-
-	// Name the tenant on the response, as the other tenant-deriving grants
-	// (ID-JAG, api_key) do. When the tenant was derived from the client's
-	// linked identity the request carries none, so without this an embedder
-	// attributing issuance from the token response with a request-body
-	// fallback (AuthN's metering) has no tenant to attribute it to.
-	accessToken.AccountID = identity.AccountID
-	accessToken.ProjectID = identity.ProjectID
 
 	return accessToken, nil
 }
