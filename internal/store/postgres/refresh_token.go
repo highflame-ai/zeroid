@@ -158,13 +158,33 @@ func (r *RefreshTokenRepository) RestoreClaimed(ctx context.Context, db bun.IDB,
 	return true, nil
 }
 
+// FamilyHasActiveToken reports whether the family has a token in the active
+// state. Reuse detection uses it to tell a token that was rotated out (its
+// family still has an active successor) from one revoked with its family.
+// Expiry is deliberately not checked: an expired successor still marks the
+// presented token as rotated out rather than revoked.
+func (r *RefreshTokenRepository) FamilyHasActiveToken(ctx context.Context, familyID string) (bool, error) {
+	exists, err := r.db.NewSelect().
+		Model((*domain.RefreshToken)(nil)).
+		Where("family_id = ?", familyID).
+		Where("state = ?", domain.RefreshTokenStateActive).
+		Exists(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to check refresh token family: %w", err)
+	}
+	return exists, nil
+}
+
 // DeleteExpired removes refresh-token rows whose expires_at is strictly before
-// the given cutoff. The cutoff MUST be lagged behind now by at least
-// domain.RefreshTokenReuseGraceWindow: reuse detection (see
-// service/refresh_token.go) relies on rotated-out rows still existing so that
-// presenting one revokes its family. A rotated-out row keeps its original
-// expires_at, so it stays consultable for the token's whole lifetime; the lag
-// only keeps the sweep from racing a lookup at the instant of expiry.
+// the given cutoff. The cutoff MUST be lagged behind now by at least the
+// configured reuse grace window (and never less than
+// domain.RefreshTokenReuseGraceWindow): reuse detection (see
+// service/refresh_token.go) relies on rotated-out rows still existing, both to
+// recognise a concurrent retry within the grace window and to revoke the
+// family after it. A rotated-out row keeps its original expires_at, so it
+// stays consultable for the token's whole lifetime; the lag keeps a row that
+// was rotated just before it expired around for the whole grace window, and
+// keeps the sweep from racing a lookup at the instant of expiry.
 // Deleting strictly by expires_at < (now - lag) keeps every row that reuse
 // detection could still consult while still bounding table growth. Returns the number of rows deleted.
 func (r *RefreshTokenRepository) DeleteExpired(ctx context.Context, before time.Time) (int64, error) {

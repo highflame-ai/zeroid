@@ -87,6 +87,24 @@ token:
   # ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION.
   allow_unauthenticated_token_inspection: true
 
+  # refresh_reuse_grace_seconds: every refresh rotates the refresh token, and
+  # presenting a rotated-out token again is treated as a sign it leaked — the
+  # whole token family and the access tokens issued from it are revoked
+  # (RFC 9700 §4.14.2). This sets a grace window after each rotation in which
+  # a second presentation of the rotated-out token is instead refused as a
+  # concurrent retry (invalid_grant) and nothing is revoked.
+  #   Why have one: browser tabs, or several processes (CLIs, IDE plugins),
+  #   that share one refresh token and refresh at the same moment. Without a
+  #   grace, the loser of that race revokes the family and every instance is
+  #   signed out.
+  #   What it costs: a stolen rotated-out token used within the window does
+  #   not revoke the family, so whoever rotated first keeps the session.
+  # Only rotation earns the grace: a token whose family was revoked (reuse
+  # detection, RFC 7009 revocation, authorization-code replay) is refused
+  # outright. 0 disables the grace (strict RFC 9700). Range 0-300; default 10.
+  # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
+  # refresh_reuse_grace_seconds: 10
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.
