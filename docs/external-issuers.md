@@ -20,7 +20,7 @@ ZeroID refuses to start with `issuer_store: db` and a non-empty `external_issuer
 federation:
   issuer_store: db                 # Env: ZEROID_FEDERATION_ISSUER_STORE
   allow_private_endpoints: false   # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS
-  shared_issuers: []               # empty = the built-in list below
+  shared_issuers: []               # [{issuer, pin_claim}]; empty = the built-in list below
 ```
 
 `allow_private_endpoints` relaxes the SSRF guard on issuer rows' discovery and JWKS fetches and admits `http` issuer and JWKS URLs.
@@ -50,19 +50,29 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 ### Who may hold an issuer
 
 - An issuer unique to one customer (an Entra tenant, an Okta org, an AWS account's STS issuer, a cluster, a SPIFFE trust domain) is trusted by **one account at most**, whatever its claim constraints.
-- Only an issuer on the platform's shared list may appear in several accounts, and only with claim constraints that pin it to the customer.
-  Two rows of the same kind, in any accounts, must never both match one token: their constraints must not **overlap**.
-  Two equality-constraint sets overlap when every claim they both constrain has a value in common; sets on different claims overlap, since one token can carry both.
-  So a second account cannot shadow the first with a superset (`{hd: [acme.com], email_verified: [true]}` beside `{hd: [acme.com]}`), and must pin a claim the first pins, to a different value.
+- Only an issuer on the platform's shared list may appear in several accounts.
+  The list names, for each shared issuer, one **pinning claim** whose value says which customer a token belongs to.
+  Every row on a shared issuer must constrain that claim; its other constraints only narrow the row.
+  Two rows of the same kind, in any accounts, must not share a pinning value, and at a grant the token's pinning claim must be a single string (an array matches no row), so one token can never match two rows.
+  Pinning only on the configured claim stops a first row on a near-universal claim (GitHub `event_name`, Entra `ver`) from blocking every other account, and array claims (`groups`) from making grants ambiguous.
 - Constraints on claims every token carries (`iss`, `aud`, `exp`, `iat`, `nbf`, `jti`) are refused: they pin nothing.
 - An issuer has at most one row per kind in its account, so an Entra tenant can be both the account's `person` issuer and its `workload` issuer.
+- The Microsoft personal-account tenant (`9188040d-6c67-4c5b-b112-36a304b66dad`) belongs to no customer and cannot be trusted by any account.
 
 Issuers are compared without trailing slashes, so `https://acme.okta.com/` and `https://acme.okta.com` are one issuer; a token's `iss` is still matched against the row exactly.
-Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the constraints for a shared one.
+Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the pinning claim's values for a shared one.
 
-**Known limitation.** Nothing proves that an account owns the values it pins (`hd`, `tid`, `repository_owner`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
-The built-in shared list is `https://accounts.google.com`, `https://token.actions.githubusercontent.com`, Entra's `common`, `organizations` and `consumers` v2.0 endpoints, and the Microsoft consumer tenant `9188040d-6c67-4c5b-b112-36a304b66dad`.
-`federation.shared_issuers` replaces it.
+**Known limitation.** Nothing proves that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
+
+The built-in shared list (used when `federation.shared_issuers` is empty):
+
+| Issuer | Pinning claim |
+|---|---|
+| `https://accounts.google.com` | `hd` |
+| `https://token.actions.githubusercontent.com` (workload only) | `repository_owner_id` |
+| `https://login.microsoftonline.com/{common,organizations,consumers}/v2.0` | `tid` |
+
+`federation.shared_issuers` replaces it, as a list of `{issuer, pin_claim}`; ZeroID refuses to start if an entry lacks a pinning claim or pins `iss`, `aud`, `exp`, `iat`, `nbf` or `jti`.
 
 A person row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant endpoints, which name no single tenant.
 A person row also refuses an issuer that only issues workload tokens (GitHub Actions, `https://token.actions.githubusercontent.com`).
@@ -226,7 +236,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri` |
 | 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned) |
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
-| 422 | `shared_issuer_requires_constraints` | A shared issuer without `claim_constraints` |
+| 422 | `shared_issuer_requires_constraints` | A shared-issuer row that does not constrain its pinning claim |
 | 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
 | 422 | `identity_not_found` | `identity_id` names no identity in this account |
 | 422 | `identity_has_no_public_key` | `oauth_client` was requested but the identity has no EC P-256 key |

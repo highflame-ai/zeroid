@@ -91,10 +91,11 @@ type FederationConfig struct {
 	// their own allow_private_endpoints.
 	AllowPrivateEndpoints bool `koanf:"allow_private_endpoints"`
 
-	// SharedIssuers may be trusted by several accounts, each with claim
-	// constraints that pin it to the customer. Empty means the built-in list
+	// SharedIssuers may be trusted by several accounts. Each names the one
+	// claim (pin_claim) whose value says which customer a token belongs to;
+	// every row on it must pin that claim. Empty means the built-in list
 	// (domain.DefaultSharedIssuers).
-	SharedIssuers []string `koanf:"shared_issuers"`
+	SharedIssuers []domain.SharedIssuer `koanf:"shared_issuers"`
 }
 
 // ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
@@ -630,6 +631,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
 	}
 
+	if err := domain.ValidateSharedIssuers(c.Federation.SharedIssuers); err != nil {
+		return fmt.Errorf("federation.%w", err)
+	}
 	switch c.Federation.IssuerStore {
 	case "", "config":
 	case "db":

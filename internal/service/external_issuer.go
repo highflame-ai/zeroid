@@ -74,8 +74,8 @@ type JWKSCheck struct {
 // ExternalIssuerServiceConfig is the deployment's federation settings.
 type ExternalIssuerServiceConfig struct {
 	Store IssuerStore
-	// SharedIssuers may appear in several accounts, with claim constraints.
-	SharedIssuers []string
+	// SharedIssuers may appear in several accounts, each pinned on its claim.
+	SharedIssuers []domain.SharedIssuer
 	// AllowPrivateEndpoints admits private addresses and http URLs.
 	AllowPrivateEndpoints bool
 	// StaticIssuers are listed read-only in config mode.
@@ -114,19 +114,10 @@ func NewExternalIssuerService(repo *postgres.ExternalIssuerRepository, identityL
 // Store reports where this deployment reads issuers from.
 func (s *ExternalIssuerService) Store() IssuerStore { return s.cfg.Store }
 
-// IsShared reports whether iss is on the platform's shared-issuer list.
-func (s *ExternalIssuerService) IsShared(iss string) bool {
-	return isSharedIssuer(s.cfg.SharedIssuers, iss)
-}
-
-func isSharedIssuer(list []string, iss string) bool {
-	canon := domain.CanonicalIssuer(iss)
-	for _, sh := range list {
-		if domain.CanonicalIssuer(sh) == canon {
-			return true
-		}
-	}
-	return false
+// sharedPin returns iss's pinning claim, or "" for a customer-unique issuer.
+func (s *ExternalIssuerService) sharedPin(iss string) string {
+	pin, _ := domain.SharedPin(s.cfg.SharedIssuers, iss)
+	return pin
 }
 
 func (s *ExternalIssuerService) requireDB() error {
@@ -197,11 +188,11 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		return nil, nil, validationToAPIError(err)
 	}
 	row.Normalize()
-	shared := s.IsShared(row.Issuer)
-	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, Shared: shared, JWKSURIPending: true}); err != nil {
+	pin := s.sharedPin(row.Issuer)
+	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin, JWKSURIPending: true}); err != nil {
 		return nil, nil, validationToAPIError(err)
 	}
-	row.ConstraintsKey = row.UniquenessKey(shared)
+	row.ConstraintsKey = row.UniquenessKey(pin)
 
 	// A conflict is answered before anything is fetched; the transaction
 	// below re-checks under the lock.
@@ -209,7 +200,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	if err != nil {
 		return nil, nil, err
 	}
-	if uniquenessConflict(existing, row, shared) {
+	if uniquenessConflict(existing, row, pin) {
 		return nil, nil, errIssuerAlreadyTrusted
 	}
 
@@ -236,7 +227,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		if err != nil {
 			return err
 		}
-		if conflict := uniquenessConflict(existing, row, shared); conflict {
+		if conflict := uniquenessConflict(existing, row, pin); conflict {
 			return errIssuerAlreadyTrusted
 		}
 		n, err := s.repo.CountByAccount(ctx, accountID)
@@ -265,46 +256,34 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 
 // uniquenessConflict applies ADR 0042 D4 to a candidate row against the rows
 // already stored for its issuer, compared canonically (other than itself).
+// pin is the shared-issuer list's pinning claim, "" for a customer-unique
+// issuer.
 //
 //   - A customer-unique issuer belongs to one account at most, whatever the
 //     constraints, and has at most one row per kind.
 //   - A shared issuer may repeat, in any account, but two rows of one kind
-//     must never both match a token: their constraints must not overlap.
-//     Equal sets are the obvious case; a superset, or constraints on
-//     different claims, would let one account's row shadow another's (the
-//     grant refuses a token two rows match), so they conflict too.
-func uniquenessConflict(existing []*domain.ExternalIssuer, row *domain.ExternalIssuer, shared bool) bool {
+//     must never both match a token: their pinning-claim values must not
+//     intersect. The token's pinning claim must be a single string, so
+//     disjoint values cannot both match; other constraints only narrow a
+//     row and play no part here.
+func uniquenessConflict(existing []*domain.ExternalIssuer, row *domain.ExternalIssuer, pin string) bool {
 	for _, e := range existing {
 		if e.ID == row.ID {
 			continue
 		}
-		if !shared && e.AccountID != row.AccountID {
+		if pin == "" && e.AccountID != row.AccountID {
 			return true
 		}
 		if e.Kind != row.Kind {
 			continue
 		}
-		if !shared || constraintsOverlap(e.ClaimConstraints, row.ClaimConstraints) {
+		if pin == "" || slices.ContainsFunc(e.ClaimConstraints[pin], func(v string) bool {
+			return slices.Contains(row.ClaimConstraints[pin], v)
+		}) {
 			return true
 		}
 	}
 	return false
-}
-
-// constraintsOverlap reports whether one token could satisfy both
-// equality-constraint sets: every claim they both constrain has a value in
-// common. Two sets on disjoint claims overlap (a token can carry both).
-func constraintsOverlap(a, b map[string][]string) bool {
-	for claim, av := range a {
-		bv, both := b[claim]
-		if !both {
-			continue
-		}
-		if !slices.ContainsFunc(av, func(v string) bool { return slices.Contains(bv, v) }) {
-			return false
-		}
-	}
-	return true
 }
 
 // List returns accountID's issuers. In config mode it returns the static
@@ -394,16 +373,16 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
 		r.Normalize()
-		shared := s.IsShared(r.Issuer)
-		if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, Shared: shared}); err != nil {
+		pin := s.sharedPin(r.Issuer)
+		if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin}); err != nil {
 			return validationToAPIError(err)
 		}
-		r.ConstraintsKey = r.UniquenessKey(shared)
+		r.ConstraintsKey = r.UniquenessKey(pin)
 		existing, err := s.repo.ListByCanonicalIssuer(ctx, domain.CanonicalIssuer(r.Issuer))
 		if err != nil {
 			return err
 		}
-		if uniquenessConflict(existing, r, shared) {
+		if uniquenessConflict(existing, r, pin) {
 			return errIssuerAlreadyTrusted
 		}
 		if err := s.repo.Update(ctx, r); err != nil {

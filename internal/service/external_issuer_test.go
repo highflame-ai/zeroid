@@ -39,14 +39,16 @@ func TestUniquenessConflict(t *testing.T) {
 			cand: row("", "a", domain.IssuerKindPerson, ""), want: true},
 		{name: "shared, second account, other kind", existing: []*domain.ExternalIssuer{row("1", "a", domain.IssuerKindWorkload, "k1")},
 			cand: row("", "b", domain.IssuerKindPerson, "k2"), shared: true},
-		{name: "shared, second account, no constraints overlap trivially", existing: []*domain.ExternalIssuer{row("1", "a", domain.IssuerKindWorkload, "k1")},
-			cand: row("", "b", domain.IssuerKindWorkload, "k1"), shared: true, want: true},
 		{name: "update ignores itself", existing: []*domain.ExternalIssuer{row("1", "a", domain.IssuerKindPerson, "")},
 			cand: row("1", "a", domain.IssuerKindPerson, "")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := uniquenessConflict(tc.existing, tc.cand, tc.shared); got != tc.want {
+			pin := ""
+			if tc.shared {
+				pin = "hd"
+			}
+			if got := uniquenessConflict(tc.existing, tc.cand, pin); got != tc.want {
 				t.Fatalf("conflict = %v, want %v", got, tc.want)
 			}
 		})
@@ -214,24 +216,23 @@ func TestIdentityJWKS(t *testing.T) {
 	}
 }
 
-func TestUniquenessConflict_SharedOverlap(t *testing.T) {
+func TestUniquenessConflict_SharedPin(t *testing.T) {
 	row := func(id, acct string, c map[string][]string) *domain.ExternalIssuer {
 		return &domain.ExternalIssuer{ID: id, AccountID: acct, Kind: domain.IssuerKindPerson, ClaimConstraints: c}
 	}
-	a := row("1", "a", map[string][]string{"hd": {"acme.com"}})
+	a := row("1", "a", map[string][]string{"hd": {"acme.com"}, "groups": {"y"}})
 	for name, tc := range map[string]struct {
 		c    map[string][]string
 		want bool
 	}{
-		"same set":                        {map[string][]string{"hd": {"acme.com"}}, true},
-		"superset on another claim":       {map[string][]string{"hd": {"acme.com"}, "email_verified": {"true"}}, true},
-		"values intersect":                {map[string][]string{"hd": {"acme.com", "beta.com"}}, true},
-		"different claim only":            {map[string][]string{"tid": {"t1"}}, true},
-		"disjoint values on shared claim": {map[string][]string{"hd": {"beta.com"}}, false},
-		"disjoint and another claim":      {map[string][]string{"hd": {"beta.com"}, "tid": {"t1"}}, false},
+		"same pin":                               {map[string][]string{"hd": {"acme.com"}}, true},
+		"same pin, other constraints differ":     {map[string][]string{"hd": {"acme.com"}, "groups": {"x"}}, true},
+		"pin values intersect":                   {map[string][]string{"hd": {"acme.com", "beta.com"}}, true},
+		"disjoint pin":                           {map[string][]string{"hd": {"beta.com"}}, false},
+		"disjoint pin, same optional constraint": {map[string][]string{"hd": {"beta.com"}, "groups": {"y"}}, false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := uniquenessConflict([]*domain.ExternalIssuer{a}, row("", "b", tc.c), true); got != tc.want {
+			if got := uniquenessConflict([]*domain.ExternalIssuer{a}, row("", "b", tc.c), "hd"); got != tc.want {
 				t.Fatalf("conflict = %v, want %v", got, tc.want)
 			}
 		})

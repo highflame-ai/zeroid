@@ -774,3 +774,15 @@ func TestConfig_FederationIssuerStore(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "pin_claim") {
+		t.Fatalf("err = %v", err)
+	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com", PinClaim: "hd"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

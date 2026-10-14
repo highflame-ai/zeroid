@@ -58,7 +58,7 @@ func TestDBRegistry_ResolvePerson(t *testing.T) {
 	jwksSrv := newFakeJWKSServer(t, "k1")
 	const iss = "https://idp.example"
 	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{issuerRow("r1", "acct-a", iss, domain.IssuerKindPerson, jwksSrv.srv.URL)}}
-	reg := NewDBExternalIssuerRegistry(rows, true, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
+	reg := NewDBExternalIssuerRegistry(rows, true, nil, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
 	defer reg.Close()
 	ctx := context.Background()
 
@@ -127,7 +127,7 @@ func TestDBRegistry_SharedIssuerConstraints(t *testing.T) {
 	b := issuerRow("rb", "acct-b", iss, domain.IssuerKindPerson, jwksSrv.srv.URL)
 	b.ClaimConstraints = map[string][]string{"hd": {"b.com"}}
 	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{a, b}}
-	reg := NewDBExternalIssuerRegistry(rows, true, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
+	reg := NewDBExternalIssuerRegistry(rows, true, nil, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
 	defer reg.Close()
 	ctx := context.Background()
 

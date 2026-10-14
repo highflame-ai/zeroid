@@ -541,7 +541,7 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 	}
 	// A shared issuer's row was chosen on unverified claims; its constraints
 	// must also hold on the verified ones.
-	if entry.Row != nil && !entry.Row.ConstraintsMatch(tokenClaimsAsMap(verified)) {
+	if entry.Row != nil && !entry.Row.ConstraintsMatch(tokenClaimsAsMap(verified), entry.PinClaim) {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s does not satisfy the issuer's claim constraints", fieldName))
 	}
 

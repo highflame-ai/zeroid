@@ -460,7 +460,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		if options.externalIssuerHTTPClient != nil {
 			jwksOpts = append(jwksOpts, jwks.WithHTTPClient(options.externalIssuerHTTPClient))
 		}
-		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, jwksOpts...)
+		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, cfg.Federation.SharedIssuers, jwksOpts...)
 		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
 		oauthSvc.SetIssuerBindings(externalIssuerRepo)
 		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).

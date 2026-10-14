@@ -19,6 +19,8 @@ type ExternalIssuerEntry struct {
 	Config domain.ExternalIssuerConfig
 	JWKS   *jwks.Client
 	Row    *domain.ExternalIssuer
+	// PinClaim is the row's shared-issuer pinning claim, "" when unshared.
+	PinClaim string
 }
 
 // issuerRowSource reads issuer rows; *postgres.ExternalIssuerRepository.
@@ -41,8 +43,9 @@ type ExternalIssuerRegistry struct {
 	byIss   map[string]*ExternalIssuerEntry
 	closers []func()
 
-	rows  issuerRowSource
-	cache *issuerJWKSCache
+	rows   issuerRowSource
+	cache  *issuerJWKSCache
+	shared []domain.SharedIssuer
 }
 
 // Resolution failures, wrapped by ResolvePerson. Grants map them to OAuth
@@ -90,12 +93,17 @@ func NewExternalIssuerRegistry(ctx context.Context, configs []domain.ExternalIss
 // NewDBExternalIssuerRegistry builds a registry that reads account rows.
 // allowPrivate relaxes the SSRF guard on JWKS fetches; opts follow it and
 // may replace the HTTP client.
-func NewDBExternalIssuerRegistry(rows issuerRowSource, allowPrivate bool, opts ...jwks.Option) *ExternalIssuerRegistry {
+// shared is the platform's shared-issuer list (nil means the default).
+func NewDBExternalIssuerRegistry(rows issuerRowSource, allowPrivate bool, shared []domain.SharedIssuer, opts ...jwks.Option) *ExternalIssuerRegistry {
 	base := append([]jwks.Option{jwks.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(allowPrivate))}, opts...)
+	if shared == nil {
+		shared = domain.DefaultSharedIssuers
+	}
 	return &ExternalIssuerRegistry{
-		byIss: map[string]*ExternalIssuerEntry{},
-		rows:  rows,
-		cache: newIssuerJWKSCache(base),
+		byIss:  map[string]*ExternalIssuerEntry{},
+		rows:   rows,
+		cache:  newIssuerJWKSCache(base),
+		shared: shared,
 	}
 }
 
@@ -169,8 +177,9 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 	if len(enabled) == 0 {
 		return nil, errIssuerDisabled
 	}
+	pin, _ := domain.SharedPin(r.shared, iss)
 	for _, row := range enabled {
-		if row.ConstraintsMatch(claims) {
+		if row.ConstraintsMatch(claims, pin) {
 			matched = append(matched, row)
 		}
 	}
@@ -186,7 +195,7 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errIssuerLookupFailed, err)
 	}
-	return &ExternalIssuerEntry{Config: row.AsConfig(), JWKS: client, Row: row}, nil
+	return &ExternalIssuerEntry{Config: row.AsConfig(), JWKS: client, Row: row, PinClaim: pin}, nil
 }
 
 // Close stops every background JWKS refresh goroutine. Idempotent.

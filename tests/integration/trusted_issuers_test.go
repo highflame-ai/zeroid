@@ -62,7 +62,7 @@ func newDBFederation(t *testing.T) *dbFederation {
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
 	// One mock Entra tenant stands in for a shared issuer (like
 	// accounts.google.com), beside the built-in list.
-	f.srv, f.http = newDBFederationServer(t, append(slices.Clone(domain.DefaultSharedIssuers), idp.EntraIssuer(sharedTenant))...)
+	f.srv, f.http = newDBFederationServer(t, append(slices.Clone(domain.DefaultSharedIssuers), domain.SharedIssuer{Issuer: idp.EntraIssuer(sharedTenant), PinClaim: "hd"})...)
 	f.srv.SetFederatedPersonResolver(func(_ context.Context, r zeroid.FederatedPersonRequest) (string, error) {
 		f.resolverCalls.Add(1)
 		f.mu.Lock()
@@ -78,7 +78,7 @@ func newDBFederation(t *testing.T) *dbFederation {
 
 // newDBFederationServer starts a ZeroID reading issuer rows, on the shared
 // database, as federationIssuer.
-func newDBFederationServer(t *testing.T, sharedIssuers ...string) (*zeroid.Server, *httptest.Server) {
+func newDBFederationServer(t *testing.T, sharedIssuers ...domain.SharedIssuer) (*zeroid.Server, *httptest.Server) {
 	t.Helper()
 	require.NoError(t, initFederationKeyMaterial())
 	cfg := zeroid.Config{
@@ -1153,27 +1153,47 @@ func TestTrustedIssuers_SharedIssuerOverlap(t *testing.T) {
 			"claim_mapping": map[string]string{"user_id": "oid"}, "claim_constraints": c,
 		}, tn.headers)
 	}
-	status, body := create(a, map[string][]string{"hd": {"acme.com"}})
+	// The mock shared tenant's pinning claim is hd.
+	status, body := create(a, map[string][]string{"hd": {"acme.com"}, "ver": {"2.0"}, "groups": {"y"}})
 	require.Equal(t, http.StatusCreated, status, "%v", body)
-	for name, c := range map[string]map[string][]string{
-		"the same set":                    {"hd": {"acme.com"}},
-		"a superset shadowing A's tokens": {"hd": {"acme.com"}, "email_verified": {"true"}},
-		"a constraint on another claim":   {"tid": {"t1"}},
-	} {
-		t.Run("refused: "+name, func(t *testing.T) {
-			status, body := create(b, c)
-			assert.Equal(t, http.StatusConflict, status, "%v", body)
-			assert.Equal(t, "issuer_already_trusted", body["code"])
-		})
-	}
+	rowA := body["id"].(string)
+
+	t.Run("refused: the same pin, whatever else is constrained", func(t *testing.T) {
+		status, body := create(b, map[string][]string{"hd": {"acme.com"}, "email_verified": {"true"}})
+		assert.Equal(t, http.StatusConflict, status, "%v", body)
+		assert.Equal(t, "issuer_already_trusted", body["code"])
+	})
+	t.Run("refused: no pin, only a near-universal claim", func(t *testing.T) {
+		status, body := create(b, map[string][]string{"ver": {"2.0"}})
+		assert.Equal(t, http.StatusUnprocessableEntity, status, "%v", body)
+		assert.Equal(t, "shared_issuer_requires_constraints", body["code"])
+	})
 	t.Run("a pin on a claim every token carries is refused", func(t *testing.T) {
 		status, body := create(b, map[string][]string{"hd": {"beta.com"}, "aud": {federationIssuer}})
 		assert.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, "invalid_claim_constraints", body["code"])
 	})
-	t.Run("a disjoint pin is allowed", func(t *testing.T) {
-		status, body := create(b, map[string][]string{"hd": {"beta.com"}})
+	t.Run("a disjoint pin is allowed, even with the same near-universal constraint", func(t *testing.T) {
+		status, body := create(b, map[string][]string{"hd": {"beta.com"}, "ver": {"2.0"}, "groups": {"x"}})
 		assert.Equal(t, http.StatusCreated, status, "%v", body)
+	})
+
+	t.Run("at the grant, an array in the pinning claim matches no row; a scalar matches one", func(t *testing.T) {
+		agent := a.agent(t)
+		app := uid("app-shared")
+		status, body := f.bind(t, a, rowA, app, agent.id, true)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		oid := uid("oid-shared")
+		f.member(f.idp.EntraIssuer(sharedTenant), oid, "user_hf_shared")
+		exchange := func(hd any) tokenResponse {
+			tok, _, err := f.idp.Mint(mockidp.MintRequest{Profile: mockidp.ProfileEntraIDToken, Tenant: sharedTenant,
+				Claims: map[string]any{"aud": app, "oid": oid, "hd": hd, "groups": []string{"x", "y"}}})
+			require.NoError(t, err)
+			return postFederation(t, f.http.URL, merged(idTokenExchangeBody(tok), clientCreds(t, app, agent.key)))
+		}
+		ok := exchange("acme.com")
+		require.Equal(t, http.StatusOK, ok.StatusCode, "groups naming both rows' values no longer make it ambiguous: %s", ok.RawBody)
+		requireRefused(t, exchange([]string{"acme.com", "beta.com"}), "invalid_grant")
 	})
 }
 

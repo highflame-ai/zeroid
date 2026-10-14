@@ -250,7 +250,7 @@ func requireInvalidClient(t *testing.T, err error) {
 // are trusted and costs no lookup.
 func TestIDJAGBearer_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
 	rows := &fakeIssuerRows{}
-	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true)}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil)}
 	defer svc.externalIssuerRegistry.Close()
 	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	now := time.Now()

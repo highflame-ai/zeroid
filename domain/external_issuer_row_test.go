@@ -59,15 +59,18 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.Kind = IssuerKindWorkload
 			e.Issuer = "https://login.microsoftonline.com/common/v2.0"
 			e.ClaimConstraints = map[string][]string{"tid": {"t"}}
-		}, v: IssuerValidation{Shared: true}},
+		}, v: IssuerValidation{PinClaim: "tid"}},
 		{name: "GitHub Actions as a person issuer", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://token.actions.githubusercontent.com/"
-		}, v: IssuerValidation{Shared: true}, want: "invalid_issuer"},
+		}, v: IssuerValidation{PinClaim: "repository_owner_id"}, want: "invalid_issuer"},
 		{name: "GitHub Actions as a workload issuer", mutate: func(e *ExternalIssuer) {
 			e.Kind = IssuerKindWorkload
 			e.Issuer = "https://token.actions.githubusercontent.com"
-			e.ClaimConstraints = map[string][]string{"repository_owner": {"acme"}}
-		}, v: IssuerValidation{Shared: true}},
+			e.ClaimConstraints = map[string][]string{"repository_owner_id": {"123"}}
+		}, v: IssuerValidation{PinClaim: "repository_owner_id"}},
+		{name: "personal Microsoft accounts are unclaimable", mutate: func(e *ExternalIssuer) {
+			e.Issuer = "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0"
+		}, want: "invalid_issuer"},
 		{name: "http jwks_uri", mutate: func(e *ExternalIssuer) { e.JWKSURI = "http://acme.okta.com/keys" }, want: "invalid_jwks_uri"},
 		{name: "person row without audiences (bindings admit client ids)", mutate: func(e *ExternalIssuer) { e.Audiences = nil }},
 		{name: "workload row without audiences", mutate: func(e *ExternalIssuer) {
@@ -94,11 +97,15 @@ func TestExternalIssuerValidate(t *testing.T) {
 		}, want: "invalid_claim_constraints"},
 		{name: "shared without constraints", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://accounts.google.com"
-		}, v: IssuerValidation{Shared: true}, want: "shared_issuer_requires_constraints"},
+		}, v: IssuerValidation{PinClaim: "hd"}, want: "shared_issuer_requires_constraints"},
+		{name: "shared with constraints but not on its pinning claim", mutate: func(e *ExternalIssuer) {
+			e.Issuer = "https://accounts.google.com"
+			e.ClaimConstraints = map[string][]string{"email_verified": {"true"}}
+		}, v: IssuerValidation{PinClaim: "hd"}, want: "shared_issuer_requires_constraints"},
 		{name: "shared with constraints", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://accounts.google.com"
 			e.ClaimConstraints = map[string][]string{"hd": {"acme.com"}}
-		}, v: IssuerValidation{Shared: true}},
+		}, v: IssuerValidation{PinClaim: "hd"}},
 		{name: "issuer too long", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://acme.okta.com/" + strings.Repeat("a", MaxIssuerURLBytes)
 		}, want: "invalid_issuer"},
@@ -130,35 +137,56 @@ func TestExternalIssuerValidate(t *testing.T) {
 
 func TestExternalIssuerUniquenessKey(t *testing.T) {
 	a := validRow()
-	a.ClaimConstraints = map[string][]string{"repository_owner": {"acme", "beta"}, "aud": {"x"}}
+	a.ClaimConstraints = map[string][]string{"hd": {"acme", "beta"}, "groups": {"x"}}
 	b := validRow()
-	b.ClaimConstraints = map[string][]string{"aud": {"x"}, "repository_owner": {"beta", "acme"}}
-	if a.UniquenessKey(false) != "" {
+	b.ClaimConstraints = map[string][]string{"hd": {"beta", "acme"}, "groups": {"y"}}
+	if a.UniquenessKey("") != "" {
 		t.Fatal("a customer-unique issuer has an empty key, so one row per kind")
 	}
-	if a.UniquenessKey(true) == "" || a.UniquenessKey(true) != b.UniquenessKey(true) {
-		t.Fatal("equal constraints in any order give the same key")
+	if a.UniquenessKey("hd") == "" || a.UniquenessKey("hd") != b.UniquenessKey("hd") {
+		t.Fatal("the key is the pinning claim's values, in any order; other constraints do not count")
 	}
-	b.ClaimConstraints["repository_owner"] = []string{"acme"}
-	if a.UniquenessKey(true) == b.UniquenessKey(true) {
-		t.Fatal("different constraints give different keys")
+	b.ClaimConstraints["hd"] = []string{"acme"}
+	if a.UniquenessKey("hd") == b.UniquenessKey("hd") {
+		t.Fatal("different pins give different keys")
 	}
 }
 
 func TestExternalIssuerConstraintsMatch(t *testing.T) {
 	e := validRow()
 	e.ClaimConstraints = map[string][]string{"tid": {"t1"}, "groups": {"agents"}}
-	if !e.ConstraintsMatch(map[string]any{"tid": "t1", "groups": []any{"x", "agents"}}) {
+	if !e.ConstraintsMatch(map[string]any{"tid": "t1", "groups": []any{"x", "agents"}}, "") {
 		t.Fatal("matching claims must match")
 	}
-	if e.ConstraintsMatch(map[string]any{"tid": "t2", "groups": []any{"agents"}}) {
+	if e.ConstraintsMatch(map[string]any{"tid": "t2", "groups": []any{"agents"}}, "") {
 		t.Fatal("a wrong value must not match")
 	}
-	if e.ConstraintsMatch(map[string]any{"groups": []any{"agents"}}) {
+	if e.ConstraintsMatch(map[string]any{"groups": []any{"agents"}}, "") {
 		t.Fatal("a missing claim must not match")
 	}
-	if e.ConstraintsMatch(map[string]any{"tid": 1, "groups": "agents"}) {
+	if e.ConstraintsMatch(map[string]any{"tid": 1, "groups": "agents"}, "") {
 		t.Fatal("a non-string claim must not match")
+	}
+	if !e.ConstraintsMatch(map[string]any{"tid": "t1", "groups": []any{"agents"}}, "tid") {
+		t.Fatal("a scalar pin matches")
+	}
+	if e.ConstraintsMatch(map[string]any{"tid": []any{"t1", "t2"}, "groups": []any{"agents"}}, "tid") {
+		t.Fatal("an array in the pinning claim must not match: it could name several customers")
+	}
+}
+
+func TestValidateSharedIssuers(t *testing.T) {
+	if err := ValidateSharedIssuers(DefaultSharedIssuers); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range [][]SharedIssuer{
+		{{Issuer: "https://x"}},
+		{{Issuer: "https://x", PinClaim: "aud"}},
+		{{Issuer: "http://x", PinClaim: "hd"}},
+	} {
+		if ValidateSharedIssuers(bad) == nil {
+			t.Fatalf("%v must be refused", bad)
+		}
 	}
 }
 

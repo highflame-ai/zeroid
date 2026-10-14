@@ -256,4 +256,4 @@ cimd:
 # federation:
 #   issuer_store: config            # Env: ZEROID_FEDERATION_ISSUER_STORE
 #   allow_private_endpoints: false  # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS — local mock IdP only; relaxes the SSRF guard and https on issuer rows
-#   shared_issuers: []              # empty = built-in list (accounts.google.com, GitHub Actions, Entra multi-tenant endpoints)
+#   shared_issuers: []              # [{issuer, pin_claim}]; empty = built-in list (accounts.google.com/hd, GitHub Actions/repository_owner_id, Entra multi-tenant/tid)

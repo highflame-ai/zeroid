@@ -154,7 +154,7 @@ func TestResolvePersonIssuer_OneGenericRefusal(t *testing.T) {
 	defer jwksSrv.Close()
 	const iss = "https://idp.example.test"
 	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{issuerRow("r1", "acct", iss, domain.IssuerKindPerson, jwksSrv.URL())}}
-	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)))}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil, authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)))}
 	defer svc.externalIssuerRegistry.Close()
 	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	token := func(issuer string) string {
@@ -262,7 +262,7 @@ func TestRequireIDToken(t *testing.T) {
 // anonymous exchange is invalid_client before any issuer lookup.
 func TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
 	rows := &fakeIssuerRows{}
-	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true)}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil)}
 	defer svc.externalIssuerRegistry.Close()
 	tok, _ := jwt.NewBuilder().Issuer("https://probe.example.test").Subject("alice").Build()
 	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

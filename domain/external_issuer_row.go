@@ -125,8 +125,9 @@ type IssuerValidation struct {
 	// AllowHTTP admits http URLs, for a deployment that allows private
 	// endpoints (local development against a mock IdP).
 	AllowHTTP bool
-	// Shared reports whether the issuer is on the platform's shared list.
-	Shared bool
+	// PinClaim is the shared-issuer list's pinning claim for this issuer, or
+	// "" for a customer-unique issuer.
+	PinClaim string
 	// JWKSURIPending skips jwks_uri, which is discovered after validation.
 	JWKSURIPending bool
 }
@@ -187,6 +188,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	}
 	if templatedIssuer(e.Issuer) {
 		return issuerInvalid("invalid_issuer", "issuer %q is a template; use the tenant's own issuer", e.Issuer)
+	}
+	if slices.Contains(unclaimableIssuers, CanonicalIssuer(e.Issuer)) {
+		return issuerInvalid("invalid_issuer", "issuer %q (personal Microsoft accounts) belongs to no customer and cannot be trusted by an account", e.Issuer)
 	}
 	if e.Kind == IssuerKindPerson && slices.Contains(WorkloadOnlyIssuers, CanonicalIssuer(e.Issuer)) {
 		return issuerInvalid("invalid_issuer", "issuer %q issues workload tokens only; it can be a workload issuer, not a person issuer", e.Issuer)
@@ -250,9 +254,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 			return issuerInvalid("invalid_claim_constraints", "claim_constraints.%s must list at least one non-empty value", claim)
 		}
 	}
-	if v.Shared && len(e.ClaimConstraints) == 0 {
+	if v.PinClaim != "" && len(e.ClaimConstraints[v.PinClaim]) == 0 {
 		return &IssuerValidationError{Code: "shared_issuer_requires_constraints",
-			Message: fmt.Sprintf("issuer %q is shared by many customers; add claim_constraints that pin it to yours", e.Issuer)}
+			Message: fmt.Sprintf("issuer %q is shared by many customers; pin it to yours with claim_constraints.%s", e.Issuer, v.PinClaim)}
 	}
 	if e.MaxTokenAgeSeconds < 1 || e.MaxTokenAgeSeconds > 3600 {
 		return issuerInvalid("invalid_max_token_age", "max_token_age_seconds must be between 1 and 3600")
@@ -280,32 +284,31 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 
 // UniquenessKey is the constraints_key column: empty for a customer-unique
 // issuer, so the unique index allows one row per kind, and a hash of the
-// canonical constraints for a shared one.
-func (e *ExternalIssuer) UniquenessKey(shared bool) string {
-	if !shared {
+// pinning claim's values for a shared one (pin is that claim).
+func (e *ExternalIssuer) UniquenessKey(pin string) string {
+	if pin == "" {
 		return ""
 	}
-	keys := make([]string, 0, len(e.ClaimConstraints))
-	for k := range e.ClaimConstraints {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	canon := make([][2]any, 0, len(keys))
-	for _, k := range keys {
-		vals := slices.Clone(e.ClaimConstraints[k])
-		sort.Strings(vals)
-		canon = append(canon, [2]any{k, vals})
-	}
-	raw, _ := json.Marshal(canon)
+	vals := slices.Clone(e.ClaimConstraints[pin])
+	sort.Strings(vals)
+	raw, _ := json.Marshal([2]any{pin, vals})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }
 
 // ConstraintsMatch reports whether claims satisfy every claim constraint: the
 // claim is present and equals one of the listed values (or, for an array
-// claim, contains one).
-func (e *ExternalIssuer) ConstraintsMatch(claims map[string]any) bool {
+// claim, contains one). The pinning claim pin, when set, must be a single
+// string: an array naming several customers' values would match each of
+// their rows.
+func (e *ExternalIssuer) ConstraintsMatch(claims map[string]any, pin string) bool {
 	for claim, allowed := range e.ClaimConstraints {
+		if claim == pin {
+			if s, ok := claims[claim].(string); !ok || !slices.Contains(allowed, s) {
+				return false
+			}
+			continue
+		}
 		if !claimMatches(claims[claim], allowed) {
 			return false
 		}
@@ -400,18 +403,51 @@ func CanonicalIssuer(iss string) string {
 	return strings.TrimRight(strings.TrimSpace(iss), "/")
 }
 
-// DefaultSharedIssuers is the platform's shared-issuer list when the
-// deployment configures none (ADR 0042 D4). Rows for these need claim
-// constraints and may exist in several accounts.
-var DefaultSharedIssuers = []string{
-	"https://accounts.google.com",
-	"https://token.actions.githubusercontent.com",
-	"https://login.microsoftonline.com/common/v2.0",
-	"https://login.microsoftonline.com/organizations/v2.0",
-	"https://login.microsoftonline.com/consumers/v2.0",
-	// The Microsoft personal-account tenant, the issuer consumer tokens carry.
-	"https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+// SharedIssuer is an issuer many customers share (ADR 0042 D4) and the one
+// claim whose value says which customer a token belongs to. Every row on it
+// pins that claim, and rows are told apart on that claim alone.
+type SharedIssuer struct {
+	Issuer   string `koanf:"issuer"    json:"issuer"`
+	PinClaim string `koanf:"pin_claim" json:"pin_claim"`
 }
+
+// DefaultSharedIssuers is the platform's shared-issuer list when the
+// deployment configures none.
+var DefaultSharedIssuers = []SharedIssuer{
+	{Issuer: "https://accounts.google.com", PinClaim: "hd"},
+	{Issuer: "https://token.actions.githubusercontent.com", PinClaim: "repository_owner_id"},
+	{Issuer: "https://login.microsoftonline.com/common/v2.0", PinClaim: "tid"},
+	{Issuer: "https://login.microsoftonline.com/organizations/v2.0", PinClaim: "tid"},
+	{Issuer: "https://login.microsoftonline.com/consumers/v2.0", PinClaim: "tid"},
+}
+
+// SharedPin returns iss's pinning claim when iss is on list.
+func SharedPin(list []SharedIssuer, iss string) (string, bool) {
+	canon := CanonicalIssuer(iss)
+	for _, sh := range list {
+		if CanonicalIssuer(sh.Issuer) == canon {
+			return sh.PinClaim, true
+		}
+	}
+	return "", false
+}
+
+// ValidateSharedIssuers checks a configured shared-issuer list.
+func ValidateSharedIssuers(list []SharedIssuer) error {
+	for i, sh := range list {
+		if err := checkIssuerURL(sh.Issuer, false); err != nil {
+			return fmt.Errorf("shared_issuers[%d].issuer %v", i, err)
+		}
+		if sh.PinClaim == "" || slices.Contains(unpinnableClaims, sh.PinClaim) {
+			return fmt.Errorf("shared_issuers[%d].pin_claim must name a claim that identifies the customer (not iss, aud, exp, iat, nbf or jti)", i)
+		}
+	}
+	return nil
+}
+
+// unclaimableIssuers name no customer and pin to none: Microsoft personal
+// accounts all carry this tenant. No account may trust them.
+var unclaimableIssuers = []string{"https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0"}
 
 func compactStrings(in []string) []string {
 	out := make([]string, 0, len(in))
