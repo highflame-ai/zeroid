@@ -119,6 +119,10 @@ func TestJWTBearerFlow(t *testing.T) {
 	accessToken := token["access_token"].(string)
 	assert.Equal(t, "Bearer", token["token_type"])
 	assert.NotEmpty(t, accessToken)
+	// The request named no tenant, so the response is where an embedder
+	// attributing issuance (AuthN's metering) learns it.
+	assert.Equal(t, testAccountID, token["account_id"], "response must name the token's tenant")
+	assert.Equal(t, testProjectID, token["project_id"], "response must name the token's tenant")
 
 	// Introspect: token should be active with correct sub.
 	result := introspect(t, accessToken)
@@ -194,6 +198,8 @@ func TestTokenExchangeFlow(t *testing.T) {
 	delegatedToken := token["access_token"].(string)
 	assert.NotEmpty(t, delegatedToken)
 	assert.Equal(t, "data:read", token["scope"])
+	assert.Equal(t, testAccountID, token["account_id"], "response must name the token's tenant")
+	assert.Equal(t, testProjectID, token["project_id"], "response must name the token's tenant")
 
 	// Derive orchestrator WIMSE URI from introspecting its token.
 	orchIntrospect := introspect(t, orchToken)

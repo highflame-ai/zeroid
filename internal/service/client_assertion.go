@@ -208,11 +208,11 @@ func (s *OAuthService) enforceRegisteredClientAuthMethod(
 //
 // The client is resolved registry-first, with a CIMD fallback ONLY when the
 // caller opts in (cimdFallback). The opt-in is a property of the CALLER, not of
-// the credential check: a self-asserted document chooses its own grant_types,
-// so only a caller that gates on the resolved client's grant_types may accept
-// one. Today that is ID-JAG redemption alone (MCP Enterprise-Managed
-// Authorization §5), which requires jwt-bearer in the document's kept set;
-// client_credentials passes false. TestCIMDDirectAuthOptInIsBounded pins the
+// the credential check: a self-asserted document is anyone's to publish, so
+// only a caller whose authority comes from something the caller cannot choose
+// may accept one. Today that is ID-JAG redemption alone (MCP Enterprise-Managed
+// Authorization §5), where an IdP-signed ID-JAG must name this exact client_id
+// and the tenant is derived server-side; client_credentials passes false. TestCIMDDirectAuthOptInIsBounded pins the
 // set of callers that pass true, so a new one cannot appear silently.
 //
 // A CIMD client reaching here must declare private_key_jwt. "none" carries no

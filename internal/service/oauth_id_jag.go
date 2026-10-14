@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -204,8 +203,10 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// Document URL as its client_id (MCP Enterprise-Managed Authorization §5),
 	// so this grant opts into the CIMD fallback. A registry row for the URL
 	// still wins over its document, and a deactivated row still blocks it.
-	// The opt-in is safe only because of the gate right after it: the
-	// document must declare private_key_jwt and list jwt-bearer.
+	// The opt-in is safe only because of the gate right after it and the
+	// client_id binding below: the document must declare private_key_jwt (so
+	// the caller proved control of the URL's key), and the IdP-signed ID-JAG
+	// must name this exact client_id.
 	authedClient, err := s.authenticateRegisteredClient(ctx, req, true)
 	if err != nil {
 		return nil, err
@@ -539,19 +540,28 @@ func (s *OAuthService) recordObservedResources(
 //     so a key is the only credential it can have. authenticateRegisteredClient
 //     already refuses a CIMD client with any other method; this re-states it at
 //     the grant that depends on it.
-//   - grant_types must include jwt-bearer. A self-asserted document chooses its
-//     own grants, and this is the gate that makes the opt-in to CIMD resolution
-//     safe (see authenticateRegisteredClient). The kept set has already had
-//     §8's rule applied: a document claiming the ID-JAG profile without both
-//     token-exchange and jwt-bearer lost jwt-bearer at synthesis.
+//   - A document that claims the ID-JAG profile must not contradict itself
+//     (draft §8: it MUST then list both token-exchange and jwt-bearer). That
+//     is a refusal of an explicit, wrong declaration.
+//
+// A document that simply does not list jwt-bearer is NOT refused. It used to
+// be, and that broke real clients for no security gain: WSO2's MCP playground
+// publishes grant_types [authorization_code, refresh_token,
+// client_credentials] and redeems ID-JAGs with the same document. The grant
+// list is the publisher's own unauthenticated statement, so an attacker can put
+// jwt-bearer in it as easily as leave it out. What makes the redemption safe is
+// what the caller cannot choose: the private_key_jwt assertion proves control
+// of the document's key, the IdP-signed ID-JAG must name this exact client_id,
+// and the tenant must be derived server-side (deriveIDJAGTenant).
 func requireCIMDClientFitForIDJAG(client *domain.OAuthClient) error {
 	if client.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
 		return oauthUnauthorized(
 			"a client metadata document client must authenticate with private_key_jwt to redeem an ID-JAG", nil)
 	}
-	if !slices.Contains(client.GrantTypes, grantTypeJWTBearerURN) {
+	if client.IDJAGProfileContradicted {
 		return oauthBadRequest(oautherror.UnauthorizedClient,
-			"the client metadata document does not list "+grantTypeJWTBearerURN+" in grant_types")
+			"the client metadata document claims the ID-JAG grant profile without listing both "+
+				grantTypeTokenExchangeURN+" and "+grantTypeJWTBearerURN+" in grant_types")
 	}
 	return nil
 }
