@@ -195,9 +195,12 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if e.Kind == IssuerKindPerson && slices.Contains(WorkloadOnlyIssuers, CanonicalIssuer(e.Issuer)) {
 		return issuerInvalid("invalid_issuer", "issuer %q issues workload tokens only; it can be a workload issuer, not a person issuer", e.Issuer)
 	}
-	if e.Kind == IssuerKindPerson && EntraMultiTenantIssuer(e.Issuer) {
+	// No token carries these as iss, and their discovery documents publish
+	// a templated issuer, so a row on one could never match: each tenant is
+	// its own issuer.
+	if EntraMultiTenantIssuer(e.Issuer) {
 		return issuerInvalid("invalid_issuer",
-			"issuer %q is an Entra multi-tenant endpoint; a person issuer must be one tenant (https://login.microsoftonline.com/<tenant-id>/v2.0)", e.Issuer)
+			"issuer %q is an Entra multi-tenant endpoint; add each tenant's own issuer (https://login.microsoftonline.com/<tenant-id>/v2.0)", e.Issuer)
 	}
 	if !v.JWKSURIPending {
 		if err := checkIssuerURL(e.JWKSURI, v.AllowHTTP); err != nil {
@@ -416,9 +419,6 @@ type SharedIssuer struct {
 var DefaultSharedIssuers = []SharedIssuer{
 	{Issuer: "https://accounts.google.com", PinClaim: "hd"},
 	{Issuer: "https://token.actions.githubusercontent.com", PinClaim: "repository_owner_id"},
-	{Issuer: "https://login.microsoftonline.com/common/v2.0", PinClaim: "tid"},
-	{Issuer: "https://login.microsoftonline.com/organizations/v2.0", PinClaim: "tid"},
-	{Issuer: "https://login.microsoftonline.com/consumers/v2.0", PinClaim: "tid"},
 }
 
 // SharedPin returns iss's pinning claim when iss is on list.

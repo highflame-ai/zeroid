@@ -55,11 +55,11 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "entra consumers as person", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://login.microsoftonline.com/consumers/v2.0"
 		}, want: "invalid_issuer"},
-		{name: "entra common as workload with constraints is allowed", mutate: func(e *ExternalIssuer) {
+		{name: "entra common as workload is refused too", mutate: func(e *ExternalIssuer) {
 			e.Kind = IssuerKindWorkload
 			e.Issuer = "https://login.microsoftonline.com/common/v2.0"
 			e.ClaimConstraints = map[string][]string{"tid": {"t"}}
-		}, v: IssuerValidation{PinClaim: "tid"}},
+		}, want: "invalid_issuer"},
 		{name: "GitHub Actions as a person issuer", mutate: func(e *ExternalIssuer) {
 			e.Issuer = "https://token.actions.githubusercontent.com/"
 		}, v: IssuerValidation{PinClaim: "repository_owner_id"}, want: "invalid_issuer"},

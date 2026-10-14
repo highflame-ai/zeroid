@@ -70,11 +70,14 @@ The built-in shared list (used when `federation.shared_issuers` is empty):
 |---|---|
 | `https://accounts.google.com` | `hd` |
 | `https://token.actions.githubusercontent.com` (workload only) | `repository_owner_id` |
-| `https://login.microsoftonline.com/{common,organizations,consumers}/v2.0` | `tid` |
+
+Entra is not on it.
+Every Entra token carries its tenant's own issuer, `https://login.microsoftonline.com/<tenant-id>/v2.0`, and the multi-tenant endpoints (`common`, `organizations`, `consumers`) publish a templated issuer (`…/{tenantid}/v2.0`) in discovery, so a row on one could never pass the exact discovery match; they are refused for every kind.
+A customer with several Entra tenants adds each tenant's issuer as its own (customer-unique) row.
 
 `federation.shared_issuers` replaces it, as a list of `{issuer, pin_claim}`; ZeroID refuses to start if an entry lacks a pinning claim, pins `iss`, `aud`, `exp`, `iat`, `nbf` or `jti`, or is not https (http is admitted only with `federation.allow_private_endpoints`, for a local mock IdP).
 
-A person row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant endpoints, which name no single tenant.
+Every row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant endpoints, which name no single tenant.
 A person row also refuses an issuer that only issues workload tokens (GitHub Actions, `https://token.actions.githubusercontent.com`).
 
 ### Presets
