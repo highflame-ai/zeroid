@@ -494,7 +494,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if err != nil {
 		return nil, err
 	}
-	issue.SubjectOverride, issue.IdPSubject = person.sub, person.idpSub
+	person.apply(&issue)
 	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
 		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
 	}

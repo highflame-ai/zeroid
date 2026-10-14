@@ -136,7 +136,7 @@ asserted. It returns a ceiling and the person's roles.
 On ID-JAG and the ID-token exchange, when a federated person resolver is
 installed (`Server.SetFederatedPersonResolver`, ADR 0042 D5a), it runs first:
 the person this resolver sees is the deployer's user it returned, not the IdP
-subject, which the token carries as `idp_sub`
+subject, which the token carries as `idp_iss`/`idp_sub`
 ([external-issuers.md](external-issuers.md#person-resolution)).
 
 The resolver runs on the token request's path, under its context. It must

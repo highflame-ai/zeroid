@@ -554,8 +554,9 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 
 	assert.Equal(t, "user_hf_alice", claims["sub"], "sub is the person's Highflame user id (D5a)")
+	assert.Equal(t, federationIssuer, claims["user_id_iss"], "sub's issuer is ZeroID's, as on authorization_code")
 	assert.Equal(t, p.aliceOID, claims["idp_sub"], "the IdP subject (Entra oid) rides in idp_sub")
-	assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["user_id_iss"])
+	assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["idp_iss"], "with the IdP's issuer in idp_iss")
 	assert.Equal(t, "user", claims["principal_type"])
 	assert.Equal(t, p.tn.account, claims["account_id"], "account from the issuer row (D5)")
 	assert.Equal(t, p.tn.project, claims["project_id"], "project from the bound agent (D5)")
@@ -584,6 +585,7 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 		require.Equal(t, http.StatusOK, ex.StatusCode, "body=%s", ex.RawBody)
 		child := decodeIssuedTokenClaims(t, ex.AccessToken)
 		assert.Equal(t, "user_hf_alice", child["sub"], "the chain's principal is the person")
+		assert.Equal(t, federationIssuer, child["user_id_iss"], "the chain keeps sub's issuer")
 		assert.Equal(t, "user", child["principal_type"])
 		assert.Equal(t, p.agent.wimse, actChain(t, child)[0])
 		assert.Equal(t, p.tn.account, child["account_id"])
@@ -688,11 +690,13 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		assert.Equal(t, http.StatusOK, p.exchange(t, good(), nil).StatusCode, "re-enabled at the next request")
 	})
 	t.Run("idp_sub cannot be supplied by the caller", func(t *testing.T) {
-		resp := p.exchange(t, good(), map[string]any{"additional_claims": map[string]any{"idp_sub": "forged", "user_id_iss": "forged"}})
+		resp := p.exchange(t, good(), map[string]any{"additional_claims": map[string]any{
+			"idp_sub": "forged", "idp_iss": "forged", "user_id_iss": "forged"}})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 		assert.Equal(t, p.aliceOID, claims["idp_sub"])
-		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["user_id_iss"])
+		assert.Equal(t, p.f.idp.EntraIssuer(p.tid), claims["idp_iss"])
+		assert.Equal(t, federationIssuer, claims["user_id_iss"])
 	})
 }
 
@@ -767,7 +771,9 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	assert.Equal(t, "user_hf_alice", claims["sub"])
+	assert.Equal(t, federationIssuer, claims["user_id_iss"])
 	assert.Equal(t, p.aliceSub, claims["idp_sub"])
+	assert.Equal(t, p.f.idp.OktaIssuer(), claims["idp_iss"])
 	assert.Equal(t, "user", claims["principal_type"])
 	assert.Equal(t, p.tn.account, claims["account_id"])
 	assert.Equal(t, p.tn.project, claims["project_id"])

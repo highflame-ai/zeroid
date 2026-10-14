@@ -124,7 +124,7 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
 5. The person resolver finds the person in the account (below).
 6. The agent is `active` (D7).
 
-The token's `sub` is the person's user id, `principal_type` is `user`, the agent is the current actor in `act`, `client_id` is the presenting client, and `resource` audience-restricts it.
+The token's `sub` is the person's user id with `user_id_iss` ZeroID's issuer, the IdP's pair is in `idp_iss` and `idp_sub`, `principal_type` is `user`, the agent is the current actor in `act`, `client_id` is the presenting client, and `resource` audience-restricts it.
 
 ### P1b: ID-JAG
 
@@ -157,12 +157,14 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
 ```
 
 - The returned id becomes the token's `sub`.
-  The IdP subject moves to the reserved claim `idp_sub`, beside `user_id_iss` (the IdP's issuer); both are written after caller-supplied claims, so no caller can set them.
+  `user_id_iss` keeps meaning "the issuer of `sub`", so it becomes ZeroID's own issuer, as on `authorization_code` and the external-principal exchange (under the `rfc8693` profile; the legacy profile emits no `user_id_iss` for such a `sub`).
+  The IdP's pair travels together in the reserved claims `idp_iss` (the IdP's issuer) and `idp_sub` (the user key).
+  All three are written after caller-supplied claims, so no caller can set them.
 - `ErrPersonNotMember` is `invalid_grant` ("the person is not a member of this organization").
 - Any other error, an empty id or a panic is `server_error` with a fixed message; the cause is logged, never returned.
   Each call is bounded at 5 seconds.
 - With issuer rows a resolver is required: without one the grants answer `server_error` ("person resolution is not configured").
-  With static issuers and no resolver, `sub` stays the IdP subject and there is no `idp_sub`.
+  With static issuers and no resolver, `sub` stays the IdP subject, `user_id_iss` is the IdP's issuer, and there is no `idp_iss` or `idp_sub`.
 
 The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceiling)) then sees the resolved user id.
 

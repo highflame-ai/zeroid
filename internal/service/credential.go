@@ -257,8 +257,10 @@ type IssueRequest struct {
 	// PersonGrantExternalIDToken. Empty elsewhere.
 	PersonGrantType string
 
-	// IdPSubject is the IdP's subject for a person the deployer's resolver
-	// mapped to its own user (sub). Written as idp_sub after CustomClaims.
+	// IdPIssuer and IdPSubject are the IdP's pair for a person the deployer's
+	// resolver mapped to its own user (sub), written as idp_iss and idp_sub
+	// after CustomClaims. sub's issuer (user_id_iss) is then ZeroID's.
+	IdPIssuer  string
 	IdPSubject string
 
 	// personGrant is the person-grant decision already made for these scopes
@@ -913,9 +915,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
 
-	// idp_sub: like mission_id, only ever the grant's own value.
+	// idp_iss / idp_sub: like mission_id, only ever the grant's own values.
+	_ = token.Remove("idp_iss")
 	_ = token.Remove("idp_sub")
 	if req.IdPSubject != "" {
+		_ = token.Set("idp_iss", req.IdPIssuer)
 		_ = token.Set("idp_sub", req.IdPSubject)
 	}
 

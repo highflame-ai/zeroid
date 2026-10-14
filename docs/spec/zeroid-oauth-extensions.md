@@ -296,7 +296,10 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   root workload — and is fixed for the life of the chain, through every
   exchange and refresh (RFC 9068 §2.2). `principal_type` says which. A user
   principal also carries `user_id_iss`, its issuer: the upstream IdP's for a
-  federated user, otherwise ZeroID's own, forming an RFC 9493 `iss_sub` pair.
+  federated user whose `sub` is the IdP subject, otherwise ZeroID's own
+  (including a federated person a person resolver mapped to the deployer's
+  user, whose IdP pair is in `idp_iss`/`idp_sub`), forming an RFC 9493
+  `iss_sub` pair.
 - `act` is the **current actor**, with prior actors nested inside it, most
   recent first:
   `{"sub": "<C>", "identity_type": "agent", "trust_level": "...", "external_id": "<c>", "act": {"sub": "<B>", "act": {"sub": "<A>"}}}`.
@@ -358,7 +361,7 @@ broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
 | `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
 | `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
 | `user_id_iss` | string | upstream `iss` | **IdP-granular provenance** — the issuer URL of the upstream OpenID Provider that authenticated the subject, copied verbatim from the verified ID token. Only on the `external_id_token` path (Section 5.6). Lets a consumer answer "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). Reserved (Section 8) so a caller cannot forge it. |
-| `idp_sub` | string | upstream user key | The person's subject at the IdP (the issuer's `claim_mapping.user_id`, e.g. Entra `oid`, Okta `sub`) when the deployer's person resolver mapped them to its own user, which is then `sub`. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
+| `idp_iss` / `idp_sub` | string | upstream `iss` / user key | The person's pair at the IdP — its issuer, and the subject the issuer's `claim_mapping.user_id` names (e.g. Entra `oid`, Okta `sub`) — when the deployer's person resolver mapped them to its own user. `sub` is then that user and `user_id_iss` ZeroID's issuer, so `user_id_iss` always names `sub`'s issuer. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
 | `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
 | `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
 | `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
@@ -632,8 +635,9 @@ upstream ID token. The mode:
   identity the authenticated client is bound to, and a caller-supplied
   `account_id`/`project_id` that differs is `invalid_grant`. The bound agent is
   the current actor in `act`, and the deployer's person resolver must find the
-  person in the account; the token's `sub` is the resolved user and the IdP
-  subject is carried in the reserved `idp_sub` claim. See
+  person in the account; the token's `sub` is the resolved user, its
+  `user_id_iss` is ZeroID's issuer, and the IdP's issuer and subject are carried
+  in the reserved `idp_iss` and `idp_sub` claims. See
   [external-issuers.md](../external-issuers.md).
 - With a static issuer (standalone), binds the upstream token to a ZeroID
   tenant via the issuer's
@@ -645,7 +649,8 @@ upstream ID token. The mode:
   `allowed_accounts` at config load (fail closed).
 - Maps the principal from the issuer's `claim_mapping` (`user_id` REQUIRED,
   becomes `sub`; OPTIONAL `email`, `name`).
-- Emits `token_exchange=external_id_token` and `user_id_iss=<upstream iss>`, and
+- Emits `token_exchange=external_id_token` and, unless a person resolver mapped
+  `sub` to the deployer's user, `user_id_iss=<upstream iss>`, and
   propagates `auth_time`/`acr`/`amr` per the issuer's `propagate_claims`
   (Section 4.6). Is RS256-signed with a short (900 s) TTL and is governed by the
   tenant credential-policy ceiling (the tenant default policy when no
@@ -797,7 +802,7 @@ scopes grant_type delegation_depth user_email user_name
 # RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
 resource client_id scope may_act
 # ZeroID internal / provenance
-act token_exchange trusted_by user_id_iss idp_sub mission_id principal_type
+act token_exchange trusted_by user_id_iss idp_iss idp_sub mission_id principal_type
 # RFC 9449 sender-constraint
 cnf
 # RFC 8707 resource binding, RFC 9068 client attribution
@@ -1451,7 +1456,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `token_exchange` | string | §4.6, §4.7 |
 | `trusted_by` | string | §4.6 |
 | `user_id_iss` | string | §4.6, §5.6 |
-| `idp_sub` | string | §4.6, §5.6 |
+| `idp_iss` `idp_sub` | string | §4.6, §5.6 |
 | `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |

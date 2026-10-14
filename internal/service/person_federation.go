@@ -64,10 +64,24 @@ func (s *OAuthService) SetFederatedPersonResolver(fn FederatedPersonResolver) {
 }
 
 // federatedPerson is the result of resolving a person: the token's sub and,
-// when a resolver mapped it, the IdP subject for idp_sub.
+// when a resolver mapped it, the IdP's pair for idp_iss and idp_sub.
 type federatedPerson struct {
 	sub    string
+	idpIss string
 	idpSub string
+}
+
+// apply sets the person on req. A resolved person's sub is the deployer's
+// user, whose issuer is ZeroID's: user_id_iss names sub's issuer, so the
+// IdP's issuer moves to idp_iss with idp_sub (ADR 0042 D5a), and the token
+// carries the same user_id_iss as other person grants.
+func (p federatedPerson) apply(req *IssueRequest) {
+	req.SubjectOverride = p.sub
+	if p.idpSub == "" {
+		return
+	}
+	req.IdPIssuer, req.IdPSubject = p.idpIss, p.idpSub
+	delete(req.CustomClaims, "user_id_iss")
 }
 
 // resolveFederatedPerson maps the IdP subject to the deployer's user.
@@ -98,7 +112,7 @@ func (s *OAuthService) resolveFederatedPerson(ctx context.Context, fromRow bool,
 	case strings.TrimSpace(userID) == "":
 		return federatedPerson{}, oauthServerError("the person could not be resolved", errors.New("resolver returned an empty user id"))
 	}
-	return federatedPerson{sub: userID, idpSub: r.Subject}, nil
+	return federatedPerson{sub: userID, idpIss: r.Issuer, idpSub: r.Subject}, nil
 }
 
 func callFederatedPersonResolver(ctx context.Context, fn FederatedPersonResolver, r FederatedPersonRequest) (userID string, err error) {

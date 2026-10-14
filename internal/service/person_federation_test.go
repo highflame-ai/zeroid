@@ -33,7 +33,7 @@ func TestResolveFederatedPerson(t *testing.T) {
 			return "user_hf_1", nil
 		})
 		got, err := s.resolveFederatedPerson(ctx, true, req)
-		if err != nil || got.sub != "user_hf_1" || got.idpSub != "oid-1" {
+		if err != nil || got.sub != "user_hf_1" || got.idpSub != "oid-1" || got.idpIss != "https://idp" {
 			t.Fatalf("got %+v err %v", got, err)
 		}
 		if seen != req {
@@ -77,6 +77,28 @@ func TestResolveFederatedPerson(t *testing.T) {
 	})
 }
 
+// A resolved person's sub is the deployer's user, so user_id_iss (sub's
+// issuer) must not stay the IdP's; the IdP pair moves to idp_iss/idp_sub.
+func TestFederatedPersonApply(t *testing.T) {
+	req := IssueRequest{SubjectOverride: "oid-1", CustomClaims: map[string]any{"user_id_iss": "https://idp", "token_exchange": "id_jag"}}
+	federatedPerson{sub: "user_hf_1", idpIss: "https://idp", idpSub: "oid-1"}.apply(&req)
+	if req.SubjectOverride != "user_hf_1" || req.IdPIssuer != "https://idp" || req.IdPSubject != "oid-1" {
+		t.Fatalf("req = %+v", req)
+	}
+	if _, ok := req.CustomClaims["user_id_iss"]; ok {
+		t.Fatal("user_id_iss must not name the IdP once sub is the deployer's user")
+	}
+	if got := (&CredentialService{issuer: "https://zeroid"}).resolvePrincipal(IssueRequest{SubjectOverride: req.SubjectOverride, CustomClaims: req.CustomClaims}); got.Iss != "https://zeroid" {
+		t.Fatalf("principal issuer = %q, want ZeroID's, as on authorization_code", got.Iss)
+	}
+
+	static := IssueRequest{SubjectOverride: "oid-1", CustomClaims: map[string]any{"user_id_iss": "https://idp"}}
+	federatedPerson{sub: "oid-1"}.apply(&static)
+	if static.CustomClaims["user_id_iss"] != "https://idp" || static.IdPSubject != "" || static.IdPIssuer != "" {
+		t.Fatalf("without a resolver the IdP stays sub's issuer: %+v", static)
+	}
+}
+
 func TestEmailVerified(t *testing.T) {
 	cases := []struct {
 		claims map[string]any
@@ -99,7 +121,7 @@ func TestEmailVerified(t *testing.T) {
 }
 
 func TestReservedClaims_IdPSub(t *testing.T) {
-	if !reservedClaims["idp_sub"] || !reservedClaims["user_id_iss"] {
-		t.Fatal("idp_sub and user_id_iss are written only by the federated grants")
+	if !reservedClaims["idp_iss"] || !reservedClaims["idp_sub"] || !reservedClaims["user_id_iss"] {
+		t.Fatal("idp_iss, idp_sub and user_id_iss are written only by ZeroID")
 	}
 }

@@ -230,7 +230,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 
 	// The person must be a member of the tenant (ADR 0042 D5a); the token's
-	// sub becomes the deployer's user id and the IdP subject moves to idp_sub.
+	// sub becomes the deployer's user id and the IdP pair moves to idp_iss/idp_sub.
 	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
 		GrantType:       PersonGrantExternalIDToken,
 		AccountID:       req.AccountID,
@@ -316,8 +316,6 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		GrantType:             domain.GrantTypeTokenExchange,
 		Scopes:                scopes,
 		UseRS256:              true,
-		SubjectOverride:       person.sub,
-		IdPSubject:            person.idpSub,
 		UserEmail:             userEmail,
 		UserName:              userName,
 		ApplicationID:         req.ApplicationID,
@@ -345,6 +343,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// upstream authorized set to narrow against, so the requested resource simply
 	// restricts the token it would have minted anyway — the same treatment
 	// client_credentials and api_key get.
+	person.apply(&issue)
 	bindResourceOnIssue(&issue, req.Resource)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
