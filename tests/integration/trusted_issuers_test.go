@@ -639,6 +639,7 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 	assert.True(t, seen.EmailVerified, "xms_edov marks the Entra email verified")
 	assert.Equal(t, p.tn.account, seen.AccountID)
 	assert.Equal(t, p.agent.id, seen.AgentIdentityID)
+	assert.Equal(t, p.rowID, seen.IssuerID, "the issuer row that verified the token")
 
 	t.Run("the agent exchanges the person token with its actor_token (RFC 8693)", func(t *testing.T) {
 		ex := postFederation(t, p.f.http.URL, map[string]any{
@@ -996,6 +997,41 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims), "act.sub's bound agent is the current actor (zeroid#416)")
 	assert.Equal(t, p.agent.extID, claims["act"].(map[string]any)["external_id"])
 	assert.ElementsMatch(t, []any{"https://gateway.example/mcp/github"}, claims["aud"])
+	p.f.mu.Lock()
+	seen := p.f.lastPerson
+	p.f.mu.Unlock()
+	assert.Equal(t, p.rowID, seen.IssuerID, "the issuer row that verified the ID-JAG")
+	assert.Equal(t, zeroid.PersonGrantIDJAG, seen.GrantType)
+}
+
+// TestFederatedPerson_StaticIssuerHasNoRowID: a static issuer has no row, so
+// the resolver sees an empty IssuerID.
+func TestFederatedPerson_StaticIssuerHasNoRowID(t *testing.T) {
+	upstreamIss, aud := "https://static.person.test", "https://zeroid-rp.static.test"
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+	fedSrv, fedHTTP, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer: upstreamIss, JWKSURI: upstream.JWKSURL(), Audience: aud,
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTP.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+	var seen zeroid.FederatedPersonRequest
+	fedSrv.SetFederatedPersonResolver(func(_ context.Context, r zeroid.FederatedPersonRequest) (string, error) {
+		seen = r
+		return "user_static", nil
+	})
+	now := time.Now()
+	tok := upstream.SignToken(t, map[string]any{"iss": upstreamIss, "aud": aud, "sub": "alice", "iat": now.Unix(), "exp": now.Add(time.Minute).Unix()})
+	resp := postFederation(t, fedHTTP.URL, withClientAuth(t, map[string]any{
+		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token":      tok,
+		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+		"account_id":         fedCfg.AccountID, "project_id": fedCfg.ProjectID,
+	}, rpClient(t, aud)))
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	assert.Equal(t, "", seen.IssuerID)
+	assert.Equal(t, upstreamIss, seen.Issuer)
 }
 
 func TestTrustedIssuers_P1B_Refusals(t *testing.T) {

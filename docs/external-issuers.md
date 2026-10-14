@@ -179,6 +179,7 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
 	// r.GrantType        zeroid.PersonGrantIDJAG or zeroid.PersonGrantExternalIDToken
 	// r.AccountID, r.ProjectID   the tenant the token is minted into
 	// r.Issuer, r.Subject        the IdP and the person's user key (claim_mapping.user_id)
+	// r.IssuerID                 the issuer row that verified the token ("" for a static issuer)
 	// r.Email, r.EmailVerified   the mapped email, and whether the IdP asserted it verified
 	// r.ClientID, r.AgentIdentityID
 	return highflameUserID, nil // or zeroid.ErrPersonNotMember
@@ -190,6 +191,7 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
   The IdP's pair travels together in the reserved claims `user_idp_iss` (the IdP's issuer) and `user_idp_sub` (the user key).
   They are prefixed `user_` because they describe the person, and to stay clear of the agent's own IdP provenance (`agent_idp_iss`), which Shield projects as `principal.idp_iss`.
   All three are written after caller-supplied claims, so no caller can set them.
+- Key links on `IssuerID` as well as `(Issuer, Subject)`: a row deleted and added again gets a new id, so its people re-link on first sight under the new row's rules and never inherit links made under the old one (whose claim mapping may have differed).
 - `ErrPersonNotMember` is `invalid_grant` ("the person is not a member of this organization").
 - Any other error, an empty id or a panic is `server_error` with a fixed message; the cause is logged, never returned.
   Each call is bounded at 5 seconds.

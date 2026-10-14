@@ -25,6 +25,11 @@ type FederatedPersonRequest struct {
 	// the issuer's claim_mapping.user_id names (Entra oid, Okta sub).
 	Issuer  string
 	Subject string
+	// IssuerID is the id of the issuer row that verified the token, empty
+	// for a static issuer. A deployer keying its links on it never reuses a
+	// link after the row is deleted and added again (a new id), so people
+	// re-link on first sight against the new row's rules.
+	IssuerID string
 	// Email is the mapped email claim. EmailVerified is true only when the
 	// IdP asserted it (the claim claim_mapping.email_verified names, default
 	// email_verified; Entra's xms_edov).
@@ -122,6 +127,14 @@ func callFederatedPersonResolver(ctx context.Context, fn FederatedPersonResolver
 		}
 	}()
 	return fn(ctx, r)
+}
+
+// issuerRowID is the id of the row entry came from, "" for a static issuer.
+func issuerRowID(entry *ExternalIssuerEntry) string {
+	if entry == nil || entry.Row == nil {
+		return ""
+	}
+	return entry.Row.ID
 }
 
 // emailVerified reads the claim that asserts the email was verified: a JSON

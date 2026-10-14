@@ -242,6 +242,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		AccountID:       req.AccountID,
 		ProjectID:       req.ProjectID,
 		Issuer:          upstreamIss,
+		IssuerID:        issuerRowID(entry),
 		Subject:         userID,
 		Email:           userEmail,
 		EmailVerified:   emailVerified(rawClaims, cfg.ClaimMapping["email_verified"]),
