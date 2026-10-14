@@ -1371,3 +1371,56 @@ func TestTrustedIssuers_DroppedFromSharedList(t *testing.T) {
 	status, body = call(map[string]any{"audiences": []string{"x"}})
 	assert.Equal(t, http.StatusConflict, status, "a substantive change re-checks uniqueness: %v", body)
 }
+
+// TestTrustedIssuers_ConditionalEnable: the deployer's enable at adoption
+// cannot undo an admin's disable, even racing it.
+func TestTrustedIssuers_ConditionalEnable(t *testing.T) {
+	f := newDBFederation(t)
+	tn := newTITenant(t)
+	row := f.entraRow(t, tn, uid("ce-tid"), nil)["id"].(string)
+	patch := func(bindingID string, body map[string]any) (int, map[string]any) {
+		return f.call(t, http.MethodPatch, "/external-issuers/"+row+"/bindings/"+bindingID, body, tn.headers)
+	}
+
+	// Awaiting adoption: created disabled for a discovered agent.
+	discovered := tn.discoveredAgent(t)
+	status, body := f.bind(t, tn, row, uid("app-ce"), discovered, false)
+	require.Equal(t, http.StatusCreated, status, "%v", body)
+	waiting := body["id"].(string)
+	_, err := testDB.NewUpdate().Table("identities").Set("status = 'active'").Where("id = ?", discovered).Exec(context.Background())
+	require.NoError(t, err)
+	status, body = patch(waiting, map[string]any{"enabled": true, "only_if_not_explicitly_disabled": true})
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.Equal(t, true, body["enabled"])
+
+	// An admin disabled it: the conditional enable is refused, a plain one is not.
+	status, _ = patch(waiting, map[string]any{"enabled": false})
+	require.Equal(t, http.StatusOK, status)
+	status, body = patch(waiting, map[string]any{"enabled": true, "only_if_not_explicitly_disabled": true})
+	assert.Equal(t, http.StatusConflict, status, "%v", body)
+	assert.Equal(t, "binding_explicitly_disabled", body["code"])
+	status, body = patch(waiting, map[string]any{"enabled": true})
+	assert.Equal(t, http.StatusOK, status, "an admin's explicit enable: %v", body)
+
+	// Racing an admin's disable never leaves it enabled after the disable.
+	for round := 0; round < 10; round++ {
+		status, _ = patch(waiting, map[string]any{"enabled": true})
+		require.Equal(t, http.StatusOK, status)
+		_, err = testDB.NewUpdate().Table("external_issuer_bindings").Set("enabled = false, explicitly_disabled = false").Where("id = ?", waiting).Exec(context.Background())
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); patch(waiting, map[string]any{"enabled": false}) }()
+		go func() {
+			defer wg.Done()
+			patch(waiting, map[string]any{"enabled": true, "only_if_not_explicitly_disabled": true})
+		}()
+		wg.Wait()
+		var enabled, explicit bool
+		require.NoError(t, testDB.NewSelect().Table("external_issuer_bindings").Column("enabled", "explicitly_disabled").
+			Where("id = ?", waiting).Scan(context.Background(), &enabled, &explicit))
+		if explicit {
+			assert.False(t, enabled, "round %d: an admin's disable must stand", round)
+		}
+	}
+}

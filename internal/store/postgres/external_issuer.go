@@ -276,20 +276,31 @@ func (r *ExternalIssuerRepository) ListBindings(ctx context.Context, accountID, 
 	return out, nil
 }
 
-// UpdateBinding rewrites a binding's enabled flag.
-func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.IssuerBinding) error {
-	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(b).
+// ErrBindingExplicitlyDisabled is UpdateBinding's answer to a conditional
+// enable of a binding an admin disabled.
+var ErrBindingExplicitlyDisabled = errors.New("binding was explicitly disabled")
+
+// UpdateBinding rewrites a binding's enabled flag. With unlessExplicitlyDisabled
+// the write happens only if the stored row is not explicitly disabled, in the
+// same statement, so it cannot race an admin's disable.
+func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.IssuerBinding, unlessExplicitlyDisabled bool) error {
+	q := dbOrTx(ctx, r.db).NewUpdate().Model(b).
 		Column("enabled", "explicitly_disabled", "updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", b.ID).
 		Where("account_id = ?", b.AccountID).
-		Where("deleted_at IS NULL").
-		Returning("*").
-		Exec(ctx)
+		Where("deleted_at IS NULL")
+	if unlessExplicitlyDisabled {
+		q = q.Where("NOT explicitly_disabled")
+	}
+	res, err := q.Returning("*").Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to update binding: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		if unlessExplicitlyDisabled {
+			return ErrBindingExplicitlyDisabled
+		}
 		return fmt.Errorf("failed to update binding: %w", sql.ErrNoRows)
 	}
 	return nil

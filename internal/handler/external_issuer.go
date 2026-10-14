@@ -428,13 +428,18 @@ func (a *API) updateBindingOp(ctx context.Context, input *struct {
 	BindingID string `path:"binding_id"`
 	Body      struct {
 		Enabled bool `json:"enabled"`
+		// OnlyIfNotExplicitlyDisabled makes an enable conditional and atomic:
+		// it applies only if no admin disabled the binding (409
+		// binding_explicitly_disabled otherwise). For enabling at adoption.
+		OnlyIfNotExplicitlyDisabled bool `json:"only_if_not_explicitly_disabled,omitempty"`
 	}
 }) (*bindingOutput, error) {
 	account, actor, err := issuerTenant(ctx)
 	if err != nil {
 		return nil, err
 	}
-	b, err := a.externalIssuerSvc.SetBindingEnabled(ctx, account, input.ID, input.BindingID, actor, input.Body.Enabled)
+	b, err := a.externalIssuerSvc.SetBindingEnabled(ctx, account, input.ID, input.BindingID, actor,
+		input.Body.Enabled, input.Body.OnlyIfNotExplicitlyDisabled)
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update binding")
 	}

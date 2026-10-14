@@ -111,7 +111,7 @@ At most one **enabled** binding may exist per `(issuer row, subject key)`.
 A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
 ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an agent's bindings when an org admin adopts or activates it.
 Each binding carries `explicitly_disabled`: true when an admin disabled it (`PATCH {"enabled": false}`) or created it with `"enabled": false`, false when it is disabled only because its identity was not active yet.
-At adoption the deployer enables only bindings with `explicitly_disabled: false`, so adoption never undoes an admin's decision; `PATCH {"enabled": true}` clears it.
+At adoption the deployer enables bindings with the conditional PATCH below, which skips any with `explicitly_disabled: true`, so adoption never undoes an admin's decision; a plain `PATCH {"enabled": true}` clears it.
 Until then the mint refuses it as not adopted (D7), naming the state.
 
 ## The person grants with issuer rows
@@ -229,6 +229,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `issuer_store_config` | Any route but the list and `/check` on a `config`-mode server |
 | 409 | `binding_conflict` | Another enabled binding maps this subject key under this issuer |
 | 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
+| 409 | `binding_explicitly_disabled` | A conditional enable of a binding an admin disabled |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
 | 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
 | 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
@@ -410,7 +411,12 @@ On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` cl
 
 ```json
 {"enabled": true}
+{"enabled": true, "only_if_not_explicitly_disabled": true}
 ```
+
+`{"enabled": false}` sets `explicitly_disabled`; a plain `{"enabled": true}` clears it (an admin's own decision).
+The deployer enables an agent's bindings at adoption with `only_if_not_explicitly_disabled: true`: the enable is applied in one statement only where `explicitly_disabled` is false, so it cannot undo an admin's disable even when the two race, and it is 409 `binding_explicitly_disabled` otherwise.
+Either enable needs the identity to be `active` (409 `identity_not_active`).
 
 ### `DELETE /external-issuers/{id}/bindings/{binding_id}` → 204
 

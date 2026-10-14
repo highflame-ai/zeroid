@@ -854,8 +854,10 @@ func (s *ExternalIssuerService) GetBinding(ctx context.Context, accountID, issue
 }
 
 // SetBindingEnabled enables or disables a binding. Enabling needs an active
-// identity and no other enabled binding for the same subject key.
-func (s *ExternalIssuerService) SetBindingEnabled(ctx context.Context, accountID, issuerID, id, actor string, enabled bool) (*domain.IssuerBinding, error) {
+// identity and no other enabled binding for the same subject key. With
+// unlessExplicitlyDisabled an enable applies only if no admin disabled the
+// binding, decided atomically (the deployer's enable at adoption).
+func (s *ExternalIssuerService) SetBindingEnabled(ctx context.Context, accountID, issuerID, id, actor string, enabled, unlessExplicitlyDisabled bool) (*domain.IssuerBinding, error) {
 	b, err := s.GetBinding(ctx, accountID, issuerID, id)
 	if err != nil {
 		return nil, err
@@ -874,7 +876,11 @@ func (s *ExternalIssuerService) SetBindingEnabled(ctx context.Context, accountID
 	b.ExplicitlyDisabled = !enabled
 	b.UpdatedBy = actor
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
-		if err := s.repo.UpdateBinding(ctx, b); err != nil {
+		if err := s.repo.UpdateBinding(ctx, b, enabled && unlessExplicitlyDisabled); err != nil {
+			if errors.Is(err, postgres.ErrBindingExplicitlyDisabled) {
+				return issuerErr(http.StatusConflict, "binding_explicitly_disabled",
+					"an admin disabled this binding; it is enabled only by an explicit request")
+			}
 			if errors.Is(err, sql.ErrNoRows) {
 				return errBindingNotFound
 			}
