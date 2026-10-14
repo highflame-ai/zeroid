@@ -1315,3 +1315,30 @@ func TestTrustedIssuers_ForgedIDJAGRaisesNoEvent(t *testing.T) {
 	assert.Contains(t, resp.RawBody, "verification failed")
 	assert.NotContains(t, resp.RawBody, "discovered")
 }
+
+// TestTrustedIssuers_BindingVsIssuerDelete: a binding created while its
+// issuer is being deleted never survives as a live binding under a deleted
+// issuer.
+func TestTrustedIssuers_BindingVsIssuerDelete(t *testing.T) {
+	f := newDBFederation(t)
+	tn := newTITenant(t)
+	agent := tn.agent(t)
+	for round := 0; round < 10; round++ {
+		id := f.entraRow(t, tn, uid("del-tid"), nil)["id"].(string)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			f.call(t, http.MethodDelete, "/external-issuers/"+id, nil, tn.headers)
+		}()
+		go func() {
+			defer wg.Done()
+			f.bind(t, tn, id, uid("app-del"), agent.id, false)
+		}()
+		wg.Wait()
+		n, err := testDB.NewSelect().Table("external_issuer_bindings").
+			Where("issuer_id = ?", id).Where("deleted_at IS NULL").Count(context.Background())
+		require.NoError(t, err)
+		assert.Zero(t, n, "round %d: a live binding under a deleted issuer", round)
+	}
+}

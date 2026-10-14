@@ -697,6 +697,12 @@ func (s *ExternalIssuerService) CreateBinding(ctx context.Context, accountID, is
 	}
 	var clientRes *BindingClientResult
 	err = s.inTx(ctx, actor, func(ctx context.Context) error {
+		// Re-read the issuer locked: a delete committing between the read
+		// above and this insert would otherwise leave a live binding under
+		// a deleted issuer.
+		if _, err := s.repo.GetForShare(ctx, issuerID, accountID); err != nil {
+			return notFoundOr(err, errIssuerNotFound)
+		}
 		if err := s.repo.InsertBinding(ctx, b); err != nil {
 			return bindingWriteError(err)
 		}

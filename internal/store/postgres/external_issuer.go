@@ -129,6 +129,25 @@ func (r *ExternalIssuerRepository) Get(ctx context.Context, id, accountID string
 	return row, nil
 }
 
+// GetForShare is Get holding a share lock until the transaction ends, so a
+// concurrent delete waits for it (or it sees the delete).
+func (r *ExternalIssuerRepository) GetForShare(ctx context.Context, id, accountID string) (*domain.ExternalIssuer, error) {
+	if !hasTx(ctx) {
+		return nil, errors.New("GetForShare requires a transaction")
+	}
+	row := &domain.ExternalIssuer{}
+	err := dbOrTx(ctx, r.db).NewSelect().Model(row).
+		Where("id = ?", id).
+		Where("account_id = ?", accountID).
+		Where("deleted_at IS NULL").
+		For("SHARE").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get issuer: %w", err)
+	}
+	return row, nil
+}
+
 // List returns an account's rows.
 func (r *ExternalIssuerRepository) List(ctx context.Context, accountID string) ([]*domain.ExternalIssuer, error) {
 	var rows []*domain.ExternalIssuer
