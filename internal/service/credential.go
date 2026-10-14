@@ -495,6 +495,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	ttl := req.TTL
+	// A grant that names no lifetime gets the server default, which a stricter
+	// policy shortens (clampDefaultTTLToPolicy) instead of refusing. Only a
+	// lifetime the caller asked for is held to the policy as a hard limit.
+	ttlRequested := ttl > 0
 	if ttl <= 0 {
 		ttl = s.defaultTTL
 	}
@@ -681,6 +685,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			if err != nil {
 				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", identityPolicyID, err)
 			}
+			ttl = clampDefaultTTLToPolicy(ttl, ttlRequested, policy)
+			enforceReq.TTL = ttl
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
@@ -703,6 +709,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			if err != nil {
 				return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
 			}
+			ttl = clampDefaultTTLToPolicy(ttl, ttlRequested, policy)
+			enforceReq.TTL = ttl
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
@@ -1293,4 +1301,14 @@ func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*d
 		return cred, false, nil
 	}
 	return cred, true, nil
+}
+
+// clampDefaultTTLToPolicy shortens a server-default lifetime to the policy's
+// max_ttl_seconds. A lifetime the caller requested is returned unchanged, so
+// EnforcePolicy still refuses one that exceeds the policy.
+func clampDefaultTTLToPolicy(ttl int, requested bool, policy *domain.CredentialPolicy) int {
+	if requested || policy == nil || policy.MaxTTLSeconds <= 0 || ttl <= policy.MaxTTLSeconds {
+		return ttl
+	}
+	return policy.MaxTTLSeconds
 }
