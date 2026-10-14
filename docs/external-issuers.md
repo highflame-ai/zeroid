@@ -129,6 +129,7 @@ The token's `sub` is the person's user id, `principal_type` is `user`, the agent
 ### P1b: ID-JAG
 
 The request is unchanged ([identity-model.md](identity-model.md#enterprise-managed-authorization-id-jag)).
+Its `aud` must name ZeroID's issuer (draft §4.3) as well as one of the row's audiences.
 With issuer rows the agent is the ID-JAG's `act.sub` mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
 A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
 The subject must not be a workload, and checks 4 to 6 above apply.
@@ -190,7 +191,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 404 | `not_found` | No such row or binding in this account |
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
 | 409 | `issuer_limit_reached` | The account has 20 issuers |
-| 409 | `issuer_store_config` | A write on a `config`-mode server |
+| 409 | `issuer_store_config` | Any route but the list and `/check` on a `config`-mode server |
 | 409 | `binding_conflict` | Another enabled binding maps this subject key under this issuer |
 | 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |

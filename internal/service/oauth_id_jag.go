@@ -207,6 +207,15 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 
 	rawClaims := tokenClaimsAsMap(verified)
 
+	// An ID-JAG's aud MUST be the resource authorization server's issuer
+	// (draft §4.3). A person row may also list agents' app ids for the
+	// ID-token exchange, so the row's audiences alone are not enough here.
+	if entry.Row != nil {
+		if aud, _ := verified.Audience(); !slices.Contains(aud, s.issuer) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG is not addressed to this authorization server (aud)")
+		}
+	}
+
 	// client_id binding (ADR 0010 D2b). Signature validity alone is not enough:
 	// the ID-JAG's `client_id` claim MUST equal the authenticated client, so a
 	// stolen-but-validly-signed ID-JAG cannot be redeemed by a different client

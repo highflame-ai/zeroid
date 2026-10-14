@@ -848,6 +848,14 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 	t.Run("an ID-JAG not addressed to an audience of the row", func(t *testing.T) {
 		requireRefused(t, p.redeem(t, p.idJAG(t, map[string]any{"aud": "https://someone-else.example"}), nil), "invalid_grant")
 	})
+	t.Run("an ID-JAG addressed to an agent's app id, not to ZeroID", func(t *testing.T) {
+		status, _ := p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID,
+			map[string]any{"audiences": []string{federationIssuer, "app-for-p1c"}}, p.tn.headers)
+		require.Equal(t, http.StatusOK, status)
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"aud": "app-for-p1c"}), nil)
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "not addressed to this authorization server")
+	})
 }
 
 // TestTrustedIssuers_NonMemberDoesNotBurnIDJAG pins the pre-burn position of
