@@ -351,3 +351,14 @@ func TestPersonGrantOAuthError(t *testing.T) {
 func TestRolesIsReserved(t *testing.T) {
 	assert.True(t, reservedClaims["roles"])
 }
+
+// TestRolesNotPropagatedFromIdP: an IdP claim named roles, even one a deployer
+// lists in propagate_claims, never reaches an ID-JAG token's claims. Only the
+// reserved-claims filter stops it before issuance.
+func TestRolesNotPropagatedFromIdP(t *testing.T) {
+	cfg := domain.ExternalIssuerConfig{PropagateClaims: []string{"roles", "acr"}}
+	raw := map[string]any{"roles": []any{"superadmin"}, "acr": "mfa"}
+	claims := buildIDJAGCustomClaims(raw, cfg, "https://idp.test", nil)
+	assert.NotContains(t, claims, "roles")
+	assert.Equal(t, "mfa", claims["acr"], "a propagated claim that is not reserved still flows")
+}

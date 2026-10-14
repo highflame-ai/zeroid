@@ -456,6 +456,37 @@ func TestPersonGrant_ChainsDoNotConsultIt(t *testing.T) {
 	assert.Empty(t, grants.callsFor("user-a"), "the step-up approver is evidence only")
 }
 
+// TestPersonGrant_LegacyExchangeDoesNotInheritRoles: under the legacy token
+// profile too, a token exchanged from a person's root carries no roles and
+// does not consult the resolver.
+func TestPersonGrant_LegacyExchangeDoesNotInheritRoles(t *testing.T) {
+	grants := installPersonGrants(t, zeroid.PersonGrantModeEnforce, testZeroIDServer)
+	tn := newTenant(t, "legacy")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	bob := uid("pg-bob")
+	grants.set(bob, &zeroid.PersonGrant{Scopes: scopes, Roles: []string{"member"}}, nil)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": "external-principal-assertion",
+		"account_id":    tn.account,
+		"project_id":    tn.project,
+		"user_id":       bob,
+		"scope":         "data:read",
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	root := decode(t, resp)["access_token"].(string)
+	rootClaims := decodeJWTPayload(t, root)
+	assert.NotContains(t, rootClaims, "principal_type", "the tenant is on the legacy profile")
+	assert.Equal(t, []any{"member"}, rootClaims["roles"])
+
+	child, _ := tn.exchange(t, policyID, uid("pg-legacy-agent"), scopes, root)
+	childClaims := decodeJWTPayload(t, child["access_token"].(string))
+	assert.NotContains(t, childClaims, "roles", "a delegated token does not inherit roles under legacy either")
+	assert.Len(t, grants.callsFor(bob), 1, "the exchange did not consult the resolver")
+}
+
 // TestPersonGrant_RolesIsReserved: a caller cannot set `roles`; it comes only
 // from the resolver.
 func TestPersonGrant_RolesIsReserved(t *testing.T) {
