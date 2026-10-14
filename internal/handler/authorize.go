@@ -531,22 +531,16 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 // redirectToInteractiveLogin sends the user agent to the deployer's login
 // surface, returning true when it handled the response.
 //
-// Returns false — leaving the caller to refuse — in the three cases where a
-// redirect is not the right answer:
+// Returns false — leaving the caller to refuse — when a redirect is not the
+// right answer:
 //
 //   - Not a GET. There is no user agent in a POST exchange to send anywhere; the
 //     caller is a CLI or a server posting an assertion.
 //   - No target configured. The deployment has no login surface, so there is
 //     nowhere to go.
-//   - A self-asserted (CIMD) client heading for an unvetted REMOTE destination.
-//     Sending a user through the deployment's real login page on behalf of such a
-//     client is the more damaging half of the same problem failAuthorize declines:
-//     the victim authenticates for real, and the flow resumes toward an
-//     attacker-published redirect_uri. A loopback or private-use redirect_uri is
-//     not that — the code lands on the user's own machine — so those proceed, which
-//     is what keeps the native/CLI/MCP browser leg working. Setting
-//     cimd.allowed_domains lifts the refusal for remote hosts too. See
-//     refusesRedirectTo.
+//   - refusesRedirectTo declines the client (no resolvable client). A CIMD
+//     client is not refused here: cimd.allowed_domains is enforced when its
+//     document resolves, so a client that reached this point was admitted.
 //
 // The return_to it appends is rebuilt from the VALIDATED protocol parameters, not
 // copied from the inbound URL. That is deliberate: the inbound query is
@@ -647,32 +641,11 @@ func (a *API) redirectToInteractiveLogin(
 // v1. Redirecting those would break them for no benefit, and there is no user
 // agent in that exchange to redirect anyway.
 //
-// It also keeps the JSON body for a SELF-ASSERTED client, and that one is a
-// deliberate deviation from §4.1.2.1 rather than a gap.
-//
-// §4.1.2.1's redirect rule rests on "registered" meaning a party somebody vetted.
-// CIMD removes registration by design: the redirect_uris come from a document the
-// requester published, CIMD is on by default, and allowed_domains ships empty, so
-// the destination is attacker-CHOSEN rather than merely attacker-supplied. Under
-// those conditions honouring the rule turns this endpoint into an unauthenticated
-// redirector — reachable with no credential, since the failure being reported IS
-// "you have no credential" — with the authorization server's own origin as the
-// first hop. Three independent reviews flagged it; the deviation is the
-// deliberate answer.
-//
-// What it costs: a CIMD client driving a browser cannot learn its error from the
-// callback and must read the JSON body instead, which is exactly the ergonomic
-// problem #279 set out to fix, kept for the one client class whose redirect
-// target nobody vetted. Registered and dynamically-registered clients — where
-// somebody did — are unaffected and get the conformant redirect.
-//
-// Two things narrow that deviation, because it is provenance-and-reach, not the
-// CIMD feature itself. A loopback or private-use redirect_uri is redirected
-// normally — it delivers to the caller's own device, so there is no third party
-// to hand an error or a code to, which is the same reasoning RFC 8252 §7.3 uses
-// to accept those callbacks from unregistered native clients. And setting
-// cimd.allowed_domains restores redirects to remote hosts as well, by
-// re-establishing the vetting the rule assumes. See docs/cimd.md.
+// The GET redirect applies to CIMD clients exactly as to registered ones:
+// cimd.allowed_domains is enforced once, when the document resolves, and a
+// client that got this far was admitted. The cost of the open default (empty
+// allow-list) is that anyone can publish a document whose redirect_uri this
+// redirects to; docs/spec/zeroid-oauth-extensions.md §12.5 records that trade.
 //
 // jsonCode vs redirectCode: the wire code sometimes has to differ between the
 // two shapes. A failed resolver is invalid_client to a programmatic POST caller

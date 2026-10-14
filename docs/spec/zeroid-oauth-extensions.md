@@ -1200,12 +1200,14 @@ overrides the document.
   Changed in zeroid#344.
 - When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
   entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
-  is a deviation**, and it is what makes the allow-list load-bearing for Section
-  12.5: allow-listing a publisher vets the destination only if the destination is
-  vetted too, and on a host with multiple publishers it otherwise does not.
-  Loopback `http://` and private-use schemes are exempt — they resolve on the
-  caller's own device, not at a published host. Constrains nothing in open mode,
-  where those redirects are refused regardless.
+  is a deviation.** ZeroID redirects to a resolved CIMD client's `redirect_uri`
+  like any other client's (Section 12.5), so allow-listing a publisher vets the
+  destination only if the destination is vetted too — on a host with multiple
+  publishers it otherwise does not. Loopback `http://` and private-use schemes are
+  exempt — they resolve on the caller's own device, not at a published host. With
+  an empty allow-list (open mode) this check does not run and any `https://`
+  destination is accepted; that is the open-redirect surface Section 12.5
+  describes.
 - `response_types`, when present, **MUST** include `code`.
 - Outer-shape validation only, by default. Per-type schema validation is opt-in
   through the `RegisterAuthorizationDetailValidator`-style hook pattern.
