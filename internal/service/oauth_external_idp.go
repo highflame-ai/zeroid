@@ -107,29 +107,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
 	}
 
-	// Peek at the token to extract iss without validating signatures yet —
-	// we need iss to look up which IdP's JWKS to verify against.
-	peeked, err := jwt.ParseInsecure([]byte(req.SubjectToken))
+	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.SubjectToken, "subject_token", oautherror.InvalidRequest)
 	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "subject_token is malformed", err)
-	}
-	upstreamIss, ok := peeked.Issuer()
-	if !ok || upstreamIss == "" {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing iss claim")
-	}
-
-	entry := s.externalIssuerRegistry.Lookup(upstreamIss)
-	if entry == nil {
-		// Unknown issuer — invalid_request, not invalid_grant: the deployer
-		// has not configured this IdP, which is a configuration mismatch
-		// rather than a credential failure. Wrap ErrUnknownExternalIssuer as
-		// the cause so callers can errors.Is while the handler still picks up
-		// the OAuth error code via errors.As on *OAuthError.
-		return nil, oauthBadRequestCause(
-			"invalid_request",
-			fmt.Sprintf("issuer %s is not a configured external issuer", upstreamIss),
-			fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, upstreamIss),
-		)
+		return nil, err
 	}
 	cfg := entry.Config
 
@@ -309,6 +289,36 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	return accessToken, nil
 }
 
+// resolvePersonIssuer reads the token's issuer and resolves the trusted
+// person issuer it must verify against (ADR 0042 D4: person grants accept
+// only enabled person rows). An issuer nobody trusts is unknownCode, which
+// differs by path; a workload, disabled or unmatched issuer is invalid_grant.
+func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName, unknownCode string) (*ExternalIssuerEntry, string, error) {
+	peeked, err := jwt.ParseInsecure([]byte(token))
+	if err != nil {
+		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+" is malformed", err)
+	}
+	iss, ok := peeked.Issuer()
+	if !ok || iss == "" {
+		return nil, "", oauthBadRequest(oautherror.InvalidGrant, fieldName+" missing iss claim")
+	}
+	entry, err := s.externalIssuerRegistry.ResolvePerson(ctx, iss, tokenClaimsAsMap(peeked))
+	switch {
+	case err == nil:
+		return entry, iss, nil
+	case errors.Is(err, ErrUnknownExternalIssuer):
+		return nil, "", oauthBadRequestCause(unknownCode, fmt.Sprintf("issuer %s is not a configured external issuer", iss), err)
+	case errors.Is(err, errIssuerNotPerson):
+		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant,
+			fmt.Sprintf("issuer %s is not trusted for person grants (it is a workload issuer)", iss), err)
+	case errors.Is(err, errIssuerDisabled):
+		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("issuer %s is disabled", iss), err)
+	case errors.Is(err, errIssuerConstraints), errors.Is(err, errIssuerAmbiguous):
+		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+" does not match exactly one trusted issuer for "+iss, err)
+	}
+	return nil, "", oauthServerError("failed to resolve the external issuer", err)
+}
+
 // validateExternalAssertion runs the #88 external-IdP validation substrate
 // against a single externally-signed assertion: the JWS algorithm allow-list
 // gate, a synchronous best-effort JWKS load, full signature + iss + aud +
@@ -402,7 +412,6 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 		jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(cfg.Issuer),
-		jwt.WithAudience(cfg.Audience),
 		jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 	)
 	if err != nil {
@@ -414,13 +423,24 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 				jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(cfg.Issuer),
-				jwt.WithAudience(cfg.Audience),
 				jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 			)
 		}
 		if err != nil {
 			return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("%s verification failed", fieldName), err)
 		}
+	}
+
+	// aud must name one of the issuer's audiences. Checked here rather than
+	// with jwt.WithAudience, which accepts only one value.
+	aud, _ := verified.Audience()
+	if !slices.ContainsFunc(cfg.AudienceList(), func(a string) bool { return slices.Contains(aud, a) }) {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s verification failed: aud is not one this issuer is trusted for", fieldName))
+	}
+	// A shared issuer's row was chosen on unverified claims; its constraints
+	// must also hold on the verified ones.
+	if entry.Row != nil && !entry.Row.ConstraintsMatch(tokenClaimsAsMap(verified)) {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s does not satisfy the issuer's claim constraints", fieldName))
 	}
 
 	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires
@@ -542,21 +562,22 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 // chain. Workloads authenticate as clients instead (RFC 7523 §2.2), which mints
 // a workload principal.
 //
-// Until an issuer's kind is part of its configuration, this recognizes the
-// well-known workload shapes: an Entra app-only token (idtyp=app), a Kubernetes
-// service-account subject, and a SPIFFE ID. Both `sub` and the mapped user_id
-// are checked, since the mapping may point at a claim other than `sub`.
+// The issuer's kind (person) is checked first; this also refuses the
+// well-known workload shapes a person issuer can still sign (ADR 0042 D3a
+// rule 3): an Entra app-only token (idtyp=app), a Kubernetes service-account
+// subject, and a SPIFFE ID. Both `sub` and the mapped user_id are checked,
+// since the mapping may point at a claim other than `sub`.
 func refuseWorkloadSubject(claims map[string]any, userID string) error {
 	if idtyp, _ := claims["idtyp"].(string); strings.EqualFold(idtyp, "app") {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an app-only token (idtyp=app); this grant accepts person tokens only")
+		return oauthBadRequest(oautherror.InvalidGrant, "the subject is an app-only token (idtyp=app); this grant accepts person tokens only")
 	}
 	sub, _ := claims["sub"].(string)
 	for _, id := range []string{sub, userID} {
 		if strings.HasPrefix(id, "system:serviceaccount:") {
-			return oauthBadRequest(oautherror.InvalidGrant, "subject_token names a Kubernetes service account; this grant accepts person tokens only")
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a Kubernetes service account; this grant accepts person tokens only")
 		}
 		if len(id) >= len("spiffe://") && strings.EqualFold(id[:len("spiffe://")], "spiffe://") {
-			return oauthBadRequest(oautherror.InvalidGrant, "subject_token names a SPIFFE ID; this grant accepts person tokens only")
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a SPIFFE ID; this grant accepts person tokens only")
 		}
 	}
 	return nil

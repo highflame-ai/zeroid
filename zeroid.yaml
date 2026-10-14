@@ -248,3 +248,12 @@ cimd:
 #     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch
+
+# Where trusted issuers come from (ADR 0042 D4). "config" reads the static
+# external_issuers list above (standalone ZeroID). "db" reads per-account rows
+# managed through the admin API (/external-issuers); it refuses to start when
+# external_issuers is also set. See docs/external-issuers.md.
+# federation:
+#   issuer_store: config            # Env: ZEROID_FEDERATION_ISSUER_STORE
+#   allow_private_endpoints: false  # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS — local mock IdP only; relaxes the SSRF guard and https on issuer rows
+#   shared_issuers: []              # empty = built-in list (accounts.google.com, GitHub Actions, Entra multi-tenant endpoints)

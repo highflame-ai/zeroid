@@ -72,6 +72,29 @@ type Config struct {
 	// verifies the ID token before minting a ZeroID token. Empty list (default)
 	// disables direct federation — only the broker path remains available.
 	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
+
+	// Federation chooses where trusted issuers come from and how they are
+	// fetched (ADR 0042 D4). See docs/external-issuers.md.
+	Federation FederationConfig `koanf:"federation"`
+}
+
+// FederationConfig governs per-account trusted issuers.
+type FederationConfig struct {
+	// IssuerStore is "config" (default: the static external_issuers list,
+	// for standalone ZeroID) or "db" (account rows managed through the admin
+	// API). The two are exclusive: db with external_issuers set is refused.
+	IssuerStore string `koanf:"issuer_store"`
+
+	// AllowPrivateEndpoints relaxes the SSRF guard, and the https
+	// requirement, on issuer rows' JWKS URIs. Local development against a
+	// mock IdP only; production MUST keep it false. Static entries keep
+	// their own allow_private_endpoints.
+	AllowPrivateEndpoints bool `koanf:"allow_private_endpoints"`
+
+	// SharedIssuers may be trusted by several accounts, each with claim
+	// constraints that pin it to the customer. Empty means the built-in list
+	// (domain.DefaultSharedIssuers).
+	SharedIssuers []string `koanf:"shared_issuers"`
 }
 
 // ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
@@ -607,6 +630,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
 	}
 
+	switch c.Federation.IssuerStore {
+	case "", "config":
+	case "db":
+		// ADR 0042 D4: one source of trusted issuers, never both.
+		if len(c.ExternalIssuers) > 0 {
+			return fmt.Errorf("federation.issuer_store=db and static external_issuers are both set; " +
+				"trusted issuers come from one source only (move the static entries to account rows, or use issuer_store=config)")
+		}
+	default:
+		return fmt.Errorf("federation.issuer_store must be config or db, got %q", c.Federation.IssuerStore)
+	}
+
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
 	for i := range c.ExternalIssuers {
 		c.ExternalIssuers[i].Defaults()
@@ -949,6 +984,11 @@ func loadDefaults(k *koanf.Koanf) error {
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
 
+		// Trusted issuers from static config unless the deployment opts
+		// into account rows.
+		"federation.issuer_store":            "config",
+		"federation.allow_private_endpoints": false,
+
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
 		// key stays verifiable for a long audit window (400d) so
@@ -1046,6 +1086,11 @@ var envMapping = map[string]string{
 	"ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS": "client_auth.allow_private_jwks_endpoints",
 	"ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE":              "client_auth.jwks_cache_size",
 
+	// Trusted issuers: config (static external_issuers) or db (account
+	// rows). The private-endpoint relaxation is for local development only.
+	"ZEROID_FEDERATION_ISSUER_STORE":            "federation.issuer_store",
+	"ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS": "federation.allow_private_endpoints",
+
 	"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
 	"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",
 	"ZEROID_CIMD_MAX_DOCUMENT_BYTES":      "cimd.max_document_bytes",
@@ -1079,6 +1124,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".require_approver_identity") ||
 			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
+			strings.HasSuffix(configPath, ".allow_private_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {

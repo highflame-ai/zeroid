@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -193,8 +194,9 @@ type ServerOption func(*serverOptions)
 
 // serverOptions is the internal accumulator behind ServerOption.
 type serverOptions struct {
-	externalIssuerJWKSOpts []jwks.Option
-	cimdHTTPClient         *http.Client
+	externalIssuerJWKSOpts   []jwks.Option
+	externalIssuerHTTPClient *http.Client
+	cimdHTTPClient           *http.Client
 }
 
 // WithExternalIssuerJWKSOption forwards a pkg/jwks option to the
@@ -205,6 +207,16 @@ type serverOptions struct {
 func WithExternalIssuerJWKSOption(opt jwks.Option) ServerOption {
 	return func(o *serverOptions) {
 		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
+	}
+}
+
+// WithExternalIssuerHTTPClient replaces the HTTP client used for issuer rows
+// (federation.issuer_store=db): their JWKS fetches and the admin JWKS probe.
+// For tests against httptest.NewTLSServer. SUPPLYING ONE REPLACES THE SSRF
+// GUARD; federation.allow_private_endpoints is the supported relaxation.
+func WithExternalIssuerHTTPClient(c *http.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.externalIssuerHTTPClient = c
 	}
 }
 
@@ -434,8 +446,25 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// trusted upstream IdPs. JWKS warm-up is best-effort (pkg/jwks does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
 	// deploy); an issuer that never loads fails closed at token-exchange time.
+	//
+	// federation.issuer_store=db reads per-account rows live instead (ADR 0042
+	// D4); Validate() has already refused it alongside static entries.
+	externalIssuerRepo := postgres.NewExternalIssuerRepository(db)
+	issuerStore := service.IssuerStore(cfg.Federation.IssuerStore)
+	if issuerStore == "" {
+		issuerStore = service.IssuerStoreConfig
+	}
 	var externalIssuerRegistry *service.ExternalIssuerRegistry
-	if len(cfg.ExternalIssuers) > 0 {
+	if issuerStore == service.IssuerStoreDB {
+		jwksOpts := slices.Clone(options.externalIssuerJWKSOpts)
+		if options.externalIssuerHTTPClient != nil {
+			jwksOpts = append(jwksOpts, jwks.WithHTTPClient(options.externalIssuerHTTPClient))
+		}
+		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, jwksOpts...)
+		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
+		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).
+			Msg("Trusted issuers are per-account rows (federation.issuer_store=db)")
+	} else if len(cfg.ExternalIssuers) > 0 {
 		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers, options.externalIssuerJWKSOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize external OIDC issuer registry (issue #88): %w", err)

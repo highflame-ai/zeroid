@@ -7,7 +7,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -157,32 +156,13 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// the issuer and the authenticated client (ADR 0042 D5); a conformant
 	// client sends neither field (draft §4.4, EMA §5).
 
-	// Peek at the assertion to extract iss without verifying — we need iss to
-	// look up which IdP's JWKS to validate against. (typ was already confirmed
-	// as oauth-id-jag+jwt by the caller's isIDJAGAssertion branch.)
-	peeked, err := jwt.ParseInsecure([]byte(req.Assertion))
+	// Unknown issuer. Unlike the id_token-exchange path (invalid_request,
+	// because the failure is a deployer-config gap), ADR 0010 D3 mandates
+	// fail-closed with invalid_grant here: an ID-JAG from an unconfigured IdP
+	// cannot be mapped to a Highflame principal.
+	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.Assertion, "ID-JAG assertion", oautherror.InvalidGrant)
 	if err != nil {
-		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "ID-JAG assertion is malformed", err)
-	}
-	upstreamIss, ok := peeked.Issuer()
-	if !ok || upstreamIss == "" {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG assertion missing iss claim")
-	}
-
-	entry := s.externalIssuerRegistry.Lookup(upstreamIss)
-	if entry == nil {
-		// Unknown issuer. Unlike the id_token-exchange path (which classifies
-		// this as invalid_request because the token may be valid against its
-		// real IdP and the failure is purely a deployer-config gap), ADR 0010
-		// D3 mandates fail-closed with invalid_grant for the ID-JAG path: an
-		// ID-JAG from an unconfigured IdP cannot be mapped to a Highflame
-		// principal, so the grant is invalid. Wrap the sentinel so callers can
-		// still errors.Is it for logging/branching.
-		return nil, oauthBadRequestCause(
-			oautherror.InvalidGrant,
-			fmt.Sprintf("issuer %s is not a configured external issuer", upstreamIss),
-			fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, upstreamIss),
-		)
+		return nil, err
 	}
 	cfg := entry.Config
 
@@ -310,6 +290,11 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 
 	if userID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) and has no usable sub_id — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
+	}
+	// The ID-JAG names a person; a workload subject would mint
+	// principal_type=user for a machine (zeroid#415, ADR 0043 D3).
+	if err := refuseWorkloadSubject(rawClaims, userID); err != nil {
+		return nil, err
 	}
 	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
 	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
