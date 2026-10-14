@@ -133,6 +133,12 @@ requested scopes (after every other layer narrowed them, or their default)
 and, on the external-principal exchange only, the role the trusted service
 asserted. It returns a ceiling and the person's roles.
 
+On ID-JAG and the ID-token exchange, when a federated person resolver is
+installed (`Server.SetFederatedPersonResolver`, ADR 0042 D5a), it runs first:
+the person this resolver sees is the deployer's user it returned, not the IdP
+subject, which the token carries as `idp_sub`
+([external-issuers.md](external-issuers.md#person-resolution)).
+
 The resolver runs on the token request's path, under its context. It must
 honour the context's deadline and cancellation, and should cache role
 lookups: a slow resolver slows every person mint, and in enforce mode one

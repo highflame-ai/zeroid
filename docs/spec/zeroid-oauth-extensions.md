@@ -358,6 +358,7 @@ broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
 | `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
 | `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
 | `user_id_iss` | string | upstream `iss` | **IdP-granular provenance** — the issuer URL of the upstream OpenID Provider that authenticated the subject, copied verbatim from the verified ID token. Only on the `external_id_token` path (Section 5.6). Lets a consumer answer "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). Reserved (Section 8) so a caller cannot forge it. |
+| `idp_sub` | string | upstream user key | The person's subject at the IdP (the issuer's `claim_mapping.user_id`, e.g. Entra `oid`, Okta `sub`) when the deployer's person resolver mapped them to its own user, which is then `sub`. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
 | `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
 | `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
 | `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
@@ -597,8 +598,8 @@ upstream ID token. The mode:
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
   here — the JWKS signature check, issuer allowlist, audience binding and
   client binding below *are* the trust anchor.
-- **MUST** authenticate the redeeming client (absent client credentials →
-  `invalid_client`), through the same client authentication as ID-JAG, and
+- **MUST** authenticate the redeeming client with `private_key_jwt` (absent
+  client credentials, or a client secret → `invalid_client`; ADR 0042 D3a), and
   **MUST** redeem only for the relying party the ID token was issued to (OpenID
   Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
   token's `aud` values, `azp`, if present, must equal it, and a token with
@@ -610,15 +611,32 @@ upstream ID token. The mode:
 - **MUST** verify the ID token's signature against the issuer's JWKS (fetched
   from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
   absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
-  matched issuer), `aud` (equal to the issuer's configured `audience`), `exp`,
-  `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
+  matched issuer), `aud` (naming one of the issuer's configured audiences),
+  `exp`, `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
   library honors but does not require them). A 60-second clock skew is tolerated.
+- **MUST** accept only a token that is positively an ID token: `iss`, `sub`,
+  `aud`, `exp` and `iat` present, and no access-token marker (`scp`, `scope`,
+  or a JWS `typ` of `at+jwt` / `application/at+jwt`, RFC 9068 §2.1). Together
+  with the relying-party check above this separates an ID token from an access
+  token a trusted issuer also signs.
+- **MUST** accept only an issuer of kind `person`, and refuse a workload
+  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID)
+  with `invalid_grant`, since the minted token carries `principal_type=user`.
 - **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
   Section 7.2) and outside the issuer's configured `algorithms` (default
   `RS256`, `ES256`, `PS256`); `none` and HMAC are rejected.
 - Caps replay: the ID token's `iat` **MUST** be within the issuer's
   `max_token_age` (default 10 minutes).
-- Binds the upstream token to a ZeroID tenant via the issuer's
+- With per-account issuer rows (`federation.issuer_store=db`), derives the
+  tenant instead: the account from the issuer row, the project from the agent
+  identity the authenticated client is bound to, and a caller-supplied
+  `account_id`/`project_id` that differs is `invalid_grant`. The bound agent is
+  the current actor in `act`, and the deployer's person resolver must find the
+  person in the account; the token's `sub` is the resolved user and the IdP
+  subject is carried in the reserved `idp_sub` claim. See
+  [external-issuers.md](../external-issuers.md).
+- With a static issuer (standalone), binds the upstream token to a ZeroID
+  tenant via the issuer's
   **`allowed_accounts`** — a **REQUIRED, non-empty** list; the request's
   `account_id` **MUST** appear in it. Because the ID token's `aud` binds it to
   ZeroID-the-RP (not to a tenant) and `account_id` is caller-supplied on the
@@ -779,7 +797,7 @@ scopes grant_type delegation_depth user_email user_name
 # RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
 resource client_id scope may_act
 # ZeroID internal / provenance
-act token_exchange trusted_by user_id_iss mission_id principal_type
+act token_exchange trusted_by user_id_iss idp_sub mission_id principal_type
 # RFC 9449 sender-constraint
 cnf
 # RFC 8707 resource binding, RFC 9068 client attribution
@@ -1433,6 +1451,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `token_exchange` | string | §4.6, §4.7 |
 | `trusted_by` | string | §4.6 |
 | `user_id_iss` | string | §4.6, §5.6 |
+| `idp_sub` | string | §4.6, §5.6 |
 | `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |
