@@ -18,8 +18,9 @@
 //     with a key the client registered or with a federated client assertion
 //     from a trusted workload issuer (Kubernetes, AWS STS, SPIFFE, GitHub).
 //
-// The id_token exchange is a person path outside ADR 0042; its client binding
-// (zeroid#385 D13) is pinned at the end of this file.
+// The id_token exchange is P1c (ADR 0042 D3a); its client binding (zeroid#385
+// D13) is pinned at the end of this file, and the rest of D3a in
+// trusted_issuers_test.go.
 package integration_test
 
 import (
@@ -582,9 +583,11 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 		}
 	}
 
-	// Flips with ADR 0042 D6: the ID-JAG maps through a binding on act.sub to
-	// the agent's own identity row, and no binding means invalid_grant rather
-	// than a synthetic identity.
+	// Static issuers only (standalone ZeroID keeps this). With issuer rows
+	// (federation.issuer_store=db, ADR 0042 D6) the ID-JAG maps through a
+	// binding on act.sub to the agent's own identity, and no binding is
+	// invalid_grant rather than a synthetic identity:
+	// TestTrustedIssuers_P1B_Refusals.
 	t.Run("no application_id: synthetic identity", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, map[string]any{"email": "agent@corp.example"}),
 			fedCfg.AccountID, fedCfg.ProjectID))
@@ -660,7 +663,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	})
 }
 
-// ── id_token exchange (a person path, outside ADR 0042) ─────────────────────
+// ── id_token exchange (P1c, ADR 0042 D3a) ────────────────────────────────────
 
 // TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience pins the
 // relying-party rules on the id_token exchange: the redeeming client must

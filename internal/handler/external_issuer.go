@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/rs/zerolog/log"
@@ -90,8 +91,46 @@ type ExternalIssuerPatchBody struct {
 // ExternalIssuerView is an issuer row, with the JWKS probe made by the write
 // when there was one.
 type ExternalIssuerView struct {
-	*domain.ExternalIssuer
-	JWKSCheck *service.JWKSCheck `json:"jwks_check,omitempty"`
+	ID                  string              `json:"id"`
+	AccountID           string              `json:"account_id"`
+	Issuer              string              `json:"issuer"`
+	Kind                string              `json:"kind"`
+	DisplayName         string              `json:"display_name"`
+	JWKSURI             string              `json:"jwks_uri"`
+	Audiences           []string            `json:"audiences"`
+	Algorithms          []string            `json:"algorithms"`
+	ClaimMapping        map[string]string   `json:"claim_mapping"`
+	PropagateClaims     []string            `json:"propagate_claims"`
+	ClaimConstraints    map[string][]string `json:"claim_constraints"`
+	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds"`
+	JWKSCacheTTLSeconds int                 `json:"jwks_cache_ttl_seconds"`
+	Source              string              `json:"source"`
+	SourceRef           string              `json:"source_ref"`
+	Enabled             bool                `json:"enabled"`
+	CreatedBy           string              `json:"created_by"`
+	UpdatedBy           string              `json:"updated_by"`
+	CreatedAt           time.Time           `json:"created_at"`
+	UpdatedAt           time.Time           `json:"updated_at"`
+	JWKSCheck           *service.JWKSCheck  `json:"jwks_check,omitempty"`
+}
+
+func issuerView(r *domain.ExternalIssuer, check *service.JWKSCheck) ExternalIssuerView {
+	return ExternalIssuerView{
+		ID: r.ID, AccountID: r.AccountID, Issuer: r.Issuer, Kind: string(r.Kind), DisplayName: r.DisplayName,
+		JWKSURI: r.JWKSURI, Audiences: nonNil(r.Audiences), Algorithms: nonNil(r.Algorithms),
+		ClaimMapping: r.ClaimMapping, PropagateClaims: nonNil(r.PropagateClaims), ClaimConstraints: r.ClaimConstraints,
+		MaxTokenAgeSeconds: r.MaxTokenAgeSeconds, JWKSCacheTTLSeconds: r.JWKSCacheTTLSeconds,
+		Source: string(r.Source), SourceRef: r.SourceRef, Enabled: r.Enabled,
+		CreatedBy: r.CreatedBy, UpdatedBy: r.UpdatedBy, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+		JWKSCheck: check,
+	}
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 type externalIssuerOutput struct {
@@ -100,8 +139,8 @@ type externalIssuerOutput struct {
 
 type externalIssuerListOutput struct {
 	Body struct {
-		IssuerStore string                   `json:"issuer_store" doc:"db: rows are writable. config: static entries, read-only (source config)."`
-		Items       []*domain.ExternalIssuer `json:"items"`
+		IssuerStore string               `json:"issuer_store" doc:"db: rows are writable. config: static entries, read-only (source config)."`
+		Items       []ExternalIssuerView `json:"items"`
 	}
 }
 
@@ -134,8 +173,25 @@ type BindingCreateBody struct {
 // BindingView is a binding, with the presenting client when one was created
 // or confirmed.
 type BindingView struct {
-	*domain.IssuerBinding
+	ID          string                       `json:"id"`
+	AccountID   string                       `json:"account_id"`
+	IssuerID    string                       `json:"issuer_id"`
+	SubjectKey  string                       `json:"subject_key"`
+	IdentityID  string                       `json:"identity_id"`
+	Enabled     bool                         `json:"enabled"`
+	CreatedBy   string                       `json:"created_by"`
+	UpdatedBy   string                       `json:"updated_by"`
+	CreatedAt   time.Time                    `json:"created_at"`
+	UpdatedAt   time.Time                    `json:"updated_at"`
 	OAuthClient *service.BindingClientResult `json:"oauth_client,omitempty"`
+}
+
+func bindingView(b *domain.IssuerBinding, client *service.BindingClientResult) BindingView {
+	return BindingView{
+		ID: b.ID, AccountID: b.AccountID, IssuerID: b.IssuerID, SubjectKey: b.SubjectKey, IdentityID: b.IdentityID,
+		Enabled: b.Enabled, CreatedBy: b.CreatedBy, UpdatedBy: b.UpdatedBy, CreatedAt: b.CreatedAt, UpdatedAt: b.UpdatedAt,
+		OAuthClient: client,
+	}
 }
 
 type bindingOutput struct {
@@ -144,7 +200,7 @@ type bindingOutput struct {
 
 type bindingListOutput struct {
 	Body struct {
-		Items []*domain.IssuerBinding `json:"items"`
+		Items []BindingView `json:"items"`
 	}
 }
 
@@ -197,9 +253,9 @@ func (a *API) listExternalIssuersOp(ctx context.Context, _ *struct{}) (*external
 	}
 	out := &externalIssuerListOutput{}
 	out.Body.IssuerStore = string(a.externalIssuerSvc.Store())
-	out.Body.Items = items
-	if out.Body.Items == nil {
-		out.Body.Items = []*domain.ExternalIssuer{}
+	out.Body.Items = make([]ExternalIssuerView, 0, len(items))
+	for _, r := range items {
+		out.Body.Items = append(out.Body.Items, issuerView(r, nil))
 	}
 	return out, nil
 }
@@ -222,7 +278,7 @@ func (a *API) createExternalIssuerOp(ctx context.Context, input *struct {
 	if err != nil {
 		return nil, issuerProblemFrom(err, "create external issuer")
 	}
-	return &externalIssuerOutput{Body: ExternalIssuerView{ExternalIssuer: row, JWKSCheck: check}}, nil
+	return &externalIssuerOutput{Body: issuerView(row, check)}, nil
 }
 
 func (a *API) checkExternalIssuerOp(ctx context.Context, input *externalIssuerCheckInput) (*externalIssuerCheckOutput, error) {
@@ -253,7 +309,7 @@ func (a *API) getExternalIssuerOp(ctx context.Context, input *externalIssuerIDIn
 	if err != nil {
 		return nil, issuerProblemFrom(err, "get external issuer")
 	}
-	return &externalIssuerOutput{Body: ExternalIssuerView{ExternalIssuer: row}}, nil
+	return &externalIssuerOutput{Body: issuerView(row, nil)}, nil
 }
 
 func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
@@ -273,7 +329,7 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")
 	}
-	return &externalIssuerOutput{Body: ExternalIssuerView{ExternalIssuer: row, JWKSCheck: check}}, nil
+	return &externalIssuerOutput{Body: issuerView(row, check)}, nil
 }
 
 func (a *API) deleteExternalIssuerOp(ctx context.Context, input *externalIssuerIDInput) (*struct{}, error) {
@@ -297,9 +353,9 @@ func (a *API) listBindingsOp(ctx context.Context, input *externalIssuerIDInput) 
 		return nil, issuerProblemFrom(err, "list bindings")
 	}
 	out := &bindingListOutput{}
-	out.Body.Items = items
-	if out.Body.Items == nil {
-		out.Body.Items = []*domain.IssuerBinding{}
+	out.Body.Items = make([]BindingView, 0, len(items))
+	for _, b := range items {
+		out.Body.Items = append(out.Body.Items, bindingView(b, nil))
 	}
 	return out, nil
 }
@@ -320,7 +376,7 @@ func (a *API) createBindingOp(ctx context.Context, input *struct {
 	if err != nil {
 		return nil, issuerProblemFrom(err, "create binding")
 	}
-	return &bindingOutput{Body: BindingView{IssuerBinding: b, OAuthClient: client}}, nil
+	return &bindingOutput{Body: bindingView(b, client)}, nil
 }
 
 func (a *API) getBindingOp(ctx context.Context, input *bindingIDInput) (*bindingOutput, error) {
@@ -332,7 +388,7 @@ func (a *API) getBindingOp(ctx context.Context, input *bindingIDInput) (*binding
 	if err != nil {
 		return nil, issuerProblemFrom(err, "get binding")
 	}
-	return &bindingOutput{Body: BindingView{IssuerBinding: b}}, nil
+	return &bindingOutput{Body: bindingView(b, nil)}, nil
 }
 
 func (a *API) updateBindingOp(ctx context.Context, input *struct {
@@ -350,7 +406,7 @@ func (a *API) updateBindingOp(ctx context.Context, input *struct {
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update binding")
 	}
-	return &bindingOutput{Body: BindingView{IssuerBinding: b}}, nil
+	return &bindingOutput{Body: bindingView(b, nil)}, nil
 }
 
 func (a *API) deleteBindingOp(ctx context.Context, input *bindingIDInput) (*struct{}, error) {
