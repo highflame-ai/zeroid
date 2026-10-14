@@ -829,30 +829,25 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 
 	// Resolve the identity this token is for.
 	//
-	// A request that names a tenant keeps the original rule: the identity whose
-	// external_id is the client_id within that tenant.
+	// A client whose REGISTRATION links an identity (identity_id) mints for
+	// that identity, in that identity's tenant, whether or not the request
+	// names a tenant. The link is written by an administrator inside the
+	// identity's own tenant, so the caller cannot steer it. A request that
+	// does name a tenant must name the link's (the rule ADR 0042 D5 applies to
+	// the ID-JAG grant); otherwise the request is refused rather than quietly
+	// minted into the other tenant's external_id match, which would let the
+	// caller pick between two identities. A conformant client (RFC 6749
+	// §4.4.2 defines only grant_type and scope) names none.
 	//
-	// A request that names none, which is every conformant client (RFC 6749
-	// §4.4.2 defines only grant_type and scope), gets the identity the client's
-	// REGISTRATION links to (identity_id), and that identity's tenant. The link
-	// is written by an administrator inside the identity's own tenant, so the
-	// caller cannot steer it. There is deliberately no fallback to a
-	// cross-tenant external_id search: anyone in another tenant can create an
-	// identity with this client's id as its external_id, and a search would let
-	// them make the answer ambiguous or, for a client with no identity yet,
-	// decide it.
+	// A client with no link keeps the original rule: the request must name a
+	// tenant, and the token is for the identity whose external_id is the
+	// client_id within it. There is deliberately no cross-tenant external_id
+	// search for such a client: anyone in another tenant can create an
+	// identity with this client's id as its external_id, and a search would
+	// let them make the answer ambiguous or, for a client with no identity
+	// yet, decide it.
 	var identity *domain.Identity
-	if req.AccountID != "" {
-		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
-		if err != nil {
-			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
-		}
-	} else {
-		if client.IdentityID == nil || *client.IdentityID == "" {
-			return nil, oauthBadRequest(oautherror.InvalidRequest,
-				"this client's registration links no identity, so its tenant cannot be derived; "+
-					"link one (identity_id) or send account_id and project_id")
-		}
+	if client.IdentityID != nil && *client.IdentityID != "" {
 		identity, err = s.identitySvc.repo.GetLinkedByID(ctx, *client.IdentityID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -862,6 +857,28 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		}
 		if identity.AccountID == "" || identity.ProjectID == "" {
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "the client's linked identity has no complete tenant")
+		}
+		// The messages do not echo the linked tenant: the caller either
+		// already knows it or has no business learning it from an error.
+		if req.AccountID != "" && req.AccountID != identity.AccountID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"account_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+		if req.ProjectID != "" && req.ProjectID != identity.ProjectID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"project_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+	} else {
+		if req.AccountID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"this client's registration links no identity, so its tenant cannot be derived; "+
+					"link one (identity_id) or send account_id and project_id")
+		}
+		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
 		}
 	}
 	if !identity.Status.IsUsable() {
