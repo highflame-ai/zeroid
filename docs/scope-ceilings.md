@@ -153,6 +153,10 @@ type, so they are named by the value of their tokens' `token_exchange` claim.
 | `shadow` | unchanged | issued | issued |
 | `enforce` | request ∩ ceiling | refused | refused (`server_error`) |
 
+`SetPersonGrantResolver` rejects a nil resolver with shadow or enforce, and
+an empty or unknown mode, leaving the hook as it was; only an explicit `off`
+removes it, so a wiring mistake cannot turn the ceiling off unnoticed.
+
 In shadow and enforce, a narrowing, a refusal and a resolver error are
 counted in `zeroid_person_scope_ceiling_total` (by mode and outcome) and
 logged as `person_scope_ceiling_violation`. Shadow lets a deployer see who

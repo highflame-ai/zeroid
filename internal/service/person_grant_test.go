@@ -316,10 +316,15 @@ func TestSetPersonGrantResolver(t *testing.T) {
 
 	require.NoError(t, svc.SetPersonGrantResolver(fn, PersonGrantModeShadow))
 	assert.False(t, svc.personGrantEnforced())
-	require.NoError(t, svc.SetPersonGrantResolver(nil, PersonGrantModeEnforce))
-	assert.Nil(t, svc.personGrant.hook.Load(), "a nil resolver removes the hook")
+	for _, mode := range []PersonGrantMode{PersonGrantModeShadow, PersonGrantModeEnforce} {
+		require.Error(t, svc.SetPersonGrantResolver(nil, mode), "a nil resolver is a wiring mistake, not off")
+		assert.NotNil(t, svc.personGrant.hook.Load(), "and leaves the hook installed")
+	}
+	require.Error(t, svc.SetPersonGrantResolver(fn, ""), "off must be said explicitly")
+	assert.NotNil(t, svc.personGrant.hook.Load())
 	require.NoError(t, svc.SetPersonGrantResolver(fn, PersonGrantModeOff))
 	assert.Nil(t, svc.personGrant.hook.Load(), "off removes the hook")
+	require.NoError(t, svc.SetPersonGrantResolver(nil, PersonGrantModeOff), "off needs no resolver")
 
 	var nilSvc *CredentialService
 	assert.False(t, nilSvc.personGrantEnforced())

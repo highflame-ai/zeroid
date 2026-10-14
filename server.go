@@ -1366,9 +1366,10 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 // refused; in shadow mode issuance is unchanged and each narrowing, refusal or
 // resolver failure is logged as person_scope_ceiling_violation and counted in
 // zeroid_person_scope_ceiling_total. In both modes the returned roles are
-// stamped as the `roles` claim on the person's own token. A nil fn or
-// PersonGrantModeOff removes the hook; an unknown mode is rejected and the
-// hook left unchanged.
+// stamped as the `roles` claim on the person's own token. PersonGrantModeOff
+// removes the hook (fn is ignored). A nil fn with shadow or enforce, an empty
+// mode or an unknown one is rejected and the hook left unchanged, so a wiring
+// mistake fails loudly instead of turning the ceiling off.
 //
 // Can be called any time after NewServer; safe to call concurrently.
 func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {

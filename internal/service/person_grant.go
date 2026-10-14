@@ -113,23 +113,24 @@ type personGrantState struct {
 	hook atomic.Pointer[personGrantHook]
 }
 
-// SetPersonGrantResolver installs the person-grant hook. A nil resolver or
-// the off mode removes it.
+// SetPersonGrantResolver installs the person-grant hook; PersonGrantModeOff
+// removes it. A nil resolver in shadow or enforce mode, or any other mode
+// (including ""), is rejected and leaves the hook unchanged, so a wiring
+// mistake never turns the ceiling off silently.
 func (s *CredentialService) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {
 	switch mode {
-	case "", PersonGrantModeOff:
+	case PersonGrantModeOff:
 		s.personGrant.hook.Store(nil)
 		return nil
 	case PersonGrantModeShadow, PersonGrantModeEnforce:
+		if fn == nil {
+			return fmt.Errorf("person grant mode %q needs a resolver; use %q to remove the hook", mode, PersonGrantModeOff)
+		}
+		s.personGrant.hook.Store(&personGrantHook{resolve: fn, mode: mode})
+		return nil
 	default:
 		return fmt.Errorf("unknown person grant mode %q (want off, shadow or enforce)", mode)
 	}
-	if fn == nil {
-		s.personGrant.hook.Store(nil)
-		return nil
-	}
-	s.personGrant.hook.Store(&personGrantHook{resolve: fn, mode: mode})
-	return nil
 }
 
 // personGrantEnforced reports whether a resolver is installed in enforce mode.
