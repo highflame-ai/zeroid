@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -30,5 +31,25 @@ func TestMapErr_InvalidIdentityFieldIs400(t *testing.T) {
 		if se.Error() != err.Error() {
 			t.Errorf("mapErr must surface the specific reason: got %q, want %q", se.Error(), err.Error())
 		}
+	}
+}
+
+// TestExtractOAuthError_PersonGrant pins the token endpoint's answer to a
+// person-grant refusal (invalid_scope) and to a failed resolver (server_error,
+// without the resolver's message).
+func TestExtractOAuthError_PersonGrant(t *testing.T) {
+	code, desc, status := extractOAuthError(service.ErrPersonScopeDenied)
+	if code != "invalid_scope" || status != http.StatusBadRequest {
+		t.Errorf("denied: got %s/%d, want invalid_scope/400", code, status)
+	}
+	if desc == "" {
+		t.Error("denied: want a description")
+	}
+	code, desc, status = extractOAuthError(fmt.Errorf("%w: %w", service.ErrPersonGrantUnavailable, errors.New("db at 10.0.0.5 refused")))
+	if code != "server_error" || status != http.StatusInternalServerError {
+		t.Errorf("unavailable: got %s/%d, want server_error/500", code, status)
+	}
+	if strings.Contains(desc, "10.0.0.5") {
+		t.Errorf("the resolver's error must not reach the client: %q", desc)
 	}
 }

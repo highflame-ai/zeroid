@@ -1133,6 +1133,12 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
 		return nil, cerr
 	}
+	// A root grant mints for the approved person, so the person's ceiling
+	// applies, before the burn (ADR 0041 D15). A step-up carries its chain's
+	// principal and is never a person root, so this is a no-op for it.
+	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
+	}
 	// ciba:approve is issued only from a trusted approval-channel credential,
 	// which a CIBA grant never is, so the chokepoint always refuses it here.
 	// Refuse it before the burn, whether the request named it or a requesting
@@ -1163,6 +1169,9 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		// chokepoint can check (trust level, verified attestation). Map the
 		// known refusals to the 4xx codes sibling grant paths use instead of
 		// a blanket 500.
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
 		switch {
 		case errors.Is(err, ErrScopesNotAllowed):
 			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)

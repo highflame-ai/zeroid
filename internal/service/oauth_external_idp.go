@@ -288,6 +288,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
 	}
 
