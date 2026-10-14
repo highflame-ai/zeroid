@@ -77,7 +77,8 @@ type PersonGrant struct {
 
 // PersonGrantResolver returns a person's scope ceiling and roles. A nil
 // PersonGrant is an empty ceiling. Returning an error (or panicking) fails
-// the grant closed in enforce mode.
+// the grant closed in enforce mode. It runs on the token request's path: it
+// must honour ctx's deadline and should cache.
 type PersonGrantResolver func(ctx context.Context, r PersonGrantRequest) (*PersonGrant, error)
 
 // ErrPersonScopeDenied is returned when the person's ceiling leaves none of

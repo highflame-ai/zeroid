@@ -133,6 +133,11 @@ requested scopes (after every other layer narrowed them, or their default)
 and, on the external-principal exchange only, the role the trusted service
 asserted. It returns a ceiling and the person's roles.
 
+The resolver runs on the token request's path, under its context. It must
+honour the context's deadline and cancellation, and should cache role
+lookups: a slow resolver slows every person mint, and in enforce mode one
+that fails or times out refuses them.
+
 `GrantType` is one of these constants. The two token exchanges share a grant
 type, so they are named by the value of their tokens' `token_exchange` claim.
 
@@ -159,7 +164,10 @@ removes it, so a wiring mistake cannot turn the ceiling off unnoticed.
 
 In shadow and enforce, a narrowing, a refusal and a resolver error are
 counted in `zeroid_person_scope_ceiling_total` (by mode and outcome) and
-logged as `person_scope_ceiling_violation`. Shadow lets a deployer see who
+logged as `person_scope_ceiling_violation`. The metric counts decisions, not
+tokens: in enforce mode an `authorization_code` is decided at
+`/oauth2/authorize` and again at the token endpoint, and a refused request
+that is retried is decided again. Shadow lets a deployer see who
 enforcement would affect before turning it on.
 
 **Rules.**
