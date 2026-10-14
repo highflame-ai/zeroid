@@ -169,7 +169,8 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
 
 The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceiling)) then sees the resolved user id.
 
-When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
+When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so under the `rfc8693` profile the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
+The legacy profile is frozen (ADR 0043 D1): there the exchange delegates as before, adding a level.
 `idp_iss` and `idp_sub` travel with `sub` onto every exchanged `rfc8693` token; a different agent becomes a new actor level as usual.
 
 ## Admin API

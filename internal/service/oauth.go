@@ -1233,10 +1233,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if len(parentActors) > 0 {
 		delegatedBy = parentActors[0].Sub
 	}
-	// An agent exchanging a token it already acts on (a person token from
-	// ID-JAG or the ID-token exchange names it as act) is re-scoping, not
-	// delegating: no new actor level and no added depth.
-	sameActor := isCurrentActor(subjectParsed, subjectCred, parentActors, actorIdentity)
+	// Under rfc8693, an agent exchanging a token it already acts on (a person
+	// token from ID-JAG or the ID-token exchange names it as act) is
+	// re-scoping, not delegating: no new actor level and no added depth.
+	sameActor := isCurrentActor(parentActors, actorIdentity)
 	childDepth := parentDepth + 1
 	if sameActor {
 		childDepth = parentDepth
@@ -1332,36 +1332,19 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 }
 
 // isCurrentActor reports whether actor is already the subject token's
-// current actor (ADR 0043 D2): its act.sub under rfc8693; under legacy, the
-// identity the token was issued to, when that token acts for someone (it has
-// an act, or a sub other than the identity's own).
-func isCurrentActor(subject jwt.Token, cred *domain.IssuedCredential, parentActors []domain.Actor, actor *domain.Identity) bool {
-	if len(parentActors) > 0 {
-		return parentActors[0].Sub == actor.WIMSEURI
-	}
-	if _, err := jwt.Get[string](subject, "principal_type"); err == nil {
-		return false
-	}
-	if cred.IdentityID == nil || *cred.IdentityID != actor.ID {
-		return false
-	}
-	sub, _ := subject.Subject()
-	return subject.Has("act") || sub != actor.WIMSEURI
+// current actor: its act.sub under rfc8693 (ADR 0043 D2). parentActors is
+// empty for a legacy token, which keeps today's nesting (ADR 0043 D1: no
+// new behaviour for legacy).
+func isCurrentActor(parentActors []domain.Actor, actor *domain.Identity) bool {
+	return len(parentActors) > 0 && parentActors[0].Sub == actor.WIMSEURI
 }
 
 // delegatorBefore names who delegated to the parent's current actor, for a
 // re-scoping exchange that keeps that actor: the next prior actor, else the
-// legacy act.sub, else the parent's sub.
+// parent's sub (the principal).
 func delegatorBefore(subject jwt.Token, parentActors []domain.Actor) string {
 	if len(parentActors) > 1 {
 		return parentActors[1].Sub
-	}
-	if len(parentActors) == 0 {
-		if act, err := jwt.Get[map[string]any](subject, "act"); err == nil {
-			if sub, _ := act["sub"].(string); sub != "" {
-				return sub
-			}
-		}
 	}
 	sub, _ := subject.Subject()
 	return sub

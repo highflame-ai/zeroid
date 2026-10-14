@@ -121,32 +121,22 @@ func TestIsCurrentActor(t *testing.T) {
 		return tok
 	}
 	agentA := &domain.Identity{ID: "a", WIMSEURI: "spiffe://d/acct/proj/agent/a"}
-	idA := "a"
-	credA := &domain.IssuedCredential{IdentityID: &idA}
 
 	rfcPerson := sign(map[string]any{"sub": "user_1", "principal_type": "user", "act": map[string]any{"sub": agentA.WIMSEURI}})
 	actors := priorActorsOf(rfcPerson)
-	if !isCurrentActor(rfcPerson, credA, actors, agentA) {
+	if !isCurrentActor(actors, agentA) {
 		t.Fatal("rfc8693: act.sub is the actor")
 	}
-	if isCurrentActor(rfcPerson, credA, actors, &domain.Identity{ID: "b", WIMSEURI: "spiffe://d/acct/proj/agent/b"}) {
+	if isCurrentActor(actors, &domain.Identity{ID: "b", WIMSEURI: "spiffe://d/acct/proj/agent/b"}) {
 		t.Fatal("rfc8693: another agent is a new actor")
 	}
 	rfcCode := sign(map[string]any{"sub": "user_1", "principal_type": "user", "client_id": "c"})
-	if isCurrentActor(rfcCode, credA, priorActorsOf(rfcCode), agentA) {
+	if isCurrentActor(priorActorsOf(rfcCode), agentA) {
 		t.Fatal("rfc8693: a root with no act has no current actor")
 	}
-	legacyPerson := sign(map[string]any{"sub": "user_1"})
-	if !isCurrentActor(legacyPerson, credA, nil, agentA) {
-		t.Fatal("legacy: the identity a person token was issued to acts for the person")
-	}
-	legacyWorkload := sign(map[string]any{"sub": agentA.WIMSEURI})
-	if isCurrentActor(legacyWorkload, credA, nil, agentA) {
-		t.Fatal("legacy: a workload's own root token has no actor")
-	}
-	idB := "b"
-	if isCurrentActor(legacyPerson, &domain.IssuedCredential{IdentityID: &idB}, nil, agentA) {
-		t.Fatal("legacy: a token issued to another identity")
+	legacy := sign(map[string]any{"sub": "user_1", "act": map[string]any{"sub": agentA.WIMSEURI}})
+	if isCurrentActor(priorActorsOf(legacy), agentA) {
+		t.Fatal("legacy never collapses (ADR 0043 D1)")
 	}
 
 	if got := delegatorBefore(rfcPerson, actors); got != "user_1" {

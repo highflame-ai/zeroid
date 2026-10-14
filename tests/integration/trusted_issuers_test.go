@@ -613,9 +613,10 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 	})
 }
 
-// TestTrustedIssuers_ReScopeLegacyProfile: under the legacy profile the
-// same agent exchanging its person token adds no depth either, and the
-// IdP pair is not stamped on a token whose sub is the agent.
+// TestTrustedIssuers_ReScopeLegacyProfile: the legacy profile is frozen
+// (ADR 0043 D1), so the same agent exchanging its person token delegates
+// exactly as before, and the IdP pair is not stamped on a token whose sub
+// is the agent.
 func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
 	p := newP1B(t)
 	resp := doRequest(t, http.MethodPut, adminPath("/tenant-settings"), map[string]any{"token_profile": "legacy"}, p.tn.headers)
@@ -640,8 +641,9 @@ func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
 		return decodeIssuedTokenClaims(t, ex.AccessToken)
 	}
 	same := exchange(p.agent.key, p.agent.wimse)
-	assert.Nil(t, same["delegation_depth"], "the same agent re-scoping adds no depth")
+	assert.EqualValues(t, 1, same["delegation_depth"], "legacy is unchanged: every exchange adds a level")
 	assert.Equal(t, p.agent.wimse, same["sub"], "legacy puts the actor in sub")
+	assert.Equal(t, map[string]any{"sub": "user_hf_alice"}, same["act"], "legacy act names the delegating parent's sub, as before")
 	assert.NotContains(t, same, "idp_sub", "the IdP pair describes the person, not a legacy sub")
 	assert.NotContains(t, same, "idp_iss")
 

@@ -478,11 +478,11 @@ The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
 
-An exchange whose actor already **is** the subject token's current actor (ADR
-0043 D2: its `act.sub` under `rfc8693`; under legacy, the identity the token was
-issued to when it acts for someone) is a re-scoping, not a delegation: the
-actor replaces itself as the current actor rather than nesting, and
-`delegation_depth` does not increase. This is the agent narrowing the person
+Under the `rfc8693` profile, an exchange whose actor already **is** the subject
+token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
+delegation: the actor replaces itself as the current actor rather than
+nesting, and `delegation_depth` does not increase. The legacy profile is
+frozen (ADR 0043 D1) and delegates on every exchange as before. This is the agent narrowing the person
 token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
 still links the child for cascade revocation.
 
