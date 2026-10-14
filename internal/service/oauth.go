@@ -120,8 +120,13 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 // defeats the single-use guarantee. The concrete impl is
 // postgres.IDJAGReplayStore; an interface here keeps the service testable and
 // the dependency narrow.
+//
+// Redeemed is a read-only pre-check so a replay is refused before work that
+// should not run for it (the person-grant resolver). It is not the gate:
+// Insert stays the atomic single-use check.
 type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+	Redeemed(ctx context.Context, jti string) (bool, error)
 }
 
 // ObservedIDJAGResourceStore records the MCP servers named by the `resource`

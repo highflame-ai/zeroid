@@ -451,7 +451,15 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// to be present, so this lookup succeeds.
 	jtiExpiry, _ := verified.Expiration()
 	// The person's ceiling can refuse too, so it is decided before the burn
-	// and reused at the mint.
+	// and reused at the mint. A replay is refused first, so it never reaches
+	// the deployer's resolver; Insert below is still the single-use gate.
+	redeemed, err := s.idJAGReplayStore.Redeemed(ctx, jti)
+	if err != nil {
+		return nil, oauthServerError("failed to check ID-JAG single-use jti", err)
+	}
+	if redeemed {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+	}
 	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
 		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
 	}
