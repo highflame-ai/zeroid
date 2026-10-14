@@ -105,9 +105,11 @@ type RegisterClientRequest struct {
 	// When set, authorization_code and refresh_token grants issued through
 	// this client gate on the linked identity's expires_at + status (fail-
 	// closed) and propagate the link to refresh_tokens.identity_id for
-	// downstream rotation checks. Tenant-scoped IDOR validation happens
-	// at the handler boundary before this struct is built. Empty = plain
-	// human-session client.
+	// downstream rotation checks, and the link decides the identity and
+	// tenant client_credentials and ID-JAG tokens are minted for (see
+	// OAuthService.clientCredentials and deriveIDJAGTenant). Tenant-scoped
+	// IDOR validation happens at the handler boundary before this struct is
+	// built. Empty = plain human-session client.
 	IdentityID string
 
 	// CIBA ping/push endpoint. Must be HTTPS when non-empty; validated at registration.
