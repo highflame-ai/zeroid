@@ -1217,15 +1217,20 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 
 // TestCIMDDirectAuthOptInIsBounded pins which callers may resolve a CIMD
 // client through authenticateRegisteredClient. A self-asserted document picks
-// its own grant_types, so only a caller that gates on them may opt in.
-// idJAGBearer does (requireCIMDClientFitForIDJAG requires jwt-bearer). Every
-// other caller must pass a literal false; anything else fails here, so the
-// opt-in cannot widen silently.
+// its own grant_types, so they authorize nothing: a caller may opt in only if
+// the authority it grants rests on something the document's publisher cannot
+// choose. idJAGBearer qualifies: the client must prove the document's key
+// (private_key_jwt), an IdP-signed ID-JAG must name this exact client_id, and
+// the tenant is derived server-side. It does NOT require jwt-bearer in the
+// document's grant_types; it refuses only a document that contradicts itself
+// about the ID-JAG profile (draft §8). Every other caller must pass a literal
+// false; anything else fails here, so the opt-in cannot widen silently.
 func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
 	allowed := map[string]bool{
 		// ID-JAG redemption (MCP Enterprise-Managed Authorization §5). Gates
-		// on jwt-bearer in the document's kept grant_types and on
-		// private_key_jwt, then needs a tenant binding (ADR 0042 D5/D6).
+		// on private_key_jwt and on a non-contradictory ID-JAG profile claim,
+		// binds the ID-JAG's client_id, then needs a tenant binding (ADR 0042
+		// D5/D6).
 		"idJAGBearer": true,
 	}
 
@@ -1268,7 +1273,8 @@ func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
 	}
 	if len(offenders) > 0 {
 		t.Errorf("authenticateRegisteredClient may resolve a CIMD client from an unexpected caller:\n  %s\n\n"+
-			"Pass a literal false, or confirm the caller gates on the resolved client's grant_types "+
+			"Pass a literal false, or confirm the authority the caller grants rests on something "+
+			"the document's publisher cannot choose (its grant_types are self-asserted and do not count) "+
 			"and add it to `allowed` with a note saying how.",
 			strings.Join(offenders, "\n  "))
 	}
@@ -1504,4 +1510,41 @@ func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
 			t.Error("a public CIMD client must be entirely unchanged by zeroid#264")
 		}
 	})
+}
+
+// IDJAGProfileContradicted is what requireCIMDClientFitForIDJAG refuses on, so
+// synthesis must set it exactly when a document claims the ID-JAG profile
+// without both §8 grants, and never for a document that makes no claim.
+func TestSynthesizeCIMDClient_FlagsAContradictedIDJAGProfile(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	cases := []struct {
+		name     string
+		grants   []string
+		profiles []string
+		want     bool
+	}{
+		{"no profile claim, no jwt-bearer (WSO2 playground shape)", []string{"refresh_token", "client_credentials"}, nil, false},
+		{"no profile claim, jwt-bearer listed", []string{grantTypeJWTBearerURN}, nil, false},
+		{"profile claimed with both grants", []string{grantTypeTokenExchangeURN, grantTypeJWTBearerURN}, []string{idJAGGrantProfile}, false},
+		{"profile claimed without token-exchange", []string{grantTypeJWTBearerURN}, []string{idJAGGrantProfile}, true},
+		{"profile claimed without jwt-bearer", []string{grantTypeTokenExchangeURN}, []string{idJAGGrantProfile}, true},
+		{"profile claimed with neither", nil, []string{idJAGGrantProfile}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+				ClientID:                   url,
+				ClientName:                 "N",
+				RedirectURIs:               []string{"https://app.example.com/cb"},
+				GrantTypes:                 append([]string{"authorization_code"}, tc.grants...),
+				AuthorizationGrantProfiles: tc.profiles,
+			}, time.Now())
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if client.IDJAGProfileContradicted != tc.want {
+				t.Fatalf("IDJAGProfileContradicted = %v, want %v", client.IDJAGProfileContradicted, tc.want)
+			}
+		})
+	}
 }

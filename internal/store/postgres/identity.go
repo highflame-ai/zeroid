@@ -80,6 +80,24 @@ func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, a
 	return identity, nil
 }
 
+// GetLinkedByID loads the identity an OAuth client's registration links to
+// (oauth_clients.identity_id), in whatever tenant it lives. Unscoped on
+// purpose: the tenant is what the caller is trying to learn, and the link was
+// written by an administrator inside that identity's own tenant (the client
+// create handler refuses a foreign identity_id). Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the tenant.
+func (r *IdentityRepository) GetLinkedByID(ctx context.Context, id string) (*domain.Identity, error) {
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get linked identity: %w", err)
+	}
+	return identity, nil
+}
+
 // GetByIDs returns identities with the given UUIDs, scoped to a tenant.
 // Used for batch node enrichment in graph endpoints (issue #153) so a
 // single query loads every identity referenced by a delegation chain

@@ -799,6 +799,13 @@ Replay defence is atomic: each proof's `jti` is INSERT-or-fail on a primary-key 
 ```bash
 # 1. Platform mints an initial access token (ordinary client_credentials grant
 #    against a confidential client whose allowed_scopes includes client:register).
+#    account_id/project_id may be omitted when the client was registered with an
+#    identity_id: the token is then for the linked identity, in its tenant, and
+#    the response names that tenant (account_id/project_id). If a linked client
+#    does send them they must name the linked identity's tenant, or the request
+#    is refused with invalid_request. Without a link they are required (the
+#    token is for the identity whose external_id is the client_id in that
+#    tenant). Either way they must be sent together, or not at all.
 IAT=$(curl -s -X POST https://auth.example/oauth2/token \
   -d 'grant_type=client_credentials' \
   -d "client_id=$BOOTSTRAP_CLIENT" -d "client_secret=$BOOTSTRAP_SECRET" \
