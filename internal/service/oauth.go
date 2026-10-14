@@ -65,6 +65,9 @@ type OAuthService struct {
 	// issuerBindings maps federated agents to identities when issuers are
 	// account rows (ADR 0042 D6). Nil in static mode.
 	issuerBindings issuerBindingSource
+	// federatedPerson resolves the person in an IdP token to the deployer's
+	// user (ADR 0042 D5a).
+	federatedPerson federatedPersonHook
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
@@ -190,6 +193,9 @@ var reservedClaims = map[string]bool{
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
+	// The IdP's subject for a person ZeroID resolved to the deployer's user
+	// (ADR 0042 D5a); only the federated grants write it.
+	"idp_sub": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to

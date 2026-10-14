@@ -257,6 +257,10 @@ type IssueRequest struct {
 	// PersonGrantExternalIDToken. Empty elsewhere.
 	PersonGrantType string
 
+	// IdPSubject is the IdP's subject for a person the deployer's resolver
+	// mapped to its own user (sub). Written as idp_sub after CustomClaims.
+	IdPSubject string
+
 	// personGrant is the person-grant decision already made for these scopes
 	// by a grant that had to decide before burning a single-use credential.
 	personGrant *personGrantDecision
@@ -908,6 +912,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// CustomClaims, and the lineage a token is grafted onto must come from the
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
+
+	// idp_sub: like mission_id, only ever the grant's own value.
+	_ = token.Remove("idp_sub")
+	if req.IdPSubject != "" {
+		_ = token.Set("idp_sub", req.IdPSubject)
+	}
 
 	// RFC 9068 §2.2.3.1 `roles`: the person grant's roles, on a person root
 	// only. Removed from every other token, so nothing below a root and no

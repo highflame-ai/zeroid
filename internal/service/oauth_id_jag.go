@@ -468,6 +468,24 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if redeemed {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
 	}
+	// The person must be a member of the tenant (ADR 0042 D5a). Resolved here,
+	// before the burn, so a non-member does not consume the grant, and before
+	// the ceiling, which is keyed on the resolved user.
+	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
+		GrantType:       PersonGrantIDJAG,
+		AccountID:       req.AccountID,
+		ProjectID:       req.ProjectID,
+		Issuer:          upstreamIss,
+		Subject:         userID,
+		Email:           userEmail,
+		EmailVerified:   emailVerified(rawClaims, cfg.ClaimMapping["email_verified"]),
+		ClientID:        authedClient.ClientID,
+		AgentIdentityID: identity.ID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	issue.SubjectOverride, issue.IdPSubject = person.sub, person.idpSub
 	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
 		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
 	}
@@ -485,7 +503,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 
 	accessToken.AccountID = req.AccountID
 	accessToken.ProjectID = req.ProjectID
-	accessToken.UserID = userID
+	accessToken.UserID = person.sub
 
 	// Record the MCP servers this exchange authorized (zeroid#259). We just
 	// audience-restricted a token to them, which makes this the authoritative
@@ -504,7 +522,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).
 		Str("project_id", req.ProjectID).
-		Str("user_id", userID).
+		Str("user_id", person.sub).
 		Strs("resources", resources).
 		Msg("ID-JAG jwt-bearer exchange succeeded")
 

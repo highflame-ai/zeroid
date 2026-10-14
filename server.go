@@ -1389,6 +1389,15 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 	s.backchannelSvc.RegisterAuthorizationDetailValidator(typ, service.AuthorizationDetailValidator(fn))
 }
 
+// SetFederatedPersonResolver installs the hook that resolves the person in
+// an IdP token to the deployer's user on ID-JAG redemption and the ID-token
+// exchange (ADR 0042 D5a). It runs before any single-use credential is
+// consumed. nil removes it: static issuers then keep the IdP subject as sub,
+// and issuer rows refuse to mint. Safe to call at any time.
+func (s *Server) SetFederatedPersonResolver(fn FederatedPersonResolver) {
+	s.oauthSvc.SetFederatedPersonResolver(fn)
+}
+
 // SetPersonGrantResolver installs the deployer's person-grant hook (ADR 0041
 // D15 in Highflame's deployment). Every token minted for a person is then
 // bounded by the ceiling fn returns: in enforce mode the issued scope is the

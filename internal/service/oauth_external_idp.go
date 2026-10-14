@@ -229,6 +229,23 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		}
 	}
 
+	// The person must be a member of the tenant (ADR 0042 D5a); the token's
+	// sub becomes the deployer's user id and the IdP subject moves to idp_sub.
+	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
+		GrantType:       PersonGrantExternalIDToken,
+		AccountID:       req.AccountID,
+		ProjectID:       req.ProjectID,
+		Issuer:          upstreamIss,
+		Subject:         userID,
+		Email:           userEmail,
+		EmailVerified:   emailVerified(rawClaims, cfg.ClaimMapping["email_verified"]),
+		ClientID:        authedClient.ClientID,
+		AgentIdentityID: identity.ID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	// Build provenance claims. user_id_iss is the headline addition: it
 	// pins the upstream IdP onto every issued token, so consumers can
 	// answer "which IdP authenticated this user" from the token alone.
@@ -299,7 +316,8 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		GrantType:             domain.GrantTypeTokenExchange,
 		Scopes:                scopes,
 		UseRS256:              true,
-		SubjectOverride:       userID,
+		SubjectOverride:       person.sub,
+		IdPSubject:            person.idpSub,
 		UserEmail:             userEmail,
 		UserName:              userName,
 		ApplicationID:         req.ApplicationID,
@@ -339,13 +357,13 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 
 	accessToken.AccountID = req.AccountID
 	accessToken.ProjectID = req.ProjectID
-	accessToken.UserID = userID
+	accessToken.UserID = person.sub
 
 	log.Info().
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).
 		Str("project_id", req.ProjectID).
-		Str("user_id", userID).
+		Str("user_id", person.sub).
 		Msg("external id_token exchange succeeded")
 
 	return accessToken, nil
