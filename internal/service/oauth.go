@@ -2895,7 +2895,9 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// A failed peek means the token is NOT active (expired, revoked, or
 	// unknown). We deliberately DO NOT reject here — instead we fall through to
 	// RotateRefreshToken, whose claim path recognises an already-rotated token
-	// and revokes its family (RFC 9700 §4.14.2). Short-circuiting on the peek
+	// and either refuses it as a concurrent retry (within the reuse grace
+	// window, family still live) or revokes its family (RFC 9700 §4.14.2).
+	// Short-circuiting on the peek
 	// would silence reuse detection.
 	var (
 		identity         *domain.Identity
@@ -2975,7 +2977,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if errors.Is(err, ErrDPoPBindingMismatch) {
 			return nil, oauthBadRequest(oautherror.InvalidDPoPProof, "refresh token is DPoP-bound; the presented proof does not match the original key")
 		}
-		// An already-rotated token was presented (RFC 9700 §4.14.2). Rotation
+		// An already-rotated token was presented outside the reuse grace
+		// window, or one whose family was already revoked (RFC 9700
+		// §4.14.2). (A rotated-out token within the window comes back as
+		// ErrRefreshTokenAlreadyRotated instead: refused below, nothing
+		// revoked.) Rotation
 		// has revoked the family's refresh tokens; revoke the access tokens
 		// minted under it too. The response is the same invalid_grant as any
 		// other unusable refresh token, so it does not reveal the detection.

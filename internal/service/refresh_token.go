@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,11 +32,31 @@ type RefreshTokenService struct {
 	// CredentialService so one Server.SetRevocationNotifier wires every path.
 	// Nil-safe: unset ⇒ no events.
 	revocationDispatcher *RevocationDispatcher
+	// reuseGrace (nanoseconds) is how long after a rotation a second
+	// presentation of the rotated-out token is refused as a concurrent retry
+	// rather than treated as reuse (token.refresh_reuse_grace_seconds). 0 ⇒ no
+	// grace. Atomic so Server.SetRefreshReuseGrace can change it at runtime.
+	reuseGrace atomic.Int64
 }
 
-// NewRefreshTokenService creates a new refresh token service.
+// NewRefreshTokenService creates a new refresh token service with the default
+// reuse grace window (domain.RefreshTokenReuseGraceWindow); the server sets
+// the configured one with SetReuseGrace.
 func NewRefreshTokenService(repo *postgres.RefreshTokenRepository, db *bun.DB) *RefreshTokenService {
-	return &RefreshTokenService{repo: repo, db: db}
+	s := &RefreshTokenService{repo: repo, db: db}
+	s.reuseGrace.Store(int64(domain.RefreshTokenReuseGraceWindow))
+	return s
+}
+
+// SetReuseGrace sets the refresh-token reuse grace window. A negative value
+// is treated as 0 (no grace).
+func (s *RefreshTokenService) SetReuseGrace(d time.Duration) {
+	s.reuseGrace.Store(int64(max(d, 0)))
+}
+
+// ReuseGrace returns the current refresh-token reuse grace window.
+func (s *RefreshTokenService) ReuseGrace() time.Duration {
+	return time.Duration(s.reuseGrace.Load())
 }
 
 // RefreshTokenParams contains the data needed to issue a refresh token.
@@ -94,8 +115,8 @@ type RefreshTokenResult struct {
 }
 
 // RefreshTokenReuseError is returned by RotateRefreshToken when the presented
-// refresh token had already been rotated (or its family revoked) — the reuse
-// signal of RFC 9700 §4.14.2. By the time it is returned, every refresh token
+// refresh token had already been rotated, longer ago than the reuse grace
+// window, or its family was revoked — the reuse signal of RFC 9700 §4.14.2. By the time it is returned, every refresh token
 // in the family has been revoked. FamilyID lets the caller revoke the access
 // tokens issued under the family as well. Callers MUST answer it with the
 // same invalid_grant as any other unusable refresh token, so the response
@@ -297,31 +318,48 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 	}, nil
 }
 
+// ErrRefreshTokenAlreadyRotated is returned by RotateRefreshToken when the
+// presented token was rotated out within the reuse grace window and its family
+// is still live: a concurrent retry, refused without revoking anything. The
+// refresh grant answers it with the same invalid_grant as any other unusable
+// refresh token.
+var ErrRefreshTokenAlreadyRotated = errors.New("refresh token already rotated")
+
 // handleFailedClaim runs when ClaimByTokenHash found no matching active,
-// non-expired row. It disambiguates among three possibilities:
+// non-expired row. It disambiguates among four possibilities:
 //
-//  1. Revoked — the token was already rotated (or its family revoked). This
-//     is the reuse signal of RFC 9700 §4.14.2: revoke every refresh token in
-//     the family and return a *RefreshTokenReuseError.
-//  2. Expired — normal TTL expiry. Returns "expired".
-//  3. Should-be-unreachable state (active and non-expired but claim still
+//  1. Rotated out within the reuse grace window (ReuseGrace) — treated as a
+//     concurrent retry: several tabs or processes sharing one refresh token,
+//     or a client retry loop. Returns ErrRefreshTokenAlreadyRotated and
+//     revokes nothing, so the successor and the session survive.
+//  2. Revoked otherwise — rotated out longer ago than the window, or revoked
+//     by anything other than rotation (its family revoked by reuse detection,
+//     RFC 7009 revocation, authorization-code replay). The reuse signal of RFC
+//     9700 §4.14.2: revoke every refresh token in the family and return a
+//     *RefreshTokenReuseError so the caller revokes the family's access tokens.
+//  3. Expired — normal TTL expiry. Returns "expired".
+//  4. Should-be-unreachable state (active and non-expired but claim still
 //     missed). Logs at Error level and returns a generic error.
 //
-// There is deliberately no grace window for a "concurrent retry". The server
-// cannot tell a client retrying a request it never saw the answer to from an
-// attacker replaying a stolen token, and RFC 9700 §4.14.2 resolves exactly
-// that ambiguity by revoking the active token: a window in which the newest
-// token survives a replay is a window in which whoever rotated first — the
-// attacker included — keeps the session. Two requests racing on one token
-// therefore leave the family revoked: the claim lets exactly one of them
-// rotate, and the other's presentation of the now-rotated token revokes the
-// family, successor included (the claim's row lock makes the loser wait until
-// the winner's successor has committed, so the revocation always sees it).
+// Telling rotation from other revocations: refresh tokens are revoked in only
+// two ways — the rotation claim, which inserts an active successor in the
+// same transaction, and RevokeFamily, which revokes every active token in the
+// family. So a revoked token whose family still has an active token was
+// rotated out (the active token is its successor, or a later one), and a
+// revoked token whose family has none was revoked with its family and gets no
+// grace. RestoreRotation does not break this: it swaps the active successor
+// for the reactivated predecessor in one transaction, so the family is never
+// seen without an active token while a restore runs, and it never reactivates
+// anything in a family RevokeFamily has revoked.
 //
-// The one retry this would punish for no reason — the server consumed the
-// token and then failed before answering — is handled where it happens:
-// RestoreRotation puts the presented token back, so the client's retry
-// rotates normally instead of tripping reuse detection.
+// The grace window trades strictness for availability. Within it a replay of
+// a stolen rotated-out token is refused without revoking the family, so
+// whichever party rotated first keeps the session; 0 disables it.
+//
+// The one retry that would otherwise be punished for no reason outside the
+// window — the server consumed the token and then failed before answering —
+// is handled where it happens: RestoreRotation puts the presented token back,
+// so the client's retry rotates normally.
 func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash string) error {
 	existing, err := s.repo.GetByTokenHashIncludingRevoked(ctx, tokenHash)
 	if err != nil {
@@ -329,6 +367,25 @@ func (s *RefreshTokenService) handleFailedClaim(ctx context.Context, tokenHash s
 	}
 
 	if existing.State == domain.RefreshTokenStateRevoked {
+		if grace := s.ReuseGrace(); grace > 0 && existing.RevokedAt != nil && time.Since(*existing.RevokedAt) < grace {
+			live, liveErr := s.repo.FamilyHasActiveToken(ctx, existing.FamilyID)
+			if liveErr != nil {
+				// Refuse without revoking: the token is not usable either way,
+				// and a lookup failure must not decide to end the session.
+				return fmt.Errorf("refresh token reuse check failed: %w", liveErr)
+			}
+			if live {
+				log.Info().
+					Str("family_id", existing.FamilyID).
+					Str("user_id", existing.UserID).
+					Str("client_id", existing.ClientID).
+					Dur("age", time.Since(*existing.RevokedAt)).
+					Dur("grace", grace).
+					Msg("Rotated-out refresh token presented within the reuse grace window — treating as a concurrent retry")
+				return ErrRefreshTokenAlreadyRotated
+			}
+		}
+
 		revoked, revokeErr := s.repo.RevokeFamily(ctx, existing.FamilyID)
 		log.Warn().
 			Str("family_id", existing.FamilyID).

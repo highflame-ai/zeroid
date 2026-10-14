@@ -256,7 +256,10 @@ func TestRevocationNotifier_FiresOnRefreshReuse(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_ = resp.Body.Close()
 
-	// Replaying the now-rotated original token is reuse: the family is revoked.
+	// Replaying the now-rotated original token after the reuse grace window is
+	// reuse: the family is revoked. (Within the window it would be refused as a
+	// concurrent retry, with no events.)
+	backdateRotation(t, refreshToken, time.Hour)
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"client_id":     testMCPClientID,

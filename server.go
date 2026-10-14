@@ -701,6 +701,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
+	// Refresh-token reuse grace (token.refresh_reuse_grace_seconds): the
+	// service applies it, and the cleanup worker keeps rotated-out rows at
+	// least that long. Validate() already rejected an out-of-range value.
+	srv.SetRefreshReuseGrace(cfg.Token.RefreshReuseGrace())
 
 	// Discovery must not promise a flow /oauth2/authorize cannot serve: with no
 	// PrincipalResolver registered the endpoint 503s, so the authorization_code
@@ -1458,6 +1462,17 @@ func (s *Server) SetRegistrationEndpoint(endpoint string) error {
 // server without restarting it.
 func (s *Server) SetRequireTokenInspectionAuth(require bool) {
 	s.oauthSvc.SetRequireTokenInspectionAuth(require)
+}
+
+// SetRefreshReuseGrace sets the refresh-token reuse grace window: how long
+// after a rotation a second presentation of the rotated-out refresh token is
+// refused as a concurrent retry instead of revoking its family. Mirrors the
+// token.refresh_reuse_grace_seconds config key (0 = no grace, strict RFC
+// 9700); negative values are treated as 0. Exposed so integration tests can
+// exercise several windows on one server without restarting it.
+func (s *Server) SetRefreshReuseGrace(d time.Duration) {
+	s.refreshTokenSvc.SetReuseGrace(d)
+	s.cleanupWorker.SetRefreshReuseGrace(d)
 }
 
 // SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used

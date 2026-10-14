@@ -3,6 +3,7 @@ package integration_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -205,6 +206,9 @@ func TestExternalPrincipalRefreshToken(t *testing.T) {
 		require.True(t, introspect(t, exchangeAccess)["active"].(bool), "precondition: the exchange's access token is active")
 		require.True(t, introspect(t, rotatedAccess)["active"].(bool), "precondition: the rotated access token is active")
 
+		// Past the reuse grace window, so the replay is reuse rather than a
+		// concurrent retry.
+		backdateRotation(t, original, time.Hour)
 		resp = post(t, "/oauth2/token", map[string]any{
 			"grant_type":    "refresh_token",
 			"refresh_token": original,
