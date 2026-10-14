@@ -52,6 +52,32 @@ func idTokenIssuedTo(token jwt.Token, clientID string) error {
 	return nil
 }
 
+// requireIDToken is ADR 0042 D3a rule 2: the subject token is positively an
+// ID token, not merely a JWT from a trusted issuer. IdPs do not type ID
+// tokens, so this means the OpenID Connect Core §2 claims are present and no
+// access-token marker is (RFC 9068 §2.1 typ, scp or scope). The aud check
+// that separates the two is idTokenIssuedTo. Signature, iss, exp and iat
+// were verified before this runs.
+func requireIDToken(raw string, verified jwt.Token) error {
+	if hdr, ok := decodeJWTHeader(raw); ok {
+		switch strings.ToLower(hdr.Typ) {
+		case "at+jwt", "application/at+jwt":
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an access token (typ at+jwt), not an ID token")
+		}
+	}
+	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat"} {
+		if !verified.Has(claim) {
+			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token is not an ID token: it has no %s claim", claim))
+		}
+	}
+	for _, claim := range []string{"scp", "scope"} {
+		if verified.Has(claim) {
+			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token carries %s, which marks an access token, not an ID token", claim))
+		}
+	}
+	return nil
+}
+
 // TokenTypeAccessToken is the RFC 8693 §3 identifier for an OAuth 2.0 access
 // token, returned as issued_token_type on every token-exchange response.
 const TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
@@ -131,6 +157,12 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if err != nil {
 		return nil, err
 	}
+	// ADR 0042 D3a rule 1: the relying party proves itself with a key, never
+	// a shared secret, so an agent needs no Highflame secret (D8).
+	if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+		return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
+			"a client secret is not accepted", nil)
+	}
 
 	// Verify the upstream ID token against its configured IdP — signature
 	// (JWKS), iss, aud, exp/nbf, alg allow-list, MaxTokenAge, and the
@@ -140,6 +172,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// what an id_token-exchange caller presents.
 	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireIDToken(req.SubjectToken, verified); err != nil {
 		return nil, err
 	}
 	if err := idTokenIssuedTo(verified, authedClient.ClientID); err != nil {

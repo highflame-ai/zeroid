@@ -703,8 +703,7 @@ func TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience(t *testing.T) {
 			"project_id":         fedCfg.ProjectID,
 		}
 		if client != nil {
-			body["client_id"] = client.ClientID
-			body["client_secret"] = client.ClientSecret
+			withClientAuth(t, body, *client)
 		}
 		return postFederation(t, fedHTTP.URL, body)
 	}

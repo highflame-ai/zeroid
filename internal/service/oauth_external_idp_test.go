@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -219,5 +220,66 @@ func TestExternalIDTokenExchange_UnknownIssuerWrapsSentinel(t *testing.T) {
 	// Caller path: errors.Is on the sentinel must succeed.
 	if !errors.Is(err, ErrUnknownExternalIssuer) {
 		t.Errorf("expected errors.Is(err, ErrUnknownExternalIssuer) to be true; chain = %v", err)
+	}
+}
+
+// TestRequireIDToken is ADR 0042 D3a rule 2: a token from a trusted issuer is
+// accepted on the ID-token exchange only when it is positively an ID token.
+func TestRequireIDToken(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign := func(typ string, claims map[string]any) (string, jwt.Token) {
+		tok := jwt.New()
+		for k, v := range claims {
+			_ = tok.Set(k, v)
+		}
+		hdr := jws.NewHeaders()
+		if typ != "" {
+			_ = hdr.Set(jws.TypeKey, typ)
+		}
+		raw, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdr)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := jwt.ParseInsecure(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw), parsed
+	}
+	idToken := func() map[string]any {
+		now := time.Now()
+		return map[string]any{"iss": "https://idp", "sub": "u", "aud": "client", "exp": now.Add(time.Minute).Unix(), "iat": now.Unix()}
+	}
+
+	raw, tok := sign("JWT", idToken())
+	if err := requireIDToken(raw, tok); err != nil {
+		t.Fatalf("an ID token is accepted: %v", err)
+	}
+	for _, typ := range []string{"at+jwt", "application/at+jwt", "AT+JWT"} {
+		raw, tok := sign(typ, idToken())
+		if err := requireIDToken(raw, tok); err == nil {
+			t.Fatalf("typ %s marks an access token", typ)
+		}
+	}
+	for _, claim := range []string{"scp", "scope"} {
+		c := idToken()
+		c[claim] = "mail.read"
+		raw, tok := sign("JWT", c)
+		if err := requireIDToken(raw, tok); err == nil {
+			t.Fatalf("%s marks an access token", claim)
+		}
+	}
+	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat"} {
+		c := idToken()
+		delete(c, claim)
+		raw, tok := sign("JWT", c)
+		err := requireIDToken(raw, tok)
+		var oe *OAuthError
+		if !errors.As(err, &oe) || oe.Code != "invalid_grant" {
+			t.Fatalf("missing %s must be invalid_grant, got %v", claim, err)
+		}
 	}
 }
