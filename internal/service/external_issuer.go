@@ -373,11 +373,11 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
 		r.Normalize()
-		// A rename or an enable/disable changes nothing uniqueness or
-		// validation decide on. Skipping both keeps such rows manageable when
-		// the deployment's rules moved under them (an issuer dropped from the
+		// A rename or a disable changes nothing uniqueness or validation
+		// decide on. Skipping both keeps such rows manageable when the
+		// deployment's rules moved under them (an issuer dropped from the
 		// shared list leaves rows in several accounts).
-		if !p.onlyNameOrEnabled() {
+		if !p.onlyNameOrDisable() {
 			pin := s.sharedPin(r.Issuer)
 			if err := r.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin}); err != nil {
 				return validationToAPIError(err)
@@ -408,11 +408,13 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 	return row, check, nil
 }
 
-// onlyNameOrEnabled reports whether p changes nothing but display_name and
-// enabled.
-func (p IssuerPatch) onlyNameOrEnabled() bool {
+// onlyNameOrDisable reports whether p changes nothing but display_name and,
+// at most, disables the row. An enable is re-checked: re-enabling a row
+// stranded in conflict would make grants for both accounts ambiguous.
+func (p IssuerPatch) onlyNameOrDisable() bool {
 	return p.Audiences == nil && p.Algorithms == nil && p.ClaimMapping == nil && p.PropagateClaims == nil &&
-		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil
+		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil &&
+		(p.Enabled == nil || !*p.Enabled)
 }
 
 func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {

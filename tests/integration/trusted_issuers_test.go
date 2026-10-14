@@ -1406,6 +1406,11 @@ func TestTrustedIssuers_DroppedFromSharedList(t *testing.T) {
 	assert.Equal(t, http.StatusOK, status, "%v", body)
 	status, body = call(map[string]any{"audiences": []string{"x"}})
 	assert.Equal(t, http.StatusConflict, status, "a substantive change re-checks uniqueness: %v", body)
+	status, body = call(map[string]any{"enabled": true})
+	assert.Equal(t, http.StatusConflict, status, "re-enabling a stranded conflicting row is refused: %v", body)
+	assert.Equal(t, "issuer_already_trusted", body["code"])
+	status, body = call(map[string]any{"display_name": "renamed again", "enabled": false})
+	assert.Equal(t, http.StatusOK, status, "%v", body)
 }
 
 // TestTrustedIssuers_ConditionalEnable: the deployer's enable at adoption
