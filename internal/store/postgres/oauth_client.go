@@ -21,7 +21,7 @@ func NewOAuthClientRepository(db *bun.DB) *OAuthClientRepository {
 
 // Create inserts a new OAuth2 client.
 func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuthClient) error {
-	_, err := r.db.NewInsert().Model(client).Exec(ctx)
+	_, err := dbOrTx(ctx, r.db).NewInsert().Model(client).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create oauth client: %w", err)
 	}
@@ -31,7 +31,7 @@ func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuth
 // GetByClientID retrieves a client by its globally unique OAuth2 client_id.
 func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
-	err := r.db.NewSelect().Model(client).
+	err := dbOrTx(ctx, r.db).NewSelect().Model(client).
 		Where("client_id = ?", clientID).
 		Scan(ctx)
 	if err != nil {
