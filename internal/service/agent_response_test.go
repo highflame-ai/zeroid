@@ -38,10 +38,12 @@ func TestIdentityToAgentResponse_SurfacesOwner(t *testing.T) {
 // whitespace, coordinates as fixed 32-byte big-endian values.
 func rfc7638ECThumbprint(t *testing.T, k *ecdsa.PrivateKey) string {
 	t.Helper()
-	x := make([]byte, 32)
-	y := make([]byte, 32)
-	k.PublicKey.X.FillBytes(x)
-	k.PublicKey.Y.FillBytes(y)
+	// Uncompressed point: 0x04 || X (32 bytes) || Y (32 bytes).
+	b, err := k.PublicKey.Bytes()
+	if err != nil {
+		t.Fatalf("encode public key: %v", err)
+	}
+	x, y := b[1:33], b[33:65]
 	canonical := fmt.Sprintf(`{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}`,
 		base64.RawURLEncoding.EncodeToString(x), base64.RawURLEncoding.EncodeToString(y))
 	sum := sha256.Sum256([]byte(canonical))
