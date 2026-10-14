@@ -1220,12 +1220,14 @@ arrays (Section 11.1) applies to *registered* public clients only.
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
 redirecting to the client's `redirect_uri`. ZeroID does that for registered and
-CIMD clients alike, once the client and `redirect_uri` have been validated (step
-3.5 of `/oauth2/authorize`). The interactive-authentication redirect
-(`ErrPrincipalInteractionRequired`) and the `access_denied` redirect for a
-resource owner's explicit denial (`ErrPrincipalAccessDenied`, issued on POST as
-well as GET) follow the same rule. Only a request with no resolvable client is
-answered with an RFC 6749 §5.2 JSON body instead.
+CIMD clients alike, on GET, once the client and `redirect_uri` have been
+validated (step 3.5 of `/oauth2/authorize`). The interactive-authentication
+redirect (`ErrPrincipalInteractionRequired`, GET only) follows the same rule, and
+so does the `access_denied` redirect for a resource owner's explicit denial
+(`ErrPrincipalAccessDenied`), which is the one error also redirected on POST.
+Everything else is answered with an RFC 6749 §5.2 JSON body: the two §4.1.2.1
+exemptions (a `client_id` that does not resolve, a `redirect_uri` that is missing
+or not registered for the client), and every other failure on POST.
 
 `cimd.allowed_domains` (Section 12.7) is enforced in exactly one place: document
 resolution. A host that is not listed never resolves, so a CIMD client that reaches
