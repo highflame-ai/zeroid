@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,7 +165,7 @@ func TestStaticRegistry_ResolvePersonKind(t *testing.T) {
 // refusedURL is a JWKS URL nothing listens on, so jwks.New returns at once.
 const refusedURL = "http://127.0.0.1:1/keys"
 
-func TestIssuerJWKSCache_VersionsAndEviction(t *testing.T) {
+func TestIssuerJWKSCache_SharingAndEviction(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	c := newIssuerJWKSCache(nil)
 	c.now = func() time.Time { return now }
@@ -175,66 +176,97 @@ func TestIssuerJWKSCache_VersionsAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again, _ := c.get(row); again != first {
-		t.Fatal("the same version reuses its client")
-	}
-
-	t.Run("an edited row gets a new client and the old one is retired", func(t *testing.T) {
-		edited := *row
-		edited.UpdatedAt = row.UpdatedAt.Add(time.Second)
-		second, err := c.get(&edited)
-		if err != nil {
-			t.Fatal(err)
+	t.Run("rows with the same key set share a client, across accounts", func(t *testing.T) {
+		other := issuerRow("r9", "acct-2", "https://i2", domain.IssuerKindPerson, refusedURL)
+		got, _ := c.get(other)
+		if got != first || c.size() != 1 {
+			t.Fatalf("shared = %v, size %d", got == first, c.size())
 		}
-		if second == first {
-			t.Fatal("a new updated_at must not reuse the old client")
-		}
-		if c.size() != 1 {
-			t.Fatalf("size = %d; the old version is closed", c.size())
-		}
-		row = &edited
 	})
-
+	t.Run("a re-discovered jwks_uri gets its own client", func(t *testing.T) {
+		moved := *row
+		moved.JWKSURI = refusedURL + "?v=2"
+		got, _ := c.get(&moved)
+		if got == first {
+			t.Fatal("a new jwks_uri must not reuse the old client")
+		}
+	})
 	t.Run("an idle client is evicted", func(t *testing.T) {
-		other := issuerRow("r2", "acct", "https://j", domain.IssuerKindPerson, refusedURL)
-		if _, err := c.get(other); err != nil {
+		live := issuerRow("r2", "acct", "https://j", domain.IssuerKindPerson, refusedURL+"?live")
+		if _, err := c.get(live); err != nil {
 			t.Fatal(err)
 		}
 		now = now.Add(issuerJWKSIdleTTL + 2*issuerJWKSSweepPeriod)
-		if _, err := c.get(other); err != nil {
+		if _, err := c.get(live); err != nil {
 			t.Fatal(err)
 		}
 		c.mu.Lock()
 		_, kept := c.entries[issuerJWKSKey(row)]
 		c.mu.Unlock()
 		if kept {
-			t.Fatal("r1 sat idle past the TTL and must be gone")
+			t.Fatal("the first key set sat idle past the TTL and must be gone")
 		}
 	})
-
-	t.Run("per-account cap", func(t *testing.T) {
+	t.Run("per-account cap evicts only that account's use", func(t *testing.T) {
+		shared := issuerRow("s", "quiet", "https://s", domain.IssuerKindPerson, refusedURL+"?shared")
+		if _, err := c.get(shared); err != nil {
+			t.Fatal(err)
+		}
 		for i := 0; i < issuerJWKSPerAccount+5; i++ {
 			now = now.Add(time.Millisecond)
-			if _, err := c.get(issuerRow(fmt.Sprintf("cap-%d", i), "busy", "https://x", domain.IssuerKindPerson, refusedURL)); err != nil {
+			r := issuerRow(fmt.Sprintf("cap-%d", i), "busy", "https://x", domain.IssuerKindPerson, fmt.Sprintf("%s?cap=%d", refusedURL, i))
+			if i == 0 {
+				r.JWKSURI = shared.JWKSURI
+			}
+			if _, err := c.get(r); err != nil {
 				t.Fatal(err)
 			}
 		}
 		c.mu.Lock()
 		n := 0
 		for _, e := range c.entries {
-			if e.account == "busy" {
+			if _, ok := e.owners["busy"]; ok {
 				n++
 			}
 		}
-		_, oldestKept := c.entries[issuerJWKSKey(issuerRow("cap-0", "busy", "https://x", domain.IssuerKindPerson, refusedURL))]
+		_, sharedKept := c.entries[issuerJWKSKey(shared)]
 		c.mu.Unlock()
 		if n != issuerJWKSPerAccount {
-			t.Fatalf("account holds %d clients, cap %d", n, issuerJWKSPerAccount)
+			t.Fatalf("busy uses %d clients, cap %d", n, issuerJWKSPerAccount)
 		}
-		if oldestKept {
-			t.Fatal("the least recently used client is the one evicted")
+		if !sharedKept {
+			t.Fatal("busy's churn must not close a client another account still uses")
 		}
 	})
+}
+
+func TestIssuerJWKSCache_SingleFlight(t *testing.T) {
+	c := newIssuerJWKSCache(nil)
+	defer c.close()
+	var made atomic.Int64
+	c.newClient = func(url string, opts ...jwks.Option) (*jwks.Client, error) {
+		made.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		return jwks.New(url, opts...)
+	}
+	var wg sync.WaitGroup
+	clients := make([]*jwks.Client, 10)
+	for i := range clients {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			clients[i], _ = c.get(issuerRow(fmt.Sprintf("r%d", i), fmt.Sprintf("acct-%d", i), "https://i", domain.IssuerKindPerson, refusedURL))
+		}(i)
+	}
+	wg.Wait()
+	if made.Load() != 1 {
+		t.Fatalf("a cold key set was fetched %d times, want 1", made.Load())
+	}
+	for _, cl := range clients {
+		if cl != clients[0] {
+			t.Fatal("every caller gets the one client")
+		}
+	}
 }
 
 func TestIssuerJWKSCache_TotalCap(t *testing.T) {
@@ -247,7 +279,7 @@ func TestIssuerJWKSCache_TotalCap(t *testing.T) {
 	defer c.close()
 	for i := 0; i < issuerJWKSTotal+10; i++ {
 		now = now.Add(time.Millisecond)
-		row := issuerRow(fmt.Sprintf("t-%d", i), fmt.Sprintf("acct-%d", i), "https://x", domain.IssuerKindPerson, refusedURL)
+		row := issuerRow(fmt.Sprintf("t-%d", i), fmt.Sprintf("acct-%d", i), "https://x", domain.IssuerKindPerson, fmt.Sprintf("%s?n=%d", refusedURL, i))
 		if _, err := c.get(row); err != nil {
 			t.Fatal(err)
 		}

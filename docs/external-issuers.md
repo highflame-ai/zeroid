@@ -83,7 +83,8 @@ For `email_verified` on Entra, ask the customer to emit the optional claims `ema
 ### Read live
 
 On every federated grant ZeroID reads the issuer's rows with one indexed query and caches no row, so a disable or delete applies at the next request on every replica.
-Only JWKS clients are cached: keyed by `(row id, jwks_uri, updated_at)`, so an edited row never verifies with its old keys; created on first use; closed after 30 idle minutes; capped at 20 per account and 1000 in total.
+Only JWKS clients are cached: shared by every row with the same `(jwks_uri, jwks_cache_ttl_seconds)`; created on first use, with one fetch however many requests race for a cold key set; a use by an account is dropped after 30 idle minutes and a client with no users is closed; capped at 20 per account (evicting only that account's use of a shared client) and 1000 in total.
+A refresh triggered by an unknown `kid` is single-flight and at most one per 10 seconds per key set, since the kid comes from an unverified token.
 Tokens already issued under a deleted row live out their 15 minutes; bulk revocation on delete is ADR 0042 open question 6.
 
 ## Bindings

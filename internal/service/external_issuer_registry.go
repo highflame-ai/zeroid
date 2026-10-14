@@ -34,9 +34,8 @@ type issuerRowSource interface {
 //
 // Database mode (ADR 0042 D4): rows are read live on every federated grant,
 // with no row cache, so disabling or deleting a row takes effect at the next
-// request on every replica. Only the JWKS clients are cached, keyed by (row
-// id, jwks_uri, updated_at) so an edited row never verifies with keys
-// fetched for its old version.
+// request on every replica. Only the JWKS clients are cached, shared by
+// (jwks_uri, refresh interval).
 type ExternalIssuerRegistry struct {
 	mu      sync.RWMutex
 	byIss   map[string]*ExternalIssuerEntry
@@ -214,12 +213,16 @@ const (
 	issuerJWKSSweepPeriod = time.Minute
 )
 
-// issuerJWKSCache holds JWKS clients for issuer rows: created on first use,
-// closed when idle, when their row changes, or past the caps. Each client
-// owns a refresh goroutine, so the caps bound goroutines as well as memory.
+// issuerJWKSCache holds JWKS clients for issuer rows, shared by every row
+// with the same (jwks_uri, refresh interval): created on first use, one
+// fetch per cold key however many requests race for it, closed when idle
+// or past the caps. Each client owns a refresh goroutine, so the caps bound
+// goroutines as well as memory. An entry remembers which accounts use it,
+// so one account's churn evicts only its own use of a shared client.
 type issuerJWKSCache struct {
 	mu        sync.Mutex
 	entries   map[string]*issuerJWKSEntry
+	inflight  map[string]*issuerJWKSFlight
 	opts      []jwks.Option
 	now       func() time.Time
 	lastSweep time.Time
@@ -228,68 +231,90 @@ type issuerJWKSCache struct {
 
 type issuerJWKSEntry struct {
 	key      string
-	rowID    string
-	account  string
 	client   *jwks.Client
+	owners   map[string]time.Time // account -> last use
 	lastUsed time.Time
+}
+
+type issuerJWKSFlight struct {
+	done   chan struct{}
+	client *jwks.Client
+	err    error
 }
 
 func newIssuerJWKSCache(opts []jwks.Option) *issuerJWKSCache {
 	return &issuerJWKSCache{
 		entries:   map[string]*issuerJWKSEntry{},
+		inflight:  map[string]*issuerJWKSFlight{},
 		opts:      opts,
 		now:       time.Now,
 		newClient: jwks.New,
 	}
 }
 
+// issuerJWKSKey is what a client is shared on. jwks_uri changes only by
+// re-discovery, which makes a new key, so a row never verifies with keys
+// fetched from a URI it no longer names.
 func issuerJWKSKey(row *domain.ExternalIssuer) string {
-	return fmt.Sprintf("%s\x00%s\x00%d", row.ID, row.JWKSURI, row.UpdatedAt.UnixNano())
+	return fmt.Sprintf("%s\x00%d", row.JWKSURI, row.JWKSCacheTTLSeconds)
 }
 
-// get returns the client for row's current version, creating it outside the
-// lock (jwks.New fetches synchronously) and retiring older versions.
 func (c *issuerJWKSCache) get(row *domain.ExternalIssuer) (*jwks.Client, error) {
 	key := issuerJWKSKey(row)
 	c.mu.Lock()
 	if e, ok := c.entries[key]; ok {
-		e.lastUsed = c.now()
+		c.touchLocked(e, row.AccountID)
 		closed := c.sweepLocked(false)
 		c.mu.Unlock()
 		closeAll(closed)
 		return e.client, nil
 	}
+	if f, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		<-f.done
+		if f.err != nil {
+			return nil, f.err
+		}
+		c.mu.Lock()
+		if e, ok := c.entries[key]; ok {
+			c.touchLocked(e, row.AccountID)
+		}
+		c.mu.Unlock()
+		return f.client, nil
+	}
+	f := &issuerJWKSFlight{done: make(chan struct{})}
+	c.inflight[key] = f
 	c.mu.Unlock()
 
+	// Outside the lock: jwks.New fetches synchronously.
 	opts := append(append([]jwks.Option{}, c.opts...), jwks.WithRefreshInterval(time.Duration(row.JWKSCacheTTLSeconds)*time.Second))
 	client, err := c.newClient(row.JWKSURI, opts...)
-	if err != nil {
-		return nil, err
-	}
 
 	c.mu.Lock()
-	if e, ok := c.entries[key]; ok {
-		e.lastUsed = c.now()
-		c.mu.Unlock()
-		client.Close()
-		return e.client, nil
-	}
+	delete(c.inflight, key)
 	var closed []*jwks.Client
-	for k, e := range c.entries {
-		if e.rowID == row.ID {
-			delete(c.entries, k)
-			closed = append(closed, e.client)
-		}
+	if err == nil {
+		e := &issuerJWKSEntry{key: key, client: client, owners: map[string]time.Time{}}
+		c.entries[key] = e
+		c.touchLocked(e, row.AccountID)
+		closed = c.sweepLocked(true)
 	}
-	c.entries[key] = &issuerJWKSEntry{key: key, rowID: row.ID, account: row.AccountID, client: client, lastUsed: c.now()}
-	closed = append(closed, c.sweepLocked(true)...)
+	f.client, f.err = client, err
+	close(f.done)
 	c.mu.Unlock()
 	closeAll(closed)
-	return client, nil
+	return client, err
 }
 
-// sweepLocked drops idle entries (at most once a minute unless forced) and
-// enforces the per-account and total caps, least recently used first.
+func (c *issuerJWKSCache) touchLocked(e *issuerJWKSEntry, account string) {
+	now := c.now()
+	e.lastUsed = now
+	e.owners[account] = now
+}
+
+// sweepLocked drops idle uses and entries (at most once a minute unless
+// forced) and enforces the per-account and total caps, least recently used
+// first.
 func (c *issuerJWKSCache) sweepLocked(force bool) []*jwks.Client {
 	now := c.now()
 	if !force && now.Sub(c.lastSweep) < issuerJWKSSweepPeriod {
@@ -297,43 +322,50 @@ func (c *issuerJWKSCache) sweepLocked(force bool) []*jwks.Client {
 	}
 	c.lastSweep = now
 	var closed []*jwks.Client
+	drop := func(e *issuerJWKSEntry) {
+		delete(c.entries, e.key)
+		closed = append(closed, e.client)
+	}
 	perAccount := map[string][]*issuerJWKSEntry{}
-	for k, e := range c.entries {
-		if now.Sub(e.lastUsed) > issuerJWKSIdleTTL {
-			delete(c.entries, k)
-			closed = append(closed, e.client)
+	for _, e := range c.entries {
+		for acct, used := range e.owners {
+			if now.Sub(used) > issuerJWKSIdleTTL {
+				delete(e.owners, acct)
+			}
+		}
+		if len(e.owners) == 0 || now.Sub(e.lastUsed) > issuerJWKSIdleTTL {
+			drop(e)
 			continue
 		}
-		perAccount[e.account] = append(perAccount[e.account], e)
+		for acct := range e.owners {
+			perAccount[acct] = append(perAccount[acct], e)
+		}
 	}
-	for _, list := range perAccount {
+	for acct, list := range perAccount {
 		for len(list) > issuerJWKSPerAccount {
-			victim := oldest(list)
-			delete(c.entries, victim.key)
-			closed = append(closed, victim.client)
+			victim := list[0]
+			for _, e := range list[1:] {
+				if e.owners[acct].Before(victim.owners[acct]) {
+					victim = e
+				}
+			}
+			delete(victim.owners, acct)
+			if len(victim.owners) == 0 {
+				drop(victim)
+			}
 			list = removeEntry(list, victim)
 		}
 	}
 	for len(c.entries) > issuerJWKSTotal {
-		var all []*issuerJWKSEntry
+		var victim *issuerJWKSEntry
 		for _, e := range c.entries {
-			all = append(all, e)
+			if victim == nil || e.lastUsed.Before(victim.lastUsed) {
+				victim = e
+			}
 		}
-		victim := oldest(all)
-		delete(c.entries, victim.key)
-		closed = append(closed, victim.client)
+		drop(victim)
 	}
 	return closed
-}
-
-func oldest(list []*issuerJWKSEntry) *issuerJWKSEntry {
-	o := list[0]
-	for _, e := range list[1:] {
-		if e.lastUsed.Before(o.lastUsed) {
-			o = e
-		}
-	}
-	return o
 }
 
 func removeEntry(list []*issuerJWKSEntry, victim *issuerJWKSEntry) []*issuerJWKSEntry {
