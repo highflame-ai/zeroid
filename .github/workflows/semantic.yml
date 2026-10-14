@@ -110,7 +110,7 @@ jobs:
             if ! git diff --cached --quiet; then
               git config user.name "Highflame GitHub Bot"
               git config user.email "bot@github.com"
-              git commit -m "devops: point nested-module pins at ${VERSION}"
+              git commit -m "devops: point nested-module pins at ${VERSION} [skip ci]"
               git push origin HEAD:main
             fi
 
