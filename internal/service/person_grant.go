@@ -237,10 +237,10 @@ func applyPersonCeiling(requested, ceiling []string) ([]string, string) {
 			granted = append(granted, sc)
 		}
 	}
-	switch kept := len(granted) - (len(requested) - authority); {
-	case kept == authority:
+	switch kept := len(granted) - (len(requested) - authority); kept {
+	case authority:
 		return granted, ""
-	case kept == 0:
+	case 0:
 		return granted, "denied"
 	default:
 		return granted, "narrowed"
