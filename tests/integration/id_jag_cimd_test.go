@@ -6,8 +6,9 @@
 // using private_key_jwt."
 //
 // What lands here, and what does not. A CIMD client now RESOLVES on this grant,
-// is held to private_key_jwt against its document's key, must list jwt-bearer,
-// and is bound to the ID-JAG's client_id claim. It then stops at the tenant:
+// is held to private_key_jwt against its document's key, must not contradict an
+// ID-JAG profile claim (draft §8), and is bound to the ID-JAG's client_id claim.
+// It need not list jwt-bearer: the grant list is its own unauthenticated claim. It then stops at the tenant:
 // ADR 0042 D5 derives the project from the identity the credential maps to
 // (D6), and no (issuer, client_id) → identity binding exists yet. So the best
 // a CIMD client can reach today is a clean invalid_grant naming the missing
@@ -147,9 +148,11 @@ func TestIDJAG_CIMDClient(t *testing.T) {
 	key := generateKey(t)
 	otherKey := generateKey(t)
 	base, docClient := newCIMDDocumentsOrigin(t, map[string]string{
-		"/fit.json":        idJAGCIMDDoc(t, "private_key_jwt", key, []string{"authorization_code", jwtBearer}, nil),
-		"/public.json":     idJAGCIMDDoc(t, "none", nil, []string{"authorization_code", jwtBearer}, nil),
-		"/no-bearer.json":  idJAGCIMDDoc(t, "private_key_jwt", key, []string{"authorization_code"}, nil),
+		"/fit.json":    idJAGCIMDDoc(t, "private_key_jwt", key, []string{"authorization_code", jwtBearer}, nil),
+		"/public.json": idJAGCIMDDoc(t, "none", nil, []string{"authorization_code", jwtBearer}, nil),
+		// WSO2 MCP playground's shape: no jwt-bearer, no profile claim.
+		"/no-bearer.json": idJAGCIMDDoc(t, "private_key_jwt", key,
+			[]string{"authorization_code", "refresh_token", "client_credentials"}, nil),
 		"/profile-ok.json": idJAGCIMDDoc(t, "private_key_jwt", key, []string{"authorization_code", tokenExchange, jwtBearer}, []string{idJAGProfile}),
 		"/profile-bad.json": idJAGCIMDDoc(t, "private_key_jwt", key,
 			[]string{"authorization_code", jwtBearer}, []string{idJAGProfile}),
@@ -252,11 +255,13 @@ func TestIDJAG_CIMDClient(t *testing.T) {
 		require.Empty(t, resp.AccessToken)
 	})
 
-	t.Run("a document without the jwt-bearer grant is refused", func(t *testing.T) {
+	t.Run("a document that does not list jwt-bearer passes the client gates", func(t *testing.T) {
 		nb := base + "/no-bearer.json"
 		resp := redeem(t, nb, idjagFor(t, nb), key, nil)
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
-		require.Equal(t, "unauthorized_client", resp.Error, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "no binding maps this client metadata document client",
+			"it must reach the tenant gate, i.e. pass every client gate")
 		require.Empty(t, resp.AccessToken)
 	})
 

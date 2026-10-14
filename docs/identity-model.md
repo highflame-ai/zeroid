@@ -165,10 +165,15 @@ it). The document must:
 - declare `token_endpoint_auth_method: private_key_jwt` and publish its key
   (`jwks` or `jwks_uri`). The client authenticates with an RFC 7523 §2.2
   `client_assertion`, and `none` is refused.
-- list `urn:ietf:params:oauth:grant-type:jwt-bearer` in `grant_types`. If it
-  lists `urn:ietf:params:oauth:grant-profile:id-jag` in
-  `authorization_grant_profiles_supported`, it must also list
-  `urn:ietf:params:oauth:grant-type:token-exchange` (draft §8).
+- not contradict itself about the ID-JAG profile. If it lists
+  `urn:ietf:params:oauth:grant-profile:id-jag` in
+  `authorization_grant_profiles_supported`, it must also list both
+  `urn:ietf:params:oauth:grant-type:token-exchange` and
+  `urn:ietf:params:oauth:grant-type:jwt-bearer` in `grant_types` (draft §8).
+  A document that makes no profile claim need not list `jwt-bearer`: the grant
+  list is the publisher's own unauthenticated statement, so it decides nothing
+  here. What does is the key (above), the IdP-signed ID-JAG naming this exact
+  `client_id`, and the server-derived tenant (below).
 
 **Such a client cannot redeem yet.** Its tenant has to come from an identity its
 URL is bound to (ADR 0042 D6), and that binding does not exist yet. Until it
