@@ -474,6 +474,9 @@ var lookupIPs = func(ctx context.Context, host string) ([]net.IP, error) {
 // This is the dial-time half of the DNS-rebinding defence.
 func ssrfGuardedTransport(allowPrivate func() bool) *http.Transport {
 	base := http.DefaultTransport.(*http.Transport).Clone()
+	// No proxy: a proxy dials the target itself, so the checks below would
+	// see only the proxy's address (HTTPS_PROXY is honoured by the default).
+	base.Proxy = nil
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	base.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if allowPrivate() {
