@@ -60,3 +60,21 @@ func TestResolvePrincipal_NotApplicableStillContinues(t *testing.T) {
 		t.Fatalf("got (%v, %q, %v), want the second resolver's principal", p, matched, err)
 	}
 }
+
+// A resolver that returns a Principal AND a denial is denied: the error wins and
+// the Principal is discarded, so no code can be minted from it.
+func TestResolvePrincipal_DenialWithPrincipalIsDenied(t *testing.T) {
+	s := &Server{}
+	s.RegisterPrincipalResolver("consent", func(context.Context, *AuthorizeRequest) (*Principal, error) {
+		return &Principal{AccountID: "acct", ProjectID: "proj", UserID: "user"}, ErrPrincipalAccessDenied
+	})
+
+	p, matched, err := s.resolvePrincipal(context.Background(), &AuthorizeRequest{})
+	if p != nil {
+		t.Fatalf("principal returned alongside a denial: %+v", p)
+	}
+
+	if !errors.Is(err, ErrPrincipalAccessDenied) || matched != "consent" {
+		t.Fatalf("got (%q, %v), want the denying resolver's ErrPrincipalAccessDenied", matched, err)
+	}
+}
