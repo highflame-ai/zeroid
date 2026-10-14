@@ -162,8 +162,11 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if err := checkIssuerURL(e.JWKSURI, v.AllowHTTP); err != nil {
 		return issuerInvalid("invalid_jwks_uri", "jwks_uri %v", err)
 	}
-	if len(e.Audiences) == 0 {
-		return issuerInvalid("invalid_audiences", "audiences must name at least one value")
+	// A person row may leave audiences empty: on the ID-token exchange an
+	// enabled binding admits its client_id as the audience, and an ID-JAG's
+	// audience is ZeroID's issuer. A workload row has no such rule.
+	if e.Kind == IssuerKindWorkload && len(e.Audiences) == 0 {
+		return issuerInvalid("invalid_audiences", "a workload issuer needs at least one audience")
 	}
 	for _, alg := range e.Algorithms {
 		if !ExternalIssuerAlgorithmAllowed(alg) {

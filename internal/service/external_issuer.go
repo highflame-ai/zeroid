@@ -72,8 +72,6 @@ type JWKSCheck struct {
 // ExternalIssuerServiceConfig is the deployment's federation settings.
 type ExternalIssuerServiceConfig struct {
 	Store IssuerStore
-	// ZeroIDIssuer is this server's issuer, the Okta preset's audience.
-	ZeroIDIssuer string
 	// SharedIssuers may appear in several accounts, with claim constraints.
 	SharedIssuers []string
 	// AllowPrivateEndpoints admits private addresses and http URLs.
@@ -196,7 +194,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		CreatedBy:           actor,
 		UpdatedBy:           actor,
 	}
-	if err := domain.ApplyIssuerPreset(row, in.Preset, s.cfg.ZeroIDIssuer); err != nil {
+	if err := domain.ApplyIssuerPreset(row, in.Preset); err != nil {
 		return nil, nil, validationToAPIError(err)
 	}
 	row.Normalize()
@@ -440,7 +438,7 @@ func (s *ExternalIssuerService) Check(ctx context.Context, jwksURI string) (*JWK
 // DeriveJWKSURI returns the JWKS URI a preset derives for issuer, or "".
 func (s *ExternalIssuerService) DeriveJWKSURI(preset, issuer string) (string, error) {
 	row := &domain.ExternalIssuer{Issuer: issuer, Kind: domain.IssuerKindPerson}
-	if err := domain.ApplyIssuerPreset(row, preset, s.cfg.ZeroIDIssuer); err != nil {
+	if err := domain.ApplyIssuerPreset(row, preset); err != nil {
 		return "", validationToAPIError(err)
 	}
 	return row.JWKSURI, nil

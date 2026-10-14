@@ -56,12 +56,12 @@ func issuerTenant(ctx context.Context) (string, string, error) {
 
 // ExternalIssuerCreateBody is POST /external-issuers.
 type ExternalIssuerCreateBody struct {
-	Preset              string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Fill IdP-fixed fields from the issuer: entra (jwks_uri, RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (jwks_uri, RS256, user key sub, audiences default to ZeroID's issuer). Never overrides a field the request sets."`
+	Preset              string              `json:"preset,omitempty" enum:"entra,okta,generic" doc:"Fill IdP-fixed fields from the issuer: entra (jwks_uri, RS256, user key oid, email_verified from xms_edov, tid pinned) or okta (jwks_uri, RS256, user key sub). Never overrides a field the request sets. Neither needs audiences: bind each agent's app id instead."`
 	Kind                string              `json:"kind" enum:"person,workload" doc:"person: an IdP whose ID-JAGs and ID tokens name people. workload: a client-assertion issuer."`
 	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https."`
 	DisplayName         string              `json:"display_name,omitempty"`
 	JWKSURI             string              `json:"jwks_uri,omitempty" doc:"https. Required unless a preset derives it."`
-	Audiences           []string            `json:"audiences,omitempty" doc:"A token's aud must name one. For P1c, the agents' app ids at the IdP; for P1b, ZeroID's issuer."`
+	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
 	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, PS256. Default all three."`
 	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, role, privilege_scope, scope, trust_level."`
 	PropagateClaims     []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`

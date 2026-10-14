@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS external_issuers (
     kind                    VARCHAR(16)   NOT NULL CHECK (kind IN ('person', 'workload')),
     display_name            VARCHAR(255)  NOT NULL DEFAULT '',
     jwks_uri                VARCHAR(2048) NOT NULL,
-    audiences               TEXT[]        NOT NULL CHECK (cardinality(audiences) > 0),
+    -- A person row may have none: bindings admit the agents' client ids.
+    audiences               TEXT[]        NOT NULL CHECK (kind = 'person' OR cardinality(audiences) > 0),
     algorithms              TEXT[]        NOT NULL CHECK (cardinality(algorithms) > 0),
     claim_mapping           JSONB         NOT NULL DEFAULT '{}'::jsonb,
     propagate_claims        TEXT[]        NOT NULL DEFAULT '{}',

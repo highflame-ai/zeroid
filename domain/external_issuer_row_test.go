@@ -59,7 +59,11 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.ClaimConstraints = map[string][]string{"tid": {"t"}}
 		}, v: IssuerValidation{Shared: true}},
 		{name: "http jwks_uri", mutate: func(e *ExternalIssuer) { e.JWKSURI = "http://acme.okta.com/keys" }, want: "invalid_jwks_uri"},
-		{name: "no audiences", mutate: func(e *ExternalIssuer) { e.Audiences = nil }, want: "invalid_audiences"},
+		{name: "person row without audiences (bindings admit client ids)", mutate: func(e *ExternalIssuer) { e.Audiences = nil }},
+		{name: "workload row without audiences", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.Audiences = nil
+		}, want: "invalid_audiences"},
 		{name: "HS256", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"HS256"} }, want: "invalid_algorithms"},
 		{name: "none alg", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"none"} }, want: "invalid_algorithms"},
 		{name: "propagate groups", mutate: func(e *ExternalIssuer) { e.PropagateClaims = []string{"groups"} }, want: "invalid_propagate_claims"},
@@ -135,7 +139,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 	const tid = "11111111-2222-3333-4444-555555555555"
 	t.Run("entra fills keys, oid and the tid pin", func(t *testing.T) {
 		e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0", Audiences: []string{"app"}}
-		if err := ApplyIssuerPreset(e, IssuerPresetEntra, "https://zeroid"); err != nil {
+		if err := ApplyIssuerPreset(e, IssuerPresetEntra); err != nil {
 			t.Fatal(err)
 		}
 		if e.JWKSURI != "https://login.microsoftonline.com/"+tid+"/discovery/v2.0/keys" {
@@ -154,7 +158,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 	})
 	t.Run("entra keeps a caller's mapping", func(t *testing.T) {
 		e := &ExternalIssuer{Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0", ClaimMapping: map[string]string{"user_id": "sub"}}
-		if err := ApplyIssuerPreset(e, IssuerPresetEntra, ""); err != nil {
+		if err := ApplyIssuerPreset(e, IssuerPresetEntra); err != nil {
 			t.Fatal(err)
 		}
 		if e.ClaimMapping["user_id"] != "sub" {
@@ -169,7 +173,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 	} {
 		t.Run("entra refuses "+iss, func(t *testing.T) {
 			e := &ExternalIssuer{Issuer: iss}
-			if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetEntra, "")); got != "invalid_issuer" {
+			if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetEntra)); got != "invalid_issuer" {
 				t.Fatalf("code = %q", got)
 			}
 		})
@@ -177,20 +181,20 @@ func TestApplyIssuerPreset(t *testing.T) {
 	t.Run("entra refuses a conflicting tid pin", func(t *testing.T) {
 		e := &ExternalIssuer{Issuer: "https://login.microsoftonline.com/" + tid + "/v2.0",
 			ClaimConstraints: map[string][]string{"tid": {"other"}}}
-		if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetEntra, "")); got != "invalid_claim_constraints" {
+		if got := issuerCode(ApplyIssuerPreset(e, IssuerPresetEntra)); got != "invalid_claim_constraints" {
 			t.Fatalf("code = %q", got)
 		}
 	})
 	t.Run("okta org server", func(t *testing.T) {
 		e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: "https://acme.okta.com/"}
-		if err := ApplyIssuerPreset(e, IssuerPresetOkta, "https://zeroid"); err != nil {
+		if err := ApplyIssuerPreset(e, IssuerPresetOkta); err != nil {
 			t.Fatal(err)
 		}
 		if e.Issuer != "https://acme.okta.com" || e.JWKSURI != "https://acme.okta.com/oauth2/v1/keys" {
 			t.Fatalf("issuer %s jwks %s", e.Issuer, e.JWKSURI)
 		}
-		if len(e.Audiences) != 1 || e.Audiences[0] != "https://zeroid" {
-			t.Fatalf("audiences = %v, want ZeroID's issuer (the ID-JAG aud)", e.Audiences)
+		if len(e.Audiences) != 0 {
+			t.Fatalf("audiences = %v; an ID-JAG's audience is ZeroID's issuer, never a row value", e.Audiences)
 		}
 		if e.ClaimMapping["user_id"] != "sub" {
 			t.Fatal("Okta's user key is sub")
@@ -198,7 +202,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 	})
 	t.Run("okta custom server", func(t *testing.T) {
 		e := &ExternalIssuer{Issuer: "https://acme.okta.com/oauth2/aus1"}
-		if err := ApplyIssuerPreset(e, IssuerPresetOkta, ""); err != nil {
+		if err := ApplyIssuerPreset(e, IssuerPresetOkta); err != nil {
 			t.Fatal(err)
 		}
 		if e.JWKSURI != "https://acme.okta.com/oauth2/aus1/v1/keys" {
@@ -206,7 +210,7 @@ func TestApplyIssuerPreset(t *testing.T) {
 		}
 	})
 	t.Run("unknown preset", func(t *testing.T) {
-		if got := issuerCode(ApplyIssuerPreset(&ExternalIssuer{}, "auth0", "")); got != "invalid_preset" {
+		if got := issuerCode(ApplyIssuerPreset(&ExternalIssuer{}, "auth0")); got != "invalid_preset" {
 			t.Fatalf("code = %q", got)
 		}
 	})

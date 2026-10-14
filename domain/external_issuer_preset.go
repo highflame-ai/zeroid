@@ -17,16 +17,15 @@ const (
 
 var entraIssuerPath = regexp.MustCompile(`^/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/v2\.0$`)
 
-// ApplyIssuerPreset fills e from preset. zeroidIssuer is this server's
-// issuer, the audience of an Okta ID-JAG.
-func ApplyIssuerPreset(e *ExternalIssuer, preset, zeroidIssuer string) error {
+// ApplyIssuerPreset fills e from preset.
+func ApplyIssuerPreset(e *ExternalIssuer, preset string) error {
 	switch preset {
 	case "", "generic":
 		return nil
 	case IssuerPresetEntra:
 		return applyEntraPreset(e)
 	case IssuerPresetOkta:
-		return applyOktaPreset(e, zeroidIssuer)
+		return applyOktaPreset(e)
 	}
 	return issuerInvalid("invalid_preset", "preset must be entra, okta or generic")
 }
@@ -68,7 +67,7 @@ func applyEntraPreset(e *ExternalIssuer) error {
 	return nil
 }
 
-func applyOktaPreset(e *ExternalIssuer, zeroidIssuer string) error {
+func applyOktaPreset(e *ExternalIssuer) error {
 	iss := strings.TrimRight(strings.TrimSpace(e.Issuer), "/")
 	u, err := url.Parse(iss)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
@@ -87,9 +86,6 @@ func applyOktaPreset(e *ExternalIssuer, zeroidIssuer string) error {
 	}
 	if len(e.Algorithms) == 0 {
 		e.Algorithms = []string{"RS256"}
-	}
-	if len(e.Audiences) == 0 && zeroidIssuer != "" && e.Kind == IssuerKindPerson {
-		e.Audiences = []string{zeroidIssuer}
 	}
 	fillMapping(e, map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified", "name": "name"})
 	return nil

@@ -569,7 +569,6 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	apiHandler.SetExternalIssuerService(service.NewExternalIssuerService(externalIssuerRepo, identityRepo.GetByIDInAccounts, oauthClientSvc,
 		service.ExternalIssuerServiceConfig{
 			Store:                 issuerStore,
-			ZeroIDIssuer:          cfg.Token.Issuer,
 			SharedIssuers:         cfg.Federation.SharedIssuers,
 			AllowPrivateEndpoints: cfg.Federation.AllowPrivateEndpoints,
 			StaticIssuers:         cfg.ExternalIssuers,

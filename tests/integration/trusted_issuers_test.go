@@ -225,10 +225,10 @@ func (f *dbFederation) entraRow(t *testing.T, tn tiTenant, tenantID string, audi
 func (f *dbFederation) oktaRow(t *testing.T, tn tiTenant) map[string]any {
 	t.Helper()
 	status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
-		"kind":          "person",
-		"issuer":        f.idp.OktaIssuer(),
-		"jwks_uri":      f.idp.OktaJWKSURI(),
-		"audiences":     []string{federationIssuer},
+		"kind":     "person",
+		"issuer":   f.idp.OktaIssuer(),
+		"jwks_uri": f.idp.OktaJWKSURI(),
+		// No audiences: an ID-JAG's audience is ZeroID's issuer.
 		"claim_mapping": map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified"},
 	}, tn.headers)
 	require.Equal(t, http.StatusCreated, status, "create okta row: %v", body)
@@ -362,10 +362,10 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		status int
 		code   string
 	}{
-		"not a URL":    {map[string]any{"kind": "person", "issuer": "ftp://x", "jwks_uri": "https://x/k", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
-		"HS256":        {map[string]any{"kind": "person", "issuer": "https://hs.example", "jwks_uri": "https://hs.example/k", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
-		"no audience":  {map[string]any{"kind": "person", "issuer": "https://na.example", "jwks_uri": "https://na.example/k", "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_audiences"},
-		"entra common": {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
+		"not a URL":                 {map[string]any{"kind": "person", "issuer": "ftp://x", "jwks_uri": "https://x/k", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
+		"HS256":                     {map[string]any{"kind": "person", "issuer": "https://hs.example", "jwks_uri": "https://hs.example/k", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
+		"workload with no audience": {map[string]any{"kind": "workload", "issuer": "https://na.example", "jwks_uri": "https://na.example/k"}, 400, "invalid_audiences"},
+		"entra common":              {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
 		"shared issuer without constraints": {map[string]any{"kind": "person", "issuer": "https://accounts.google.com",
 			"jwks_uri": "https://www.googleapis.com/oauth2/v3/certs", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
 		"unreachable keys": {map[string]any{"kind": "person", "issuer": "https://dead.example", "jwks_uri": "https://127.0.0.1:1/keys",
@@ -521,7 +521,9 @@ type p1cFixture struct {
 func newP1C(t *testing.T) *p1cFixture {
 	t.Helper()
 	p := &p1cFixture{f: newDBFederation(t), tn: newTITenant(t), tid: uid("p1c-tid"), appID: uid("app"), aliceOID: uid("oid-alice")}
-	p.rowID = p.f.entraRow(t, p.tn, p.tid, []string{p.appID})["id"].(string)
+	// No row audiences: the agent's binding is the audience rule (D3a, D6),
+	// so the app id is written once, as the binding's subject key.
+	p.rowID = p.f.entraRow(t, p.tn, p.tid, nil)["id"].(string)
 	p.agent = p.tn.agent(t)
 	status, body := p.f.bind(t, p.tn, p.rowID, p.appID, p.agent.id, true)
 	require.Equal(t, http.StatusCreated, status, "%v", body)
@@ -643,6 +645,30 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 	t.Run("the derived tenant, sent explicitly, is accepted", func(t *testing.T) {
 		resp := p.exchange(t, good(), map[string]any{"account_id": p.tn.account, "project_id": p.tn.project})
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+	t.Run("a presenting client with no binding is not an audience of the row", func(t *testing.T) {
+		app := uid("app-unbound")
+		rp := rpClient(t, app)
+		resp := postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": app})),
+			clientCreds(t, app, rp.Key)))
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "aud is not one this issuer is trusted for")
+	})
+	t.Run("a disabled binding no longer admits its client as an audience", func(t *testing.T) {
+		other := p.tn.agent(t)
+		app := uid("app-disabled")
+		status, body := p.f.bind(t, p.tn, p.rowID, app, other.id, true)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		exchange := func() tokenResponse {
+			return postFederation(t, p.f.http.URL, merged(idTokenExchangeBody(p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"aud": app})),
+				clientCreds(t, app, other.key)))
+		}
+		require.Equal(t, http.StatusOK, exchange().StatusCode, "bound and enabled")
+		status, _ = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID+"/bindings/"+body["id"].(string), map[string]any{"enabled": false}, p.tn.headers)
+		require.Equal(t, http.StatusOK, status)
+		resp := exchange()
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "aud is not one this issuer is trusted for")
 	})
 	t.Run("a presenting client with no binding", func(t *testing.T) {
 		loneApp := uid("app-lone")

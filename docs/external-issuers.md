@@ -37,7 +37,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `issuer` | The `iss` tokens carry, matched exactly. https. |
 | `kind` | `person`: an IdP whose ID-JAGs and ID tokens name people. `workload`: a client-assertion issuer (P2, not yet accepted by any grant). |
 | `jwks_uri` | https. Fetched through the SSRF-guarded client. |
-| `audiences` | Non-empty. A token's `aud` must name one. For P1c these are the agents' app ids at the IdP; for P1b, ZeroID's issuer. |
+| `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
 | `algorithms` | A subset of RS256, ES256, PS256. |
 | `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `role`, `privilege_scope`, `scope`, `trust_level`. |
 | `propagate_claims` | A subset of `auth_time`, `acr`, `amr`. |
@@ -67,7 +67,7 @@ A person row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant 
 | Preset | Issuer | Fills |
 |---|---|---|
 | `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `jwks_uri` `.../<tid>/discovery/v2.0/keys`, `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, and the constraint `tid: [<tid>]` |
-| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `jwks_uri` (`/oauth2/v1/keys` or `/v1/keys`), `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name`, and, on a person row, `audiences: [<ZeroID issuer>]` |
+| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `jwks_uri` (`/oauth2/v1/keys` or `/v1/keys`), `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name` |
 | `generic` or absent | any | nothing |
 
 The user key is `oid` for Entra because Entra's `sub` is pairwise per application, so one person would carry a different `sub` in every agent's app.
@@ -96,7 +96,7 @@ A binding for an identity that is not `active` is created disabled, and enabling
 
 Both grants resolve the issuer first: the token's `iss` must have an **enabled `person`** row whose claim constraints the token satisfies.
 An unknown issuer is `invalid_request` on the ID-token exchange and `invalid_grant` on ID-JAG, as before; a workload, disabled or unmatched row is `invalid_grant`.
-The token's `aud` must name one of the row's audiences.
+The token's `aud` must name an accepted audience: on the ID-token exchange the presenting client's `client_id` when an enabled binding on the row has it as subject key, on ID-JAG ZeroID's issuer, and on both any value in the row's `audiences`.
 
 ### P1c: the ID-token exchange
 
@@ -116,6 +116,7 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
 
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`, on static issuers too.
    Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
+   The `aud` is accepted because an enabled binding on the row has the `client_id` as subject key (the binding is the audience rule), or because it is in the row's `audiences`.
 2. The subject token is positively an ID token: it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker (`scp`, `scope`, or a `typ` of `at+jwt` or `application/at+jwt`).
 3. The issuer row is `person`, and the subject is not a workload: no Entra `idtyp=app`, no `system:serviceaccount:` subject, no SPIFFE ID.
 4. An enabled binding maps the client's `client_id` under the row to an identity, which is the agent.
@@ -129,7 +130,7 @@ The token's `sub` is the person's user id with `user_id_iss` ZeroID's issuer, th
 ### P1b: ID-JAG
 
 The request is unchanged ([identity-model.md](identity-model.md#enterprise-managed-authorization-id-jag)).
-Its `aud` must name ZeroID's issuer (draft §4.3) as well as one of the row's audiences.
+Its `aud` must name ZeroID's issuer (draft §4.3); the row's `audiences` play no part.
 With issuer rows the agent is the ID-JAG's `act.sub` mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
 A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
 The subject must not be a workload, and checks 4 to 6 above apply.
@@ -188,7 +189,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
 | 400 | `invalid_jwks_uri` | Not an absolute https URL |
-| 400 | `invalid_kind`, `invalid_audiences`, `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 400 | `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
@@ -227,7 +228,7 @@ On a `config` server the items are the static entries that admit the account, wi
   "kind": "person",
   "issuer": "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0",
   "display_name": "Contoso Entra",
-  "audiences": ["<agent app id>"],
+  "audiences": [],
   "jwks_uri": "optional with a preset",
   "algorithms": ["RS256"],
   "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
@@ -241,7 +242,8 @@ On a `config` server the items are the static entries that admit the account, wi
 }
 ```
 
-Only `kind` and `issuer` are always required; `audiences`, `jwks_uri` and `claim_mapping.user_id` are required unless a preset fills them.
+Only `kind` and `issuer` are always required; `jwks_uri` and `claim_mapping.user_id` (person) are required unless a preset fills them, and `audiences` is required on a workload row.
+A person row needs no audiences: add each agent with a binding (below), whose subject key is its app id.
 The JWKS is fetched before the row is written, and an unreachable or empty one is refused (422).
 The response is the issuer:
 
@@ -253,7 +255,7 @@ The response is the issuer:
   "kind": "person",
   "display_name": "Contoso Entra",
   "jwks_uri": "https://login.microsoftonline.com/1111.../discovery/v2.0/keys",
-  "audiences": ["<agent app id>"],
+  "audiences": [],
   "algorithms": ["RS256"],
   "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
   "propagate_claims": [],

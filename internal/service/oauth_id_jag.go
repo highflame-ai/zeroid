@@ -200,7 +200,13 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// alg allow-list, MaxTokenAge, sub/exp/iat presence. Shared verbatim with
 	// the id_token-exchange path (validateExternalAssertion); "assertion" names
 	// the wire field for ID-JAG callers.
-	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier)
+	// On an issuer row ZeroID's own issuer is the ID-JAG audience (checked
+	// as required below); the row's audiences add nothing here.
+	var issuerAudience []string
+	if entry.Row != nil {
+		issuerAudience = []string{s.issuer}
+	}
+	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier, issuerAudience...)
 	if err != nil {
 		return nil, err
 	}

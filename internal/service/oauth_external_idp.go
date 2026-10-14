@@ -174,7 +174,21 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// verbatim with the ID-JAG jwt-bearer path (validateExternalAssertion).
 	// "subject_token" is the field name in the error strings because that is
 	// what an id_token-exchange caller presents.
-	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub)
+	// On an issuer row the binding is the audience rule (ADR 0042 D3a, D6): an
+	// enabled binding for the presenting client makes its client_id, which
+	// idTokenIssuedTo requires in aud, an accepted audience. The row's own
+	// audiences are an optional extra allowlist.
+	var bindingAudiences []string
+	if entry.Row != nil && s.issuerBindings != nil {
+		b, err := s.issuerBindings.EnabledBinding(ctx, entry.Row.ID, authedClient.ClientID)
+		if err != nil {
+			return nil, oauthServerError("failed to read the agent's credential binding", err)
+		}
+		if b != nil {
+			bindingAudiences = []string{authedClient.ClientID}
+		}
+	}
+	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub, bindingAudiences...)
 	if err != nil {
 		return nil, err
 	}
@@ -449,7 +463,8 @@ const (
 	allowSubjectIdentifier
 )
 
-func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement) (jwt.Token, error) {
+// extraAudiences are accepted beside the issuer's configured audiences.
+func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement, extraAudiences ...string) (jwt.Token, error) {
 	cfg := entry.Config
 
 	// Algorithm allowlist gate. Read the JWS header before signature
@@ -513,7 +528,8 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 	// aud must name one of the issuer's audiences. Checked here rather than
 	// with jwt.WithAudience, which accepts only one value.
 	aud, _ := verified.Audience()
-	if !slices.ContainsFunc(cfg.AudienceList(), func(a string) bool { return slices.Contains(aud, a) }) {
+	accepted := append(cfg.AudienceList(), extraAudiences...)
+	if !slices.ContainsFunc(accepted, func(a string) bool { return slices.Contains(aud, a) }) {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s verification failed: aud is not one this issuer is trusted for", fieldName))
 	}
 	// A shared issuer's row was chosen on unverified claims; its constraints
