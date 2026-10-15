@@ -918,7 +918,9 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 	})
 }
 
-// OnClaimsIssue registers a claims enricher called during JWT issuance.
+// OnClaimsIssue registers a claims enricher.
+//
+// Deprecated: enrichers are stored but never invoked. See ClaimsEnricher.
 func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1365,6 +1367,23 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 	// Wrap the public-typed validator into the service-internal alias so the
 	// service layer stays decoupled from the top-level package's type names.
 	s.backchannelSvc.RegisterAuthorizationDetailValidator(typ, service.AuthorizationDetailValidator(fn))
+}
+
+// SetPersonGrantResolver installs the deployer's person-grant hook (ADR 0041
+// D15 in Highflame's deployment). Every token minted for a person is then
+// bounded by the ceiling fn returns: in enforce mode the issued scope is the
+// request (or its default) ∩ the ceiling and a request that leaves nothing is
+// refused; in shadow mode issuance is unchanged and each narrowing, refusal or
+// resolver failure is logged as person_scope_ceiling_violation and counted in
+// zeroid_person_scope_ceiling_total. In both modes the returned roles are
+// stamped as the `roles` claim on the person's own token. PersonGrantModeOff
+// removes the hook (fn is ignored). A nil fn with shadow or enforce, an empty
+// mode or an unknown one is rejected and the hook left unchanged, so a wiring
+// mistake fails loudly instead of turning the ceiling off.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {
+	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
 }
 
 // SetApproverAuthorizer installs the hook consulted on CIBA approve/deny for
