@@ -1167,6 +1167,11 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 		// passes cimdFallback=true; which callers may do that is pinned by
 		// TestCIMDDirectAuthOptInIsBounded.
 		"authenticateRegisteredClient": true,
+		// RFC 7009 revocation by a public CIMD client (zeroid#419). Derives no
+		// authority from the client beyond its client_id and public-ness, and
+		// grants nothing: the only action is revoking a token already issued
+		// to this client (RevokeForClient, revocationScope.ownAccessTokensOnly).
+		"authorizeCIMDRevoker": true,
 	}
 
 	files, err := filepath.Glob("*.go")

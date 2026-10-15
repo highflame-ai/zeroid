@@ -875,22 +875,37 @@ func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*Intros
 
 func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevokeOutput, error) {
 	// Accept-and-verify client auth (RFC 7009 §2.1) via client_secret_basic
-	// (Authorization header) or client_secret_post (body). A presented-but-wrong
-	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
-	// "always 200" contract holds (including for unknown/already-revoked tokens
-	// and anonymous internal-path callers).
+	// (Authorization header), client_secret_post (body), private_key_jwt, or a
+	// public client's client_id alone. A presented-but-refused credential is
+	// rejected with invalid_client; a server-side failure to revoke is a
+	// server_error; otherwise the RFC 7009 §2.2 "always 200" contract holds
+	// (including for unknown/already-revoked tokens, tokens issued to another
+	// client, and anonymous internal-path callers).
 	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(
 		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
 		input.Body.ClientAssertion, input.Body.ClientAssertionType)
+	//
+	// Authorization and revocation are one service call because they are not
+	// separable: a public CIMD client identifying itself by client_id alone is
+	// accepted here (unlike introspection) only on the condition that the
+	// token was issued to that client, so the revoke itself carries the
+	// constraint. See OAuthService.RevokeForClient.
 	if err == nil {
-		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
+		err = a.oauthSvc.RevokeForClient(ctx, service.RevocationRequest{
+			Token:               input.Body.Token,
+			TokenTypeHint:       input.Body.TokenTypeHint,
+			ClientID:            clientID,
+			ClientSecret:        clientSecret,
+			ClientAssertion:     input.Body.ClientAssertion,
+			ClientAssertionType: input.Body.ClientAssertionType,
+		})
 	}
 	if err != nil {
 		code, desc, status := extractOAuthError(err)
 		out := &OAuthRevokeOutput{Status: status}
-		// Use the error's own code, not a hardcoded invalid_client — an
-		// operational failure maps to a 500/server_error and must not be
-		// labelled as a client authentication failure.
+		// Use the error's own code, not a hardcoded invalid_client — a
+		// server-side revocation failure maps to 500/server_error and must not
+		// be labelled as a client authentication failure.
 		out.Body.Error = code
 		out.Body.ErrorDescription = desc
 		if viaBasic && status == http.StatusUnauthorized {
@@ -899,26 +914,6 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 		return out, nil
 	}
 
-	// clientID is the client the request identified, verified above (or "" for
-	// a caller that identified none); it restricts refresh-token revocation to
-	// the client's own tokens. A private_key_jwt client may omit client_id and
-	// be identified by its assertion's iss (RFC 7523 §3), which
-	// VerifyPresentedClientAuth has just authenticated; it is confined the
-	// same as one that sent client_id.
-	if clientID == "" && input.Body.ClientAssertion != "" {
-		clientID, _ = service.ClientIDFromAssertion(input.Body.ClientAssertion)
-	}
-	if err := a.oauthSvc.RevokeToken(ctx, input.Body.Token, input.Body.TokenTypeHint, clientID); err != nil {
-		// A lookup or revocation failed server-side. Answering 200 here would
-		// tell the client its token is dead when it may not be (RFC 7009 §2.1:
-		// the client must not use the token after a 200). Report the failure
-		// instead; the cause stays in the server log.
-		log.Error().Err(err).Msg("oauth2 revocation failed")
-		out := &OAuthRevokeOutput{Status: http.StatusInternalServerError}
-		out.Body.Error = oautherror.ServerError
-		out.Body.ErrorDescription = "the token could not be revoked; retry the request"
-		return out, nil
-	}
 	out := &OAuthRevokeOutput{Status: http.StatusOK}
 	out.Body.Revoked = true
 	return out, nil

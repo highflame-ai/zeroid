@@ -286,7 +286,10 @@ func (a *API) buildASMetadata() map[string]any {
 		// client_secret_post via body fields). "none" is included because
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
-		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
+		// Revocation additionally accepts CIMD clients (public by client_id,
+		// private_key_jwt by assertion), limited to tokens issued to that
+		// client (OAuthService.RevokeForClient); introspection does not — see
+		// VerifyPresentedClientAuth.
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		// RFC 8414 §2 makes these two REQUIRED once the corresponding
