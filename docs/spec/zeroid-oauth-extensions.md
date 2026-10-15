@@ -126,7 +126,7 @@ This document uses the following terms:
   by following `parent_jti` edges. Identified by `mission_id` (Section 5.4).
 - **Deployer** — the operator embedding the ZeroID library/service and supplying
   its pluggable hooks (`PrincipalResolver`, `BackchannelNotifier`,
-  `TrustedServiceValidator`, `RevocationNotifier`, `ClaimsEnricher`, grant
+  `TrustedServiceValidator`, `RevocationNotifier`, `PersonGrantResolver`, grant
   handlers).
 - **Trusted service** — an internal caller that has passed the deployer's
   `TrustedServiceValidator` gate (Section 5.5).
@@ -282,6 +282,7 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
 |---|---|---|---|
 | `scopes` | array&lt;string&gt; | when non-empty | Granted scopes. (ZeroID emits the JSON array `scopes`, in addition to the standard space-delimited `scope` on the token *response*.) |
 | `scope` | string | when non-empty, `rfc8693` profile | The RFC 9068 §2.2.3 space-delimited form of `scopes`, emitted beside it until consumers move. |
+| `roles` | array&lt;string&gt; | person root, when the deployer's person-grant resolver returns roles | RFC 9068 §2.2.3.1 roles of the person `sub` names. Only on the token minted for the person, never on a token delegated from it. See Section 5.1c. |
 | `delegation_depth` | number | when &gt; 0 | Number of `token_exchange` hops from the root; see Section 5.2. Omitted (≡ 0) for a directly-issued credential. |
 | `application_id` | string | when set | OAuth client / application the token was issued for (`api_key`, `authorization_code`). |
 | `user_email` | string | when set | End-user email (human/external-principal/CIBA paths). |
@@ -378,11 +379,11 @@ The CIBA token's `sub` is the **approving user**, its `grant_type` claim is
 
 ### 4.8 Deployment-specific claims
 
-Deployers MAY inject additional claims through two mechanisms:
-
-- the `ClaimsEnricher` hook (server-side, applies to issuance), and
-- the `additional_claims` request field on the external-principal exchange
-  (caller-supplied, blocklist-gated per Section 8).
+Deployers MAY inject additional claims through the `additional_claims`
+request field on the external-principal exchange (caller-supplied,
+blocklist-gated per Section 8). The `ClaimsEnricher` hook is deprecated: it
+was never invoked at issuance. A person's roles come from the person-grant
+resolver (Section 5.1c).
 
 Coding-agent task fields surfaced by the SDKs (`session_id`, `task_id`,
 `task_type`, `allowed_tools`, `workspace`, `environment`) are **not**
@@ -448,8 +449,23 @@ policy, never less.
 Somewhere in a chain, something other than the requester must bound the scopes.
 ZeroID counts, per identity, tokens issued for a named scope with no configured
 ceiling — a workload whose every ceiling was empty, or a request-bounded user
-root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` — as
+root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` and
+whose person-grant ceiling (Section 5.1c) was not enforced — as
 `zeroid_workload_unbounded_scope_total`. These are not yet refused.
+
+### 5.1c A person's ceiling (person-grant resolver)
+
+A deployer MAY install a person-grant resolver. Every token minted for a
+person (`authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG,
+ID-token exchange, the trusted external-principal exchange) is then issued
+with scope = request (or its default) ∩ the ceiling the resolver returns for
+that person, and a request that leaves nothing is refused with
+`invalid_scope` (`invalid_grant` on `authorization_code` and refresh at the
+token endpoint; `invalid_scope` at the authorization endpoint). An empty ceiling grants
+nothing; `openid` is never removed. Token exchange and a CIBA step-up carry
+their chain's principal and are not consulted. A shadow mode counts what
+enforcement would change without changing it. The resolver's roles are
+emitted as `roles` (Section 4.3). Details: `docs/scope-ceilings.md`.
 
 ### 5.2 Delegation depth tracking and capping
 
@@ -508,6 +524,24 @@ control. Rotation of an already-enrolled key additionally **REQUIRES** a
 (base64url SHA-256 thumbprint of the new key's SPKI DER) binding old key to
 new — so possession of a stolen access token alone cannot swap an enrolled
 key.
+
+An administrator can also supply the key as `public_key_pem` on
+`POST /agents/register`, `POST /identities`, `PATCH /agents/registry/{id}`
+(admin recovery, no proof-of-possession) and `PATCH /identities/{id}`. On every
+path the value **MUST** be a PEM `PUBLIC KEY` block holding an SPKI EC P-256
+key; anything else (an RSA or P-384 key, a private-key block, non-PEM text) is
+rejected with `400` and a detail of the form `invalid public_key_pem: must be a
+PEM-encoded P-256 (ES256) public key: <reason>`. On the two `PATCH` paths an
+empty or omitted value leaves the enrolled key unchanged; no admin path clears
+one.
+
+The agent registry (`GET /agents/registry`, `GET /agents/registry/{id}`, and
+every agent write response, including `POST /agents/self/public-key`) never
+returns the PEM. It reports enrollment as `has_public_key` (boolean, always
+present) and `public_key_thumbprint`: the RFC 7638 JWK SHA-256 thumbprint of the
+enrolled key, base64url without padding — the same form as a DPoP `cnf.jkt`,
+and **not** the SPKI-DER hash used for `nkt` above — omitted when no key is
+enrolled. `GET /identities/{id}` still returns `public_key_pem` itself.
 
 ### 5.4 `mission_id` — delegation-tree identifier
 
@@ -751,7 +785,7 @@ cnf
 # RFC 8707 resource binding, RFC 9068 client attribution
 resource client_id
 # Authorization (gated)
-role privilege_scope
+role privilege_scope roles
 # Step-up approvals (RFC 9396)
 authorization_details approval_id
 # Agent provenance
@@ -768,6 +802,10 @@ Special cases:
   **dedicated request fields** (`role`, `privilege_scope`) — i.e. only *after*
   the `TrustedServiceValidator` gate. Empty values are omitted, preserving
   byte-identical tokens for callers that don't use them.
+
+- `roles` is never settable through any request field: ZeroID writes it only
+  from the deployer's person-grant resolver, on a person's own token
+  (Section 5.1c).
 
 - `authorization_details` is written **only** on the CIBA path, from the
   approved backchannel request, with ZeroID stamping `approval_id` into each
@@ -1382,6 +1420,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |
+| `roles` | array | §4.3, §5.1c (Std: RFC 9068) |
 | `backchannel_client_id` | string | §4.7 |
 | `binding_message` | string | §4.7 |
 | `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |
