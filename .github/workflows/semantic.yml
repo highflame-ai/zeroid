@@ -1,25 +1,12 @@
 name: Semantic Version - Zeroid
 
 on:
-  push:
-    branches:
-      - "main"
-    paths-ignore:
-      - "*CHANGELOG.md"
-      - "README.md"
-      - "docker-compose.yml"
-      - ".gitignore"
-      - ".dockerignore"
-      - ".github/**"
-
-env:
-  REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+  workflow_dispatch:
 
 jobs:
   highflame-semantic-release:
     permissions:
       contents: 'write'
-    if: "${{ !startsWith(github.event.head_commit.message, 'devops: point nested-module pins at ') }}"
     runs-on: ubuntu-24.04
     steps:
       - name: Create APP token
@@ -68,54 +55,50 @@ jobs:
 
           if [[ "${RAW}" == "${CURRENT}" ]]; then
             echo "::error::No feat: or fix: commits since ${CURRENT}. Nothing to release."
-          else
-            VERSION="${EXPECTED}"
-
-            if [[ ! "${VERSION}" =~ ${REGEX_PATTERN} ]]; then
-              echo "::error::Invalid version format: ${VERSION}"
-              exit 1
-            fi
-            echo "Valid version format: ${VERSION}"
-
-            VER_MAJOR="${VERSION#v}"
-            VER_MAJOR="${VER_MAJOR%%.*}"
-            EXP_MAJOR="${EXPECTED#v}"
-            EXP_MAJOR="${EXP_MAJOR%%.*}"
-
-            if [[ "${VER_MAJOR}" -ge 2 && "${EXP_MAJOR}" -lt 2 ]]; then
-              echo "::error::${VERSION} is not a valid Go module version for this path. Go only allows v0 or v1 until the module path ends in /v${VER_MAJOR}."
-              echo "::error::Leave the version empty. This release is ${EXPECTED}."
-              exit 1
-            fi
-
-            if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-              echo "::error::Tag ${VERSION} already exists. Refusing to move it."
-              exit 1
-            fi
-
-            if gh release view "${VERSION}" >/dev/null 2>&1; then
-              echo "::error::Release ${VERSION} already exists. Refusing to move it."
-              exit 1
-            fi
-
-            echo "Releasing ${VERSION}"
-            make release-prep VERSION="${VERSION}"
-            git add -- go.mod pkg/authjwt/go.mod go.sum pkg/authjwt/go.sum go.work.sum
-
-            if ! git diff --quiet; then
-              echo "::error::release-prep changed files other than the module pins:"
-              git status --porcelain
-              exit 1
-            fi
-
-            if ! git diff --cached --quiet; then
-              git config user.name "Highflame GitHub Bot"
-              git config user.email "bot@github.com"
-              git commit -m "devops: point nested-module pins at ${VERSION}"
-              git push origin HEAD:main
-            fi
-
-            SHA="$(git rev-parse HEAD)"
-            echo "Publishing ${VERSION} at ${SHA}"
-            gh release create "${VERSION}" --target "${SHA}" --title "${VERSION}" --generate-notes
+            exit 1
           fi
+
+          VERSION="${EXPECTED}"
+          echo "Valid version format: ${VERSION}"
+
+          VER_MAJOR="${VERSION#v}"
+          VER_MAJOR="${VER_MAJOR%%.*}"
+          EXP_MAJOR="${EXPECTED#v}"
+          EXP_MAJOR="${EXP_MAJOR%%.*}"
+
+          if [[ "${VER_MAJOR}" -ge 2 && "${EXP_MAJOR}" -lt 2 ]]; then
+            echo "::error::${VERSION} is not a valid Go module version for this path. Go only allows v0 or v1 until the module path ends in /v${VER_MAJOR}."
+            echo "::error::Leave the version empty. This release is ${EXPECTED}."
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+            echo "::error::Tag ${VERSION} already exists. Refusing to move it."
+            exit 1
+          fi
+
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Release ${VERSION} already exists. Refusing to move it."
+            exit 1
+          fi
+
+          echo "Releasing ${VERSION}"
+          make release-prep VERSION="${VERSION}"
+          git add -- go.mod pkg/authjwt/go.mod go.sum pkg/authjwt/go.sum go.work.sum
+
+          if ! git diff --quiet; then
+            echo "::error::release-prep changed files other than the module pins:"
+            git status --porcelain
+            exit 1
+          fi
+
+          if ! git diff --cached --quiet; then
+            git config user.name "Highflame GitHub Bot"
+            git config user.email "bot@github.com"
+            git commit -m "devops: point nested-module pins at ${VERSION}"
+            git push origin HEAD:main
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+          echo "Publishing ${VERSION} at ${SHA}"
+          gh release create "${VERSION}" --target "${SHA}" --title "${VERSION}" --generate-notes
