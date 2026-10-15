@@ -10,6 +10,7 @@ package integration_test
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -236,10 +237,20 @@ func TestTrustedIssuers_OwnershipProof_VerifyIDToken(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, status, name)
 			assert.Equal(t, "invalid_request", out["code"], name)
 		}
-		status, _ := p.verify(t, p.tn, p.rowID, map[string]any{"id_token": tok, "client_id": p.app})
+		// huma's schema refusals echo the body; the token must not come back.
+		status, out := p.verify(t, p.tn, p.rowID, map[string]any{"id_token": tok, "client_id": p.app})
 		assert.Equal(t, http.StatusUnprocessableEntity, status, "a missing field is a schema refusal")
-		status, _ = p.verify(t, p.tn, p.rowID, map[string]any{"id_token": tok, "client_id": p.app, "nonce": p.nonce, "binding": "x"})
+		raw, err := json.Marshal(out)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), tok, "a missing field's refusal echoes the token")
+		status, out = p.verify(t, p.tn, p.rowID, map[string]any{"id_token": tok, "client_id": p.app, "nonce": p.nonce, "binding": "x"})
 		assert.Equal(t, http.StatusUnprocessableEntity, status, "an unknown field is a schema refusal")
+		raw, err = json.Marshal(out)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), tok, "an unknown field's refusal echoes the token")
+		// A body far over the field caps is refused before huma reads it all.
+		status, _ = p.verify(t, p.tn, p.rowID, map[string]any{"id_token": strings.Repeat("a", 64<<10), "client_id": p.app, "nonce": p.nonce})
+		assert.Equal(t, http.StatusRequestEntityTooLarge, status)
 	})
 }
 

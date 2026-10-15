@@ -240,7 +240,8 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "get-external-issuer-discovery", Method: http.MethodGet,
 		Path: "/external-issuers/{id}/discovery", Summary: "Read a person issuer's sign-in endpoints from its discovery document", Tags: tags}, a.externalIssuerDiscoveryOp)
 	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-id-token", Method: http.MethodPost,
-		Path: "/external-issuers/{id}/verify-id-token", Summary: "Verify an ID token under a person issuer, as the ID-token exchange would", Tags: tags}, a.verifyExternalIssuerIDTokenOp)
+		Path: "/external-issuers/{id}/verify-id-token", Summary: "Verify an ID token under a person issuer, as the ID-token exchange would", Tags: tags,
+		MaxBodyBytes: maxVerifyIDTokenBodyBytes}, a.verifyExternalIssuerIDTokenOp)
 
 	huma.Register(api, huma.Operation{OperationID: "list-account-issuer-bindings", Method: http.MethodGet,
 		Path: "/external-issuers/bindings", Summary: "List the account's credential bindings across issuers", Tags: tags}, a.listAccountBindingsOp)
@@ -387,6 +388,12 @@ type VerifyIDTokenBody struct {
 	ClientID string `json:"client_id" doc:"The app the token was issued to: it must be in aud, and equal azp when present. At most 512 bytes."`
 	Nonce    string `json:"nonce" doc:"The nonce sent on the authorization request; the token's nonce claim must equal it. At most 512 bytes."`
 }
+
+// maxVerifyIDTokenBodyBytes bounds the verify-id-token body huma reads (its
+// default is 1 MiB). It is over the sum of the service's field caps, so an
+// over-cap field still gets the precise 400 and only a body no caller sends
+// is a 413.
+const maxVerifyIDTokenBodyBytes = 32 << 10
 
 type verifyIDTokenOutput struct {
 	Body *service.IDTokenVerification

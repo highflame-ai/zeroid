@@ -389,6 +389,7 @@ Nothing is stored: the row's `jwks_uri` changes only through `/refresh`.
 ```
 
 All three are required: `id_token` at most 16384 bytes, `client_id` and `nonce` at most 512 (400 `invalid_request` otherwise).
+A body over 32 KiB is refused unread (413), and a schema refusal (a missing or unknown field, 422 with no `code`) redacts every echoed value, so the token never comes back.
 ZeroID verifies the token under this row with the routine the ID-token exchange (P1c) runs, so it accepts nothing the exchange's token checks would refuse:
 
 - the row is `person` (else `wrong_kind`) and enabled (else `issuer_disabled`), checked before the token is read;
