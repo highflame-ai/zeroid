@@ -29,7 +29,7 @@ type AgentClaims struct {
 	PrincipalType string
 	// UserIDIssuer is the user_id_iss claim: set when the token's subject is
 	// a person vouched for by a federated IdP.
-	UserIDIssuer string	// Issuer and Audience are the token's iss and aud. ZeroID's own tokens
+	UserIDIssuer string // Issuer and Audience are the token's iss and aud. ZeroID's own tokens
 	// carry the issuer as aud unless they were bound to another audience,
 	// such as a gateway or an RFC 8707 resource.
 	Issuer   string
