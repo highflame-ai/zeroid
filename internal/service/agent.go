@@ -7,11 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // AgentService handles agent registration (atomic identity + API key creation)
@@ -113,6 +115,12 @@ type AgentResponse struct {
 	UpdatedAt          time.Time             `json:"updated_at"`
 	AdoptedAt          *time.Time            `json:"adopted_at,omitempty"`
 	DelegationDepth    int                   `json:"delegation_depth"`
+	// HasPublicKey reports whether an actor-assertion key is enrolled.
+	// PublicKeyThumbprint identifies it as an RFC 7638 JWK SHA-256 thumbprint
+	// (base64url, unpadded) — the same form as a DPoP cnf.jkt. The PEM itself
+	// is never returned on the agent registry; GET /identities/{id} carries it.
+	HasPublicKey        bool   `json:"has_public_key" doc:"Whether an actor-assertion public key is enrolled"`
+	PublicKeyThumbprint string `json:"public_key_thumbprint,omitempty" doc:"RFC 7638 JWK SHA-256 thumbprint (base64url, unpadded) of the enrolled P-256 key; omitted when none is enrolled"`
 }
 
 // AgentRegistrationResponse is returned on agent creation — includes plaintext API key.
@@ -588,32 +596,63 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 	}
 
 	return AgentResponse{
-		ID:                 identity.ID,
-		AccountID:          identity.AccountID,
-		ProjectID:          identity.ProjectID,
-		Name:               identity.Name,
-		ExternalID:         identity.ExternalID,
-		WIMSEURI:           identity.WIMSEURI,
-		APIKeyPrefix:       keyPrefix,
-		IdentityType:       identity.IdentityType,
-		SubType:            identity.SubType,
-		TrustLevel:         identity.TrustLevel,
-		Status:             identity.Status,
-		Origin:             identity.Origin,
-		OwnerUserID:        identity.OwnerUserID,
-		CredentialPolicyID: identity.CredentialPolicyID,
-		Framework:          identity.Framework,
-		Version:            identity.Version,
-		Publisher:          identity.Publisher,
-		Description:        identity.Description,
-		Capabilities:       caps,
-		Labels:             labels,
-		Metadata:           metadata,
-		CreatedAt:          identity.CreatedAt,
-		AdoptedAt:          identity.AdoptedAt,
-		CreatedBy:          identity.CreatedBy,
-		UpdatedAt:          identity.UpdatedAt,
+		ID:                  identity.ID,
+		AccountID:           identity.AccountID,
+		ProjectID:           identity.ProjectID,
+		Name:                identity.Name,
+		ExternalID:          identity.ExternalID,
+		WIMSEURI:            identity.WIMSEURI,
+		APIKeyPrefix:        keyPrefix,
+		IdentityType:        identity.IdentityType,
+		SubType:             identity.SubType,
+		TrustLevel:          identity.TrustLevel,
+		Status:              identity.Status,
+		Origin:              identity.Origin,
+		OwnerUserID:         identity.OwnerUserID,
+		CredentialPolicyID:  identity.CredentialPolicyID,
+		Framework:           identity.Framework,
+		Version:             identity.Version,
+		Publisher:           identity.Publisher,
+		Description:         identity.Description,
+		Capabilities:        caps,
+		Labels:              labels,
+		Metadata:            metadata,
+		CreatedAt:           identity.CreatedAt,
+		AdoptedAt:           identity.AdoptedAt,
+		CreatedBy:           identity.CreatedBy,
+		UpdatedAt:           identity.UpdatedAt,
+		HasPublicKey:        identity.PublicKeyPEM != "",
+		PublicKeyThumbprint: publicKeyThumbprint(identity),
 	}
+}
+
+// publicKeyThumbprint returns the RFC 7638 JWK SHA-256 thumbprint of the
+// identity's enrolled actor key, or "" when none is enrolled. Every write path
+// validates the key as P-256, so a failure here means a row written before that
+// check; it is logged and reported as has_public_key with no thumbprint.
+func publicKeyThumbprint(identity *domain.Identity) string {
+	if identity.PublicKeyPEM == "" {
+		return ""
+	}
+	jkt, err := ecPublicKeyJKT(identity.PublicKeyPEM)
+	if err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("stored public_key_pem has no thumbprint")
+		return ""
+	}
+	return jkt
+}
+
+// ecPublicKeyJKT computes the DPoP-style jkt of a PEM-encoded P-256 key.
+func ecPublicKeyJKT(publicKeyPEM string) (string, error) {
+	pub, err := parseECPublicKeyPEM(publicKeyPEM)
+	if err != nil {
+		return "", err
+	}
+	key, err := jwk.Import[jwk.Key](pub)
+	if err != nil {
+		return "", err
+	}
+	return dpop.JKT(key)
 }
 
 // agentMeta is the subset of an agent's opaque metadata this service reads to

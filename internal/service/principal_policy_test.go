@@ -74,3 +74,27 @@ func TestValidateRequiredPrincipalType(t *testing.T) {
 		"owner needs the personal-agent profile and is refused until it ships")
 	assert.True(t, errors.Is(validateRequiredPrincipalType("human"), ErrInvalidPolicyField))
 }
+
+func TestClampDefaultTTLToPolicy(t *testing.T) {
+	policy := &domain.CredentialPolicy{MaxTTLSeconds: 900}
+	cases := []struct {
+		name      string
+		ttl       int
+		requested bool
+		policy    *domain.CredentialPolicy
+		want      int
+	}{
+		{"default above policy is shortened", 3600, false, policy, 900},
+		{"default within policy is kept", 600, false, policy, 600},
+		{"requested above policy is left for EnforcePolicy to refuse", 3600, true, policy, 3600},
+		{"no policy", 3600, false, nil, 3600},
+		{"policy without a maximum", 3600, false, &domain.CredentialPolicy{}, 3600},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := clampDefaultTTLToPolicy(c.ttl, c.requested, c.policy); got != c.want {
+				t.Fatalf("clampDefaultTTLToPolicy(%d, %v) = %d, want %d", c.ttl, c.requested, got, c.want)
+			}
+		})
+	}
+}

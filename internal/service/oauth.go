@@ -120,8 +120,13 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 // defeats the single-use guarantee. The concrete impl is
 // postgres.IDJAGReplayStore; an interface here keeps the service testable and
 // the dependency narrow.
+//
+// Redeemed is a read-only pre-check so a replay is refused before work that
+// should not run for it (the person-grant resolver). It is not the gate:
+// Insert stays the atomic single-use check.
 type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+	Redeemed(ctx context.Context, jti string) (bool, error)
 }
 
 // ObservedIDJAGResourceStore records the MCP servers named by the `resource`
@@ -198,6 +203,9 @@ var reservedClaims = map[string]bool{
 	// route fail closed regardless of which grant is in play.
 	"role":            true,
 	"privilege_scope": true,
+	// RFC 9068 §2.2.3.1 `roles` comes only from the deployer's person-grant
+	// resolver, on a person root (see decidePersonGrant).
+	"roles": true,
 	// RFC 9068 §2.2 `client_id` — set from the OAuth client the grant actually
 	// authenticated or resolved (IssueRequest.ClientID), never from caller
 	// input. It exists so a resource server can attribute a call to a client,
@@ -1608,6 +1616,8 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		TTL:                externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:       customClaims,
 		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
+		TrustedRole:        req.Role,
+		PersonGrantType:    PersonGrantExternalPrincipal,
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
@@ -1627,6 +1637,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
 
@@ -2353,6 +2366,24 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", err
 	}
 
+	// The person's ceiling is applied again at the token endpoint; checked
+	// here too so a refusal reaches the client at authorize time (RFC 6749
+	// §4.1.2.1 invalid_scope) instead of burning the code. Enforce mode only:
+	// shadow refuses nothing and counts once, at the mint.
+	if s.credentialSvc.personGrantEnforced() {
+		probe := IssueRequest{
+			Identity:        &domain.Identity{AccountID: req.AccountID, ProjectID: req.ProjectID},
+			GrantType:       domain.GrantTypeAuthorizationCode,
+			SubjectOverride: req.UserID,
+			ClientID:        req.ClientID,
+			Audience:        resources,
+			Scopes:          scopes,
+		}
+		if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+			return "", personGrantOAuthError(err, oautherror.InvalidScope)
+		}
+	}
+
 	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
 	// as the issuance instant — mintAuthCodeJWT derives jti + exp from
 	// it. Centralising the timestamp here (rather than inside the pure
@@ -2551,6 +2582,22 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, err
 	}
 
+	// The person's ceiling, also before Consume: a refusal leaves the code
+	// redeemable within its lifetime once the role is restored. invalid_grant,
+	// as on refresh: the grant's authority changed after consent. The
+	// decision is handed to the mint below.
+	probe := IssueRequest{
+		Identity:        &domain.Identity{AccountID: authCode.AccountID, ProjectID: authCode.ProjectID},
+		GrantType:       domain.GrantTypeAuthorizationCode,
+		SubjectOverride: authCode.UserID,
+		ClientID:        authCode.ClientID,
+		Audience:        boundResources,
+		Scopes:          authCode.Scopes,
+	}
+	if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+	}
+
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
 	// Placed after all validation (client, redirect_uri, PKCE) so an
 	// attacker who intercepts a code but doesn't know the verifier cannot
@@ -2714,13 +2761,14 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		Scopes:            authCode.Scopes,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 		RefreshFamilyID:   refreshFamilyID,
+		personGrant:       probe.personGrant,
 	}
 
 	bindResourceOnIssue(&issue, boundResources)
 
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
-		return nil, err
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
 	}
 
 	accessToken.AccountID = authCode.AccountID
@@ -2970,6 +3018,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	var (
 		identity         *domain.Identity
 		identityPolicyID string
+		personGrant      *personGrantDecision
 	)
 	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshToken(ctx, req.RefreshTokenStr); peekErr == nil {
 		// client_id binding check (RFC 6749 §10.4) — done on the peek so a
@@ -3029,6 +3078,24 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			}
 			identityPolicyID = policy.ID
 		}
+
+		// The person's current ceiling, on the peek like every other gate, so
+		// a demoted user's refresh is refused without burning the token and
+		// works again once the role is restored. The decision is handed to
+		// the mint below.
+		probe := IssueRequest{
+			Identity:        &domain.Identity{AccountID: peeked.AccountID, ProjectID: peeked.ProjectID},
+			GrantType:       domain.GrantTypeRefreshToken,
+			SubjectOverride: peeked.UserID,
+			PrincipalIss:    peeked.PrincipalIss,
+			ClientID:        peeked.ClientID,
+			Audience:        refreshAudienceOf(peeked),
+			Scopes:          parseScopeString(peeked.Scopes),
+		}
+		if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+			return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+		}
+		personGrant = probe.personGrant
 	}
 
 	// Pre-rotation gates passed (or the token was already inactive — in which
@@ -3188,6 +3255,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// Tie the access token to the family, so revoking the family (reuse
 		// detection, authorization-code replay) revokes it as well.
 		RefreshFamilyID: oldToken.FamilyID,
+		// Reused by the chokepoint only while the scopes are the ones decided.
+		personGrant: personGrant,
 	}
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A
@@ -3209,7 +3278,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, refreshIssue)
 	if err != nil {
-		return nil, err
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
 	}
 	issued = true
 
@@ -4039,4 +4108,13 @@ func intersectScopes(requested, allowed []string) []string {
 		}
 	}
 	return result
+}
+
+// refreshAudienceOf is the audience a refresh of rt is minted for: its
+// audience profile, else its resource ceiling.
+func refreshAudienceOf(rt *domain.RefreshToken) []string {
+	if rt.Audience != "" {
+		return []string{rt.Audience}
+	}
+	return rt.Resources
 }

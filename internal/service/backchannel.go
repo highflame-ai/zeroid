@@ -1133,6 +1133,12 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
 		return nil, cerr
 	}
+	// A root grant mints for the approved person, so the person's ceiling
+	// applies, before the burn (ADR 0041 D15). A step-up carries its chain's
+	// principal and is never a person root, so this is a no-op for it.
+	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
+	}
 	// ciba:approve is issued only from a trusted approval-channel credential,
 	// which a CIBA grant never is, so the chokepoint always refuses it here.
 	// Refuse it before the burn, whether the request named it or a requesting
@@ -1163,6 +1169,9 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		// chokepoint can check (trust level, verified attestation). Map the
 		// known refusals to the 4xx codes sibling grant paths use instead of
 		// a blanket 500.
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
 		switch {
 		case errors.Is(err, ErrScopesNotAllowed):
 			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
@@ -1386,6 +1395,16 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 		// have delivered (or will deliver).
 		log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("push approval mint failed")
 		_ = s.repo.SetLastNotifyError(ctx, row.AuthReqID, err.Error())
+		// A person-ceiling refusal is final for this request, and a push
+		// client cannot poll to learn it, so it gets the CIBA Core §12 error
+		// payload. A lost race is not answered: the winner delivers.
+		if code, desc, ok := pushPersonGrantError(err); ok {
+			s.postCallback(ctx, row, map[string]any{
+				"error":             code,
+				"error_description": desc,
+				"auth_req_id":       row.AuthReqID,
+			})
+		}
 		return
 	}
 
@@ -1415,6 +1434,20 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	}
 
 	s.postCallback(ctx, row, payload)
+}
+
+// pushPersonGrantError maps a person-ceiling failure to a CIBA Core §12 push
+// error. §12 defines only access_denied, expired_token and
+// transaction_failed, so a refusal is access_denied and a resolver failure
+// transaction_failed.
+func pushPersonGrantError(err error) (code, description string, ok bool) {
+	switch {
+	case errors.Is(err, ErrPersonScopeDenied):
+		return oautherror.AccessDenied, "none of the requested scopes is granted to this user", true
+	case errors.Is(err, ErrPersonGrantUnavailable):
+		return oautherror.TransactionFailed, "the user's scope ceiling could not be resolved", true
+	}
+	return "", "", false
 }
 
 // dispatchPushDenial POSTs the OAuth error body (CIBA Core §10.3.2) to the
