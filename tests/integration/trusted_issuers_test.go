@@ -778,6 +778,13 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 		requireRefused(t, resp, "invalid_client")
 	})
+	t.Run("a scope the agent's credential policy does not grant", func(t *testing.T) {
+		// The client asked for more than the policy allows: a 400, as on the
+		// sibling grants, not a server_error.
+		resp := p.exchange(t, good(), map[string]any{"scope": "tools:write"})
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		requireRefused(t, resp, "policy_violation")
+	})
 	t.Run("a person who is not a member of the account", func(t *testing.T) {
 		requireRefused(t, p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"oid": uid("oid-stranger")}), nil), "invalid_grant")
 	})

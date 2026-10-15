@@ -405,6 +405,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
 			return nil, mapped
 		}
+		if issuanceRefusal(err) {
+			return nil, err
+		}
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
 	}
 
