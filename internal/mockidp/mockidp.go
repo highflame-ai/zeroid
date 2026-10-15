@@ -104,20 +104,21 @@ func (i *IdP) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /entra/{tid}/v2.0/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		tid := r.PathValue("tid")
-		writeJSON(w, http.StatusOK, discovery(i.EntraIssuer(tid), i.EntraJWKSURI(tid)))
+		base := i.baseURL() + "/entra/" + tid + "/oauth2/v2.0"
+		writeJSON(w, http.StatusOK, discovery(i.EntraIssuer(tid), i.EntraJWKSURI(tid), base+"/authorize", base+"/token"))
 	})
 	// Entra publishes keys with no alg member.
 	mux.HandleFunc("GET /entra/{tid}/discovery/v2.0/keys", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, keySet(&i.entra.PublicKey, entraKID, false))
 	})
 	mux.HandleFunc("GET /okta/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, discovery(i.OktaIssuer(), i.OktaJWKSURI()))
+		writeJSON(w, http.StatusOK, discovery(i.OktaIssuer(), i.OktaJWKSURI(), i.OktaIssuer()+"/oauth2/v1/authorize", i.OktaIssuer()+"/oauth2/v1/token"))
 	})
 	mux.HandleFunc("GET /okta/oauth2/v1/keys", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, keySet(&i.okta.PublicKey, oktaKID, true))
 	})
 	mux.HandleFunc("GET /k8s/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, discovery(i.K8sIssuer(), i.K8sJWKSURI()))
+		writeJSON(w, http.StatusOK, discovery(i.K8sIssuer(), i.K8sJWKSURI(), "", ""))
 	})
 	mux.HandleFunc("GET /k8s/openid/v1/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, keySet(&i.k8s.PublicKey, k8sKID, true))
@@ -245,14 +246,22 @@ func merge(dst, src map[string]any) {
 	}
 }
 
-func discovery(iss, jwksURI string) map[string]any {
-	return map[string]any{
+// discovery is an issuer's discovery document. The authorization and token
+// endpoints are advertised (a Kubernetes issuer has none) but not served:
+// tokens come from POST /mint, with any nonce in claims.
+func discovery(iss, jwksURI, authorizationEndpoint, tokenEndpoint string) map[string]any {
+	doc := map[string]any{
 		"issuer":                                iss,
 		"jwks_uri":                              jwksURI,
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"response_types_supported":              []string{"code", "id_token"},
 		"subject_types_supported":               []string{"pairwise"},
 	}
+	if authorizationEndpoint != "" {
+		doc["authorization_endpoint"] = authorizationEndpoint
+		doc["token_endpoint"] = tokenEndpoint
+	}
+	return doc
 }
 
 func keySet(pub *rsa.PublicKey, kid string, withAlg bool) jwk.Set {

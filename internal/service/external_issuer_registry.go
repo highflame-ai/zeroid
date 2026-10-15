@@ -190,7 +190,18 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 	default:
 		return nil, errIssuerAmbiguous
 	}
-	row := matched[0]
+	return r.EntryForRow(matched[0])
+}
+
+// EntryForRow returns the entry a person token verifies against for an
+// issuer row the caller already read: the row's config, its shared-issuer
+// pinning claim, and the cached JWKS client every grant on the row uses.
+// Database mode only. It checks neither kind nor enabled; callers decide.
+func (r *ExternalIssuerRegistry) EntryForRow(row *domain.ExternalIssuer) (*ExternalIssuerEntry, error) {
+	if r == nil || r.rows == nil {
+		return nil, fmt.Errorf("%w: issuer rows are not configured", errIssuerLookupFailed)
+	}
+	pin, _ := domain.SharedPin(r.shared, row.Issuer)
 	client, err := r.cache.get(row)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errIssuerLookupFailed, err)

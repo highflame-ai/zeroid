@@ -43,16 +43,81 @@ const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
 func idTokenIssuedTo(token jwt.Token, clientID string) error {
 	aud, _ := token.Audience()
 	if !slices.Contains(aud, clientID) {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)")
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)", errAssertionAudience)
 	}
 	azp, err := jwt.Get[string](token, "azp")
 	if err == nil && azp != clientID {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)")
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)", errAssertionAudience)
 	}
 	if err != nil && len(aud) > 1 {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client")
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client", errAssertionAudience)
 	}
 	return nil
+}
+
+// Causes wrapped onto the *OAuthError of a refused external assertion, for
+// callers that report the reason as a code (VerifyIDToken). The wire answer
+// on the grants is unchanged: invalid_grant.
+var (
+	errAssertionAudience    = errors.New("the assertion was not issued to the expected audience")
+	errAssertionConstraints = errors.New("the assertion does not satisfy the issuer's claim constraints")
+)
+
+// personIDToken is a person's ID token verified by verifyPersonIDToken, with
+// what the issuer's claim mapping reads from it.
+type personIDToken struct {
+	claims        map[string]any
+	userID        string
+	email         string
+	emailVerified bool
+	name          string
+}
+
+// verifyPersonIDToken verifies an OpenID Connect ID token naming a person,
+// issued by entry's IdP to clientID: the P1c checks that need no binding
+// (ADR 0042 D3a rules 1 to 3). Signature against the issuer's JWKS, iss,
+// exp/nbf/iat with the shared skew and max_token_age, the row's claim
+// constraints (and shared-issuer pin), the token being an ID token and not
+// an access token, aud naming clientID with azp equal to it when present,
+// the mapped user_id, and a person rather than a workload subject. The
+// email and email_verified come from the row's claim mapping (Entra's
+// xms_edov).
+//
+// It is the single routine both the ID-token exchange and the issuer
+// ownership proof (ExternalIssuerService.VerifyIDToken) run, so the proof
+// can never accept a token the grant would refuse on these checks. On an
+// issuer row clientID is an accepted audience beside the row's own: on the
+// exchange an enabled binding for it is required afterwards.
+func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerEntry, clientID string) (*personIDToken, error) {
+	var extraAudiences []string
+	if entry.Row != nil {
+		extraAudiences = []string{clientID}
+	}
+	verified, err := validateExternalAssertion(ctx, raw, entry, "subject_token", requirePlainSub, extraAudiences...)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireIDToken(raw, verified); err != nil {
+		return nil, err
+	}
+	if err := idTokenIssuedTo(verified, clientID); err != nil {
+		return nil, err
+	}
+	// Single-level claim names only. v4 dropped AsMap, so the claims are
+	// materialized from Keys()/Get().
+	mapping := entry.Config.ClaimMapping
+	claims := tokenClaimsAsMap(verified)
+	userID, ok := extractMappedClaimString(claims, mapping["user_id"])
+	if !ok || userID == "" {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", mapping["user_id"]))
+	}
+	if err := refuseWorkloadSubject(claims, userID); err != nil {
+		return nil, err
+	}
+	out := &personIDToken{claims: claims, userID: userID, emailVerified: emailVerified(claims, mapping["email_verified"])}
+	out.email, _ = extractMappedClaimString(claims, mapping["email"])
+	out.name, _ = extractMappedClaimString(claims, mapping["name"])
+	return out, nil
 }
 
 // requireIDToken is ADR 0042 D3a rule 2: the subject token is positively an
@@ -151,10 +216,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	}
 	cfg := entry.Config
 
-	var (
-		identity         *domain.Identity
-		bindingAudiences []string
-	)
+	var identity *domain.Identity
 	if entry.Row != nil {
 		// ADR 0042 D3a rule 1 (issuer rows): the relying party proves itself
 		// with a key, never a shared secret, so an agent needs no Highflame
@@ -163,13 +225,12 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 			return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
 				"a client secret is not accepted", nil)
 		}
-		// The binding is the audience rule (D3a): the presenting client_id,
-		// which idTokenIssuedTo requires in aud, is accepted beside the row's
-		// optional audiences, and bindFederatedAgent below refuses a client
-		// with no enabled binding. The binding is read only after the token
-		// is verified, so a forged token cannot raise events under the
-		// account or learn its binding state.
-		bindingAudiences = []string{authedClient.ClientID}
+		// The binding is the audience rule (D3a): verifyPersonIDToken accepts
+		// the presenting client_id beside the row's optional audiences, and
+		// bindFederatedAgent below refuses a client with no enabled binding.
+		// The binding is read only after the token is verified, so a forged
+		// token cannot raise events under the account or learn its binding
+		// state.
 	} else {
 		// A static issuer, in standalone ZeroID, takes the tenant from the
 		// caller, inside its allowed_accounts (D5 is for issuer rows).
@@ -181,33 +242,15 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		}
 	}
 
-	// Verify the upstream ID token against its IdP — signature (JWKS), iss,
-	// aud, exp/nbf, alg allow-list, MaxTokenAge, and the presence of
-	// sub/exp/iat. Shared verbatim with the ID-JAG path.
-	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub, bindingAudiences...)
+	// Verify the upstream ID token against its IdP (signature, iss, aud/azp,
+	// exp/nbf/iat, alg allow-list, MaxTokenAge, constraints, ID-token shape,
+	// person subject) and read the mapped claims. The issuer ownership proof
+	// runs the same routine.
+	idTok, err := verifyPersonIDToken(ctx, req.SubjectToken, entry, authedClient.ClientID)
 	if err != nil {
 		return nil, err
 	}
-	if err := requireIDToken(req.SubjectToken, verified); err != nil {
-		return nil, err
-	}
-	if err := idTokenIssuedTo(verified, authedClient.ClientID); err != nil {
-		return nil, err
-	}
-
-	// Claim mapping. user_id is required (validated at config load); other
-	// mappings are optional. Single-level keys only in v1. v4 dropped AsMap,
-	// so iterate Keys()/Get() to materialize a plain map.
-	rawClaims := tokenClaimsAsMap(verified)
-	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
-	if !ok || userID == "" {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", cfg.ClaimMapping["user_id"]))
-	}
-	if err := refuseWorkloadSubject(rawClaims, userID); err != nil {
-		return nil, err
-	}
-	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
-	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
+	rawClaims, userID, userEmail, userName := idTok.claims, idTok.userID, idTok.email, idTok.name
 
 	// For an issuer row the agent is the identity the presenting client is
 	// bound to under the row (D6: on P1c the subject key is the client_id),
@@ -245,7 +288,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		IssuerID:        issuerRowID(entry),
 		Subject:         userID,
 		Email:           userEmail,
-		EmailVerified:   emailVerified(rawClaims, cfg.ClaimMapping["email_verified"]),
+		EmailVerified:   idTok.emailVerified,
 		ClientID:        authedClient.ClientID,
 		AgentIdentityID: identity.ID,
 	})
@@ -466,7 +509,7 @@ const (
 )
 
 // extraAudiences are accepted beside the issuer's configured audiences.
-func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement, extraAudiences ...string) (jwt.Token, error) {
+func validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement, extraAudiences ...string) (jwt.Token, error) {
 	cfg := entry.Config
 
 	// Algorithm allowlist gate. Read the JWS header before signature
@@ -532,12 +575,12 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 	aud, _ := verified.Audience()
 	accepted := append(cfg.AudienceList(), extraAudiences...)
 	if !slices.ContainsFunc(accepted, func(a string) bool { return slices.Contains(aud, a) }) {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s verification failed: aud is not one this issuer is trusted for", fieldName))
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("%s verification failed: aud is not one this issuer is trusted for", fieldName), errAssertionAudience)
 	}
 	// A shared issuer's row was chosen on unverified claims; its constraints
 	// must also hold on the verified ones.
 	if entry.Row != nil && !entry.Row.ConstraintsMatch(tokenClaimsAsMap(verified), entry.PinClaim) {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("%s does not satisfy the issuer's claim constraints", fieldName))
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("%s does not satisfy the issuer's claim constraints", fieldName), errAssertionConstraints)
 	}
 
 	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires

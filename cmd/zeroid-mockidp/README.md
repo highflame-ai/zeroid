@@ -13,6 +13,9 @@ It publishes three issuers, each with its own RSA key:
 
 Any tenant id works in the Entra paths; `11111111-2222-3333-4444-555555555555` is the default.
 
+The Entra and Okta discovery documents also name an `authorization_endpoint` and a `token_endpoint` (`{base}/entra/{tenant}/oauth2/v2.0/authorize` and `/token`, `{base}/okta/oauth2/v1/authorize` and `/token`), so the issuer ownership proof (`GET /external-issuers/{id}/discovery`) can be exercised.
+They are advertised, not served: there is no interactive sign-in, and a test mints the ID token with `POST /mint` instead, putting the sign-in's `nonce` in `claims`.
+
 ## Run
 
 ```bash
