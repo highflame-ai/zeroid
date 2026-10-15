@@ -36,8 +36,9 @@ const (
 // bindFederatedAgent maps the agent a federated person grant names to its
 // own identity through an enabled binding under the issuer row (ADR 0042
 // D6), and refuses an identity that is not active (D7). subjectKey is the
-// value the credential carries at runtime: the ID-JAG's act.sub, or the
-// presenting client's client_id on the ID-token exchange.
+// value the credential carries at runtime: the ID-JAG's act.sub (its
+// client_id when it names no actor), or the presenting client's client_id on
+// the ID-token exchange.
 //
 // There is no synthetic identity: no binding, or a client registered to a
 // different identity, is invalid_grant and an unmatched-agent event.
@@ -55,7 +56,7 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 ) (*domain.Identity, error) {
 	if subjectKey == "" {
 		recordUnmatchedAgent(ctx, row, subjectKey, grant, "no_subject_key")
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "the credential names no agent to bind (no act.sub)")
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "the credential names no agent to bind")
 	}
 	all, err := bindings.BindingsFor(ctx, row.ID, subjectKey)
 	if err != nil {
@@ -152,6 +153,17 @@ func recordAgentNotAdopted(ctx context.Context, row *domain.ExternalIssuer, iden
 }
 
 // actorSubject returns the ID-JAG's act.sub, the agent's IdP client id.
+// federatedAgentKey is the subject key that names the agent on an ID-JAG:
+// act.sub when the IdP names the actor, else the ID-JAG's client_id. The
+// ID-JAG draft makes act OPTIONAL (§3.1, §4.3) and requires client_id,
+// which the grant has already checked equals the authenticated client.
+func federatedAgentKey(claims map[string]any, clientID string) string {
+	if sub := actorSubject(claims); sub != "" {
+		return sub
+	}
+	return clientID
+}
+
 func actorSubject(claims map[string]any) string {
 	act, _ := claims["act"].(map[string]any)
 	sub, _ := act["sub"].(string)
