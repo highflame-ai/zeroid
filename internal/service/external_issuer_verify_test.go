@@ -220,6 +220,52 @@ func TestVerifyIDToken_Constraints(t *testing.T) {
 	})
 }
 
+// A row's own audiences admit a token past the signature checks, but the
+// token must still name client_id: idTokenIssuedTo is the check that refuses
+// it, not validateExternalAssertion's audience gate.
+func TestVerifyIDToken_RowAudienceIsNotTheClient(t *testing.T) {
+	f := newVerifyFixture(t, nil)
+	row := *f.row
+	row.Audiences = []string{"row-aud"}
+	if _, err := f.verify(t, &row, f.token(t, map[string]any{"aud": []string{"row-aud", verifyClientID}, "azp": verifyClientID})); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.verify(t, &row, f.token(t, map[string]any{"aud": "row-aud"}))
+	requireIssuerCode(t, err, http.StatusUnprocessableEntity, "audience_mismatch")
+}
+
+// verifyPersonIDToken accepts the client as an extra audience only on an
+// issuer row (where a binding is required next). A static issuer accepts its
+// configured audiences only, exactly as the exchange did before the routine
+// was shared.
+func TestVerifyPersonIDToken_StaticIssuerAddsNoAudience(t *testing.T) {
+	srv := newFakeJWKSServer(t, "k1")
+	t.Cleanup(srv.Close)
+	reg, err := NewExternalIssuerRegistry(context.Background(), []domain.ExternalIssuerConfig{{
+		Issuer: verifyIssuer, JWKSURI: srv.URL(), Audience: "configured-aud",
+		Algorithms: []string{"ES256"}, JWKSCacheTTL: time.Minute, MaxTokenAge: time.Hour,
+		ClaimMapping: map[string]string{"user_id": "sub"},
+	}}, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reg.Close)
+	entry, err := reg.ResolvePerson(context.Background(), verifyIssuer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &verifyFixture{jwks: srv}
+	sign := func(extra map[string]any) string { return signWithTyp(t, srv.curPriv, "k1", "JWT", f.claims(extra)) }
+
+	if _, err := verifyPersonIDToken(context.Background(), sign(map[string]any{"aud": []string{"configured-aud", verifyClientID}, "azp": verifyClientID}), entry, verifyClientID); err != nil {
+		t.Fatalf("a token for the configured audience and the client: %v", err)
+	}
+	_, err = verifyPersonIDToken(context.Background(), sign(map[string]any{"aud": verifyClientID}), entry, verifyClientID)
+	if !errors.Is(err, errAssertionAudience) {
+		t.Fatalf("a static issuer accepted the client as an audience it was not configured for: %v", err)
+	}
+}
+
 func TestVerifyIDToken_ClaimMapping(t *testing.T) {
 	f := newVerifyFixture(t, nil)
 	t.Run("Entra: user key oid, email_verified from xms_edov", func(t *testing.T) {
