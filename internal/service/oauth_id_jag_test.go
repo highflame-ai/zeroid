@@ -244,33 +244,27 @@ func requireInvalidClient(t *testing.T, err error) {
 // available. The unit tests here pin the DB-free gates plus the D2b client-auth
 // gate itself.
 
-func TestIDJAGBearer_UnknownIssuer_InvalidGrant(t *testing.T) {
-	const acct = "acct-idjag"
-	registry, _, _, aud := idJAGTestRegistry(t, acct)
-
-	// Sign an ID-JAG whose iss is NOT the configured issuer. Lookup misses →
-	// fail closed with invalid_grant (NOT invalid_request — that is the
-	// id_token-exchange semantics; ADR 0010 D3 mandates invalid_grant here).
+// TestIDJAGBearer_IssuerNotResolvedBeforeClientAuth pins the order: an
+// unauthenticated redemption is invalid_client before ZeroID looks up the
+// assertion's issuer, so an anonymous probe learns nothing about which IdPs
+// are trusted and costs no lookup.
+func TestIDJAGBearer_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
+	rows := &fakeIssuerRows{}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil)}
+	defer svc.externalIssuerRegistry.Close()
 	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	now := time.Now()
-	stranger := signWithTyp(t, priv, "kid", idJAGTyp, map[string]any{
-		"iss":      "https://stranger.example.test",
-		"sub":      "alice",
-		"aud":      aud,
-		"resource": "https://mcp.example.test",
-		"iat":      now.Unix(),
-		"exp":      now.Add(5 * time.Minute).Unix(),
+	assertion := signWithTyp(t, priv, "kid", idJAGTyp, map[string]any{
+		"iss": "https://probe.example.test", "sub": "alice", "aud": "x",
+		"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 	})
-
-	svc := &OAuthService{externalIssuerRegistry: registry}
-	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Assertion: stranger,
-		AccountID: acct,
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
-	if !errors.Is(err, ErrUnknownExternalIssuer) {
-		t.Errorf("expected errors.Is(err, ErrUnknownExternalIssuer); chain=%v", err)
+	_, err := svc.idJAGBearer(context.Background(), TokenRequest{Assertion: assertion})
+	var oe *OAuthError
+	if !errors.As(err, &oe) || oe.Code != "invalid_client" {
+		t.Fatalf("err = %v, want invalid_client", err)
+	}
+	if rows.calls != 0 {
+		t.Fatalf("issuer looked up %d times before client authentication", rows.calls)
 	}
 }
 

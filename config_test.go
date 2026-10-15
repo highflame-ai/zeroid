@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // TestValidateWIMSEDomain pins the SPIFFE §2.2 / RFC 1123 rules. The error
@@ -730,4 +732,76 @@ func TestRegistrationEndpointConfig(t *testing.T) {
 			t.Fatalf("Validate must refuse an http registration endpoint beside an https issuer, got: %v", err)
 		}
 	})
+}
+
+// ADR 0042 D4: trusted issuers come from one source. A deployment that reads
+// account rows must not also carry static entries, which would be a second,
+// unaudited trust list.
+func TestConfig_FederationIssuerStore(t *testing.T) {
+	static := domain.ExternalIssuerConfig{
+		Issuer: "https://idp.example", JWKSURI: "https://idp.example/keys", Audience: "https://zeroid.example",
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+	}
+	cases := []struct {
+		name    string
+		store   string
+		static  bool
+		wantErr string
+	}{
+		{name: "default config with static", store: "", static: true},
+		{name: "config with static", store: "config", static: true},
+		{name: "db alone", store: "db"},
+		{name: "db with static is refused", store: "db", static: true, wantErr: "both set"},
+		{name: "unknown store", store: "redis", wantErr: "must be config or db"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Federation.IssuerStore = tc.store
+			if tc.static {
+				cfg.ExternalIssuers = []domain.ExternalIssuerConfig{static}
+			}
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "pin_claim") {
+		t.Fatalf("err = %v", err)
+	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com", PinClaim: "hd"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "http://mockidp:8080/google", PinClaim: "hd"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an http shared issuer needs allow_private_endpoints")
+	}
+	cfg.Federation.AllowPrivateEndpoints = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("local mock as a shared issuer: %v", err)
+	}
+}
+
+func TestConfig_StaticIssuerCannotBeSelf(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{{
+		Issuer: cfg.Token.Issuer + "/", JWKSURI: cfg.Token.Issuer + "/.well-known/jwks.json", Audience: "x",
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "own issuer") {
+		t.Fatalf("err = %v", err)
+	}
 }

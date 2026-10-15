@@ -87,14 +87,15 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 		})
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
-			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":      idToken,
-			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-			"client_id":          rpClient(t, federationAud).ClientID,
-			"client_secret":      rpClient(t, federationAud).ClientSecret,
-			"account_id":         fedCfg.AccountID,
-			"project_id":         fedCfg.ProjectID,
-			"resource":           mcpResource,
+			"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":         idToken,
+			"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+			"client_id":             rpClient(t, federationAud).ClientID,
+			"client_assertion":      rpAssertion(t, rpClient(t, federationAud)),
+			"client_assertion_type": clientAssertionType,
+			"account_id":            fedCfg.AccountID,
+			"project_id":            fedCfg.ProjectID,
+			"resource":              mcpResource,
 		})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 
@@ -120,13 +121,14 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 		})
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
-			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":      idToken,
-			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-			"client_id":          rpClient(t, federationAud).ClientID,
-			"client_secret":      rpClient(t, federationAud).ClientSecret,
-			"account_id":         fedCfg.AccountID,
-			"project_id":         fedCfg.ProjectID,
+			"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":         idToken,
+			"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+			"client_id":             rpClient(t, federationAud).ClientID,
+			"client_assertion":      rpAssertion(t, rpClient(t, federationAud)),
+			"client_assertion_type": clientAssertionType,
+			"account_id":            fedCfg.AccountID,
+			"project_id":            fedCfg.ProjectID,
 		})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 
@@ -152,13 +154,14 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 		})
 
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
-			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":      idToken,
-			"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-			"client_id":          rpClient(t, federationAud).ClientID,
-			"client_secret":      rpClient(t, federationAud).ClientSecret,
-			"account_id":         fedCfg.AccountID,
-			"project_id":         fedCfg.ProjectID,
+			"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":         idToken,
+			"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+			"client_id":             rpClient(t, federationAud).ClientID,
+			"client_assertion":      rpAssertion(t, rpClient(t, federationAud)),
+			"client_assertion_type": clientAssertionType,
+			"account_id":            fedCfg.AccountID,
+			"project_id":            fedCfg.ProjectID,
 		})
 		require.Equal(t, http.StatusOK, resp.StatusCode, "federation /oauth2/token must return 200; body=%s", resp.RawBody)
 

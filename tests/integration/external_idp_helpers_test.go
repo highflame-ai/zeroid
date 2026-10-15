@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"net/http"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/lestrrat-go/jwx/v4/jws"
@@ -133,14 +135,59 @@ var rpClients sync.Map
 // rpClient returns the OAuth client registered as the relying party an ID token
 // with this aud was issued to. Since D13 only that client, authenticated, may
 // redeem the token. Its client_id is the audience, as at a real IdP, where an ID
-// token's aud is the relying party's client_id. Registered once per audience;
-// safe across tests because no integration test calls t.Parallel().
+// token's aud is the relying party's client_id. It authenticates with
+// private_key_jwt, the only method the exchange accepts (ADR 0042 D3a).
+// Registered once per audience; safe across tests because no integration test
+// calls t.Parallel().
 func rpClient(t *testing.T, aud string) oauthClientResp {
 	t.Helper()
 	if c, ok := rpClients.Load(aud); ok {
 		return c.(oauthClientResp)
 	}
-	c := registerOAuthClient(t, aud, nil)
+	key := generateKey(t)
+	resp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":                  aud,
+		"name":                       aud + "-rp",
+		"token_endpoint_auth_method": "private_key_jwt",
+		"jwks":                       clientJWKS(t, key),
+		"grant_types":                []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+	}, nil)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "register relying party %s", aud)
+	_ = resp.Body.Close()
+	c := oauthClientResp{ClientID: aud, Key: key}
 	rpClients.Store(aud, c)
 	return c
+}
+
+// federationIssuer is the issuer every federation test server runs as, and so
+// the audience of a client assertion presented to one.
+const federationIssuer = "https://federation.zeroid.test"
+
+// rpAssertion is a fresh private_key_jwt client assertion for a key-based
+// client, addressed to the federation servers.
+func rpAssertion(t *testing.T, c oauthClientResp) string {
+	t.Helper()
+	require.NotNil(t, c.Key, "client %s has no key", c.ClientID)
+	now := time.Now()
+	tok, err := jwt.NewBuilder().Issuer(c.ClientID).Subject(c.ClientID).
+		Audience([]string{federationIssuer}).IssuedAt(now).Expiration(now.Add(2 * time.Minute)).
+		JwtID(uid("rp-cla")).Build()
+	require.NoError(t, err)
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), c.Key))
+	require.NoError(t, err)
+	return string(signed)
+}
+
+// withClientAuth adds c's credentials to a token request body: an assertion
+// for a key-based client, else its secret.
+func withClientAuth(t *testing.T, body map[string]any, c oauthClientResp) map[string]any {
+	t.Helper()
+	body["client_id"] = c.ClientID
+	if c.Key != nil {
+		body["client_assertion"] = rpAssertion(t, c)
+		body["client_assertion_type"] = clientAssertionType
+	} else {
+		body["client_secret"] = c.ClientSecret
+	}
+	return body
 }

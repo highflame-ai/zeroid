@@ -33,6 +33,13 @@ urn:ietf:params:oauth:token-type:id_token` for exactly this case.
 - **NIST SP 800-63C §4.1** requires federation assertions to name the IdP
   that authenticated the subject — not an aggregator or relay.
 
+Trusted issuers come from the static `external_issuers` list below
+(`federation.issuer_store: config`, standalone) or from per-account rows
+managed through the admin API (`federation.issuer_store: db`). With rows the
+tenant, the agent and the person are derived rather than requested; see
+[external-issuers.md](external-issuers.md). This page describes the static
+list.
+
 ### Request shape
 
 ```
@@ -43,10 +50,19 @@ POST /oauth2/token
   account_id           = <tenant>
   project_id           = <tenant>
   scope                = <optional>
+  + client authentication as the ID token's relying party
 ```
 
 `application_id` is optional. When present it must resolve to an active
 identity in the caller's tenant — same IDOR guard the broker path uses.
+
+The redeeming client must be the ID token's relying party (its `client_id` in
+`aud`, and equal to `azp` when present) and authenticates with its registered
+method (with issuer rows, `private_key_jwt` only, ADR 0042 D3a). The subject
+token must be positively an ID token: `iss`, `sub`, `aud`, `exp` and `iat`
+present, and no `scp`, `scope` or `typ` of `at+jwt`. Workload subjects (Entra
+`idtyp=app`, Kubernetes service accounts, SPIFFE IDs) are refused, and an entry
+with `kind: workload` is not accepted on this grant.
 
 ### Issued-token claim shape
 
@@ -135,7 +151,10 @@ This is the request draft §4.4 and the MCP extension §5 define. It carries
 
 ### How the tenant is derived
 
-The tenant is derived from server-side facts and never chosen by the caller:
+With issuer rows, the agent is the ID-JAG's `act.sub` mapped through a binding
+and the tenant is that agent's ([external-issuers.md](external-issuers.md)).
+With a static issuer, the tenant is derived from server-side facts and never
+chosen by the caller:
 
 - the **account** must be one of the issuer's `allowed_accounts`, and
 - the **account and project** come from the authenticated client's
@@ -170,13 +189,15 @@ it). The document must:
   `authorization_grant_profiles_supported`, it must also list
   `urn:ietf:params:oauth:grant-type:token-exchange` (draft §8).
 
-**Such a client cannot redeem yet.** Its tenant has to come from an identity its
-URL is bound to (ADR 0042 D6), and that binding does not exist yet. Until it
-does, a CIMD client that passes every check above is refused with
+**On a static issuer such a client cannot redeem.** Its tenant has to come
+from an identity it is bound to (ADR 0042 D6), and static issuers have no
+bindings, so a CIMD client that passes every check above is refused with
 `invalid_grant`. The request's `account_id`/`project_id` never supply the
-tenant. Today, the way to use a Client Identifier URL on this grant is to
-pre-register it (CIMD §7.2): create an OAuth client whose `client_id` is the
-URL, with `private_key_jwt`, its key, and an `identity_id` in the right tenant.
+tenant. With a static issuer, the way to use a Client Identifier URL on this
+grant is to pre-register it (CIMD §7.2): create an OAuth client whose
+`client_id` is the URL, with `private_key_jwt`, its key, and an `identity_id`
+in the right tenant. With issuer rows the agent and its tenant come from a binding on the ID-JAG's `act.sub`, which serves a CIMD client too
+([external-issuers.md](external-issuers.md#p1b-id-jag)).
 
 ## Trusted-service broker (fallback)
 
