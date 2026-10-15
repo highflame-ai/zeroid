@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -300,13 +301,65 @@ type SetOwnPublicKeyOutput struct {
 	Body *service.AgentResponse
 }
 
+// selfKeyGrantTypes are the grants that issue an agent a token for itself.
+// Every other token is refused: exchanged and CIBA tokens are held for a
+// delegation chain; proof tokens carry no grant_type and are meant for the
+// third party named in their audience; person grants act for a human.
+var selfKeyGrantTypes = map[string]bool{
+	string(domain.GrantTypeAPIKey):            true,
+	string(domain.GrantTypeClientCredentials): true,
+	string(domain.GrantTypeJWTBearer):         true,
+}
+
+// selfKeyTokenRefusal returns why a token may not set its agent's key, or ""
+// when it may. Setting a first key is trust-on-first-use, authorized by the
+// token alone, so only the agent's own credential qualifies.
+func selfKeyTokenRefusal(c internalMiddleware.AgentClaims) string {
+	if !selfKeyGrantTypes[c.GrantType] {
+		return "key enrollment needs the agent's own token (api_key, client_credentials or jwt-bearer)"
+	}
+	// jwt_bearer also redeems an IdP's ID-JAG, which acts for a person.
+	if c.PrincipalType == "user" || c.UserIDIssuer != "" {
+		return "key enrollment needs the agent's own token, not one acting for a person"
+	}
+	// A token bound to another audience (a gateway, an RFC 8707 resource) is
+	// held by that audience too. It must not become a durable key: whoever
+	// holds it could otherwise enroll one on an agent that has none.
+	if !slices.Contains(c.Audience, c.Issuer) {
+		return "key enrollment needs a token whose audience is this issuer, not one bound to another audience"
+	}
+	return ""
+}
+
 // setOwnPublicKeyOp enrolls or rotates the actor-assertion public key for the
 // authenticated agent identity (self-service). Identity + tenant come from the
 // agent's own access-token claims (AgentAuthMiddleware), never from caller input.
 func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput) (*SetOwnPublicKeyOutput, error) {
 	claims, ok := internalMiddleware.GetAgentClaims(ctx)
-	if !ok || claims.IdentityID == "" {
+	if !ok || claims.Subject == "" {
 		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+	if reason := selfKeyTokenRefusal(claims); reason != "" {
+		return nil, huma.Error403Forbidden(reason)
+	}
+
+	// The token must still be live: a revoked token could otherwise bind a
+	// key that outlives the revocation.
+	if _, active, err := a.credSvc.IntrospectToken(ctx, claims.JTI); err != nil || !active {
+		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+
+	// The agent is the token's subject (the current actor under the rfc8693
+	// profile), looked up in the token's tenant. ZeroID sets no identity_id
+	// claim, and reserves it so a caller cannot supply one. A token whose
+	// subject is not a registered identity, such as one issued to a person,
+	// finds nothing.
+	identity, err := a.identitySvc.GetIdentityByWIMSEURI(ctx, claims.Subject, claims.AccountID, claims.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityNotFound) {
+			return nil, huma.Error401Unauthorized("missing or invalid agent token")
+		}
+		return nil, mapErr(err)
 	}
 
 	// Attribute the key change to the agent itself in the audit trail (this
@@ -314,7 +367,7 @@ func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput
 	// unset).
 	ctx = internalMiddleware.SetCallerName(ctx, claims.Subject)
 
-	resp, err := a.agentSvc.SetPublicKey(ctx, claims.IdentityID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
+	resp, err := a.agentSvc.SetPublicKey(ctx, identity.ID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
 		NewPublicKeyPEM: input.Body.NewPublicKeyPEM,
 		NewKeyProof:     input.Body.NewKeyProof,
 		CurrentKeyProof: input.Body.CurrentKeyProof,

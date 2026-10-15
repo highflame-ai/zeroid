@@ -76,14 +76,28 @@ func TestIdentityID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
 	assert.Nil(t, claims["identity_id"], "identity_id must never be caller-supplied")
 	assert.Nil(t, claims["agent_id"], "agent_id must never be caller-supplied")
 
+	// Even with a valid key proof for the victim, the forged token reaches no
+	// key: self-service takes the agent from the token's subject, never from
+	// identity_id, and refuses tokens that are not the agent's own.
+	victimResp := get(t, adminPath("/agents/registry/"+victimID), adminHeaders())
+	victim := decode(t, victimResp)
+	require.Equal(t, http.StatusOK, victimResp.StatusCode, "%v", victim)
+	victimWIMSE, _ := victim["wimse_uri"].(string)
+	require.NotEmpty(t, victimWIMSE)
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	enroll := post(t, "/agents/self/public-key", map[string]any{
 		"new_public_key_pem": ecPublicKeyPEM(t, key),
-		"new_key_proof":      "not-checked-before-the-identity",
+		"new_key_proof":      selfKeyProof(t, key, victimWIMSE, nil),
 	}, map[string]string{"Authorization": "Bearer " + token})
-	defer func() { _ = enroll.Body.Close() }()
-	assert.Equal(t, http.StatusUnauthorized, enroll.StatusCode, "a forged identity_id must not reach agent self-service")
+	_ = decode(t, enroll)
+	assert.NotEqual(t, http.StatusOK, enroll.StatusCode, "a forged identity_id must not reach agent self-service")
+
+	after := get(t, adminPath("/agents/registry/"+victimID), adminHeaders())
+	afterBody := decode(t, after)
+	require.Equal(t, http.StatusOK, after.StatusCode)
+	assert.Equal(t, false, afterBody["has_public_key"], "the victim must still have no key")
 }
 
 // TestMissionID_ChainPropagation pins the issue #81 invariant: every
