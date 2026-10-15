@@ -397,7 +397,9 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		"not a URL":                 {map[string]any{"kind": "person", "issuer": "ftp://x", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
 		"HS256":                     {map[string]any{"kind": "person", "issuer": "https://hs.example", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
 		"workload with no audience": {map[string]any{"kind": "workload", "issuer": "https://na.example"}, 400, "invalid_audiences"},
-		"entra common":              {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
+		"workload that vouches for emails": {map[string]any{"kind": "workload", "issuer": "https://wt.example",
+			"audiences": []string{"a"}, "trust_email": true}, 400, "invalid_trust_email"},
+		"entra common": {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
 		"shared issuer without constraints": {map[string]any{"kind": "person", "issuer": "https://accounts.google.com",
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
 		"unreachable discovery": {map[string]any{"kind": "person", "issuer": "https://127.0.0.1:1",
@@ -980,11 +982,9 @@ func (p *p1bFixture) idJAG(t *testing.T, extra map[string]any) string {
 		"act":      map[string]any{"sub": p.clientID, "sub_profile": "ai_agent"},
 		"resource": "https://gateway.example/mcp/github", "scope": "tools:read", "jti": uid("jti"),
 	}
+	// A nil value reaches the mock as JSON null, which removes the claim:
+	// deleting it here would leave the profile's default in place.
 	for k, v := range extra {
-		if v == nil {
-			delete(claims, k)
-			continue
-		}
 		claims[k] = v
 	}
 	return p.f.mint(t, mockidp.ProfileOktaIDJAG, claims)
@@ -1018,6 +1018,45 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	p.f.mu.Unlock()
 	assert.Equal(t, p.rowID, seen.IssuerID, "the issuer row that verified the ID-JAG")
 	assert.Equal(t, zeroid.PersonGrantIDJAG, seen.GrantType)
+}
+
+// TestTrustedIssuers_TrustEmail: an issuer that vouches for its own email
+// claim (trust_email) makes a person token with an email and no
+// email_verified claim count as verified. OpenID Connect returns
+// email_verified from the UserInfo endpoint whenever the sign-in also issued
+// an access token (OIDC Core 5.4), so a directory may never put it in the
+// tokens ZeroID sees. An explicit false is never overridden.
+func TestTrustedIssuers_TrustEmail(t *testing.T) {
+	p := newP1B(t)
+	verdict := func(t *testing.T, extra map[string]any) bool {
+		t.Helper()
+		resp := p.redeem(t, p.idJAG(t, extra), nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		p.f.mu.Lock()
+		defer p.f.mu.Unlock()
+		return p.f.lastPerson.EmailVerified
+	}
+	// The mock's Okta ID-JAG asserts email_verified by default; a real Okta
+	// token carries the email without it.
+	email := map[string]any{"email": "alice@corp.example", "email_verified": nil}
+
+	status, body := p.f.call(t, http.MethodGet, "/external-issuers/"+p.rowID, nil, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.Equal(t, false, body["trust_email"], "off unless the owner turns it on")
+	assert.False(t, verdict(t, email), "off: an email with no email_verified claim is not verified")
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"trust_email": true}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.Equal(t, true, body["trust_email"])
+
+	assert.True(t, verdict(t, email), "on: the issuer vouches for its email")
+	assert.False(t, verdict(t, merged(email, map[string]any{"email_verified": false})), "an explicit false stays false")
+	assert.True(t, verdict(t, merged(email, map[string]any{"email_verified": true})), "an explicit true stays true")
+	assert.False(t, verdict(t, map[string]any{"email": nil, "email_verified": nil}), "no email: nothing to vouch for")
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"trust_email": false}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.False(t, verdict(t, email), "off again")
 }
 
 // TestFederatedPerson_StaticIssuerHasNoRowID: a static issuer has no row, so

@@ -494,7 +494,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		IssuerID:        issuerRowID(entry),
 		Subject:         userID,
 		Email:           userEmail,
-		EmailVerified:   emailVerified(rawClaims, cfg.ClaimMapping["email_verified"]),
+		EmailVerified:   issuerEmailVerified(rawClaims, cfg, userEmail),
 		ClientID:        authedClient.ClientID,
 		AgentIdentityID: identity.ID,
 	})

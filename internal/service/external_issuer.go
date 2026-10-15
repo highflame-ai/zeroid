@@ -147,6 +147,7 @@ type IssuerInput struct {
 	ClaimConstraints map[string][]string
 	MaxTokenAge      int
 	JWKSCacheTTL     int
+	TrustEmail       bool
 	Source           domain.IssuerSource
 	SourceRef        string
 	Enabled          *bool
@@ -163,6 +164,7 @@ type IssuerPatch struct {
 	ClaimConstraints *map[string][]string
 	MaxTokenAge      *int
 	JWKSCacheTTL     *int
+	TrustEmail       *bool
 	Enabled          *bool
 }
 
@@ -184,6 +186,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		ClaimConstraints:    cloneConstraints(in.ClaimConstraints),
 		MaxTokenAgeSeconds:  in.MaxTokenAge,
 		JWKSCacheTTLSeconds: in.JWKSCacheTTL,
+		TrustEmail:          in.TrustEmail,
 		Source:              in.Source,
 		SourceRef:           in.SourceRef,
 		Enabled:             in.Enabled == nil || *in.Enabled,
@@ -328,6 +331,7 @@ func staticIssuerView(c domain.ExternalIssuerConfig, accountID string) *domain.E
 		ClaimConstraints:    map[string][]string{},
 		MaxTokenAgeSeconds:  int(c.MaxTokenAge / time.Second),
 		JWKSCacheTTLSeconds: int(c.JWKSCacheTTL / time.Second),
+		TrustEmail:          c.TrustEmail,
 		Source:              domain.IssuerSourceConfig,
 		Enabled:             true,
 	}
@@ -426,7 +430,7 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 // stranded in conflict would make grants for both accounts ambiguous.
 func (p IssuerPatch) onlyNameOrDisable() bool {
 	return p.Audiences == nil && p.Algorithms == nil && p.ClaimMapping == nil && p.PropagateClaims == nil &&
-		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil &&
+		p.ClaimConstraints == nil && p.MaxTokenAge == nil && p.JWKSCacheTTL == nil && p.TrustEmail == nil &&
 		(p.Enabled == nil || !*p.Enabled)
 }
 
@@ -454,6 +458,9 @@ func applyIssuerPatch(r *domain.ExternalIssuer, p IssuerPatch) {
 	}
 	if p.JWKSCacheTTL != nil {
 		r.JWKSCacheTTLSeconds = *p.JWKSCacheTTL
+	}
+	if p.TrustEmail != nil {
+		r.TrustEmail = *p.TrustEmail
 	}
 	if p.Enabled != nil {
 		r.Enabled = *p.Enabled

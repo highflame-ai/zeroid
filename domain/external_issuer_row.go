@@ -50,28 +50,32 @@ const (
 type ExternalIssuer struct {
 	bun.BaseModel `bun:"table:external_issuers,alias:ei"`
 
-	ID                  string              `bun:"id,pk,type:uuid,default:gen_random_uuid()" json:"id"`
-	AccountID           string              `bun:"account_id,notnull"                        json:"account_id"`
-	Issuer              string              `bun:"issuer,notnull"                            json:"issuer"`
-	Kind                IssuerKind          `bun:"kind,notnull"                              json:"kind"`
-	DisplayName         string              `bun:"display_name,notnull"                      json:"display_name"`
-	JWKSURI             string              `bun:"jwks_uri,notnull"                          json:"jwks_uri"`
-	Audiences           []string            `bun:"audiences,array"                           json:"audiences"`
-	Algorithms          []string            `bun:"algorithms,array"                          json:"algorithms"`
-	ClaimMapping        map[string]string   `bun:"claim_mapping,type:jsonb,notnull"          json:"claim_mapping"`
-	PropagateClaims     []string            `bun:"propagate_claims,array"                    json:"propagate_claims"`
-	ClaimConstraints    map[string][]string `bun:"claim_constraints,type:jsonb,notnull"      json:"claim_constraints"`
-	ConstraintsKey      string              `bun:"constraints_key,notnull"                   json:"-"`
-	MaxTokenAgeSeconds  int                 `bun:"max_token_age_seconds,notnull"             json:"max_token_age_seconds"`
-	JWKSCacheTTLSeconds int                 `bun:"jwks_cache_ttl_seconds,notnull"            json:"jwks_cache_ttl_seconds"`
-	Source              IssuerSource        `bun:"source,notnull"                            json:"source"`
-	SourceRef           string              `bun:"source_ref,notnull"                        json:"source_ref"`
-	Enabled             bool                `bun:"enabled,notnull"                           json:"enabled"`
-	CreatedBy           string              `bun:"created_by,notnull"                        json:"created_by"`
-	UpdatedBy           string              `bun:"updated_by,notnull"                        json:"updated_by"`
-	CreatedAt           time.Time           `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt           time.Time           `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
-	DeletedAt           *time.Time          `bun:"deleted_at"                                json:"-"`
+	ID                 string              `bun:"id,pk,type:uuid,default:gen_random_uuid()" json:"id"`
+	AccountID          string              `bun:"account_id,notnull"                        json:"account_id"`
+	Issuer             string              `bun:"issuer,notnull"                            json:"issuer"`
+	Kind               IssuerKind          `bun:"kind,notnull"                              json:"kind"`
+	DisplayName        string              `bun:"display_name,notnull"                      json:"display_name"`
+	JWKSURI            string              `bun:"jwks_uri,notnull"                          json:"jwks_uri"`
+	Audiences          []string            `bun:"audiences,array"                           json:"audiences"`
+	Algorithms         []string            `bun:"algorithms,array"                          json:"algorithms"`
+	ClaimMapping       map[string]string   `bun:"claim_mapping,type:jsonb,notnull"          json:"claim_mapping"`
+	PropagateClaims    []string            `bun:"propagate_claims,array"                    json:"propagate_claims"`
+	ClaimConstraints   map[string][]string `bun:"claim_constraints,type:jsonb,notnull"      json:"claim_constraints"`
+	ConstraintsKey     string              `bun:"constraints_key,notnull"                   json:"-"`
+	MaxTokenAgeSeconds int                 `bun:"max_token_age_seconds,notnull"             json:"max_token_age_seconds"`
+	// TrustEmail makes the issuer vouch for its own email claim: a person
+	// token that carries an email but no email_verified claim counts as
+	// verified. An explicit email_verified=false is never overridden.
+	TrustEmail          bool         `bun:"trust_email,notnull"                       json:"trust_email"`
+	JWKSCacheTTLSeconds int          `bun:"jwks_cache_ttl_seconds,notnull"            json:"jwks_cache_ttl_seconds"`
+	Source              IssuerSource `bun:"source,notnull"                            json:"source"`
+	SourceRef           string       `bun:"source_ref,notnull"                        json:"source_ref"`
+	Enabled             bool         `bun:"enabled,notnull"                           json:"enabled"`
+	CreatedBy           string       `bun:"created_by,notnull"                        json:"created_by"`
+	UpdatedBy           string       `bun:"updated_by,notnull"                        json:"updated_by"`
+	CreatedAt           time.Time    `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt           time.Time    `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
+	DeletedAt           *time.Time   `bun:"deleted_at"                                json:"-"`
 }
 
 // IssuerBinding maps a credential's runtime subject key, under one issuer
@@ -213,6 +217,10 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	if e.Kind == IssuerKindWorkload && len(e.Audiences) == 0 {
 		return issuerInvalid("invalid_audiences", "a workload issuer needs at least one audience")
 	}
+	// Only a person token has an email to vouch for.
+	if e.TrustEmail && e.Kind != IssuerKindPerson {
+		return issuerInvalid("invalid_trust_email", "trust_email applies to a person issuer only")
+	}
 	if len(e.Audiences) > maxAudiences || slices.ContainsFunc(e.Audiences, func(a string) bool { return len(a) > MaxIssuerURLBytes }) {
 		return issuerInvalid("invalid_audiences", "at most %d audiences of at most %d bytes", maxAudiences, MaxIssuerURLBytes)
 	}
@@ -351,6 +359,7 @@ func (e *ExternalIssuer) AsConfig() ExternalIssuerConfig {
 		MaxTokenAge:     time.Duration(e.MaxTokenAgeSeconds) * time.Second,
 		JWKSCacheTTL:    time.Duration(e.JWKSCacheTTLSeconds) * time.Second,
 		ClaimMapping:    e.ClaimMapping,
+		TrustEmail:      e.TrustEmail,
 		AllowedAccounts: []string{e.AccountID},
 		PropagateClaims: slices.Clone(e.PropagateClaims),
 	}
