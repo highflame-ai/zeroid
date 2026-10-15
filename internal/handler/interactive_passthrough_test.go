@@ -86,6 +86,10 @@ func TestInteractivePassthrough_RefusedValuesDropped(t *testing.T) {
 		"too long":          {strings.Repeat("x", MaxInteractiveLoginPassthroughValueLen+1)},
 		"control character": {"p1\r\nSet-Cookie: x=y"},
 		"nul":               {"p1\x00"},
+		"invalid UTF-8":     {"p1\xff\xfe"},
+		"bidi override":     {"p1\u202egnp.exe"},
+		"zero-width joiner": {"p\u200d1"},
+		"BOM":               {"\ufeffp1"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			rt := loginRedirect(t, []string{"project_id"}, url.Values{"project_id": values})
@@ -152,5 +156,30 @@ func TestValidateInteractiveLoginPassthroughParams(t *testing.T) {
 
 	if _, err := ValidateInteractiveLoginPassthroughParams(tooMany); err == nil {
 		t.Error("more than the maximum number of names accepted")
+	}
+}
+
+// An encoded separator in the value stays inside the value: it cannot split
+// into a second parameter of return_to, and a differently-cased name is not
+// the allowlisted one.
+func TestInteractivePassthrough_EncodedSeparatorsStayInValue(t *testing.T) {
+	const smuggle = "p1&client_id=evil&redirect_uri=https://evil.example/cb#x"
+
+	rt := loginRedirect(t, []string{"project_id"}, url.Values{
+		"project_id": {smuggle},
+		"Project_ID": {"other"},
+	})
+
+	if got := rt.Get("project_id"); got != smuggle {
+		t.Errorf("project_id = %q, want %q verbatim", got, smuggle)
+	}
+
+	if rt.Get("client_id") != "c" || len(rt["client_id"]) != 1 ||
+		rt.Get("redirect_uri") != saRedirectURI || len(rt["redirect_uri"]) != 1 {
+		t.Errorf("an encoded separator split into a protocol parameter: %v", rt)
+	}
+
+	if rt.Has("Project_ID") {
+		t.Error("names are matched exactly; Project_ID is not project_id")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog/log"
 )
@@ -112,8 +113,10 @@ func ValidateInteractiveLoginPassthroughParams(names []string) ([]string, error)
 // addPassthroughParams copies each allowlisted parameter from inbound into
 // returnTo, verbatim. A parameter is copied only when it appears exactly once
 // with a non-empty value of at most MaxInteractiveLoginPassthroughValueLen
-// bytes and no control characters; otherwise it is dropped, never truncated or
-// guessed at. Dropping is not an error: the parameter is the embedder's hint,
+// bytes that is valid UTF-8 with no control or format characters; otherwise it
+// is dropped, never truncated or guessed at. Format characters (Unicode Cf:
+// bidi overrides, zero-width joiners) are refused because the login surface
+// may display the value, and they let one identifier render as another. Dropping is not an error: the parameter is the embedder's hint,
 // not part of the authorization request, and refusing the sign-in over it
 // would let a malformed hint block a login.
 //
@@ -157,8 +160,12 @@ func passthroughRefusal(values []string) string {
 		return "empty"
 	case len(values[0]) > MaxInteractiveLoginPassthroughValueLen:
 		return "too long"
+	case !utf8.ValidString(values[0]):
+		return "invalid UTF-8"
 	case strings.ContainsFunc(values[0], unicode.IsControl):
 		return "control character"
+	case strings.ContainsFunc(values[0], func(r rune) bool { return unicode.Is(unicode.Cf, r) }):
+		return "format character"
 	default:
 		return ""
 	}

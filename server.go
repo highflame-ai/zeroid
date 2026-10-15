@@ -1249,7 +1249,8 @@ const (
 //     current list unchanged.
 //   - A listed parameter is copied only when it appears exactly once with a
 //     non-empty value of at most MaxInteractiveLoginPassthroughValueLen bytes
-//     and no control characters. Anything else is dropped (and logged without
+//     that is valid UTF-8 with no control or format (bidi, zero-width)
+//     characters. Anything else is dropped (and logged without
 //     its value); the redirect still happens, because the parameter is a hint,
 //     not part of the authorization request.
 //   - ZeroID does not interpret or validate the value. It is caller input:
