@@ -181,6 +181,12 @@ type IssueRequest struct {
 	// mission). Non-empty on token_exchange — the caller has resolved the
 	// subject_token's mission and is propagating it down the chain.
 	MissionID string
+	// RefreshFamilyID records the refresh-token family this access token is
+	// issued under (authorization_code with a refresh token, refresh_token,
+	// and the external-principal exchange with a refresh token), so revoking
+	// the family also revokes the access tokens minted from it. Empty for
+	// every other issuance.
+	RefreshFamilyID string
 	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
 	// the client's DPoP public key. When non-empty, the issued JWT carries a
 	// cnf.jkt claim binding the token to that key, and token_type is returned
@@ -1008,6 +1014,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		ParentJTI:           req.ParentJTI,
 		DelegatedByWIMSEURI: req.DelegatedBy,
 		MissionID:           missionID,
+		RefreshFamilyID:     req.RefreshFamilyID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		AuditRetentionUntil: &auditRetentionUntil,
 		// Persisted for every tenant, whatever its token profile, so a chain
@@ -1107,6 +1114,37 @@ func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID,
 	}
 	s.dispatchRevocations(ctx, revoked, reason)
 	return nil
+}
+
+// RevokeByRefreshFamily revokes every active access token issued under the
+// given refresh-token family, cascading to each one's delegated descendants,
+// and returns how many credentials it revoked. Paired with revoking the
+// family's refresh tokens when a rotated refresh token is presented again
+// (RFC 9700 §4.14.2) or an authorization code is replayed (RFC 6749 §4.1.2),
+// so neither leaves the family's access tokens valid until they expire.
+//
+// Each anchor is revoked through the same cascade as RevokeCredential, so the
+// tenant guard and the RevocationNotifier fan-out are identical. An anchor
+// that has already been revoked or expired between the lookup and its revoke
+// (a concurrent cascade, say) is skipped rather than reported as an error.
+func (s *CredentialService) RevokeByRefreshFamily(ctx context.Context, familyID, reason string) (int, error) {
+	if familyID == "" {
+		return 0, nil
+	}
+	anchors, err := s.repo.ListActiveByRefreshFamily(ctx, familyID)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, a := range anchors {
+		revoked, err := s.repo.Revoke(ctx, a.ID, a.AccountID, a.ProjectID, reason)
+		if err != nil {
+			return total, err
+		}
+		s.dispatchRevocations(ctx, revoked, reason)
+		total += len(revoked)
+	}
+	return total, nil
 }
 
 // RevokeAllActiveForIdentity revokes every active credential issued to the given

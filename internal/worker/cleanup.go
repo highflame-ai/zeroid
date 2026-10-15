@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -35,6 +36,24 @@ type CleanupWorker struct {
 	expirer         IdentityExpirer
 	interval        time.Duration
 	credRetention   time.Duration
+	// refreshGrace (nanoseconds) is the configured refresh-token reuse grace
+	// window; the refresh-token sweep lags at least this far behind now.
+	// Atomic because Server.SetRefreshReuseGrace changes it at runtime.
+	refreshGrace atomic.Int64
+}
+
+// SetRefreshReuseGrace tells the worker the configured refresh-token reuse
+// grace window, so the refresh-token sweep never deletes a rotated-out row
+// reuse detection could still consult within that window.
+func (w *CleanupWorker) SetRefreshReuseGrace(d time.Duration) {
+	w.refreshGrace.Store(int64(max(d, 0)))
+}
+
+// refreshTokenRetentionLag is how far behind now the refresh-token sweep's
+// expiry cutoff sits: the configured reuse grace window, and never less than
+// domain.RefreshTokenReuseGraceWindow.
+func (w *CleanupWorker) refreshTokenRetentionLag() time.Duration {
+	return max(time.Duration(w.refreshGrace.Load()), domain.RefreshTokenReuseGraceWindow)
 }
 
 // NewCleanupWorker creates a cleanup worker with the given tick interval.
@@ -170,15 +189,16 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 
 	// Refresh tokens: under rotation every refresh inserts a successor row and
 	// revokes its predecessor, so the table grows linearly with token traffic
-	// if never swept. Delete rows whose expires_at is past the reuse-detection
-	// grace window. Reuse detection (service/refresh_token.go) consults
-	// recently-revoked rows for RefreshTokenReuseGraceWindow after revocation to
-	// distinguish a benign concurrent retry from a replay attack; lagging the
-	// cutoff by that window guarantees we never delete a row reuse detection
-	// could still need. Expiry is the bound (rotation revokes well before
-	// expires_at), so a row past expires_at - graceWindow is safe to reap.
+	// if never swept. Delete rows whose expires_at is past now minus
+	// refreshTokenRetentionLag. Reuse detection (service/refresh_token.go)
+	// looks up rotated-out rows, both to recognise a concurrent retry within
+	// the reuse grace window and to revoke the family after it. A rotated-out
+	// row keeps its original expires_at, so it remains consultable for the
+	// token's whole lifetime; the lag (never shorter than the configured grace
+	// window) keeps a row rotated just before its expiry for the whole window,
+	// and keeps the sweep from racing a lookup at the instant of expiry.
 	refreshRepo := postgres.NewRefreshTokenRepository(w.db)
-	if n, err := refreshRepo.DeleteExpired(ctx, now.Add(-domain.RefreshTokenReuseGraceWindow)); err != nil {
+	if n, err := refreshRepo.DeleteExpired(ctx, now.Add(-w.refreshTokenRetentionLag())); err != nil {
 		log.Error().Err(err).Msg("Cleanup: failed to delete expired refresh tokens")
 	} else if n > 0 {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired refresh tokens")

@@ -108,14 +108,85 @@ func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, db bun.ID
 	return token, nil
 }
 
+// RestoreClaimed reverses a committed rotation: it deletes the successor row
+// (by hash) and returns the claimed row to active. Both conditions are
+// guarded so it only ever reverses an UNUSED successor in the same family —
+// the successor must still be active, and the claimed row must still be the
+// revoked predecessor. Returns false, changing nothing, when the successor is
+// gone or no longer active (rotated onward, or its family revoked by reuse
+// detection). Must be called with a transaction so the two statements commit
+// together.
+func (r *RefreshTokenRepository) RestoreClaimed(ctx context.Context, db bun.IDB, claimedID, familyID, successorHash string) (bool, error) {
+	res, err := db.NewDelete().
+		Model((*domain.RefreshToken)(nil)).
+		Where("token_hash = ?", successorHash).
+		Where("family_id = ?", familyID).
+		Where("state = ?", domain.RefreshTokenStateActive).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete refresh token successor: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read successor delete result: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+
+	res, err = db.NewUpdate().
+		Model((*domain.RefreshToken)(nil)).
+		Set("state = ?", domain.RefreshTokenStateActive).
+		Set("revoked_at = NULL").
+		Where("id = ?", claimedID).
+		Where("family_id = ?", familyID).
+		Where("state = ?", domain.RefreshTokenStateRevoked).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to reactivate claimed refresh token: %w", err)
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to read reactivation result: %w", err)
+	}
+	if n == 0 {
+		// The successor existed but the predecessor is not in the state a
+		// rotation leaves it in. Roll the delete back rather than leave the
+		// family with no usable token.
+		return false, fmt.Errorf("claimed refresh token %s is not a revoked predecessor", claimedID)
+	}
+	return true, nil
+}
+
+// FamilyHasActiveToken reports whether the family has a token in the active
+// state. Reuse detection uses it to tell a token that was rotated out (its
+// family still has an active successor) from one revoked with its family.
+// Expiry is deliberately not checked: an expired successor still marks the
+// presented token as rotated out rather than revoked.
+func (r *RefreshTokenRepository) FamilyHasActiveToken(ctx context.Context, familyID string) (bool, error) {
+	exists, err := r.db.NewSelect().
+		Model((*domain.RefreshToken)(nil)).
+		Where("family_id = ?", familyID).
+		Where("state = ?", domain.RefreshTokenStateActive).
+		Exists(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to check refresh token family: %w", err)
+	}
+	return exists, nil
+}
+
 // DeleteExpired removes refresh-token rows whose expires_at is strictly before
-// the given cutoff. The cutoff MUST be lagged behind now by at least
-// domain.RefreshTokenReuseGraceWindow: reuse detection (see
-// service/refresh_token.go) relies on recently-revoked rows still existing so a
-// replay within the grace window is treated as a benign retry rather than a
-// family compromise. Deleting strictly by expires_at < (now - graceWindow)
-// keeps every row that reuse detection could still consult while still bounding
-// table growth under rotation. Returns the number of rows deleted.
+// the given cutoff. The cutoff MUST be lagged behind now by at least the
+// configured reuse grace window (and never less than
+// domain.RefreshTokenReuseGraceWindow): reuse detection (see
+// service/refresh_token.go) relies on rotated-out rows still existing, both to
+// recognise a concurrent retry within the grace window and to revoke the
+// family after it. A rotated-out row keeps its original expires_at, so it
+// stays consultable for the token's whole lifetime; the lag keeps a row that
+// was rotated just before it expired around for the whole grace window, and
+// keeps the sweep from racing a lookup at the instant of expiry.
+// Deleting strictly by expires_at < (now - lag) keeps every row that reuse
+// detection could still consult while still bounding table growth. Returns the number of rows deleted.
 func (r *RefreshTokenRepository) DeleteExpired(ctx context.Context, before time.Time) (int64, error) {
 	res, err := r.db.NewDelete().
 		Model((*domain.RefreshToken)(nil)).
@@ -137,20 +208,35 @@ func (r *RefreshTokenRepository) DeleteExpired(ctx context.Context, before time.
 // RevocationNotifier event per revoked token. Refresh tokens are opaque (hashed)
 // and carry no JWT id, so the row's UUID (RefreshToken.ID) serves as the stable,
 // unique revocation handle.
+//
+// The UPDATE runs twice, because one pass can race RestoreClaimed. A restore
+// deletes the unused successor and reactivates the presented token in one
+// transaction. If the first pass takes its snapshot before that transaction
+// commits, it sees the presented token as revoked (not a target) and the
+// successor as active; it blocks on the successor's row lock, finds the row
+// deleted once the restore commits, and revokes nothing — leaving the
+// presented token active in a family the caller believes is revoked. Any
+// restore that touches this family has either committed by the time the first
+// pass returns (the pass waited on its lock) or found the successor revoked
+// and changed nothing, so the second pass, with a fresh snapshot, sees every
+// row a restore reactivated. TestRefreshTokenRevokeFamilyRacingRestore forces
+// that interleaving.
 func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID string) ([]*domain.RefreshToken, error) {
-	now := time.Now()
-
 	var revoked []*domain.RefreshToken
-	err := r.db.NewUpdate().
-		Model(&revoked).
-		Set("state = ?", domain.RefreshTokenStateRevoked).
-		Set("revoked_at = ?", now).
-		Where("family_id = ?", familyID).
-		Where("state = ?", domain.RefreshTokenStateActive).
-		Returning("*").
-		Scan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)
+	for range 2 {
+		var pass []*domain.RefreshToken
+		err := r.db.NewUpdate().
+			Model(&pass).
+			Set("state = ?", domain.RefreshTokenStateRevoked).
+			Set("revoked_at = ?", time.Now()).
+			Where("family_id = ?", familyID).
+			Where("state = ?", domain.RefreshTokenStateActive).
+			Returning("*").
+			Scan(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)
+		}
+		revoked = append(revoked, pass...)
 	}
 
 	return revoked, nil

@@ -325,6 +325,20 @@ func (s *ServerConfig) GetAdminPathPrefix() string {
 	return DefaultAdminPathPrefix
 }
 
+// RefreshReuseGrace returns the configured refresh-token reuse grace window
+// (token.refresh_reuse_grace_seconds): domain.DefaultRefreshTokenReuseGraceSeconds
+// when unset, 0 when the grace is disabled. Validate rejects out-of-range
+// values; this clamps them anyway so a Config that skipped Validate can never
+// produce a negative window.
+func (t *TokenConfig) RefreshReuseGrace() time.Duration {
+	secs := domain.DefaultRefreshTokenReuseGraceSeconds
+	if t.RefreshReuseGraceSeconds != nil {
+		secs = *t.RefreshReuseGraceSeconds
+	}
+	secs = max(0, min(secs, domain.MaxRefreshTokenReuseGraceSeconds))
+	return time.Duration(secs) * time.Second
+}
+
 // DatabaseConfig holds PostgreSQL connection settings.
 type DatabaseConfig struct {
 	URL          string `koanf:"url"`
@@ -419,6 +433,24 @@ type TokenConfig struct {
 	// itself alive by self-rotating before the user must re-authenticate through
 	// the broker. 0 ⇒ the built-in default (12h).
 	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
+
+	// RefreshReuseGraceSeconds is how long after a refresh token is rotated
+	// out a second presentation of it is refused as a concurrent retry rather
+	// than treated as reuse. Within the window the rotated-out token is
+	// refused (invalid_grant) and nothing is revoked, so clients that share
+	// one refresh token across tabs or processes, and race to rotate it, keep
+	// their session. After the window, presenting it revokes the whole family
+	// and the access tokens issued from it (RFC 9700 §4.14.2). Only rotation
+	// earns the grace: a token whose family was revoked (reuse detection, RFC
+	// 7009 revocation, authorization-code replay) is refused outright.
+	//
+	// The cost: a stolen rotated-out token used within the window does not
+	// revoke the family. 0 disables the grace (strict RFC 9700). nil (unset)
+	// ⇒ domain.DefaultRefreshTokenReuseGraceSeconds, so a Config built in
+	// code without the field keeps the default rather than going strict.
+	// Validate rejects values below 0 or above
+	// domain.MaxRefreshTokenReuseGraceSeconds.
+	RefreshReuseGraceSeconds *int `koanf:"refresh_reuse_grace_seconds"`
 
 	// AuditRetentionDays is how long an issued_credentials row remains
 	// queryable AFTER the token expires. The two clocks are deliberately
@@ -603,6 +635,14 @@ func (c *Config) Validate() error {
 	// clamp via domain. 0 means "use domain.DefaultAuditRetentionDays".
 	if c.Token.AuditRetentionDays < 0 || c.Token.AuditRetentionDays > domain.MaxAuditRetentionDays {
 		return fmt.Errorf("token.audit_retention_days must be between 0 and %d, got %d: it is the delegation-graph evidence-retention window in days (0 = default %d)", domain.MaxAuditRetentionDays, c.Token.AuditRetentionDays, domain.DefaultAuditRetentionDays)
+	}
+
+	// token.refresh_reuse_grace_seconds: 0 is meaningful (grace disabled,
+	// strict RFC 9700), so only negative and over-long windows are refused. A
+	// long window is a long stretch in which a replayed refresh token does not
+	// revoke its family.
+	if g := c.Token.RefreshReuseGraceSeconds; g != nil && (*g < 0 || *g > domain.MaxRefreshTokenReuseGraceSeconds) {
+		return fmt.Errorf("token.refresh_reuse_grace_seconds must be between 0 and %d, got %d: it is how long after a refresh token is rotated a second presentation of it is refused as a concurrent retry instead of revoking the family (0 = no grace, strict RFC 9700)", domain.MaxRefreshTokenReuseGraceSeconds, *g)
 	}
 
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
@@ -910,6 +950,8 @@ func loadDefaults(k *koanf.Koanf) error {
 		// Accept-and-verify on introspect/revoke by default (dev/standalone).
 		// Validate() forces this false in production (RFC 7662/7009).
 		"token.allow_unauthenticated_token_inspection": true,
+		// Refresh-token reuse grace (seconds) after a rotation; 0 = strict.
+		"token.refresh_reuse_grace_seconds": domain.DefaultRefreshTokenReuseGraceSeconds,
 
 		// Telemetry
 		"telemetry.enabled":       false,
@@ -1018,6 +1060,9 @@ var envMapping = map[string]string{
 	// Strict client auth on introspection/revocation (RFC 7662/7009).
 	// Default true (accept-and-verify); Validate() forces false in production.
 	"ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION": "token.allow_unauthenticated_token_inspection",
+	// Seconds after a rotation in which re-presenting the rotated-out refresh
+	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
+	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
 
 	// WIMSE
 	"ZEROID_WIMSE_DOMAIN": "wimse_domain",
@@ -1091,6 +1136,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".max_ttl") ||
 			strings.HasSuffix(configPath, ".audit_retention_days") ||
 			strings.HasSuffix(configPath, ".jwks_cache_size") ||
+			strings.HasSuffix(configPath, ".refresh_reuse_grace_seconds") ||
 			strings.HasSuffix(configPath, ".shutdown_timeout_seconds"):
 			intVal, err := strconv.Atoi(value)
 			if err != nil {

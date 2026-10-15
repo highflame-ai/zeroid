@@ -131,4 +131,11 @@ type IssuedCredential struct {
 	PrincipalType PrincipalType `bun:"principal_type,type:varchar(20),nullzero" json:"principal_type,omitempty"`
 	PrincipalSub  string        `bun:"principal_sub,type:text,nullzero"         json:"principal_sub,omitempty"`
 	PrincipalIss  string        `bun:"principal_iss,type:text,nullzero"         json:"principal_iss,omitempty"`
+	// RefreshFamilyID is the refresh-token family this access token was issued
+	// under: the authorization_code exchange that started the family, every
+	// refresh_token rotation within it, and the external-principal exchange
+	// when it mints a refresh token. Revoking the family (refresh-token reuse,
+	// authorization-code replay) revokes these access tokens with it. Empty
+	// for every other grant and for rows written before migration 055.
+	RefreshFamilyID string `bun:"refresh_family_id,type:uuid,nullzero" json:"refresh_family_id,omitempty"`
 }
