@@ -1164,7 +1164,7 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
 	rp := rpClient(t, aud)
-	other := registerOAuthClient(t, uid("d13-other"), nil)
+	other := rpClient(t, uid("d13-other"))
 	idToken := func(extra map[string]any) string {
 		now := time.Now()
 		claims := map[string]any{
@@ -1176,7 +1176,7 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 		}
 		return upstream.SignToken(t, claims)
 	}
-	redeem := func(token string, client *oauthClientResp, secret string) (int, map[string]any) {
+	redeem := func(token string, client *oauthClientResp) (int, map[string]any) {
 		body := map[string]any{
 			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
 			"subject_token":      token,
@@ -1185,8 +1185,7 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 			"project_id":         fedCfg.ProjectID,
 		}
 		if client != nil {
-			body["client_id"] = client.ClientID
-			body["client_secret"] = secret
+			withClientAuth(t, body, *client)
 		}
 		resp := postFederation(t, fedHTTPSrv.URL, body)
 		var got map[string]any
@@ -1195,37 +1194,43 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 	}
 
 	t.Run("no client authentication", func(t *testing.T) {
-		status, body := redeem(idToken(nil), nil, "")
+		status, body := redeem(idToken(nil), nil)
 		assert.Equal(t, http.StatusUnauthorized, status)
 		assert.Equal(t, "invalid_client", body["error"])
 	})
-	t.Run("wrong client secret", func(t *testing.T) {
-		status, body := redeem(idToken(nil), &rp, "not-the-secret")
+	t.Run("a static issuer keeps the client's registered method, secrets included", func(t *testing.T) {
+		// ADR 0042 D3a's secret-free rule is for issuer rows; standalone
+		// ZeroID on static config keeps main's client authentication.
+		secretRP := registerOAuthClient(t, uid("d13-secret-rp"), nil)
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, secretRP.ClientID}, "azp": secretRP.ClientID}), &secretRP)
+		assert.Equal(t, http.StatusOK, status, "body=%v", body)
+		status, body = redeem(idToken(map[string]any{"aud": []string{aud, secretRP.ClientID}, "azp": secretRP.ClientID}),
+			&oauthClientResp{ClientID: secretRP.ClientID, ClientSecret: "wrong"})
 		assert.Equal(t, http.StatusUnauthorized, status)
 		assert.Equal(t, "invalid_client", body["error"])
 	})
 	t.Run("a client the token was not issued to", func(t *testing.T) {
-		status, body := redeem(idToken(nil), &other, other.ClientSecret)
+		status, body := redeem(idToken(nil), &other)
 		assert.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, "invalid_grant", body["error"])
 	})
 	t.Run("azp names a different party", func(t *testing.T) {
-		status, body := redeem(idToken(map[string]any{"azp": other.ClientID}), &rp, rp.ClientSecret)
+		status, body := redeem(idToken(map[string]any{"azp": other.ClientID}), &rp)
 		assert.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, "invalid_grant", body["error"])
 	})
 	t.Run("several audiences and no azp", func(t *testing.T) {
-		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}}), &rp, rp.ClientSecret)
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}}), &rp)
 		assert.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, "invalid_grant", body["error"])
 	})
 	t.Run("the relying party, authenticated", func(t *testing.T) {
-		status, body := redeem(idToken(nil), &rp, rp.ClientSecret)
+		status, body := redeem(idToken(nil), &rp)
 		require.Equal(t, http.StatusOK, status, "body=%v", body)
 		assert.Equal(t, rp.ClientID, decodeIssuedTokenClaims(t, body["access_token"].(string))["client_id"])
 	})
 	t.Run("several audiences with azp naming the relying party", func(t *testing.T) {
-		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}, "azp": aud}), &rp, rp.ClientSecret)
+		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}, "azp": aud}), &rp)
 		assert.Equal(t, http.StatusOK, status, "body=%v", body)
 	})
 }

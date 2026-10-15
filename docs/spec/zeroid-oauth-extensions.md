@@ -296,7 +296,10 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   root workload — and is fixed for the life of the chain, through every
   exchange and refresh (RFC 9068 §2.2). `principal_type` says which. A user
   principal also carries `user_id_iss`, its issuer: the upstream IdP's for a
-  federated user, otherwise ZeroID's own, forming an RFC 9493 `iss_sub` pair.
+  federated user whose `sub` is the IdP subject, otherwise ZeroID's own
+  (including a federated person a person resolver mapped to the deployer's
+  user, whose IdP pair is in `user_idp_iss`/`user_idp_sub`), forming an RFC 9493
+  `iss_sub` pair.
 - `act` is the **current actor**, with prior actors nested inside it, most
   recent first:
   `{"sub": "<C>", "identity_type": "agent", "trust_level": "...", "external_id": "<c>", "act": {"sub": "<B>", "act": {"sub": "<A>"}}}`.
@@ -357,7 +360,8 @@ broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
 |---|---|---|---|
 | `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
 | `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
-| `user_id_iss` | string | upstream `iss` | **IdP-granular provenance** — the issuer URL of the upstream OpenID Provider that authenticated the subject, copied verbatim from the verified ID token. Only on the `external_id_token` path (Section 5.6). Lets a consumer answer "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). Reserved (Section 8) so a caller cannot forge it. |
+| `user_id_iss` | string | issuer of `sub` | The issuer of the person in `sub`, forming an RFC 9493 `iss_sub` pair with it. On the ID-JAG and `external_id_token` paths with no person resolver (static issuers), `sub` is the IdP subject and this is the upstream IdP's `iss`, copied from the verified token: **IdP-granular provenance** that answers "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). With a person resolver, `sub` is the deployer's user and this is ZeroID's issuer, and the IdP's pair is in `user_idp_iss`/`user_idp_sub` instead. Under `rfc8693` every user-subject token carries it (ZeroID's issuer for a locally resolved person, e.g. `authorization_code`), and exchanged tokens keep their parent's. Reserved (Section 8) so a caller cannot forge it. |
+| `user_idp_iss` / `user_idp_sub` | string | upstream `iss` / user key | The person's pair at the IdP — its issuer, and the subject the issuer's `claim_mapping.user_id` names (e.g. Entra `oid`, Okta `sub`) — when the deployer's person resolver mapped them to its own user. `sub` is then that user and `user_id_iss` ZeroID's issuer, so `user_id_iss` always names `sub`'s issuer. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
 | `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
 | `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
 | `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
@@ -473,6 +477,19 @@ Each exchange increments `delegation_depth` by 1 relative to the subject token.
 The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
+
+Under the `rfc8693` profile, an exchange whose actor already **is** the subject
+token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
+delegation: the actor replaces itself as the current actor rather than
+nesting, and `delegation_depth` does not increase. The legacy profile is
+frozen (ADR 0043 D1) and delegates on every exchange as before. This is the agent narrowing the person
+token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
+still links the child for cascade revocation.
+
+The principal's IdP pair, `user_idp_iss` and `user_idp_sub` (Section 4.6), is copied from
+the verified subject token onto every exchanged token whose `sub` is that
+person (`rfc8693`), like `user_id_iss`; it describes the principal, never an
+actor, and remains reserved.
 
 ### 5.3 NHI delegation requires an actor proof-of-possession
 
@@ -591,14 +608,18 @@ A request selects this mode with `subject_token_type =
 urn:ietf:params:oauth:token-type:id_token` and `subject_token` set to the
 upstream ID token. The mode:
 
-- Is gated by a deployer-configured allowlist of **external issuers**
-  (`external_issuers`), keyed by the upstream `iss`. A token whose `iss` is not
-  configured **MUST** be rejected (`invalid_request`). The
+- Is gated by trusted **external issuers** (the static `external_issuers` list,
+  or per-account issuer rows), keyed by the upstream `iss`. The client is
+  authenticated first; a token whose `iss` is not trusted, or names a disabled
+  or workload issuer, **MUST** be rejected with one generic `invalid_grant`, so
+  an unverified token cannot reveal which issuers are trusted. The
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
   here — the JWKS signature check, issuer allowlist, audience binding and
   client binding below *are* the trust anchor.
 - **MUST** authenticate the redeeming client (absent client credentials →
-  `invalid_client`), through the same client authentication as ID-JAG, and
+  `invalid_client`) with its registered method; with per-account issuer rows
+  only `private_key_jwt` is accepted and a client secret is `invalid_client`
+  (ADR 0042 D3a); static issuers (standalone) keep secrets. And
   **MUST** redeem only for the relying party the ID token was issued to (OpenID
   Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
   token's `aud` values, `azp`, if present, must equal it, and a token with
@@ -610,15 +631,35 @@ upstream ID token. The mode:
 - **MUST** verify the ID token's signature against the issuer's JWKS (fetched
   from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
   absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
-  matched issuer), `aud` (equal to the issuer's configured `audience`), `exp`,
-  `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
+  matched issuer), `aud` (naming one of the issuer's configured audiences),
+  `exp`, `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
   library honors but does not require them). A 60-second clock skew is tolerated.
+- **MUST** accept only a token that is positively an ID token: `iss`, `sub`,
+  `aud`, `exp` and `iat` present, and no access-token marker (`scp`, `scope`,
+  Entra's `azpacr`/`appidacr`, or a JWS `typ` of `at+jwt` / `application/at+jwt`
+  (RFC 9068 §2.1) or `oauth-id-jag+jwt`). Together
+  with the relying-party check above this separates an ID token from an access
+  token a trusted issuer also signs.
+- **MUST** accept only an issuer of kind `person`, and refuse a workload
+  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID,
+  a GitHub Actions `repo:` subject)
+  with `invalid_grant`, since the minted token carries `principal_type=user`.
 - **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
   Section 7.2) and outside the issuer's configured `algorithms` (default
   `RS256`, `ES256`, `PS256`); `none` and HMAC are rejected.
 - Caps replay: the ID token's `iat` **MUST** be within the issuer's
   `max_token_age` (default 10 minutes).
-- Binds the upstream token to a ZeroID tenant via the issuer's
+- With per-account issuer rows (`federation.issuer_store=db`), derives the
+  tenant instead: the account from the issuer row, the project from the agent
+  identity the authenticated client is bound to, and a caller-supplied
+  `account_id`/`project_id` that differs is `invalid_grant`. The bound agent is
+  the current actor in `act`, and the deployer's person resolver must find the
+  person in the account; the token's `sub` is the resolved user, its
+  `user_id_iss` is ZeroID's issuer, and the IdP's issuer and subject are carried
+  in the reserved `user_idp_iss` and `user_idp_sub` claims. See
+  [external-issuers.md](../external-issuers.md).
+- With a static issuer (standalone), binds the upstream token to a ZeroID
+  tenant via the issuer's
   **`allowed_accounts`** — a **REQUIRED, non-empty** list; the request's
   `account_id` **MUST** appear in it. Because the ID token's `aud` binds it to
   ZeroID-the-RP (not to a tenant) and `account_id` is caller-supplied on the
@@ -627,7 +668,8 @@ upstream ID token. The mode:
   `allowed_accounts` at config load (fail closed).
 - Maps the principal from the issuer's `claim_mapping` (`user_id` REQUIRED,
   becomes `sub`; OPTIONAL `email`, `name`).
-- Emits `token_exchange=external_id_token` and `user_id_iss=<upstream iss>`, and
+- Emits `token_exchange=external_id_token` and, unless a person resolver mapped
+  `sub` to the deployer's user, `user_id_iss=<upstream iss>`, and
   propagates `auth_time`/`acr`/`amr` per the issuer's `propagate_claims`
   (Section 4.6). Is RS256-signed with a short (900 s) TTL and is governed by the
   tenant credential-policy ceiling (the tenant default policy when no
@@ -779,7 +821,7 @@ scopes grant_type delegation_depth user_email user_name
 # RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
 resource client_id scope may_act
 # ZeroID internal / provenance
-act token_exchange trusted_by user_id_iss mission_id principal_type
+act token_exchange trusted_by user_id_iss user_idp_iss user_idp_sub mission_id principal_type
 # RFC 9449 sender-constraint
 cnf
 # RFC 8707 resource binding, RFC 9068 client attribution
@@ -1417,6 +1459,7 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `token_exchange` | string | §4.6, §4.7 |
 | `trusted_by` | string | §4.6 |
 | `user_id_iss` | string | §4.6, §5.6 |
+| `user_idp_iss` `user_idp_sub` | string | §4.6, §5.6 |
 | `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |

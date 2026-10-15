@@ -58,6 +58,22 @@ var (
 	// resolver_error), grant_type, account_id, project_id. Exported to
 	// Prometheus as zeroid_person_scope_ceiling_total.
 	PersonScopeCeiling metric.Int64Counter
+
+	// FederationUnmatchedAgent counts federated person grants refused
+	// because no enabled credential binding maps the agent, or the presenting
+	// client is registered to a different identity (ADR 0042 D6, ADR 0027).
+	// Attributes: account_id, grant_type, reason.
+	FederationUnmatchedAgent metric.Int64Counter
+
+	// FederationAgentNotAdopted counts federated grants refused because the
+	// bound agent is not active (ADR 0042 D7): the adoption queue's demand.
+	// Attributes: account_id, grant_type, status.
+	FederationAgentNotAdopted metric.Int64Counter
+
+	// FederationIssuerRefused counts person grants whose token issuer was
+	// unknown, a workload issuer, disabled, or matched no single row. The
+	// wire answer is one generic invalid_grant. Attribute: reason.
+	FederationIssuerRefused metric.Int64Counter
 )
 
 func init() {
@@ -98,6 +114,15 @@ func registerInstruments(m metric.Meter) {
 	)
 	PersonScopeCeiling, _ = m.Int64Counter("zeroid.person.scope_ceiling",
 		metric.WithDescription("Person mints the person-grant ceiling narrowed or refused (counted in shadow and enforce), or whose resolver failed"),
+	)
+	FederationUnmatchedAgent, _ = m.Int64Counter("zeroid.federation.unmatched_agent",
+		metric.WithDescription("Federated grants refused because no enabled binding maps the agent, or its client is bound elsewhere"),
+	)
+	FederationAgentNotAdopted, _ = m.Int64Counter("zeroid.federation.agent_not_adopted",
+		metric.WithDescription("Federated grants refused because the bound agent identity is not active"),
+	)
+	FederationIssuerRefused, _ = m.Int64Counter("zeroid.federation.issuer_refused",
+		metric.WithDescription("Federated person grants refused at issuer resolution, by reason"),
 	)
 }
 

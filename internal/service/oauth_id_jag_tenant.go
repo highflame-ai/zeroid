@@ -113,8 +113,9 @@ func deriveIDJAGTenant(
 	return derived, nil
 }
 
-// cimdClientTenant would read a CIMD client's tenant. Today there is nothing
-// to read it from, so it always refuses.
+// cimdClientTenant would read a CIMD client's tenant from a static issuer,
+// which has no bindings, so it always refuses. Issuer rows bind the agent
+// through act.sub instead (bindFederatedAgent), which serves a CIMD client.
 //
 // ADR 0042 D5 takes the project for this path from "the identity the
 // credential maps to", and D6 says a CIMD client's credential maps to an

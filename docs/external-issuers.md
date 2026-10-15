@@ -1,0 +1,453 @@
+# Trusted issuers
+
+ZeroID accepts tokens from a customer's IdP on two person grants: an ID-JAG redeemed with `jwt-bearer` (P1b) and an OpenID Connect ID token exchanged with RFC 8693 (P1c).
+The IdP has to be a **trusted issuer**.
+This page is the reference for how trusted issuers are stored, how the two grants use them, and the admin API that manages them.
+The design is highflame-architecture ADR 0042 (D3a, D4, D4a, D5, D5a, D6, D7); the capability is CAP-IDN-028 and the invariant INV-IDN-014.
+
+## Two stores
+
+`federation.issuer_store` chooses where trusted issuers come from.
+
+| Value | Source | Tenant on the grants | For |
+|---|---|---|---|
+| `config` (default) | The static `external_issuers` list | ID-token exchange: the caller's `account_id`/`project_id`, inside the entry's `allowed_accounts`. ID-JAG: the authenticated client's linked identity, inside `allowed_accounts` | Standalone ZeroID |
+| `db` | Per-account rows, managed through the admin API below | Derived from the issuer row and the agent's binding; a caller-supplied tenant must match | SaaS (AuthN) |
+
+ZeroID refuses to start with `issuer_store: db` and a non-empty `external_issuers`, so trust never comes from two lists.
+
+```yaml
+federation:
+  issuer_store: db                 # Env: ZEROID_FEDERATION_ISSUER_STORE
+  allow_private_endpoints: false   # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS
+  shared_issuers: []               # [{issuer, pin_claim}]; empty = the built-in list below
+```
+
+`allow_private_endpoints` relaxes the SSRF guard on issuer rows' discovery and JWKS fetches and admits `http` issuer and JWKS URLs.
+It exists for local development against `cmd/zeroid-mockidp` and is a deployment setting, never a row field.
+Production keeps it false.
+Static entries keep their own `allow_private_endpoints`.
+
+## Issuer rows
+
+A row (`external_issuers`, migration 056) belongs to one account and holds:
+
+| Field | Meaning |
+|---|---|
+| `issuer` | The `iss` tokens carry, matched exactly. https. |
+| `kind` | `person`: an IdP whose ID-JAGs and ID tokens name people. `workload`: a client-assertion issuer (P2, not yet accepted by any grant). |
+| `jwks_uri` | Never supplied by the caller. ZeroID reads it from the issuer's OpenID discovery document, `{issuer}/.well-known/openid-configuration`, whose `issuer` must equal the row's issuer exactly (OpenID Connect Discovery §4.3); both fetches go through the SSRF-guarded client. It changes only through `POST /external-issuers/{id}/refresh`, which re-reads discovery. A caller-chosen key set would let an admin sign tokens for anyone their IdP's issuer names. |
+| `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
+| `algorithms` | A subset of RS256, ES256, PS256. |
+| `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `role`, `privilege_scope`, `scope`, `trust_level`. |
+| `propagate_claims` | A subset of `auth_time`, `acr`, `amr`. |
+| `claim_constraints` | Claim to accepted values. Every listed claim must be present and equal one of its values (for an array claim, contain one). Required on a shared issuer. |
+| `max_token_age_seconds` | 1 to 3600, default 600. |
+| `jwks_cache_ttl_seconds` | 30 to 86400, default 300. |
+| `source`, `source_ref` | `admin`, or `connector` with the connector that created the row. |
+| `enabled` | A disabled row refuses every token at the next request. |
+
+### Who may hold an issuer
+
+- An issuer unique to one customer (an Entra tenant, an Okta org, an AWS account's STS issuer, a cluster, a SPIFFE trust domain) is trusted by **one account at most**, whatever its claim constraints.
+- Only an issuer on the platform's shared list may appear in several accounts.
+  The list names, for each shared issuer, one **pinning claim** whose value says which customer a token belongs to.
+  Every row on a shared issuer must constrain that claim; its other constraints only narrow the row.
+  Two rows of the same kind, in any accounts, must not share a pinning value, and at a grant the token's pinning claim must be a single string (an array matches no row), so one token can never match two rows.
+  Pinning only on the configured claim stops a first row on a near-universal claim (GitHub `event_name`, Entra `ver`) from blocking every other account, and array claims (`groups`) from making grants ambiguous.
+- Constraints on claims every token carries (`iss`, `aud`, `exp`, `iat`, `nbf`, `jti`) are refused: they pin nothing.
+- An issuer has at most one row per kind in its account, so an Entra tenant can be both the account's `person` issuer and its `workload` issuer.
+- The Microsoft personal-account tenant (`9188040d-6c67-4c5b-b112-36a304b66dad`) belongs to no customer and cannot be trusted by any account.
+
+Issuers are compared without trailing slashes, so `https://acme.okta.com/` and `https://acme.okta.com` are one issuer; a token's `iss` is still matched against the row exactly.
+Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the pinning claim's values for a shared one.
+
+**Known limitation.** Nothing proves that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
+
+The built-in shared list (used when `federation.shared_issuers` is empty):
+
+| Issuer | Pinning claim |
+|---|---|
+| `https://accounts.google.com` | `hd` |
+| `https://token.actions.githubusercontent.com` (workload only) | `repository_owner_id` |
+
+Entra is not on it.
+Every Entra token carries its tenant's own issuer, `https://login.microsoftonline.com/<tenant-id>/v2.0`, and the multi-tenant endpoints (`common`, `organizations`, `consumers`) publish a templated issuer (`…/{tenantid}/v2.0`) in discovery, so a row on one could never pass the exact discovery match; they are refused for every kind.
+A customer with several Entra tenants adds each tenant's issuer as its own (customer-unique) row.
+
+`federation.shared_issuers` replaces it, as a list of `{issuer, pin_claim}`; ZeroID refuses to start if an entry lacks a pinning claim, pins `iss`, `aud`, `exp`, `iat`, `nbf` or `jti`, or is not https (http is admitted only with `federation.allow_private_endpoints`, for a local mock IdP).
+
+Every row refuses a templated issuer (`{tenantid}`) and Entra's multi-tenant endpoints, which name no single tenant.
+A person row also refuses an issuer that only issues workload tokens (GitHub Actions, `https://token.actions.githubusercontent.com`).
+
+### Presets
+
+`preset` fills only the fields the request leaves unset, except the identity claims, which it pins: a request naming another claim for `user_id`, `email` or `email_verified` is refused (`invalid_claim_mapping`).
+
+| Preset | Issuer | Fills |
+|---|---|---|
+| `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, and the constraint `tid: [<tid>]` |
+| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name` |
+| `generic` or absent | any | nothing |
+
+The user key is `oid` for Entra because Entra's `sub` is pairwise per application, so one person would carry a different `sub` in every agent's app.
+For `email_verified` on Entra, ask the customer to emit the optional claims `email` and `xms_edov`.
+
+### Read live
+
+On every federated grant ZeroID reads the issuer's rows with one indexed query and caches no row, so a disable or delete applies at the next request on every replica.
+Only JWKS clients are cached: shared by every row with the same `(jwks_uri, jwks_cache_ttl_seconds)`; created on first use, with one fetch however many requests race for a cold key set; a use by an account is dropped after 30 idle minutes and a client with no users is closed; capped at 20 per account (evicting only that account's use of a shared client) and 1000 in total.
+A refresh triggered by an unknown `kid` is single-flight and at most one per 10 seconds per key set, since the kid comes from an unverified token.
+Tokens already issued under a deleted row live out their 15 minutes; bulk revocation on delete is ADR 0042 open question 6.
+
+## Bindings
+
+A binding (`external_issuer_bindings`) maps `(issuer row, subject key)` to one identity in the row's account (ADR 0042 D6).
+The subject key is the value the credential carries at runtime:
+
+| Grant | Subject key |
+|---|---|
+| ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP |
+| ID-token exchange (P1c) | the presenting client's `client_id`, which is the ID token's `aud` |
+
+At most one **enabled** binding may exist per `(issuer row, subject key)`.
+A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
+ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an agent's bindings when an org admin adopts or activates it.
+Each binding carries `explicitly_disabled`: true when an admin disabled it (`PATCH {"enabled": false}`) or created it with `"enabled": false`, false when it is disabled only because its identity was not active yet.
+At adoption the deployer enables bindings with the conditional PATCH below, which skips any with `explicitly_disabled: true`, so adoption never undoes an admin's decision; a plain `PATCH {"enabled": true}` clears it.
+Until then the mint refuses it as not adopted (D7), naming the state.
+
+## The person grants with issuer rows
+
+Both grants resolve the issuer first: the token's `iss` must have an **enabled `person`** row whose claim constraints the token satisfies.
+The client authenticates first; nothing about the token's issuer is looked up for an anonymous caller.
+Every issuer refusal (unknown, workload row, disabled row, no or several rows matching its constraints) is then the same `invalid_grant` ("…'s issuer is not trusted for this grant"), since the token is not verified yet and a distinct answer would tell a probe which IdPs are trusted.
+The reason is logged as `federation_issuer_refused` and counted in `zeroid.federation.issuer_refused{reason}`.
+This also applies to static issuers, where an unknown issuer on the ID-token exchange used to be `invalid_request`.
+The token's `aud` must name an accepted audience: on the ID-token exchange the presenting client's `client_id` when an enabled binding on the row has it as subject key, on ID-JAG ZeroID's issuer, and on both any value in the row's `audiences`.
+
+### P1c: the ID-token exchange
+
+```
+POST /oauth2/token
+  grant_type         = urn:ietf:params:oauth:grant-type:token-exchange
+  subject_token      = <the person's ID token>
+  subject_token_type = urn:ietf:params:oauth:token-type:id_token
+  client_id          = <the agent's app id at the IdP>
+  client_assertion_type = urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+  client_assertion   = <private_key_jwt>
+  resource           = <optional; audience-restricts the token>
+  scope              = <optional>
+```
+
+All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_grant` (`invalid_client` for client authentication):
+
+1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
+   This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
+   Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
+   The `aud` is accepted because it names the presenting `client_id`, which must then be the subject key of an enabled binding on the row (rule 4; the binding is the audience rule), or because it is in the row's `audiences`.
+2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker: no `scp`, `scope`, `azpacr` or `appidacr` (Entra stamps one of the last two on every access token, app-only ones included), and no `typ` of `at+jwt`, `application/at+jwt` or `oauth-id-jag+jwt`.
+   `roles` alone is not a marker: Entra ID tokens carry a user's app roles in it.
+3. The issuer row is `person`, and the subject is not a workload (static issuers too): no Entra `idtyp=app`, no `system:serviceaccount:` subject, no SPIFFE ID, no GitHub Actions `repo:` subject.
+4. An enabled binding maps the client's `client_id` under the row to an identity, which is the agent.
+   If the client's registration links an identity, it must be that one.
+   The account is the row's and the project is the agent's; a request's `account_id`, `project_id` or `application_id` must match.
+5. The person resolver finds the person in the account (below).
+6. The agent is `active` (D7).
+
+The token's `sub` is the person's user id with `user_id_iss` ZeroID's issuer, the IdP's pair is in `user_idp_iss` and `user_idp_sub`, `principal_type` is `user`, the agent is the current actor in `act`, `client_id` is the presenting client, and `resource` audience-restricts it.
+
+### P1b: ID-JAG
+
+The request is unchanged ([identity-model.md](identity-model.md#enterprise-managed-authorization-id-jag)).
+Its `aud` must name ZeroID's issuer (draft §4.3); the row's `audiences` play no part.
+With issuer rows the agent is the ID-JAG's `act.sub` mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
+A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
+The subject must not be a workload, and checks 4 to 6 above apply.
+Every check, including person resolution, runs before the ID-JAG's `jti` is consumed, after the replay check, so a refused request leaves the grant redeemable.
+
+### Refusals that are events
+
+- **Unmatched agent** (ADR 0027): no `act.sub`, no binding, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
+  On both grants the binding is read only after the token's signature and the checks that need no binding have passed, so a forged token raises no event under an account and learns nothing of its bindings.
+  Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
+- **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
+
+ZeroID has no event bus; an embedder that needs ADR 0027 findings reads these.
+
+## Person resolution
+
+```go
+srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPersonRequest) (string, error) {
+	// r.GrantType        zeroid.PersonGrantIDJAG or zeroid.PersonGrantExternalIDToken
+	// r.AccountID, r.ProjectID   the tenant the token is minted into
+	// r.Issuer, r.Subject        the IdP and the person's user key (claim_mapping.user_id)
+	// r.IssuerID                 the issuer row that verified the token ("" for a static issuer)
+	// r.Email, r.EmailVerified   the mapped email, and whether the IdP asserted it verified
+	// r.ClientID, r.AgentIdentityID
+	return highflameUserID, nil // or zeroid.ErrPersonNotMember
+})
+```
+
+- The returned id becomes the token's `sub`.
+  `user_id_iss` keeps meaning "the issuer of `sub`", so it becomes ZeroID's own issuer, as on `authorization_code` and the external-principal exchange (under the `rfc8693` profile; the legacy profile emits no `user_id_iss` for such a `sub`).
+  The IdP's pair travels together in the reserved claims `user_idp_iss` (the IdP's issuer) and `user_idp_sub` (the user key).
+  They are prefixed `user_` because they describe the person, and to stay clear of the agent's own IdP provenance (`agent_idp_iss`), which Shield projects as `principal.idp_iss`.
+  All three are written after caller-supplied claims, so no caller can set them.
+- Key links on `IssuerID` as well as `(Issuer, Subject)`: a row deleted and added again gets a new id, so its people re-link on first sight under the new row's rules and never inherit links made under the old one (whose claim mapping may have differed).
+- `ErrPersonNotMember` is `invalid_grant` ("the person is not a member of this organization").
+- Any other error, an empty id or a panic is `server_error` with a fixed message; the cause is logged, never returned.
+  Each call is bounded at 5 seconds.
+- With issuer rows a resolver is required: without one the grants answer `server_error` ("person resolution is not configured").
+  With static issuers and no resolver, `sub` stays the IdP subject, `user_id_iss` is the IdP's issuer, and there is no `user_idp_iss` or `user_idp_sub`.
+
+The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceiling)) then sees the resolved user id.
+
+When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so under the `rfc8693` profile the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
+The legacy profile is frozen (ADR 0043 D1): there the exchange delegates as before, adding a level.
+`user_idp_iss` and `user_idp_sub` travel with `sub` onto every exchanged `rfc8693` token; a different agent becomes a new actor level as usual.
+
+## Admin API
+
+The routes are on the admin router (`server.admin_path_prefix`), behind the deployer's admin authentication.
+The account is always the caller's tenant: `TenantContextMiddleware` reads `X-Account-ID` and `X-Project-ID` (both required; the project is not used for issuer rows).
+`X-User-ID` names the actor, recorded as `created_by`/`updated_by` and in `identity_audit_logs`.
+Another account's rows answer 404.
+In AuthN these routes are reached only through Admin, which checks the org role and forwards with its verified tenant (ADR 0042 D4a).
+
+### Errors
+
+Every refusal is an RFC 9457 problem with a stable `code`:
+
+```json
+{"status": 409, "title": "Conflict", "detail": "this issuer is already trusted and cannot be added again", "code": "issuer_already_trusted"}
+```
+
+| Status | `code` | When |
+|---|---|---|
+| 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
+| 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 401 | `unauthorized` | No tenant context |
+| 404 | `not_found` | No such row or binding in this account |
+| 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
+| 409 | `issuer_limit_reached` | The account has 20 issuers |
+| 409 | `issuer_store_config` | Any route but the list and `/check` on a `config`-mode server |
+| 409 | `binding_conflict` | Another enabled binding maps this subject key under this issuer |
+| 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
+| 409 | `binding_explicitly_disabled` | A conditional enable of a binding an admin disabled |
+| 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
+| 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
+| 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
+| 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
+| 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri` |
+| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned) |
+| 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
+| 422 | `shared_issuer_requires_constraints` | A shared-issuer row that does not constrain its pinning claim |
+| 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
+| 422 | `issuer_is_self` | The issuer is ZeroID's own (`token.issuer`, compared without trailing slashes); static `external_issuers` listing it are refused at boot |
+| 422 | `identity_not_found` | `identity_id` names no identity in this account |
+| 422 | `identity_has_no_public_key` | `oauth_client` was requested but the identity has no EC P-256 key |
+| 500 | `internal_error` | Anything else |
+
+Sizes: `issuer` and each audience at most 2000 bytes, at most 50 audiences, `subject_key` at most 2000 bytes, claim names at most 128 bytes, at most 20 constrained claims with at most 50 values of at most 256 bytes each.
+
+A malformed body (wrong type, unknown field, missing `kind`/`issuer`) is huma's own 422 `application/problem+json` with `errors[]` and no `code`.
+
+### `GET /external-issuers`
+
+```json
+{
+  "issuer_store": "db",
+  "items": [ <issuer>, ... ]
+}
+```
+
+On a `config` server the items are the static entries that admit the account, with `source: "config"` and an empty `id`; they are read-only.
+
+### `POST /external-issuers` → 201
+
+```json
+{
+  "preset": "entra",
+  "kind": "person",
+  "issuer": "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0",
+  "display_name": "Contoso Entra",
+  "audiences": [],
+  "algorithms": ["RS256"],
+  "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
+  "propagate_claims": ["auth_time"],
+  "claim_constraints": {"tid": ["11111111-2222-3333-4444-555555555555"]},
+  "max_token_age_seconds": 600,
+  "jwks_cache_ttl_seconds": 300,
+  "source": "admin",
+  "source_ref": "",
+  "enabled": true
+}
+```
+
+Only `kind` and `issuer` are always required; `claim_mapping.user_id` (person) is required unless a preset fills it, and `audiences` is required on a workload row.
+`jwks_uri` is not accepted (422, an unknown field): it comes from the issuer's discovery document.
+A person row needs no audiences: add each agent with a binding (below), whose subject key is its app id.
+The discovery document and the JWKS are fetched before the row is written; a refusal is a 422 with a `discovery_*` or `jwks_*` code.
+The response is the issuer:
+
+```json
+{
+  "id": "6f1d...",
+  "account_id": "acct_123",
+  "issuer": "https://login.microsoftonline.com/1111.../v2.0",
+  "kind": "person",
+  "display_name": "Contoso Entra",
+  "jwks_uri": "https://login.microsoftonline.com/1111.../discovery/v2.0/keys",
+  "audiences": [],
+  "algorithms": ["RS256"],
+  "claim_mapping": {"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "name"},
+  "propagate_claims": [],
+  "claim_constraints": {"tid": ["1111..."]},
+  "max_token_age_seconds": 600,
+  "jwks_cache_ttl_seconds": 300,
+  "source": "admin",
+  "source_ref": "",
+  "enabled": true,
+  "created_by": "user_abc",
+  "updated_by": "user_abc",
+  "created_at": "2026-10-15T10:00:00Z",
+  "updated_at": "2026-10-15T10:00:00Z",
+  "jwks_check": {"reachable": true, "key_count": 2, "kids": ["k1", "k2"], "checked_at": "2026-10-15T10:00:00Z"}
+}
+```
+
+### `GET /external-issuers/{id}` → 200
+
+The issuer, without `jwks_check`.
+
+### `PATCH /external-issuers/{id}` → 200
+
+Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `enabled`; absent fields are unchanged.
+`issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
+Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
+A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
+The whole row is re-validated and re-checked for uniqueness, except for a patch that changes only `display_name` and/or disables the row, so rows stay manageable when the deployment's rules move under them (an issuer dropped from the shared list leaves rows in several accounts that can still be renamed and disabled).
+Any patch that enables a row is re-checked, so a row stranded in conflict cannot be re-enabled.
+
+### `POST /external-issuers/{id}/refresh` → 200
+
+Re-reads the issuer's discovery document and, when it names a different `jwks_uri`, probes that key set and moves the row to it.
+The response is the issuer with `jwks_check`; a discovery or key-set refusal is the same 422 as on create.
+
+### `DELETE /external-issuers/{id}` → 204
+
+Soft-deletes the row and its bindings (`deleted_at`; audited as `DELETE_*`).
+They disappear from every read and grant at once, and stop holding the issuer: the same account, or another, may trust it again.
+An identity that is hard-deleted (only a purge of a never-adopted discovered identity does that) takes its bindings with it.
+
+### `POST /external-issuers/check` → 200
+
+```json
+{"issuer": "https://acme.okta.com"}
+```
+
+Runs what a create would fetch: the discovery document, then the key set it names.
+The answer is a probe result, never an upstream body:
+
+```json
+{"jwks_uri": "https://acme.okta.com/oauth2/v1/keys", "reachable": true, "key_count": 1, "kids": ["k1"], "checked_at": "..."}
+{"reachable": false, "key_count": 0, "kids": [], "error": "discovery_issuer_mismatch", "checked_at": "..."}
+```
+
+`error` is one of the `discovery_*` or `jwks_*` codes above.
+Only an invalid issuer URL is a 400.
+
+### `GET /external-issuers/bindings` → 200
+
+The account's bindings across all its issuers, in one query.
+`?identity_id=<uuid>` returns only that identity's, which is how to answer "which credentials map to this agent" without walking every issuer.
+
+```json
+{"items": [ <binding>, ... ]}
+```
+
+A malformed `identity_id` is 400 `invalid_identity_id`; on a `config` server the route answers `issuer_store_config`.
+
+### `GET /external-issuers/{id}/bindings` → 200
+
+One issuer's bindings; takes the same `?identity_id=` filter.
+
+```json
+{"items": [ <binding>, ... ]}
+```
+
+### `POST /external-issuers/{id}/bindings` → 201
+
+```json
+{
+  "subject_key": "<agent app id, or the ID-JAG act.sub>",
+  "identity_id": "<agent identity uuid in this account>",
+  "enabled": true,
+  "oauth_client": {"client_id": "optional, defaults to subject_key"}
+}
+```
+
+`oauth_client` also creates the OAuth client the agent presents on P1b/P1c, unless it exists already linked to this identity with `private_key_jwt`:
+`client_id` as given, `token_endpoint_auth_method: private_key_jwt`, `jwks` built from the identity's registered EC P-256 public key (kid = the identity id), grant types `token-exchange` and `jwt-bearer`, and `identity_id` = the agent.
+It is created in the same transaction as the binding.
+On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` claim must equal the authenticated client, so set `client_id` to that value when it differs from `act.sub`.
+
+```json
+{
+  "id": "b7c2...",
+  "account_id": "acct_123",
+  "issuer_id": "6f1d...",
+  "subject_key": "<agent app id>",
+  "identity_id": "9a0e...",
+  "enabled": true,
+  "explicitly_disabled": false,
+  "created_by": "user_abc",
+  "updated_by": "user_abc",
+  "created_at": "...",
+  "updated_at": "...",
+  "oauth_client": {"client_id": "<agent app id>", "created": true}
+}
+```
+
+`enabled` is `false` in the response when the identity is not active.
+
+### `GET /external-issuers/{id}/bindings/{binding_id}` → 200
+
+### `PATCH /external-issuers/{id}/bindings/{binding_id}` → 200
+
+```json
+{"enabled": true}
+{"enabled": true, "only_if_not_explicitly_disabled": true}
+```
+
+`{"enabled": false}` sets `explicitly_disabled`; a plain `{"enabled": true}` clears it (an admin's own decision).
+The deployer enables an agent's bindings at adoption with `only_if_not_explicitly_disabled: true`: the enable is applied in one statement only where `explicitly_disabled` is false, so it cannot undo an admin's disable even when the two race, and it is 409 `binding_explicitly_disabled` otherwise.
+Either enable needs the identity to be `active` (409 `identity_not_active`).
+
+### `DELETE /external-issuers/{id}/bindings/{binding_id}` → 204
+
+Soft-deletes the binding.
+
+## Migration ordering
+
+The tables are migration 056.
+Migration 055 (the refresh-token family, PRs #421 to #423) must be applied before it: golang-migrate never applies a version below the database's current one, so a database that reached 056 first would silently skip 055.
+If this change merges before 055, renumber it at merge.
+
+## Audit
+
+Every insert, update and delete of a row or binding writes `identity_audit_logs` (`table_name` `external_issuers` or `external_issuer_bindings`, actions `INSERT_EXTERNAL_ISSUER`, `UPDATE_EXTERNAL_ISSUER`, `DELETE_EXTERNAL_ISSUER`, `INSERT_ISSUER_BINDING`, ...), with the actor from `X-User-ID` and the binding's identity as `identity_id`.
+
+## Running it locally
+
+`cmd/zeroid-mockidp` serves an Entra-shaped tenant, an Okta org and a Kubernetes issuer and mints every token shape above; see its [README](../cmd/zeroid-mockidp/README.md).
+`tests/integration/trusted_issuers_test.go` drives both person paths and every INV-IDN-014 refusal against it.
+
+## Not yet
+
+- Federated client assertions (P2) do not read workload rows yet.
+- Every issuer row needs OpenID discovery at `{issuer}/.well-known/openid-configuration` (Entra, Okta, Google, GitHub Actions, AWS STS and Kubernetes service-account issuer discovery all serve it). An issuer without it, such as a bare SPIFFE trust-domain bundle endpoint, cannot be a row yet.
+- The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
+- Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it.
+- Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
