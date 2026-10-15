@@ -244,6 +244,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
 | 422 | `shared_issuer_requires_constraints` | A shared-issuer row that does not constrain its pinning claim |
 | 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
+| 422 | `issuer_is_self` | The issuer is ZeroID's own (`token.issuer`, compared without trailing slashes); static `external_issuers` listing it are refused at boot |
 | 422 | `identity_not_found` | `identity_id` names no identity in this account |
 | 422 | `identity_has_no_public_key` | `oauth_client` was requested but the identity has no EC P-256 key |
 | 500 | `internal_error` | Anything else |

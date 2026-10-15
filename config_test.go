@@ -794,3 +794,14 @@ func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
 		t.Fatalf("local mock as a shared issuer: %v", err)
 	}
 }
+
+func TestConfig_StaticIssuerCannotBeSelf(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{{
+		Issuer: cfg.Token.Issuer + "/", JWKSURI: cfg.Token.Issuer + "/.well-known/jwks.json", Audience: "x",
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "own issuer") {
+		t.Fatalf("err = %v", err)
+	}
+}

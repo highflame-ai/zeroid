@@ -409,6 +409,15 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 			assert.Equal(t, tc.code, body["code"])
 		})
 	}
+	t.Run("ZeroID's own issuer cannot be trusted, with or without a trailing slash", func(t *testing.T) {
+		for _, iss := range []string{federationIssuer, federationIssuer + "/"} {
+			status, body := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+				"kind": "person", "issuer": iss, "claim_mapping": map[string]string{"user_id": "sub"},
+			}, a.headers)
+			assert.Equal(t, http.StatusUnprocessableEntity, status, "%s: %v", iss, body)
+			assert.Equal(t, "issuer_is_self", body["code"])
+		}
+	})
 	t.Run("check probes a JWKS and reports keys only", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPost, "/external-issuers/check", map[string]any{"issuer": f.idp.OktaIssuer()}, a.headers)
 		require.Equal(t, http.StatusOK, status)

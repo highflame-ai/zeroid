@@ -74,6 +74,8 @@ type JWKSCheck struct {
 // ExternalIssuerServiceConfig is the deployment's federation settings.
 type ExternalIssuerServiceConfig struct {
 	Store IssuerStore
+	// SelfIssuer is ZeroID's own issuer, which no row may trust.
+	SelfIssuer string
 	// SharedIssuers may appear in several accounts, each pinned on its claim.
 	SharedIssuers []domain.SharedIssuer
 	// AllowPrivateEndpoints admits private addresses and http URLs.
@@ -188,6 +190,12 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		return nil, nil, validationToAPIError(err)
 	}
 	row.Normalize()
+	// Trusting ZeroID's own issuer would let its tokens (or ID-JAGs it might
+	// be tricked into signing) federate back in as an external person.
+	if s.cfg.SelfIssuer != "" && domain.CanonicalIssuer(row.Issuer) == domain.CanonicalIssuer(s.cfg.SelfIssuer) {
+		return nil, nil, issuerErr(http.StatusUnprocessableEntity, "issuer_is_self",
+			"this is ZeroID's own issuer; it cannot be trusted as an external issuer")
+	}
 	pin := s.sharedPin(row.Issuer)
 	if err := row.Validate(domain.IssuerValidation{AllowHTTP: s.cfg.AllowPrivateEndpoints, PinClaim: pin, JWKSURIPending: true}); err != nil {
 		return nil, nil, validationToAPIError(err)

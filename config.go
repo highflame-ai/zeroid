@@ -653,6 +653,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("external_issuers[%d]: %w", i, err)
 		}
 		iss := c.ExternalIssuers[i].Issuer
+		if c.Token.Issuer != "" && domain.CanonicalIssuer(iss) == domain.CanonicalIssuer(c.Token.Issuer) {
+			return fmt.Errorf("external_issuers[%d]: %q is ZeroID's own issuer (token.issuer) and cannot be trusted as an external issuer", i, iss)
+		}
 		if _, dup := seen[iss]; dup {
 			return fmt.Errorf("external_issuers[%d]: duplicate issuer %q", i, iss)
 		}

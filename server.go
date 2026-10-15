@@ -572,6 +572,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 			SharedIssuers:         cfg.Federation.SharedIssuers,
 			AllowPrivateEndpoints: cfg.Federation.AllowPrivateEndpoints,
 			StaticIssuers:         cfg.ExternalIssuers,
+			SelfIssuer:            cfg.Token.Issuer,
 			HTTPClient:            options.externalIssuerHTTPClient,
 		}))
 	// An allow-list is the deployer vetting which hosts may publish a metadata
