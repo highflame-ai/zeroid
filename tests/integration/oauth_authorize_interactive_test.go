@@ -139,3 +139,33 @@ func TestAuthorizePOST_InteractionIsNotRedirected(t *testing.T) {
 		"POST must get the JSON refusal, not a login redirect")
 	require.Empty(t, resp.Header.Get("Location"))
 }
+
+// TestAuthorizeGET_InteractionReturnToKeepsAllowlistedParams — an embedder that
+// allowlists one of its own parameters (Server.SetInteractiveLoginPassthroughParams)
+// gets it back verbatim in return_to, so the resumed request still carries it.
+// Everything not allowlisted is still dropped.
+func TestAuthorizeGET_InteractionReturnToKeepsAllowlistedParams(t *testing.T) {
+	require.NoError(t, testZeroIDServer.SetInteractiveLoginPassthroughParams("project_id"))
+	t.Cleanup(func() { require.NoError(t, testZeroIDServer.SetInteractiveLoginPassthroughParams()) })
+
+	const leaked = "zid_sk_passthroughleak"
+
+	query, _ := authorizeGETQuery(t)
+	query.Set("project_id", "proj-7f3a")
+	query.Set("api_key", leaked)
+
+	resp := getAuthorize(t, query, interactionHeaders())
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+
+	rt, err := url.Parse(loc.Query().Get("return_to"))
+	require.NoError(t, err)
+	require.Equal(t, "proj-7f3a", rt.Query().Get("project_id"))
+	require.Equal(t, testCLIClientID, rt.Query().Get("client_id"))
+	require.NotContains(t, resp.Header.Get("Location"), leaked,
+		"allowlisting one parameter must not forward the rest")
+}

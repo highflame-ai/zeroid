@@ -175,8 +175,12 @@ type Server struct {
 	// report ErrPrincipalInteractionRequired. nil means "no surface", which
 	// degrades that sentinel to access_denied. See SetInteractiveLoginURL.
 	interactiveLoginURL func(*AuthorizeRequest) string
-	adminAuthState      *middlewareHolder
-	globalMWState       *middlewareHolder
+	// interactiveLoginPassthrough is the validated allowlist of extra
+	// authorize parameters preserved into return_to. See
+	// SetInteractiveLoginPassthroughParams.
+	interactiveLoginPassthrough []string
+	adminAuthState              *middlewareHolder
+	globalMWState               *middlewareHolder
 }
 
 // namedPrincipalResolver pairs a registered PrincipalResolver with the
@@ -754,6 +758,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// and before Start (#263).
 	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
 	apiHandler.SetInteractiveLoginURL(srv.resolveInteractiveLoginURL)
+	apiHandler.SetInteractiveLoginPassthroughParams(srv.interactiveLoginPassthroughParams)
 
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
@@ -1190,7 +1195,8 @@ func (s *Server) Use(middleware func(http.Handler) http.Handler) {
 //     pointing back at /oauth2/authorize. Your surface should send the user there
 //     after authenticating, at which point your resolver should recognise the
 //     session it established. return_to deliberately excludes anything else from
-//     the inbound query — see redirectToInteractiveLogin.
+//     the inbound query — see redirectToInteractiveLogin — except parameters
+//     you allowlist with SetInteractiveLoginPassthroughParams.
 //   - Returning "" declines, as does leaving fn nil: the sentinel then degrades
 //     to access_denied, because a resolver cannot conjure a surface the
 //     deployment does not have.
@@ -1215,6 +1221,65 @@ func (s *Server) SetInteractiveLoginURL(fn func(*AuthorizeRequest) string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.interactiveLoginURL = fn
+}
+
+// Limits on SetInteractiveLoginPassthroughParams: how many names may be listed,
+// and the longest value (in bytes) that is copied rather than dropped.
+const (
+	MaxInteractiveLoginPassthroughParams   = handler.MaxInteractiveLoginPassthroughParams
+	MaxInteractiveLoginPassthroughValueLen = handler.MaxInteractiveLoginPassthroughValueLen
+)
+
+// SetInteractiveLoginPassthroughParams names extra /oauth2/authorize query
+// parameters that survive the interactive-login round trip: each is copied
+// verbatim from the inbound authorize request into the return_to that
+// SetInteractiveLoginURL's surface receives, so the resumed request carries it
+// too. Use it for an embedder's own hint that is not an OAuth parameter — a
+// CLI pre-selecting the project a sign-in is for, for example.
+//
+// The contract:
+//
+//   - Names are validated: 1-64 characters of letters, digits, '_', '.' or '-',
+//     starting with a letter, at most MaxInteractiveLoginPassthroughParams of
+//     them. Any name with protocol or credential meaning at the authorization
+//     endpoint (client_id, redirect_uri, scope, state, resource, return_to,
+//     code_verifier, client_secret, api_key, …) is refused, compared
+//     case-insensitively — passthrough can never override or add to the
+//     validated request. An invalid list returns an error and leaves the
+//     current list unchanged.
+//   - A listed parameter is copied only when it appears exactly once with a
+//     non-empty value of at most MaxInteractiveLoginPassthroughValueLen bytes
+//     and no control characters. Anything else is dropped (and logged without
+//     its value); the redirect still happens, because the parameter is a hint,
+//     not part of the authorization request.
+//   - ZeroID does not interpret or validate the value. It is caller input:
+//     your login surface must treat it as untrusted and authorize whatever it
+//     selects against the signed-in user, exactly as if the user had typed it.
+//   - Only the interactive-login redirect is affected. The parameter has no
+//     effect on the authorization request, the code, or the token.
+//
+// Calling with no names clears the list. Safe to call after NewServer.
+func (s *Server) SetInteractiveLoginPassthroughParams(names ...string) error {
+	validated, err := handler.ValidateInteractiveLoginPassthroughParams(names)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactiveLoginPassthrough = validated
+
+	return nil
+}
+
+// interactiveLoginPassthroughParams is wired into the handler at build time and
+// returns a snapshot of the allowlist. The slice is replaced, never mutated, so
+// handing out the stored one is safe.
+func (s *Server) interactiveLoginPassthroughParams() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.interactiveLoginPassthrough
 }
 
 // resolveInteractiveLoginURL is wired into the handler at build time, so the

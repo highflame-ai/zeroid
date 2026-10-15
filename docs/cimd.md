@@ -217,6 +217,12 @@ Three things a deployer must handle:
   `return_to` is rebuilt from the parameters ZeroID validated, never copied from
   the inbound URL, so nothing extraneous a caller appended — including a
   credential in the wrong channel — is forwarded to your login surface.
+  If your clients send a parameter of your own that must survive the round trip
+  (a project or tenant hint, say), allowlist it by name with
+  `Server.SetInteractiveLoginPassthroughParams`: it is copied verbatim into
+  `return_to` when it appears exactly once with a short value. Protocol and
+  credential parameter names cannot be allowlisted, and the value is untrusted
+  caller input your surface must authorize against the signed-in user.
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
