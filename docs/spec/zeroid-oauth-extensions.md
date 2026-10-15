@@ -622,7 +622,7 @@ upstream ID token. The mode:
   (ADR 0042 D3a); static issuers (standalone) keep secrets. And
   **MUST** redeem only for the relying party the ID token was issued to (OpenID
   Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
-  token's `aud` values, `azp`, if present, must equal it, and a token with
+  token's `aud` values, `azp`, if present, must be a string equal to it, and a token with
   several audiences must carry `azp`. A mismatch is `invalid_grant`. Without
   this, anyone holding a person's ID token could mint a token with that person
   as `sub`. Since an ID token's `aud` is the relying party's `client_id`, the

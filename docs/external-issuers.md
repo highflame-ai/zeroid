@@ -62,7 +62,9 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 Issuers are compared without trailing slashes, so `https://acme.okta.com/` and `https://acme.okta.com` are one issuer; a token's `iss` is still matched against the row exactly.
 Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the pinning claim's values for a shared one.
 
-**Known limitation.** Nothing proves that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
+**Known limitation.** ZeroID itself does not prove that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
+For `person` rows the deployer closes the impersonation half with an ownership proof built on two routes, [`GET /external-issuers/{id}/discovery`](#get-external-issuersiddiscovery--200) and [`POST /external-issuers/{id}/verify-id-token`](#post-external-issuersidverify-id-token--200): the account's owner signs in through the issuer, ZeroID verifies the ID token as the ID-token exchange would, and the deployer (in SaaS, Admin) refuses person resolution through a row it has not verified.
+`workload` rows have no such proof yet.
 
 The built-in shared list (used when `federation.shared_issuers` is empty):
 
@@ -144,7 +146,7 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
 
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
    This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
-   Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
+   Its `client_id` is in the ID token's `aud`; `azp`, when present, is a string equal to it; several audiences without `azp` are refused.
    The `aud` is accepted because it names the presenting `client_id`, which must then be the subject key of an enabled binding on the row (rule 4; the binding is the audience rule), or because it is in the row's `audiences`.
 2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker: no `scp`, `scope`, `azpacr` or `appidacr` (Entra stamps one of the last two on every access token, app-only ones included), and no `typ` of `at+jwt`, `application/at+jwt` or `oauth-id-jag+jwt`.
    `roles` alone is not a marker: Entra ID tokens carry a user's app roles in it.
@@ -237,10 +239,13 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `binding_explicitly_disabled` | A conditional enable of a binding an admin disabled |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
 | 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
+| 422 | `wrong_kind` | `/discovery` or `/verify-id-token` on a `workload` row |
+| 422 | `issuer_disabled` | `/verify-id-token` on a disabled row |
+| 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `nonce_mismatch` | `/verify-id-token` refused the token ([below](#post-external-issuersidverify-id-token--200)) |
 | 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
 | 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
-| 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri` |
-| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned) |
+| 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri`; on `/discovery`, also no usable `authorization_endpoint` or `token_endpoint` |
+| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned). On `/verify-id-token`, the row's key set could not be loaded |
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
 | 422 | `shared_issuer_requires_constraints` | A shared-issuer row that does not constrain its pinning claim |
 | 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
@@ -358,6 +363,74 @@ The answer is a probe result, never an upstream body:
 `error` is one of the `discovery_*` or `jwks_*` codes above.
 Only an invalid issuer URL is a 400.
 
+### `GET /external-issuers/{id}/discovery` → 200
+
+The sign-in endpoints of a `person` row, for a deployer starting an authorization-code sign-in through the issuer (the ownership proof above).
+ZeroID re-reads `{issuer}/.well-known/openid-configuration` with the same fetch a create uses: the SSRF-guarded client (a private address refused unless `federation.allow_private_endpoints`), a 10-second timeout, no redirects, a 256 KiB cap, and the document's `issuer` equal to the row's exactly.
+
+```json
+{
+  "issuer": "https://login.microsoftonline.com/1111.../v2.0",
+  "authorization_endpoint": "https://login.microsoftonline.com/1111.../oauth2/v2.0/authorize",
+  "token_endpoint": "https://login.microsoftonline.com/1111.../oauth2/v2.0/token"
+}
+```
+
+Both endpoints must be absolute https URLs with no userinfo, query or fragment (http only with `allow_private_endpoints`), or the answer is 422 `discovery_invalid`.
+An endpoint with a query (Azure AD B2C's `?p=<policy>`) is refused; such an issuer cannot be a row anyway, since its `jwks_uri` carries the same query.
+A fetch failure is the create's 422 (`discovery_unreachable`, `discovery_issuer_mismatch`, `discovery_invalid`).
+A `workload` row is 422 `wrong_kind`; another account's row is 404.
+A disabled row still answers, so a deployer can prepare a sign-in before enabling it; `/verify-id-token` refuses it.
+Nothing is stored: the row's `jwks_uri` changes only through `/refresh`.
+
+### `POST /external-issuers/{id}/verify-id-token` → 200
+
+```json
+{"id_token": "<the ID token from the sign-in>", "client_id": "<the verification app's client id>", "nonce": "<the nonce sent on the authorization request>"}
+```
+
+All three are required: `id_token` at most 16384 bytes, `client_id` and `nonce` at most 512 (400 `invalid_request` otherwise).
+A body of 32 KiB or more is refused with 413, and a refusal before the handler runs (malformed JSON, or a missing or unknown field: 400 or 422 with no `code`) redacts every echoed value, so the token never comes back.
+ZeroID verifies the token under this row with the routine the ID-token exchange (P1c) runs, so it accepts nothing the exchange's token checks would refuse:
+
+- the row is `person` (else `wrong_kind`) and enabled (else `issuer_disabled`), checked before the token is read;
+- the signature, against the row's JWKS (an unknown `kid` triggers the same single-flight refresh), with an algorithm on the row's list;
+- `iss` equal to the row's issuer; `exp`, `nbf` and `iat` with the 60-second skew; `iat` within `max_token_age_seconds`; `sub` present;
+- an ID token, not an access token (rule 2 of P1c);
+- `aud` containing `client_id`, `azp` (when present) a string equal to it, and several audiences only with `azp`;
+- the row's claim constraints, including a shared issuer's pinning claim, on the verified claims;
+- the mapped `user_id` present, and the subject a person (rule 3 of P1c);
+- and, beyond P1c, a `nonce` claim equal to `nonce`, compared in constant time.
+
+It needs no binding (the verification app is not an agent), mints nothing, and records no `jti`: the token is only read, and the deployer makes its own record single-use.
+The answer is the person as the row's claim mapping reads them, exactly as P1c hands them to the person resolver:
+
+```json
+{
+  "issuer_id": "6f1d...",
+  "issuer": "https://login.microsoftonline.com/1111.../v2.0",
+  "subject": "<claim_mapping.user_id, e.g. the Entra oid>",
+  "email": "owner@contoso.com",
+  "email_verified": true
+}
+```
+
+`email_verified` is true only when the claim `claim_mapping.email_verified` names (default `email_verified`; `xms_edov` with the Entra preset) is JSON `true` or the string `"true"` or `"1"`.
+
+A refused token is 422 with one of these codes, and never the token, its claims, or why in more detail (the log line has the account, the row and the code only):
+
+| `code` | When |
+|---|---|
+| `token_invalid` | Malformed, a disallowed algorithm, a bad signature or unknown key, `iss` not the row's, expired or not yet valid, too old, no `sub`/`exp`/`iat`, an access token, no mapped `user_id`, or a workload subject |
+| `audience_mismatch` | `client_id` is not in `aud`, `azp` names another party or is not a string, or several audiences and no `azp` |
+| `constraint_mismatch` | The verified claims do not satisfy the row's claim constraints |
+| `nonce_mismatch` | The token has no `nonce` claim, or not this one |
+| `issuer_disabled` | The row is disabled |
+| `wrong_kind` | The row is a `workload` row |
+| `jwks_unreachable` | The row's key set could not be loaded (not the token's fault) |
+
+Another account's row is 404.
+
 ### `GET /external-issuers/bindings` → 200
 
 The account's bindings across all its issuers, in one query.
@@ -449,5 +522,6 @@ Every insert, update and delete of a row or binding writes `identity_audit_logs`
 - Federated client assertions (P2) do not read workload rows yet.
 - Every issuer row needs OpenID discovery at `{issuer}/.well-known/openid-configuration` (Entra, Okta, Google, GitHub Actions, AWS STS and Kubernetes service-account issuer discovery all serve it). An issuer without it, such as a bare SPIFFE trust-domain bundle endpoint, cannot be a row yet.
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
-- Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it.
+- Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); `workload` rows and the ownership of a shared issuer's pinning value remain open.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
+- JWKS refreshes on an unknown `kid` are rate-limited per key set (one every 10 seconds), and rows that share a `jwks_uri` share the key set. Tokens with made-up `kid`s, presented on the ID-token exchange or on `/verify-id-token`, can hold that slot, so a real key rotation at the IdP is picked up up to 10 seconds late for every account on the key set.

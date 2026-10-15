@@ -206,7 +206,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	if entry.Row != nil {
 		issuerAudience = []string{s.issuer}
 	}
-	verified, err := s.validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier, issuerAudience...)
+	verified, err := validateExternalAssertion(ctx, req.Assertion, entry, "assertion", allowSubjectIdentifier, issuerAudience...)
 	if err != nil {
 		return nil, err
 	}

@@ -237,6 +237,11 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "delete-external-issuer", Method: http.MethodDelete,
 		Path: "/external-issuers/{id}", Summary: "Stop trusting an issuer", Tags: tags,
 		DefaultStatus: http.StatusNoContent}, a.deleteExternalIssuerOp)
+	huma.Register(api, huma.Operation{OperationID: "get-external-issuer-discovery", Method: http.MethodGet,
+		Path: "/external-issuers/{id}/discovery", Summary: "Read a person issuer's sign-in endpoints from its discovery document", Tags: tags}, a.externalIssuerDiscoveryOp)
+	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-id-token", Method: http.MethodPost,
+		Path: "/external-issuers/{id}/verify-id-token", Summary: "Verify an ID token under a person issuer, as the ID-token exchange would", Tags: tags,
+		MaxBodyBytes: maxVerifyIDTokenBodyBytes}, a.verifyExternalIssuerIDTokenOp)
 
 	huma.Register(api, huma.Operation{OperationID: "list-account-issuer-bindings", Method: http.MethodGet,
 		Path: "/external-issuers/bindings", Summary: "List the account's credential bindings across issuers", Tags: tags}, a.listAccountBindingsOp)
@@ -357,6 +362,58 @@ func (a *API) deleteExternalIssuerOp(ctx context.Context, input *externalIssuerI
 		return nil, issuerProblemFrom(err, "delete external issuer")
 	}
 	return nil, nil
+}
+
+type externalIssuerDiscoveryOutput struct {
+	Body *service.IssuerDiscovery
+}
+
+func (a *API) externalIssuerDiscoveryOp(ctx context.Context, input *externalIssuerIDInput) (*externalIssuerDiscoveryOutput, error) {
+	account, _, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := a.externalIssuerSvc.Discovery(ctx, account, input.ID)
+	if err != nil {
+		return nil, issuerProblemFrom(err, "read issuer discovery")
+	}
+	return &externalIssuerDiscoveryOutput{Body: doc}, nil
+}
+
+// VerifyIDTokenBody is POST /external-issuers/{id}/verify-id-token. The
+// fields carry no length tags on purpose: a schema refusal echoes the value,
+// and the token must never be echoed. The service caps them.
+type VerifyIDTokenBody struct {
+	IDToken  string `json:"id_token" doc:"The ID token from the person's sign-in. At most 16384 bytes."`
+	ClientID string `json:"client_id" doc:"The app the token was issued to: it must be in aud, and equal azp when present. At most 512 bytes."`
+	Nonce    string `json:"nonce" doc:"The nonce sent on the authorization request; the token's nonce claim must equal it. At most 512 bytes."`
+}
+
+// maxVerifyIDTokenBodyBytes bounds the verify-id-token body huma reads (its
+// default is 1 MiB). It is over the sum of the service's field caps, so an
+// over-cap field still gets the precise 400 and only a body no caller sends
+// is a 413.
+const maxVerifyIDTokenBodyBytes = 32 << 10
+
+type verifyIDTokenOutput struct {
+	Body *service.IDTokenVerification
+}
+
+func (a *API) verifyExternalIssuerIDTokenOp(ctx context.Context, input *struct {
+	ID   string `path:"id" doc:"Issuer row id"`
+	Body VerifyIDTokenBody
+}) (*verifyIDTokenOutput, error) {
+	account, _, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := a.externalIssuerSvc.VerifyIDToken(ctx, account, input.ID, service.VerifyIDTokenInput{
+		IDToken: input.Body.IDToken, ClientID: input.Body.ClientID, Nonce: input.Body.Nonce,
+	})
+	if err != nil {
+		return nil, issuerProblemFrom(err, "verify id_token")
+	}
+	return &verifyIDTokenOutput{Body: out}, nil
 }
 
 func (a *API) listBindingsOp(ctx context.Context, input *bindingListInput) (*bindingListOutput, error) {
