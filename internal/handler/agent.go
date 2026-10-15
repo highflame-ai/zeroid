@@ -305,8 +305,28 @@ type SetOwnPublicKeyOutput struct {
 // agent's own access-token claims (AgentAuthMiddleware), never from caller input.
 func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput) (*SetOwnPublicKeyOutput, error) {
 	claims, ok := internalMiddleware.GetAgentClaims(ctx)
-	if !ok || claims.IdentityID == "" {
+	if !ok || claims.Subject == "" {
 		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+	// Only the agent's own token may set its key. An exchanged token is held
+	// by its current actor on behalf of a delegation chain, and that actor
+	// already has a key (it signed the actor assertion), so refusing it costs
+	// nothing and keeps first-key enrollment tied to the agent's own credential.
+	if claims.GrantType == string(domain.GrantTypeTokenExchange) {
+		return nil, huma.Error403Forbidden("key enrollment needs the agent's own token, not a delegated one")
+	}
+
+	// The agent is the token's subject (the current actor under the rfc8693
+	// profile), looked up in the token's tenant. ZeroID sets no identity_id
+	// claim, and reserves it so a caller cannot supply one. A token whose
+	// subject is not a registered identity, such as one issued to a person,
+	// finds nothing.
+	identity, err := a.identitySvc.GetIdentityByWIMSEURI(ctx, claims.Subject, claims.AccountID, claims.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityNotFound) {
+			return nil, huma.Error401Unauthorized("missing or invalid agent token")
+		}
+		return nil, mapErr(err)
 	}
 
 	// Attribute the key change to the agent itself in the audit trail (this
@@ -314,7 +334,7 @@ func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput
 	// unset).
 	ctx = internalMiddleware.SetCallerName(ctx, claims.Subject)
 
-	resp, err := a.agentSvc.SetPublicKey(ctx, claims.IdentityID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
+	resp, err := a.agentSvc.SetPublicKey(ctx, identity.ID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
 		NewPublicKeyPEM: input.Body.NewPublicKeyPEM,
 		NewKeyProof:     input.Body.NewKeyProof,
 		CurrentKeyProof: input.Body.CurrentKeyProof,

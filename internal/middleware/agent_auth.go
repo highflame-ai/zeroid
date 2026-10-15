@@ -23,6 +23,7 @@ type AgentClaims struct {
 	Scopes     []string
 	JTI        string
 	IdentityID string
+	GrantType  string // the grant that issued the token, such as "api_key" or "token_exchange"
 }
 
 type agentClaimsKey struct{}
@@ -194,6 +195,9 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v
+	}
+	if v, err := jwt.Get[string](token, "grant_type"); err == nil {
+		claims.GrantType = v
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {

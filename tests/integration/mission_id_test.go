@@ -83,7 +83,15 @@ func TestIdentityID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
 		"new_key_proof":      "not-checked-before-the-identity",
 	}, map[string]string{"Authorization": "Bearer " + token})
 	defer func() { _ = enroll.Body.Close() }()
-	assert.Equal(t, http.StatusUnauthorized, enroll.StatusCode, "a forged identity_id must not reach agent self-service")
+	// Refused before any key is touched: an exchanged token cannot enroll a
+	// key (403), and the self-service endpoint resolves the agent from the
+	// token's subject, never from identity_id (401 when it is not an agent).
+	assert.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, enroll.StatusCode,
+		"a forged identity_id must not reach agent self-service")
+	victim := get(t, adminPath("/agents/registry/"+victimID), adminHeaders())
+	defer func() { _ = victim.Body.Close() }()
+	require.Equal(t, http.StatusOK, victim.StatusCode)
+	assert.Empty(t, decode(t, victim)["public_key_pem"], "the victim's key must stay unset")
 }
 
 // TestMissionID_ChainPropagation pins the issue #81 invariant: every
