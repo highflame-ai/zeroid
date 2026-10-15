@@ -67,6 +67,7 @@ type ExternalIssuerCreateBody struct {
 	ClaimConstraints    map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`
 	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds,omitempty" doc:"1-3600, default 600."`
 	JWKSCacheTTLSeconds int                 `json:"jwks_cache_ttl_seconds,omitempty" doc:"30-86400, default 300."`
+	TrustEmail          bool                `json:"trust_email,omitempty" doc:"Person issuers only. The issuer vouches for its own email claim: a token with an email and no email_verified claim counts as verified (an explicit false stays false). For an organization's own directory, whose ID tokens leave email_verified to the UserInfo endpoint (OIDC Core 5.4). Default false."`
 	Source              string              `json:"source,omitempty" enum:"admin,connector" doc:"Default admin."`
 	SourceRef           string              `json:"source_ref,omitempty" doc:"The connector that created the row; only with source connector."`
 	Enabled             *bool               `json:"enabled,omitempty" doc:"Default true."`
@@ -83,6 +84,7 @@ type ExternalIssuerPatchBody struct {
 	ClaimConstraints    *map[string][]string `json:"claim_constraints,omitempty"`
 	MaxTokenAgeSeconds  *int                 `json:"max_token_age_seconds,omitempty"`
 	JWKSCacheTTLSeconds *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
+	TrustEmail          *bool                `json:"trust_email,omitempty"`
 	Enabled             *bool                `json:"enabled,omitempty"`
 }
 
@@ -102,6 +104,7 @@ type ExternalIssuerView struct {
 	ClaimConstraints    map[string][]string `json:"claim_constraints"`
 	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds"`
 	JWKSCacheTTLSeconds int                 `json:"jwks_cache_ttl_seconds"`
+	TrustEmail          bool                `json:"trust_email"`
 	Source              string              `json:"source"`
 	SourceRef           string              `json:"source_ref"`
 	Enabled             bool                `json:"enabled"`
@@ -117,7 +120,7 @@ func issuerView(r *domain.ExternalIssuer, check *service.JWKSCheck) ExternalIssu
 		ID: r.ID, AccountID: r.AccountID, Issuer: r.Issuer, Kind: string(r.Kind), DisplayName: r.DisplayName,
 		JWKSURI: r.JWKSURI, Audiences: nonNil(r.Audiences), Algorithms: nonNil(r.Algorithms),
 		ClaimMapping: r.ClaimMapping, PropagateClaims: nonNil(r.PropagateClaims), ClaimConstraints: r.ClaimConstraints,
-		MaxTokenAgeSeconds: r.MaxTokenAgeSeconds, JWKSCacheTTLSeconds: r.JWKSCacheTTLSeconds,
+		MaxTokenAgeSeconds: r.MaxTokenAgeSeconds, JWKSCacheTTLSeconds: r.JWKSCacheTTLSeconds, TrustEmail: r.TrustEmail,
 		Source: string(r.Source), SourceRef: r.SourceRef, Enabled: r.Enabled,
 		CreatedBy: r.CreatedBy, UpdatedBy: r.UpdatedBy, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		JWKSCheck: check,
@@ -289,7 +292,7 @@ func (a *API) createExternalIssuerOp(ctx context.Context, input *struct {
 		Preset: b.Preset, Kind: domain.IssuerKind(b.Kind), Issuer: b.Issuer, DisplayName: b.DisplayName,
 		Audiences: b.Audiences, Algorithms: b.Algorithms, ClaimMapping: b.ClaimMapping,
 		PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
-		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds,
+		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
 		Source: domain.IssuerSource(b.Source), SourceRef: b.SourceRef, Enabled: b.Enabled,
 	})
 	if err != nil {
@@ -333,7 +336,8 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 	row, check, err := a.externalIssuerSvc.Update(ctx, account, input.ID, actor, service.IssuerPatch{
 		DisplayName: b.DisplayName, Audiences: b.Audiences, Algorithms: b.Algorithms,
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
-		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, Enabled: b.Enabled,
+		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
+		Enabled: b.Enabled,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")

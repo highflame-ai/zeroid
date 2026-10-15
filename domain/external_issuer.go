@@ -65,6 +65,14 @@ type ExternalIssuerConfig struct {
 	//	  email:   email
 	ClaimMapping map[string]string `koanf:"claim_mapping"`
 
+	// TrustEmail makes the issuer vouch for its own email claim. OpenID
+	// Connect returns email_verified from the UserInfo endpoint, not in the
+	// ID token, when the sign-in also issued an access token (OIDC Core 5.4),
+	// so an organization's directory may never put it in the tokens ZeroID
+	// sees. With TrustEmail, a person token that carries an email and no
+	// email_verified claim counts as verified; an explicit false stays false.
+	TrustEmail bool `koanf:"trust_email"`
+
 	// AllowedAccounts is the REQUIRED, non-empty list of tenants permitted to
 	// exchange tokens from this issuer. The request's account_id must appear
 	// here. It is the only thing that binds an upstream ID token to a ZeroID

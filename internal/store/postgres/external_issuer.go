@@ -168,7 +168,7 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(row).
 		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",
 			"claim_constraints", "constraints_key", "max_token_age_seconds", "jwks_cache_ttl_seconds",
-			"enabled", "updated_by").
+			"trust_email", "enabled", "updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
