@@ -244,13 +244,14 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// (identity resolution, the mint, the observed-resource inventory) reads
 	// the derived value and nothing can reach back to what the caller sent.
 	//
-	// For an issuer row the agent is the ID-JAG's act.sub mapped through an
-	// enabled binding (ADR 0042 D6), and the tenant is that identity's; a
-	// registered client linked to another identity is refused. This also
-	// gives a CIMD client its tenant.
+	// For an issuer row the agent is the ID-JAG's act.sub, or its client_id
+	// when the IdP names no actor (act is OPTIONAL in the draft), mapped
+	// through an enabled binding (ADR 0042 D6), and the tenant is that
+	// identity's; a registered client linked to another identity is refused.
+	// This also gives a CIMD client its tenant.
 	var boundAgent *domain.Identity
 	if entry.Row != nil {
-		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, actorSubject(rawClaims), authedClient, federatedGrantIDJAG)
+		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, federatedAgentKey(rawClaims, idJAGClientID), authedClient, federatedGrantIDJAG)
 		if err != nil {
 			return nil, err
 		}
@@ -258,7 +259,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 			return nil, err
 		}
 		if req.ApplicationID != "" && req.ApplicationID != boundAgent.ID {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG's act.sub is bound to")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG is bound to")
 		}
 		req.AccountID, req.ProjectID = boundAgent.AccountID, boundAgent.ProjectID
 	} else {
@@ -342,9 +343,19 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// extractResourceClaim handles both shapes; we audience-restrict to the full
 	// set the IdP authorized. `resource` is a standard claim named directly by
 	// the spec, not a ClaimMapping target.
+	//
+	// The draft makes the resource claim OPTIONAL (§3.1): an IdP that grants
+	// only an audience and scopes leaves the server to the client, which names
+	// the one it is about to call with RFC 8707 `resource`, and the token is
+	// bound to that. With neither, the token could not be audience-restricted,
+	// so the grant is refused.
 	resources, ok := extractResourceClaim(rawClaims)
 	if !ok || len(resources) == 0 {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing required resource claim — cannot audience-restrict the minted token")
+		if len(req.Resource) == 0 {
+			return nil, oauthBadRequest(oautherror.InvalidGrant,
+				"the ID-JAG has no resource claim and the request names no resource — cannot audience-restrict the minted token")
+		}
+		resources = slices.Clone(req.Resource)
 	}
 
 	// RFC 8707 `resource` on the token request NARROWS the binding to a subset of
@@ -356,9 +367,9 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// shrink the set, never extend it: the IdP remains the sole source of
 	// authority and the client only spends less of it.
 	//
-	// Placed AFTER the missing-claim check so an assertion with no resource fails
-	// with the D4 error regardless of what the request asked for, and BEFORE the
-	// single-use jti is consumed so a bad `resource` does not burn the grant.
+	// Placed AFTER the missing-claim check (which takes the request's resource
+	// when the ID-JAG names none, so the narrowing is then a no-op), and BEFORE
+	// the single-use jti is consumed so a bad `resource` does not burn the grant.
 	resources, err = narrowResourcesTo(resources, req.Resource)
 	if err != nil {
 		return nil, err

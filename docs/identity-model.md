@@ -142,7 +142,8 @@ POST /oauth2/token
   assertion   = <ID-JAG, JWS typ oauth-id-jag+jwt>
   + client authentication as registered (client_secret_basic / _post, or
     private_key_jwt with client_assertion + client_assertion_type)
-  resource    = <optional; narrows the ID-JAG's resource claim>
+  resource    = <optional; narrows the ID-JAG's resource claim, or binds
+                 the token when the ID-JAG has none (then required)>
   application_id = <optional>
 ```
 
@@ -151,7 +152,8 @@ This is the request draft §4.4 and the MCP extension §5 define. It carries
 
 ### How the tenant is derived
 
-With issuer rows, the agent is the ID-JAG's `act.sub` mapped through a binding
+With issuer rows, the agent is the ID-JAG's `act.sub` (its `client_id` when it
+has no `act`) mapped through a binding
 and the tenant is that agent's ([external-issuers.md](external-issuers.md)).
 With a static issuer, the tenant is derived from server-side facts and never
 chosen by the caller:
@@ -201,7 +203,7 @@ bindings, so a CIMD client that passes every check above is refused with
 tenant. With a static issuer, the way to use a Client Identifier URL on this
 grant is to pre-register it (CIMD §7.2): create an OAuth client whose
 `client_id` is the URL, with `private_key_jwt`, its key, and an `identity_id`
-in the right tenant. With issuer rows the agent and its tenant come from a binding on the ID-JAG's `act.sub`, which serves a CIMD client too
+in the right tenant. With issuer rows the agent and its tenant come from a binding on the ID-JAG's `act.sub` (or its `client_id` when it has no `act`), which serves a CIMD client too
 ([external-issuers.md](external-issuers.md#p1b-id-jag)).
 
 ## Trusted-service broker (fallback)

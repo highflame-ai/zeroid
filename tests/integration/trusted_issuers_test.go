@@ -1059,6 +1059,44 @@ func TestTrustedIssuers_TrustEmail(t *testing.T) {
 	assert.False(t, verdict(t, email), "off again")
 }
 
+// TestTrustedIssuers_P1B_OptionalClaims: the ID-JAG draft makes act and the
+// resource claim OPTIONAL (§3.1). Without act the ID-JAG's client_id (which
+// must equal the authenticated client) names the agent; without a resource
+// claim the RFC 8707 resource the request names binds the token, and with
+// neither the grant is refused.
+func TestTrustedIssuers_P1B_OptionalClaims(t *testing.T) {
+	p := newP1B(t)
+	const mcp = "https://gateway.example/mcp/notion"
+
+	t.Run("no act: the client_id's binding names the agent", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"act": nil}), nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, "user_hf_alice", claims["sub"])
+		assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims), "the bound agent is the current actor")
+	})
+	t.Run("no resource claim: the requested resource binds the token", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"resource": nil}), map[string]any{"resource": mcp})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.ElementsMatch(t, []any{mcp}, decodeIssuedTokenClaims(t, resp.AccessToken)["aud"])
+	})
+	t.Run("no resource claim and no requested resource is refused", func(t *testing.T) {
+		requireRefused(t, p.redeem(t, p.idJAG(t, map[string]any{"resource": nil}), nil), "invalid_grant")
+	})
+	t.Run("neither act nor resource: the client and the request decide both", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"act": nil, "resource": nil}), map[string]any{"resource": mcp})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims))
+		assert.ElementsMatch(t, []any{mcp}, claims["aud"])
+	})
+	t.Run("a resource claim still bounds what the request may name", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, nil), map[string]any{"resource": mcp})
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Empty(t, resp.AccessToken)
+	})
+}
+
 // TestFederatedPerson_StaticIssuerHasNoRowID: a static issuer has no row, so
 // the resolver sees an empty IssuerID.
 func TestFederatedPerson_StaticIssuerHasNoRowID(t *testing.T) {
@@ -1102,8 +1140,20 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 		requireRefused(t, resp, "invalid_grant")
 		assert.Contains(t, resp.RawBody, "no enabled binding")
 	})
-	t.Run("no act at all", func(t *testing.T) {
-		requireRefused(t, p.redeem(t, p.idJAG(t, map[string]any{"act": nil}), nil), "invalid_grant")
+	t.Run("no act, and the client_id names no binding", func(t *testing.T) {
+		app, key := uid("0oa-unbound"), generateKey(t)
+		resp := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id": app, "name": app, "token_endpoint_auth_method": "private_key_jwt",
+			"jwks": clientJWKS(t, key), "grant_types": []string{"urn:ietf:params:oauth:grant-type:jwt-bearer"},
+		}, nil)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		_ = resp.Body.Close()
+		r := postFederation(t, p.f.http.URL, merged(map[string]any{
+			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":  p.idJAG(t, map[string]any{"act": nil, "client_id": app}),
+		}, clientCreds(t, app, key)))
+		requireRefused(t, r, "invalid_grant")
+		assert.Contains(t, r.RawBody, "no enabled binding")
 	})
 	t.Run("a discovered, unadopted agent", func(t *testing.T) {
 		// Its own client, linked to no identity, so the binding alone decides.

@@ -122,7 +122,7 @@ The subject key is the value the credential carries at runtime:
 
 | Grant | Subject key |
 |---|---|
-| ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP |
+| ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP; the ID-JAG's `client_id` when it has no `act` (`act` is OPTIONAL in the draft) |
 | ID-token exchange (P1c) | the presenting client's `client_id`, which is the ID token's `aud` |
 
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
@@ -176,14 +176,15 @@ The token's `sub` is the person's user id with `user_id_iss` ZeroID's issuer, th
 
 The request is unchanged ([identity-model.md](identity-model.md#enterprise-managed-authorization-id-jag)).
 Its `aud` must name ZeroID's issuer (draft §4.3); the row's `audiences` play no part.
-With issuer rows the agent is the ID-JAG's `act.sub` mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
+With issuer rows the agent is the ID-JAG's `act.sub` (its `client_id` when it has no `act`) mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
+The draft also makes the `resource` claim OPTIONAL: an ID-JAG without one is bound to the RFC 8707 `resource` the request names, and refused when the request names none, so every minted token is still audience-restricted.
 A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
 The subject must not be a workload, and checks 4 to 6 above apply.
 Every check, including person resolution, runs before the ID-JAG's `jti` is consumed, after the replay check, so a refused request leaves the grant redeemable.
 
 ### Refusals that are events
 
-- **Unmatched agent** (ADR 0027): no `act.sub`, no binding, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
+- **Unmatched agent** (ADR 0027): no binding for the subject key, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
   On both grants the binding is read only after the token's signature and the checks that need no binding have passed, so a forged token raises no event under an account and learns nothing of its bindings.
   Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
 - **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
@@ -467,7 +468,7 @@ One issuer's bindings; takes the same `?identity_id=` filter.
 
 ```json
 {
-  "subject_key": "<agent app id, or the ID-JAG act.sub>",
+  "subject_key": "<agent app id, or the ID-JAG act.sub (its client_id when it has no act)>",
   "identity_id": "<agent identity uuid in this account>",
   "enabled": true,
   "oauth_client": {"client_id": "optional, defaults to subject_key"}
