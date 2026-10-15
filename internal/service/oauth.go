@@ -3417,33 +3417,153 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	return result, nil
 }
 
-// Revoke implements RFC 7009 token revocation.
-// The caller need only present the token — tenant is derived from the credential record.
-// Per RFC 7009 section 2.2, always returns nil (success) even for unknown or already-revoked tokens.
+// Revoke implements RFC 7009 token revocation for an anonymous caller: the
+// token alone, no client identified. See RevokeToken.
 func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
+	return s.RevokeToken(ctx, tokenStr, "", "")
+}
+
+// RevokeToken implements RFC 7009 token revocation for both token types this
+// server issues: access tokens (JWTs) and refresh tokens (opaque). RFC 7009 §2
+// requires refresh-token revocation; access-token revocation is the SHOULD.
+//
+// clientID is the client the request identified, already verified by the
+// caller (client authentication, or a public client's client_id), or "" for a
+// caller that identified no client. When it is set, a refresh token is revoked
+// only if it was issued to that client (RFC 7009 §2.1: the server "verifies
+// whether the token was issued to the client making the revocation request").
+// When it is empty, possession of the token is the authorization — the same
+// rule this endpoint has always applied to access tokens.
+//
+// Revoking a refresh token revokes its whole family — the grant — together
+// with the access tokens issued from that family, which RFC 7009 §2.1 says the
+// server SHOULD do when it can revoke access tokens.
+//
+// tokenTypeHint ("access_token" / "refresh_token") only orders the lookups;
+// both token types are always tried (RFC 7009 §2.1: if the token is not found
+// using the hint, the server MUST extend its search). Unknown hint values are
+// ignored (§2.2).
+//
+// Returns nil when the token was revoked AND when there was nothing to do —
+// unknown, malformed, already revoked or expired, or issued to a different
+// client — so the endpoint answers 200 for all of them alike (§2.2), without
+// telling the caller which tokens exist or whose they are. Returns an error
+// only when the server failed to look up or revoke a token, so the endpoint
+// does not report a revocation it did not carry out.
+func (s *OAuthService) RevokeToken(ctx context.Context, tokenStr, tokenTypeHint, clientID string) error {
+	if tokenStr == "" {
+		return nil
+	}
+	for _, kind := range revocationLookupOrder(tokenTypeHint) {
+		revoke := s.revokeAccessToken
+		if kind == revocationKindRefresh {
+			revoke = s.revokeRefreshToken
+		}
+		found, err := revoke(ctx, tokenStr, clientID)
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+	}
+	return nil
+}
+
+type revocationKind int
+
+const (
+	revocationKindAccess revocationKind = iota
+	revocationKindRefresh
+)
+
+// revocationLookupOrder returns the token types to try, hinted type first.
+// Every type is always included: RFC 7009 §2.1 requires the search to extend
+// past the hint, and §2.2 says an unknown hint value is ignored.
+func revocationLookupOrder(tokenTypeHint string) []revocationKind {
+	if tokenTypeHint == "refresh_token" {
+		return []revocationKind{revocationKindRefresh, revocationKindAccess}
+	}
+	return []revocationKind{revocationKindAccess, revocationKindRefresh}
+}
+
+// revokeAccessToken revokes tokenStr if it is an access token this server
+// issued. found reports whether it was one — revoked now, or already revoked
+// or expired — so the refresh-token lookup is skipped.
+//
+// clientID is not checked here: access-token revocation keeps the rule this
+// endpoint has always had (possession of the token authorizes its
+// revocation).
+func (s *OAuthService) revokeAccessToken(ctx context.Context, tokenStr, _ string) (bool, error) {
 	// Parse without full validation — token may already be expired but still revocable.
 	parsed, err := s.parseToken(tokenStr, false)
 	if err != nil {
-		return nil // malformed or invalid — treat as not found per RFC 7009 section 2.2
+		return false, nil // not a JWT this server signed — maybe a refresh token
 	}
 
 	jti, _ := parsed.JwtID()
 	if jti == "" {
-		return nil
+		return true, nil // signed by us but not a revocable credential
 	}
 
 	cred, err := s.credentialSvc.repo.GetByJTI(ctx, jti)
 	if err != nil {
-		return nil // not found — treat as success per RFC 7009 section 2.2
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil // unknown — success per RFC 7009 §2.2
+		}
+		return true, fmt.Errorf("revocation: look up access token: %w", err)
 	}
 
 	// Already revoked or expired — success per RFC 7009.
 	if cred.IsRevoked || time.Now().After(cred.ExpiresAt) {
-		return nil
+		return true, nil
 	}
 
 	// Tenant is taken from the credential record — not caller-supplied headers.
-	return s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
+	err = s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
+	if err != nil && !errors.Is(err, ErrCredentialNotFound) { // not found ⇒ revoked concurrently
+		return true, fmt.Errorf("revocation: revoke access token: %w", err)
+	}
+	return true, nil
+}
+
+// revokeRefreshToken revokes tokenStr if it is a refresh token this server
+// issued, by revoking its family and the access tokens issued from it. found
+// reports whether it was one.
+//
+// A token issued to a client other than clientID (when clientID is set) is
+// left alone and reported as found, so the response is the same 200 as for a
+// token the caller owns.
+//
+// The family is revoked whatever state the presented row is in. A rotated-out
+// or already-revoked token still names the grant the client asked to end, and
+// revoking an already-revoked family is a no-op.
+func (s *OAuthService) revokeRefreshToken(ctx context.Context, tokenStr, clientID string) (bool, error) {
+	if s.refreshTokenSvc == nil {
+		return false, nil
+	}
+	row, err := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, tokenStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("revocation: look up refresh token: %w", err)
+	}
+	if clientID != "" && row.ClientID != clientID {
+		log.Debug().Str("family_id", row.FamilyID).
+			Msg("oauth2 revocation: refresh token not issued to the requesting client; nothing revoked")
+		return true, nil
+	}
+
+	if _, err := s.refreshTokenSvc.RevokeFamily(ctx, row.FamilyID, "oauth2_revocation"); err != nil {
+		return true, fmt.Errorf("revocation: revoke refresh token family: %w", err)
+	}
+	if s.credentialSvc != nil {
+		if _, err := s.credentialSvc.RevokeByRefreshFamily(ctx, row.FamilyID, "oauth2_revocation"); err != nil {
+			return true, fmt.Errorf("revocation: revoke access tokens of refresh token family: %w", err)
+		}
+	}
+	return true, nil
 }
 
 // parseToken verifies a JWT against the JWKS keyset. The library matches
