@@ -442,3 +442,46 @@ func TestAuthorizationCodeReplayRevokesTokens(t *testing.T) {
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "refresh token should be revoked after auth code replay")
 }
+
+// TestAuthorizationCodeReplayRevokesRefreshedAccessTokens extends the
+// RFC 6749 §4.1.2 revocation to access tokens minted by refreshing the
+// code's family: replaying the code revokes them too, not only the access
+// token recorded on the code.
+func TestAuthorizationCodeReplayRevokesRefreshedAccessTokens(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, uid("user-replay-refreshed"), testRedirectURI, challenge, []string{"data:read"})
+	payload := map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}
+
+	resp := post(t, "/oauth2/token", payload, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rt1 := decode(t, resp)["refresh_token"].(string)
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt1,
+		"client_id":     testMCPClientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	refreshed := decode(t, resp)
+	at2 := refreshed["access_token"].(string)
+	rt2 := refreshed["refresh_token"].(string)
+	require.True(t, introspect(t, at2)["active"].(bool), "precondition: the refreshed access token is active")
+
+	resp = post(t, "/oauth2/token", payload, nil) // replay the code
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	assert.False(t, introspect(t, at2)["active"].(bool),
+		"an access token minted by refreshing the code's family must be revoked on code replay")
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt2,
+		"client_id":     testMCPClientID,
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "the family's current refresh token is revoked too")
+}
