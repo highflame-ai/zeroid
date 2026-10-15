@@ -35,7 +35,7 @@ was not enough last time.
 All modules release in **lockstep**: `zeroid`, `pkg/authjwt`, `pkg/dpop` and `pkg/jwks` carry the
 SAME version and are tagged at the SAME commit, every time.
 
-**Actions → Release Build - Zeroid → Run workflow.** Leave the version empty to use svu's next tag.
+**Actions → Release Build - Zeroid → Run workflow.** The workflow uses `make releasable-version`. There is no version field.
 
 1. **`cut-release`** runs `make release-prep` for that version and pushes the pin commit to `main` when `go.mod` does not already name it. The commit is `devops:`, so it does not raise the version again.
 2. **The same job creates the GitHub release** on that commit. Creating it pushes tag `vX.Y.Z`. The cloud repo clones that tag, so the bump has to be in the commit before the tag exists.
@@ -141,7 +141,7 @@ below was invisible in-repo for exactly this reason.
 
 The gate fails if your release tag is below svu's recommendation (you'd silently ship a `feat:` as a patch). It allows tags at or above the recommendation, so you can manually force a higher bump.
 
-That major is not always a tag this module path can publish. `go.mod` says `github.com/highflame-ai/zeroid`, with no `/v2` suffix, so Go accepts only v0 and v1. `make release-prep VERSION=v2.0.0` fails in `go build` with `should be v0 or v1, not v2`, and no tag is created. `make releasable-version` clamps that major to the next v1 minor. The workflow's cut and its tag check both use that version. Leave the version empty.
+That major is not always a tag this module path can publish. `go.mod` says `github.com/highflame-ai/zeroid`, with no `/v2` suffix, so Go accepts only v0 and v1. `make release-prep VERSION=v2.0.0` fails in `go build` with `should be v0 or v1, not v2`, and no tag is created. `make releasable-version` clamps that major to the next v1 minor. The workflow's cut and its tag check both use that version.
 
 Run `make next-version` to preview. `svu next` is the conventional-commit bump. `releasable` is the tag that will be created.
 
@@ -153,9 +153,9 @@ Run `make next-version` to preview. `svu next` is the conventional-commit bump. 
 |---------|-------|-----|
 | `Invalid version format` | Tag doesn't match `vMAJOR.MINOR.PATCH` | Use a semver tag |
 | `Release tag X is below svu's computed next version Y` | A `feat:` commit since the last tag implies a minor bump | Re-create the release at Y or higher |
-| `version "v2.0.0" invalid: should be v0 or v1, not v2` | A `feat!:` made svu ask for a major, and the module path has no `/v2` suffix | Leave the workflow version empty. It releases the next v1 minor. A real v2 tag requires the module path `github.com/highflame-ai/zeroid/v2` first. |
+| `version "v2.0.0" invalid: should be v0 or v1, not v2` | A `feat!:` made svu ask for a major, and the module path has no `/v2` suffix | Run the workflow. It releases the next v1 minor. A real v2 tag requires the module path `github.com/highflame-ai/zeroid/v2` first. |
 | `go.mod pins ... to X, but this release is Y` | A tag was published from the Releases UI before the pins named Y | That tag is already public. Let the next `feat:` or `fix:` on `main` cut the next version. Do not republish Y. |
-| Both at once: go.mod pins `vA.B.C`, and svu demands `vA.B+1.0` | A `feat:` landed on `main` after a release was prepared by hand | Run the workflow again with the version empty. svu supplies the higher tag, and the pins are bumped before that tag is created. |
+| Both at once: go.mod pins `vA.B.C`, and svu demands `vA.B+1.0` | A `feat:` landed on `main` after a release was prepared by hand | Run the workflow again. It uses the higher tag, and the pins are bumped before that tag is created. |
 | The release tag exists but the run failed | **Expected, and not recoverable in place.** Pushing the tag publishes the Go module; the workflow runs afterwards. Cut the next patch version — do not force-push the tag, since the proxy may already have cached it. |
 
 ---

@@ -81,7 +81,7 @@ next-version: ## Print svu's next semver and the version this module path can ta
 		echo "releasable : $$($(MAKE) -s --no-print-directory releasable-version)"
 	@echo
 	@echo "Cut a release: Actions → Release Build - Zeroid → Run workflow."
-	@echo "Leave the version empty. See RELEASING.md."
+	@echo "The workflow uses the releasable version. See RELEASING.md."
 
 # feat!: makes svu ask for a new major. A module path without /vN can only be
 # v0 or v1, so that major is released as the next minor until the path moves.
