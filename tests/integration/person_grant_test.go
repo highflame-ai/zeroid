@@ -208,14 +208,15 @@ func personMints(f *personGrantFederation) map[string]personMint {
 				"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 			})
 			return federationResult(postFederation(t, f.url, map[string]any{
-				"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-				"subject_token":      idToken,
-				"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-				"client_id":          f.rp.ClientID,
-				"client_secret":      f.rp.ClientSecret,
-				"account_id":         f.cfg.AccountID,
-				"project_id":         f.cfg.ProjectID,
-				"scope":              strings.Join(scopes, " "),
+				"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+				"subject_token":         idToken,
+				"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+				"client_id":             f.rp.ClientID,
+				"client_assertion":      rpAssertion(t, f.rp),
+				"client_assertion_type": clientAssertionType,
+				"account_id":            f.cfg.AccountID,
+				"project_id":            f.cfg.ProjectID,
+				"scope":                 strings.Join(scopes, " "),
 			}))
 		},
 	}

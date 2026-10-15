@@ -188,6 +188,25 @@ const (
 // authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
 var ErrPersonScopeDenied = service.ErrPersonScopeDenied
 
+// FederatedPersonRequest names the person in a verified IdP token (ID-JAG or
+// ID-token exchange) for a FederatedPersonResolver. See
+// internal/service/person_federation.go for the field docs.
+type FederatedPersonRequest = service.FederatedPersonRequest
+
+// FederatedPersonResolver maps the person in an IdP token to the deployer's
+// user id, which becomes the minted token's sub; the IdP subject is carried
+// in the reserved user_idp_iss and user_idp_sub claims, and user_id_iss becomes
+// ZeroID's issuer, since it names sub's issuer (ADR 0042 D5a). Install with
+// Server.SetFederatedPersonResolver. Return ErrPersonNotMember for a person
+// who is not a member of the account (invalid_grant); any other error, an
+// empty id or a panic fails the grant with server_error. Required when
+// trusted issuers are account rows (federation.issuer_store=db).
+type FederatedPersonResolver = service.FederatedPersonResolver
+
+// ErrPersonNotMember is a FederatedPersonResolver's answer for a person who
+// is not a member of the account.
+var ErrPersonNotMember = service.ErrPersonNotMember
+
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before
 // reaching any handler. Use this to add authentication (Bearer JWT, mTLS, API key,

@@ -101,6 +101,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
 - **Continuous Access Evaluation (CAE)** — Revoke credentials in real time when risk signals fire via the OpenID Shared Signals Framework (SSF). Revoke the orchestrator's credential and the entire downstream chain is invalidated immediately—no waiting for token expiry.
 - **Attestation Framework** — Pluggable verifiers behind a fail-closed contract: software, platform, and hardware attestation elevate trust levels before credentials are issued. Ships with an OIDC verifier (GitHub Actions, GCP Workload Identity, Kubernetes projected SA tokens, etc.) plus per-tenant `AttestationPolicy` for issuer allowlisting and claim binding. Full reference: [`docs/attestation.md`](docs/attestation.md).
+- **Trusted issuers** — agents registered in a customer IdP reach ZeroID with the IdP's own tokens: an ID-JAG redeemed with `jwt-bearer`, or the person's OpenID Connect ID token exchanged by the agent it was issued to (RFC 8693, `private_key_jwt` only, positively an ID token). Issuers are per-account rows (`federation.issuer_store: db`) of kind `person` or `workload`, read live on every grant, with credential bindings that map the agent to its own identity, the tenant derived rather than requested, adopted agents only, and a hook (`Server.SetFederatedPersonResolver`) that maps the IdP person to the deployer's user. Standalone deployments keep the static `external_issuers` list. Full reference: [`docs/external-issuers.md`](docs/external-issuers.md); a mock IdP for local runs is [`cmd/zeroid-mockidp`](cmd/zeroid-mockidp/README.md).
 - **WIMSE Proof Tokens** — Single-use, nonce-bound tokens for service-to-service verification and replay protection.
 
 ---
@@ -1006,6 +1007,12 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET | `/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
 | GET | `/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
 | GET | `/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
+| GET, POST | `/external-issuers` | List or add the account's trusted issuers ([contract](docs/external-issuers.md#admin-api)) |
+| GET, PATCH, DELETE | `/external-issuers/{id}` | Read, change or remove a trusted issuer |
+| POST | `/external-issuers/check` | Probe an issuer's JWKS |
+| GET | `/external-issuers/bindings` | List the account's credential bindings across issuers (`?identity_id=`) |
+| GET, POST | `/external-issuers/{id}/bindings` | List (`?identity_id=`) or add credential bindings (optionally creating the agent's OAuth client) |
+| GET, PATCH, DELETE | `/external-issuers/{id}/bindings/{binding_id}` | Read, enable/disable or remove a binding |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
 

@@ -62,6 +62,12 @@ type OAuthService struct {
 	// Nil when no external_issuers are configured — direct federation is
 	// disabled in that case and only the broker path remains.
 	externalIssuerRegistry *ExternalIssuerRegistry
+	// issuerBindings maps federated agents to identities when issuers are
+	// account rows (ADR 0042 D6). Nil in static mode.
+	issuerBindings issuerBindingSource
+	// federatedPerson resolves the person in an IdP token to the deployer's
+	// user (ADR 0042 D5a).
+	federatedPerson federatedPersonHook
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
@@ -187,6 +193,9 @@ var reservedClaims = map[string]bool{
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
+	// The IdP's issuer and subject for a person ZeroID resolved to the
+	// deployer's user (ADR 0042 D5a); only the federated grants write them.
+	"user_idp_iss": true, "user_idp_sub": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to
@@ -1292,6 +1301,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if len(parentActors) > 0 {
 		delegatedBy = parentActors[0].Sub
 	}
+	// Under rfc8693, an agent exchanging a token it already acts on (a person
+	// token from ID-JAG or the ID-token exchange names it as act) is
+	// re-scoping, not delegating: no new actor level and no added depth.
+	sameActor := isCurrentActor(parentActors, actorIdentity)
+	childDepth := parentDepth + 1
+	if sameActor {
+		childDepth = parentDepth
+		delegatedBy = delegatorBefore(subjectParsed, parentActors)
+	}
 
 	// Resolve mission_id from the subject_token (issue #81). Prefer the
 	// explicit mission_id claim; fall back to the subject_token's own jti
@@ -1321,7 +1339,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		GrantType:           domain.GrantTypeTokenExchange,
 		DelegatedBy:         delegatedBy,
 		ParentJTI:           subjectJTI,
-		DelegationDepth:     parentDepth + 1,
+		DelegationDepth:     childDepth,
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
@@ -1338,17 +1356,32 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
 	issue.UserGrantBounded = true
 
+	// The principal's IdP pair (user_idp_iss, user_idp_sub) describes sub, which the
+	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
+	// from the verified parent; never from the request.
+	if parent.Type == domain.PrincipalUser {
+		idpIss, _ := jwt.Get[string](subjectParsed, "user_idp_iss")
+		idpSub, _ := jwt.Get[string](subjectParsed, "user_idp_sub")
+		if idpIss != "" && idpSub != "" {
+			issue.IdPIssuer, issue.IdPSubject = idpIss, idpSub
+		}
+	}
+
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
 	// outermost, then the parent's actors. A parent with no actors was a root
 	// grant; its client acted for the principal, so it becomes the first
-	// prior actor (T0's client A in the design's three-hop example).
+	// prior actor (T0's client A in the design's three-hop example). When the
+	// actor already is the parent's current actor, it replaces itself.
+	if sameActor && len(parentActors) > 0 {
+		parentActors = parentActors[1:]
+	}
 	issue.Actors = append([]domain.Actor{{
 		Sub:          actorIdentity.WIMSEURI,
 		IdentityType: string(actorIdentity.IdentityType),
 		TrustLevel:   string(actorIdentity.TrustLevel),
 		ExternalID:   actorIdentity.ExternalID,
 	}}, parentActors...)
-	if len(parentActors) == 0 {
+	if len(parentActors) == 0 && !sameActor {
 		if cid, _ := jwt.Get[string](subjectParsed, "client_id"); cid != "" {
 			issue.Actors = append(issue.Actors, domain.Actor{Sub: cid})
 		}
@@ -1364,6 +1397,25 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// isCurrentActor reports whether actor is already the subject token's
+// current actor: its act.sub under rfc8693 (ADR 0043 D2). parentActors is
+// empty for a legacy token, which keeps today's nesting (ADR 0043 D1: no
+// new behaviour for legacy).
+func isCurrentActor(parentActors []domain.Actor, actor *domain.Identity) bool {
+	return len(parentActors) > 0 && parentActors[0].Sub == actor.WIMSEURI
+}
+
+// delegatorBefore names who delegated to the parent's current actor, for a
+// re-scoping exchange that keeps that actor: the next prior actor, else the
+// parent's sub (the principal).
+func delegatorBefore(subject jwt.Token, parentActors []domain.Actor) string {
+	if len(parentActors) > 1 {
+		return parentActors[1].Sub
+	}
+	sub, _ := subject.Subject()
+	return sub
 }
 
 // mayActPermits reports whether an RFC 8693 §4.4 may_act claim names actor.

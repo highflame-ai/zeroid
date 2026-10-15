@@ -556,6 +556,8 @@ type identityResp struct {
 type oauthClientResp struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
+	// Key is a private_key_jwt client's signing key; nil for a secret client.
+	Key *ecdsa.PrivateKey `json:"-"`
 }
 
 // registerIdentity calls POST /api/v1/identities and returns the created identity.
