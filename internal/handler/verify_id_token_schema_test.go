@@ -46,6 +46,23 @@ func TestVerifyIDTokenSchemaRefusalNeverEchoesTheToken(t *testing.T) {
 	}
 }
 
+// A body that is not JSON is the path where huma copies the raw body
+// verbatim into errors[].value.
+func TestVerifyIDTokenMalformedBodyNeverEchoesTheToken(t *testing.T) {
+	const tok = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvd25lciJ9.c2lnbmF0dXJl"
+	for name, body := range map[string]string{
+		"unterminated": `{"id_token":"` + tok + `"`,
+		"a bare token": `{"id_token":` + tok + `}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := postVerifyIDToken(t, []byte(body))
+			require.GreaterOrEqual(t, rec.Code, 400, rec.Body.String())
+			assert.NotContains(t, rec.Body.String(), tok)
+			assert.NotContains(t, rec.Body.String(), "eyJzdWIiOiJvd25lciJ9", "the token's claims segment")
+		})
+	}
+}
+
 func TestVerifyIDTokenBodyIsCapped(t *testing.T) {
 	raw, err := json.Marshal(map[string]any{"id_token": strings.Repeat("a", maxVerifyIDTokenBodyBytes), "client_id": "app", "nonce": "n"})
 	require.NoError(t, err)

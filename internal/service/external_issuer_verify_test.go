@@ -114,6 +114,12 @@ func TestVerifyIDToken_Refusals(t *testing.T) {
 		{"a non-string nonce", func() string { return f.token(t, map[string]any{"nonce": 7}) }, "nonce_mismatch"},
 		{"wrong aud", func() string { return f.token(t, map[string]any{"aud": "another-app"}) }, "audience_mismatch"},
 		{"azp names another party", func() string { return f.token(t, map[string]any{"azp": "another-app"}) }, "audience_mismatch"},
+		{"azp is not a string", func() string {
+			return f.token(t, map[string]any{"azp": []string{"another-app"}})
+		}, "audience_mismatch"},
+		{"azp is not a string, several audiences", func() string {
+			return f.token(t, map[string]any{"aud": []string{verifyClientID, "another-app"}, "azp": []string{verifyClientID}})
+		}, "audience_mismatch"},
 		{"several audiences, no azp", func() string {
 			return f.token(t, map[string]any{"aud": []string{verifyClientID, "another-app"}})
 		}, "audience_mismatch"},

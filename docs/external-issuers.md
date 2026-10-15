@@ -146,7 +146,7 @@ All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_
 
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
    This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
-   Its `client_id` is in the ID token's `aud`; `azp`, when present, equals it; several audiences without `azp` are refused.
+   Its `client_id` is in the ID token's `aud`; `azp`, when present, is a string equal to it; several audiences without `azp` are refused.
    The `aud` is accepted because it names the presenting `client_id`, which must then be the subject key of an enabled binding on the row (rule 4; the binding is the audience rule), or because it is in the row's `audiences`.
 2. The subject token is positively an ID token (static issuers too): it carries `iss`, `sub`, `aud`, `exp` and `iat`, and no access-token marker: no `scp`, `scope`, `azpacr` or `appidacr` (Entra stamps one of the last two on every access token, app-only ones included), and no `typ` of `at+jwt`, `application/at+jwt` or `oauth-id-jag+jwt`.
    `roles` alone is not a marker: Entra ID tokens carry a user's app roles in it.
@@ -377,6 +377,7 @@ ZeroID re-reads `{issuer}/.well-known/openid-configuration` with the same fetch 
 ```
 
 Both endpoints must be absolute https URLs with no userinfo, query or fragment (http only with `allow_private_endpoints`), or the answer is 422 `discovery_invalid`.
+An endpoint with a query (Azure AD B2C's `?p=<policy>`) is refused; such an issuer cannot be a row anyway, since its `jwks_uri` carries the same query.
 A fetch failure is the create's 422 (`discovery_unreachable`, `discovery_issuer_mismatch`, `discovery_invalid`).
 A `workload` row is 422 `wrong_kind`; another account's row is 404.
 A disabled row still answers, so a deployer can prepare a sign-in before enabling it; `/verify-id-token` refuses it.
@@ -389,14 +390,14 @@ Nothing is stored: the row's `jwks_uri` changes only through `/refresh`.
 ```
 
 All three are required: `id_token` at most 16384 bytes, `client_id` and `nonce` at most 512 (400 `invalid_request` otherwise).
-A body over 32 KiB is refused unread (413), and a schema refusal (a missing or unknown field, 422 with no `code`) redacts every echoed value, so the token never comes back.
+A body of 32 KiB or more is refused with 413, and a refusal before the handler runs (malformed JSON, or a missing or unknown field: 400 or 422 with no `code`) redacts every echoed value, so the token never comes back.
 ZeroID verifies the token under this row with the routine the ID-token exchange (P1c) runs, so it accepts nothing the exchange's token checks would refuse:
 
 - the row is `person` (else `wrong_kind`) and enabled (else `issuer_disabled`), checked before the token is read;
 - the signature, against the row's JWKS (an unknown `kid` triggers the same single-flight refresh), with an algorithm on the row's list;
 - `iss` equal to the row's issuer; `exp`, `nbf` and `iat` with the 60-second skew; `iat` within `max_token_age_seconds`; `sub` present;
 - an ID token, not an access token (rule 2 of P1c);
-- `aud` containing `client_id`, `azp` equal to it when present, and several audiences only with `azp`;
+- `aud` containing `client_id`, `azp` (when present) a string equal to it, and several audiences only with `azp`;
 - the row's claim constraints, including a shared issuer's pinning claim, on the verified claims;
 - the mapped `user_id` present, and the subject a person (rule 3 of P1c);
 - and, beyond P1c, a `nonce` claim equal to `nonce`, compared in constant time.
@@ -421,7 +422,7 @@ A refused token is 422 with one of these codes, and never the token, its claims,
 | `code` | When |
 |---|---|
 | `token_invalid` | Malformed, a disallowed algorithm, a bad signature or unknown key, `iss` not the row's, expired or not yet valid, too old, no `sub`/`exp`/`iat`, an access token, no mapped `user_id`, or a workload subject |
-| `audience_mismatch` | `client_id` is not in `aud`, `azp` names another party, or several audiences and no `azp` |
+| `audience_mismatch` | `client_id` is not in `aud`, `azp` names another party or is not a string, or several audiences and no `azp` |
 | `constraint_mismatch` | The verified claims do not satisfy the row's claim constraints |
 | `nonce_mismatch` | The token has no `nonce` claim, or not this one |
 | `issuer_disabled` | The row is disabled |
@@ -523,3 +524,4 @@ Every insert, update and delete of a row or binding writes `identity_audit_logs`
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
 - Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); `workload` rows and the ownership of a shared issuer's pinning value remain open.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
+- JWKS refreshes on an unknown `kid` are rate-limited per key set (one every 10 seconds), and rows that share a `jwks_uri` share the key set. Tokens with made-up `kid`s, presented on the ID-token exchange or on `/verify-id-token`, can hold that slot, so a real key rotation at the IdP is picked up up to 10 seconds late for every account on the key set.

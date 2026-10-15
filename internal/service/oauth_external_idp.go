@@ -45,11 +45,15 @@ func idTokenIssuedTo(token jwt.Token, clientID string) error {
 	if !slices.Contains(aud, clientID) {
 		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)", errAssertionAudience)
 	}
-	azp, err := jwt.Get[string](token, "azp")
-	if err == nil && azp != clientID {
-		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)", errAssertionAudience)
+	// An azp that is present must be a string equal to clientID: one of
+	// another type is refused, never read as absent.
+	hasAZP := token.Has("azp")
+	if hasAZP {
+		if azp, err := jwt.Get[string](token, "azp"); err != nil || azp != clientID {
+			return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)", errAssertionAudience)
+		}
 	}
-	if err != nil && len(aud) > 1 {
+	if !hasAZP && len(aud) > 1 {
 		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client", errAssertionAudience)
 	}
 	return nil
