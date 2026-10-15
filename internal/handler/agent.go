@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -300,6 +301,36 @@ type SetOwnPublicKeyOutput struct {
 	Body *service.AgentResponse
 }
 
+// selfKeyGrantTypes are the grants that issue an agent a token for itself.
+// Every other token is refused: exchanged and CIBA tokens are held for a
+// delegation chain; proof tokens carry no grant_type and are meant for the
+// third party named in their audience; person grants act for a human.
+var selfKeyGrantTypes = map[string]bool{
+	string(domain.GrantTypeAPIKey):            true,
+	string(domain.GrantTypeClientCredentials): true,
+	string(domain.GrantTypeJWTBearer):         true,
+}
+
+// selfKeyTokenRefusal returns why a token may not set its agent's key, or ""
+// when it may. Setting a first key is trust-on-first-use, authorized by the
+// token alone, so only the agent's own credential qualifies.
+func selfKeyTokenRefusal(c internalMiddleware.AgentClaims) string {
+	if !selfKeyGrantTypes[c.GrantType] {
+		return "key enrollment needs the agent's own token (api_key, client_credentials or jwt-bearer)"
+	}
+	// jwt_bearer also redeems an IdP's ID-JAG, which acts for a person.
+	if c.PrincipalType == "user" || c.UserIDIssuer != "" {
+		return "key enrollment needs the agent's own token, not one acting for a person"
+	}
+	// A token bound to another audience (a gateway, an RFC 8707 resource) is
+	// held by that audience too. It must not become a durable key: whoever
+	// holds it could otherwise enroll one on an agent that has none.
+	if !slices.Contains(c.Audience, c.Issuer) {
+		return "key enrollment needs a token whose audience is this issuer, not one bound to another audience"
+	}
+	return ""
+}
+
 // setOwnPublicKeyOp enrolls or rotates the actor-assertion public key for the
 // authenticated agent identity (self-service). Identity + tenant come from the
 // agent's own access-token claims (AgentAuthMiddleware), never from caller input.
@@ -308,12 +339,14 @@ func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput
 	if !ok || claims.Subject == "" {
 		return nil, huma.Error401Unauthorized("missing or invalid agent token")
 	}
-	// Only the agent's own token may set its key. An exchanged token is held
-	// by its current actor on behalf of a delegation chain, and that actor
-	// already has a key (it signed the actor assertion), so refusing it costs
-	// nothing and keeps first-key enrollment tied to the agent's own credential.
-	if claims.GrantType == string(domain.GrantTypeTokenExchange) {
-		return nil, huma.Error403Forbidden("key enrollment needs the agent's own token, not a delegated one")
+	if reason := selfKeyTokenRefusal(claims); reason != "" {
+		return nil, huma.Error403Forbidden(reason)
+	}
+
+	// The token must still be live: a revoked token could otherwise bind a
+	// key that outlives the revocation.
+	if _, active, err := a.credSvc.IntrospectToken(ctx, claims.JTI); err != nil || !active {
+		return nil, huma.Error401Unauthorized("missing or invalid agent token")
 	}
 
 	// The agent is the token's subject (the current actor under the rfc8693
