@@ -3433,7 +3433,9 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // only if it was issued to that client (RFC 7009 §2.1: the server "verifies
 // whether the token was issued to the client making the revocation request").
 // When it is empty, possession of the token is the authorization — the same
-// rule this endpoint has always applied to access tokens.
+// rule this endpoint has always applied to access tokens. Access tokens are
+// not checked against clientID here; a CIMD client's revocation, which must
+// confine access tokens too, goes through RevokeForClient instead.
 //
 // Revoking a refresh token revokes its whole family — the grant — together
 // with the access tokens issued from that family, which RFC 7009 §2.1 says the
@@ -3451,6 +3453,27 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 // only when the server failed to look up or revoke a token, so the endpoint
 // does not report a revocation it did not carry out.
 func (s *OAuthService) RevokeToken(ctx context.Context, tokenStr, tokenTypeHint, clientID string) error {
+	return s.revokeToken(ctx, tokenStr, tokenTypeHint, revocationScope{clientID: clientID})
+}
+
+// revocationScope says whose tokens a revocation may reach.
+//
+//   - clientID set: a refresh token is revoked only if it was issued to that
+//     client (row.ClientID). Empty: any refresh token the caller presents.
+//   - ownAccessTokensOnly: an access token is revoked only if its verified
+//     `client_id` claim names clientID, too. Off, possession of an access
+//     token authorizes its revocation. RevokeForClient turns this on for a
+//     CIMD client, whose identity is self-published and so may only ever
+//     reach tokens that client already holds. With clientID empty, nothing
+//     matches and no access token is revoked (fail closed).
+type revocationScope struct {
+	clientID            string
+	ownAccessTokensOnly bool
+}
+
+// revokeToken is RevokeToken with an explicit revocationScope. See RevokeToken
+// for the lookup order and the error contract.
+func (s *OAuthService) revokeToken(ctx context.Context, tokenStr, tokenTypeHint string, scope revocationScope) error {
 	if tokenStr == "" {
 		return nil
 	}
@@ -3459,7 +3482,7 @@ func (s *OAuthService) RevokeToken(ctx context.Context, tokenStr, tokenTypeHint,
 		if kind == revocationKindRefresh {
 			revoke = s.revokeRefreshToken
 		}
-		found, err := revoke(ctx, tokenStr, clientID)
+		found, err := revoke(ctx, tokenStr, scope)
 		if err != nil {
 			return err
 		}
@@ -3488,57 +3511,71 @@ func revocationLookupOrder(tokenTypeHint string) []revocationKind {
 }
 
 // revokeAccessToken revokes tokenStr if it is an access token this server
-// issued. found reports whether it was one — revoked now, or already revoked
-// or expired — so the refresh-token lookup is skipped.
+// issued. found reports whether it was one — revoked now, already revoked or
+// expired, or out of scope — so the refresh-token lookup is skipped.
 //
-// clientID is not checked here: access-token revocation keeps the rule this
-// endpoint has always had (possession of the token authorizes its
-// revocation).
-func (s *OAuthService) revokeAccessToken(ctx context.Context, tokenStr, _ string) (bool, error) {
+// Unless scope.ownAccessTokensOnly is set, the client is not checked here:
+// access-token revocation keeps the rule this endpoint has always had
+// (possession of the token authorizes its revocation). When it is set, a
+// token whose verified `client_id` claim does not name scope.clientID is left
+// alone and reported as found, so the response is the same 200 as for the
+// caller's own token.
+func (s *OAuthService) revokeAccessToken(ctx context.Context, tokenStr string, scope revocationScope) (bool, error) {
 	// Parse without full validation — token may already be expired but still revocable.
 	parsed, err := s.parseToken(tokenStr, false)
 	if err != nil {
 		return false, nil // not a JWT this server signed — maybe a refresh token
 	}
+	if scope.ownAccessTokensOnly && !tokenIssuedToClient(parsed, scope.clientID) {
+		log.Debug().Str("client_id", scope.clientID).
+			Msg("oauth2 revocation: access token not issued to the requesting client; nothing revoked")
+		return true, nil
+	}
+	return true, s.revokeParsed(ctx, parsed)
+}
 
+// revokeParsed revokes the credential behind an already signature-verified
+// access token. Unknown, already-revoked and expired tokens are success (RFC
+// 7009 §2.2); an error means the lookup or the revocation failed server-side.
+func (s *OAuthService) revokeParsed(ctx context.Context, parsed jwt.Token) error {
 	jti, _ := parsed.JwtID()
 	if jti == "" {
-		return true, nil // signed by us but not a revocable credential
+		return nil // signed by us but not a revocable credential
 	}
 
 	cred, err := s.credentialSvc.repo.GetByJTI(ctx, jti)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil // unknown — success per RFC 7009 §2.2
+			return nil // unknown — success per RFC 7009 §2.2
 		}
-		return true, fmt.Errorf("revocation: look up access token: %w", err)
+		return fmt.Errorf("revocation: look up access token: %w", err)
 	}
 
 	// Already revoked or expired — success per RFC 7009.
 	if cred.IsRevoked || time.Now().After(cred.ExpiresAt) {
-		return true, nil
+		return nil
 	}
 
 	// Tenant is taken from the credential record — not caller-supplied headers.
 	err = s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
 	if err != nil && !errors.Is(err, ErrCredentialNotFound) { // not found ⇒ revoked concurrently
-		return true, fmt.Errorf("revocation: revoke access token: %w", err)
+		return fmt.Errorf("revocation: revoke access token: %w", err)
 	}
-	return true, nil
+	return nil
 }
 
 // revokeRefreshToken revokes tokenStr if it is a refresh token this server
 // issued, by revoking its family and the access tokens issued from it. found
 // reports whether it was one.
 //
-// A token issued to a client other than clientID (when clientID is set) is
+// A token issued to a client other than scope.clientID (when that is set) is
 // left alone and reported as found, so the response is the same 200 as for a
 // token the caller owns.
 //
 // The family is revoked whatever state the presented row is in. A rotated-out
 // or already-revoked token still names the grant the client asked to end, and
 // revoking an already-revoked family is a no-op.
-func (s *OAuthService) revokeRefreshToken(ctx context.Context, tokenStr, clientID string) (bool, error) {
+func (s *OAuthService) revokeRefreshToken(ctx context.Context, tokenStr string, scope revocationScope) (bool, error) {
 	if s.refreshTokenSvc == nil {
 		return false, nil
 	}
@@ -3549,7 +3586,7 @@ func (s *OAuthService) revokeRefreshToken(ctx context.Context, tokenStr, clientI
 		}
 		return false, fmt.Errorf("revocation: look up refresh token: %w", err)
 	}
-	if clientID != "" && row.ClientID != clientID {
+	if scope.clientID != "" && row.ClientID != scope.clientID {
 		log.Debug().Str("family_id", row.FamilyID).
 			Msg("oauth2 revocation: refresh token not issued to the requesting client; nothing revoked")
 		return true, nil
@@ -3738,6 +3775,10 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// deliberate exclusion of CIMD clients: introspection has no redirect_uri
 	// binding to protect it, so a self-published metadata document must not be
 	// able to satisfy this gate and turn introspection into a token oracle.
+	// That holds even for a VALID assertion from a CIMD client: it proves only
+	// control of the document URL, which anyone can have. (Revocation accepts
+	// such a client in RevokeForClient, where the action is confined to the
+	// client's own tokens; introspection has no such confinement.)
 	if clientAssertionPresented(assertion, assertionType) {
 		if clientSecret != "" {
 			return oauthUnauthorized(
@@ -3812,6 +3853,11 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// fetches) with zero registration. Token issuance to a CIMD client is
 	// safe because redirect_uri binding protects the flow; token INSPECTION
 	// has no equivalent binding, so it stays registry-only.
+	//
+	// Revocation does accept CIMD clients, but not through here:
+	// RevokeForClient handles them BEFORE calling this function, and only
+	// revokes a token issued to that same client_id. Do not widen this
+	// function to cover them — it would reach introspection too.
 	if clientSecret == "" {
 		publicClient, err := s.oauthClientSvc.GetPublicClient(ctx, clientID)
 		if err != nil {
