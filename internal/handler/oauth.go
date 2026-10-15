@@ -260,6 +260,12 @@ func extractOAuthError(err error) (code, description string, status int) {
 	if errors.Is(err, service.ErrScopesNotAllowed) {
 		return oautherror.InsufficientScope, err.Error(), http.StatusBadRequest
 	}
+	if errors.Is(err, service.ErrPersonScopeDenied) {
+		return oautherror.InvalidScope, "none of the requested scopes is granted to this user", http.StatusBadRequest
+	}
+	if errors.Is(err, service.ErrPersonGrantUnavailable) {
+		return oautherror.ServerError, "the user's scope ceiling could not be resolved", http.StatusInternalServerError
+	}
 	// Identity gates can fire at the chokepoint after the per-grant
 	// check passed (TOCTOU window). Map to stable error_description
 	// strings — the per-grant checks emit the exact same values, so

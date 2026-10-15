@@ -51,6 +51,13 @@ var (
 	// backchannel.enforce_hints=shadow that enforce_hints=on would refuse.
 	// Attribute: reason (low-cardinality refusal code).
 	CIBAApproverWouldDeny metric.Int64Counter
+
+	// PersonScopeCeiling counts person mints whose scopes the deployer's
+	// person-grant ceiling narrowed or refused, or whose resolver failed.
+	// Attributes: mode (shadow/enforce), outcome (narrowed/denied/
+	// resolver_error), grant_type, account_id, project_id. Exported to
+	// Prometheus as zeroid_person_scope_ceiling_total.
+	PersonScopeCeiling metric.Int64Counter
 )
 
 func init() {
@@ -88,6 +95,9 @@ func registerInstruments(m metric.Meter) {
 	)
 	CIBAApproverWouldDeny, _ = m.Int64Counter("ciba_approver_would_deny_total",
 		metric.WithDescription("CIBA approver checks that would deny under enforce_hints=on (shadow mode)"),
+	)
+	PersonScopeCeiling, _ = m.Int64Counter("zeroid.person.scope_ceiling",
+		metric.WithDescription("Person mints the person-grant ceiling narrowed or refused (counted in shadow and enforce), or whose resolver failed"),
 	)
 }
 

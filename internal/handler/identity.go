@@ -121,7 +121,7 @@ type UpdateIdentityInput struct {
 		OwnerUserID        string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`
 		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
 		CredentialPolicyID *string         `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Empty string resets to tenant default; omit to leave unchanged."`
-		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA public key PEM"`
+		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 (ES256) SPKI public key. Empty or omitted leaves the key unchanged; this field cannot clear an enrolled key."`
 		Framework          *string         `json:"framework,omitempty" doc:"Agent framework"`
 		Version            *string         `json:"version,omitempty" doc:"Agent version"`
 		Publisher          *string         `json:"publisher,omitempty" doc:"Agent publisher"`

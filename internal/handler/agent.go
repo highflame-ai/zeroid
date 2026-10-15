@@ -46,6 +46,12 @@ func mapErr(err error) error {
 	if errors.Is(err, service.ErrInvalidOwnerArgument) {
 		return huma.Error400BadRequest(err.Error())
 	}
+	// Caller-fixable field validation (e.g. a non-P-256 public_key_pem on
+	// PATCH /agents/registry/{id}). Checked before the substring fallbacks so a
+	// reason that happens to contain "not found" cannot turn it into a 404.
+	if errors.Is(err, service.ErrInvalidIdentityField) {
+		return huma.Error400BadRequest(err.Error())
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "no rows in result set"), strings.Contains(msg, "not found"):
@@ -170,7 +176,7 @@ type UpdateAgentInput struct {
 		// possession — the admin recovery path. This route is secret-gated
 		// (management API), so admin authority is the authorization. Agents
 		// rotate their own key via POST /agents/self/public-key with proofs.
-		PublicKeyPEM *string `json:"public_key_pem,omitempty" doc:"Force-set the agent's actor-assertion public key (admin recovery; no proof-of-possession)."`
+		PublicKeyPEM *string `json:"public_key_pem,omitempty" doc:"Force-set the agent's actor-assertion public key, a PEM-encoded EC P-256 (ES256) SPKI key (admin recovery; no proof-of-possession). Empty leaves the key unchanged."`
 	}
 }
 
