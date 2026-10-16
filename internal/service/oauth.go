@@ -1692,6 +1692,9 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
 			return nil, mapped
 		}
+		if issuanceRefusal(err) {
+			return nil, err
+		}
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
 

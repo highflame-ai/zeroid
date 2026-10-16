@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 func TestResolveFederatedPerson(t *testing.T) {
@@ -116,6 +118,34 @@ func TestEmailVerified(t *testing.T) {
 	for _, tc := range cases {
 		if got := emailVerified(tc.claims, tc.claim); got != tc.want {
 			t.Errorf("emailVerified(%v, %q) = %v", tc.claims, tc.claim, got)
+		}
+	}
+}
+
+func TestIssuerEmailVerified(t *testing.T) {
+	okta := domain.ExternalIssuerConfig{ClaimMapping: map[string]string{"email_verified": "email_verified"}}
+	trusted := okta
+	trusted.TrustEmail = true
+	entraTrusted := domain.ExternalIssuerConfig{ClaimMapping: map[string]string{"email_verified": "xms_edov"}, TrustEmail: true}
+	cases := []struct {
+		name   string
+		claims map[string]any
+		cfg    domain.ExternalIssuerConfig
+		email  string
+		want   bool
+	}{
+		{"the claim decides when present", map[string]any{"email_verified": true}, okta, "a@corp.example", true},
+		{"no claim, not trusted", map[string]any{}, okta, "a@corp.example", false},
+		{"no claim, trusted: the issuer vouches for its email", map[string]any{}, trusted, "a@corp.example", true},
+		{"an explicit false is never overridden", map[string]any{"email_verified": false}, trusted, "a@corp.example", false},
+		{"an explicit string false is never overridden", map[string]any{"email_verified": "false"}, trusted, "a@corp.example", false},
+		{"trusted, but no email to vouch for", map[string]any{}, trusted, "", false},
+		{"the mapped claim, absent, trusted", map[string]any{"email_verified": false}, entraTrusted, "a@corp.example", true},
+		{"the mapped claim, present", map[string]any{"xms_edov": "1"}, entraTrusted, "a@corp.example", true},
+	}
+	for _, tc := range cases {
+		if got := issuerEmailVerified(tc.claims, tc.cfg, tc.email); got != tc.want {
+			t.Errorf("%s: issuerEmailVerified(%v) = %v, want %v", tc.name, tc.claims, got, tc.want)
 		}
 	}
 }

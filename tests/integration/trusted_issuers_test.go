@@ -397,7 +397,9 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 		"not a URL":                 {map[string]any{"kind": "person", "issuer": "ftp://x", "audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_issuer"},
 		"HS256":                     {map[string]any{"kind": "person", "issuer": "https://hs.example", "audiences": []string{"a"}, "algorithms": []string{"HS256"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 400, "invalid_algorithms"},
 		"workload with no audience": {map[string]any{"kind": "workload", "issuer": "https://na.example"}, 400, "invalid_audiences"},
-		"entra common":              {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
+		"workload that vouches for emails": {map[string]any{"kind": "workload", "issuer": "https://wt.example",
+			"audiences": []string{"a"}, "trust_email": true}, 400, "invalid_trust_email"},
+		"entra common": {map[string]any{"kind": "person", "preset": "entra", "issuer": "https://login.microsoftonline.com/common/v2.0", "audiences": []string{"a"}}, 400, "invalid_issuer"},
 		"shared issuer without constraints": {map[string]any{"kind": "person", "issuer": "https://accounts.google.com",
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
 		"unreachable discovery": {map[string]any{"kind": "person", "issuer": "https://127.0.0.1:1",
@@ -778,6 +780,13 @@ func TestTrustedIssuers_P1C_Refusals(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 		requireRefused(t, resp, "invalid_client")
 	})
+	t.Run("a scope the agent's credential policy does not grant", func(t *testing.T) {
+		// The client asked for more than the policy allows: a 400, as on the
+		// sibling grants, not a server_error.
+		resp := p.exchange(t, good(), map[string]any{"scope": "tools:write"})
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		requireRefused(t, resp, "policy_violation")
+	})
 	t.Run("a person who is not a member of the account", func(t *testing.T) {
 		requireRefused(t, p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"oid": uid("oid-stranger")}), nil), "invalid_grant")
 	})
@@ -973,11 +982,9 @@ func (p *p1bFixture) idJAG(t *testing.T, extra map[string]any) string {
 		"act":      map[string]any{"sub": p.clientID, "sub_profile": "ai_agent"},
 		"resource": "https://gateway.example/mcp/github", "scope": "tools:read", "jti": uid("jti"),
 	}
+	// A nil value reaches the mock as JSON null, which removes the claim:
+	// deleting it here would leave the profile's default in place.
 	for k, v := range extra {
-		if v == nil {
-			delete(claims, k)
-			continue
-		}
 		claims[k] = v
 	}
 	return p.f.mint(t, mockidp.ProfileOktaIDJAG, claims)
@@ -1011,6 +1018,83 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	p.f.mu.Unlock()
 	assert.Equal(t, p.rowID, seen.IssuerID, "the issuer row that verified the ID-JAG")
 	assert.Equal(t, zeroid.PersonGrantIDJAG, seen.GrantType)
+}
+
+// TestTrustedIssuers_TrustEmail: an issuer that vouches for its own email
+// claim (trust_email) makes a person token with an email and no
+// email_verified claim count as verified. OpenID Connect returns
+// email_verified from the UserInfo endpoint whenever the sign-in also issued
+// an access token (OIDC Core 5.4), so a directory may never put it in the
+// tokens ZeroID sees. An explicit false is never overridden.
+func TestTrustedIssuers_TrustEmail(t *testing.T) {
+	p := newP1B(t)
+	verdict := func(t *testing.T, extra map[string]any) bool {
+		t.Helper()
+		resp := p.redeem(t, p.idJAG(t, extra), nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		p.f.mu.Lock()
+		defer p.f.mu.Unlock()
+		return p.f.lastPerson.EmailVerified
+	}
+	// The mock's Okta ID-JAG asserts email_verified by default; a real Okta
+	// token carries the email without it.
+	email := map[string]any{"email": "alice@corp.example", "email_verified": nil}
+
+	status, body := p.f.call(t, http.MethodGet, "/external-issuers/"+p.rowID, nil, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.Equal(t, false, body["trust_email"], "off unless the owner turns it on")
+	assert.False(t, verdict(t, email), "off: an email with no email_verified claim is not verified")
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"trust_email": true}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.Equal(t, true, body["trust_email"])
+
+	assert.True(t, verdict(t, email), "on: the issuer vouches for its email")
+	assert.False(t, verdict(t, merged(email, map[string]any{"email_verified": false})), "an explicit false stays false")
+	assert.True(t, verdict(t, merged(email, map[string]any{"email_verified": true})), "an explicit true stays true")
+	assert.False(t, verdict(t, map[string]any{"email": nil, "email_verified": nil}), "no email: nothing to vouch for")
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"trust_email": false}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.False(t, verdict(t, email), "off again")
+}
+
+// TestTrustedIssuers_P1B_OptionalClaims: the ID-JAG draft makes act and the
+// resource claim OPTIONAL (§3.1). Without act the ID-JAG's client_id (which
+// must equal the authenticated client) names the agent; without a resource
+// claim the RFC 8707 resource the request names binds the token, and with
+// neither the grant is refused.
+func TestTrustedIssuers_P1B_OptionalClaims(t *testing.T) {
+	p := newP1B(t)
+	const mcp = "https://gateway.example/mcp/notion"
+
+	t.Run("no act: the client_id's binding names the agent", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"act": nil}), nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, "user_hf_alice", claims["sub"])
+		assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims), "the bound agent is the current actor")
+	})
+	t.Run("no resource claim: the requested resource binds the token", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"resource": nil}), map[string]any{"resource": mcp})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.ElementsMatch(t, []any{mcp}, decodeIssuedTokenClaims(t, resp.AccessToken)["aud"])
+	})
+	t.Run("no resource claim and no requested resource is refused", func(t *testing.T) {
+		requireRefused(t, p.redeem(t, p.idJAG(t, map[string]any{"resource": nil}), nil), "invalid_grant")
+	})
+	t.Run("neither act nor resource: the client and the request decide both", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, map[string]any{"act": nil, "resource": nil}), map[string]any{"resource": mcp})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims))
+		assert.ElementsMatch(t, []any{mcp}, claims["aud"])
+	})
+	t.Run("a resource claim still bounds what the request may name", func(t *testing.T) {
+		resp := p.redeem(t, p.idJAG(t, nil), map[string]any{"resource": mcp})
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Empty(t, resp.AccessToken)
+	})
 }
 
 // TestFederatedPerson_StaticIssuerHasNoRowID: a static issuer has no row, so
@@ -1056,8 +1140,20 @@ func TestTrustedIssuers_P1B_Refusals(t *testing.T) {
 		requireRefused(t, resp, "invalid_grant")
 		assert.Contains(t, resp.RawBody, "no enabled binding")
 	})
-	t.Run("no act at all", func(t *testing.T) {
-		requireRefused(t, p.redeem(t, p.idJAG(t, map[string]any{"act": nil}), nil), "invalid_grant")
+	t.Run("no act, and the client_id names no binding", func(t *testing.T) {
+		app, key := uid("0oa-unbound"), generateKey(t)
+		resp := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id": app, "name": app, "token_endpoint_auth_method": "private_key_jwt",
+			"jwks": clientJWKS(t, key), "grant_types": []string{"urn:ietf:params:oauth:grant-type:jwt-bearer"},
+		}, nil)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		_ = resp.Body.Close()
+		r := postFederation(t, p.f.http.URL, merged(map[string]any{
+			"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":  p.idJAG(t, map[string]any{"act": nil, "client_id": app}),
+		}, clientCreds(t, app, key)))
+		requireRefused(t, r, "invalid_grant")
+		assert.Contains(t, r.RawBody, "no enabled binding")
 	})
 	t.Run("a discovered, unadopted agent", func(t *testing.T) {
 		// Its own client, linked to no identity, so the binding alone decides.

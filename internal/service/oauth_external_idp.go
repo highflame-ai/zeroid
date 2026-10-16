@@ -118,8 +118,9 @@ func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerE
 	if err := refuseWorkloadSubject(claims, userID); err != nil {
 		return nil, err
 	}
-	out := &personIDToken{claims: claims, userID: userID, emailVerified: emailVerified(claims, mapping["email_verified"])}
+	out := &personIDToken{claims: claims, userID: userID}
 	out.email, _ = extractMappedClaimString(claims, mapping["email"])
+	out.emailVerified = issuerEmailVerified(claims, entry.Config, out.email)
 	out.name, _ = extractMappedClaimString(claims, mapping["name"])
 	return out, nil
 }
@@ -404,6 +405,9 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	if err != nil {
 		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
 			return nil, mapped
+		}
+		if issuanceRefusal(err) {
+			return nil, err
 		}
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
 	}

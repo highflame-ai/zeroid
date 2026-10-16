@@ -43,6 +43,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `propagate_claims` | A subset of `auth_time`, `acr`, `amr`. |
 | `claim_constraints` | Claim to accepted values. Every listed claim must be present and equal one of its values (for an array claim, contain one). Required on a shared issuer. |
 | `max_token_age_seconds` | 1 to 3600, default 600. |
+| `trust_email` | Person rows only, default false. The issuer vouches for its own email claim: a token that carries an email and **no** `email_verified` claim counts as verified. An explicit `email_verified: false` is never overridden. See [Trusting a directory's emails](#trusting-a-directorys-emails). |
 | `jwks_cache_ttl_seconds` | 30 to 86400, default 300. |
 | `source`, `source_ref` | `admin`, or `connector` with the connector that created the row. |
 | `enabled` | A disabled row refuses every token at the next request. |
@@ -95,6 +96,18 @@ A person row also refuses an issuer that only issues workload tokens (GitHub Act
 The user key is `oid` for Entra because Entra's `sub` is pairwise per application, so one person would carry a different `sub` in every agent's app.
 For `email_verified` on Entra, ask the customer to emit the optional claims `email` and `xms_edov`.
 
+### Trusting a directory's emails
+
+OpenID Connect returns `email_verified` from the UserInfo endpoint, not in the ID token, whenever the sign-in also issued an access token (OIDC Core 5.4).
+An authorization-code sign-in does, so an organization's own directory (Okta is one) may put `email` in the tokens ZeroID sees and never `email_verified`; its ID-JAGs may carry an email and no `email_verified` either.
+ZeroID only ever sees those tokens, so it cannot ask the UserInfo endpoint itself.
+
+`trust_email: true` is the deployer's statement that this issuer is the organization's directory and its email claim can be trusted as given.
+With it, a token that carries an email and no `email_verified` claim is passed to the person resolver as verified; a token that says `email_verified: false` stays unverified.
+Without it (the default), such a token is unverified, as before.
+
+Turn it on only for an issuer whose emails its users cannot set to someone else's address: the organization's own directory, not a social or multi-tenant identity provider.
+
 ### Read live
 
 On every federated grant ZeroID reads the issuer's rows with one indexed query and caches no row, so a disable or delete applies at the next request on every replica.
@@ -109,7 +122,7 @@ The subject key is the value the credential carries at runtime:
 
 | Grant | Subject key |
 |---|---|
-| ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP |
+| ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP; the ID-JAG's `client_id` when it has no `act` (`act` is OPTIONAL in the draft) |
 | ID-token exchange (P1c) | the presenting client's `client_id`, which is the ID token's `aud` |
 
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
@@ -163,14 +176,15 @@ The token's `sub` is the person's user id with `user_id_iss` ZeroID's issuer, th
 
 The request is unchanged ([identity-model.md](identity-model.md#enterprise-managed-authorization-id-jag)).
 Its `aud` must name ZeroID's issuer (draft §4.3); the row's `audiences` play no part.
-With issuer rows the agent is the ID-JAG's `act.sub` mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
+With issuer rows the agent is the ID-JAG's `act.sub` (its `client_id` when it has no `act`) mapped through an enabled binding, not the client's linked identity or `application_id`, and there is no synthetic identity.
+The draft also makes the `resource` claim OPTIONAL: an ID-JAG without one is bound to the RFC 8707 `resource` the request names, and refused when the request names none, so every minted token is still audience-restricted.
 A registered client linked to a different identity is refused, and a CIMD client gets its tenant from the binding.
 The subject must not be a workload, and checks 4 to 6 above apply.
 Every check, including person resolution, runs before the ID-JAG's `jti` is consumed, after the replay check, so a refused request leaves the grant redeemable.
 
 ### Refusals that are events
 
-- **Unmatched agent** (ADR 0027): no `act.sub`, no binding, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
+- **Unmatched agent** (ADR 0027): no binding for the subject key, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
   On both grants the binding is read only after the token's signature and the checks that need no binding have passed, so a forged token raises no event under an account and learns nothing of its bindings.
   Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
 - **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
@@ -228,7 +242,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
-| 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_trust_email` (on a workload row), `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
@@ -328,7 +342,7 @@ The issuer, without `jwks_check`.
 
 ### `PATCH /external-issuers/{id}` → 200
 
-Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `enabled`; absent fields are unchanged.
+Any of `display_name`, `audiences`, `algorithms`, `claim_mapping`, `propagate_claims`, `claim_constraints`, `max_token_age_seconds`, `jwks_cache_ttl_seconds`, `trust_email`, `enabled`; absent fields are unchanged.
 `issuer`, `kind`, `source` and `jwks_uri` never change through PATCH (an unknown field is a 422).
 Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.email_verified`: they decide who a token's person is, and remapping one to a claim an IdP user can set (`upn`, `preferred_username`) would let that user take over an existing link (nOAuth).
 A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
@@ -415,7 +429,7 @@ The answer is the person as the row's claim mapping reads them, exactly as P1c h
 }
 ```
 
-`email_verified` is true only when the claim `claim_mapping.email_verified` names (default `email_verified`; `xms_edov` with the Entra preset) is JSON `true` or the string `"true"` or `"1"`.
+`email_verified` is true when the claim `claim_mapping.email_verified` names (default `email_verified`; `xms_edov` with the Entra preset) is JSON `true` or the string `"true"` or `"1"`, or, on a row with `trust_email`, when that claim is absent and the token carries an email.
 
 A refused token is 422 with one of these codes, and never the token, its claims, or why in more detail (the log line has the account, the row and the code only):
 
@@ -454,7 +468,7 @@ One issuer's bindings; takes the same `?identity_id=` filter.
 
 ```json
 {
-  "subject_key": "<agent app id, or the ID-JAG act.sub>",
+  "subject_key": "<agent app id, or the ID-JAG act.sub (its client_id when it has no act)>",
   "identity_id": "<agent identity uuid in this account>",
   "enabled": true,
   "oauth_client": {"client_id": "optional, defaults to subject_key"}

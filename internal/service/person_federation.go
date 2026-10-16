@@ -10,6 +10,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
@@ -135,6 +136,24 @@ func issuerRowID(entry *ExternalIssuerEntry) string {
 		return ""
 	}
 	return entry.Row.ID
+}
+
+// issuerEmailVerified is the verdict a grant passes on: the issuer's
+// email_verified claim when the token carries it, else, when the issuer
+// vouches for its own email claim (TrustEmail), whether the token has an
+// email. OpenID Connect returns email_verified from the UserInfo endpoint
+// when the sign-in also issued an access token (OIDC Core 5.4), so an
+// organization's directory may never put it in the tokens ZeroID sees. An
+// explicit false is never overridden.
+func issuerEmailVerified(claims map[string]any, cfg domain.ExternalIssuerConfig, email string) bool {
+	claim := cfg.ClaimMapping["email_verified"]
+	if claim == "" {
+		claim = "email_verified"
+	}
+	if _, present := claims[claim]; present {
+		return emailVerified(claims, claim)
+	}
+	return cfg.TrustEmail && email != ""
 }
 
 // emailVerified reads the claim that asserts the email was verified: a JSON
