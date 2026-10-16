@@ -25,6 +25,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -544,8 +545,12 @@ func adminHeaders() map[string]string {
 }
 
 // uid returns a unique agent ID for each test to avoid conflicts.
+// uidSeq breaks ties: two uid calls inside one clock tick (two in the same
+// struct literal, say) returned the same value and collided on unique keys.
+var uidSeq atomic.Int64
+
 func uid(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), uidSeq.Add(1))
 }
 
 // ── Platform setup helpers ────────────────────────────────────────────────────
