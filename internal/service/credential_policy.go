@@ -221,12 +221,15 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 }
 
 // GetPolicy retrieves a credential policy by ID.
+// Within a token request (see withPolicyMemo) each policy is read once.
 func (s *CredentialPolicyService) GetPolicy(ctx context.Context, id, accountID, projectID string) (*domain.CredentialPolicy, error) {
-	policy, err := s.repo.GetByID(ctx, id, accountID, projectID)
-	if err != nil {
-		return nil, ErrPolicyNotFound
-	}
-	return policy, nil
+	return memoPolicy(ctx, accountID+"\x00"+projectID+"\x00"+id, func() (*domain.CredentialPolicy, error) {
+		policy, err := s.repo.GetByID(ctx, id, accountID, projectID)
+		if err != nil {
+			return nil, ErrPolicyNotFound
+		}
+		return policy, nil
+	})
 }
 
 // ListPolicies returns all credential policies for a tenant.
