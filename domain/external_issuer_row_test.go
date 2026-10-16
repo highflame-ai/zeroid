@@ -91,6 +91,9 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "role mapped to an over-long claim is still reserved", mutate: func(e *ExternalIssuer) {
 			e.ClaimMapping["role"] = strings.Repeat("r", maxClaimNameBytes+1)
 		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to a claim over 255 bytes is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", 256)
+		}, want: "claim_mapping_reserved"},
 		{name: "a claim named role may feed another key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["name"] = "role" }},
 		{name: "person without user key", mutate: func(e *ExternalIssuer) { e.ClaimMapping = map[string]string{} }, want: "invalid_claim_mapping"},
 		{name: "workload without user key", mutate: func(e *ExternalIssuer) {
