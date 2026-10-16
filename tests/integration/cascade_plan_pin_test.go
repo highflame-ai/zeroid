@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Migration 059 pins the single-token cascade walk to index nested loops and
+// Migration 060 pins the single-token cascade walk to index nested loops and
 // leaves the bulk (identity, owner) cascades to the planner. CREATE OR REPLACE
 // FUNCTION silently drops function-level settings, so a later migration that
 // redefines one of these functions must carry them forward.
