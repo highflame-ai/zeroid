@@ -94,6 +94,12 @@ type RefreshTokenParams struct {
 	// revoked by the RFC 9493 (issuer, subject) pair, and so the refreshed
 	// token keeps the same principal.
 	PrincipalIss string
+	// UserEmail and UserName are the user's display attributes as the
+	// access token issued alongside carries them (user_email / user_name).
+	// Persisted on the family so every rotation re-stamps them. Empty ⇒ the
+	// refreshed tokens carry neither claim.
+	UserEmail string
+	UserName  string
 	// FamilyID optionally fixes the id of the family this token starts, for a
 	// caller that must stamp it on the access token it issues BEFORE the
 	// refresh token exists (so the access token is revoked with the family).
@@ -164,6 +170,8 @@ func (s *RefreshTokenService) IssueRefreshToken(ctx context.Context, params *Ref
 		Audience:          params.Audience,
 		Resources:         params.Resources,
 		PrincipalIss:      params.PrincipalIss,
+		UserEmail:         params.UserEmail,
+		UserName:          params.UserName,
 	}
 
 	if err := s.repo.Create(ctx, s.db, record); err != nil {
@@ -298,6 +306,12 @@ func (s *RefreshTokenService) RotateRefreshToken(ctx context.Context, rawToken s
 			// refreshed token falls back to ZeroID's own issuer for a user an
 			// external IdP vouched for.
 			PrincipalIss: c.PrincipalIss,
+			// Carry the user's display attributes forward. Lose them and a
+			// CLI's `whoami` goes blank after the second refresh, not the
+			// first — the first is minted from the row the code exchange
+			// seeded.
+			UserEmail: c.UserEmail,
+			UserName:  c.UserName,
 		}
 		return s.repo.Create(ctx, tx, successor)
 	})
