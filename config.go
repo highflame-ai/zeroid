@@ -18,6 +18,7 @@ import (
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/service"
@@ -704,6 +705,13 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("external_issuers[%d]: %w", i, err)
 		}
 		iss := c.ExternalIssuers[i].Issuer
+		// A static issuer is not refused for a reserved key, so an existing
+		// config still boots; the grant ignores the key (ADR 0044 D16), and
+		// this says so rather than dropping it silently.
+		for _, k := range domain.ReservedMappingKeysIn(c.ExternalIssuers[i].ClaimMapping) {
+			log.Warn().Str("issuer", iss).Str("key", k).
+				Msg("external_issuers: claim_mapping key is reserved and ignored; an IdP claim never sets a token's role or privilege_scope. Remove it from the config")
+		}
 		if c.Token.Issuer != "" && domain.CanonicalIssuer(iss) == domain.CanonicalIssuer(c.Token.Issuer) {
 			return fmt.Errorf("external_issuers[%d]: %q is ZeroID's own issuer (token.issuer) and cannot be trusted as an external issuer", i, iss)
 		}

@@ -88,6 +88,9 @@ func TestExternalIssuerValidate(t *testing.T) {
 			e.Kind = IssuerKindWorkload
 			e.ClaimMapping = map[string]string{"role": "roles"}
 		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to an over-long claim is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", maxClaimNameBytes+1)
+		}, want: "claim_mapping_reserved"},
 		{name: "a claim named role may feed another key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["name"] = "role" }},
 		{name: "person without user key", mutate: func(e *ExternalIssuer) { e.ClaimMapping = map[string]string{} }, want: "invalid_claim_mapping"},
 		{name: "workload without user key", mutate: func(e *ExternalIssuer) {
@@ -316,5 +319,34 @@ func TestExternalIssuerConfigAudienceAndKind(t *testing.T) {
 	c.Kind = IssuerKindWorkload
 	if err := c.Validate(); err != nil {
 		t.Fatalf("audiences alone satisfy the audience requirement: %v", err)
+	}
+}
+
+// A reserved key wins over any other claim_mapping fault, whatever order the
+// map iterates in (ADR 0044 D16).
+func TestExternalIssuerValidate_ReservedKeyCodeIsDeterministic(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		e := validRow()
+		e.ClaimMapping = map[string]string{
+			"user_id": "sub", "role": "groups", "sub": "x", "zzz": "y", "aaa": "z",
+			"name": strings.Repeat("n", maxClaimNameBytes+1), "email": " ",
+		}
+		err := e.Validate(IssuerValidation{})
+		if got := issuerCode(err); got != "claim_mapping_reserved" {
+			t.Fatalf("iteration %d: code = %q (err %v), want claim_mapping_reserved", i, got, err)
+		}
+		if !strings.Contains(err.Error(), `"role"`) {
+			t.Fatalf("iteration %d: %v does not name role", i, err)
+		}
+	}
+}
+
+func TestReservedMappingKeysIn(t *testing.T) {
+	got := ReservedMappingKeysIn(map[string]string{"privilege_scope": "a", "user_id": "sub", "role": "b"})
+	if fmt.Sprint(got) != "[role privilege_scope]" {
+		t.Fatalf("got %v, want [role privilege_scope] in fixed order", got)
+	}
+	if got := ReservedMappingKeysIn(map[string]string{"user_id": "sub"}); len(got) != 0 {
+		t.Fatalf("got %v, want none", got)
 	}
 }
