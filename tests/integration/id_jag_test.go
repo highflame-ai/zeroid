@@ -61,7 +61,11 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 	// Confidential client the ID-JAG is bound to (ADR 0010 D2b). Registered on
 	// the shared testServer; OAuth-client lookup is global, so the federation
 	// server's VerifyClientSecret resolves it from the same DB.
-	client := registerOAuthClient(t, uid("idjag-client"), []string{"data:read"})
+	//
+	// The client's registration carries the tenant (ADR 0042 D5): it links an
+	// identity in acct-fed-001/proj-fed-001, and that is where every token from
+	// this harness lands, whether or not the request also names it.
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
 
 	// signIDJAG mints a validly-signed ID-JAG against the fake upstream IdP. It
 	// auto-fills the bound client_id (D2b) and a UNIQUE jti (D2a) unless the
@@ -125,7 +129,7 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Equal(t, upstreamIss, claims["user_id_iss"])
 		require.Equal(t, "id_jag", claims["token_exchange"])
 
-		// Tenant binding stamped from the request (gated by AllowedAccounts).
+		// Tenant derived from the client's registration, inside AllowedAccounts.
 		require.Equal(t, fedCfg.AccountID, claims["account_id"])
 		require.Equal(t, fedCfg.ProjectID, claims["project_id"])
 
@@ -487,6 +491,127 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"an ID-JAG whose client_id does not match the authenticated client must be invalid_grant; body=%s", resp.RawBody)
 		require.Empty(t, resp.AccessToken)
 	})
+
+	// ── ADR 0042 D5 — the tenant is derived, never supplied (firehog#630) ────
+
+	freshIDJAG := func(t *testing.T, c oauthClientResp) string {
+		t.Helper()
+		now := time.Now()
+		return upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+			"iss":       upstreamIss,
+			"aud":       federationAud,
+			"sub":       uid("00uD5"),
+			"resource":  mcpResource,
+			"scope":     "tools:read",
+			"client_id": c.ClientID,
+			"jti":       uid("idjag-jti-d5"),
+			"iat":       now.Unix(),
+			"exp":       now.Add(5 * time.Minute).Unix(),
+		})
+	}
+	conformantBody := func(idjag string, c oauthClientResp) map[string]any {
+		// Exactly what draft §4.4 / MCP EMA §5 define: no tenant fields.
+		return map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     idjag,
+			"client_id":     c.ClientID,
+			"client_secret": c.ClientSecret,
+		}
+	}
+
+	t.Run("D5: a conformant request with no tenant fields redeems into the client's tenant", func(t *testing.T) {
+		resp := postFederation(t, fedHTTPSrv.URL, conformantBody(freshIDJAG(t, client), client))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.Equal(t, fedCfg.AccountID, claims["account_id"])
+		require.Equal(t, fedCfg.ProjectID, claims["project_id"])
+		require.Equal(t, []any{mcpResource}, claims["aud"])
+	})
+
+	t.Run("D5: account_id naming another tenant is invalid_grant", func(t *testing.T) {
+		body := conformantBody(freshIDJAG(t, client), client)
+		body["account_id"] = "acct-somebody-else"
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "account_id does not match")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: project_id naming another project is invalid_grant", func(t *testing.T) {
+		body := conformantBody(freshIDJAG(t, client), client)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = "proj-somebody-else"
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "project_id does not match")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: a refused tenant does not burn the single-use jti", func(t *testing.T) {
+		idjag := freshIDJAG(t, client)
+		bad := conformantBody(idjag, client)
+		bad["project_id"] = "proj-somebody-else"
+		rejected := postFederation(t, fedHTTPSrv.URL, bad)
+		require.Equal(t, http.StatusBadRequest, rejected.StatusCode, "body=%s", rejected.RawBody)
+
+		resp := postFederation(t, fedHTTPSrv.URL, conformantBody(idjag, client))
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"the jti was consumed by a request refused on its tenant; body=%s", resp.RawBody)
+	})
+
+	t.Run("D5: a client whose registration names no tenant is refused, even naming an allowed one", func(t *testing.T) {
+		unlinked := registerOAuthClient(t, uid("idjag-unlinked"), []string{"data:read"})
+		body := conformantBody(freshIDJAG(t, unlinked), unlinked)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = fedCfg.ProjectID
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "not registered to a tenant")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: a client registered in a tenant the issuer does not admit is refused", func(t *testing.T) {
+		// Linked to an identity in the shared test tenant, which this issuer's
+		// allowed_accounts does not list. Naming the admitted tenant on the
+		// request must not rescue it.
+		foreign := registerTenantBoundClient(t, testAccountID, testProjectID, []string{"data:read"})
+		body := conformantBody(freshIDJAG(t, foreign), foreign)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = fedCfg.ProjectID
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "may mint into")
+		require.Empty(t, resp.AccessToken)
+	})
+}
+
+// registerTenantBoundClient registers a confidential OAuth client whose
+// registration carries a tenant: it links (identity_id) an identity created in
+// account/project. oauth_clients has no tenant columns; the linked identity is
+// where the ID-JAG grant derives the tenant from (ADR 0042 D5). The admin API
+// refuses an identity_id outside the caller's tenant headers, so the link can
+// only be written by that tenant.
+func registerTenantBoundClient(t *testing.T, account, project string, scopes []string) oauthClientResp {
+	t.Helper()
+	headers := map[string]string{"X-Account-ID": account, "X-Project-ID": project}
+	agent := registerIdentityIn(t, headers, uid("idjag-client-agent"), scopes)
+	clientID := uid("idjag-client")
+	resp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":    clientID,
+		"name":         clientID + "-client",
+		"confidential": true,
+		"grant_types":  []string{"client_credentials"},
+		"scopes":       scopes,
+		"identity_id":  agent.ID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerTenantBoundClient: expected 201")
+	raw := decode(t, resp)
+	c := raw["client"].(map[string]any)
+	return oauthClientResp{ClientID: c["client_id"].(string), ClientSecret: raw["client_secret"].(string)}
 }
 
 // TestIDJAG_NHISelfSignedRegression is the load-bearing regression: a normal
@@ -546,7 +671,7 @@ func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
 	// Confidential client the ID-JAG is bound to (D2b).
-	client := registerOAuthClient(t, uid("idjag-scp-client"), []string{"data:read"})
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
 
 	now := time.Now()
 	idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
@@ -610,7 +735,7 @@ func TestIDJAG_SubjectIdentifier(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	client := registerOAuthClient(t, uid("idjag-subid-client"), []string{"data:read"})
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
 
 	redeem := func(t *testing.T, extra map[string]any) tokenResponse {
 		t.Helper()
@@ -841,13 +966,14 @@ func TestExternalIdP_SubjectTokenStillRequiresPlainSub(t *testing.T) {
 	})
 
 	resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
-		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token":      idToken,
-		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-		"client_id":          rpClient(t, federationAud).ClientID,
-		"client_secret":      rpClient(t, federationAud).ClientSecret,
-		"account_id":         fedCfg.AccountID,
-		"project_id":         fedCfg.ProjectID,
+		"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token":         idToken,
+		"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+		"client_id":             rpClient(t, federationAud).ClientID,
+		"client_assertion":      rpAssertion(t, rpClient(t, federationAud)),
+		"client_assertion_type": clientAssertionType,
+		"account_id":            fedCfg.AccountID,
+		"project_id":            fedCfg.ProjectID,
 	})
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,

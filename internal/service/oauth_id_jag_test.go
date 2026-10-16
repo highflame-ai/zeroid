@@ -230,12 +230,13 @@ func requireInvalidClient(t *testing.T, err error) {
 // The following tests exercise idJAGBearer's fail-closed gates that fire BEFORE
 // any token mint — so they need only a registry, no DB / CredentialService.
 //
-// Gate order (idJAGBearer): external-issuers configured → tenant fields present
-// → issuer lookup → tenant binding (AllowedAccounts) → D2b confidential client
-// auth → ID-JAG signature/claim validation → D2b client_id binding → identity
+// Gate order (idJAGBearer): external-issuers configured → issuer lookup → D2b
+// confidential client auth → derived tenant (ADR 0042 D5, deriveIDJAGTenant)
+// → ID-JAG signature/claim validation → D2b client_id binding → identity
 // mapping → resource (D4) → … → D2a single-use jti (consumed LAST). The
-// UnknownIssuer and TenantBinding gates fire BEFORE client auth, so those tests
-// need no client. Everything from ID-JAG validation onward (bad signature,
+// UnknownIssuer gate fires BEFORE client auth, so it needs no client; the
+// tenant derivation is pure and is covered row by row in
+// oauth_id_jag_tenant_test.go. Everything from ID-JAG validation onward (bad signature,
 // missing resource, unmappable identity, client_id binding, jti replay) is now
 // gated behind D2b client auth, which requires a real oauth_clients row — so the
 // fail-closed coverage for those gates lives in the integration suite
@@ -243,33 +244,27 @@ func requireInvalidClient(t *testing.T, err error) {
 // available. The unit tests here pin the DB-free gates plus the D2b client-auth
 // gate itself.
 
-func TestIDJAGBearer_UnknownIssuer_InvalidGrant(t *testing.T) {
-	const acct = "acct-idjag"
-	registry, _, _, aud := idJAGTestRegistry(t, acct)
-
-	// Sign an ID-JAG whose iss is NOT the configured issuer. Lookup misses →
-	// fail closed with invalid_grant (NOT invalid_request — that is the
-	// id_token-exchange semantics; ADR 0010 D3 mandates invalid_grant here).
+// TestIDJAGBearer_IssuerNotResolvedBeforeClientAuth pins the order: an
+// unauthenticated redemption is invalid_client before ZeroID looks up the
+// assertion's issuer, so an anonymous probe learns nothing about which IdPs
+// are trusted and costs no lookup.
+func TestIDJAGBearer_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
+	rows := &fakeIssuerRows{}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil)}
+	defer svc.externalIssuerRegistry.Close()
 	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	now := time.Now()
-	stranger := signWithTyp(t, priv, "kid", idJAGTyp, map[string]any{
-		"iss":      "https://stranger.example.test",
-		"sub":      "alice",
-		"aud":      aud,
-		"resource": "https://mcp.example.test",
-		"iat":      now.Unix(),
-		"exp":      now.Add(5 * time.Minute).Unix(),
+	assertion := signWithTyp(t, priv, "kid", idJAGTyp, map[string]any{
+		"iss": "https://probe.example.test", "sub": "alice", "aud": "x",
+		"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
 	})
-
-	svc := &OAuthService{externalIssuerRegistry: registry}
-	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Assertion: stranger,
-		AccountID: acct,
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
-	if !errors.Is(err, ErrUnknownExternalIssuer) {
-		t.Errorf("expected errors.Is(err, ErrUnknownExternalIssuer); chain=%v", err)
+	_, err := svc.idJAGBearer(context.Background(), TokenRequest{Assertion: assertion})
+	var oe *OAuthError
+	if !errors.As(err, &oe) || oe.Code != "invalid_client" {
+		t.Fatalf("err = %v, want invalid_client", err)
+	}
+	if rows.calls != 0 {
+		t.Fatalf("issuer looked up %d times before client authentication", rows.calls)
 	}
 }
 
@@ -303,7 +298,11 @@ func TestIDJAGBearer_NoClientAuth_InvalidClient(t *testing.T) {
 	requireInvalidClient(t, err)
 }
 
-func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
+// TestIDJAGBearer_NoTenantFieldsRequired pins #630: a request carrying no
+// account_id / project_id — the only shape a conformant client sends (draft
+// §4.4, MCP EMA §5) — is no longer refused for omitting them. It proceeds to
+// client authentication, which is the first gate it can fail here.
+func TestIDJAGBearer_NoTenantFieldsRequired(t *testing.T) {
 	const acct = "acct-idjag"
 	registry, jwks, iss, aud := idJAGTestRegistry(t, acct)
 
@@ -318,13 +317,12 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 	})
 
 	svc := &OAuthService{externalIssuerRegistry: registry}
-	// account_id NOT in AllowedAccounts → fail closed before any verification.
-	_, err := svc.idJAGBearer(context.Background(), TokenRequest{
-		Assertion: idjag,
-		AccountID: "acct-not-allowed",
-		ProjectID: "proj",
-	})
-	requireInvalidGrant(t, err)
+	_, err := svc.idJAGBearer(context.Background(), TokenRequest{Assertion: idjag})
+	var oe *OAuthError
+	if errors.As(err, &oe) && oe.Code == "invalid_request" {
+		t.Fatalf("a request without account_id/project_id must not be invalid_request: %v", err)
+	}
+	requireInvalidClient(t, err)
 }
 
 // NOTE: the deep-gate fail-closed unit tests that previously lived here —
@@ -336,3 +334,44 @@ func TestIDJAGBearer_TenantBindingFailure_InvalidGrant(t *testing.T) {
 // closed", "missing resource fails closed", plus the D2a replay / missing-jti
 // and D2b bad-secret / client_id-mismatch cases), where a full server with a
 // real DB authenticates the client first and then reaches each deeper gate.
+
+// TestRequireCIMDClientFitForIDJAG pins the document-level gates a CIMD
+// client must pass to redeem an ID-JAG (firehog#701).
+func TestRequireCIMDClientFitForIDJAG(t *testing.T) {
+	fit := func() *domain.OAuthClient {
+		return &domain.OAuthClient{
+			ClientID:                "https://client.example.test/client.json",
+			RegistrationSource:      domain.RegistrationSourceCIMD,
+			TokenEndpointAuthMethod: clientAuthMethodPrivateKeyJWT,
+			GrantTypes:              []string{"authorization_code", grantTypeJWTBearerURN},
+			IsActive:                true,
+		}
+	}
+
+	if err := requireCIMDClientFitForIDJAG(fit()); err != nil {
+		t.Fatalf("a private_key_jwt document listing jwt-bearer must pass: %v", err)
+	}
+
+	t.Run("auth method none is refused (draft §9.1, ADR 0010 D2b)", func(t *testing.T) {
+		c := fit()
+		c.TokenEndpointAuthMethod = "none"
+		requireInvalidClient(t, requireCIMDClientFitForIDJAG(c))
+	})
+
+	// WSO2's MCP playground publishes exactly this grant list and redeems
+	// ID-JAGs with it. The list is the publisher's own unauthenticated claim,
+	// so leaving jwt-bearer out is not a reason to refuse.
+	t.Run("a document that does not list jwt-bearer passes", func(t *testing.T) {
+		c := fit()
+		c.GrantTypes = []string{"authorization_code", "refresh_token"}
+		if err := requireCIMDClientFitForIDJAG(c); err != nil {
+			t.Fatalf("must pass: %v", err)
+		}
+	})
+
+	t.Run("a document contradicting its ID-JAG profile claim is unauthorized_client (draft §8)", func(t *testing.T) {
+		c := fit()
+		c.IDJAGProfileContradicted = true
+		requireOAuthError(t, requireCIMDClientFitForIDJAG(c), "unauthorized_client", http.StatusBadRequest)
+	})
+}

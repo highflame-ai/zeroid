@@ -37,25 +37,25 @@ func NewTenantSettingsService(repo *postgres.TenantSettingsRepository) *TenantSe
 }
 
 // TokenProfile returns the token profile the tenant's tokens are issued in.
-// A tenant with no settings row is on the legacy profile.
+// A tenant with no settings row is on domain.DefaultTokenProfile.
 //
 // Read on every issuance, with no cache: a cache would make a profile switch
 // take effect at different times on different replicas, and a token minted in
 // the old shape after the switch is exactly the inconsistency a staged rollout
 // has to rule out. The lookup is one primary-key read.
 //
-// An error is returned rather than defaulting to legacy, so a database fault
+// An error is returned rather than falling back to the default, so a database fault
 // fails the issuance instead of silently minting in the wrong shape.
 func (s *TenantSettingsService) TokenProfile(ctx context.Context, accountID, projectID string) (domain.TokenProfile, error) {
 	if s == nil || s.repo == nil {
-		return domain.TokenProfileLegacy, nil
+		return domain.DefaultTokenProfile, nil
 	}
 	settings, err := s.repo.Get(ctx, accountID, projectID)
 	if err != nil {
 		return "", fmt.Errorf("resolve token profile: %w", err)
 	}
 	if settings == nil {
-		return domain.TokenProfileLegacy, nil
+		return domain.DefaultTokenProfile, nil
 	}
 	return settings.TokenProfile, nil
 }
@@ -71,7 +71,7 @@ func (s *TenantSettingsService) Get(ctx context.Context, accountID, projectID st
 		return &domain.TenantSettings{
 			AccountID:    accountID,
 			ProjectID:    projectID,
-			TokenProfile: domain.TokenProfileLegacy,
+			TokenProfile: domain.DefaultTokenProfile,
 		}, nil
 	}
 	return settings, nil

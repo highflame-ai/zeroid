@@ -22,6 +22,9 @@ const (
 	defaultRefreshInterval = 5 * time.Minute
 	defaultRequestTimeout  = 10 * time.Second
 	minRefreshInterval     = 30 * time.Second
+	// defaultOnDemandInterval spaces RefreshIfMissing fetches, so tokens
+	// naming made-up kids cannot drive one upstream fetch each.
+	defaultOnDemandInterval = 10 * time.Second
 )
 
 // Client fetches and caches a JWKS from a remote endpoint.
@@ -43,6 +46,12 @@ type Client struct {
 	// an existing leader's broadcast channel.
 	loadMu       sync.Mutex
 	loadInFlight *fetchResult
+
+	// onDemandMu makes RefreshIfMissing single-flight; lastOnDemand and
+	// onDemandInterval rate-limit it.
+	onDemandMu       sync.Mutex
+	lastOnDemand     time.Time
+	onDemandInterval time.Duration
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -67,6 +76,14 @@ func WithRefreshInterval(d time.Duration) Option {
 		if d >= minRefreshInterval {
 			c.refreshInterval = d
 		}
+	}
+}
+
+// WithOnDemandRefreshInterval sets the minimum time between refreshes
+// triggered by an unknown kid. Default 10 seconds; 0 disables the limit.
+func WithOnDemandRefreshInterval(d time.Duration) Option {
+	return func(c *Client) {
+		c.onDemandInterval = d
 	}
 }
 
@@ -116,7 +133,9 @@ func New(url string, opts ...Option) (*Client, error) {
 		httpClient:      http.DefaultClient,
 		logger:          zerolog.Nop(),
 		kids:            make(map[string]struct{}),
-		done:            make(chan struct{}),
+
+		onDemandInterval: defaultOnDemandInterval,
+		done:             make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -226,20 +245,34 @@ func (c *Client) populated() bool {
 }
 
 // RefreshIfMissing triggers an immediate JWKS refresh if the given kid is not
-// in the current key set. Returns true if a refresh was performed.
-// This handles key rotation — when ZeroID rotates keys, the first request
-// with the new kid triggers a refresh rather than failing.
+// in the current key set. Returns true if the key set changed so the caller
+// should retry. This handles key rotation — the first request with a new
+// kid triggers a refresh rather than failing.
+//
+// Concurrent callers share one fetch, and fetches are at least the on-demand
+// interval apart: the kid comes from an unverified token, so without the
+// limit anyone could make ZeroID fetch the issuer's keys once per request.
 func (c *Client) RefreshIfMissing(ctx context.Context, kid string) bool {
 	if c.HasKID(kid) {
 		return false
 	}
+	c.onDemandMu.Lock()
+	defer c.onDemandMu.Unlock()
+	// Another caller may have fetched it while this one waited.
+	if c.HasKID(kid) {
+		return true
+	}
+	if c.onDemandInterval > 0 && time.Since(c.lastOnDemand) < c.onDemandInterval {
+		return false
+	}
+	c.lastOnDemand = time.Now()
 
 	c.logger.Info().Str("kid", kid).Msg("unknown kid, refreshing JWKS")
 	if err := c.refresh(ctx); err != nil {
 		c.logger.Error().Err(err).Msg("on-demand JWKS refresh failed")
 		return false
 	}
-	return true
+	return c.HasKID(kid)
 }
 
 // Close stops the background refresh goroutine and releases resources.

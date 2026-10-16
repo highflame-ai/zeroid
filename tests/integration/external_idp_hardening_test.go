@@ -129,16 +129,15 @@ func signRSAToken(t *testing.T, alg jwa.SignatureAlgorithm, key *rsa.PrivateKey,
 
 // federationExchangeBody builds an ID-token exchange, authenticated as the
 // relying party the token was issued to (D13).
-func federationExchangeBody(idToken, accountID, projectID string, rp oauthClientResp) map[string]any {
-	return map[string]any{
+func federationExchangeBody(t *testing.T, idToken, accountID, projectID string, rp oauthClientResp) map[string]any {
+	t.Helper()
+	return withClientAuth(t, map[string]any{
 		"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
 		"subject_token":      idToken,
 		"subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
 		"account_id":         accountID,
 		"project_id":         projectID,
-		"client_id":          rp.ClientID,
-		"client_secret":      rp.ClientSecret,
-	}
+	}, rp)
 }
 
 // TestExternalIDTokenFederation_NoAlgKeyAndAlgVariants is the P1-A regression
@@ -176,7 +175,7 @@ func TestExternalIDTokenFederation_NoAlgKeyAndAlgVariants(t *testing.T) {
 
 	t.Run("RS256 token with no-alg JWKS key verifies and emits user_id_iss", func(t *testing.T) {
 		idToken := idp.sign(t, validClaims())
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode,
 			"no-alg JWKS key must verify (requires WithInferAlgorithmFromKey); body=%s", resp.RawBody)
 		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
@@ -188,7 +187,7 @@ func TestExternalIDTokenFederation_NoAlgKeyAndAlgVariants(t *testing.T) {
 	t.Run("PS256 token with no-alg JWKS key verifies", func(t *testing.T) {
 		key, kid := idp.signKey()
 		idToken := signRSAToken(t, jwa.PS256(), key, kid, validClaims())
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode,
 			"PS256 over a no-alg RSA key must verify via inference; body=%s", resp.RawBody)
 	})
@@ -223,12 +222,12 @@ func TestExternalIDTokenFederation_CrossTenantRejected(t *testing.T) {
 	})
 
 	t.Run("allowed tenant succeeds", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idToken, fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
 	t.Run("disallowed tenant is rejected (no cross-tenant minting)", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idToken, "acct-evil", "proj-evil", rpClient(t, aud)))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idToken, "acct-evil", "proj-evil", rpClient(t, aud)))
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 			"a token must not be exchangeable under a tenant not in allowed_accounts; body=%s", resp.RawBody)
 		require.Empty(t, resp.AccessToken, "no token may be minted for a disallowed tenant")
@@ -269,7 +268,7 @@ func TestExternalIDTokenFederation_VerificationNegatives(t *testing.T) {
 	// Baseline: a clean token mints, so every failure below is the mutation's
 	// doing and not a misconfigured server.
 	t.Run("baseline clean token mints", func(t *testing.T) {
-		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, base()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idp.sign(t, base()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
@@ -317,14 +316,14 @@ func TestExternalIDTokenFederation_VerificationNegatives(t *testing.T) {
 		}},
 		{"unknown issuer", func(t *testing.T) string {
 			c := base()
-			c["iss"] = "https://stranger.idp.test" // not configured → invalid_request
+			c["iss"] = "https://stranger.idp.test" // not configured → generic invalid_grant
 			return idp.sign(t, c)
 		}},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name+" rejected", func(t *testing.T) {
-			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(tc.token(t), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, tc.token(t), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 				"%s must be rejected with 400; body=%s", tc.name, resp.RawBody)
 			require.Empty(t, resp.AccessToken, "%s must not mint a token", tc.name)
@@ -362,15 +361,73 @@ func TestExternalIDTokenFederation_KeyRotation(t *testing.T) {
 	}
 
 	// Sanity: kid-1 (already warm in the cache) verifies.
-	resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+	resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 	require.Equal(t, http.StatusOK, resp.StatusCode, "pre-rotation token must verify; body=%s", resp.RawBody)
 
 	// Upstream rotates to a brand-new key+kid the cache has never seen.
 	idp.rotate(t, "rot-kid-2")
 
-	resp = postFederation(t, fedHTTPSrv.URL, federationExchangeBody(idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+	resp = postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, idp.sign(t, mk()), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"post-rotation token must verify after on-demand JWKS refresh; body=%s", resp.RawBody)
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	require.Equal(t, iss, claims["user_id_iss"])
+}
+
+// TestExternalIDTokenFederation_WorkloadSubjectRefused covers #415: the
+// ID-token exchange mints principal_type=user, which resource servers read as a
+// person behind the chain, so a subject_token that names a workload is refused
+// with invalid_grant rather than minted as a person. One case per recognized
+// marker, plus a person token from the same issuer that still mints as a user.
+func TestExternalIDTokenFederation_WorkloadSubjectRefused(t *testing.T) {
+	iss := "https://workload.idp.test"
+	aud := "https://zeroid.federation.test"
+
+	idp := newFakeRSAIdP(t, "wl-kid-1", true)
+	defer idp.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          iss,
+		JWKSURI:         idp.JWKSURL(),
+		Audience:        aud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	token := func(extra map[string]any) string {
+		now := time.Now()
+		c := map[string]any{
+			"iss": iss, "aud": aud, "sub": uid("wl-person"),
+			"iat": now.Unix(), "exp": now.Add(5 * time.Minute).Unix(),
+		}
+		for k, v := range extra {
+			c[k] = v
+		}
+		return idp.sign(t, c)
+	}
+
+	t.Run("person token mints principal_type=user", func(t *testing.T) {
+		resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, token(map[string]any{"idtyp": "user"}), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "user", principalOf(t, resp.AccessToken).Type)
+	})
+
+	cases := []struct {
+		name  string
+		extra map[string]any
+	}{
+		{"Entra app-only token (idtyp=app)", map[string]any{"idtyp": "app"}},
+		{"Kubernetes service account subject", map[string]any{"sub": "system:serviceaccount:prod:builder"}},
+		{"SPIFFE ID subject", map[string]any{"sub": "spiffe://example.org/ns/prod/sa/builder"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" refused", func(t *testing.T) {
+			resp := postFederation(t, fedHTTPSrv.URL, federationExchangeBody(t, token(tc.extra), fedCfg.AccountID, fedCfg.ProjectID, rpClient(t, aud)))
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+			require.Equal(t, "invalid_grant", resp.Error)
+			require.Empty(t, resp.AccessToken, "a workload subject must not be minted as a person")
+		})
+	}
 }

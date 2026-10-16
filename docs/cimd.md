@@ -78,6 +78,12 @@ to carry application state only. ZeroID round-trips it verbatim when present and
 does not require it. It is shown because most clients have somewhere to return
 the user to.
 
+Every authorization response — the success redirect and any error redirect —
+also carries `iss=<issuer>` (RFC 9207), and AS metadata advertises
+`authorization_response_iss_parameter_supported: true`. A client that talks to
+more than one authorization server should compare it with the issuer it started
+the flow against and drop the response on a mismatch (mix-up defense).
+
 **Serving the browser leg *directly* at `/oauth2/authorize` needs a GET-capable
 `PrincipalResolver`, which ZeroID does not ship.** A browser cannot set a custom
 header on a top-level navigation, and the resolver-facing `Form` accessor is
@@ -98,18 +104,28 @@ usually the better one:
    ZeroID will send the user to that login screen for you: return
    `ErrPrincipalInteractionRequired` from the resolver when there is no session
    and register the surface with `Server.SetInteractiveLoginURL`. See the
-   resolver bullet below for what that does and does not do — in particular
-   **for a CIMD client it is refused only when the `redirect_uri` is a remote
-   `https://` host that `cimd.allowed_domains` does not cover.** A loopback or
-   private-use callback — the ordinary desktop/CLI MCP client — is exempt and
-   completes this route with no allowlist. A hosted client with a real `https://`
-   callback needs you to name the hosts that may publish.
+   resolver bullet below for what that does and does not do. A CIMD client is
+   offered this hop like any other; `cimd.allowed_domains` decides who may
+   publish a document at all, and a client that resolved has already passed it.
 2. **Front the browser leg above ZeroID and hand off over POST.** Your own
    surface owns the redirect, authenticates the human however you already do,
    and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
    reads — an RFC 7523 assertion signed by that surface, say, verified against
    its published JWKS. The browser never reaches this endpoint, so no GET-capable
    resolver is needed.
+
+   The surface also owns consent, so it needs a way to report "the user said
+   no". The client still expects RFC 6749 §4.1.2.1's `error=access_denied`
+   redirect, and the surface cannot build it — only ZeroID has validated
+   `client_id` and `redirect_uri`. Have the assertion carry the decision, and on
+   a denial return `ErrPrincipalAccessDenied` from the resolver (after verifying
+   the assertion — never for an unauthenticated request). ZeroID answers the POST
+   with a 302 to the validated `redirect_uri` carrying `error=access_denied`, the
+   request's `state` and `iss`, and the surface forwards that `Location` to the
+   browser exactly as it forwards the code redirect on approval. This is the only
+   error ZeroID redirects on POST, and it reaches a CIMD client's `redirect_uri`
+   like every other redirect: the client was admitted when its document
+   resolved (see step 3 of "How ZeroID resolves + validates a document").
 
    What route 2 does **not** remove is authorization-request CSRF — it moves it
    to your surface. An attacker can still navigate a victim's browser to that
@@ -147,32 +163,37 @@ cookie resolver is safe while POST is the only route, because `SameSite=Lax`
 withholds the cookie on a cross-site POST, and becomes reachable by cross-site
 top-level navigation once GET is mounted.
 
-**Errors are not redirected to an *unvetted, remote* CIMD destination.** RFC 6749 §4.1.2.1 says report most
-`/oauth2/authorize` failures by redirecting to the client's registered
-`redirect_uri`, and ZeroID does — for clients somebody registered. A CIMD client's
-`redirect_uris` come from a document it published itself, so with `allowed_domains`
-empty the destination is attacker-*chosen*, and honouring the rule would make the
-endpoint an unauthenticated redirector: the failure being reported is "you have no
-credential", so no credential is needed to trigger it, and the first hop carries
-your origin. CIMD clients therefore get the §5.2 JSON body instead, and the
-interactive-login redirect is refused for them too — an unvetted client does not
-get to borrow your login surface's credibility.
+**Errors are redirected to a CIMD destination, like any other.** RFC 6749 §4.1.2.1
+says report most `/oauth2/authorize` failures by redirecting to the client's
+registered `redirect_uri`, and ZeroID does, whatever the client's provenance.
 
-**A loopback or private-use `redirect_uri` is exempt, and that is most MCP
-clients.** The threat above is about a *remote* destination — an unauthenticated
-redirector with your origin as the first hop. A 302 to `127.0.0.1` has no remote
-hop: the code lands on the machine the user is sitting at, and an attacker able
-to listen there already has local code execution. RFC 8252 §7.3 accepts loopback
-callbacks from clients nobody registered for exactly that reason, and CIMD does
-not weaken it. Since the document shape at the top of this page — the ordinary
-desktop/CLI MCP client — lists only loopback callbacks, the carve-out simply does
-not apply to it, and its browser leg works with no allowlist configured.
+There used to be a carve-out here: a self-asserted client with a remote
+`https://` callback got the §5.2 JSON body instead, and the interactive-login
+redirect was refused for it too, unless `cimd.allowed_domains` named its
+publisher.
 
-The cost, for the clients it does apply to: a browser-driven CIMD client with a
-real `https://` callback cannot learn its error from that callback and has to
-read the JSON body. Setting `cimd.allowed_domains` restores the redirect there
-too, because vetting which hosts may publish restores the assumption §4.1.2.1 is
-built on. The gate is provenance and reach, not CIMD.
+That inverted the meaning of an empty allow-list. Everywhere else in CIMD, empty
+is the **open-ecosystem default** — any public `https` host may publish, and an
+operator sets a list to *close* the ecosystem. In this one place, empty was the
+most restrictive setting and adding a list was what unlocked the flow. The
+practical effect was a deployment where a desktop client worked and a hosted one
+could not reach the consent screen at all, failing with `interactive
+authentication required but unavailable` — an error naming the login surface
+rather than the allow-list that actually refused the hop. Loopback callbacks were
+exempt, so the shape most CIMD clients have hid it until a hosted client appeared.
+
+`cimd.allowed_domains` is now enforced in **one** place: document resolution. A
+host that is not listed never resolves, so a client that reached the redirect has
+already been admitted by whatever policy the deployer set. Asking again at the
+redirect asked the same question twice and answered it differently.
+
+**What an empty allow-list gives up.** An unauthenticated caller can make
+`/oauth2/authorize` emit a §4.1.2.1 error redirect to a host they chose, by
+publishing a document that names it. That is the open-redirect surface an open
+ecosystem has, and it is the reason the lever exists: a deployer who does not want
+it sets `cimd.allowed_domains`, which closes the ecosystem at the fetch and
+therefore at the redirect too. The success redirect was never gated by any of
+this — it follows user consent.
 
 **That hatch only works on a single-tenant deployment.** `allowed_domains` is one
 deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
@@ -196,13 +217,17 @@ Three things a deployer must handle:
   `return_to` is rebuilt from the parameters ZeroID validated, never copied from
   the inbound URL, so nothing extraneous a caller appended — including a
   credential in the wrong channel — is forwarded to your login surface.
+  If your clients send a parameter of your own that must survive the round trip
+  (a project or tenant hint, say), allowlist it by name with
+  `Server.SetInteractiveLoginPassthroughParams`: it is copied verbatim into
+  `return_to` when it appears exactly once with a short value. Protocol and
+  credential parameter names cannot be allowlisted, and the value is untrusted
+  caller input your surface must authorize against the signed-in user.
 
   Only GET is redirected: a POST caller has no user agent. With no target
   configured the sentinel degrades to `access_denied`, because a resolver cannot
-  conjure a surface the deployment does not have — and it is refused for a CIMD
-  client headed to an unvetted *remote* destination, per the rule above. Loopback
-  and private-use callbacks are exempt, and `cimd.allowed_domains` lifts the
-  refusal for remote hosts. Same check as the error redirect, either way.
+  conjure a surface the deployment does not have. A CIMD client is offered this
+  hop like any other — same check as the error redirect, either way.
 
   Use `Server.Use` middleware instead if you want to own the whole interaction
   including the 302.
@@ -248,7 +273,7 @@ arrive in a header (`X-API-Key`, or `Authorization: Bearer zid_sk_…`) or a
 cookie — a URL ends up in access logs, browser history, and `Referer`. The
 protocol parameters above are fine there; the credential is not.
 
-ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…`.
+ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…&iss=…`.
 
 ### 3. The client exchanges the code
 
@@ -256,7 +281,10 @@ ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, 
 
 ### 4. Refresh, introspect, revoke
 
-When the document's `grant_types` includes `refresh_token`, the exchange also returns a rotating refresh token. On `grant_type=refresh_token` ZeroID re-resolves the document before rotating — which gives CIMD its lifecycle story: **a client that unpublishes its metadata document can no longer rotate** (the presented token is not consumed on resolution failure, so a transient outage doesn't brick the session). The introspection and revocation endpoints likewise accept a CIMD `client_id` as a public-client identification (RFC 7662/7009 §2.1), so stock OAuth libraries that attach `client_id` to those calls work unmodified.
+When the document's `grant_types` includes `refresh_token`, the exchange also returns a rotating refresh token. On `grant_type=refresh_token` ZeroID re-resolves the document before rotating — which gives CIMD its lifecycle story: **a client that unpublishes its metadata document can no longer rotate** (the presented token is not consumed on resolution failure, so a transient outage doesn't brick the session). The two token-inspection endpoints treat a CIMD `client_id` differently:
+
+- **Revocation** (`POST /oauth2/token/revoke`) accepts a CIMD client, authenticated as its document declares. A document declaring `none` is a public client and identifies itself with its `client_id` alone (RFC 7009 §2.1), so stock OAuth libraries that attach `client_id` to the call work unmodified. A document declaring `private_key_jwt` is a confidential client and must present a `client_assertion` (RFC 7523 §2.2) signed by a key its document publishes; `client_id` may be omitted, in which case the assertion's `iss` identifies the client. The client is resolved and authenticated exactly as on the token endpoint: registry first, then the document, under the same `allowed_domains` policy and cache, with the same assertion rules (accepted `aud` is this server's issuer identifier or its token endpoint URL, as for registered clients; `jti` single-use; same `alg` allow-list and `exp` bounds). Either way, the token — access or refresh — is revoked **only if it was issued to that same `client_id`**: for an access token, compared against the signed `client_id` claim in the token; for a refresh token, against the client the refresh token was issued to. Revoking the client's own refresh token ends the grant: its whole rotation family and the access tokens issued from it are revoked, as for any client. A token issued to anyone else is left untouched and the response is still `200` (RFC 7009 §2.2), so the endpoint does not reveal whose token it was. That constraint is what makes accepting a self-published identity safe here: anyone can publish a document, keys included, at a URL they control, so being that URL only ever reaches tokens that URL's client already holds. Refused with `401 invalid_client`: a `client_id` whose document does not resolve (disallowed domain, fetch failure, invalid document); a `private_key_jwt` client with no assertion or an assertion that does not verify; and a `none` client that presents an assertion. A failure on the server's side to look up or revoke the token is `500 server_error`, never a `200` the endpoint did not earn.
+- **Introspection** (`POST /oauth2/token/introspect`) does **not** accept a CIMD client, with or without a valid assertion. Introspection answers questions about any token presented, and authenticating as a CIMD client proves only control of a URL, so admitting it would turn introspection into a token oracle for anyone with a web server. It accepts registered clients only.
 
 ---
 
@@ -270,13 +298,13 @@ Implemented in [`internal/service/cimd.go`](../internal/service/cimd.go); wired 
    Two of these carry their own weight beyond conformance. Userinfo is the phishing shape — `https://legit.example.com@evil.example/client.json` resolves to `evil.example` while *reading* as `legit.example.com` on a consent screen or in an audit log. Dot segments would give one document many spellings, splitting the resolution cache and handing one client several identities the §4 self-reference check cannot distinguish.
 
    ZeroID also rejects a **query string**, where the draft says only SHOULD NOT. That is deliberate and stricter than required: the `client_id` a client presents must stay byte-identical to the URL the document was fetched from, which is exactly what the self-reference check compares.
-3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity — and, since it also gates redirects (§ below), *where documents from those hosts may send a user*. **Only list hosts whose publishing you control.** On a host where anyone can serve a path — user content, a raw-file CDN, a broadly writable bucket — allow-listing hands that party a vetted-client status the redirect gate then honours. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
+3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity — and, through the `redirect_uris` host check in step 5, *where documents from those hosts may send a user*. This is the only place the allowlist is enforced: there is no second gate at redirect time. A CIMD client that resolved has been admitted, and ZeroID sends the user agent to its validated `redirect_uri` — the code redirect, the RFC 6749 §4.1.2.1 error redirect, the interactive-login redirect and the `access_denied` redirect — exactly as for a registered client. With an empty allowlist that means an unauthenticated caller can publish a document and make `/oauth2/authorize` emit an error redirect to a host of their choosing; that is the open-redirect surface of an open ecosystem, and setting `allowed_domains` is how a deployer closes it. **Only list hosts whose publishing you control.** On a host where anyone can serve a path — user content, a raw-file CDN, a broadly writable bucket — allow-listing hands that party admission, and with it ZeroID's redirects. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
 4. **Fetch (SSRF-guarded, no redirects).** `GET` via the same DNS-rebinding-safe client the OIDC attestation verifier and CIBA dispatch use ([`attestation.NewSSRFGuardedHTTPClient`](../internal/attestation/oidc.go)): the host is resolved once, every answer is checked against the private/loopback/link-local/multicast/CGN/reserved blocklist, and the connection is pinned to the validated IP. TLS still verifies against the original hostname. Response is size-capped (5 KiB default) and timeout-bounded (5 s). **HTTP redirects are not followed** — the `client_id` is a canonical location; a 3xx is a resolution failure.
 5. **Validate the document.**
    - **Self-reference** (draft §4): the document's `client_id` field MUST equal the URL it was fetched from. This is what stops a document from claiming someone else's identity.
    - `redirect_uris` is **required and non-empty** — CIMD's primary anti-impersonation control. Each entry must satisfy OAuth 2.1 scheme rules: `https://`, loopback `http://`, or a private-use scheme (native apps); plaintext non-loopback `http://` is rejected. The requested `redirect_uri` is matched against the list by the existing `redirectURIAllowed` logic (exact match, with RFC 8252 §7.3 port-agnostic matching for loopback callbacks).
 
-     When `cimd.allowed_domains` is set, an `https://` entry must additionally be on the `client_id`'s own host or on that list — a **deviation**, and the reason the allowlist can be trusted as the switch that restores redirects (see below). Allow-listing the *publisher* only vets the destination if the destination is vetted too; otherwise any host where more than one party can publish a path lets an attacker name `https://evil.example/cb` and collect codes from a real sign-in. Loopback and private-use schemes are exempt: they deliver to the caller's own machine, not to a published host. In open mode this constrains nothing, because open mode refuses those redirects outright.
+     When `cimd.allowed_domains` is set, an `https://` entry must additionally be on the `client_id`'s own host or on that list — a **deviation**, and the reason the allowlist bounds where an admitted client can send a user (step 3). Allow-listing the *publisher* only vets the destination if the destination is vetted too; otherwise any host where more than one party can publish a path lets an attacker name `https://evil.example/cb` and collect codes from a real sign-in. Loopback and private-use schemes are exempt: they deliver to the caller's own machine, not to a published host. In open mode (empty allowlist) this check does not run and any `https://` destination is accepted.
    - `token_endpoint_auth_method` must be `none` (omitted defaults to `none`) or `private_key_jwt`. A `private_key_jwt` document MUST publish exactly one of `jwks` (inline JWK Set) or `jwks_uri` — declaring the method with no key material is refused at resolution, because it describes a client that could never authenticate. `jwks_uri` must be absolute `https://` with **no** private-endpoint relaxation: the hatch the registered path offers for loopback test fixtures exists because an operator controls what they register, and a self-published document has no operator. The secret-based methods are refused and structurally always will be — there is no registration response in which a CIMD client could be handed a secret.
 
      A document that publishes `jwks` while declaring `none` is **not** rejected; the keys are simply not copied onto the synthesized client, so nothing can ever verify an assertion against them. A CIMD document is one declaration published to every authorization server at once, so it may legitimately carry key material for a purpose this server has no part in — the same reasoning as the `grant_types` intersection below.

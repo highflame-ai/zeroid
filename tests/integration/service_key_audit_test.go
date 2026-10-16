@@ -91,7 +91,7 @@ func TestKeyAudit_CreateAndSingleRevoke(t *testing.T) {
 func TestKeyAudit_RotateNamesTheOperator(t *testing.T) {
 	reg := registerAgent(t, uid("key-audit-rotate"))
 
-	rotate(t, reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
+	rotate(t, adminHeaders(), reg.AgentID, map[string]string{"X-User-ID": "sre-bob"})
 
 	rows := keyAuditRows(t, reg.AgentID)
 	require.Equal(t, 2, countAction(rows, "CREATE_KEY"), "bootstrap key + rotated key")
@@ -133,7 +133,7 @@ func TestKeyAudit_DeactivateRevokesWithCaller(t *testing.T) {
 func TestKeyAudit_NoCallerFallsBackToSystemLabel(t *testing.T) {
 	reg := registerAgent(t, uid("key-audit-no-caller"))
 
-	rotate(t, reg.AgentID, nil)
+	rotate(t, adminHeaders(), reg.AgentID, nil)
 
 	rows := keyAuditRows(t, reg.AgentID)
 	require.Equal(t, 1, countAction(rows, "REVOKE_KEY"))

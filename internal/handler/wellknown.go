@@ -286,7 +286,10 @@ func (a *API) buildASMetadata() map[string]any {
 		// client_secret_post via body fields). "none" is included because
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
-		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
+		// Revocation additionally accepts CIMD clients (public by client_id,
+		// private_key_jwt by assertion), limited to tokens issued to that
+		// client (OAuthService.RevokeForClient); introspection does not — see
+		// VerifyPresentedClientAuth.
 		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		// RFC 8414 §2 makes these two REQUIRED once the corresponding
@@ -328,8 +331,11 @@ func (a *API) buildASMetadata() map[string]any {
 		// member is the advertised subset clients are expected to use.
 		"token_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
 
-		// RFC 7591 dynamic client registration.
-		"registration_endpoint": a.issuer + "/oauth2/register",
+		// RFC 7591 dynamic client registration. ZeroID's own endpoint unless
+		// the deployer advertises one hosted elsewhere
+		// (token.registration_endpoint) — RFC 8414 §2 puts no constraint on
+		// where this URL lives.
+		"registration_endpoint": a.advertisedRegistrationEndpoint(),
 
 		// RFC 9449 — Demonstrating Proof of Possession (DPoP). Algorithms the
 		// token endpoint will accept on the DPoP header. Symmetric algs are
@@ -377,6 +383,13 @@ func (a *API) buildASMetadata() map[string]any {
 		// the accurate values when the flow IS servable.
 		body["response_types_supported"] = []string{"code"}
 		body["code_challenge_methods_supported"] = []string{"S256"}
+
+		// RFC 9207 §3 — every authorization response /oauth2/authorize
+		// redirects (success and error alike) carries iss=<issuer>, so a
+		// client talking to more than one AS can detect a mix-up. Same gate as
+		// the members above: with no servable flow there are no authorization
+		// responses to describe.
+		body["authorization_response_iss_parameter_supported"] = true
 	}
 
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support

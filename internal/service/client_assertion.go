@@ -205,9 +205,44 @@ func (s *OAuthService) enforceRegisteredClientAuthMethod(
 //     "advertised method that cannot work" this issue exists to eliminate.
 //
 // Routing both through the shared enforcement fixes them together.
-func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req TokenRequest) (*domain.OAuthClient, error) {
-	client, err := s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
+//
+// The client is resolved registry-first, with a CIMD fallback ONLY when the
+// caller opts in (cimdFallback). The opt-in is a property of the CALLER, not of
+// the credential check: a self-asserted document is anyone's to publish, so
+// only a caller whose authority comes from something the caller cannot choose
+// may accept one. Today that is ID-JAG redemption alone (MCP Enterprise-Managed
+// Authorization §5), where an IdP-signed ID-JAG must name this exact client_id
+// and the tenant is derived server-side; client_credentials passes false. TestCIMDDirectAuthOptInIsBounded pins the
+// set of callers that pass true, so a new one cannot appear silently.
+//
+// A CIMD client reaching here must declare private_key_jwt. "none" carries no
+// credential to check, and a self-published document cannot carry a shared
+// secret (draft-ietf-oauth-client-id-metadata-document-02 §4.1). When the
+// document declares private_key_jwt the AS "MUST require client authentication
+// according to Section 2.2 of [RFC7523] using the corresponding key discovered
+// from the client's metadata document" (§8.2), which is exactly what
+// enforceRegisteredClientAuthMethod does with the document's jwks / jwks_uri.
+func (s *OAuthService) authenticateRegisteredClient(
+	ctx context.Context, req TokenRequest, cimdFallback bool,
+) (*domain.OAuthClient, error) {
+	var (
+		client  *domain.OAuthClient
+		viaCIMD bool
+		err     error
+	)
+	if cimdFallback {
+		client, viaCIMD, err = s.resolveClientRegistryOrCIMD(ctx, req.ClientID)
+	} else {
+		client, err = s.oauthClientSvc.GetClientByClientID(ctx, req.ClientID)
+	}
 	if err != nil {
+		if viaCIMD {
+			// A CIMD sentinel says WHY the document was refused: unreachable,
+			// malformed, domain not allowed. Map it the way the
+			// authorization-code path does rather than flattening it into
+			// "invalid client credentials", which reads as "unknown client".
+			return nil, cimdOAuthError(err)
+		}
 		if errors.Is(err, ErrOAuthClientNotFound) {
 			return nil, oauthUnauthorized("invalid client credentials", err)
 		}
@@ -217,6 +252,8 @@ func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req Tok
 	// GetClientByClientID deliberately does not filter on IsActive (its CIMD
 	// callers need the distinction), unlike VerifyClientSecret which did.
 	// Re-apply it here or deactivation stops being a kill switch on this path.
+	// A synthesized CIMD client is always active, so this only ever gates a
+	// registry row.
 	if !client.IsActive {
 		return nil, oauthUnauthorized("invalid client credentials", nil)
 	}
@@ -229,6 +266,17 @@ func (s *OAuthService) authenticateRegisteredClient(ctx context.Context, req Tok
 	// private_key_jwt is fully authenticated by the assertion above.
 	if client.TokenEndpointAuthMethod == clientAuthMethodPrivateKeyJWT {
 		return client, nil
+	}
+	// A CIMD client has no registry row and so no stored secret. Reaching
+	// VerifyClientSecret would fail as ErrOAuthClientNotFound and surface as
+	// "invalid client credentials", the wrong diagnosis: the document declared
+	// a method that carries no credential this grant can check. Refuse on the
+	// method, and say so.
+	if viaCIMD {
+		return nil, oauthUnauthorized(
+			"client id metadata document declares token_endpoint_auth_method "+
+				client.TokenEndpointAuthMethod+
+				"; a grant that authenticates the client directly requires private_key_jwt", nil)
 	}
 	// Secret-based (or legacy-unset) client: unchanged behaviour, including
 	// VerifyClientSecret's own constant-time compare and active-client gate.

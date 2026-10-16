@@ -48,6 +48,19 @@ token:
   issuer: "http://localhost:8899"
   default_ttl: 3600
   max_ttl: 7776000  # 90 days
+  # registration_endpoint overrides the registration_endpoint advertised in
+  # AS metadata (/.well-known/oauth-authorization-server and
+  # /.well-known/openid-configuration). Empty (default) advertises ZeroID's
+  # own {issuer}/oauth2/register, which requires an initial access token and
+  # registers machine clients only. Set it when client registration is hosted
+  # elsewhere (e.g. an interactive registration front end); RFC 8414 §2 lets
+  # this be any URL. Must be an absolute, canonical https URL (lowercase
+  # scheme/host, ASCII host, no user-info/fragment/whitespace); http is
+  # accepted for localhost / loopback, or for any host when issuer is itself
+  # http. An invalid value fails config load. Only the advertisement changes —
+  # ZeroID's own /oauth2/register stays mounted.
+  # Env: ZEROID_REGISTRATION_ENDPOINT
+  # registration_endpoint: "https://app.example.com/oauth/register"
   # require_dpop makes a valid DPoP proof (RFC 9449) mandatory on every
   # /oauth2/token issuance. Off by default: without a proof the token falls
   # back to Bearer. When true, proof-less issuance is refused with
@@ -73,6 +86,24 @@ token:
   # production is spec-compliant (strict) by default. Env override:
   # ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION.
   allow_unauthenticated_token_inspection: true
+
+  # refresh_reuse_grace_seconds: every refresh rotates the refresh token, and
+  # presenting a rotated-out token again is treated as a sign it leaked — the
+  # whole token family and the access tokens issued from it are revoked
+  # (RFC 9700 §4.14.2). This sets a grace window after each rotation in which
+  # a second presentation of the rotated-out token is instead refused as a
+  # concurrent retry (invalid_grant) and nothing is revoked.
+  #   Why have one: browser tabs, or several processes (CLIs, IDE plugins),
+  #   that share one refresh token and refresh at the same moment. Without a
+  #   grace, the loser of that race revokes the family and every instance is
+  #   signed out.
+  #   What it costs: a stolen rotated-out token used within the window does
+  #   not revoke the family, so whoever rotated first keeps the session.
+  # Only rotation earns the grace: a token whose family was revoked (reuse
+  # detection, RFC 7009 revocation, authorization-code replay) is refused
+  # outright. 0 disables the grace (strict RFC 9700). Range 0-300; default 10.
+  # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
+  # refresh_reuse_grace_seconds: 10
 
 wimse_domain: "highflame.ai"
 
@@ -188,12 +219,11 @@ cimd:
   # recommended for enterprise/closed deployments. Leave empty only for open
   # agent ecosystems, and rate-limit /oauth2/authorize at the edge. YAML only.
   #
-  # REQUIRED to serve CIMD clients whose redirect_uri is a REMOTE https URL.
-  # While this is empty such a client gets neither the RFC 6749 4.1.2.1 error
-  # redirect nor the interactive-login redirect, so a user with no session has
-  # nowhere to be sent and the flow cannot complete for them. Loopback and
-  # private-use callbacks are exempt (they deliver to the user's own device), so
-  # the ordinary desktop/CLI MCP client needs nothing here.
+  # Enforced only when a document resolves; a resolved CIMD client is then
+  # redirected to (code, RFC 6749 4.1.2.1 error, interactive-login, access_denied)
+  # like a registered client. While this is empty, anyone can publish a document
+  # naming any https redirect_uri, so /oauth2/authorize can be made to emit an
+  # error redirect to an attacker-chosen host — set this to close that.
   #
   # Listing a host asserts you vet who publishes there — an https redirect_uri
   # must then be on the client_id's own host or on this list. Do not list a host
@@ -216,7 +246,11 @@ cimd:
 
 # Direct OIDC IdP federation (issue #88).
 # Each entry registers a trusted upstream issuer for RFC 8693 token exchange
-# with subject_token_type=urn:ietf:params:oauth:token-type:id_token.
+# with subject_token_type=urn:ietf:params:oauth:token-type:id_token, and for
+# ID-JAG redemption (jwt-bearer, MCP Enterprise-Managed Authorization). On the
+# ID-JAG grant the tenant is derived, not sent: the account must be in
+# allowed_accounts AND be the tenant of the identity the authenticated client's
+# registration links to (identity_id). See docs/identity-model.md.
 # When empty (default), only the broker path remains available.
 # external_issuers:
 #   - issuer:           "https://auth.example.okta.com"
@@ -231,3 +265,12 @@ cimd:
 #     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch
+
+# Where trusted issuers come from (ADR 0042 D4). "config" reads the static
+# external_issuers list above (standalone ZeroID). "db" reads per-account rows
+# managed through the admin API (/external-issuers); it refuses to start when
+# external_issuers is also set. See docs/external-issuers.md.
+# federation:
+#   issuer_store: config            # Env: ZEROID_FEDERATION_ISSUER_STORE
+#   allow_private_endpoints: false  # Env: ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS — local mock IdP only; relaxes the SSRF guard and https on issuer rows
+#   shared_issuers: []              # [{issuer, pin_claim}]; empty = built-in list (accounts.google.com/hd, GitHub Actions/repository_owner_id)

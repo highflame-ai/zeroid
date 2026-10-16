@@ -110,9 +110,10 @@ type AuthorizeRequest struct {
 // resolver to return a non-nil Principal wins. A resolver that doesn't
 // apply to the current request (e.g. the api_key resolver seeing no
 // api_key form field) MUST return (nil, ErrPrincipalNotApplicable) —
-// that signals "skip me, try the next one." Any other returned error
-// fails the request immediately with 401 invalid_client, and the
-// resolver chain stops.
+// that signals "skip me, try the next one." ErrPrincipalInteractionRequired
+// and ErrPrincipalAccessDenied stop the chain with their documented
+// meanings. Any other returned error fails the request immediately with
+// 401 invalid_client, and the resolver chain stops.
 //
 // Resolvers run in the request goroutine — keep them fast (no network
 // I/O beyond cache hits, no DB queries beyond in-process pools). The
@@ -145,12 +146,14 @@ var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not appli
 // which starts a login. Returning this sentinel lets zeroid do the redirect on
 // the resolver's behalf, so the resolver still never touches the transport.
 //
-// Distinguish all three:
+// Distinguish all four:
 //
 //   - ErrPrincipalNotApplicable — "this is not my kind of credential." Try the
 //     next resolver.
 //   - ErrPrincipalInteractionRequired — "this IS my kind of request, and it can
 //     be satisfied by logging in." Stop the chain and redirect.
+//   - ErrPrincipalAccessDenied — "I authenticated the resource owner and they
+//     said no." Stop the chain and report access_denied to the client.
 //   - any other error — "I found my credential and it is bad." Stop and fail.
 //
 // Only honoured on GET, where a user agent exists to redirect, and only when the
@@ -162,6 +165,39 @@ var ErrPrincipalNotApplicable = errors.New("zeroid: principal resolver not appli
 // Returning it stops the chain: a resolver that wants to defer to a later one
 // should return ErrPrincipalNotApplicable instead.
 var ErrPrincipalInteractionRequired = errors.New("zeroid: principal requires interactive authentication")
+
+// ErrPrincipalAccessDenied is the sentinel a PrincipalResolver returns after it
+// has authenticated the request and established that the resource owner
+// DECLINED it — a user pressing "Deny" on a consent screen, typically. It may be
+// wrapped; zeroid matches it with errors.Is.
+//
+// It exists for deployments whose login and consent surface is a separate
+// front end. That front end authenticates the user, asks for consent, and then
+// posts a signed statement of the outcome to /oauth2/authorize server-to-server.
+// On approval the resolver returns a Principal and the front end receives the
+// code redirect to hand to the browser. On denial the client still needs the
+// RFC 6749 §4.1.2.1 error redirect — and the front end cannot build it, because
+// only zeroid has validated client_id and redirect_uri. Returning this sentinel
+// asks zeroid to build it.
+//
+// zeroid answers with a 302 to the client's validated redirect_uri carrying
+// error=access_denied, a fixed error_description, the request's state (when
+// one was sent) and the RFC 9207 iss parameter. Unlike every other failure at
+// this endpoint, that redirect is issued on POST as well as GET: the POST
+// caller here is the front end, and its job is to forward the Location to the
+// user agent. That holds for self-asserted (CIMD) clients too, remote
+// redirect_uri included: cimd.allowed_domains is enforced when the document
+// resolves, before any resolver runs. A JSON access_denied body (403) is only
+// a defensive fallback for a destination zeroid cannot redirect to at all.
+// It also stops the resolver chain, and it outranks both
+// ErrPrincipalNotApplicable and ErrPrincipalInteractionRequired when an error
+// matches more than one sentinel.
+//
+// Only return it for a request the resolver has authenticated. A credential
+// that fails to verify is an ordinary error, and a request the resolver does
+// not handle is ErrPrincipalNotApplicable; a resolver that reported denial for
+// an unauthenticated request would let anyone produce the error redirect.
+var ErrPrincipalAccessDenied = errors.New("zeroid: resource owner denied the request")
 
 // ErrNoResolversRegistered is the sentinel Server.resolvePrincipal
 // returns when the /oauth2/authorize endpoint is reached but the

@@ -15,10 +15,13 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/jwtalg"
 	"github.com/highflame-ai/zeroid/internal/oautherror"
+	"github.com/highflame-ai/zeroid/internal/telemetry"
 )
 
 // externalIDTokenClockSkew is the leeway allowed when validating the upstream
@@ -40,14 +43,115 @@ const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
 func idTokenIssuedTo(token jwt.Token, clientID string) error {
 	aud, _ := token.Audience()
 	if !slices.Contains(aud, clientID) {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)")
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was not issued to the authenticated client (aud)", errAssertionAudience)
 	}
-	azp, err := jwt.Get[string](token, "azp")
-	if err == nil && azp != clientID {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)")
+	// An azp that is present must be a string equal to clientID: one of
+	// another type is refused, never read as absent.
+	hasAZP := token.Has("azp")
+	if hasAZP {
+		if azp, err := jwt.Get[string](token, "azp"); err != nil || azp != clientID {
+			return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token was issued to a different authorized party (azp)", errAssertionAudience)
+		}
 	}
-	if err != nil && len(aud) > 1 {
-		return oauthBadRequest(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client")
+	if !hasAZP && len(aud) > 1 {
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token has several audiences and no azp naming the authenticated client", errAssertionAudience)
+	}
+	return nil
+}
+
+// Causes wrapped onto the *OAuthError of a refused external assertion, for
+// callers that report the reason as a code (VerifyIDToken). The wire answer
+// on the grants is unchanged: invalid_grant.
+var (
+	errAssertionAudience    = errors.New("the assertion was not issued to the expected audience")
+	errAssertionConstraints = errors.New("the assertion does not satisfy the issuer's claim constraints")
+)
+
+// personIDToken is a person's ID token verified by verifyPersonIDToken, with
+// what the issuer's claim mapping reads from it.
+type personIDToken struct {
+	claims        map[string]any
+	userID        string
+	email         string
+	emailVerified bool
+	name          string
+}
+
+// verifyPersonIDToken verifies an OpenID Connect ID token naming a person,
+// issued by entry's IdP to clientID: the P1c checks that need no binding
+// (ADR 0042 D3a rules 1 to 3). Signature against the issuer's JWKS, iss,
+// exp/nbf/iat with the shared skew and max_token_age, the row's claim
+// constraints (and shared-issuer pin), the token being an ID token and not
+// an access token, aud naming clientID with azp equal to it when present,
+// the mapped user_id, and a person rather than a workload subject. The
+// email and email_verified come from the row's claim mapping (Entra's
+// xms_edov).
+//
+// It is the single routine both the ID-token exchange and the issuer
+// ownership proof (ExternalIssuerService.VerifyIDToken) run, so the proof
+// can never accept a token the grant would refuse on these checks. On an
+// issuer row clientID is an accepted audience beside the row's own: on the
+// exchange an enabled binding for it is required afterwards.
+func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerEntry, clientID string) (*personIDToken, error) {
+	var extraAudiences []string
+	if entry.Row != nil {
+		extraAudiences = []string{clientID}
+	}
+	verified, err := validateExternalAssertion(ctx, raw, entry, "subject_token", requirePlainSub, extraAudiences...)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireIDToken(raw, verified); err != nil {
+		return nil, err
+	}
+	if err := idTokenIssuedTo(verified, clientID); err != nil {
+		return nil, err
+	}
+	// Single-level claim names only. v4 dropped AsMap, so the claims are
+	// materialized from Keys()/Get().
+	mapping := entry.Config.ClaimMapping
+	claims := tokenClaimsAsMap(verified)
+	userID, ok := extractMappedClaimString(claims, mapping["user_id"])
+	if !ok || userID == "" {
+		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", mapping["user_id"]))
+	}
+	if err := refuseWorkloadSubject(claims, userID); err != nil {
+		return nil, err
+	}
+	out := &personIDToken{claims: claims, userID: userID}
+	out.email, _ = extractMappedClaimString(claims, mapping["email"])
+	out.emailVerified = issuerEmailVerified(claims, entry.Config, out.email)
+	out.name, _ = extractMappedClaimString(claims, mapping["name"])
+	return out, nil
+}
+
+// requireIDToken is ADR 0042 D3a rule 2: the subject token is positively an
+// ID token, not merely a JWT from a trusted issuer. IdPs do not type ID
+// tokens, so this means the OpenID Connect Core §2 claims are present and no
+// access-token marker is (RFC 9068 §2.1 typ, scp or scope). The aud check
+// that separates the two is idTokenIssuedTo. Signature, iss, exp and iat
+// were verified before this runs.
+func requireIDToken(raw string, verified jwt.Token) error {
+	if hdr, ok := decodeJWTHeader(raw); ok {
+		switch strings.ToLower(hdr.Typ) {
+		case "at+jwt", "application/at+jwt":
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an access token (typ at+jwt), not an ID token")
+		case idJAGTyp:
+			return oauthBadRequest(oautherror.InvalidGrant, "subject_token is an ID-JAG; redeem it with the jwt-bearer grant")
+		}
+	}
+	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat"} {
+		if !verified.Has(claim) {
+			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token is not an ID token: it has no %s claim", claim))
+		}
+	}
+	// Entra stamps azpacr (v2) or appidacr (v1) on every access token, the
+	// app-only ones included, and never on an ID token. roles alone is not
+	// a marker: Entra ID tokens carry a user's app roles in it.
+	for _, claim := range []string{"scp", "scope", "azpacr", "appidacr"} {
+		if verified.Has(claim) {
+			return oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("subject_token carries %s, which marks an access token, not an ID token", claim))
+		}
 	}
 	return nil
 }
@@ -56,17 +160,11 @@ func idTokenIssuedTo(token jwt.Token, clientID string) error {
 // token, returned as issued_token_type on every token-exchange response.
 const TokenTypeAccessToken = "urn:ietf:params:oauth:token-type:access_token"
 
-// ErrUnknownExternalIssuer is returned when a token-exchange request carries
-// an upstream `iss` that is not in the deployer-configured external_issuers
-// allowlist. Wrapped onto the *OAuthError so callers can branch with
-// errors.Is while the handler still maps the OAuth error code via errors.As.
-//
-// We classify this as `invalid_request` (RFC 6749 §5.2) rather than
-// `invalid_grant`: the token may be perfectly valid against its real issuer;
-// the failure is that the deployer has not configured this IdP. Per the RFC,
-// `invalid_grant` covers credentials that "are invalid, expired, revoked"
-// against a trust config the server does have — not credentials whose issuer
-// the server has never been told to trust.
+// ErrUnknownExternalIssuer is the cause when a person grant's token names an
+// issuer nobody trusts. It is wrapped onto the *OAuthError so callers can
+// branch with errors.Is; on the wire it is the same generic invalid_grant as
+// every other issuer refusal (resolvePersonIssuer), so a probe cannot tell an
+// unknown issuer from a disabled or workload one.
 var ErrUnknownExternalIssuer = errors.New("issuer is not a configured external issuer")
 
 // SetExternalIssuerRegistry installs a registry of trusted external IdPs.
@@ -97,88 +195,108 @@ func (s *OAuthService) SetExternalIssuerRegistry(r *ExternalIssuerRegistry) {
 // check + issuer allowlist + audience binding are the proof of trust.
 // That bypass is intentional and the entire point of the new path.
 func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
-		return nil, oauthBadRequest("invalid_request", "no external issuers are configured for direct OIDC federation")
-	}
 	if req.SubjectToken == "" {
 		return nil, oauthBadRequest("invalid_request", "subject_token is required")
 	}
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
-	}
-
-	// Peek at the token to extract iss without validating signatures yet —
-	// we need iss to look up which IdP's JWKS to verify against.
-	peeked, err := jwt.ParseInsecure([]byte(req.SubjectToken))
-	if err != nil {
-		return nil, oauthBadRequestCause("invalid_grant", "subject_token is malformed", err)
-	}
-	upstreamIss, ok := peeked.Issuer()
-	if !ok || upstreamIss == "" {
-		return nil, oauthBadRequest("invalid_grant", "subject_token missing iss claim")
-	}
-
-	entry := s.externalIssuerRegistry.Lookup(upstreamIss)
-	if entry == nil {
-		// Unknown issuer — invalid_request, not invalid_grant: the deployer
-		// has not configured this IdP, which is a configuration mismatch
-		// rather than a credential failure. Wrap ErrUnknownExternalIssuer as
-		// the cause so callers can errors.Is while the handler still picks up
-		// the OAuth error code via errors.As on *OAuthError.
-		return nil, oauthBadRequestCause(
-			"invalid_request",
-			fmt.Sprintf("issuer %s is not a configured external issuer", upstreamIss),
-			fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, upstreamIss),
-		)
-	}
-	cfg := entry.Config
-
-	if !cfg.AccountAllowed(req.AccountID) {
-		return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
-	}
 
 	// D13: only the relying party an ID token was issued to may redeem it, and
-	// it must authenticate as that client. Without this, anyone holding a
-	// person's ID token could mint a token with that person as sub. Same
-	// shared client authentication ID-JAG uses, so the client's registered
-	// token_endpoint_auth_method decides which credential it must present.
+	// it must authenticate as that client. Authenticated first, so nothing
+	// about the token's issuer is looked up or revealed to an anonymous
+	// caller. cimdFallback=false: this path does not gate on the client's
+	// declared grant_types, so a self-asserted document must not resolve here.
 	if req.ClientID == "" {
 		return nil, oauthUnauthorized("ID-token exchange requires client authentication", nil)
 	}
-	authedClient, err := s.authenticateRegisteredClient(ctx, req)
+	authedClient, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify the upstream ID token against its configured IdP — signature
-	// (JWKS), iss, aud, exp/nbf, alg allow-list, MaxTokenAge, and the
-	// presence of sub/exp/iat. This is the #88 federation substrate, shared
-	// verbatim with the ID-JAG jwt-bearer path (validateExternalAssertion).
-	// "subject_token" is the field name in the error strings because that is
-	// what an id_token-exchange caller presents.
-	verified, err := s.validateExternalAssertion(ctx, req.SubjectToken, entry, "subject_token", requirePlainSub)
+	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
+		return nil, oauthBadRequest("invalid_request", "no external issuers are configured for direct OIDC federation")
+	}
+	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.SubjectToken, "subject_token")
 	if err != nil {
 		return nil, err
 	}
-	if err := idTokenIssuedTo(verified, authedClient.ClientID); err != nil {
+	cfg := entry.Config
+
+	var identity *domain.Identity
+	if entry.Row != nil {
+		// ADR 0042 D3a rule 1 (issuer rows): the relying party proves itself
+		// with a key, never a shared secret, so an agent needs no Highflame
+		// secret (D8). Static issuers keep the client's registered method.
+		if authedClient.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT {
+			return nil, oauthUnauthorized("the ID-token exchange requires private_key_jwt client authentication; "+
+				"a client secret is not accepted", nil)
+		}
+		// The binding is the audience rule (D3a): verifyPersonIDToken accepts
+		// the presenting client_id beside the row's optional audiences, and
+		// bindFederatedAgent below refuses a client with no enabled binding.
+		// The binding is read only after the token is verified, so a forged
+		// token cannot raise events under the account or learn its binding
+		// state.
+	} else {
+		// A static issuer, in standalone ZeroID, takes the tenant from the
+		// caller, inside its allowed_accounts (D5 is for issuer rows).
+		if req.AccountID == "" || req.ProjectID == "" {
+			return nil, oauthBadRequest("invalid_request", "account_id and project_id are required for external id_token exchange")
+		}
+		if !cfg.AccountAllowed(req.AccountID) {
+			return nil, oauthBadRequest("invalid_request", fmt.Sprintf("account %s is not allowed to use issuer %s", req.AccountID, upstreamIss))
+		}
+	}
+
+	// Verify the upstream ID token against its IdP (signature, iss, aud/azp,
+	// exp/nbf/iat, alg allow-list, MaxTokenAge, constraints, ID-token shape,
+	// person subject) and read the mapped claims. The issuer ownership proof
+	// runs the same routine.
+	idTok, err := verifyPersonIDToken(ctx, req.SubjectToken, entry, authedClient.ClientID)
+	if err != nil {
 		return nil, err
 	}
+	rawClaims, userID, userEmail, userName := idTok.claims, idTok.userID, idTok.email, idTok.name
 
-	// Claim mapping. user_id is required (validated at config load); other
-	// mappings are optional. Single-level keys only in v1. v4 dropped AsMap,
-	// so iterate Keys()/Get() to materialize a plain map.
-	rawClaims := tokenClaimsAsMap(verified)
-	userID, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["user_id"])
-	if !ok || userID == "" {
-		return nil, oauthBadRequest("invalid_grant", fmt.Sprintf("subject_token missing claim %q (mapped to user_id)", cfg.ClaimMapping["user_id"]))
+	// For an issuer row the agent is the identity the presenting client is
+	// bound to under the row (D6: on P1c the subject key is the client_id),
+	// and the tenant is that identity's (D5). Static issuers keep the
+	// caller-named application, or a synthetic carrier.
+	var actors []domain.Actor
+	if entry.Row != nil {
+		identity, err = s.bindFederatedAgent(ctx, entry.Row, authedClient.ClientID, authedClient, federatedGrantIDToken)
+		if err != nil {
+			return nil, err
+		}
+		if err := federatedTenant(identity, req.AccountID, req.ProjectID); err != nil {
+			return nil, err
+		}
+		if req.ApplicationID != "" && req.ApplicationID != identity.ID {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the presenting client is bound to")
+		}
+		req.AccountID, req.ProjectID = identity.AccountID, identity.ProjectID
+		// The bound agent is the current actor (ADR 0043 D2), as on ID-JAG.
+		actors = idJAGActors(identity)
+	} else {
+		identity, err = s.resolveExternalPrincipalIdentity(ctx, req)
+		if err != nil {
+			return nil, err
+		}
 	}
-	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
-	userName, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["name"])
 
-	// Resolve the application identity if requested. Same IDOR-guarded
-	// lookup the broker path uses — falling back to a synthetic service
-	// identity when no application_id is provided.
-	identity, err := s.resolveExternalPrincipalIdentity(ctx, req)
+	// The person must be a member of the tenant (ADR 0042 D5a); the token's
+	// sub becomes the deployer's user id and the IdP pair moves to user_idp_iss/user_idp_sub.
+	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
+		GrantType:       PersonGrantExternalIDToken,
+		AccountID:       req.AccountID,
+		ProjectID:       req.ProjectID,
+		Issuer:          upstreamIss,
+		IssuerID:        issuerRowID(entry),
+		Subject:         userID,
+		Email:           userEmail,
+		EmailVerified:   idTok.emailVerified,
+		ClientID:        authedClient.ClientID,
+		AgentIdentityID: identity.ID,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -253,7 +371,6 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		GrantType:             domain.GrantTypeTokenExchange,
 		Scopes:                scopes,
 		UseRS256:              true,
-		SubjectOverride:       userID,
 		UserEmail:             userEmail,
 		UserName:              userName,
 		ApplicationID:         req.ApplicationID,
@@ -261,9 +378,11 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		// bound to the ID token's aud/azp (D13), so it is the client the
 		// token is issued to.
 		ClientID:          authedClient.ClientID,
+		Actors:            actors,
 		TTL:               900, // 15 minutes — same short-lived posture as the broker path
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		PersonGrantType:   PersonGrantExternalIDToken,
 	}
 	// RFC 8707 resource binding (CAP-IDN-026). token-exchange forks THREE ways —
 	// this id_token federation path, the trusted external-principal exchange, and
@@ -279,25 +398,71 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 	// upstream authorized set to narrow against, so the requested resource simply
 	// restricts the token it would have minted anyway — the same treatment
 	// client_credentials and api_key get.
+	person.apply(&issue)
 	bindResourceOnIssue(&issue, req.Resource)
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
+		if issuanceRefusal(err) {
+			return nil, err
+		}
 		return nil, oauthServerError("failed to issue external id_token exchange token", err)
 	}
 
 	accessToken.AccountID = req.AccountID
 	accessToken.ProjectID = req.ProjectID
-	accessToken.UserID = userID
+	accessToken.UserID = person.sub
 
 	log.Info().
 		Str("upstream_iss", upstreamIss).
 		Str("account_id", req.AccountID).
 		Str("project_id", req.ProjectID).
-		Str("user_id", userID).
+		Str("user_id", person.sub).
 		Msg("external id_token exchange succeeded")
 
 	return accessToken, nil
+}
+
+// resolvePersonIssuer reads the token's issuer and resolves the trusted
+// person issuer it must verify against (ADR 0042 D4: person grants accept
+// only enabled person rows). Every refusal is one generic invalid_grant on
+// the wire, since the token is not verified yet: telling an unknown issuer
+// from a disabled, workload or unmatched one would let a probe learn which
+// IdPs a deployment trusts. The reason is logged and counted. Callers
+// authenticate the client first.
+func (s *OAuthService) resolvePersonIssuer(ctx context.Context, token, fieldName string) (*ExternalIssuerEntry, string, error) {
+	peeked, err := jwt.ParseInsecure([]byte(token))
+	if err != nil {
+		return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+" is malformed", err)
+	}
+	iss, ok := peeked.Issuer()
+	if !ok || iss == "" {
+		return nil, "", oauthBadRequest(oautherror.InvalidGrant, fieldName+" missing iss claim")
+	}
+	entry, err := s.externalIssuerRegistry.ResolvePerson(ctx, iss, tokenClaimsAsMap(peeked))
+	if err == nil {
+		return entry, iss, nil
+	}
+	if errors.Is(err, errIssuerLookupFailed) {
+		return nil, "", oauthServerError("failed to resolve the external issuer", err)
+	}
+	reason := "unknown"
+	switch {
+	case errors.Is(err, errIssuerNotPerson):
+		reason = "workload_issuer"
+	case errors.Is(err, errIssuerDisabled):
+		reason = "disabled"
+	case errors.Is(err, errIssuerConstraints):
+		reason = "constraints"
+	case errors.Is(err, errIssuerAmbiguous):
+		reason = "ambiguous"
+	}
+	telemetry.FederationIssuerRefused.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+	log.Info().Err(err).Str("issuer", iss).Str("reason", reason).Msg("federation_issuer_refused")
+	return nil, "", oauthBadRequestCause(oautherror.InvalidGrant, fieldName+"'s issuer is not trusted for this grant", err)
 }
 
 // validateExternalAssertion runs the #88 external-IdP validation substrate
@@ -351,7 +516,8 @@ const (
 	allowSubjectIdentifier
 )
 
-func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement) (jwt.Token, error) {
+// extraAudiences are accepted beside the issuer's configured audiences.
+func validateExternalAssertion(ctx context.Context, assertion string, entry *ExternalIssuerEntry, fieldName string, subjectReq subjectRequirement, extraAudiences ...string) (jwt.Token, error) {
 	cfg := entry.Config
 
 	// Algorithm allowlist gate. Read the JWS header before signature
@@ -393,7 +559,6 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 		jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 		jwt.WithValidate(true),
 		jwt.WithIssuer(cfg.Issuer),
-		jwt.WithAudience(cfg.Audience),
 		jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 	)
 	if err != nil {
@@ -405,13 +570,25 @@ func (s *OAuthService) validateExternalAssertion(ctx context.Context, assertion 
 				jwt.WithKeySet(keySet, jws.WithInferAlgorithmFromKey(true)),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(cfg.Issuer),
-				jwt.WithAudience(cfg.Audience),
 				jwt.WithAcceptableSkew(externalIDTokenClockSkew),
 			)
 		}
 		if err != nil {
 			return nil, oauthBadRequestCause("invalid_grant", fmt.Sprintf("%s verification failed", fieldName), err)
 		}
+	}
+
+	// aud must name one of the issuer's audiences. Checked here rather than
+	// with jwt.WithAudience, which accepts only one value.
+	aud, _ := verified.Audience()
+	accepted := append(cfg.AudienceList(), extraAudiences...)
+	if !slices.ContainsFunc(accepted, func(a string) bool { return slices.Contains(aud, a) }) {
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("%s verification failed: aud is not one this issuer is trusted for", fieldName), errAssertionAudience)
+	}
+	// A shared issuer's row was chosen on unverified claims; its constraints
+	// must also hold on the verified ones.
+	if entry.Row != nil && !entry.Row.ConstraintsMatch(tokenClaimsAsMap(verified), entry.PinClaim) {
+		return nil, oauthBadRequestCause(oautherror.InvalidGrant, fmt.Sprintf("%s does not satisfy the issuer's claim constraints", fieldName), errAssertionConstraints)
 	}
 
 	// jwx's validation only checks exp/nbf when present; RFC 7523 §3 requires
@@ -523,6 +700,38 @@ func extractMappedClaimString(claims map[string]any, path string) (string, bool)
 		return tv.String(), true
 	}
 	return "", false
+}
+
+// refuseWorkloadSubject rejects a subject_token that names a workload rather
+// than a person. This grant mints with the mapped user_id as the subject, so the
+// token carries principal_type=user, which resource servers read as "a person
+// authorized this chain". A configured issuer can also sign tokens for machines,
+// and exchanged here one would pass any check that requires a human behind the
+// chain. Workloads authenticate as clients instead (RFC 7523 §2.2), which mints
+// a workload principal.
+//
+// The issuer's kind (person) is checked first; this also refuses the
+// well-known workload shapes a person issuer can still sign (ADR 0042 D3a
+// rule 3): an Entra app-only token (idtyp=app), a Kubernetes service-account
+// subject, and a SPIFFE ID. Both `sub` and the mapped user_id are checked,
+// since the mapping may point at a claim other than `sub`.
+func refuseWorkloadSubject(claims map[string]any, userID string) error {
+	if idtyp, _ := claims["idtyp"].(string); strings.EqualFold(idtyp, "app") {
+		return oauthBadRequest(oautherror.InvalidGrant, "the subject is an app-only token (idtyp=app); this grant accepts person tokens only")
+	}
+	sub, _ := claims["sub"].(string)
+	for _, id := range []string{sub, userID} {
+		if strings.HasPrefix(id, "repo:") {
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a GitHub Actions workflow; this grant accepts person tokens only")
+		}
+		if strings.HasPrefix(id, "system:serviceaccount:") {
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a Kubernetes service account; this grant accepts person tokens only")
+		}
+		if len(id) >= len("spiffe://") && strings.EqualFold(id[:len("spiffe://")], "spiffe://") {
+			return oauthBadRequest(oautherror.InvalidGrant, "the subject is a SPIFFE ID; this grant accepts person tokens only")
+		}
+	}
+	return nil
 }
 
 // extractMappedClaimStrings reads a claim that may be either a space-delimited

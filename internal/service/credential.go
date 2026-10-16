@@ -46,6 +46,9 @@ type CredentialService struct {
 	// claim shape of every token this service issues. Nil-safe: when unset,
 	// every tenant is on the legacy profile.
 	tenantSettings *TenantSettingsService
+	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
+	// consulted for every person root. Nil-safe: unset, nothing changes.
+	personGrant personGrantState
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -150,10 +153,13 @@ type IssueRequest struct {
 	// UserEmail and UserName are set for human user tokens.
 	UserEmail string
 	UserName  string
-	// ActClaim, when non-nil, is emitted verbatim as the RFC 8693 "act" claim
-	// (nested actors included), taking precedence over Actors, DelegatedBy and
-	// ActingUserID under either token profile. Used to carry an existing
-	// chain's act unchanged (a CIBA step-up approved into a requesting chain).
+	// ActClaim, when non-nil, is an existing chain's act as issued (a CIBA
+	// step-up approved into a requesting chain). Under the legacy profile it is
+	// emitted verbatim, nested actors included, taking precedence over
+	// DelegatedBy and ActingUserID. Under the rfc8693 profile Actors takes
+	// precedence over it, and it is emitted only when it is already in the
+	// rfc8693 shape (see rfc8693Act), since the chain may have been minted
+	// under the other profile.
 	ActClaim map[string]any
 	// ChannelTrustedCredential reports that the credential presented for this
 	// issuance (API key, OAuth client or public key) was written by a caller
@@ -175,6 +181,12 @@ type IssueRequest struct {
 	// mission). Non-empty on token_exchange — the caller has resolved the
 	// subject_token's mission and is propagating it down the chain.
 	MissionID string
+	// RefreshFamilyID records the refresh-token family this access token is
+	// issued under (authorization_code with a refresh token, refresh_token,
+	// and the external-principal exchange with a refresh token), so revoking
+	// the family also revokes the access tokens minted from it. Empty for
+	// every other issuance.
+	RefreshFamilyID string
 	// DPoPKeyThumbprint is the base64url JWK thumbprint (RFC 7638 SHA-256) of
 	// the client's DPoP public key. When non-empty, the issued JWT carries a
 	// cnf.jkt claim binding the token to that key, and token_type is returned
@@ -213,7 +225,7 @@ type IssueRequest struct {
 	PrincipalSub  string
 	PrincipalIss  string
 
-	// Actors is the RFC 8693 §4.1 actor chain for an exchanged token under the
+	// Actors is the RFC 8693 §4.1 actor chain for a delegated token under the
 	// rfc8693 profile: the current actor first, prior actors after it, most
 	// recent first. Ignored under the legacy profile, which keeps its
 	// single-level `act`. Capped at domain.MaxActorChainDepth.
@@ -240,6 +252,26 @@ type IssueRequest struct {
 	// which counts in phase 1 and refuses in phase 2.
 	ScopeCeilingUnbounded bool
 	RequestBoundedRoot    bool
+
+	// TrustedRole is the role a trusted service asserted on the external
+	// principal exchange, handed to the person-grant resolver so it can skip a
+	// role lookup. Set by no other grant.
+	TrustedRole string
+
+	// PersonGrantType names the grant to the person-grant resolver when the
+	// grant type alone does not: PersonGrantExternalPrincipal or
+	// PersonGrantExternalIDToken. Empty elsewhere.
+	PersonGrantType string
+
+	// IdPIssuer and IdPSubject are the IdP's pair for a person the deployer's
+	// resolver mapped to its own user (sub), written as user_idp_iss and user_idp_sub
+	// after CustomClaims. sub's issuer (user_id_iss) is then ZeroID's.
+	IdPIssuer  string
+	IdPSubject string
+
+	// personGrant is the person-grant decision already made for these scopes
+	// by a grant that had to decide before burning a single-use credential.
+	personGrant *personGrantDecision
 }
 
 // actorChainClaim renders an actor chain as the nested RFC 8693 §4.1 `act`
@@ -274,6 +306,36 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 	return nested
 }
 
+// rfc8693Act returns the `act` claim of a token issued under the rfc8693
+// profile, or nil when the token has no actor. An actor chain wins: it is
+// built from identity records, so it is in the rfc8693 shape whatever profile
+// the chain's earlier tokens were minted under. Without one, a verbatim
+// actClaim is used only when it is already in that shape, its outermost level
+// carrying the current actor's attributes. A single-level legacy `act` names a
+// delegating agent or an end user rather than the current actor, so emitting
+// it here would leave the actor's attributes in no claim; the token is then
+// issued without `act` and keeps those attributes at the top level.
+func rfc8693Act(actors []domain.Actor, actClaim map[string]any) map[string]any {
+	if len(actors) > 0 {
+		return actorChainClaim(actors)
+	}
+	if carriesActorAttributes(actClaim) {
+		return actClaim
+	}
+	return nil
+}
+
+// carriesActorAttributes reports whether an `act` claim's outermost level
+// carries the current actor's attributes, which only the rfc8693 shape does.
+func carriesActorAttributes(act map[string]any) bool {
+	for _, k := range []string{"identity_type", "trust_level", "external_id"} {
+		if v, _ := act[k].(string); v != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // recordUnboundedScope implements the ceiling rule's first phase (P1): it
 // counts, without refusing, a token issued for a named scope that nothing
 // other than the requester bounded. Somewhere in the chain, something other
@@ -284,7 +346,8 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 //     it asked for (api_key, NHI jwt_bearer).
 //   - A user-subject root bounded only by the caller's request (trusted
 //     broker, ID-token exchange, CIBA) whose governing policy sets neither
-//     allowed_scopes nor user_grant_scopes, and no Cedar decision exists yet.
+//     allowed_scopes nor user_grant_scopes, no person-grant ceiling was
+//     enforced, and no Cedar decision exists yet.
 //
 // Phase 2 refuses these with invalid_scope behind
 // workload_subject_requires_ceiling. Counting first, per identity, lets
@@ -298,7 +361,8 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 	case req.ScopeCeilingUnbounded && principal.Type == domain.PrincipalWorkload:
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
-		bounded := len(req.Identity.AllowedScopes) > 0
+		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
+		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
 		}
@@ -462,6 +526,10 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 
 	ttl := req.TTL
+	// A grant that names no lifetime gets the server default, which a stricter
+	// policy shortens (clampDefaultTTLToPolicy) instead of refusing. Only a
+	// lifetime the caller asked for is held to the policy as a hard limit.
+	ttlRequested := ttl > 0
 	if ttl <= 0 {
 		ttl = s.defaultTTL
 	}
@@ -516,6 +584,17 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
+	}
+
+	// The principal is decided first: the person-grant ceiling applies only
+	// to a person root, and a policy can require a user subject
+	// (required_principal_type).
+	principal := s.resolvePrincipal(req)
+
+	// A person's own token is bounded by the deployer's ceiling for that
+	// person (ADR 0041 D15) before any other check sees its scopes.
+	if err := s.decidePersonGrant(ctx, &req); err != nil {
+		return nil, nil, err
 	}
 
 	// Some scopes are never issued to certain identity types, whatever their
@@ -592,10 +671,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// that when the key inherits the identity policy verbatim (the common
 	// case: CredentialPolicyID == IdentityPolicyID), so the hot path pays
 	// for exactly one enforcement pass.
-	// The principal is decided before enforcement because a policy can require
-	// a user subject (required_principal_type).
-	principal := s.resolvePrincipal(req)
-
+	//
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
 	var identityPolicy *domain.CredentialPolicy
@@ -648,6 +724,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			if err != nil {
 				return nil, nil, fmt.Errorf("identity credential policy %s not found: %w", identityPolicyID, err)
 			}
+			ttl = clampDefaultTTLToPolicy(ttl, ttlRequested, policy)
+			enforceReq.TTL = ttl
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
@@ -670,6 +748,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			if err != nil {
 				return nil, nil, fmt.Errorf("credential policy %s not found: %w", req.CredentialPolicyID, err)
 			}
+			ttl = clampDefaultTTLToPolicy(ttl, ttlRequested, policy)
+			enforceReq.TTL = ttl
 			if err := s.policySvc.EnforcePolicy(ctx, policy, enforceReq); err != nil {
 				log.Warn().
 					Err(err).
@@ -693,7 +773,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// The tenant's token profile decides the claim shape. A read failure
 	// fails the issuance: minting in the wrong shape after a tenant has
 	// switched is the inconsistency a staged rollout has to rule out.
-	profile := domain.TokenProfileLegacy
+	profile := domain.DefaultTokenProfile
 	if s.tenantSettings != nil {
 		p, err := s.tenantSettings.TokenProfile(ctx, req.Identity.AccountID, req.Identity.ProjectID)
 		if err != nil {
@@ -702,10 +782,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		profile = p
 	}
 	rfc8693 := profile == domain.TokenProfileRFC8693
-	// Under rfc8693 an exchanged token's top level describes the principal,
+	// Under rfc8693 a delegated token's top level describes the principal,
 	// so the actor's own attributes move inside the outermost `act`.
-	// A verbatim ActClaim from an rfc8693 chain already carries them there.
-	actorsInAct := rfc8693 && (len(req.Actors) > 0 || req.ActClaim != nil)
+	var rfc8693ActClaim map[string]any
+	if rfc8693 {
+		rfc8693ActClaim = rfc8693Act(req.Actors, req.ActClaim)
+	}
+	actorsInAct := rfc8693ActClaim != nil
 
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
@@ -838,6 +921,24 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
 
+	// user_idp_iss / user_idp_sub: like mission_id, only ever the grant's own values.
+	_ = token.Remove("user_idp_iss")
+	_ = token.Remove("user_idp_sub")
+	// Only on a token whose sub is the person: under legacy an exchanged
+	// token's sub is the actor.
+	if req.IdPSubject != "" && principal.Type == domain.PrincipalUser && (rfc8693 || req.SubjectOverride != "") {
+		_ = token.Set("user_idp_iss", req.IdPIssuer)
+		_ = token.Set("user_idp_sub", req.IdPSubject)
+	}
+
+	// RFC 9068 §2.2.3.1 `roles`: the person grant's roles, on a person root
+	// only. Removed from every other token, so nothing below a root and no
+	// caller-supplied claim can carry it.
+	_ = token.Remove("roles")
+	if isPersonRoot(req, principal) && req.personGrant != nil && len(req.personGrant.roles) > 0 {
+		_ = token.Set("roles", req.personGrant.roles)
+	}
+
 	if rfc8693 {
 		// The principal's type is a private claim (RFC 7519 §4.3): no standard
 		// claim says whether `sub` is a person or a workload. Reserved, and set
@@ -865,10 +966,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// api-key token is a workload-subject token with no actor; the creator
 		// stays identity metadata, carried in owner_user_id and returned by
 		// introspection.
-		if req.ActClaim != nil {
-			_ = token.Set("act", req.ActClaim)
-		} else if len(req.Actors) > 0 {
-			_ = token.Set("act", actorChainClaim(req.Actors))
+		if rfc8693ActClaim != nil {
+			_ = token.Set("act", rfc8693ActClaim)
 		}
 	} else {
 		// Legacy "act" claim — two use cases:
@@ -931,6 +1030,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		ParentJTI:           req.ParentJTI,
 		DelegatedByWIMSEURI: req.DelegatedBy,
 		MissionID:           missionID,
+		RefreshFamilyID:     req.RefreshFamilyID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		AuditRetentionUntil: &auditRetentionUntil,
 		// Persisted for every tenant, whatever its token profile, so a chain
@@ -964,6 +1064,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Scope:       strings.Join(req.Scopes, " "),
 		JTI:         jti,
 		IssuedAt:    now.Unix(),
+		// The tenant the JWT's account_id/project_id claims carry, named on
+		// the response for every grant. Several grants derive the tenant
+		// rather than read it from the request (jwt-bearer from the
+		// assertion's identity, token-exchange from the subject token,
+		// client_credentials from a client's linked identity), so without
+		// this an embedder attributing issuance from the response with a
+		// request-body fallback (AuthN's metering) has no tenant at all.
+		AccountID: req.Identity.AccountID,
+		ProjectID: req.Identity.ProjectID,
 	}
 
 	return accessToken, cred, nil
@@ -1021,6 +1130,37 @@ func (s *CredentialService) RevokeCredential(ctx context.Context, id, accountID,
 	}
 	s.dispatchRevocations(ctx, revoked, reason)
 	return nil
+}
+
+// RevokeByRefreshFamily revokes every active access token issued under the
+// given refresh-token family, cascading to each one's delegated descendants,
+// and returns how many credentials it revoked. Paired with revoking the
+// family's refresh tokens when a rotated refresh token is presented again
+// (RFC 9700 §4.14.2) or an authorization code is replayed (RFC 6749 §4.1.2),
+// so neither leaves the family's access tokens valid until they expire.
+//
+// Each anchor is revoked through the same cascade as RevokeCredential, so the
+// tenant guard and the RevocationNotifier fan-out are identical. An anchor
+// that has already been revoked or expired between the lookup and its revoke
+// (a concurrent cascade, say) is skipped rather than reported as an error.
+func (s *CredentialService) RevokeByRefreshFamily(ctx context.Context, familyID, reason string) (int, error) {
+	if familyID == "" {
+		return 0, nil
+	}
+	anchors, err := s.repo.ListActiveByRefreshFamily(ctx, familyID)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, a := range anchors {
+		revoked, err := s.repo.Revoke(ctx, a.ID, a.AccountID, a.ProjectID, reason)
+		if err != nil {
+			return total, err
+		}
+		s.dispatchRevocations(ctx, revoked, reason)
+		total += len(revoked)
+	}
+	return total, nil
 }
 
 // RevokeAllActiveForIdentity revokes every active credential issued to the given
@@ -1259,4 +1399,14 @@ func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*d
 		return cred, false, nil
 	}
 	return cred, true, nil
+}
+
+// clampDefaultTTLToPolicy shortens a server-default lifetime to the policy's
+// max_ttl_seconds. A lifetime the caller requested is returned unchanged, so
+// EnforcePolicy still refuses one that exceeds the policy.
+func clampDefaultTTLToPolicy(ttl int, requested bool, policy *domain.CredentialPolicy) int {
+	if requested || policy == nil || policy.MaxTTLSeconds <= 0 || ttl <= policy.MaxTTLSeconds {
+		return ttl
+	}
+	return policy.MaxTTLSeconds
 }

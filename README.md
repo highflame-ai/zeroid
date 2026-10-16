@@ -101,6 +101,7 @@ OAuth/OIDC authenticates a human to a service. **ZeroID implements true delegate
 - **Credential Policies** — Governance templates that enforce TTL, allowed grant types, required trust levels, and max delegation depth. Defines each agent's operational envelope programmatically, replacing per-action consent with policy-based controls.
 - **Continuous Access Evaluation (CAE)** — Revoke credentials in real time when risk signals fire via the OpenID Shared Signals Framework (SSF). Revoke the orchestrator's credential and the entire downstream chain is invalidated immediately—no waiting for token expiry.
 - **Attestation Framework** — Pluggable verifiers behind a fail-closed contract: software, platform, and hardware attestation elevate trust levels before credentials are issued. Ships with an OIDC verifier (GitHub Actions, GCP Workload Identity, Kubernetes projected SA tokens, etc.) plus per-tenant `AttestationPolicy` for issuer allowlisting and claim binding. Full reference: [`docs/attestation.md`](docs/attestation.md).
+- **Trusted issuers** — agents registered in a customer IdP reach ZeroID with the IdP's own tokens: an ID-JAG redeemed with `jwt-bearer`, or the person's OpenID Connect ID token exchanged by the agent it was issued to (RFC 8693, `private_key_jwt` only, positively an ID token). Issuers are per-account rows (`federation.issuer_store: db`) of kind `person` or `workload`, read live on every grant, with credential bindings that map the agent to its own identity, the tenant derived rather than requested, adopted agents only, and a hook (`Server.SetFederatedPersonResolver`) that maps the IdP person to the deployer's user. Standalone deployments keep the static `external_issuers` list. Full reference: [`docs/external-issuers.md`](docs/external-issuers.md); a mock IdP for local runs is [`cmd/zeroid-mockidp`](cmd/zeroid-mockidp/README.md).
 - **WIMSE Proof Tokens** — Single-use, nonce-bound tokens for service-to-service verification and replay protection.
 
 ---
@@ -124,9 +125,9 @@ ZeroID covers every agentic deployment pattern — from a single autonomous agen
 
 ### Token profiles
 
-Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `legacy`.
+Each tenant (account and project) issues tokens in one of two shapes, set with `PUT /tenant-settings` (`token_profile`). The default is `rfc8693`; set `legacy` for a tenant whose consumers still read only the older shape.
 
-| | `legacy` (default) | `rfc8693` |
+| | `legacy` | `rfc8693` (default) |
 |---|---|---|
 | `sub` on an exchanged token | the actor (the sub-agent) | the principal the whole chain acts for — a person or the root workload — fixed at every hop (RFC 8693 §4.1) |
 | `act` | one level; its meaning depends on the grant | nested agents, current one outermost; the person is never an actor |
@@ -353,14 +354,14 @@ delegated = client.tokens.delegate(
     scope="data:read",
 )
 
-# Under the default legacy profile the delegated token carries:
-#   sub:              spiffe://.../agent/data-fetcher   ← who is acting
-#   owner:            ops@company.com                   ← who provisioned this agent
-#   act.sub:          spiffe://.../agent/orchestrator-1 ← which agent delegated
+# Under the default rfc8693 profile the delegated token carries:
+#   sub:              spiffe://.../agent/orchestrator-1 ← the chain's principal
+#   act.sub:          spiffe://.../agent/data-fetcher   ← who is acting now
+#   owner:            ops@company.com                   ← who provisioned the actor
 #   scope:            data:read                         ← capped by intersection
 #   delegation_depth: 1
-# Under the rfc8693 profile sub stays the orchestrator (the chain's principal)
-# and act.sub is data-fetcher, the current actor. See "Token profiles".
+# Under the legacy profile sub is data-fetcher and act.sub is orchestrator-1.
+# See "Token profiles".
 ```
 
 </details>
@@ -418,8 +419,8 @@ const delegated = await client.tokens.delegate({
   actor_token: actorToken,
   scope: "data:read",
 });
-// delegated.access_token carries sub=data-fetcher, act.sub=orchestrator-1,
-// scope=data:read, delegation_depth=1
+// delegated.access_token carries sub=orchestrator-1 (the principal),
+// act.sub=data-fetcher (the current actor), scope=data:read, delegation_depth=1
 ```
 
 </details>
@@ -460,8 +461,8 @@ const session = await client.tokens.sessionFromRequest(request.headers);
 
 session.requireScope("data:read");             // throws ZeroIDError if scope missing
 session.requireTrust("verified_third_party");  // throws ZeroIDError if trust too low
-// session.sub              → "spiffe://..."
-// session.act?.sub         → orchestrator's WIMSE URI
+// session.sub              → the chain's principal
+// session.act?.sub         → the current actor (rfc8693 profile)
 ```
 
 </details>
@@ -630,14 +631,14 @@ investigator_token = monitor_client.tokens.delegate(
     actor_token=build_jwt_assertion(investigator_private_key, investigator.identity.wimse_uri),
     scope="logs:read logs:query",
 )
-# investigator_token: sub=log-investigator, act.sub=sec-monitor, depth=1
+# investigator_token: sub=sec-monitor, act.sub=log-investigator, depth=1
 
 # Investigator confirms breach → delegates remediation (depth 2, at the cap)
 remediator_token = investigator_client.tokens.delegate(
     actor_token=build_jwt_assertion(remediator_private_key, remediator.identity.wimse_uri),
     scope="firewall:write",
 )
-# remediator_token: sub=fw-remediator, act.sub=log-investigator, depth=2
+# remediator_token: sub=sec-monitor, act={sub: fw-remediator, act: {sub: log-investigator}}, depth=2
 
 # Incident resolved. Deactivate the monitor — the entire downstream chain is invalidated.
 client.agents.deactivate(monitor.identity.id)
@@ -651,7 +652,7 @@ client.agents.deactivate(monitor.identity.id)
 
 **Without ZeroID:** The agent logs into travel and HR systems as Alice (using her OAuth token). There's no distinction between Alice booking travel herself and the agent doing it on her behalf. Alice can't revoke just the agent's access — she'd have to revoke her own session.
 
-**With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries its own identity in `sub`, Alice's identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
+**With ZeroID:** Alice authenticates via the authorization_code flow and delegates to her assistant. The agent's token carries Alice's identity in `sub`, its own identity in `act.sub`, and the agent's owner (ops team) in `owner`. Downstream systems can see the full picture. Alice can revoke the agent's delegated token without affecting her own session.
 
 ```python
 # Alice authenticates via authorization_code + PKCE
@@ -664,8 +665,8 @@ assistant_token = client.tokens.issue_token_exchange(
     actor_token=build_jwt_assertion(assistant_private_key, assistant.identity.wimse_uri),
     scope="calendar:read travel:book expenses:submit",
 )
-# assistant_token: sub=travel-assistant, act.sub=alice@company.com, depth=1
-# Travel and HR systems see act.sub → book in Alice's name, charge her cost center
+# assistant_token: sub=alice@company.com, principal_type=user, act.sub=travel-assistant, depth=1
+# Travel and HR systems see sub → book in Alice's name, charge her cost center
 
 # Alice decides she wants to handle this herself — revoke just the agent's token.
 # Her own session is untouched.
@@ -799,6 +800,13 @@ Replay defence is atomic: each proof's `jti` is INSERT-or-fail on a primary-key 
 ```bash
 # 1. Platform mints an initial access token (ordinary client_credentials grant
 #    against a confidential client whose allowed_scopes includes client:register).
+#    account_id/project_id may be omitted when the client was registered with an
+#    identity_id: the token is then for the linked identity, in its tenant, and
+#    the response names that tenant (account_id/project_id). If a linked client
+#    does send them they must name the linked identity's tenant, or the request
+#    is refused with invalid_request. Without a link they are required (the
+#    token is for the identity whose external_id is the client_id in that
+#    tenant). Either way they must be sent together, or not at all.
 IAT=$(curl -s -X POST https://auth.example/oauth2/token \
   -d 'grant_type=client_credentials' \
   -d "client_id=$BOOTSTRAP_CLIENT" -d "client_secret=$BOOTSTRAP_SECRET" \
@@ -884,13 +892,15 @@ graph TD
 | Flow | Algorithm | Default TTL | Subject | User Claims |
 |------|-----------|-------------|---------|-------------|
 | NHI (`client_credentials` / `jwt_bearer`) | ES256 | 1 hour | WIMSE URI | `owner_user_id` = registrant |
-| SDK (`api_key`) | RS256 | 1 hour | WIMSE URI | `act.sub` = developer using SDK |
-| Delegated (`token_exchange`) | ES256 | 1 hour | Sub-agent WIMSE URI | `act.sub` = orchestrator URI |
+| SDK (`api_key`) | RS256 | 1 hour | WIMSE URI | `owner_user_id`; no `act` (legacy: `act.sub` = key creator) |
+| Delegated (`token_exchange`) | ES256 | 1 hour | Chain principal (legacy: sub-agent WIMSE URI) | `act.sub` = sub-agent, prior actors nested (legacy: `act.sub` = orchestrator) |
 | CLI (`authorization_code`) | RS256 | 90 days | User ID | — |
 | MCP (`authorization_code` + refresh) | RS256 | 1 hour | User ID | — |
 | CIBA (`urn:openid:params:grant-type:ciba`) | RS256 | 15 min | Approving user ID | `email`, `name`, `backchannel_client_id`, `token_exchange="ciba"` |
 | **DPoP-bound** (any grant + `DPoP` header) | — (modifier) | — (inherits grant) | — (inherits grant) | adds `cnf.jkt` claim; response `token_type: "DPoP"` |
 | **DCR client_credentials** | ES256 | 1 hour | DCR client's WIMSE URI (when bound) | identical claims to internal `client_credentials`; client's `registration_source` distinguishes provenance for audit |
+
+**Refresh token rotation:** every `refresh_token` grant rotates — the presented refresh token is consumed and a new one is returned, in the same token family. A refresh token can be used once. Presenting one that has already been rotated is treated as a sign that the family has leaked ([RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700#section-4.14.2)): ZeroID revokes every refresh token in the family, including the newest, along with the access tokens issued from the family (and their delegated descendants), and answers `invalid_grant`, the same response as any other unusable refresh token. The exception is a short grace window after each rotation, `token.refresh_reuse_grace_seconds` (env `ZEROID_REFRESH_REUSE_GRACE_SECONDS`, default 10, range 0–300): within it, a second presentation of the rotated-out token is refused with `invalid_grant` as a concurrent retry and nothing is revoked, so tabs or processes that share one refresh token and refresh at the same moment keep their session. The grace covers only rotation — a token whose family was revoked (reuse detection, RFC 7009 revocation, authorization-code replay) is refused outright — and its cost is that a stolen rotated-out token used within the window does not revoke the family. Set it to 0 for strict RFC 9700 behaviour, in which two concurrent refreshes with one token leave the family revoked. Clients should still serialise refreshes and keep only the newest refresh token. If the server fails after consuming the token but before answering, it puts the presented token back, so retrying with it rotates normally. To end a session, revoke the refresh token at `/oauth2/token/revoke` (RFC 7009): that revokes the family and its access tokens.
 
 ---
 
@@ -909,7 +919,7 @@ graph TD
 | GET | `/.well-known/spiffe-trust-bundle.json` | SPIFFE JWT-SVID trust bundle |
 | POST | `/oauth2/token` | Issue token (7 grant types, including `urn:openid:params:grant-type:ciba`) |
 | POST | `/oauth2/token/introspect` | Token introspection (RFC 7662) |
-| POST | `/oauth2/token/revoke` | Token revocation (RFC 7009) |
+| POST | `/oauth2/token/revoke` | Token revocation (RFC 7009): access tokens and refresh tokens. Revoking a refresh token revokes its whole family and the access tokens issued from it; when the request identifies a client, only that client's refresh tokens are revoked. `200` for unknown, invalid or already-revoked tokens; `500 server_error` if the revocation could not be carried out |
 | POST | `/oauth2/bc-authorize` | CIBA backchannel authorization request (OpenID CIBA Core §7) |
 | POST | `/oauth2/register` | Dynamic client registration (RFC 7591). Requires initial access token with `client:register` scope. |
 | GET / PUT / DELETE | `/oauth2/register/{client_id}` | Client management (RFC 7592). Authenticated by `registration_access_token`. |
@@ -997,8 +1007,18 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET | `/delegations/graph` | Depth-bounded delegation subgraph centered on an identity (`?identity_id=&depth=`) |
 | GET | `/delegations/by-jti/{jti}` | Full lineage root → leaf for any credential (forensic provenance walk) |
 | GET | `/delegations/chains` | List delegation tree summaries in a time window (`?since=&until=&limit=`) |
+| GET, POST | `/external-issuers` | List or add the account's trusted issuers ([contract](docs/external-issuers.md#admin-api)) |
+| GET, PATCH, DELETE | `/external-issuers/{id}` | Read, change or remove a trusted issuer |
+| POST | `/external-issuers/check` | Probe an issuer's JWKS |
+| GET | `/external-issuers/bindings` | List the account's credential bindings across issuers (`?identity_id=`) |
+| GET, POST | `/external-issuers/{id}/bindings` | List (`?identity_id=`) or add credential bindings (optionally creating the agent's OAuth client) |
+| GET, PATCH, DELETE | `/external-issuers/{id}/bindings/{binding_id}` | Read, enable/disable or remove a binding |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
+
+`public_key_pem` on the agent and identity write paths must be an SPKI EC P-256 (ES256) key; anything else is a `400` naming the reason.
+The agent registry never returns the PEM: each agent carries `has_public_key` and, when a key is enrolled, `public_key_thumbprint` (its RFC 7638 JWK SHA-256 thumbprint, base64url).
+See [§5.3 of the extensions spec](docs/spec/zeroid-oauth-extensions.md#53-nhi-delegation-requires-an-actor-proof-of-possession) for the details.
 
 Full interactive docs at `GET /docs` when running.
 
@@ -1024,6 +1044,7 @@ How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, nati
 | JSON Web Tokens | RFC 7519 | Token format |
 | JSON Web Key Sets | RFC 7517 | Public key distribution |
 | OAuth Authorization Server Metadata | RFC 8414 | `/.well-known/oauth-authorization-server` discovery |
+| Authorization Server Issuer Identification | RFC 9207 | `iss` on every `/oauth2/authorize` response (success and error) — client-side mix-up defense; advertised via `authorization_response_iss_parameter_supported` |
 | OAuth Protected Resource Metadata | RFC 9728 | `/.well-known/oauth-protected-resource` — first hop of the OAuth discovery chain; points clients at AS metadata |
 | OpenID Connect Discovery 1.0 | OpenID | `/.well-known/openid-configuration` — the discovery path cloud workload-identity federation (AWS IAM OIDC providers, Azure federated identity credentials, GCP workload identity pools) requires to trust ZeroID as an external issuer. Metadata only: ZeroID is not an OpenID Provider and issues no `id_token` |
 | WIMSE / SPIFFE | IETF Draft | Agent workload identity URIs |
@@ -1033,7 +1054,7 @@ How the whole stack maps onto the CoSAI/OASIS **ODIS** draft (Layers 1–2, nati
 | Rich Authorization Requests | RFC 9396 | Typed `authorization_details` on CIBA bc-authorize for per-action approval prompts (vs scope-string) |
 | DPoP | RFC 9449 | Sender-constrained access tokens — proof-of-possession at `/oauth2/token` and at the resource server |
 | JWK Thumbprint | RFC 7638 | DPoP `cnf.jkt` key binding |
-| Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating |
+| Dynamic Client Registration | RFC 7591 | Self-service OAuth client registration with initial access token gating; `token.registration_endpoint` can advertise a registration endpoint hosted elsewhere instead |
 | Client Configuration Endpoint | RFC 7592 | Read/update/delete of dynamically registered clients via `registration_access_token` |
 
 ---

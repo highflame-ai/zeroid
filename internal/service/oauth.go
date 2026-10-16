@@ -62,6 +62,12 @@ type OAuthService struct {
 	// Nil when no external_issuers are configured — direct federation is
 	// disabled in that case and only the broker path remains.
 	externalIssuerRegistry *ExternalIssuerRegistry
+	// issuerBindings maps federated agents to identities when issuers are
+	// account rows (ADR 0042 D6). Nil in static mode.
+	issuerBindings issuerBindingSource
+	// federatedPerson resolves the person in an IdP token to the deployer's
+	// user (ADR 0042 D5a).
+	federatedPerson federatedPersonHook
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
 	backchannelSvc *BackchannelService
@@ -120,8 +126,13 @@ type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.Acc
 // defeats the single-use guarantee. The concrete impl is
 // postgres.IDJAGReplayStore; an interface here keeps the service testable and
 // the dependency narrow.
+//
+// Redeemed is a read-only pre-check so a replay is refused before work that
+// should not run for it (the person-grant resolver). It is not the gate:
+// Insert stays the atomic single-use check.
 type IDJAGReplayStore interface {
 	Insert(ctx context.Context, jti string, expiresAt time.Time) error
+	Redeemed(ctx context.Context, jti string) (bool, error)
 }
 
 // ObservedIDJAGResourceStore records the MCP servers named by the `resource`
@@ -182,6 +193,9 @@ var reservedClaims = map[string]bool{
 	"user_email": true, "user_name": true,
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
+	// The IdP's issuer and subject for a person ZeroID resolved to the
+	// deployer's user (ADR 0042 D5a); only the federated grants write them.
+	"user_idp_iss": true, "user_idp_sub": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
 	// let a trusted-service caller mint a token that appears DPoP-bound to
@@ -198,6 +212,9 @@ var reservedClaims = map[string]bool{
 	// route fail closed regardless of which grant is in play.
 	"role":            true,
 	"privilege_scope": true,
+	// RFC 9068 §2.2.3.1 `roles` comes only from the deployer's person-grant
+	// resolver, on a person root (see decidePersonGrant).
+	"roles": true,
 	// RFC 9068 §2.2 `client_id` — set from the OAuth client the grant actually
 	// authenticated or resolved (IssueRequest.ClientID), never from caller
 	// input. It exists so a resource server can attribute a call to a client,
@@ -290,6 +307,10 @@ var defaultAudienceScopeProfiles = map[string][]string{
 	// but every pipeline verb is rejected "Missing scope: pipeline:read". Unlike
 	// the api-key exchange flow (which widens its own request), the embed-handoff
 	// token is used verbatim, so this server-side profile is the only lever.
+	// `settings:*` drive the Settings screen and `fleet:read` the fleet board —
+	// without them those surfaces fail "Missing scope: settings:read" (#400).
+	// Together this is codeoid's full scope set (its protocol ALL_SCOPES): the
+	// embedded UI is the user's own workspace, with the owner's reach.
 	audienceCodeoid: {
 		"session:list",
 		"session:create",
@@ -306,6 +327,9 @@ var defaultAudienceScopeProfiles = map[string][]string{
 		"pipeline:create",
 		"pipeline:answer",
 		"pipeline:manage",
+		"settings:read",
+		"settings:write",
+		"fleet:read",
 	},
 	// agent-sandbox: just `nhi:manage` — the one capability a broker's token needs
 	// to register a per-sandbox identity on the user's behalf.
@@ -335,6 +359,9 @@ var allowedProfileScopes = map[string]bool{
 	"pipeline:create":   true,
 	"pipeline:answer":   true,
 	"pipeline:manage":   true,
+	"settings:read":     true,
+	"settings:write":    true,
+	"fleet:read":        true,
 }
 
 // ResolveAudienceScopeProfiles merges deployer-configured audience profiles over
@@ -786,8 +813,16 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 }
 
 func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	if req.AccountID == "" || req.ProjectID == "" {
-		return nil, oauthBadRequest(oautherror.InvalidRequest, "account_id and project_id are required for client_credentials grant")
+	// RFC 6749 §4.4.2: the client MUST authenticate. Checked first, so nothing
+	// below (tenant derivation included) runs for an anonymous caller.
+	if req.ClientID == "" {
+		return nil, oauthUnauthorized("client_credentials requires client authentication", nil)
+	}
+
+	// Naming half a tenant is malformed whichever way the tenant is decided.
+	if (req.AccountID == "") != (req.ProjectID == "") {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			"account_id and project_id must be sent together, or both omitted")
 	}
 
 	// Authenticate the client with whatever its REGISTERED method requires —
@@ -795,7 +830,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// VerifyClientSecret directly and consult the registered method nowhere,
 	// which both accepted a secret from a key-based client and made a
 	// secretless key-based client unable to authenticate here at all.
-	client, err := s.authenticateRegisteredClient(ctx, req)
+	// cimdFallback=false: client_credentials does not admit CIMD clients.
+	client, err := s.authenticateRegisteredClient(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -818,11 +854,59 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		return nil, oauthBadRequest(oautherror.InvalidScope, "client is registered with no scopes and cannot be granted any")
 	}
 
-	// Resolve the identity for this client (external_id == client_id within the tenant).
-	// Tenant comes from the token request — client registration is global.
-	identity, err := s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
-	if err != nil {
-		return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+	// Resolve the identity this token is for.
+	//
+	// A client whose REGISTRATION links an identity (identity_id) mints for
+	// that identity, in that identity's tenant, whether or not the request
+	// names a tenant. The link is written by an administrator inside the
+	// identity's own tenant, so the caller cannot steer it. A request that
+	// does name a tenant must name the link's (the rule ADR 0042 D5 applies to
+	// the ID-JAG grant); otherwise the request is refused rather than quietly
+	// minted into the other tenant's external_id match, which would let the
+	// caller pick between two identities. A conformant client (RFC 6749
+	// §4.4.2 defines only grant_type and scope) names none.
+	//
+	// A client with no link keeps the original rule: the request must name a
+	// tenant, and the token is for the identity whose external_id is the
+	// client_id within it. There is deliberately no cross-tenant external_id
+	// search for such a client: anyone in another tenant can create an
+	// identity with this client's id as its external_id, and a search would
+	// let them make the answer ambiguous or, for a client with no identity
+	// yet, decide it.
+	var identity *domain.Identity
+	if client.IdentityID != nil && *client.IdentityID != "" {
+		identity, err = s.identitySvc.repo.GetLinkedByID(ctx, *client.IdentityID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, oauthUnauthorized("the client's linked identity no longer exists", err)
+			}
+			return nil, oauthServerError("failed to resolve the client's linked identity", err)
+		}
+		if identity.AccountID == "" || identity.ProjectID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "the client's linked identity has no complete tenant")
+		}
+		// The messages do not echo the linked tenant: the caller either
+		// already knows it or has no business learning it from an error.
+		if req.AccountID != "" && req.AccountID != identity.AccountID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"account_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+		if req.ProjectID != "" && req.ProjectID != identity.ProjectID {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"project_id does not match the tenant of the identity this client is registered to; "+
+					"omit account_id and project_id to use it")
+		}
+	} else {
+		if req.AccountID == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest,
+				"this client's registration links no identity, so its tenant cannot be derived; "+
+					"link one (identity_id) or send account_id and project_id")
+		}
+		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
+		}
 	}
 	if !identity.Status.IsUsable() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity is suspended or deactivated")
@@ -872,6 +956,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
+	// IssueCredential names the identity's tenant on the response, so a
+	// caller that sent none still learns which tenant it minted into.
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
 		return nil, err
@@ -1215,6 +1301,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	if len(parentActors) > 0 {
 		delegatedBy = parentActors[0].Sub
 	}
+	// Under rfc8693, an agent exchanging a token it already acts on (a person
+	// token from ID-JAG or the ID-token exchange names it as act) is
+	// re-scoping, not delegating: no new actor level and no added depth.
+	sameActor := isCurrentActor(parentActors, actorIdentity)
+	childDepth := parentDepth + 1
+	if sameActor {
+		childDepth = parentDepth
+		delegatedBy = delegatorBefore(subjectParsed, parentActors)
+	}
 
 	// Resolve mission_id from the subject_token (issue #81). Prefer the
 	// explicit mission_id claim; fall back to the subject_token's own jti
@@ -1244,7 +1339,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		GrantType:           domain.GrantTypeTokenExchange,
 		DelegatedBy:         delegatedBy,
 		ParentJTI:           subjectJTI,
-		DelegationDepth:     parentDepth + 1,
+		DelegationDepth:     childDepth,
 		MissionID:           missionID,
 		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
 		CredentialExpiresAt: &subjectCred.ExpiresAt,
@@ -1261,17 +1356,32 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	// capped by the actor's user-grant ceiling at the chokepoint too (D10).
 	issue.UserGrantBounded = true
 
+	// The principal's IdP pair (user_idp_iss, user_idp_sub) describes sub, which the
+	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
+	// from the verified parent; never from the request.
+	if parent.Type == domain.PrincipalUser {
+		idpIss, _ := jwt.Get[string](subjectParsed, "user_idp_iss")
+		idpSub, _ := jwt.Get[string](subjectParsed, "user_idp_sub")
+		if idpIss != "" && idpSub != "" {
+			issue.IdPIssuer, issue.IdPSubject = idpIss, idpSub
+		}
+	}
+
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor
 	// outermost, then the parent's actors. A parent with no actors was a root
 	// grant; its client acted for the principal, so it becomes the first
-	// prior actor (T0's client A in the design's three-hop example).
+	// prior actor (T0's client A in the design's three-hop example). When the
+	// actor already is the parent's current actor, it replaces itself.
+	if sameActor && len(parentActors) > 0 {
+		parentActors = parentActors[1:]
+	}
 	issue.Actors = append([]domain.Actor{{
 		Sub:          actorIdentity.WIMSEURI,
 		IdentityType: string(actorIdentity.IdentityType),
 		TrustLevel:   string(actorIdentity.TrustLevel),
 		ExternalID:   actorIdentity.ExternalID,
 	}}, parentActors...)
-	if len(parentActors) == 0 {
+	if len(parentActors) == 0 && !sameActor {
 		if cid, _ := jwt.Get[string](subjectParsed, "client_id"); cid != "" {
 			issue.Actors = append(issue.Actors, domain.Actor{Sub: cid})
 		}
@@ -1287,6 +1397,25 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 
 	return accessToken, nil
+}
+
+// isCurrentActor reports whether actor is already the subject token's
+// current actor: its act.sub under rfc8693 (ADR 0043 D2). parentActors is
+// empty for a legacy token, which keeps today's nesting (ADR 0043 D1: no
+// new behaviour for legacy).
+func isCurrentActor(parentActors []domain.Actor, actor *domain.Identity) bool {
+	return len(parentActors) > 0 && parentActors[0].Sub == actor.WIMSEURI
+}
+
+// delegatorBefore names who delegated to the parent's current actor, for a
+// re-scoping exchange that keeps that actor: the next prior actor, else the
+// parent's sub (the principal).
+func delegatorBefore(subject jwt.Token, parentActors []domain.Actor) string {
+	if len(parentActors) > 1 {
+		return parentActors[1].Sub
+	}
+	sub, _ := subject.Subject()
+	return sub
 }
 
 // mayActPermits reports whether an RFC 8693 §4.4 may_act claim names actor.
@@ -1539,6 +1668,8 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		TTL:                externalPrincipalAccessTokenTTL, // 15 minutes — short-lived for external principals
 		CustomClaims:       customClaims,
 		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
+		TrustedRole:        req.Role,
+		PersonGrantType:    PersonGrantExternalPrincipal,
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
@@ -1548,8 +1679,22 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// needs no separate refresh suppression.
 	bindResourceOnIssue(&issue, req.Resource)
 
+	// Fix the refresh family's id before minting, when step 6 will issue a
+	// refresh token, so this access token is revoked along with the family.
+	var refreshFamilyID string
+	if req.IssueRefreshToken && len(audience) > 0 && s.refreshTokenSvc != nil {
+		refreshFamilyID = NewRefreshFamilyID()
+		issue.RefreshFamilyID = refreshFamilyID
+	}
+
 	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
+		if issuanceRefusal(err) {
+			return nil, err
+		}
 		return nil, oauthServerError("failed to issue external principal token", err)
 	}
 
@@ -1583,6 +1728,8 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			// The family records whose issuer vouched for the user, so it
 			// is revoked by the RFC 9493 (issuer, subject) pair.
 			PrincipalIss: cred.PrincipalIss,
+			// The id already stamped on the access token above.
+			FamilyID: refreshFamilyID,
 		})
 		if rtErr != nil {
 			// Fail CLOSED: the caller explicitly asked for a refresh token (its
@@ -2133,7 +2280,12 @@ func checkAuthorizeClientPolicy(
 //     client_type gates to the returned row.
 //   - CIMD resolution runs only when the registry genuinely has NO row, CIMD
 //     is enabled, and the client_id is CIMD-shaped (https:// URL with a path).
-//     The synthesized client is always an active public PKCE client.
+//     The synthesized client is always active. It is a public PKCE client
+//     when its document declares token_endpoint_auth_method "none", and a
+//     confidential one that must authenticate with private_key_jwt against
+//     the document's own keys when it declares that (zeroid#264). Callers that
+//     authenticate the client directly go through authenticateRegisteredClient,
+//     which accepts only the latter.
 //   - An operational registry error is returned as-is — fail closed; a DB
 //     outage must not be misread as "unregistered".
 //
@@ -2267,6 +2419,24 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	resources, err := ValidateAuthorizeResource(req.Resources)
 	if err != nil {
 		return "", err
+	}
+
+	// The person's ceiling is applied again at the token endpoint; checked
+	// here too so a refusal reaches the client at authorize time (RFC 6749
+	// §4.1.2.1 invalid_scope) instead of burning the code. Enforce mode only:
+	// shadow refuses nothing and counts once, at the mint.
+	if s.credentialSvc.personGrantEnforced() {
+		probe := IssueRequest{
+			Identity:        &domain.Identity{AccountID: req.AccountID, ProjectID: req.ProjectID},
+			GrantType:       domain.GrantTypeAuthorizationCode,
+			SubjectOverride: req.UserID,
+			ClientID:        req.ClientID,
+			Audience:        resources,
+			Scopes:          scopes,
+		}
+		if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+			return "", personGrantOAuthError(err, oautherror.InvalidScope)
+		}
 	}
 
 	// Build the claim shape that decodeAuthCodeJWT reads. Use time.Now
@@ -2467,6 +2637,22 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		return nil, err
 	}
 
+	// The person's ceiling, also before Consume: a refusal leaves the code
+	// redeemable within its lifetime once the role is restored. invalid_grant,
+	// as on refresh: the grant's authority changed after consent. The
+	// decision is handed to the mint below.
+	probe := IssueRequest{
+		Identity:        &domain.Identity{AccountID: authCode.AccountID, ProjectID: authCode.ProjectID},
+		GrantType:       domain.GrantTypeAuthorizationCode,
+		SubjectOverride: authCode.UserID,
+		ClientID:        authCode.ClientID,
+		Audience:        boundResources,
+		Scopes:          authCode.Scopes,
+	}
+	if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+	}
+
 	// ── Single-use enforcement (RFC 6749 §4.1.2) ────────────────────────
 	// Placed after all validation (client, redirect_uri, PKCE) so an
 	// attacker who intercepts a code but doesn't know the verifier cannot
@@ -2537,35 +2723,6 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	issue := IssueRequest{
-		Identity:         identity,
-		IdentityPolicyID: identityPolicyID,
-		// Bounded by the user's consent and the client's registered scopes, so a
-		// linked identity's user-grant ceiling applies, not its own (D10).
-		UserGrantBounded:  true,
-		GrantType:         domain.GrantTypeAuthorizationCode,
-		UseRS256:          true,
-		SubjectOverride:   authCode.UserID,
-		ApplicationID:     authCode.ClientID,
-		ClientID:          authCode.ClientID,
-		TTL:               ttl,
-		Scopes:            authCode.Scopes,
-		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
-	}
-
-	bindResourceOnIssue(&issue, boundResources)
-
-	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
-	if err != nil {
-		return nil, err
-	}
-
-	accessToken.AccountID = authCode.AccountID
-	accessToken.ProjectID = authCode.ProjectID
-	accessToken.UserID = authCode.UserID
-
-	var refreshFamilyID string
-
 	// A resource-bound exchange IS now issued a refresh token (CAP-IDN-027,
 	// amending CAP-IDN-026).
 	//
@@ -2635,6 +2792,44 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		issueRefresh = false
 	}
 
+	// The refresh family's id is fixed BEFORE the access token is minted so the
+	// access token carries it (issued_credentials.refresh_family_id): revoking
+	// the family — refresh-token reuse, or this code being replayed — then
+	// revokes this access token as well, not just the refresh tokens.
+	var refreshFamilyID string
+	if issueRefresh && s.refreshTokenSvc != nil {
+		refreshFamilyID = NewRefreshFamilyID()
+	}
+
+	issue := IssueRequest{
+		Identity:         identity,
+		IdentityPolicyID: identityPolicyID,
+		// Bounded by the user's consent and the client's registered scopes, so a
+		// linked identity's user-grant ceiling applies, not its own (D10).
+		UserGrantBounded:  true,
+		GrantType:         domain.GrantTypeAuthorizationCode,
+		UseRS256:          true,
+		SubjectOverride:   authCode.UserID,
+		ApplicationID:     authCode.ClientID,
+		ClientID:          authCode.ClientID,
+		TTL:               ttl,
+		Scopes:            authCode.Scopes,
+		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
+		RefreshFamilyID:   refreshFamilyID,
+		personGrant:       probe.personGrant,
+	}
+
+	bindResourceOnIssue(&issue, boundResources)
+
+	accessToken, cred, err := s.credentialSvc.IssueCredential(ctx, issue)
+	if err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+	}
+
+	accessToken.AccountID = authCode.AccountID
+	accessToken.ProjectID = authCode.ProjectID
+	accessToken.UserID = authCode.UserID
+
 	// Issue refresh token when the client is registered for the refresh_token grant.
 	if issueRefresh && s.refreshTokenSvc != nil {
 		rtResult, rtErr := s.refreshTokenSvc.IssueRefreshToken(ctx, &RefreshTokenParams{
@@ -2658,12 +2853,16 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// by the RFC 9493 (issuer, subject) pair and every rotation keeps
 			// the same principal. Copied forward like MissionID.
 			PrincipalIss: cred.PrincipalIss,
+			// The id already stamped on the access token above.
+			FamilyID: refreshFamilyID,
 		})
 		if rtErr != nil {
 			log.Error().Err(rtErr).Msg("Failed to issue refresh token — returning access token only")
+			// No family exists, so there is nothing for replay detection to
+			// revoke by it; the access token is still revoked by its JTI.
+			refreshFamilyID = ""
 		} else {
 			accessToken.RefreshToken = rtResult.RawToken
-			refreshFamilyID = rtResult.FamilyID
 		}
 	}
 
@@ -2706,6 +2905,28 @@ func (s *OAuthService) revokeAuthCodeTokens(ctx context.Context, codeJTI string)
 		} else if count > 0 {
 			log.Warn().Str("family_id", *record.RefreshFamilyID).Int64("count", count).Msg("Auth code replay: revoked refresh token family from original exchange")
 		}
+		// And every access token minted under that family — the exchange's own
+		// and each one a refresh produced since — not just the one recorded on
+		// the code.
+		s.revokeRefreshFamilyAccessTokens(ctx, *record.RefreshFamilyID, "auth_code_replay")
+	}
+}
+
+// revokeRefreshFamilyAccessTokens revokes the active access tokens issued
+// under a refresh-token family (with their delegated descendants). Best
+// effort: the family's refresh tokens are already revoked by the caller, and a
+// failure here is logged rather than changing the response.
+func (s *OAuthService) revokeRefreshFamilyAccessTokens(ctx context.Context, familyID, reason string) {
+	if familyID == "" || s.credentialSvc == nil {
+		return
+	}
+	n, err := s.credentialSvc.RevokeByRefreshFamily(ctx, familyID, reason)
+	if err != nil {
+		log.Error().Err(err).Str("family_id", familyID).Str("reason", reason).Msg("Failed to revoke access tokens issued under refresh token family")
+		return
+	}
+	if n > 0 {
+		log.Warn().Str("family_id", familyID).Int("count", n).Str("reason", reason).Msg("Revoked access tokens issued under refresh token family")
 	}
 }
 
@@ -2844,12 +3065,15 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	//
 	// A failed peek means the token is NOT active (expired, revoked, or
 	// unknown). We deliberately DO NOT reject here — instead we fall through to
-	// RotateRefreshToken, whose claim path distinguishes the reuse grace window
-	// from a genuine RFC 6749 §10.4 replay (and revokes the family on the
-	// latter). Short-circuiting on the peek would silence reuse detection.
+	// RotateRefreshToken, whose claim path recognises an already-rotated token
+	// and either refuses it as a concurrent retry (within the reuse grace
+	// window, family still live) or revokes its family (RFC 9700 §4.14.2).
+	// Short-circuiting on the peek
+	// would silence reuse detection.
 	var (
 		identity         *domain.Identity
 		identityPolicyID string
+		personGrant      *personGrantDecision
 	)
 	if peeked, peekErr := s.refreshTokenSvc.PeekRefreshToken(ctx, req.RefreshTokenStr); peekErr == nil {
 		// client_id binding check (RFC 6749 §10.4) — done on the peek so a
@@ -2909,14 +3133,31 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 			}
 			identityPolicyID = policy.ID
 		}
+
+		// The person's current ceiling, on the peek like every other gate, so
+		// a demoted user's refresh is refused without burning the token and
+		// works again once the role is restored. The decision is handed to
+		// the mint below.
+		probe := IssueRequest{
+			Identity:        &domain.Identity{AccountID: peeked.AccountID, ProjectID: peeked.ProjectID},
+			GrantType:       domain.GrantTypeRefreshToken,
+			SubjectOverride: peeked.UserID,
+			PrincipalIss:    peeked.PrincipalIss,
+			ClientID:        peeked.ClientID,
+			Audience:        refreshAudienceOf(peeked),
+			Scopes:          parseScopeString(peeked.Scopes),
+		}
+		if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
+			return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+		}
+		personGrant = probe.personGrant
 	}
 
 	// Pre-rotation gates passed (or the token was already inactive — in which
 	// case rotation's claim path returns the right error / fires reuse
-	// detection). NOW consume the token and mint the successor. The remaining
-	// failure surface (IssueCredential) is the only post-claim step; if it fails
-	// the successor was already inserted in the rotation transaction, so the
-	// client's retry trips the grace window rather than reuse detection.
+	// detection). NOW consume the token and mint the successor. If a post-claim
+	// step fails, the deferred RestoreRotation below puts the presented token
+	// back, so the client's retry rotates instead of tripping reuse detection.
 	oldToken, newRT, err := s.refreshTokenSvc.RotateRefreshToken(ctx, req.RefreshTokenStr, refreshTokenTTL, req.DPoPKeyThumbprint)
 	if err != nil {
 		// A DPoP binding mismatch is a proof failure, not an invalid refresh
@@ -2926,16 +3167,47 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		if errors.Is(err, ErrDPoPBindingMismatch) {
 			return nil, oauthBadRequest(oautherror.InvalidDPoPProof, "refresh token is DPoP-bound; the presented proof does not match the original key")
 		}
+		// An already-rotated token was presented outside the reuse grace
+		// window, or one whose family was already revoked (RFC 9700
+		// §4.14.2). (A rotated-out token within the window comes back as
+		// ErrRefreshTokenAlreadyRotated instead: refused below, nothing
+		// revoked.) Rotation
+		// has revoked the family's refresh tokens; revoke the access tokens
+		// minted under it too. The response is the same invalid_grant as any
+		// other unusable refresh token, so it does not reveal the detection.
+		var reuse *RefreshTokenReuseError
+		if errors.As(err, &reuse) {
+			s.revokeRefreshFamilyAccessTokens(ctx, reuse.FamilyID, "refresh_token_reuse")
+		}
 		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "invalid or expired refresh token", err)
 	}
+
+	// From here the presented token is consumed and its successor stored, but
+	// the client has not been given the successor. If anything below fails,
+	// put the presented token back: the client will retry with it, and without
+	// the restore that retry would be indistinguishable from reuse and would
+	// revoke the family over a server-side failure.
+	issued := false
+	defer func() {
+		if issued {
+			return
+		}
+		// Detached from the request context: a client that disconnected is
+		// exactly the one that will come back and retry.
+		restoreCtx := context.WithoutCancel(ctx)
+		if _, restoreErr := s.refreshTokenSvc.RestoreRotation(restoreCtx, oldToken, newRT); restoreErr != nil {
+			log.Error().Err(restoreErr).Str("family_id", oldToken.FamilyID).
+				Msg("Failed to restore refresh token after a failed refresh; the client's retry will be treated as reuse")
+		}
+	}()
 
 	// The peek-time identity resolution is the authoritative one. If the peek
 	// missed (rare: a benign race where the row activated between peek and
 	// claim) re-run the identity gate against the freshly claimed row so the
 	// gate is never skipped — the post-claim failure window here is acceptable
-	// because it only triggers on that race, and a gate failure now lands the
-	// caller in the grace window (successor already minted) rather than a
-	// permanent family revocation. A human session (no IdentityID) falls
+	// because it only triggers on that race, and a gate failure here restores
+	// the presented token (see the deferred RestoreRotation) rather than
+	// leaving the client to trip reuse detection. A human session (no IdentityID) falls
 	// through to a synthetic carrier with no policy to resolve.
 	if identity == nil {
 		identity = &domain.Identity{
@@ -3035,6 +3307,11 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// on a family minted before migration 048: the chokepoint then derives
 		// it as for any other user subject.
 		PrincipalIss: oldToken.PrincipalIss,
+		// Tie the access token to the family, so revoking the family (reuse
+		// detection, authorization-code replay) revokes it as well.
+		RefreshFamilyID: oldToken.FamilyID,
+		// Reused by the chokepoint only while the scopes are the ones decided.
+		personGrant: personGrant,
 	}
 	// Applied after the literal so the binding goes through the one function
 	// that sets both `aud` and the reserved `resource` claim together. A
@@ -3056,7 +3333,25 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, refreshIssue)
 	if err != nil {
-		return nil, err
+		return nil, personGrantOAuthError(err, oautherror.InvalidGrant)
+	}
+	issued = true
+
+	// Close the race with a concurrent presentation of the same token. The
+	// loser of the rotation claim revokes the family's refresh tokens and then
+	// the family's access tokens — but this access token may have been
+	// inserted after that sweep ran. Checking the successor now covers it:
+	// if the family was revoked before this check, revoke the family's access
+	// tokens again (this one included); if it was revoked after, this access
+	// token was already committed and the loser's sweep sees it. Either way no
+	// access token from a revoked family survives. The response is still the
+	// successful one — this request won the rotation — but what it carries is
+	// already revoked, as RFC 9700 §4.14.2 requires.
+	if active, checkErr := s.refreshTokenSvc.IsRefreshTokenActive(ctx, newRT.RawToken); checkErr != nil {
+		log.Error().Err(checkErr).Str("family_id", oldToken.FamilyID).
+			Msg("Failed to re-check refresh token family after rotation")
+	} else if !active {
+		s.revokeRefreshFamilyAccessTokens(ctx, oldToken.FamilyID, "refresh_token_reuse")
 	}
 
 	accessToken.AccountID = oldToken.AccountID
@@ -3177,24 +3472,138 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	return result, nil
 }
 
-// Revoke implements RFC 7009 token revocation.
-// The caller need only present the token — tenant is derived from the credential record.
-// Per RFC 7009 section 2.2, always returns nil (success) even for unknown or already-revoked tokens.
+// Revoke implements RFC 7009 token revocation for an anonymous caller: the
+// token alone, no client identified. See RevokeToken.
 func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
+	return s.RevokeToken(ctx, tokenStr, "", "")
+}
+
+// RevokeToken implements RFC 7009 token revocation for both token types this
+// server issues: access tokens (JWTs) and refresh tokens (opaque). RFC 7009 §2
+// requires refresh-token revocation; access-token revocation is the SHOULD.
+//
+// clientID is the client the request identified, already verified by the
+// caller (client authentication, or a public client's client_id), or "" for a
+// caller that identified no client. When it is set, a refresh token is revoked
+// only if it was issued to that client (RFC 7009 §2.1: the server "verifies
+// whether the token was issued to the client making the revocation request").
+// When it is empty, possession of the token is the authorization — the same
+// rule this endpoint has always applied to access tokens. Access tokens are
+// not checked against clientID here; a CIMD client's revocation, which must
+// confine access tokens too, goes through RevokeForClient instead.
+//
+// Revoking a refresh token revokes its whole family — the grant — together
+// with the access tokens issued from that family, which RFC 7009 §2.1 says the
+// server SHOULD do when it can revoke access tokens.
+//
+// tokenTypeHint ("access_token" / "refresh_token") only orders the lookups;
+// both token types are always tried (RFC 7009 §2.1: if the token is not found
+// using the hint, the server MUST extend its search). Unknown hint values are
+// ignored (§2.2).
+//
+// Returns nil when the token was revoked AND when there was nothing to do —
+// unknown, malformed, already revoked or expired, or issued to a different
+// client — so the endpoint answers 200 for all of them alike (§2.2), without
+// telling the caller which tokens exist or whose they are. Returns an error
+// only when the server failed to look up or revoke a token, so the endpoint
+// does not report a revocation it did not carry out.
+func (s *OAuthService) RevokeToken(ctx context.Context, tokenStr, tokenTypeHint, clientID string) error {
+	return s.revokeToken(ctx, tokenStr, tokenTypeHint, revocationScope{clientID: clientID})
+}
+
+// revocationScope says whose tokens a revocation may reach.
+//
+//   - clientID set: a refresh token is revoked only if it was issued to that
+//     client (row.ClientID). Empty: any refresh token the caller presents.
+//   - ownAccessTokensOnly: an access token is revoked only if its verified
+//     `client_id` claim names clientID, too. Off, possession of an access
+//     token authorizes its revocation. RevokeForClient turns this on for a
+//     CIMD client, whose identity is self-published and so may only ever
+//     reach tokens that client already holds. With clientID empty, nothing
+//     matches and no access token is revoked (fail closed).
+type revocationScope struct {
+	clientID            string
+	ownAccessTokensOnly bool
+}
+
+// revokeToken is RevokeToken with an explicit revocationScope. See RevokeToken
+// for the lookup order and the error contract.
+func (s *OAuthService) revokeToken(ctx context.Context, tokenStr, tokenTypeHint string, scope revocationScope) error {
+	if tokenStr == "" {
+		return nil
+	}
+	for _, kind := range revocationLookupOrder(tokenTypeHint) {
+		revoke := s.revokeAccessToken
+		if kind == revocationKindRefresh {
+			revoke = s.revokeRefreshToken
+		}
+		found, err := revoke(ctx, tokenStr, scope)
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+	}
+	return nil
+}
+
+type revocationKind int
+
+const (
+	revocationKindAccess revocationKind = iota
+	revocationKindRefresh
+)
+
+// revocationLookupOrder returns the token types to try, hinted type first.
+// Every type is always included: RFC 7009 §2.1 requires the search to extend
+// past the hint, and §2.2 says an unknown hint value is ignored.
+func revocationLookupOrder(tokenTypeHint string) []revocationKind {
+	if tokenTypeHint == "refresh_token" {
+		return []revocationKind{revocationKindRefresh, revocationKindAccess}
+	}
+	return []revocationKind{revocationKindAccess, revocationKindRefresh}
+}
+
+// revokeAccessToken revokes tokenStr if it is an access token this server
+// issued. found reports whether it was one — revoked now, already revoked or
+// expired, or out of scope — so the refresh-token lookup is skipped.
+//
+// Unless scope.ownAccessTokensOnly is set, the client is not checked here:
+// access-token revocation keeps the rule this endpoint has always had
+// (possession of the token authorizes its revocation). When it is set, a
+// token whose verified `client_id` claim does not name scope.clientID is left
+// alone and reported as found, so the response is the same 200 as for the
+// caller's own token.
+func (s *OAuthService) revokeAccessToken(ctx context.Context, tokenStr string, scope revocationScope) (bool, error) {
 	// Parse without full validation — token may already be expired but still revocable.
 	parsed, err := s.parseToken(tokenStr, false)
 	if err != nil {
-		return nil // malformed or invalid — treat as not found per RFC 7009 section 2.2
+		return false, nil // not a JWT this server signed — maybe a refresh token
 	}
+	if scope.ownAccessTokensOnly && !tokenIssuedToClient(parsed, scope.clientID) {
+		log.Debug().Str("client_id", scope.clientID).
+			Msg("oauth2 revocation: access token not issued to the requesting client; nothing revoked")
+		return true, nil
+	}
+	return true, s.revokeParsed(ctx, parsed)
+}
 
+// revokeParsed revokes the credential behind an already signature-verified
+// access token. Unknown, already-revoked and expired tokens are success (RFC
+// 7009 §2.2); an error means the lookup or the revocation failed server-side.
+func (s *OAuthService) revokeParsed(ctx context.Context, parsed jwt.Token) error {
 	jti, _ := parsed.JwtID()
 	if jti == "" {
-		return nil
+		return nil // signed by us but not a revocable credential
 	}
 
 	cred, err := s.credentialSvc.repo.GetByJTI(ctx, jti)
 	if err != nil {
-		return nil // not found — treat as success per RFC 7009 section 2.2
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // unknown — success per RFC 7009 §2.2
+		}
+		return fmt.Errorf("revocation: look up access token: %w", err)
 	}
 
 	// Already revoked or expired — success per RFC 7009.
@@ -3203,7 +3612,50 @@ func (s *OAuthService) Revoke(ctx context.Context, tokenStr string) error {
 	}
 
 	// Tenant is taken from the credential record — not caller-supplied headers.
-	return s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
+	err = s.credentialSvc.RevokeCredential(ctx, cred.ID, cred.AccountID, cred.ProjectID, "oauth2_revocation")
+	if err != nil && !errors.Is(err, ErrCredentialNotFound) { // not found ⇒ revoked concurrently
+		return fmt.Errorf("revocation: revoke access token: %w", err)
+	}
+	return nil
+}
+
+// revokeRefreshToken revokes tokenStr if it is a refresh token this server
+// issued, by revoking its family and the access tokens issued from it. found
+// reports whether it was one.
+//
+// A token issued to a client other than scope.clientID (when that is set) is
+// left alone and reported as found, so the response is the same 200 as for a
+// token the caller owns.
+//
+// The family is revoked whatever state the presented row is in. A rotated-out
+// or already-revoked token still names the grant the client asked to end, and
+// revoking an already-revoked family is a no-op.
+func (s *OAuthService) revokeRefreshToken(ctx context.Context, tokenStr string, scope revocationScope) (bool, error) {
+	if s.refreshTokenSvc == nil {
+		return false, nil
+	}
+	row, err := s.refreshTokenSvc.PeekRefreshTokenIncludingRevoked(ctx, tokenStr)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("revocation: look up refresh token: %w", err)
+	}
+	if scope.clientID != "" && row.ClientID != scope.clientID {
+		log.Debug().Str("family_id", row.FamilyID).
+			Msg("oauth2 revocation: refresh token not issued to the requesting client; nothing revoked")
+		return true, nil
+	}
+
+	if _, err := s.refreshTokenSvc.RevokeFamily(ctx, row.FamilyID, "oauth2_revocation"); err != nil {
+		return true, fmt.Errorf("revocation: revoke refresh token family: %w", err)
+	}
+	if s.credentialSvc != nil {
+		if _, err := s.credentialSvc.RevokeByRefreshFamily(ctx, row.FamilyID, "oauth2_revocation"); err != nil {
+			return true, fmt.Errorf("revocation: revoke access tokens of refresh token family: %w", err)
+		}
+	}
+	return true, nil
 }
 
 // parseToken verifies a JWT against the JWKS keyset. The library matches
@@ -3378,6 +3830,10 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// deliberate exclusion of CIMD clients: introspection has no redirect_uri
 	// binding to protect it, so a self-published metadata document must not be
 	// able to satisfy this gate and turn introspection into a token oracle.
+	// That holds even for a VALID assertion from a CIMD client: it proves only
+	// control of the document URL, which anyone can have. (Revocation accepts
+	// such a client in RevokeForClient, where the action is confined to the
+	// client's own tokens; introspection has no such confinement.)
 	if clientAssertionPresented(assertion, assertionType) {
 		if clientSecret != "" {
 			return oauthUnauthorized(
@@ -3452,6 +3908,11 @@ func (s *OAuthService) VerifyPresentedClientAuth(ctx context.Context, clientID, 
 	// fetches) with zero registration. Token issuance to a CIMD client is
 	// safe because redirect_uri binding protects the flow; token INSPECTION
 	// has no equivalent binding, so it stays registry-only.
+	//
+	// Revocation does accept CIMD clients, but not through here:
+	// RevokeForClient handles them BEFORE calling this function, and only
+	// revokes a token issued to that same client_id. Do not widen this
+	// function to cover them — it would reach introspection too.
 	if clientSecret == "" {
 		publicClient, err := s.oauthClientSvc.GetPublicClient(ctx, clientID)
 		if err != nil {
@@ -3748,4 +4209,13 @@ func intersectScopes(requested, allowed []string) []string {
 		}
 	}
 	return result
+}
+
+// refreshAudienceOf is the audience a refresh of rt is minted for: its
+// audience profile, else its resource ceiling.
+func refreshAudienceOf(rt *domain.RefreshToken) []string {
+	if rt.Audience != "" {
+		return []string{rt.Audience}
+	}
+	return rt.Resources
 }

@@ -23,6 +23,17 @@ type AgentClaims struct {
 	Scopes     []string
 	JTI        string
 	IdentityID string
+	GrantType  string // the grant that issued the token, such as "api_key" or "token_exchange"
+	// PrincipalType is the rfc8693 profile's principal_type claim ("user",
+	// "workload"); empty on legacy-profile tokens.
+	PrincipalType string
+	// UserIDIssuer is the user_id_iss claim: set when the token's subject is
+	// a person vouched for by a federated IdP.
+	UserIDIssuer string // Issuer and Audience are the token's iss and aud. ZeroID's own tokens
+	// carry the issuer as aud unless they were bound to another audience,
+	// such as a gateway or an RFC 8707 resource.
+	Issuer   string
+	Audience []string
 }
 
 type agentClaimsKey struct{}
@@ -194,6 +205,21 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v
+	}
+	if v, err := jwt.Get[string](token, "grant_type"); err == nil {
+		claims.GrantType = v
+	}
+	if v, err := jwt.Get[string](token, "principal_type"); err == nil {
+		claims.PrincipalType = v
+	}
+	if v, err := jwt.Get[string](token, "user_id_iss"); err == nil {
+		claims.UserIDIssuer = v
+	}
+	if v, ok := token.Issuer(); ok {
+		claims.Issuer = v
+	}
+	if v, ok := token.Audience(); ok {
+		claims.Audience = v
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {

@@ -18,8 +18,9 @@
 //     with a key the client registered or with a federated client assertion
 //     from a trusted workload issuer (Kubernetes, AWS STS, SPIFFE, GitHub).
 //
-// The id_token exchange is a person path outside ADR 0042; its client binding
-// (zeroid#385 D13) is pinned at the end of this file.
+// The id_token exchange is P1c (ADR 0042 D3a); its client binding (zeroid#385
+// D13) is pinned at the end of this file, and the rest of D3a in
+// trusted_issuers_test.go.
 package integration_test
 
 import (
@@ -548,7 +549,9 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	client := registerOAuthClient(t, uid("probe-idjag-client"), []string{"tools:read"})
+	// ADR 0042 D5: the client's registration carries the tenant (it links an
+	// identity in acct-fed-001), which is how the grant derives it.
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"tools:read"})
 
 	sign := func(t *testing.T, extra map[string]any) string {
 		t.Helper()
@@ -580,9 +583,11 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 		}
 	}
 
-	// Flips with ADR 0042 D6: the ID-JAG maps through a binding on act.sub to
-	// the agent's own identity row, and no binding means invalid_grant rather
-	// than a synthetic identity.
+	// Static issuers only (standalone ZeroID keeps this). With issuer rows
+	// (federation.issuer_store=db, ADR 0042 D6) the ID-JAG maps through a
+	// binding on act.sub to the agent's own identity, and no binding is
+	// invalid_grant rather than a synthetic identity:
+	// TestTrustedIssuers_P1B_Refusals.
 	t.Run("no application_id: synthetic identity", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, map[string]any{"email": "agent@corp.example"}),
 			fedCfg.AccountID, fedCfg.ProjectID))
@@ -611,6 +616,34 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 		assert.Empty(t, resp.AccessToken)
 	})
 
+	// ADR 0042 D5: with two allowed accounts the request still cannot choose.
+	// Naming the OTHER admitted account is a mismatch, not a selection.
+	t.Run("naming another allowed account is refused", func(t *testing.T) {
+		resp := postFederation(t, fedHTTP.URL, body(sign(t, nil), "acct-fed-002", fedCfg.ProjectID))
+		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	})
+
+	// Two allowed accounts and a client that names no tenant: ambiguous, so
+	// refused, whatever the request says.
+	t.Run("several allowed accounts and no client tenant is refused", func(t *testing.T) {
+		unlinked := registerOAuthClient(t, uid("probe-idjag-unlinked"), []string{"tools:read"})
+		resp := postFederation(t, fedHTTP.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     sign(t, map[string]any{"client_id": unlinked.ClientID}),
+			"account_id":    fedCfg.AccountID,
+			"project_id":    fedCfg.ProjectID,
+			"client_id":     unlinked.ClientID,
+			"client_secret": unlinked.ClientSecret,
+		})
+		t.Logf("status=%d body=%s", resp.StatusCode, resp.RawBody)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, "invalid_grant", resp.Error)
+		assert.Empty(t, resp.AccessToken)
+	})
+
 	// ADR 0042 D3 leaves this open: ZeroID MAY accept a sub_profile=service
 	// ID-JAG if Okta documents third-party issuance, under D4-D7.
 	t.Run("sub_profile=service is accepted (not inspected)", func(t *testing.T) {
@@ -630,7 +663,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	})
 }
 
-// ── id_token exchange (a person path, outside ADR 0042) ─────────────────────
+// ── id_token exchange (P1c, ADR 0042 D3a) ────────────────────────────────────
 
 // TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience pins the
 // relying-party rules on the id_token exchange: the redeeming client must
@@ -673,8 +706,7 @@ func TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience(t *testing.T) {
 			"project_id":         fedCfg.ProjectID,
 		}
 		if client != nil {
-			body["client_id"] = client.ClientID
-			body["client_secret"] = client.ClientSecret
+			withClientAuth(t, body, *client)
 		}
 		return postFederation(t, fedHTTP.URL, body)
 	}

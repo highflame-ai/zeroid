@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"time"
 )
 
@@ -31,8 +32,14 @@ type ExternalIssuerConfig struct {
 	// Audience is the value the upstream IdP is expected to set as aud on
 	// tokens it issues for ZeroID. Required — token exchange without an
 	// audience binding lets a token issued for some other RP be replayed
-	// against ZeroID.
-	Audience string `koanf:"audience"`
+	// against ZeroID. Audiences adds further accepted values; a token's aud
+	// must name at least one of them.
+	Audience  string   `koanf:"audience"`
+	Audiences []string `koanf:"audiences"`
+
+	// Kind is person (the default) or workload. Person grants (ID-JAG and the
+	// ID-token exchange) accept only person issuers (ADR 0042 D4).
+	Kind IssuerKind `koanf:"kind"`
 
 	// Algorithms is the allow-list of JWS algorithms accepted on incoming ID
 	// tokens. Defaults to {"RS256", "ES256"} when empty. Only RS256/ES256/PS256
@@ -57,6 +64,14 @@ type ExternalIssuerConfig struct {
 	//	  user_id: sub          # or "preferred_username", "oid", etc.
 	//	  email:   email
 	ClaimMapping map[string]string `koanf:"claim_mapping"`
+
+	// TrustEmail makes the issuer vouch for its own email claim. OpenID
+	// Connect returns email_verified from the UserInfo endpoint, not in the
+	// ID token, when the sign-in also issued an access token (OIDC Core 5.4),
+	// so an organization's directory may never put it in the tokens ZeroID
+	// sees. With TrustEmail, a person token that carries an email and no
+	// email_verified claim counts as verified; an explicit false stays false.
+	TrustEmail bool `koanf:"trust_email"`
 
 	// AllowedAccounts is the REQUIRED, non-empty list of tenants permitted to
 	// exchange tokens from this issuer. The request's account_id must appear
@@ -106,8 +121,11 @@ func (e *ExternalIssuerConfig) Validate() error {
 	if u, err := url.Parse(e.JWKSURI); err != nil || u.Scheme != "https" || u.Host == "" {
 		return fmt.Errorf("external_issuer %s: jwks_uri must be an absolute https URL, got %q", e.Issuer, e.JWKSURI)
 	}
-	if e.Audience == "" {
+	if len(e.AudienceList()) == 0 {
 		return fmt.Errorf("external_issuer %s: audience is required (token-exchange without aud binding allows token replay)", e.Issuer)
+	}
+	if e.Kind != "" && !e.Kind.Valid() {
+		return fmt.Errorf("external_issuer %s: kind must be person or workload, got %q", e.Issuer, e.Kind)
 	}
 	if e.MaxTokenAge < 0 {
 		return fmt.Errorf("external_issuer %s: max_token_age must be > 0", e.Issuer)
@@ -142,20 +160,58 @@ func (e *ExternalIssuerConfig) Validate() error {
 	// allow-list). Reject unsupported entries at config load instead of failing
 	// every exchange at runtime.
 	for _, alg := range e.Algorithms {
-		switch alg {
-		case "RS256", "ES256", "PS256":
-		default:
+		if !ExternalIssuerAlgorithmAllowed(alg) {
 			return fmt.Errorf("external_issuer %s: algorithm %q is not supported (allowed: RS256, ES256, PS256)", e.Issuer, alg)
 		}
 	}
 	for _, claim := range e.PropagateClaims {
-		switch claim {
-		case "auth_time", "acr", "amr":
-		default:
+		if !ExternalIssuerPropagatableClaim(claim) {
 			return fmt.Errorf("external_issuer %s: propagate_claims entry %q not supported (allowed: auth_time, acr, amr)", e.Issuer, claim)
 		}
 	}
 	return nil
+}
+
+// ExternalIssuerAlgorithmAllowed reports whether alg is one the external-issuer
+// verifier supports.
+func ExternalIssuerAlgorithmAllowed(alg string) bool {
+	switch alg {
+	case "RS256", "ES256", "PS256":
+		return true
+	}
+	return false
+}
+
+// ExternalIssuerPropagatableClaim reports whether claim may be listed in
+// propagate_claims: the RFC 9068 authentication-context claims only.
+func ExternalIssuerPropagatableClaim(claim string) bool {
+	switch claim {
+	case "auth_time", "acr", "amr":
+		return true
+	}
+	return false
+}
+
+// AudienceList returns every accepted audience: Audience, then Audiences.
+func (e *ExternalIssuerConfig) AudienceList() []string {
+	out := make([]string, 0, 1+len(e.Audiences))
+	if e.Audience != "" {
+		out = append(out, e.Audience)
+	}
+	for _, a := range e.Audiences {
+		if a != "" && !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// EffectiveKind is Kind, defaulting to person.
+func (e *ExternalIssuerConfig) EffectiveKind() IssuerKind {
+	if e.Kind == "" {
+		return IssuerKindPerson
+	}
+	return e.Kind
 }
 
 // Defaults applies runtime defaults to the optional knobs. Idempotent — only

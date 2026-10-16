@@ -926,10 +926,20 @@ func TestEffectiveCIMDGrantTypes(t *testing.T) {
 			wantDropped: []string{"client_credentials"},
 		},
 		{
-			name:        "delegation grants are dropped in both spellings",
-			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			// token-exchange is spent at the client's IdP, never here.
+			name:        "token-exchange is dropped",
+			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"},
 			wantKept:    []string{"authorization_code"},
-			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			wantDropped: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+		},
+		{
+			// jwt-bearer is kept for ID-JAG redemption (firehog#701), the only
+			// grant that reads it from a CIMD client. The short form is not a
+			// metadata value and stays dropped.
+			name:        "jwt-bearer URN is kept, its short form is not",
+			declared:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:jwt-bearer", "jwt_bearer"},
+			wantKept:    []string{"authorization_code", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			wantDropped: []string{"jwt_bearer"},
 		},
 		{
 			name:        "duplicates collapse",
@@ -993,10 +1003,12 @@ func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
 	url := "https://app.example.com/client.json"
 	now := time.Now()
 
+	// jwt-bearer is deliberately absent: it reaches the client for ID-JAG
+	// redemption, which is pinned by TestSynthesizeCIMDClient_JWTBearerReachesTheClient.
 	for _, forbidden := range []string{
 		"client_credentials",
 		"urn:ietf:params:oauth:grant-type:token-exchange",
-		"urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"jwt_bearer",
 		"api_key",
 	} {
 		t.Run(forbidden, func(t *testing.T) {
@@ -1020,6 +1032,83 @@ func TestSynthesizeCIMDClient_M2MGrantsNeverReachTheClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+// jwt-bearer reaches a CIMD client so it can redeem an ID-JAG (MCP
+// Enterprise-Managed Authorization §5, firehog#701). It is the only grant that
+// reads it from a CIMD client; see requireCIMDClientFitForIDJAG.
+func TestSynthesizeCIMDClient_JWTBearerReachesTheClient(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	client, dropped, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+		ClientID:     url,
+		ClientName:   "N",
+		RedirectURIs: []string{"https://app.example.com/cb"},
+		GrantTypes:   []string{"authorization_code", grantTypeJWTBearerURN},
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if !slices.Contains(client.GrantTypes, grantTypeJWTBearerURN) {
+		t.Fatalf("jwt-bearer must reach the client; got %v (dropped %v)", client.GrantTypes, dropped)
+	}
+}
+
+// draft-ietf-oauth-identity-assertion-authz-grant-04 §8: a client claiming the
+// ID-JAG profile MUST list both token-exchange and jwt-bearer. A document that
+// claims it without both loses jwt-bearer, so it cannot redeem an ID-JAG, but
+// still resolves for authorization_code.
+func TestSynthesizeCIMDClient_IDJAGProfileGrantRule(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	doc := func(grants ...string) *cimdMetadataDocument {
+		return &cimdMetadataDocument{
+			ClientID:                   url,
+			ClientName:                 "N",
+			RedirectURIs:               []string{"https://app.example.com/cb"},
+			GrantTypes:                 append([]string{"authorization_code"}, grants...),
+			AuthorizationGrantProfiles: []string{idJAGGrantProfile},
+		}
+	}
+
+	t.Run("profile with both grants keeps jwt-bearer", func(t *testing.T) {
+		c, _, err := synthesizeCIMDClient(url, doc(grantTypeTokenExchangeURN, grantTypeJWTBearerURN), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(c.GrantTypes, grantTypeJWTBearerURN) {
+			t.Fatalf("GrantTypes = %v, want jwt-bearer kept", c.GrantTypes)
+		}
+		if slices.Contains(c.GrantTypes, grantTypeTokenExchangeURN) {
+			t.Fatalf("token-exchange must never be kept: %v", c.GrantTypes)
+		}
+	})
+
+	t.Run("profile without token-exchange drops jwt-bearer", func(t *testing.T) {
+		c, dropped, err := synthesizeCIMDClient(url, doc(grantTypeJWTBearerURN), time.Now())
+		if err != nil {
+			t.Fatalf("the document must still resolve for authorization_code: %v", err)
+		}
+		if slices.Contains(c.GrantTypes, grantTypeJWTBearerURN) {
+			t.Fatalf("GrantTypes = %v: a document violating §8 must not keep jwt-bearer", c.GrantTypes)
+		}
+		if !slices.Contains(dropped, grantTypeJWTBearerURN) {
+			t.Errorf("dropped = %v, want jwt-bearer reported", dropped)
+		}
+		if !slices.Contains(c.GrantTypes, "authorization_code") {
+			t.Errorf("authorization_code must be unaffected: %v", c.GrantTypes)
+		}
+	})
+
+	t.Run("no profile claimed: jwt-bearer alone is enough", func(t *testing.T) {
+		d := doc(grantTypeJWTBearerURN)
+		d.AuthorizationGrantProfiles = nil
+		c, _, err := synthesizeCIMDClient(url, d, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(c.GrantTypes, grantTypeJWTBearerURN) {
+			t.Fatalf("GrantTypes = %v, want jwt-bearer kept", c.GrantTypes)
+		}
+	})
 }
 
 // A document whose only grants are unsupported still fails — authorization_code
@@ -1074,6 +1163,15 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 		// Rotation, which re-resolves the document so a republished one acts as
 		// the revocation lever. Gates the CIMD branch at oauth.go:2521.
 		"refreshToken": true,
+		// Direct client authentication. Resolves CIMD only when its caller
+		// passes cimdFallback=true; which callers may do that is pinned by
+		// TestCIMDDirectAuthOptInIsBounded.
+		"authenticateRegisteredClient": true,
+		// RFC 7009 revocation by a public CIMD client (zeroid#419). Derives no
+		// authority from the client beyond its client_id and public-ness, and
+		// grants nothing: the only action is revoking a token already issued
+		// to this client (RevokeForClient, revocationScope.ownAccessTokensOnly).
+		"authorizeCIMDRevoker": true,
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -1113,6 +1211,71 @@ func TestCIMDClientReachabilityIsBounded(t *testing.T) {
 			"A CIMD client can now flow there. Most grant paths do NOT check client.GrantTypes, "+
 			"so confirm the new caller either gates on it or derives no authority from the client, "+
 			"then add the function to `allowed` with a note saying which.",
+			strings.Join(offenders, "\n  "))
+	}
+}
+
+// TestCIMDDirectAuthOptInIsBounded pins which callers may resolve a CIMD
+// client through authenticateRegisteredClient. A self-asserted document picks
+// its own grant_types, so they authorize nothing: a caller may opt in only if
+// the authority it grants rests on something the document's publisher cannot
+// choose. idJAGBearer qualifies: the client must prove the document's key
+// (private_key_jwt), an IdP-signed ID-JAG must name this exact client_id, and
+// the tenant is derived server-side. It does NOT require jwt-bearer in the
+// document's grant_types; it refuses only a document that contradicts itself
+// about the ID-JAG profile (draft §8). Every other caller must pass a literal
+// false; anything else fails here, so the opt-in cannot widen silently.
+func TestCIMDDirectAuthOptInIsBounded(t *testing.T) {
+	allowed := map[string]bool{
+		// ID-JAG redemption (MCP Enterprise-Managed Authorization §5). Gates
+		// on private_key_jwt and on a non-contradictory ID-JAG profile claim,
+		// binds the ID-JAG's client_id, then needs a tenant binding (ADR 0042
+		// D5/D6).
+		"idJAGBearer": true,
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	funcDecl := regexp.MustCompile(`^func (?:\([^)]*\) )?(\w+)`)
+	var offenders []string
+	calls := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		body, readErr := os.ReadFile(f)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", f, readErr)
+		}
+		enclosing := "<file scope>"
+		for i, line := range strings.Split(string(body), "\n") {
+			if m := funcDecl.FindStringSubmatch(line); m != nil {
+				enclosing = m[1]
+			}
+			if !strings.Contains(line, "authenticateRegisteredClient(") ||
+				strings.Contains(line, "func (s *OAuthService) authenticateRegisteredClient") ||
+				strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			calls++
+			if strings.HasSuffix(strings.TrimSpace(line), ", false)") {
+				continue
+			}
+			if !allowed[enclosing] {
+				offenders = append(offenders, fmt.Sprintf("%s:%d in %s()", f, i+1, enclosing))
+			}
+		}
+	}
+	if calls == 0 {
+		t.Fatal("found no calls to authenticateRegisteredClient; the scan is broken")
+	}
+	if len(offenders) > 0 {
+		t.Errorf("authenticateRegisteredClient may resolve a CIMD client from an unexpected caller:\n  %s\n\n"+
+			"Pass a literal false, or confirm the authority the caller grants rests on something "+
+			"the document's publisher cannot choose (its grant_types are self-asserted and do not count) "+
+			"and add it to `allowed` with a note saying how.",
 			strings.Join(offenders, "\n  "))
 	}
 }
@@ -1347,4 +1510,41 @@ func TestSynthesizeCIMDClient_KeyBased(t *testing.T) {
 			t.Error("a public CIMD client must be entirely unchanged by zeroid#264")
 		}
 	})
+}
+
+// IDJAGProfileContradicted is what requireCIMDClientFitForIDJAG refuses on, so
+// synthesis must set it exactly when a document claims the ID-JAG profile
+// without both §8 grants, and never for a document that makes no claim.
+func TestSynthesizeCIMDClient_FlagsAContradictedIDJAGProfile(t *testing.T) {
+	url := "https://app.example.com/client.json"
+	cases := []struct {
+		name     string
+		grants   []string
+		profiles []string
+		want     bool
+	}{
+		{"no profile claim, no jwt-bearer (WSO2 playground shape)", []string{"refresh_token", "client_credentials"}, nil, false},
+		{"no profile claim, jwt-bearer listed", []string{grantTypeJWTBearerURN}, nil, false},
+		{"profile claimed with both grants", []string{grantTypeTokenExchangeURN, grantTypeJWTBearerURN}, []string{idJAGGrantProfile}, false},
+		{"profile claimed without token-exchange", []string{grantTypeJWTBearerURN}, []string{idJAGGrantProfile}, true},
+		{"profile claimed without jwt-bearer", []string{grantTypeTokenExchangeURN}, []string{idJAGGrantProfile}, true},
+		{"profile claimed with neither", nil, []string{idJAGGrantProfile}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _, err := synthesizeCIMDClient(url, &cimdMetadataDocument{
+				ClientID:                   url,
+				ClientName:                 "N",
+				RedirectURIs:               []string{"https://app.example.com/cb"},
+				GrantTypes:                 append([]string{"authorization_code"}, tc.grants...),
+				AuthorizationGrantProfiles: tc.profiles,
+			}, time.Now())
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if client.IDJAGProfileContradicted != tc.want {
+				t.Fatalf("IDJAGProfileContradicted = %v, want %v", client.IDJAGProfileContradicted, tc.want)
+			}
+		})
+	}
 }

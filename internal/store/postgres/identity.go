@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -46,6 +47,53 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetByIDInAccounts retrieves an identity by its UUID, provided it belongs to
+// one of accountIDs. The project is not constrained: it is read FROM the row.
+//
+// It exists for one caller shape, where the id is a server-held reference and
+// the tenant is what the lookup is meant to discover: an OAuth client's
+// identity_id link, resolved against an external issuer's allowed_accounts on
+// the ID-JAG grant. The account constraint is applied in SQL, so a link into a
+// tenant the issuer does not admit is indistinguishable from no row at all and
+// nothing outside the admitted set is ever loaded. Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the project too.
+//
+// An empty accountIDs matches nothing. It short-circuits to sql.ErrNoRows
+// rather than emitting `IN ()`.
+func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, accountIDs []string) (*domain.Identity, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("failed to get identity: %w", sql.ErrNoRows)
+	}
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id IN (?)", bun.List(accountIDs)).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetLinkedByID loads the identity an OAuth client's registration links to
+// (oauth_clients.identity_id), in whatever tenant it lives. Unscoped on
+// purpose: the tenant is what the caller is trying to learn, and the link was
+// written by an administrator inside that identity's own tenant (the client
+// create handler refuses a foreign identity_id). Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the tenant.
+func (r *IdentityRepository) GetLinkedByID(ctx context.Context, id string) (*domain.Identity, error) {
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get linked identity: %w", err)
 	}
 	return identity, nil
 }

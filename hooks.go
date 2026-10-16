@@ -12,6 +12,10 @@ import (
 
 // ClaimsEnricher is called during JWT issuance to add custom claims.
 // The claims map already contains standard ZeroID claims; the enricher may add or override entries.
+//
+// Deprecated: issuance has never invoked registered enrichers; Server.OnClaimsIssue
+// stores them and nothing reads them. A person's roles and scope ceiling are
+// supplied through Server.SetPersonGrantResolver.
 type ClaimsEnricher func(claims map[string]any, identity *domain.Identity, grantType domain.GrantType)
 
 // GrantHandler implements a custom OAuth2 grant type.
@@ -77,7 +81,9 @@ type AuthorizeRequest = service.AuthorizeRequest
 // PrincipalResolver authenticates the caller at /oauth2/authorize.
 // Registered via Server.RegisterPrincipalResolver and tried in
 // registration order; the first resolver to return a non-nil Principal
-// wins. Return ErrPrincipalNotApplicable to defer to the next resolver;
+// wins. Return ErrPrincipalNotApplicable to defer to the next resolver,
+// ErrPrincipalInteractionRequired to start a login, or
+// ErrPrincipalAccessDenied to report that the resource owner declined;
 // any other error fails the request with 401 invalid_client.
 //
 // See internal/service/principal.go for the canonical doc comment.
@@ -101,6 +107,18 @@ var ErrPrincipalNotApplicable = service.ErrPrincipalNotApplicable
 // and degrades to access_denied when no target is configured.
 var ErrPrincipalInteractionRequired = service.ErrPrincipalInteractionRequired
 
+// ErrPrincipalAccessDenied is the sentinel a PrincipalResolver returns after
+// authenticating a request whose resource owner declined it (a "Deny" on a
+// consent screen). zeroid stops the chain and redirects to the client's
+// validated redirect_uri with error=access_denied, state and iss, per RFC 6749
+// §4.1.2.1 — on POST as well as GET, so a login/consent front end that posts
+// the outcome server-to-server receives a Location it can hand to the browser.
+// Wrapping is allowed (errors.Is).
+//
+// See internal/service/principal.go for the canonical doc comment, including
+// when zeroid answers with JSON instead.
+var ErrPrincipalAccessDenied = service.ErrPrincipalAccessDenied
+
 // ErrNoResolversRegistered is the sentinel surfaced by zeroid when
 // /oauth2/authorize is reached but no PrincipalResolver has been
 // registered via Server.RegisterPrincipalResolver. The handler maps
@@ -121,6 +139,73 @@ var ErrNoResolversRegistered = service.ErrNoResolversRegistered
 // See internal/service/oauth.go (APIKeyResolution definition) for the
 // canonical doc comment + field-level semantics.
 type APIKeyResolution = service.APIKeyResolution
+
+// PersonGrantRequest describes one token about to be minted for a person:
+// by authorization_code, refresh_token, a root CIBA grant, ID-JAG, ID-token
+// exchange or the trusted external-principal exchange. Token exchange and a
+// CIBA step-up into an existing chain are not person mints and never reach
+// the resolver.
+//
+// See internal/service/person_grant.go for the field docs.
+type PersonGrantRequest = service.PersonGrantRequest
+
+// PersonGrantRequest.GrantType values. Compare against these rather than raw
+// strings.
+const (
+	PersonGrantAuthorizationCode = service.PersonGrantAuthorizationCode
+	PersonGrantRefreshToken      = service.PersonGrantRefreshToken
+	PersonGrantCIBA              = service.PersonGrantCIBA
+	PersonGrantIDJAG             = service.PersonGrantIDJAG
+	PersonGrantExternalPrincipal = service.PersonGrantExternalPrincipal
+	PersonGrantExternalIDToken   = service.PersonGrantExternalIDToken
+)
+
+// PersonGrant is a PersonGrantResolver's answer: the person's scope ceiling
+// and the roles stamped as the RFC 9068 §2.2.3.1 `roles` claim. An empty
+// Scopes grants nothing.
+type PersonGrant = service.PersonGrant
+
+// PersonGrantResolver supplies a person's scope ceiling and roles, so ZeroID
+// can bound a person's tokens by a role model it does not know. Install with
+// Server.SetPersonGrantResolver. The issued scope is the request (or its
+// default) ∩ Scopes; a request that leaves nothing is refused. Returning an
+// error, or panicking, fails the grant closed in enforce mode. See
+// docs/scope-ceilings.md, "A person's ceiling".
+type PersonGrantResolver = service.PersonGrantResolver
+
+// PersonGrantMode is off, shadow (resolve and count, never narrow or refuse)
+// or enforce.
+type PersonGrantMode = service.PersonGrantMode
+
+const (
+	PersonGrantModeOff     = service.PersonGrantModeOff
+	PersonGrantModeShadow  = service.PersonGrantModeShadow
+	PersonGrantModeEnforce = service.PersonGrantModeEnforce
+)
+
+// ErrPersonScopeDenied is the cause when a person's ceiling leaves none of the
+// requested scopes. The token endpoint answers invalid_scope (invalid_grant on
+// authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
+var ErrPersonScopeDenied = service.ErrPersonScopeDenied
+
+// FederatedPersonRequest names the person in a verified IdP token (ID-JAG or
+// ID-token exchange) for a FederatedPersonResolver. See
+// internal/service/person_federation.go for the field docs.
+type FederatedPersonRequest = service.FederatedPersonRequest
+
+// FederatedPersonResolver maps the person in an IdP token to the deployer's
+// user id, which becomes the minted token's sub; the IdP subject is carried
+// in the reserved user_idp_iss and user_idp_sub claims, and user_id_iss becomes
+// ZeroID's issuer, since it names sub's issuer (ADR 0042 D5a). Install with
+// Server.SetFederatedPersonResolver. Return ErrPersonNotMember for a person
+// who is not a member of the account (invalid_grant); any other error, an
+// empty id or a panic fails the grant with server_error. Required when
+// trusted issuers are account rows (federation.issuer_store=db).
+type FederatedPersonResolver = service.FederatedPersonResolver
+
+// ErrPersonNotMember is a FederatedPersonResolver's answer for a person who
+// is not a member of the account.
+var ErrPersonNotMember = service.ErrPersonNotMember
 
 // AdminAuthMiddleware is an optional middleware applied to the admin API router.
 // When set, every request to the admin port passes through this middleware before

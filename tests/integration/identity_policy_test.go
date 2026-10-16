@@ -696,3 +696,37 @@ func TestAttestationVerifyDoesNotDemoteTrust(t *testing.T) {
 	assert.Equal(t, "first_party", decode(t, getResp)["trust_level"],
 		"trust level must be clamped, never demoted by a weaker attestation")
 }
+
+// TestIdentityPolicy_ExternalPrincipalPolicyRefusal: on the external-principal
+// exchange, a scope the named application's credential policy does not grant
+// is refused with 400 policy_violation, as on the sibling grants, not a
+// server_error.
+func TestIdentityPolicy_ExternalPrincipalPolicyRefusal(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("ep-refusal-policy"),
+		"allowed_grant_types": []string{"token_exchange"},
+		"allowed_scopes":      []string{"data:read"},
+	}, adminHeaders())
+	appID := registerIdentityWithPolicy(t, uid("ep-refusal-app"), policyID, "", nil, adminHeaders())
+
+	exchange := func(scope string) (int, map[string]any) {
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":     "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":  "external-principal-assertion",
+			"account_id":     testAccountID,
+			"project_id":     testProjectID,
+			"user_id":        uid("ep-refusal-user"),
+			"application_id": appID,
+			"scope":          scope,
+		}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+		return resp.StatusCode, decode(t, resp)
+	}
+
+	status, body := exchange("data:read")
+	require.Equal(t, http.StatusOK, status, "a granted scope is issued: %v", body)
+
+	status, body = exchange("data:write")
+	assert.Equal(t, http.StatusBadRequest, status, "body=%v", body)
+	assert.Equal(t, "policy_violation", body["error"])
+	assert.Empty(t, body["access_token"], "a refused grant mints nothing")
+}

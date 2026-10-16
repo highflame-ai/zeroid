@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
@@ -23,8 +25,8 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
-// ErrInvalidIdentityField marks caller-fixable input errors on registration
-// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+// ErrInvalidIdentityField marks caller-fixable input errors on identity writes
+// (SPIFFE path segments, enums, public_key_pem). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
 
 // ErrIdentityNotFound is returned by lookup methods when no identity matches
@@ -71,28 +73,49 @@ func NewIdentityService(
 	}
 }
 
+// invalidPublicKeyPEM is the caller-facing prefix for every public_key_pem
+// rejection; the specific reason follows it.
+const invalidPublicKeyPEM = "invalid public_key_pem: must be a PEM-encoded P-256 (ES256) public key"
+
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
-// Returns nil if keyPEM is empty (the field is optional).
+// Returns nil if keyPEM is empty (the field is optional). Every rejection wraps
+// ErrInvalidIdentityField so handlers answer 400, not 500.
 func validateECPublicKeyPEM(keyPEM string) error {
 	if keyPEM == "" {
 		return nil
 	}
 	block, _ := pem.Decode([]byte(keyPEM))
-	if block == nil || block.Type != "PUBLIC KEY" {
-		return errors.New("invalid public_key_pem: must be a PEM block of type PUBLIC KEY")
+	if block == nil {
+		return fmt.Errorf("%w: %s: no PEM block found", ErrInvalidIdentityField, invalidPublicKeyPEM)
+	}
+	if block.Type != "PUBLIC KEY" {
+		return fmt.Errorf("%w: %s: PEM block type is %q, want \"PUBLIC KEY\"", ErrInvalidIdentityField, invalidPublicKeyPEM, block.Type)
 	}
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("invalid public_key_pem: %w", err)
+		// The asn1 detail is noise to a caller; the shape that failed is not.
+		return fmt.Errorf("%w: %s: PEM body is not a DER-encoded SPKI public key", ErrInvalidIdentityField, invalidPublicKeyPEM)
 	}
 	ecKey, ok := pub.(*ecdsa.PublicKey)
 	if !ok {
-		return errors.New("invalid public_key_pem: not an ECDSA key")
+		return fmt.Errorf("%w: %s: key type is %s, want ECDSA", ErrInvalidIdentityField, invalidPublicKeyPEM, publicKeyKind(pub))
 	}
 	if ecKey.Curve.Params().Name != "P-256" {
-		return fmt.Errorf("invalid public_key_pem: must use P-256 curve, got %s", ecKey.Curve.Params().Name)
+		return fmt.Errorf("%w: %s: curve is %s, want P-256", ErrInvalidIdentityField, invalidPublicKeyPEM, ecKey.Curve.Params().Name)
 	}
 	return nil
+}
+
+// publicKeyKind names a parsed non-ECDSA public key for an error message.
+func publicKeyKind(pub any) string {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return "RSA"
+	case ed25519.PublicKey:
+		return "Ed25519"
+	default:
+		return fmt.Sprintf("%T", pub)
+	}
 }
 
 // RegisterIdentityRequest holds parameters for identity registration.
@@ -744,7 +767,7 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 // identity.
 func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, projectID, publicKeyPEM string) (*domain.Identity, error) {
 	if err := validateECPublicKeyPEM(publicKeyPEM); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidIdentityField, err)
+		return nil, err
 	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
@@ -862,6 +885,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			return nil, err
 		}
 	}
+	// Input-only check, so it runs before the row is read. Empty means "leave
+	// the key unchanged" — this path cannot clear an enrolled key.
+	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		return nil, err
+	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
@@ -897,9 +925,6 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.AllowedScopes = req.AllowedScopes
 	}
 	if req.PublicKeyPEM != "" {
-		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
-			return nil, err
-		}
 		if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
 			return nil, err
 		}

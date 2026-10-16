@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jws"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -70,6 +71,48 @@ func TestExtractMappedClaimString(t *testing.T) {
 	})
 }
 
+// TestRefuseWorkloadSubject covers the workload markers the ID-token exchange
+// refuses, so a machine token is never minted as principal_type=user, and the
+// person shapes it must keep accepting.
+func TestRefuseWorkloadSubject(t *testing.T) {
+	cases := []struct {
+		name    string
+		claims  map[string]any
+		userID  string
+		refused bool
+	}{
+		{"person sub", map[string]any{"sub": "00uABC"}, "00uABC", false},
+		{"Entra delegated token (idtyp=user)", map[string]any{"sub": "abc", "idtyp": "user"}, "abc", false},
+		{"Entra app-only token", map[string]any{"sub": "sp-object-id", "idtyp": "app"}, "sp-object-id", true},
+		{"idtyp compared case-insensitively", map[string]any{"sub": "x", "idtyp": "App"}, "x", true},
+		{"Kubernetes service account sub", map[string]any{"sub": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
+		{"Kubernetes service account in mapped user_id only", map[string]any{"sub": "opaque", "uid": "system:serviceaccount:ns:builder"}, "system:serviceaccount:ns:builder", true},
+		{"SPIFFE ID sub", map[string]any{"sub": "spiffe://example.org/ns/prod/sa/api"}, "spiffe://example.org/ns/prod/sa/api", true},
+		{"GitHub Actions workflow sub", map[string]any{"sub": "repo:acme/app:ref:refs/heads/main"}, "repo:acme/app:ref:refs/heads/main", true},
+		{"SPIFFE scheme compared case-insensitively", map[string]any{"sub": "SPIFFE://example.org/w"}, "SPIFFE://example.org/w", true},
+		{"SPIFFE ID in sub, person in mapped user_id", map[string]any{"sub": "spiffe://example.org/w", "oid": "person"}, "person", true},
+		{"lookalike that is not a marker", map[string]any{"sub": "user:system:serviceaccount:x"}, "user:system:serviceaccount:x", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseWorkloadSubject(tc.claims, tc.userID)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("expected a person token to be accepted, got %v", err)
+				}
+				return
+			}
+			var oauthErr *OAuthError
+			if !errors.As(err, &oauthErr) {
+				t.Fatalf("expected *OAuthError, got %T: %v", err, err)
+			}
+			if oauthErr.Code != "invalid_grant" || oauthErr.HTTPStatus != http.StatusBadRequest {
+				t.Errorf("got %s/%d, want invalid_grant/400", oauthErr.Code, oauthErr.HTTPStatus)
+			}
+		})
+	}
+}
+
 // TestCheckExternalIDTokenAlg verifies that the algorithm gate refuses
 // none/HS* family tokens up front and respects the configured allow-list.
 //
@@ -103,80 +146,133 @@ func TestCheckExternalIDTokenAlg(t *testing.T) {
 	}
 }
 
-// TestExternalIDTokenExchange_UnknownIssuerWrapsSentinel verifies the dual
-// signaling path for the unknown-issuer case: the OAuth handler picks up the
-// error code via errors.As on *OAuthError, while service-layer callers can
-// branch with errors.Is(ErrUnknownExternalIssuer).
-func TestExternalIDTokenExchange_UnknownIssuerWrapsSentinel(t *testing.T) {
-	// Build a registry that knows iss=A but not iss=B.
-	jwks := newFakeJWKSServer(t, "kid-1")
-	defer jwks.Close()
-
-	cfg := domain.ExternalIssuerConfig{
-		Issuer:          "https://known.example.test",
-		JWKSURI:         jwks.URL(),
-		Audience:        "https://zeroid.example.test",
-		ClaimMapping:    map[string]string{"user_id": "sub"},
-		AllowedAccounts: []string{"acct"},
+// TestResolvePersonIssuer_OneGenericRefusal pins that an unverified
+// token's issuer refusals are indistinguishable on the wire (one
+// invalid_grant) while the cause stays in the chain for logs and callers.
+func TestResolvePersonIssuer_OneGenericRefusal(t *testing.T) {
+	jwksSrv := newFakeJWKSServer(t, "kid-1")
+	defer jwksSrv.Close()
+	const iss = "https://idp.example.test"
+	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{issuerRow("r1", "acct", iss, domain.IssuerKindPerson, jwksSrv.URL())}}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil, authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)))}
+	defer svc.externalIssuerRegistry.Close()
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	token := func(issuer string) string {
+		tok, _ := jwt.NewBuilder().Issuer(issuer).Subject("alice").IssuedAt(time.Now()).Expiration(time.Now().Add(time.Minute)).Build()
+		signed, _ := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
+		return string(signed)
 	}
-	cfg.Defaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validate cfg: %v", err)
+	var descriptions []string
+	check := func(name, issuer string, sentinel error) {
+		t.Helper()
+		_, _, err := svc.resolvePersonIssuer(context.Background(), token(issuer), "subject_token")
+		var oe *OAuthError
+		if !errors.As(err, &oe) || oe.Code != "invalid_grant" || oe.HTTPStatus != http.StatusBadRequest {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("%s: cause %v not in chain", name, sentinel)
+		}
+		descriptions = append(descriptions, oe.Description)
 	}
-	registry, err := NewExternalIssuerRegistry(
-		context.Background(),
-		[]domain.ExternalIssuerConfig{cfg},
-		authjwt.WithHTTPClient(insecureHTTPClient(2*time.Second)),
-	)
-	if err != nil {
-		t.Fatalf("NewExternalIssuerRegistry: %v", err)
-	}
-	defer registry.Close()
-
-	// Mint a JWT whose iss is *not* the configured one. Lookup should miss
-	// and the federation path should return before any signature work.
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	tok, err := jwt.NewBuilder().
-		Issuer("https://stranger.example.test").
-		Subject("alice").
-		IssuedAt(time.Now()).
-		Expiration(time.Now().Add(5 * time.Minute)).
-		Build()
-	if err != nil {
-		t.Fatalf("build token: %v", err)
-	}
-	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
-	if err != nil {
-		t.Fatalf("sign token: %v", err)
-	}
-
-	svc := &OAuthService{externalIssuerRegistry: registry}
-	_, err = svc.externalIDTokenExchange(context.Background(), TokenRequest{
-		SubjectToken: string(signed),
-		AccountID:    "acct",
-		ProjectID:    "proj",
+	check("unknown", "https://stranger.example.test", ErrUnknownExternalIssuer)
+	rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled = false })
+	check("disabled", iss, errIssuerDisabled)
+	rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled, r[0].Kind = true, domain.IssuerKindWorkload })
+	check("workload", iss, errIssuerNotPerson)
+	rows.set(func(r []*domain.ExternalIssuer) {
+		r[0].Kind = domain.IssuerKindPerson
+		r[0].ClaimConstraints = map[string][]string{"tid": {"t"}}
 	})
-	if err == nil {
-		t.Fatalf("expected error for unknown issuer, got nil")
+	check("constraints", iss, errIssuerConstraints)
+	for _, d := range descriptions[1:] {
+		if d != descriptions[0] {
+			t.Fatalf("refusals differ on the wire: %q vs %q", d, descriptions[0])
+		}
+	}
+}
+
+// TestRequireIDToken is ADR 0042 D3a rule 2: a token from a trusted issuer is
+// accepted on the ID-token exchange only when it is positively an ID token.
+func TestRequireIDToken(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sign := func(typ string, claims map[string]any) (string, jwt.Token) {
+		tok := jwt.New()
+		for k, v := range claims {
+			_ = tok.Set(k, v)
+		}
+		hdr := jws.NewHeaders()
+		if typ != "" {
+			_ = hdr.Set(jws.TypeKey, typ)
+		}
+		raw, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdr)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := jwt.ParseInsecure(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw), parsed
+	}
+	idToken := func() map[string]any {
+		now := time.Now()
+		return map[string]any{"iss": "https://idp", "sub": "u", "aud": "client", "exp": now.Add(time.Minute).Unix(), "iat": now.Unix()}
 	}
 
-	// Handler path: errors.As on *OAuthError must yield invalid_request / 400.
-	var oauthErr *OAuthError
-	if !errors.As(err, &oauthErr) {
-		t.Fatalf("expected *OAuthError in chain, got %T: %v", err, err)
+	raw, tok := sign("JWT", idToken())
+	if err := requireIDToken(raw, tok); err != nil {
+		t.Fatalf("an ID token is accepted: %v", err)
 	}
-	if oauthErr.Code != "invalid_request" {
-		t.Errorf("Code = %q, want invalid_request", oauthErr.Code)
+	c := idToken()
+	c["roles"] = []string{"Approver"}
+	if raw, tok := sign("JWT", c); requireIDToken(raw, tok) != nil {
+		t.Fatal("an ID token may carry the user's app roles")
 	}
-	if oauthErr.HTTPStatus != http.StatusBadRequest {
-		t.Errorf("HTTPStatus = %d, want 400", oauthErr.HTTPStatus)
+	for _, typ := range []string{"at+jwt", "application/at+jwt", "AT+JWT", "oauth-id-jag+jwt"} {
+		raw, tok := sign(typ, idToken())
+		if err := requireIDToken(raw, tok); err == nil {
+			t.Fatalf("typ %s marks an access token", typ)
+		}
 	}
+	for _, claim := range []string{"scp", "scope", "azpacr", "appidacr"} {
+		c := idToken()
+		c[claim] = "mail.read"
+		raw, tok := sign("JWT", c)
+		if err := requireIDToken(raw, tok); err == nil {
+			t.Fatalf("%s marks an access token", claim)
+		}
+	}
+	for _, claim := range []string{"iss", "sub", "aud", "exp", "iat"} {
+		c := idToken()
+		delete(c, claim)
+		raw, tok := sign("JWT", c)
+		err := requireIDToken(raw, tok)
+		var oe *OAuthError
+		if !errors.As(err, &oe) || oe.Code != "invalid_grant" {
+			t.Fatalf("missing %s must be invalid_grant, got %v", claim, err)
+		}
+	}
+}
 
-	// Caller path: errors.Is on the sentinel must succeed.
-	if !errors.Is(err, ErrUnknownExternalIssuer) {
-		t.Errorf("expected errors.Is(err, ErrUnknownExternalIssuer) to be true; chain = %v", err)
+// TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth: an
+// anonymous exchange is invalid_client before any issuer lookup.
+func TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth(t *testing.T) {
+	rows := &fakeIssuerRows{}
+	svc := &OAuthService{externalIssuerRegistry: NewDBExternalIssuerRegistry(rows, true, nil)}
+	defer svc.externalIssuerRegistry.Close()
+	tok, _ := jwt.NewBuilder().Issuer("https://probe.example.test").Subject("alice").Build()
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	signed, _ := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), priv))
+	_, err := svc.externalIDTokenExchange(context.Background(), TokenRequest{SubjectToken: string(signed)})
+	var oe *OAuthError
+	if !errors.As(err, &oe) || oe.Code != "invalid_client" {
+		t.Fatalf("err = %v, want invalid_client", err)
+	}
+	if rows.calls != 0 {
+		t.Fatalf("issuer looked up %d times before client authentication", rows.calls)
 	}
 }

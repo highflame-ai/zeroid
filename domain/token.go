@@ -115,6 +115,15 @@ type OAuthClient struct {
 	ClientURI string `bun:"-" json:"client_uri,omitempty"`
 	LogoURI   string `bun:"-" json:"logo_uri,omitempty"`
 
+	// IDJAGProfileContradicted is set only on a CIMD-synthesized client whose
+	// document claims the ID-JAG grant profile in
+	// authorization_grant_profiles_supported without declaring both
+	// token-exchange and jwt-bearer in grant_types, which
+	// draft-ietf-oauth-identity-assertion-authz-grant-04 §8 requires. Such a
+	// document contradicts itself about how it redeems an ID-JAG, so it may
+	// not redeem one. Never persisted, for the same reason as ClientURI.
+	IDJAGProfileContradicted bool `bun:"-" json:"-"`
+
 	// OAuth configuration
 	GrantTypes   []string `bun:"grant_types,array"  json:"grant_types"`
 	RedirectURIs []string `bun:"redirect_uris,array" json:"redirect_uris"`
@@ -157,7 +166,10 @@ type OAuthClient struct {
 	// this client carry the identity_id forward (refresh_tokens.identity_id
 	// already exists) and gate token issuance on the linked identity's
 	// status + expires_at — same fail-closed semantics jwt_bearer and
-	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	// api_key paths have. It also decides the identity and tenant that
+	// client_credentials and ID-JAG tokens are minted for: the request need
+	// not name a tenant, and one naming a different tenant is refused.
+	// Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
 
 	// ChannelTrusted records that the client was registered by a caller
