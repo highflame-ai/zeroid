@@ -545,15 +545,31 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		s.recordObservedResources(ctx, req.AccountID, req.ProjectID, upstreamIss, resources)
 	}
 
-	log.Info().
-		Str("upstream_iss", upstreamIss).
-		Str("account_id", req.AccountID).
-		Str("project_id", req.ProjectID).
-		Str("user_id", person.sub).
-		Strs("resources", resources).
-		Msg("ID-JAG jwt-bearer exchange succeeded")
+	upstreamSub, _ := verified.Subject()
+	logIDJAGRedeemed(upstreamIss, jti, upstreamSub, req.AccountID, req.ProjectID, person.sub, resources)
 
 	return accessToken, nil
+}
+
+// logIDJAGRedeemed writes the success line of an ID-JAG redemption. Beside the
+// tenant and the minted principal it names the ID-JAG itself — its jti and the
+// sub its identity provider issued it for — so an operator can match the
+// redemption to the provider's audit record of the ID-JAG it issued (zeroid#447).
+// Both are identifiers, not credentials; the ID-JAG itself is never logged.
+// upstream_sub is omitted when the ID-JAG names its subject only with an
+// RFC 9493 sub_id.
+func logIDJAGRedeemed(upstreamIss, idJAGJTI, upstreamSub, accountID, projectID, userID string, resources []string) {
+	ev := log.Info().
+		Str("upstream_iss", upstreamIss).
+		Str("id_jag_jti", idJAGJTI)
+	if upstreamSub != "" {
+		ev = ev.Str("upstream_sub", upstreamSub)
+	}
+	ev.Str("account_id", accountID).
+		Str("project_id", projectID).
+		Str("user_id", userID).
+		Strs("resources", resources).
+		Msg("ID-JAG jwt-bearer exchange succeeded")
 }
 
 // observedResourceRecordTimeout bounds the inventory write. It is generous
