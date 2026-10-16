@@ -3,16 +3,23 @@ package service
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
 
 func TestMemoPolicy(t *testing.T) {
+	exp := time.Now().Add(time.Hour)
 	calls := 0
 	fetch := func() (*domain.CredentialPolicy, error) {
 		calls++
-		return &domain.CredentialPolicy{ID: "p1", MaxTTLSeconds: 60}, nil
+		e := exp
+		return &domain.CredentialPolicy{
+			ID: "p1", MaxTTLSeconds: 60, AllowedScopes: []string{"a", "b"},
+			AllowedGrantTypes: []string{"client_credentials"}, UserGrantScopes: []string{"u"}, ExpiresAt: &e,
+		}, nil
 	}
 
 	// Without a memo every call reaches the repository.
@@ -33,13 +40,35 @@ func TestMemoPolicy(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("memo: %d fetches, want 1", calls)
 	}
-	// Callers get independent copies, as from the repository.
+
+	// Callers get independent deep copies, slices and pointers included, so
+	// one caller narrowing scopes in place can't change what another enforces.
 	a.MaxTTLSeconds = 1
-	if b.MaxTTLSeconds != 60 {
-		t.Fatal("memo handed out a shared pointer")
+	a.AllowedScopes[0] = "mutated"
+	a.AllowedGrantTypes[0] = "mutated"
+	a.UserGrantScopes[0] = "mutated"
+	*a.ExpiresAt = time.Time{}
+	for _, p := range []*domain.CredentialPolicy{b, must(memoPolicy(ctx, "p1", fetch))} {
+		if p.MaxTTLSeconds != 60 || p.AllowedScopes[0] != "a" || p.AllowedGrantTypes[0] != "client_credentials" ||
+			p.UserGrantScopes[0] != "u" || !p.ExpiresAt.Equal(exp) {
+			t.Fatalf("caller mutation leaked: %+v", p)
+		}
 	}
-	if c, _ := memoPolicy(ctx, "p1", fetch); c.MaxTTLSeconds != 60 {
-		t.Fatal("caller mutation leaked into the memo")
+
+	// A write in the request clears the memo.
+	calls = 0
+	memoForget(ctx)
+	_, _ = memoPolicy(ctx, "p1", fetch)
+	if calls != 1 {
+		t.Fatalf("after memoForget: %d fetches, want 1", calls)
+	}
+
+	// A policy put under another key (default -> by ID) is a hit.
+	calls = 0
+	memoPut(ctx, "by-id", must(fetch()))
+	_, _ = memoPolicy(ctx, "by-id", fetch)
+	if calls != 1 {
+		t.Fatalf("memoPut: %d fetches, want 1 (the put itself)", calls)
 	}
 
 	// Failures are not memoized.
@@ -54,4 +83,27 @@ func TestMemoPolicy(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("failed fetches: %d, want 2", calls)
 	}
+}
+
+// clonePolicy must deep-copy every reference-typed field. Adding one to
+// domain.CredentialPolicy fails this until clonePolicy handles it.
+func TestClonePolicyCoversReferenceFields(t *testing.T) {
+	handled := map[string]bool{"AllowedGrantTypes": true, "AllowedScopes": true, "UserGrantScopes": true, "ExpiresAt": true}
+	typ := reflect.TypeFor[domain.CredentialPolicy]()
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		switch f.Type.Kind() {
+		case reflect.Slice, reflect.Map, reflect.Pointer:
+			if !handled[f.Name] {
+				t.Errorf("CredentialPolicy.%s is a %s; deep-copy it in clonePolicy", f.Name, f.Type.Kind())
+			}
+		}
+	}
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }

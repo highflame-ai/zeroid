@@ -540,6 +540,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// the https requirement at registration — an http loopback URL would be
 	// useless if the dialer refused loopback, so the two move together.
 	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
+	oauthClientSvc.SetSHA256ClientSecrets(cfg.ClientAuth.SHA256ClientSecrets)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 

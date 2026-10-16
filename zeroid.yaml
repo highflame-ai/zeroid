@@ -193,6 +193,14 @@ client_auth:
   # sets from localhost. Production MUST keep this false.
   # Env: ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS
   allow_private_jwks_endpoints: false
+  # Store client secrets as SHA-256 instead of bcrypt, and move existing bcrypt
+  # hashes to SHA-256 on their next successful verify. Secrets are 32 random
+  # bytes the server generates, so bcrypt (60-250 ms of CPU per verify) adds
+  # no protection. Default false: builds that predate SHA-256 support cannot
+  # verify these secrets, so enable only once this release is your rollback
+  # floor. Verification accepts both formats regardless.
+  # Env: ZEROID_CLIENT_AUTH_SHA256_CLIENT_SECRETS
+  sha256_client_secrets: false
   # Bounds how many distinct client jwks_uri endpoints are cached at once.
   # Each cached entry owns a background refresh goroutine, so this caps
   # goroutines and outbound fetch loops, not just memory. 0 (default) => 256.

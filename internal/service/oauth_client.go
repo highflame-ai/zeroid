@@ -55,6 +55,31 @@ type OAuthClientService struct {
 	// SSRF guard on the fetch itself — the two must move together, since an
 	// http loopback URL is useless if the dialer refuses loopback.
 	allowPrivateJWKSEndpoints bool
+	// sha256Secrets stores new and rotated client secrets as SHA-256 and
+	// upgrades bcrypt hashes on successful verify. Off by default: once on,
+	// stored secrets are unreadable by builds that predate SHA-256 support,
+	// so it must not be enabled until this build is the rollback floor.
+	// Verification accepts both formats either way.
+	sha256Secrets bool
+}
+
+// SetSHA256ClientSecrets turns on SHA-256 client-secret storage. Set from
+// ClientAuth.SHA256ClientSecrets.
+func (s *OAuthClientService) SetSHA256ClientSecrets(on bool) {
+	s.sha256Secrets = on
+}
+
+// hashNewSecret is the stored form of a freshly generated secret: SHA-256 when
+// enabled, else bcrypt at the caller's cost (the pre-SHA-256 behaviour).
+func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (string, error) {
+	if s.sha256Secrets {
+		return hashClientSecret(secret), nil
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(secret), bcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash client secret: %w", err)
+	}
+	return string(h), nil
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
@@ -167,8 +192,12 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
+		hashed, err := s.hashNewSecret(secret, bcrypt.DefaultCost)
+		if err != nil {
+			return nil, "", err
+		}
 		plainSecret = secret
-		hashedSecret = hashClientSecret(secret)
+		hashedSecret = hashed
 		clientType = "confidential"
 		authMethod = "client_secret_basic"
 	} else {
@@ -385,13 +414,17 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 	if !ok {
 		return nil, ErrInvalidClientSecret
 	}
-	if legacy {
+	if shouldUpgradeSecretHash(legacy, s.sha256Secrets, secret) {
 		// Upgrade a pre-SHA-256 bcrypt hash now that we hold the plaintext, so
 		// each existing client pays bcrypt once. Best-effort: the conditional
 		// write loses harmlessly to a concurrent rotation, and a failure only
 		// means the next verify tries again.
-		if err := s.repo.UpgradeSecretHash(ctx, client.ID, client.ClientSecret, hashClientSecret(secret)); err != nil {
+		upgraded, err := s.repo.UpgradeSecretHash(ctx, client.ID, client.ClientSecret, hashClientSecret(secret))
+		switch {
+		case err != nil:
 			log.Warn().Err(err).Str("client_id", clientID).Msg("client secret hash upgrade failed")
+		case !upgraded:
+			log.Debug().Str("client_id", clientID).Msg("client secret hash upgrade skipped: secret changed concurrently")
 		}
 	}
 	return client, nil
@@ -424,7 +457,11 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate secret: %w", err)
 	}
-	client.ClientSecret = hashClientSecret(plainSecret)
+	hashed, err := s.hashNewSecret(plainSecret, bcrypt.DefaultCost)
+	if err != nil {
+		return nil, "", err
+	}
+	client.ClientSecret = hashed
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
 		return nil, "", fmt.Errorf("failed to update client secret: %w", err)
@@ -740,7 +777,10 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		if err != nil {
 			return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
-		hashedSecret = hashClientSecret(plainSecret)
+		hashedSecret, err = s.hashNewSecret(plainSecret, dcrBcryptCost)
+		if err != nil {
+			return nil, "", "", err
+		}
 	}
 
 	scopes := req.Scopes

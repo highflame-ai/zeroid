@@ -88,19 +88,22 @@ func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuth
 }
 
 // UpgradeSecretHash swaps a client's stored secret hash from oldHash to
-// newHash. Conditional on oldHash so it never overwrites a concurrent
-// rotation, and column-scoped so it can't clobber other fields.
-func (r *OAuthClientRepository) UpgradeSecretHash(ctx context.Context, id, oldHash, newHash string) error {
-	_, err := r.db.NewUpdate().
+// newHash and reports whether it did. Conditional on oldHash so it never
+// overwrites a concurrent rotation, and column-scoped so it can't clobber
+// other fields. updated_at is left alone on purpose: the secret is unchanged,
+// only its storage format moves.
+func (r *OAuthClientRepository) UpgradeSecretHash(ctx context.Context, id, oldHash, newHash string) (bool, error) {
+	res, err := r.db.NewUpdate().
 		TableExpr("oauth_clients").
 		Set("client_secret = ?", newHash).
 		Where("id = ?", id).
 		Where("client_secret = ?", oldHash).
 		Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to upgrade oauth client secret hash: %w", err)
+		return false, fmt.Errorf("failed to upgrade oauth client secret hash: %w", err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // Delete removes an OAuth2 client (hard delete — clients are admin-controlled).

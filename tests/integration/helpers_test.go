@@ -276,8 +276,12 @@ func runTests(m *testing.M) int {
 		// fixtures serve a key set from an httptest listener on 127.0.0.1,
 		// which the SSRF guard blocks by default. Production keeps this false —
 		// a registered jwks_uri is attacker-supplied wherever DCR is open.
+		// SHA256ClientSecrets: on so the storage format and the bcrypt
+		// upgrade path run end to end (client_secret_hash_test.go). Its
+		// default-off behaviour is unit-tested in internal/service.
 		ClientAuth: zeroid.ClientAuthConfig{
 			AllowPrivateJWKSEndpoints: true,
+			SHA256ClientSecrets:       true,
 		},
 		// Opt this test deployment into workload-attested signing with a
 		// branded well-known name + purpose allowlist — exactly what a

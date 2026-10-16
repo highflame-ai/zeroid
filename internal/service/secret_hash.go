@@ -21,6 +21,27 @@ import (
 // Never use this for anything a human picks.
 const sha256SecretPrefix = "sha256$"
 
+// isServerGeneratedSecret reports whether secret has generateSecureToken(32)'s
+// shape: 64 lowercase hex characters. Only such secrets may be moved off bcrypt.
+func isServerGeneratedSecret(secret string) bool {
+	if len(secret) != 64 {
+		return false
+	}
+	for _, c := range secret {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// shouldUpgradeSecretHash decides whether a verified secret's bcrypt hash is
+// rewritten as SHA-256: only a legacy hash, only when SHA-256 storage is
+// enabled, and only for a secret this server could have generated.
+func shouldUpgradeSecretHash(legacy, sha256Enabled bool, secret string) bool {
+	return legacy && sha256Enabled && isServerGeneratedSecret(secret)
+}
+
 // hashClientSecret returns the stored form of a server-generated secret.
 func hashClientSecret(secret string) string {
 	sum := sha256.Sum256([]byte(secret))
