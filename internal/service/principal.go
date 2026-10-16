@@ -3,10 +3,44 @@ package service
 import (
 	"context"
 	"errors"
+	"unicode"
+	"unicode/utf8"
 )
 
+// MaxPrincipalUserEmailLength is the longest user email zeroid carries from a
+// Principal into a token, in bytes: the RFC 5321 §4.5.3.1.3 path limit (256)
+// less the two angle brackets.
+const MaxPrincipalUserEmailLength = 254
+
+// MaxPrincipalUserNameLength is the longest user display name zeroid carries
+// from a Principal into a token, in bytes.
+const MaxPrincipalUserNameLength = 256
+
+// sanitizePrincipalAttribute returns v when it is a non-empty, valid UTF-8
+// string of at most maxLen bytes with no control or format characters, and ""
+// otherwise. It is the defensive floor for the display attributes a resolver
+// attaches to a Principal (UserEmail, UserName): those end up as access-token
+// claims a CLI prints, so a value that could reorder or hide text on a
+// terminal (bidi overrides, zero-width characters, escape sequences) is
+// dropped rather than signed. Dropping, not rejecting, because the attribute
+// is display-only and a login must not fail over it.
+//
+// It does not check that an email is well formed — that is the resolver's
+// job, since only it knows where the value came from.
+func sanitizePrincipalAttribute(v string, maxLen int) string {
+	if v == "" || len(v) > maxLen || !utf8.ValidString(v) {
+		return ""
+	}
+	for _, r := range v {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ""
+		}
+	}
+	return v
+}
+
 // Principal is the resolved caller at /oauth2/authorize. The fields here
-// become the {aid, pid, uid, oid, scp} claims on the issued auth-code JWT
+// become the {aid, pid, uid, oid, uem, unm, scp} claims on the issued auth-code JWT
 // and travel through to the access token minted at code exchange.
 //
 // Resolvers (see PrincipalResolver) build a Principal from whatever
@@ -41,6 +75,28 @@ type Principal struct {
 	// downstream access token surfaces it for resource servers that
 	// need cross-account org context.
 	OrgID string
+
+	// UserEmail and UserName are optional display attributes of the user
+	// named by UserID — the address and display name a CLI shows on
+	// `whoami`. When set, they travel in the authorization code and are
+	// stamped as the `user_email` / `user_name` claims on the access token
+	// minted at code exchange, and on every access token a refresh of that
+	// grant mints.
+	//
+	// They are attributes the RESOLVER vouches for, read from the credential
+	// it verified (a signed assertion, a session) — never from a raw request
+	// parameter, which the client controls. They carry no authority: nothing
+	// in zeroid authorizes on them, and resource servers must not either
+	// (UserID is the subject). zeroid drops a value that is longer than
+	// MaxPrincipalUserEmailLength / MaxPrincipalUserNameLength or that is not
+	// valid, printable UTF-8 rather than failing the login, because a missing
+	// display attribute is harmless and a refused login is not.
+	//
+	// Both ride in the authorization code, which is a signed but UNENCRYPTED
+	// JWT delivered on the redirect URI — so they are visible to whatever sees
+	// that URL (the user's own browser and the client receiving the code).
+	UserEmail string
+	UserName  string
 
 	// Scopes is the resolver-narrowed list of scopes the principal is
 	// allowed to obtain. The /oauth2/authorize handler intersects this

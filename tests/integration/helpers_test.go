@@ -399,6 +399,8 @@ func runTests(m *testing.M) int {
 	//   test_principal_account → AccountID (required to "apply")
 	//   test_principal_project → ProjectID
 	//   test_principal_user    → UserID
+	//   test_principal_email   → UserEmail
+	//   test_principal_name    → UserName
 	//   test_principal_scopes  → Scopes (space-separated; empty means the
 	//                            principal has no scope restriction of its
 	//                            own — see Principal.Scopes)
@@ -424,6 +426,8 @@ func runTests(m *testing.M) int {
 			AccountID: acct,
 			ProjectID: req.Form("test_principal_project"),
 			UserID:    req.Form("test_principal_user"),
+			UserEmail: req.Form("test_principal_email"),
+			UserName:  req.Form("test_principal_name"),
 			Scopes:    strings.Fields(req.Form("test_principal_scopes")),
 		}, nil
 	})

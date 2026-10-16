@@ -84,6 +84,15 @@ type RefreshToken struct {
 	// refresh grant re-mints, so the refreshed token keeps the same principal.
 	// nullzero ⇒ empty on families minted before migration 048.
 	PrincipalIss string `bun:"principal_iss,nullzero" json:"principal_iss,omitempty"`
+	// UserEmail and UserName are the display attributes of the family's user
+	// (UserID) — the `user_email` / `user_name` claims of the access token the
+	// family was issued alongside. Copied verbatim onto every successor row on
+	// rotation and read back when the refresh grant re-mints, so a refreshed
+	// token names the same user as the one it replaces. Display only; nothing
+	// authorizes on them. nullzero ⇒ empty on families minted before
+	// migration 058 or for a grant that carried none.
+	UserEmail string `bun:"user_email,nullzero" json:"-"`
+	UserName  string `bun:"user_name,nullzero"  json:"-"`
 	// Audience is the server-recognized audience-profile name (e.g. "codeoid")
 	// this refresh family was issued for by the external-principal exchange.
 	// Copied verbatim onto every successor row on rotation and read back when
