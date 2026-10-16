@@ -83,7 +83,7 @@ func (s *OAuthClientService) SetAllowPrivateJWKSEndpoints(allow bool) {
 }
 
 // RegisterClientRequest holds all fields for creating an OAuth2 client.
-// Confidential clients get a generated bcrypt secret; public clients have none.
+// Confidential clients get a generated secret, stored SHA-256-hashed; public clients have none.
 type RegisterClientRequest struct {
 	ClientID                string
 	Name                    string
@@ -121,7 +121,7 @@ type RegisterClientRequest struct {
 
 // RegisterClient creates a new OAuth2 client.
 //
-// If req.Confidential is true, a client_secret is generated and bcrypt-hashed;
+// If req.Confidential is true, a client_secret is generated and SHA-256-hashed;
 // the plain-text secret is returned (shown once only). For public clients the
 // returned secret string is empty.
 //
@@ -167,12 +167,8 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
-		hashed, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
-		if err != nil {
-			return nil, "", fmt.Errorf("failed to hash client secret: %w", err)
-		}
 		plainSecret = secret
-		hashedSecret = string(hashed)
+		hashedSecret = hashClientSecret(secret)
 		clientType = "confidential"
 		authMethod = "client_secret_basic"
 	} else {
@@ -244,11 +240,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	//
 	// The predicates closed that by deriving the question from the registered
 	// method, which is right — but it leaves such a client unable to authenticate
-	// anywhere, because bcrypt against an empty stored hash refuses every secret
-	// it could present. Refusing the registration turns a 401 the operator debugs
-	// later, against a client they believe is correct, into an error at the one
-	// moment they can still fix it. Same reasoning and same shape as the refusal
-	// above.
+	// anywhere, because the verifier refuses every secret it could present
+	// against an empty stored hash. Refusing the registration turns a 401 the
+	// operator debugs later, against a client they believe is correct, into an
+	// error at the one moment they can still fix it. Same reasoning and same
+	// shape as the refusal above.
 	if !req.Confidential && (authMethod == "client_secret_basic" || authMethod == "client_secret_post") {
 		return nil, "", fmt.Errorf(
 			"%w: token_endpoint_auth_method %s requires confidential=true; without it no client_secret is "+
@@ -376,7 +372,7 @@ func (s *OAuthClientService) ListClients(ctx context.Context) ([]*domain.OAuthCl
 }
 
 // VerifyClientSecret looks up a client by client_id and verifies the provided
-// secret against the bcrypt hash.
+// secret against the stored hash (SHA-256, or legacy bcrypt; see secret_hash.go).
 func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, secret string) (*domain.OAuthClient, error) {
 	client, err := s.repo.GetByClientID(ctx, clientID)
 	if err != nil {
@@ -385,8 +381,18 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 	if !client.IsActive {
 		return nil, ErrOAuthClientNotFound
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(client.ClientSecret), []byte(secret)); err != nil {
+	ok, legacy := verifyClientSecret(client.ClientSecret, secret)
+	if !ok {
 		return nil, ErrInvalidClientSecret
+	}
+	if legacy {
+		// Upgrade a pre-SHA-256 bcrypt hash now that we hold the plaintext, so
+		// each existing client pays bcrypt once. Best-effort: the conditional
+		// write loses harmlessly to a concurrent rotation, and a failure only
+		// means the next verify tries again.
+		if err := s.repo.UpgradeSecretHash(ctx, client.ID, client.ClientSecret, hashClientSecret(secret)); err != nil {
+			log.Warn().Err(err).Str("client_id", clientID).Msg("client secret hash upgrade failed")
+		}
 	}
 	return client, nil
 }
@@ -418,12 +424,7 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate secret: %w", err)
 	}
-	hashed, err := bcrypt.GenerateFromPassword([]byte(plainSecret), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to hash secret: %w", err)
-	}
-
-	client.ClientSecret = string(hashed)
+	client.ClientSecret = hashClientSecret(plainSecret)
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
 		return nil, "", fmt.Errorf("failed to update client secret: %w", err)
@@ -739,11 +740,7 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		if err != nil {
 			return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
-		hashed, hashErr := bcrypt.GenerateFromPassword([]byte(plainSecret), dcrBcryptCost)
-		if hashErr != nil {
-			return nil, "", "", fmt.Errorf("failed to hash client secret: %w", hashErr)
-		}
-		hashedSecret = string(hashed)
+		hashedSecret = hashClientSecret(plainSecret)
 	}
 
 	scopes := req.Scopes
