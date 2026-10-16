@@ -751,6 +751,7 @@ type TokenRequest struct {
 
 // Token handles the /oauth2/token endpoint dispatch.
 func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+	ctx = withPolicyMemo(ctx)
 	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
 	// grant dispatch so every grant — including custom ones registered via
 	// RegisterGrant — sees the same validated list and no grant can forget the
