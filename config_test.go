@@ -377,7 +377,7 @@ func TestValidateWIMSEDomain(t *testing.T) {
 func TestLoadEnvVarsClientAuth(t *testing.T) {
 	t.Setenv("ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS", "true")
 	t.Setenv("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE", "64")
-	t.Setenv("ZEROID_CLIENT_AUTH_SHA256_CLIENT_SECRETS", "true")
+	t.Setenv("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS", "true")
 
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -389,8 +389,8 @@ func TestLoadEnvVarsClientAuth(t *testing.T) {
 	if cfg.ClientAuth.JWKSCacheSize != 64 {
 		t.Errorf("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE=64 did not reach client_auth, got %d", cfg.ClientAuth.JWKSCacheSize)
 	}
-	if !cfg.ClientAuth.SHA256ClientSecrets {
-		t.Error("ZEROID_CLIENT_AUTH_SHA256_CLIENT_SECRETS=true did not reach client_auth")
+	if !cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS=true did not reach client_auth")
 	}
 }
 
@@ -406,8 +406,8 @@ func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
 	if cfg.ClientAuth.JWKSCacheSize != 0 {
 		t.Errorf("jwks_cache_size must default to 0 (meaning the built-in cap), got %d", cfg.ClientAuth.JWKSCacheSize)
 	}
-	if cfg.ClientAuth.SHA256ClientSecrets {
-		t.Error("sha256_client_secrets must default to false — SHA-256 secrets can't be verified by older builds, so it breaks rollback")
+	if cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("bcrypt_client_secrets must default to false: client secrets are stored as SHA-256 unless a deployment opts back into bcrypt")
 	}
 }
 

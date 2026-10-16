@@ -120,15 +120,18 @@ type ClientAuthConfig struct {
 	// localhost. Production MUST keep this false.
 	AllowPrivateJWKSEndpoints bool `koanf:"allow_private_jwks_endpoints"`
 
-	// SHA256ClientSecrets stores new and rotated client secrets as SHA-256
-	// instead of bcrypt, and moves existing bcrypt hashes to SHA-256 on their
-	// next successful verify. Client secrets are 32 random bytes the server
-	// generates, so a slow KDF adds no protection; bcrypt costs 60-250 ms of
-	// CPU per verify. Default false: builds older than this one cannot verify
-	// a SHA-256 secret, so turning this on makes rolling back past this
-	// release lock those clients out. Enable once this release is your
-	// rollback floor. Verification accepts both formats regardless.
-	SHA256ClientSecrets bool `koanf:"sha256_client_secrets"`
+	// BcryptClientSecrets keeps storing new and rotated client secrets with
+	// bcrypt, as builds before this one did. By default (false) they are
+	// stored as SHA-256, and existing bcrypt hashes move to SHA-256 on their
+	// next successful verify: client secrets are 32 random bytes the server
+	// generates, so a slow KDF adds no protection, and bcrypt costs 60-250 ms
+	// of CPU per verify. Verification accepts both formats regardless.
+	//
+	// Rolling back: builds older than this one cannot verify a SHA-256
+	// secret, so rolling back past this release locks out every client that
+	// has authenticated or been created since. Set this to true only if you
+	// need that rollback path.
+	BcryptClientSecrets bool `koanf:"bcrypt_client_secrets"`
 
 	// JWKSCacheSize bounds how many distinct client jwks_uri endpoints are
 	// cached concurrently. Each cached entry owns a background refresh
@@ -1031,7 +1034,7 @@ func loadDefaults(k *koanf.Koanf) error {
 		// value; stated explicitly so the resolved config reports them.
 		"client_auth.allow_private_jwks_endpoints": false,
 		"client_auth.jwks_cache_size":              0,
-		"client_auth.sha256_client_secrets":        false,
+		"client_auth.bcrypt_client_secrets":        false,
 
 		// CIBA approver binding — both off so standalone deployments keep
 		// today's approve/deny behaviour until they opt in.
@@ -1145,7 +1148,7 @@ var envMapping = map[string]string{
 	// fetching it. Deliberately NOT tied to the CIMD flag below — the two
 	// fetchers trust different parties.
 	"ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS": "client_auth.allow_private_jwks_endpoints",
-	"ZEROID_CLIENT_AUTH_SHA256_CLIENT_SECRETS":        "client_auth.sha256_client_secrets",
+	"ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS":        "client_auth.bcrypt_client_secrets",
 	"ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE":              "client_auth.jwks_cache_size",
 
 	// Trusted issuers: config (static external_issuers) or db (account
@@ -1186,7 +1189,7 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".require_approver_identity") ||
 			strings.HasSuffix(configPath, ".allow_private_issuer_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
-			strings.HasSuffix(configPath, ".sha256_client_secrets") ||
+			strings.HasSuffix(configPath, ".bcrypt_client_secrets") ||
 			strings.HasSuffix(configPath, ".allow_private_endpoints") ||
 			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
 			boolVal, err := strconv.ParseBool(value)

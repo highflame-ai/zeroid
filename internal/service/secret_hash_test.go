@@ -46,18 +46,19 @@ func TestHashNewSecretRespectsSetting(t *testing.T) {
 	const secret = "4f2c0d9e8b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e"
 	s := &OAuthClientService{}
 
-	// Off (the default): bcrypt, readable by builds that predate SHA-256.
+	// The zero value stores SHA-256.
+	if h, _ := s.hashNewSecret(secret, bcrypt.MinCost); h != hashClientSecret(secret) {
+		t.Errorf("default must store SHA-256, got %q", h)
+	}
+
+	// Kept on bcrypt: readable by builds that predate SHA-256.
+	s.SetBcryptClientSecrets(true)
 	h, err := s.hashNewSecret(secret, bcrypt.MinCost)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.HasPrefix(h, sha256SecretPrefix) || bcrypt.CompareHashAndPassword([]byte(h), []byte(secret)) != nil {
-		t.Errorf("default must store bcrypt, got %q", h)
-	}
-
-	s.SetSHA256ClientSecrets(true)
-	if h, _ = s.hashNewSecret(secret, bcrypt.MinCost); h != hashClientSecret(secret) {
-		t.Errorf("enabled must store SHA-256, got %q", h)
+		t.Errorf("bcrypt setting must store bcrypt, got %q", h)
 	}
 }
 
@@ -70,7 +71,7 @@ func TestShouldUpgradeSecretHash(t *testing.T) {
 		want            bool
 	}{
 		{"legacy, enabled, generated", true, true, generated, true},
-		{"setting off keeps bcrypt", true, false, generated, false},
+		{"bcrypt setting keeps bcrypt", true, false, generated, false},
 		{"already sha256", false, true, generated, false},
 		{"human-chosen secret keeps bcrypt", true, true, "MyTeamPassword1", false},
 		{"uppercase hex is not ours", true, true, strings.ToUpper(generated), false},

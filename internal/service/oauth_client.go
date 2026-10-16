@@ -55,24 +55,24 @@ type OAuthClientService struct {
 	// SSRF guard on the fetch itself — the two must move together, since an
 	// http loopback URL is useless if the dialer refuses loopback.
 	allowPrivateJWKSEndpoints bool
-	// sha256Secrets stores new and rotated client secrets as SHA-256 and
-	// upgrades bcrypt hashes on successful verify. Off by default: once on,
-	// stored secrets are unreadable by builds that predate SHA-256 support,
-	// so it must not be enabled until this build is the rollback floor.
-	// Verification accepts both formats either way.
-	sha256Secrets bool
+	// bcryptSecrets keeps writing bcrypt client-secret hashes, as builds
+	// before SHA-256 support did, and skips the upgrade of existing ones. Off
+	// (the zero value) means SHA-256. Verification accepts both formats
+	// either way.
+	bcryptSecrets bool
 }
 
-// SetSHA256ClientSecrets turns on SHA-256 client-secret storage. Set from
-// ClientAuth.SHA256ClientSecrets.
-func (s *OAuthClientService) SetSHA256ClientSecrets(on bool) {
-	s.sha256Secrets = on
+// SetBcryptClientSecrets keeps bcrypt client-secret storage, for deployments
+// that must stay able to roll back past SHA-256 support. Set from
+// ClientAuth.BcryptClientSecrets.
+func (s *OAuthClientService) SetBcryptClientSecrets(on bool) {
+	s.bcryptSecrets = on
 }
 
-// hashNewSecret is the stored form of a freshly generated secret: SHA-256 when
-// enabled, else bcrypt at the caller's cost (the pre-SHA-256 behaviour).
+// hashNewSecret is the stored form of a freshly generated secret: SHA-256, or
+// bcrypt at the caller's cost when bcrypt storage is kept.
 func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (string, error) {
-	if s.sha256Secrets {
+	if !s.bcryptSecrets {
 		return hashClientSecret(secret), nil
 	}
 	h, err := bcrypt.GenerateFromPassword([]byte(secret), bcryptCost)
@@ -414,7 +414,7 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 	if !ok {
 		return nil, ErrInvalidClientSecret
 	}
-	if shouldUpgradeSecretHash(legacy, s.sha256Secrets, secret) {
+	if shouldUpgradeSecretHash(legacy, !s.bcryptSecrets, secret) {
 		// Upgrade a pre-SHA-256 bcrypt hash now that we hold the plaintext, so
 		// each existing client pays bcrypt once. Best-effort: the conditional
 		// write loses harmlessly to a concurrent rotation, and a failure only
