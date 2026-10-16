@@ -81,6 +81,14 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "none alg", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"none"} }, want: "invalid_algorithms"},
 		{name: "propagate groups", mutate: func(e *ExternalIssuer) { e.PropagateClaims = []string{"groups"} }, want: "invalid_propagate_claims"},
 		{name: "unknown mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["sub"] = "sub" }, want: "invalid_claim_mapping"},
+		// ADR 0044 D16: an IdP claim never sets a token's role or capabilities.
+		{name: "role is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["role"] = "groups" }, want: "claim_mapping_reserved"},
+		{name: "privilege_scope is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["privilege_scope"] = "scp" }, want: "claim_mapping_reserved"},
+		{name: "reserved on a workload row too", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.ClaimMapping = map[string]string{"role": "roles"}
+		}, want: "claim_mapping_reserved"},
+		{name: "a claim named role may feed another key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["name"] = "role" }},
 		{name: "person without user key", mutate: func(e *ExternalIssuer) { e.ClaimMapping = map[string]string{} }, want: "invalid_claim_mapping"},
 		{name: "workload without user key", mutate: func(e *ExternalIssuer) {
 			e.Kind = IssuerKindWorkload

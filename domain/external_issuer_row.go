@@ -151,7 +151,13 @@ func ValidateIssuerURL(raw string, allowHTTP bool) error {
 var unpinnableClaims = []string{"iss", "aud", "exp", "iat", "nbf", "jti"}
 
 // knownMappingKeys are the claim_mapping targets a grant reads.
-var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "role", "privilege_scope", "scope", "trust_level"}
+var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "scope", "trust_level"}
+
+// reservedMappingKeys are token claims an IdP claim must never set: a
+// person's role and privilege scope come only from the deployer's own
+// membership store, never from the customer's IdP (ADR 0044 D16). A
+// claim_mapping naming one is refused with claim_mapping_reserved.
+var reservedMappingKeys = []string{"role", "privilege_scope"}
 
 // Normalize trims the row and applies defaults to unset fields.
 func (e *ExternalIssuer) Normalize() {
@@ -237,6 +243,9 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	for k, claim := range e.ClaimMapping {
 		if len(claim) > maxClaimNameBytes {
 			return issuerInvalid("invalid_claim_mapping", "claim_mapping.%s is longer than %d bytes", k, maxClaimNameBytes)
+		}
+		if slices.Contains(reservedMappingKeys, k) {
+			return issuerInvalid("claim_mapping_reserved", "claim_mapping key %q is reserved: an IdP claim cannot set a token's %s", k, k)
 		}
 		if !slices.Contains(knownMappingKeys, k) {
 			return issuerInvalid("invalid_claim_mapping", "claim_mapping key %q is not recognised", k)

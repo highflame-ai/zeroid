@@ -75,9 +75,10 @@ func TestBuildIDJAGCustomClaims_PropagateClaimsCannotClobberResource(t *testing.
 	}
 }
 
-// TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope guards the claims that were
-// already there, so the extraction refactor is provably behavior-preserving.
-func TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope(t *testing.T) {
+// TestBuildIDJAGCustomClaims_IgnoresReservedMappings: a row stored before
+// role and privilege_scope were reserved may still map them; the ID-JAG grant
+// never copies either from the IdP's claims (ADR 0044 D16, EC-D16-04).
+func TestBuildIDJAGCustomClaims_IgnoresReservedMappings(t *testing.T) {
 	t.Parallel()
 
 	cfg := domain.ExternalIssuerConfig{
@@ -90,25 +91,21 @@ func TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope(t *testing.T) {
 	raw := map[string]any{
 		"groups_role": "admin",
 		"groups_ps":   []any{"tenant:read", "tenant:write"},
+		// Same-named IdP claims are not read either.
+		"role":            "owner",
+		"privilege_scope": []any{"*"},
 	}
 
 	got := buildIDJAGCustomClaims(raw, cfg, "https://corp-idp.example", []string{"https://gw/mcp/github"})
 
-	if got["role"] != "admin" {
-		t.Errorf("role = %v, want admin", got["role"])
+	if _, present := got["role"]; present {
+		t.Errorf("role = %v, want absent: an IdP claim never sets a token's role", got["role"])
 	}
-	ps, ok := got["privilege_scope"].([]string)
-	if !ok || len(ps) != 2 {
-		t.Errorf("privilege_scope = %#v, want two entries", got["privilege_scope"])
+	if _, present := got["privilege_scope"]; present {
+		t.Errorf("privilege_scope = %v, want absent", got["privilege_scope"])
 	}
-
-	// Absent mappings must not default-fill.
-	bare := buildIDJAGCustomClaims(map[string]any{}, cfg, "https://corp-idp.example", []string{"x"})
-	if _, present := bare["role"]; present {
-		t.Error("role must be absent when the IdP did not supply it (never default-fill)")
-	}
-	if _, present := bare["privilege_scope"]; present {
-		t.Error("privilege_scope must be absent when the IdP did not supply it")
+	if got["token_exchange"] != "id_jag" {
+		t.Errorf("token_exchange = %v, the rest of the claim set is unaffected", got["token_exchange"])
 	}
 }
 

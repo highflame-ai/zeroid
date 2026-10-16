@@ -47,11 +47,10 @@ func isIDJAGAssertion(assertion string) bool {
 // without a full mint (the repo's other ID-JAG tests are all fail-closed and
 // never reach issuance).
 //
-// role and privilege_scope are reservedClaims (an untrusted caller can never
-// inject them via additional_claims), but here ZeroID itself sources them from
-// the IdP-verified ID-JAG, so they are set directly into CustomClaims — which
-// bypasses the additional_claims blocklist by design, the same pattern the
-// trusted broker path uses.
+// role and privilege_scope are never set here, whatever the issuer's
+// claim_mapping says: an IdP claim must not place a role or capabilities in a
+// token (ADR 0044 D16). Validation refuses both as mapping keys, and a row
+// stored before that refusal may still name them, so they are not read.
 func buildIDJAGCustomClaims(
 	rawClaims map[string]any,
 	cfg domain.ExternalIssuerConfig,
@@ -61,16 +60,6 @@ func buildIDJAGCustomClaims(
 	customClaims := map[string]any{
 		"token_exchange": "id_jag",
 		"user_id_iss":    upstreamIss,
-	}
-
-	// Map IdP group/role claims into Cedar principal attributes (D3). OPTIONAL —
-	// present only when the ID-JAG carries the claim AND ClaimMapping routes it.
-	if role, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["role"]); ok && role != "" {
-		customClaims["role"] = role
-	}
-
-	if ps, ok := extractMappedClaimStrings(rawClaims, cfg.ClaimMapping["privilege_scope"]); ok && len(ps) > 0 {
-		customClaims["privilege_scope"] = ps
 	}
 
 	// Honest propagation of RFC 9068 authentication-context claims — only
