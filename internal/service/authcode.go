@@ -25,6 +25,15 @@ type AuthCodeClaims struct {
 	AccountID     string    // "aid" — Account ID
 	ProjectID     string    // "pid" — Project ID (optional)
 
+	// UserEmail and UserName are the user's display attributes as the
+	// principal resolver vouched for them (Principal.UserEmail/UserName) —
+	// "uem" / "unm". Optional, absent on codes minted before they existed.
+	// Signed claims for the same reason as Scopes: there is no code row at
+	// authorization time to hold them. Display only; nothing authorizes on
+	// them.
+	UserEmail string // "uem" — user email (optional)
+	UserName  string // "unm" — user display name (optional)
+
 	// Resources is the consented RFC 8707 resource ceiling — "rsc"
 	// (CAP-IDN-027). Optional: absent on every code issued before this
 	// existed, and on any request that did not name a resource.
@@ -86,6 +95,12 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 		OrgID:         getStringClaim(token, "oid"),
 		AccountID:     getStringClaim(token, "aid"),
 		ProjectID:     getStringClaim(token, "pid"),
+		// Re-checked on the way in, like rsc: the code may come from another
+		// release, and these values are about to be signed into an access
+		// token. A value that fails is dropped, not an error — it is display
+		// only.
+		UserEmail: sanitizePrincipalAttribute(getStringClaim(token, "uem"), MaxPrincipalUserEmailLength),
+		UserName:  sanitizePrincipalAttribute(getStringClaim(token, "unm"), MaxPrincipalUserNameLength),
 	}
 
 	// Extract scopes array. jwx v4 dropped the untyped Token.Get; use the
@@ -323,6 +338,12 @@ func mintAuthCodeJWT(claims *AuthCodeClaims, hmacSecret, issuer string, now time
 	}
 	if claims.ProjectID != "" {
 		builder = builder.Claim("pid", claims.ProjectID)
+	}
+	if claims.UserEmail != "" {
+		builder = builder.Claim("uem", claims.UserEmail)
+	}
+	if claims.UserName != "" {
+		builder = builder.Claim("unm", claims.UserName)
 	}
 	if len(claims.Scopes) > 0 {
 		// Stored as []any so jwx v4 serializes a JSON array. The decoder

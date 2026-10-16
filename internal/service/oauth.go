@@ -1728,6 +1728,10 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 			// The family records whose issuer vouched for the user, so it
 			// is revoked by the RFC 9493 (issuer, subject) pair.
 			PrincipalIss: cred.PrincipalIss,
+			// The family re-stamps the user's display attributes on every
+			// rotation, as the access token above carries them.
+			UserEmail: req.UserEmail,
+			UserName:  req.UserName,
 			// The id already stamped on the access token above.
 			FamilyID: refreshFamilyID,
 		})
@@ -2057,6 +2061,15 @@ type IssueAuthCodeRequest struct {
 	// OrgID is an optional org-level scope above AccountID. Baked into
 	// the "oid" claim only when non-empty; omitted otherwise.
 	OrgID string
+
+	// UserEmail and UserName are optional display attributes of UserID,
+	// baked into the "uem" / "unm" claims and stamped as `user_email` /
+	// `user_name` on the access token the code is exchanged for (and on
+	// every refresh of it). IssueAuthCode drops a value that fails
+	// sanitizePrincipalAttribute rather than refusing the code. See
+	// Principal.UserEmail.
+	UserEmail string
+	UserName  string
 
 	// Scopes is the pre-narrowed scope set this code authorizes the
 	// token exchange to mint. IssueAuthCode intersects this with the
@@ -2453,6 +2466,8 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		Scopes:        scopes,
 		UserID:        req.UserID,
 		OrgID:         req.OrgID,
+		UserEmail:     sanitizePrincipalAttribute(req.UserEmail, MaxPrincipalUserEmailLength),
+		UserName:      sanitizePrincipalAttribute(req.UserName, MaxPrincipalUserNameLength),
 		AccountID:     req.AccountID,
 		ProjectID:     req.ProjectID,
 		Resources:     resources,
@@ -2806,10 +2821,14 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		IdentityPolicyID: identityPolicyID,
 		// Bounded by the user's consent and the client's registered scopes, so a
 		// linked identity's user-grant ceiling applies, not its own (D10).
-		UserGrantBounded:  true,
-		GrantType:         domain.GrantTypeAuthorizationCode,
-		UseRS256:          true,
-		SubjectOverride:   authCode.UserID,
+		UserGrantBounded: true,
+		GrantType:        domain.GrantTypeAuthorizationCode,
+		UseRS256:         true,
+		SubjectOverride:  authCode.UserID,
+		// Display attributes the resolver vouched for at authorize time,
+		// carried in the signed code. Empty on codes minted without them.
+		UserEmail:         authCode.UserEmail,
+		UserName:          authCode.UserName,
 		ApplicationID:     authCode.ClientID,
 		ClientID:          authCode.ClientID,
 		TTL:               ttl,
@@ -2853,6 +2872,11 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// by the RFC 9493 (issuer, subject) pair and every rotation keeps
 			// the same principal. Copied forward like MissionID.
 			PrincipalIss: cred.PrincipalIss,
+			// Seed the family with the user's display attributes, so a refresh
+			// re-stamps user_email / user_name instead of dropping them. Copied
+			// forward like MissionID.
+			UserEmail: authCode.UserEmail,
+			UserName:  authCode.UserName,
 			// The id already stamped on the access token above.
 			FamilyID: refreshFamilyID,
 		})
@@ -3307,6 +3331,13 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		// on a family minted before migration 048: the chokepoint then derives
 		// it as for any other user subject.
 		PrincipalIss: oldToken.PrincipalIss,
+		// Re-stamp the user's display attributes recorded on the family, so
+		// a refreshed token names the same email and display name as the one
+		// it replaces. Empty on a family minted before migration 058, or for a
+		// grant that carried none: the refreshed token then has no claim,
+		// exactly as before.
+		UserEmail: oldToken.UserEmail,
+		UserName:  oldToken.UserName,
 		// Tie the access token to the family, so revoking the family (reuse
 		// detection, authorization-code replay) revokes it as well.
 		RefreshFamilyID: oldToken.FamilyID,

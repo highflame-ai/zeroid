@@ -474,6 +474,8 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 		ProjectID:           principal.ProjectID,
 		UserID:              principal.UserID,
 		OrgID:               principal.OrgID,
+		UserEmail:           principal.UserEmail,
+		UserName:            principal.UserName,
 		Scopes:              scopes,
 		RequestedScope:      req.Scope,
 		Resources:           resourceCeiling,
