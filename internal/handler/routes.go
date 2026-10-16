@@ -86,6 +86,12 @@ type API struct {
 	// client, locale) without the resolver having to construct redirects itself.
 	interactiveLoginURL func(*service.AuthorizeRequest) string
 
+	// interactiveLoginPassthrough returns the embedder's allowlist of extra
+	// authorize query parameters copied verbatim into return_to (see
+	// interactive_passthrough.go). Nil, or an empty list, copies nothing. A
+	// func so the server can change the list after construction.
+	interactiveLoginPassthrough func() []string
+
 	// resolvePrincipal walks the PrincipalResolver chain registered on
 	// the top-level Server. Wired unconditionally by Server.NewServer via
 	// SetPrincipalResolverFunc, which passes a BOUND METHOD — so this is
@@ -389,6 +395,14 @@ func (a *API) canServeAuthorizationCode() bool {
 // Server.SetInteractiveLoginURL for the contract.
 func (a *API) SetInteractiveLoginURL(fn func(*service.AuthorizeRequest) string) {
 	a.interactiveLoginURL = fn
+}
+
+// SetInteractiveLoginPassthroughParams records the source of the allowlist of
+// extra authorize parameters preserved into return_to. See
+// Server.SetInteractiveLoginPassthroughParams for the contract; the names it
+// returns must already have passed ValidateInteractiveLoginPassthroughParams.
+func (a *API) SetInteractiveLoginPassthroughParams(fn func() []string) {
+	a.interactiveLoginPassthrough = fn
 }
 
 // SetTenantSettingsService wires the per-tenant settings routes. Kept as a

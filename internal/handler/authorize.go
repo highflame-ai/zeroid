@@ -548,6 +548,9 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 // in the wrong channel, and forwarding it verbatim would hand that to the login
 // surface (and into its logs) as a side effect of a failed sign-in. Rebuilding
 // also means what comes back is exactly the request zeroid already validated.
+// The only additions are parameters the embedder allowlisted by name
+// (Server.SetInteractiveLoginPassthroughParams), which can never be protocol
+// or credential parameters — see addPassthroughParams.
 //
 // The target itself comes from deployer configuration, so it is not validated as
 // an open-redirect risk the way a client-supplied URI would be. It is worth
@@ -608,6 +611,16 @@ func (a *API) redirectToInteractiveLogin(
 	// which is what this function's "validated fields only" contract requires.
 	for _, resource := range req.Resource {
 		returnTo.Add("resource", resource)
+	}
+
+	// Embedder-allowlisted extras (Server.SetInteractiveLoginPassthroughParams),
+	// copied verbatim from the inbound query — the one deliberate exception to
+	// "validated fields only", bounded by deployer configuration. GET only, so
+	// the query is the parameter source (see authorizeHandler step 2).
+	if a.interactiveLoginPassthrough != nil {
+		if names := a.interactiveLoginPassthrough(); len(names) > 0 {
+			addPassthroughParams(returnTo, r.URL.Query(), names, req.ClientID)
+		}
 	}
 
 	q := u.Query()
