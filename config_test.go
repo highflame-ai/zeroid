@@ -1,6 +1,8 @@
 package zeroid
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -850,6 +855,47 @@ func TestConfig_FederationIssuerStore(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// A static issuer mapping a reserved key still loads, with one warning per
+// key naming the issuer and the key: the grant ignores it (ADR 0044 D16).
+func TestConfig_StaticIssuerReservedMappingWarns(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() { log.Logger = orig })
+
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{
+		{
+			Issuer: "https://idp.example", JWKSURI: "https://idp.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping:    map[string]string{"user_id": "sub", "role": "groups", "privilege_scope": "scp"},
+			AllowedAccounts: []string{"acct"},
+		},
+		{
+			Issuer: "https://clean.example", JWKSURI: "https://clean.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a reserved key in a static issuer must not stop the boot: %v", err)
+	}
+
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if entry["level"] != "warn" {
+			t.Fatalf("level = %v, want warn: %s", entry["level"], line)
+		}
+		got = append(got, fmt.Sprintf("%v %v", entry["issuer"], entry["key"]))
+	}
+	want := []string{"https://idp.example role", "https://idp.example privilege_scope"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("warnings = %v, want %v (one per reserved key, none for the clean issuer)", got, want)
 	}
 }
 

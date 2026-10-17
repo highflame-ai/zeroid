@@ -39,7 +39,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `jwks_uri` | Never supplied by the caller. ZeroID reads it from the issuer's OpenID discovery document, `{issuer}/.well-known/openid-configuration`, whose `issuer` must equal the row's issuer exactly (OpenID Connect Discovery §4.3); both fetches go through the SSRF-guarded client. It changes only through `POST /external-issuers/{id}/refresh`, which re-reads discovery. A caller-chosen key set would let an admin sign tokens for anyone their IdP's issuer names. |
 | `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
 | `algorithms` | A subset of RS256, ES256, PS256. |
-| `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `role`, `privilege_scope`, `scope`, `trust_level`. |
+| `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `scope`, `trust_level`. `role` and `privilege_scope` are reserved and refused (`claim_mapping_reserved`): an IdP claim never sets a token's role or capabilities, and the ID-JAG grant ignores them on a row stored before the refusal. A static `external_issuers` entry naming one still loads, with a warning naming the issuer and the key, and the grant ignores it the same way. |
 | `propagate_claims` | A subset of `auth_time`, `acr`, `amr`. |
 | `claim_constraints` | Claim to accepted values. Every listed claim must be present and equal one of its values (for an array claim, contain one). Required on a shared issuer. |
 | `max_token_age_seconds` | 1 to 3600, default 600. |
@@ -243,6 +243,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 |---|---|---|
 | 400 | `invalid_issuer` | Not an absolute https URL (http only with `allow_private_endpoints`), templated, an Entra multi-tenant endpoint on a person row, or not the shape a preset requires |
 | 400 | `invalid_identity_id`, `invalid_kind`, `invalid_audiences` (a workload row with none), `invalid_algorithms`, `invalid_claim_mapping`, `invalid_claim_constraints`, `invalid_propagate_claims`, `invalid_max_token_age`, `invalid_jwks_cache_ttl`, `invalid_trust_email` (on a workload row), `invalid_source`, `invalid_preset`, `invalid_request`, `invalid_subject_key` | The named field is invalid |
+| 400 | `claim_mapping_reserved` | `claim_mapping` names `role` or `privilege_scope`, on create or on any PATCH that is not only a rename or a disable (a row stored with one must drop it to be edited) |
 | 401 | `unauthorized` | No tenant context |
 | 404 | `not_found` | No such row or binding in this account |
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |

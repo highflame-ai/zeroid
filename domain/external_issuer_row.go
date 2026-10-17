@@ -151,7 +151,25 @@ func ValidateIssuerURL(raw string, allowHTTP bool) error {
 var unpinnableClaims = []string{"iss", "aud", "exp", "iat", "nbf", "jti"}
 
 // knownMappingKeys are the claim_mapping targets a grant reads.
-var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "role", "privilege_scope", "scope", "trust_level"}
+var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "scope", "trust_level"}
+
+// reservedMappingKeys are token claims an IdP claim must never set: a
+// person's role and privilege scope come only from the deployer's own
+// membership store, never from the customer's IdP (ADR 0044 D16). A
+// claim_mapping naming one is refused with claim_mapping_reserved.
+var reservedMappingKeys = []string{"role", "privilege_scope"}
+
+// ReservedMappingKeysIn returns the reserved keys mapping names, in a fixed
+// order, so callers report the same key whatever the map's iteration order.
+func ReservedMappingKeysIn(mapping map[string]string) []string {
+	var found []string
+	for _, k := range reservedMappingKeys {
+		if _, ok := mapping[k]; ok {
+			found = append(found, k)
+		}
+	}
+	return found
+}
 
 // Normalize trims the row and applies defaults to unset fields.
 func (e *ExternalIssuer) Normalize() {
@@ -233,6 +251,11 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 		if !ExternalIssuerPropagatableClaim(c) {
 			return issuerInvalid("invalid_propagate_claims", "propagate_claims entry %q is not supported (allowed: auth_time, acr, amr)", c)
 		}
+	}
+	// Before the per-key loop: map order must not decide between this code
+	// and invalid_claim_mapping when a mapping has both kinds of fault.
+	if reserved := ReservedMappingKeysIn(e.ClaimMapping); len(reserved) > 0 {
+		return issuerInvalid("claim_mapping_reserved", "claim_mapping key %q is reserved: an IdP claim cannot set a token's %s", reserved[0], reserved[0])
 	}
 	for k, claim := range e.ClaimMapping {
 		if len(claim) > maxClaimNameBytes {

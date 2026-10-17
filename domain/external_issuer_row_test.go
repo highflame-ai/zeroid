@@ -81,6 +81,20 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "none alg", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"none"} }, want: "invalid_algorithms"},
 		{name: "propagate groups", mutate: func(e *ExternalIssuer) { e.PropagateClaims = []string{"groups"} }, want: "invalid_propagate_claims"},
 		{name: "unknown mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["sub"] = "sub" }, want: "invalid_claim_mapping"},
+		// ADR 0044 D16: an IdP claim never sets a token's role or capabilities.
+		{name: "role is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["role"] = "groups" }, want: "claim_mapping_reserved"},
+		{name: "privilege_scope is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["privilege_scope"] = "scp" }, want: "claim_mapping_reserved"},
+		{name: "reserved on a workload row too", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.ClaimMapping = map[string]string{"role": "roles"}
+		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to an over-long claim is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", maxClaimNameBytes+1)
+		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to a claim over 255 bytes is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", 256)
+		}, want: "claim_mapping_reserved"},
+		{name: "a claim named role may feed another key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["name"] = "role" }},
 		{name: "person without user key", mutate: func(e *ExternalIssuer) { e.ClaimMapping = map[string]string{} }, want: "invalid_claim_mapping"},
 		{name: "workload without user key", mutate: func(e *ExternalIssuer) {
 			e.Kind = IssuerKindWorkload
@@ -308,5 +322,34 @@ func TestExternalIssuerConfigAudienceAndKind(t *testing.T) {
 	c.Kind = IssuerKindWorkload
 	if err := c.Validate(); err != nil {
 		t.Fatalf("audiences alone satisfy the audience requirement: %v", err)
+	}
+}
+
+// A reserved key wins over any other claim_mapping fault, whatever order the
+// map iterates in (ADR 0044 D16).
+func TestExternalIssuerValidate_ReservedKeyCodeIsDeterministic(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		e := validRow()
+		e.ClaimMapping = map[string]string{
+			"user_id": "sub", "role": "groups", "sub": "x", "zzz": "y", "aaa": "z",
+			"name": strings.Repeat("n", maxClaimNameBytes+1), "email": " ",
+		}
+		err := e.Validate(IssuerValidation{})
+		if got := issuerCode(err); got != "claim_mapping_reserved" {
+			t.Fatalf("iteration %d: code = %q (err %v), want claim_mapping_reserved", i, got, err)
+		}
+		if !strings.Contains(err.Error(), `"role"`) {
+			t.Fatalf("iteration %d: %v does not name role", i, err)
+		}
+	}
+}
+
+func TestReservedMappingKeysIn(t *testing.T) {
+	got := ReservedMappingKeysIn(map[string]string{"privilege_scope": "a", "user_id": "sub", "role": "b"})
+	if fmt.Sprint(got) != "[role privilege_scope]" {
+		t.Fatalf("got %v, want [role privilege_scope] in fixed order", got)
+	}
+	if got := ReservedMappingKeysIn(map[string]string{"user_id": "sub"}); len(got) != 0 {
+		t.Fatalf("got %v, want none", got)
 	}
 }

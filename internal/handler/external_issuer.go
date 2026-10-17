@@ -62,7 +62,7 @@ type ExternalIssuerCreateBody struct {
 	DisplayName         string              `json:"display_name,omitempty"`
 	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
 	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, PS256. Default all three."`
-	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, role, privilege_scope, scope, trust_level."`
+	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, scope, trust_level. role and privilege_scope are reserved (claim_mapping_reserved)."`
 	PropagateClaims     []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`
 	ClaimConstraints    map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`
 	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds,omitempty" doc:"1-3600, default 600."`
