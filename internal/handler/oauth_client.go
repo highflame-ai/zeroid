@@ -238,7 +238,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 }
 
 func (a *API) getOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientOutput, error) {
-	client, err := a.oauthClientSvc.GetClient(ctx, input.ID)
+	client, err := a.tenantScopedClient(ctx, input.ID)
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
@@ -257,6 +257,11 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 		return nil, huma.Error500InternalServerError("failed to list oauth clients")
 	}
 
+	clients, err = a.filterClientsToTenant(ctx, clients)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to scope oauth clients to tenant")
+		return nil, huma.Error500InternalServerError("failed to list oauth clients")
+	}
 	if clients == nil {
 		clients = []*domain.OAuthClient{}
 	}
@@ -267,6 +272,13 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 }
 
 func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientCreatedOutput, error) {
+	if _, err := a.tenantScopedClient(ctx, input.ID); err != nil {
+		if errors.Is(err, service.ErrOAuthClientNotFound) {
+			return nil, huma.Error404NotFound("oauth client not found")
+		}
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to get oauth client")
+		return nil, huma.Error500InternalServerError("failed to rotate secret")
+	}
 	client, plainSecret, err := a.oauthClientSvc.RotateSecret(ctx, input.ID)
 	if err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
@@ -287,6 +299,20 @@ func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientI
 }
 
 func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*DeleteOAuthClientOutput, error) {
+	// Deleting a client that does not exist answers 200 without doing anything.
+	// A client hidden from the caller's tenant is answered the same way, so a
+	// tenant cannot tell "not yours" from "not there", and is left untouched.
+	_, err := a.tenantScopedClient(ctx, input.ID)
+	switch {
+	case errors.Is(err, service.ErrOAuthClientNotFound):
+		out := &DeleteOAuthClientOutput{}
+		out.Body.Deleted = true
+		out.Body.ID = input.ID
+		return out, nil
+	case err != nil:
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to get oauth client")
+		return nil, huma.Error500InternalServerError("failed to delete oauth client")
+	}
 	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID); err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
 			return nil, herr
@@ -309,4 +335,71 @@ func oauthClientWriteError(err error) error {
 	}
 	log.Error().Err(err).Msg("approval-channel check failed during oauth client create")
 	return huma.Error500InternalServerError("failed to validate the client's identity")
+}
+
+// Clients are global: an oauth_clients row has no tenant columns. A client
+// linked to an identity (identity_id) takes that identity's tenant, though,
+// and that link decides which tenant client_credentials and ID-JAG tokens are
+// minted into, so the admin routes must not let one tenant act on a client
+// linked into another.
+//
+// The rule: a caller with a tenant in context sees a client only when it is
+// unlinked (global) or its linked identity is in that tenant. A caller with no
+// tenant in context (a trusted internal service) sees every client, as before.
+
+// tenantScopedClient loads a client by UUID and returns
+// service.ErrOAuthClientNotFound for one the caller's tenant may not see, so
+// tenants cannot probe each other's clients.
+func (a *API) tenantScopedClient(ctx context.Context, id string) (*domain.OAuthClient, error) {
+	client, err := a.oauthClientSvc.GetClient(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	tenant, terr := internalMiddleware.GetTenant(ctx)
+	if terr != nil || client.IdentityID == nil {
+		return client, nil
+	}
+	if _, err := a.identitySvc.GetIdentity(ctx, *client.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, service.ErrOAuthClientNotFound
+		}
+		return nil, err
+	}
+	return client, nil
+}
+
+// filterClientsToTenant drops the clients tenantScopedClient would hide, using
+// one identity lookup for the whole list.
+func (a *API) filterClientsToTenant(ctx context.Context, clients []*domain.OAuthClient) ([]*domain.OAuthClient, error) {
+	tenant, terr := internalMiddleware.GetTenant(ctx)
+	if terr != nil {
+		return clients, nil
+	}
+	var linked []string
+	for _, c := range clients {
+		if c.IdentityID != nil {
+			linked = append(linked, *c.IdentityID)
+		}
+	}
+	if len(linked) == 0 {
+		return clients, nil
+	}
+	identities, err := a.identitySvc.GetIdentitiesByIDs(ctx, linked, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	inTenant := make(map[string]struct{}, len(identities))
+	for _, id := range identities {
+		inTenant[id.ID] = struct{}{}
+	}
+	visible := make([]*domain.OAuthClient, 0, len(clients))
+	for _, c := range clients {
+		if c.IdentityID != nil {
+			if _, ok := inTenant[*c.IdentityID]; !ok {
+				continue
+			}
+		}
+		visible = append(visible, c)
+	}
+	return visible, nil
 }
