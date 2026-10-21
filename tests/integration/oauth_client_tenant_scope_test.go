@@ -6,6 +6,7 @@
 package integration_test
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -82,4 +83,31 @@ func TestOAuthClientAdminRoutes_TenantScoped(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		require.Equal(t, http.StatusNotFound, get(t, adminPath("/oauth/clients/"+linked), tenantA).StatusCode)
 	})
+}
+
+// A hard delete of an identity (migration 061) removes the clients linked to
+// it. With the old ON DELETE SET NULL they became unlinked, and an unlinked
+// client is global, so another tenant could then reach them.
+func TestOAuthClient_HardDeletingIdentityRemovesLinkedClient(t *testing.T) {
+	tenantA := tenantHeaders(uid("acct-a"), uid("proj-a"))
+	tenantB := tenantHeaders(uid("acct-b"), uid("proj-b"))
+	linked := registerClientIn(t, tenantA, true)
+	unlinked := registerClientIn(t, tenantA, false)
+
+	var identityID string
+	require.NoError(t, testDB.NewRaw(
+		"SELECT identity_id FROM oauth_clients WHERE id = ?", linked).Scan(context.Background(), &identityID))
+	require.NotEmpty(t, identityID)
+
+	_, err := testDB.ExecContext(context.Background(), "DELETE FROM identities WHERE id = ?", identityID)
+	require.NoError(t, err)
+
+	require.Equal(t, http.StatusNotFound, get(t, adminPath("/oauth/clients/"+linked), tenantA).StatusCode)
+	require.Equal(t, http.StatusNotFound, get(t, adminPath("/oauth/clients/"+linked), tenantB).StatusCode)
+	resp := post(t, adminPath("/oauth/clients/"+linked+"/rotate-secret"), nil, tenantB)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	require.False(t, listedClientIDs(t, tenantB)[linked])
+
+	// A client that was never linked is untouched.
+	require.Equal(t, http.StatusOK, get(t, adminPath("/oauth/clients/"+unlinked), tenantA).StatusCode)
 }
