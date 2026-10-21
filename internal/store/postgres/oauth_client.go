@@ -78,6 +78,36 @@ func (r *OAuthClientRepository) List(ctx context.Context) ([]*domain.OAuthClient
 	return clients, nil
 }
 
+// ListByIdentityID returns the clients linked to one identity, newest first.
+func (r *OAuthClientRepository) ListByIdentityID(ctx context.Context, identityID string) ([]*domain.OAuthClient, error) {
+	var clients []*domain.OAuthClient
+	err := r.db.NewSelect().Model(&clients).
+		Where("identity_id = ?", identityID).
+		OrderExpr("created_at DESC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list oauth clients for identity: %w", err)
+	}
+	return clients, nil
+}
+
+// DeleteForIdentity removes a client only while it is still linked to
+// identityID, in one statement, so a link that changes between a caller's
+// read and this delete cannot remove another identity's client. It reports
+// whether a row was deleted.
+func (r *OAuthClientRepository) DeleteForIdentity(ctx context.Context, id, identityID string) (bool, error) {
+	res, err := r.db.NewDelete().
+		TableExpr("oauth_clients").
+		Where("id = ?", id).
+		Where("identity_id = ?", identityID).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete oauth client: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // Update persists changes to an OAuth2 client.
 func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuthClient) error {
 	_, err := r.db.NewUpdate().Model(client).Where("id = ?", client.ID).Exec(ctx)
