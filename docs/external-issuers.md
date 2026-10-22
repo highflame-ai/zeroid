@@ -516,6 +516,19 @@ Either enable needs the identity to be `active` (409 `identity_not_active`).
 ### `DELETE /external-issuers/{id}/bindings/{binding_id}` → 204
 
 Soft-deletes the binding.
+It keeps the OAuth client that `oauth_client` created, and that client stays linked to the identity.
+
+### Moving an IdP app to another identity
+
+A client belongs to one identity, and `client_id` is unique, so binding the app to another identity with `oauth_client` is 409 `client_conflict` while the old identity's client exists.
+Free the client id first, then bind:
+
+1. `DELETE /external-issuers/{id}/bindings/{binding_id}` for the old identity's binding (at most one binding per issuer and subject key is enabled).
+2. `GET /identities/{old_identity_id}/oauth-clients` lists the clients linked to the old identity. Take the client's `id` (its UUID), not its `client_id`.
+3. `DELETE /identities/{old_identity_id}/oauth-clients/{client_uuid}` → 200 deletes it. It is 404 when the identity is not in the caller's tenant, or when the client is linked to another identity or to none, so a tenant can remove only its own identities' clients. An approval-channel client is removed only from a trusted approval-channel context (403 otherwise).
+4. `POST /external-issuers/{id}/bindings` with the new identity and `oauth_client`.
+
+Deactivating an identity (`DELETE /identities/{id}`) keeps its clients linked, because deactivation can be undone. Step 3 works on a deactivated identity too.
 
 ## Migration ordering
 

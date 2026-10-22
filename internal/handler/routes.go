@@ -425,6 +425,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 		a.registerTenantSettingsRoutes(api)
 	}
 	a.registerOAuthClientRoutes(api)
+	a.registerIdentityOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)

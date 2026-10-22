@@ -516,6 +516,37 @@ func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error 
 	return s.repo.Delete(ctx, id)
 }
 
+// ListClientsForIdentity returns the clients linked to identityID. The caller
+// has already resolved the identity in its tenant; a client carries no tenant
+// of its own, so the identity is what scopes this list.
+func (s *OAuthClientService) ListClientsForIdentity(ctx context.Context, identityID string) ([]*domain.OAuthClient, error) {
+	return s.repo.ListByIdentityID(ctx, identityID)
+}
+
+// DeleteClientForIdentity removes the client with UUID id only if it is
+// linked to identityID, so it frees the client_id for another identity. A
+// client linked to any other identity, or to none, is ErrOAuthClientNotFound.
+// A client registered by a trusted approval-channel caller is removed only by
+// one, as in DeleteClient. The caller has already resolved the identity in
+// its tenant.
+func (s *OAuthClientService) DeleteClientForIdentity(ctx context.Context, identityID, id string) error {
+	client, err := s.repo.GetByID(ctx, id)
+	if err != nil || client.IdentityID == nil || *client.IdentityID != identityID {
+		return ErrOAuthClientNotFound
+	}
+	if client.ChannelTrusted && !TrustedApprovalChannelWrite(ctx) {
+		return ErrApprovalChannelWriteNotTrusted
+	}
+	deleted, err := s.repo.DeleteForIdentity(ctx, id, identityID)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return ErrOAuthClientNotFound
+	}
+	return nil
+}
+
 // ── RFC 7591 / RFC 7592 Dynamic Client Registration ──────────────────────────
 
 // dcrBcryptCost is the work factor used for hashing the registration_access_token.
