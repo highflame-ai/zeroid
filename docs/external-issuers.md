@@ -529,6 +529,8 @@ Free the client id first, then bind:
 4. `POST /external-issuers/{id}/bindings` with the new identity and `oauth_client`.
 
 Deactivating an identity (`DELETE /identities/{id}`) keeps its clients linked, because deactivation can be undone. Step 3 works on a deactivated identity too.
+A hard delete of an identity also deletes the clients linked to it (`ON DELETE CASCADE`, migration 061), which frees their client ids. Two paths hard-delete an identity: purging a discovery source (`POST /identities/discovered/purge-source`), and the rollback of a registration that failed part-way.
+Clients that an older release left unlinked when their identity was hard-deleted are not covered here; see #453.
 
 ## Migration ordering
 
