@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -179,7 +180,7 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 		Scopes:                scopes,
 		GrantType:             domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-		ClientID:              sub,
+		ClientID:              federatedClientID(row.Issuer, sub),
 		FederatedClientAuth:   true,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
@@ -199,4 +200,22 @@ func errorDescription(err error) string {
 		return oe.Description
 	}
 	return err.Error()
+}
+
+// kubernetesSubjectPrefix starts a Kubernetes service account subject,
+// system:serviceaccount:<namespace>:<name>.
+const kubernetesSubjectPrefix = "system:serviceaccount:"
+
+// federatedClientID is the client_id claim of a token minted from a federated
+// client assertion. Where the subject is globally unique (an AWS role ARN
+// names its account, a SPIFFE ID its trust domain, an Entra object id its
+// tenant), the client is the subject itself (RFC 7523 §3). A Kubernetes
+// service account subject repeats across clusters, so there the client is the
+// (issuer, subject) pair (ADR 0042 D8): two clusters' agents:foo must not
+// share a client_id downstream.
+func federatedClientID(issuer, sub string) string {
+	if strings.HasPrefix(sub, kubernetesSubjectPrefix) {
+		return issuer + "#" + sub
+	}
+	return sub
 }

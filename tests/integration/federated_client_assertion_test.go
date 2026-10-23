@@ -92,7 +92,9 @@ func TestFederatedClientAssertion(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 		claims := decodeJWTPayload(t, resp.AccessToken)
 		assert.Equal(t, w.wimse, claims["sub"], "the token is the bound agent's")
-		assert.Equal(t, w.sub, claims["client_id"], "client_id is the assertion's sub (RFC 7523 §3)")
+		// A Kubernetes subject repeats across clusters, so the client is the
+		// (issuer, subject) pair (ADR 0042 D8).
+		assert.Equal(t, w.f.idp.K8sIssuer()+"#"+w.sub, claims["client_id"])
 		assert.Equal(t, "client_credentials", claims["grant_type"])
 		assert.Equal(t, "federated_assertion", claims["client_auth"])
 		assert.Equal(t, w.tn.account, claims["account_id"], "the tenant comes from the binding (D5)")

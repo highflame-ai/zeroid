@@ -155,7 +155,7 @@ When the assertion's `iss` names a `workload` row in database mode, ZeroID takes
 5. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
 6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)`, after the scope checks, because a Kubernetes subject repeats across clusters.
 
-The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is the assertion's `sub`, and `client_auth` is `federated_assertion`.
+The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is the assertion's `sub` where that is globally unique: an AWS role ARN, a SPIFFE ID, an Entra object id. A Kubernetes service account subject repeats across clusters, so its `client_id` is `<iss>#<sub>`. `client_auth` is `federated_assertion`.
 
 A token with `client_auth=federated_assertion` cannot enroll a key through `POST /agents/self/public-key`. The token is held by whatever runs the agent's credential provider, such as an AgentCore token vault or a gateway, and the agent was meant to hold no secret.
 
