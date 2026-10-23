@@ -2,21 +2,17 @@ package service
 
 import "testing"
 
+// Any account can add its own issuer and bind any subject string, so the
+// client_id is always issuer-qualified: the same sub under two issuers (two
+// clusters, or a lookalike issuer in another tenant) never shares one.
 func TestFederatedClientID(t *testing.T) {
-	cases := map[string]struct{ iss, sub, want string }{
-		"AWS role ARN is globally unique":               {"https://abc.tokens.sts.global.api.aws", "arn:aws:iam::111122223333:role/agent", "arn:aws:iam::111122223333:role/agent"},
-		"SPIFFE ID names its trust domain":              {"https://spire.example", "spiffe://example.org/agent", "spiffe://example.org/agent"},
-		"Kubernetes subject is qualified by its issuer": {"https://cluster-a.example", "system:serviceaccount:agents:foo", "https://cluster-a.example#system:serviceaccount:agents:foo"},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := federatedClientID(tc.iss, tc.sub); got != tc.want {
-				t.Fatalf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-	if federatedClientID("https://cluster-a.example", "system:serviceaccount:agents:foo") ==
-		federatedClientID("https://cluster-b.example", "system:serviceaccount:agents:foo") {
-		t.Fatal("two clusters' service accounts must not share a client_id")
+	for _, sub := range []string{"system:serviceaccount:agents:foo", "arn:aws:iam::111122223333:role/agent", "spiffe://example.org/agent"} {
+		a, b := federatedClientID("https://issuer-a.example", sub), federatedClientID("https://issuer-b.example", sub)
+		if a != "https://issuer-a.example#"+sub {
+			t.Fatalf("got %q, want <iss>#<sub>", a)
+		}
+		if a == b {
+			t.Fatalf("%q under two issuers shares a client_id", sub)
+		}
 	}
 }

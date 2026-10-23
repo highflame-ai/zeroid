@@ -92,8 +92,8 @@ func TestFederatedClientAssertion(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 		claims := decodeJWTPayload(t, resp.AccessToken)
 		assert.Equal(t, w.wimse, claims["sub"], "the token is the bound agent's")
-		// A Kubernetes subject repeats across clusters, so the client is the
-		// (issuer, subject) pair (ADR 0042 D8).
+		// The client is the (issuer, subject) pair: a Kubernetes subject
+		// repeats across clusters, and any tenant can bind any subject string.
 		assert.Equal(t, w.f.idp.K8sIssuer()+"#"+w.sub, claims["client_id"])
 		assert.Equal(t, "client_credentials", claims["grant_type"])
 		assert.Equal(t, "federated_assertion", claims["client_auth"])
@@ -101,8 +101,26 @@ func TestFederatedClientAssertion(t *testing.T) {
 		assert.Equal(t, w.tn.project, claims["project_id"])
 	})
 
-	t.Run("a client_id equal to the assertion's sub is accepted", func(t *testing.T) {
-		resp := w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_id": w.sub})
+	t.Run("a client_id equal to the sub or to <iss>#<sub> is accepted", func(t *testing.T) {
+		for _, id := range []string{w.sub, w.f.idp.K8sIssuer() + "#" + w.sub} {
+			resp := w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_id": id})
+			assert.Equal(t, http.StatusOK, resp.StatusCode, "client_id %q: %s", id, resp.RawBody)
+		}
+	})
+
+	t.Run("an aud naming this server's token endpoint is accepted", func(t *testing.T) {
+		resp := w.clientCredentials(t, w.assertion(t, map[string]any{"aud": federationIssuer + "/oauth2/token"}), nil)
+		// The row must list it too; it lists only the issuer, so this is the
+		// row's refusal, after verification, not the server-audience one.
+		requireRefused(t, resp, "invalid_client")
+		status, _ := w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+			map[string]any{"audiences": []string{federationIssuer, federationIssuer + "/oauth2/token"}}, w.tn.headers)
+		require.Equal(t, http.StatusOK, status)
+		t.Cleanup(func() {
+			_, _ = w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+				map[string]any{"audiences": []string{federationIssuer}}, w.tn.headers)
+		})
+		resp = w.clientCredentials(t, w.assertion(t, map[string]any{"aud": federationIssuer + "/oauth2/token"}), nil)
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
@@ -119,7 +137,7 @@ func TestFederatedClientAssertion(t *testing.T) {
 		}{
 			{"a replayed assertion", replayed, nil, "invalid_client", "replay"},
 			{"several audiences", w.assertion(t, map[string]any{"aud": []string{federationIssuer, "https://elsewhere.example"}}), nil, "invalid_client", "exactly one audience"},
-			{"an audience the row does not trust", w.assertion(t, map[string]any{"aud": "https://elsewhere.example"}), nil, "invalid_client", "aud"},
+			{"an audience the row does not trust", w.assertion(t, map[string]any{"aud": "https://elsewhere.example"}), nil, "invalid_client", "invalid client credentials"},
 			{"no jti", w.assertion(t, map[string]any{"jti": nil}), nil, "invalid_client", "jti"},
 			{"a client_id that is not the sub", w.assertion(t, nil), map[string]any{"client_id": "someone-else"}, "invalid_client", "client_id"},
 			{"a subject with no binding", w.assertion(t, map[string]any{"sub": "system:serviceaccount:agents:unbound"}), nil, "invalid_grant", "no enabled binding"},
@@ -132,6 +150,14 @@ func TestFederatedClientAssertion(t *testing.T) {
 				assert.Contains(t, resp.RawBody, tc.contains)
 			})
 		}
+	})
+
+	t.Run("the jti is spent before the binding is read", func(t *testing.T) {
+		unbound := w.assertion(t, map[string]any{"sub": "system:serviceaccount:agents:" + uid("unbound")})
+		requireRefused(t, w.clientCredentials(t, unbound, nil), "invalid_grant")
+		resp := w.clientCredentials(t, unbound, nil)
+		requireRefused(t, resp, "invalid_client")
+		assert.Contains(t, resp.RawBody, "replay")
 	})
 
 	t.Run("lifetime is capped by the row's max token age, not by time left", func(t *testing.T) {
@@ -165,13 +191,36 @@ func TestFederatedClientAssertion(t *testing.T) {
 		assert.Contains(t, resp.RawBody, "this server's issuer or token endpoint")
 	})
 
+	// Until the signature verifies, every refusal is the one an unknown client
+	// gets: an unsigned probe learns nothing about which issuers, claims or
+	// rows this server trusts.
+	requireGeneric := func(t *testing.T, resp tokenResponse) {
+		t.Helper()
+		requireRefused(t, resp, "invalid_client")
+		assert.Contains(t, resp.RawBody, "invalid client credentials")
+	}
+
 	t.Run("a signature from another issuer's key", func(t *testing.T) {
 		forged, _, err := w.f.idp.Mint(mockidp.MintRequest{
 			Profile: mockidp.ProfileEntraAppOnly,
 			Claims:  map[string]any{"iss": w.f.idp.K8sIssuer(), "sub": w.sub, "aud": federationIssuer, "jti": uid("jti")},
 		})
 		require.NoError(t, err)
-		requireRefused(t, w.clientCredentials(t, forged, nil), "invalid_client")
+		requireGeneric(t, w.clientCredentials(t, forged, nil))
+	})
+
+	t.Run("an unsigned probe", func(t *testing.T) {
+		payload, err := json.Marshal(map[string]any{"iss": w.f.idp.K8sIssuer(), "sub": w.sub, "aud": federationIssuer,
+			"jti": uid("jti"), "iat": time.Now().Unix(), "exp": time.Now().Add(time.Minute).Unix()})
+		require.NoError(t, err)
+		probe := craftUnsignedJWT("none", string(payload))
+		resp := w.clientCredentials(t, probe, nil)
+		requireGeneric(t, resp)
+		assert.NotContains(t, resp.RawBody, "alg")
+	})
+
+	t.Run("a client_secret alongside the assertion", func(t *testing.T) {
+		requireGeneric(t, w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_secret": "s3cret"}))
 	})
 
 	t.Run("not yet valid", func(t *testing.T) {
@@ -180,12 +229,11 @@ func TestFederatedClientAssertion(t *testing.T) {
 	})
 
 	t.Run("no iat", func(t *testing.T) {
-		requireRefused(t, w.clientCredentials(t, w.assertion(t, map[string]any{"iat": nil}), nil), "invalid_client")
+		requireGeneric(t, w.clientCredentials(t, w.assertion(t, map[string]any{"iat": nil}), nil))
 	})
 
 	t.Run("the wrong client_assertion_type", func(t *testing.T) {
-		resp := w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_assertion_type": "urn:example:other"})
-		requireRefused(t, resp, "invalid_client")
+		requireGeneric(t, w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_assertion_type": "urn:example:other"}))
 	})
 
 	t.Run("an agent that is not adopted gets nothing, and the refusal names its state", func(t *testing.T) {

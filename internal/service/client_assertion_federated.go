@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -76,21 +75,32 @@ func (s *OAuthService) workloadIssuerFor(ctx context.Context, req TokenRequest) 
 // federated client assertion is bound to.
 func (s *OAuthService) federatedClientCredentials(ctx context.Context, req TokenRequest, entry *ExternalIssuerEntry) (*domain.AccessToken, error) {
 	row := entry.Row
+	// Until the assertion's signature verifies, every refusal is the generic
+	// one an unknown client gets, and the reason goes to the log: a distinct
+	// answer would tell an unsigned probe that its iss and claims matched an
+	// enabled row.
+	refuseUnverified := func(reason string, cause error) error {
+		log.Info().Str("issuer", row.Issuer).Str("reason", reason).Err(cause).
+			Msg("federated client assertion refused before verification")
+		return oauthUnauthorized("invalid client credentials", cause)
+	}
 	if req.ClientAssertionType != clientAssertionTypeJWTBearer {
-		return nil, oauthUnauthorized(fmt.Sprintf(
-			"client_assertion_type must be %q", clientAssertionTypeJWTBearer), nil)
+		return nil, refuseUnverified("client_assertion_type is not jwt-bearer", nil)
+	}
+	// One client authentication method per request (RFC 6749 §2.3).
+	if req.ClientSecret != "" {
+		return nil, refuseUnverified("client_secret sent with a client_assertion", nil)
 	}
 
 	// Signature against the row's JWKS, iss, the row's audiences, its claim
-	// constraints, sub and exp present, and the row's token-age cap.
+	// constraints, sub, exp and iat present, and the row's token-age cap.
 	verified, err := validateExternalAssertion(ctx, req.ClientAssertion, entry, "client_assertion", requirePlainSub)
 	if err != nil {
 		var oe *OAuthError
 		if errors.As(err, &oe) && oe.HTTPStatus >= http.StatusInternalServerError {
 			return nil, err
 		}
-		// A client-authentication failure is invalid_client (RFC 6749 §5.2).
-		return nil, oauthUnauthorized(errorDescription(err), err)
+		return nil, refuseUnverified(errorDescription(err), err)
 	}
 
 	// D8: aud is single-valued and names this server: its issuer or its
@@ -106,9 +116,11 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	}
 
 	sub, _ := verified.Subject()
-	// RFC 7523 §3 makes sub the client_id. The handler fills an omitted
-	// client_id from the assertion's iss, so that value is "not sent".
-	if req.ClientID != "" && req.ClientID != row.Issuer && req.ClientID != sub {
+	clientID := federatedClientID(row.Issuer, sub)
+	// RFC 7523 §3 makes sub the client_id; the issued token names the client
+	// as <iss>#<sub>. The handler fills an omitted client_id from the
+	// assertion's iss, so that value means "not sent".
+	if req.ClientID != "" && req.ClientID != row.Issuer && req.ClientID != sub && req.ClientID != clientID {
 		return nil, oauthUnauthorized("client_id must equal the client_assertion's sub", nil)
 	}
 
@@ -116,15 +128,11 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	// max_token_age_seconds (600 s by default). That fits STS's 300 s default
 	// and Kubernetes' 600 s minimum, and refuses a long-lived token at any
 	// point in its life, not only while it is fresh.
+	// validateExternalAssertion has required exp and iat, and the row's age
+	// cap (validated to 1..3600 s) is always set.
 	exp, _ := verified.Expiration()
-	iat, ok := verified.IssuedAt()
-	if !ok {
-		return nil, oauthUnauthorized("client_assertion missing required iat claim", nil)
-	}
+	iat, _ := verified.IssuedAt()
 	maxLifetime := time.Duration(row.MaxTokenAgeSeconds) * time.Second
-	if maxLifetime <= 0 {
-		maxLifetime = time.Duration(domain.DefaultIssuerMaxTokenAgeSeconds) * time.Second
-	}
 	if exp.Sub(iat) > maxLifetime {
 		return nil, oauthUnauthorized(fmt.Sprintf(
 			"client_assertion lifetime exceeds the issuer's %s", maxLifetime), nil)
@@ -136,6 +144,22 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	if len(jti) > maxClientAssertionJTILength {
 		return nil, oauthUnauthorized(fmt.Sprintf(
 			"client_assertion jti exceeds %d characters", maxClientAssertionJTILength), nil)
+	}
+
+	// Single use, spent once the assertion itself has passed every check and
+	// before the binding is read, so a captured assertion cannot replay the
+	// binding and adoption refusals (and their events) over and over. Keyed on
+	// (iss, sub, jti): a Kubernetes subject repeats across clusters, so the
+	// subject alone does not name one client.
+	if s.clientAssertionReplay == nil {
+		return nil, oauthServerError("client assertion replay store is not configured", nil)
+	}
+	replayKey := clientAssertionReplayKey("federated\x00"+row.Issuer+"\x00"+sub, jti)
+	if err := s.clientAssertionReplay.Insert(ctx, replayKey, exp.Add(clientAssertionClockSkew)); err != nil {
+		if errors.Is(err, dpop.ErrReplay) {
+			return nil, oauthUnauthorized("client_assertion has already been used (replay)", nil)
+		}
+		return nil, oauthServerError("client assertion replay check failed", err)
 	}
 
 	identity, err := s.bindFederatedAgent(ctx, row, sub, nil, federatedGrantClientCredentials)
@@ -158,21 +182,6 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 		return nil, err
 	}
 
-	// Single use, recorded after every check this grant makes, so an
-	// assertion refused for its scope or binding keeps its jti. Keyed on
-	// (iss, sub, jti): a Kubernetes subject repeats across clusters, so the
-	// subject alone does not name one client.
-	if s.clientAssertionReplay == nil {
-		return nil, oauthServerError("client assertion replay store is not configured", nil)
-	}
-	replayKey := clientAssertionReplayKey("federated\x00"+row.Issuer+"\x00"+sub, jti)
-	if err := s.clientAssertionReplay.Insert(ctx, replayKey, exp.Add(clientAssertionClockSkew)); err != nil {
-		if errors.Is(err, dpop.ErrReplay) {
-			return nil, oauthUnauthorized("client_assertion has already been used (replay)", nil)
-		}
-		return nil, oauthServerError("client assertion replay check failed", err)
-	}
-
 	issue := IssueRequest{
 		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
 		Identity:              identity,
@@ -180,7 +189,7 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 		Scopes:                scopes,
 		GrantType:             domain.GrantTypeClientCredentials,
 		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-		ClientID:              federatedClientID(row.Issuer, sub),
+		ClientID:              clientID,
 		FederatedClientAuth:   true,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
@@ -202,20 +211,13 @@ func errorDescription(err error) string {
 	return err.Error()
 }
 
-// kubernetesSubjectPrefix starts a Kubernetes service account subject,
-// system:serviceaccount:<namespace>:<name>.
-const kubernetesSubjectPrefix = "system:serviceaccount:"
-
 // federatedClientID is the client_id claim of a token minted from a federated
-// client assertion. Where the subject is globally unique (an AWS role ARN
-// names its account, a SPIFFE ID its trust domain, an Entra object id its
-// tenant), the client is the subject itself (RFC 7523 §3). A Kubernetes
-// service account subject repeats across clusters, so there the client is the
-// (issuer, subject) pair (ADR 0042 D8): two clusters' agents:foo must not
-// share a client_id downstream.
+// client assertion: <iss>#<sub>. Always qualified, even for subjects that
+// look globally unique such as an AWS role ARN: any account can add its own
+// issuer and bind any subject string, so a bare sub would let one tenant mint
+// tokens carrying another tenant's client_id. The issuer is the part an
+// assertion cannot fake, since it verifies against that issuer's keys.
+// Issuer URLs carry no fragment, so the first '#' always separates the two.
 func federatedClientID(issuer, sub string) string {
-	if strings.HasPrefix(sub, kubernetesSubjectPrefix) {
-		return issuer + "#" + sub
-	}
-	return sub
+	return issuer + "#" + sub
 }

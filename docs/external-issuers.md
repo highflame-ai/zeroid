@@ -135,7 +135,7 @@ Until then the mint refuses it as not adopted (D7), naming the state.
 
 ## The workload path: federated client assertions
 
-An agent acting as itself, with no person behind it, gets a token with `grant_type=client_credentials` and a `client_assertion` that its platform signed for it (ADR 0042 D8, path P2): an AWS STS web identity token, a Kubernetes service account token, a SPIFFE JWT-SVID, or an Entra app token. The agent holds no secret and registers no OAuth client.
+An agent acting as itself, with no person behind it, gets a token with `grant_type=client_credentials` and a `client_assertion` that its platform signed for it (ADR 0042 D8, path P2): an AWS STS web identity token, a Kubernetes service account token, or a SPIFFE JWT-SVID. The agent holds no secret and registers no OAuth client. Entra app-only tokens are not accepted yet: they carry `uti` rather than `jti`, and live far longer than the age cap allows.
 
 ```
 POST /oauth2/token
@@ -148,18 +148,21 @@ resource=https://gateway.example (optional, RFC 8707)
 
 When the assertion's `iss` names a `workload` row in database mode, ZeroID takes this path instead of looking for a registered client:
 
-1. Exactly one enabled `workload` row for `iss` matches the assertion's claims. An `iss` with workload rows that are disabled, unmatched or ambiguous is refused, not passed on to the registered-client path. The assertion isn't verified yet, so the refusal is the generic `invalid client credentials`, and the reason goes to the log: a distinct answer would tell an unsigned probe which issuers and claim values an account trusts.
-2. The assertion verifies against the row's JWKS, with the row's algorithms, issuer, claim constraints and token-age cap.
-3. `aud` is exactly one value. It must be ZeroID's issuer or its token endpoint (RFC 7523 §3), and also one of the row's `audiences`. STS can put several audiences in one token, and a token minted for several servers, or for a broad audience such as a cluster's API server, could be replayed at each of them.
-4. `iat` and `jti` are present, and the lifetime from `iat` to `exp` is at most the row's `max_token_age_seconds` (600 by default). That fits STS's 300-second default and Kubernetes' 600-second minimum, and refuses a long-lived token at any point in its life. A `client_id`, if sent, must equal `sub` (RFC 7523 §3).
-5. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
-6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)`, after the scope checks, because a Kubernetes subject repeats across clusters.
+1. Exactly one enabled `workload` row for `iss` matches the assertion's claims. An `iss` with workload rows that are disabled, unmatched or ambiguous is refused, not passed on to the registered-client path.
+2. `client_assertion_type` is jwt-bearer, and no `client_secret` is sent alongside the assertion.
+3. The assertion verifies against the row's JWKS, with the row's algorithms, issuer, `audiences`, claim constraints and token-age cap (measured since `iat`).
 
-The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is the assertion's `sub` where that is globally unique: an AWS role ARN, a SPIFFE ID, an Entra object id. A Kubernetes service account subject repeats across clusters, so its `client_id` is `<iss>#<sub>`. `client_auth` is `federated_assertion`.
+   Every refusal up to here is the generic `invalid client credentials`, with the reason in the log: until the signature verifies, a distinct answer would tell an unsigned probe which issuers and claim values an account trusts.
+4. `aud` is exactly one value. It must be ZeroID's issuer or its token endpoint (RFC 7523 §3), and also one of the row's `audiences`. STS can put several audiences in one token, and a token minted for several servers, or for a broad audience such as a cluster's API server, could be replayed at each of them.
+5. `jti` is present, and the lifetime from `iat` to `exp` is at most the row's `max_token_age_seconds` (600 by default). That fits STS's 300-second default and Kubernetes' 600-second minimum, and refuses a long-lived token at any point in its life. A `client_id`, if sent, must be `sub` (RFC 7523 §3), `<iss>#<sub>`, or `iss`.
+6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)` because a Kubernetes subject repeats across clusters. It is spent here, before the binding is read, so a captured assertion cannot replay binding refusals.
+7. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
+
+The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is always `<iss>#<sub>`: a Kubernetes subject repeats across clusters, and any account can add its own issuer and bind any subject string, so `sub` alone never names one client. Issuer URLs carry no fragment, so the first `#` separates the two. `client_auth` is `federated_assertion`.
 
 A token with `client_auth=federated_assertion` cannot enroll a key through `POST /agents/self/public-key`. The token is held by whatever runs the agent's credential provider, such as an AgentCore token vault or a gateway, and the agent was meant to hold no secret.
 
-Failures before the binding is read are `invalid_client` (401): a bad signature, a wrong or multi-valued `aud`, an expired or over-long assertion, a missing `iat` or `jti`, a replay, a mismatched `client_id`. A missing, disabled or unadopted binding is `invalid_grant`, with the same unmatched-agent and not-adopted events as the person grants.
+Failures before the binding is read are `invalid_client` (401): those in steps 1–3 with the generic answer, and a multi-valued or foreign `aud`, an over-long assertion, a missing `jti`, a mismatched `client_id` or a replay with their reason. A missing, disabled or unadopted binding is `invalid_grant`, with the same unmatched-agent and not-adopted events as the person grants.
 
 ## The person grants with issuer rows
 
