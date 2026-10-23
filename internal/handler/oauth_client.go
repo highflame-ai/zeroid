@@ -20,7 +20,7 @@ import (
 type CreateOAuthClientInput struct {
 	Body struct {
 		// Core
-		ClientID    string `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier"`
+		ClientID    string `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier. Must not contain '#', which is reserved for federated client ids (<iss>#<sub>)."`
 		Name        string `json:"name" required:"true" minLength:"1" doc:"Client display name"`
 		Description string `json:"description,omitempty" doc:"Human-readable description"`
 

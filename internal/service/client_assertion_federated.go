@@ -35,6 +35,10 @@ const (
 	ClientAuthFederatedAssertion = "federated_assertion"
 )
 
+// federatedAuthUnavailable is the description of a server-side failure to
+// verify a federated client assertion. The detail goes to the log.
+const federatedAuthUnavailable = "client authentication is temporarily unavailable"
+
 // workloadIssuerFor reports whether req's client_assertion was issued by an
 // enabled workload issuer row, and returns its entry. An assertion whose iss
 // names no workload row (a registered client's own private_key_jwt) returns
@@ -98,7 +102,13 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	if err != nil {
 		var oe *OAuthError
 		if errors.As(err, &oe) && oe.HTTPStatus >= http.StatusInternalServerError {
-			return nil, err
+			// A server-side failure keeps its status, so the client retries
+			// rather than giving up, but not its description: that can name
+			// the issuer ("failed to load JWKS for issuer ..."), which an
+			// unsigned probe must not learn is trusted.
+			log.Warn().Str("issuer", row.Issuer).Err(err).
+				Msg("federated client assertion could not be verified")
+			return nil, &OAuthError{Code: oe.Code, Description: federatedAuthUnavailable, HTTPStatus: oe.HTTPStatus, err: err}
 		}
 		return nil, refuseUnverified(errorDescription(err), err)
 	}

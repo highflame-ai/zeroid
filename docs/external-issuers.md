@@ -146,6 +146,11 @@ scope=tools:read                 (optional)
 resource=https://gateway.example (optional, RFC 8707)
 ```
 
+Before an agent can use it:
+
+- The row's `audiences` must include ZeroID's issuer or its token endpoint (`<issuer>/oauth2/token`), whichever the platform puts in `aud`. Step 4 below requires `aud` to be both one of these and listed on the row.
+- The bound identity's credential policy must allow `client_credentials` in `allowed_grant_types`, or the grant is refused after the binding is read.
+
 When the assertion's `iss` names a `workload` row in database mode, ZeroID takes this path instead of looking for a registered client:
 
 1. Exactly one enabled `workload` row for `iss` matches the assertion's claims. An `iss` with workload rows that are disabled, unmatched or ambiguous is refused, not passed on to the registered-client path.
@@ -158,11 +163,14 @@ When the assertion's `iss` names a `workload` row in database mode, ZeroID takes
 6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)` because a Kubernetes subject repeats across clusters. It is spent here, before the binding is read, so a captured assertion cannot replay binding refusals.
 7. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
 
-The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is always `<iss>#<sub>`: a Kubernetes subject repeats across clusters, and any account can add its own issuer and bind any subject string, so `sub` alone never names one client. Issuer URLs carry no fragment, so the first `#` separates the two. `client_auth` is `federated_assertion`.
+The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is always `<iss>#<sub>`: a Kubernetes subject repeats across clusters, and any account can add its own issuer and bind any subject string, so `sub` alone never names one client. Issuer URLs carry no fragment, so the first `#` separates the two. `client_auth` is `federated_assertion`. No registered OAuth client can carry a `client_id` containing `#`: admin registration and a binding's presenting client refuse one with 400, and a CIMD client id containing `#` is invalid. So a registered client can never share a `client_id` with a federated one.
 
 A token with `client_auth=federated_assertion` cannot enroll a key through `POST /agents/self/public-key`. The token is held by whatever runs the agent's credential provider, such as an AgentCore token vault or a gateway, and the agent was meant to hold no secret.
 
 Failures before the binding is read are `invalid_client` (401): those in steps 1–3 with the generic answer, and a multi-valued or foreign `aud`, an over-long assertion, a missing `jti`, a mismatched `client_id` or a replay with their reason. A missing, disabled or unadopted binding is `invalid_grant`, with the same unmatched-agent and not-adopted events as the person grants.
+A server-side failure while verifying, such as an issuer whose JWKS cannot be fetched, keeps its 5xx status (`server_error`) but answers with the generic `client authentication is temporarily unavailable`; the detail, which names the issuer, goes to the log.
+
+The agent cannot revoke its own token at `POST /oauth2/token/revoke`. It has no registered client to authenticate as, so presenting the federated assertion, or `<iss>#<sub>` as `client_id`, is refused with `invalid_client` (401). A revocation with no client authentication is refused the same way unless `token.allow_unauthenticated_token_inspection` is set, which production never allows. The token lives out its lifetime unless an administrator revokes it through `POST /credentials/{id}/revoke`; disabling the binding or the row stops new tokens.
 
 ## The person grants with issuer rows
 

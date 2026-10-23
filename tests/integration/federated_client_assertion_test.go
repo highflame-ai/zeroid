@@ -124,6 +124,84 @@ func TestFederatedClientAssertion(t *testing.T) {
 		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
 	})
 
+	t.Run("the replay key names the subject, not the jti alone", func(t *testing.T) {
+		other := "system:serviceaccount:agents:" + uid("sa")
+		status, body := w.f.bind(t, w.tn, w.rowID, other, w.agent, false)
+		require.Equal(t, http.StatusCreated, status, "bind: %v", body)
+		jti := uid("jti")
+		for _, sub := range []string{w.sub, other} {
+			resp := w.clientCredentials(t, w.assertion(t, map[string]any{"sub": sub, "jti": jti}), nil)
+			assert.Equal(t, http.StatusOK, resp.StatusCode, "jti %q under %q: %s", jti, sub, resp.RawBody)
+		}
+	})
+
+	t.Run("a registered private_key_jwt client still takes the registered path", func(t *testing.T) {
+		// Its assertion's iss is its own client_id, which names no workload
+		// row, so the workload row on this server must not catch it.
+		clientID := uid("pkjwt-cc")
+		key := generateKey(t)
+		reg := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id":                  clientID,
+			"name":                       clientID,
+			"token_endpoint_auth_method": "private_key_jwt",
+			"jwks":                       clientJWKS(t, key),
+			"grant_types":                []string{"client_credentials"},
+			"scopes":                     []string{"tools:read"},
+			"identity_id":                w.agent,
+		}, w.tn.headers)
+		require.Equal(t, http.StatusCreated, reg.StatusCode)
+		_ = reg.Body.Close()
+		resp := postFederation(t, w.f.http.URL, merged(map[string]any{
+			"grant_type": "client_credentials", "scope": "tools:read",
+		}, clientCreds(t, clientID, key)))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeJWTPayload(t, resp.AccessToken)
+		assert.Equal(t, clientID, claims["client_id"])
+		assert.Nil(t, claims["client_auth"])
+	})
+
+	t.Run("claim constraints the assertion does not meet get the generic refusal", func(t *testing.T) {
+		status, body := w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+			map[string]any{"claim_constraints": map[string][]string{"team": {"payments"}}}, w.tn.headers)
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		t.Cleanup(func() {
+			_, _ = w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+				map[string]any{"claim_constraints": map[string][]string{}}, w.tn.headers)
+		})
+		resp := w.clientCredentials(t, w.assertion(t, nil), nil)
+		requireRefused(t, resp, "invalid_client")
+		assert.Contains(t, resp.RawBody, "invalid client credentials")
+		assert.NotContains(t, resp.RawBody, "constraint")
+		resp = w.clientCredentials(t, w.assertion(t, map[string]any{"team": "payments"}), nil)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "an assertion that meets them: %s", resp.RawBody)
+	})
+
+	t.Run("the agent cannot revoke its own token: there is no client to authenticate as", func(t *testing.T) {
+		token := w.clientCredentials(t, w.assertion(t, nil), nil).AccessToken
+		require.NotEmpty(t, token)
+		call := func(path string, body map[string]any) (int, map[string]any) {
+			b, err := json.Marshal(body)
+			require.NoError(t, err)
+			resp, err := http.Post(w.f.http.URL+path, "application/json", bytes.NewReader(b))
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+			var out map[string]any
+			_ = json.NewDecoder(resp.Body).Decode(&out)
+			return resp.StatusCode, out
+		}
+		for name, auth := range map[string]map[string]any{
+			"a federated assertion": {"client_assertion": w.assertion(t, nil), "client_assertion_type": clientAssertionType},
+			"<iss>#<sub>":           {"client_id": w.f.idp.K8sIssuer() + "#" + w.sub},
+			// This server requires authentication on token inspection, as
+			// production always does.
+			"no client authentication": {},
+		} {
+			status, body := call("/oauth2/token/revoke", merged(map[string]any{"token": token}, auth))
+			assert.Equal(t, http.StatusUnauthorized, status, "%s: %v", name, body)
+			assert.Equal(t, "invalid_client", body["error"], name)
+		}
+	})
+
 	t.Run("refusals", func(t *testing.T) {
 		replayed := w.assertion(t, nil)
 		require.Equal(t, http.StatusOK, w.clientCredentials(t, replayed, nil).StatusCode)
@@ -285,4 +363,41 @@ func TestFederatedClientAssertion_TokenCannotEnrollAKey(t *testing.T) {
 	body := decode(t, enroll)
 	assert.Equal(t, http.StatusForbidden, enroll.StatusCode, "%v", body)
 	assert.Contains(t, body["detail"], "federated client assertion")
+}
+
+// The replay ledger is keyed on (iss, sub, jti): the same subject and jti
+// from two issuers are two assertions, not a replay.
+func TestFederatedClientAssertion_ReplayKeyNamesTheIssuer(t *testing.T) {
+	a, b := newWorkloadFed(t), newWorkloadFed(t)
+	status, body := b.f.bind(t, b.tn, b.rowID, a.sub, b.agent, false)
+	require.Equal(t, http.StatusCreated, status, "bind: %v", body)
+	jti := uid("jti")
+	resp := a.clientCredentials(t, a.assertion(t, map[string]any{"jti": jti}), nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	resp = b.clientCredentials(t, b.assertion(t, map[string]any{"sub": a.sub, "jti": jti}), nil)
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "the same sub and jti under another issuer: %s", resp.RawBody)
+}
+
+// '#' is reserved for federated client ids (<iss>#<sub>), so no registered
+// client can carry one, by whichever route it is registered.
+func TestRegisteredClientIDCannotContainHash(t *testing.T) {
+	t.Run("admin registration", func(t *testing.T) {
+		resp := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id": "https://cluster.example#system:serviceaccount:agents:" + uid("sa"),
+			"name":      "lookalike",
+		}, nil)
+		defer func() { _ = resp.Body.Close() }()
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Contains(t, decode(t, resp)["detail"], "'#'")
+	})
+
+	t.Run("a binding's presenting client", func(t *testing.T) {
+		f := newDBFederation(t)
+		tn := newTITenant(t)
+		tid := uid("hash-tid")
+		rowID := f.entraRow(t, tn, tid, nil)["id"].(string)
+		status, body := f.bind(t, tn, rowID, uid("app")+"#1", tn.agent(t).id, true)
+		require.Equal(t, http.StatusBadRequest, status, "%v", body)
+		assert.Equal(t, "invalid_request", body["code"])
+	})
 }

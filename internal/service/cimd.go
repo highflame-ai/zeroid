@@ -420,8 +420,10 @@ func (s *CIMDService) ResolveClient(ctx context.Context, clientID string) (*doma
 	// client_id must be a stable, canonical document location, and rejecting
 	// rather than stripping keeps the identifier the client presents everywhere
 	// byte-identical to the URL the document was fetched from, which is what
-	// the §4 self-reference check compares.
-	if u.RawQuery != "" || u.Fragment != "" {
+	// the §4 self-reference check compares. A bare trailing '#' parses to an
+	// empty fragment, so the raw string is checked too: '#' is reserved for
+	// federated client ids (<iss>#<sub>), and no other client may carry one.
+	if u.RawQuery != "" || u.Fragment != "" || strings.Contains(clientID, "#") {
 		return nil, fmt.Errorf("%w: must not contain a query string or fragment", ErrCIMDInvalidClientID)
 	}
 	// draft-02 §3: userinfo is MUST NOT. Beyond conformance this is the
