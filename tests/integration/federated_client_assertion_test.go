@@ -1,0 +1,238 @@
+package integration_test
+
+// Federated client assertions (ADR 0042 D8, path P2): an agent authenticates
+// on client_credentials with a token its workload issuer signed for it (here
+// a Kubernetes service account token from the mock IdP), resolved to its
+// identity through a binding, with no secret and no registered client.
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/highflame-ai/zeroid/internal/mockidp"
+)
+
+type workloadFed struct {
+	f      *dbFederation
+	tn     tiTenant
+	rowID  string
+	agent  string // identity id
+	wimse  string
+	sub    string // the service account the binding maps
+	policy string
+}
+
+func newWorkloadFed(t *testing.T) *workloadFed {
+	t.Helper()
+	w := &workloadFed{f: newDBFederation(t), tn: newTITenant(t)}
+	w.policy = createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("wl-policy"),
+		"allowed_grant_types": []string{"client_credentials"},
+		"allowed_scopes":      []string{"tools:read"},
+		"max_ttl_seconds":     3600,
+	}, w.tn.headers)
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":          uid("wl-agent"),
+		"identity_type":        "agent",
+		"trust_level":          "unverified",
+		"owner_user_id":        "user-test-owner",
+		"credential_policy_id": w.policy,
+	}, w.tn.headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	got := decode(t, resp)
+	_ = resp.Body.Close()
+	w.agent, w.wimse = got["id"].(string), got["wimse_uri"].(string)
+
+	status, body := w.f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+		"kind": "workload", "display_name": "Mock cluster", "issuer": w.f.idp.K8sIssuer(),
+		"audiences": []string{federationIssuer},
+	}, w.tn.headers)
+	require.Equal(t, http.StatusCreated, status, "create workload row: %v", body)
+	w.rowID = body["id"].(string)
+
+	w.sub = "system:serviceaccount:agents:" + uid("sa")
+	status, body = w.f.bind(t, w.tn, w.rowID, w.sub, w.agent, false)
+	require.Equal(t, http.StatusCreated, status, "bind: %v", body)
+	require.Equal(t, true, body["enabled"])
+	return w
+}
+
+// assertion mints a service account token for w.sub, aud = ZeroID, with a
+// fresh jti, then applies overrides.
+func (w *workloadFed) assertion(t *testing.T, overrides map[string]any) string {
+	t.Helper()
+	claims := map[string]any{"sub": w.sub, "aud": federationIssuer, "jti": uid("jti")}
+	for k, v := range overrides {
+		claims[k] = v
+	}
+	return w.f.mint(t, mockidp.ProfileK8sServiceAccount, claims)
+}
+
+func (w *workloadFed) clientCredentials(t *testing.T, assertion string, extra map[string]any) tokenResponse {
+	t.Helper()
+	return postFederation(t, w.f.http.URL, merged(map[string]any{
+		"grant_type":            "client_credentials",
+		"scope":                 "tools:read",
+		"client_assertion":      assertion,
+		"client_assertion_type": clientAssertionType,
+	}, extra))
+}
+
+func TestFederatedClientAssertion(t *testing.T) {
+	w := newWorkloadFed(t)
+
+	t.Run("mints a token for the bound agent, with no secret and no registered client", func(t *testing.T) {
+		resp := w.clientCredentials(t, w.assertion(t, nil), nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeJWTPayload(t, resp.AccessToken)
+		assert.Equal(t, w.wimse, claims["sub"], "the token is the bound agent's")
+		assert.Equal(t, w.sub, claims["client_id"], "client_id is the assertion's sub (RFC 7523 §3)")
+		assert.Equal(t, "client_credentials", claims["grant_type"])
+		assert.Equal(t, "federated_assertion", claims["client_auth"])
+		assert.Equal(t, w.tn.account, claims["account_id"], "the tenant comes from the binding (D5)")
+		assert.Equal(t, w.tn.project, claims["project_id"])
+	})
+
+	t.Run("a client_id equal to the assertion's sub is accepted", func(t *testing.T) {
+		resp := w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_id": w.sub})
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+
+	t.Run("refusals", func(t *testing.T) {
+		replayed := w.assertion(t, nil)
+		require.Equal(t, http.StatusOK, w.clientCredentials(t, replayed, nil).StatusCode)
+
+		cases := []struct {
+			name      string
+			assertion string
+			extra     map[string]any
+			code      string
+			contains  string
+		}{
+			{"a replayed assertion", replayed, nil, "invalid_client", "replay"},
+			{"several audiences", w.assertion(t, map[string]any{"aud": []string{federationIssuer, "https://elsewhere.example"}}), nil, "invalid_client", "exactly one audience"},
+			{"an audience the row does not trust", w.assertion(t, map[string]any{"aud": "https://elsewhere.example"}), nil, "invalid_client", "aud"},
+			{"no jti", w.assertion(t, map[string]any{"jti": nil}), nil, "invalid_client", "jti"},
+			{"a client_id that is not the sub", w.assertion(t, nil), map[string]any{"client_id": "someone-else"}, "invalid_client", "client_id"},
+			{"a subject with no binding", w.assertion(t, map[string]any{"sub": "system:serviceaccount:agents:unbound"}), nil, "invalid_grant", "no enabled binding"},
+			{"another tenant named in the request", w.assertion(t, nil), map[string]any{"account_id": uid("other"), "project_id": "p"}, "invalid_grant", "tenant"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := w.clientCredentials(t, tc.assertion, tc.extra)
+				requireRefused(t, resp, tc.code)
+				assert.Contains(t, resp.RawBody, tc.contains)
+			})
+		}
+	})
+
+	t.Run("lifetime is capped by the row's max token age, not by time left", func(t *testing.T) {
+		mint := func(ttl int) string {
+			tok, _, err := w.f.idp.Mint(mockidp.MintRequest{
+				Profile: mockidp.ProfileK8sServiceAccount, TTLSeconds: ttl,
+				Claims: map[string]any{"sub": w.sub, "aud": federationIssuer, "jti": uid("jti")},
+			})
+			require.NoError(t, err)
+			return tok
+		}
+		// The Kubernetes TokenRequest API issues nothing shorter than 600 s.
+		resp := w.clientCredentials(t, mint(600), nil)
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "a fresh 600 s service account token: %s", resp.RawBody)
+		resp = w.clientCredentials(t, mint(1200), nil)
+		requireRefused(t, resp, "invalid_client")
+		assert.Contains(t, resp.RawBody, "lifetime")
+	})
+
+	t.Run("an audience the row lists but that is not this server", func(t *testing.T) {
+		const broad = "https://kubernetes.default.svc"
+		status, _ := w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+			map[string]any{"audiences": []string{federationIssuer, broad}}, w.tn.headers)
+		require.Equal(t, http.StatusOK, status)
+		t.Cleanup(func() {
+			_, _ = w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID,
+				map[string]any{"audiences": []string{federationIssuer}}, w.tn.headers)
+		})
+		resp := w.clientCredentials(t, w.assertion(t, map[string]any{"aud": broad}), nil)
+		requireRefused(t, resp, "invalid_client")
+		assert.Contains(t, resp.RawBody, "this server's issuer or token endpoint")
+	})
+
+	t.Run("a signature from another issuer's key", func(t *testing.T) {
+		forged, _, err := w.f.idp.Mint(mockidp.MintRequest{
+			Profile: mockidp.ProfileEntraAppOnly,
+			Claims:  map[string]any{"iss": w.f.idp.K8sIssuer(), "sub": w.sub, "aud": federationIssuer, "jti": uid("jti")},
+		})
+		require.NoError(t, err)
+		requireRefused(t, w.clientCredentials(t, forged, nil), "invalid_client")
+	})
+
+	t.Run("not yet valid", func(t *testing.T) {
+		future := time.Now().Add(10 * time.Minute).Unix()
+		requireRefused(t, w.clientCredentials(t, w.assertion(t, map[string]any{"nbf": future}), nil), "invalid_client")
+	})
+
+	t.Run("no iat", func(t *testing.T) {
+		requireRefused(t, w.clientCredentials(t, w.assertion(t, map[string]any{"iat": nil}), nil), "invalid_client")
+	})
+
+	t.Run("the wrong client_assertion_type", func(t *testing.T) {
+		resp := w.clientCredentials(t, w.assertion(t, nil), map[string]any{"client_assertion_type": "urn:example:other"})
+		requireRefused(t, resp, "invalid_client")
+	})
+
+	t.Run("an agent that is not adopted gets nothing, and the refusal names its state", func(t *testing.T) {
+		discovered := w.tn.discoveredAgent(t)
+		sub := "system:serviceaccount:agents:" + uid("unadopted")
+		status, body := w.f.bind(t, w.tn, w.rowID, sub, discovered, false)
+		require.Equal(t, http.StatusCreated, status, "%v", body)
+		resp := w.clientCredentials(t, w.assertion(t, map[string]any{"sub": sub}), nil)
+		requireRefused(t, resp, "invalid_grant")
+		assert.Contains(t, resp.RawBody, "discovered")
+	})
+
+	t.Run("a disabled issuer row authenticates no one", func(t *testing.T) {
+		status, _ := w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID, map[string]any{"enabled": false}, w.tn.headers)
+		require.Equal(t, http.StatusOK, status)
+		t.Cleanup(func() {
+			_, _ = w.f.call(t, http.MethodPatch, "/external-issuers/"+w.rowID, map[string]any{"enabled": true}, w.tn.headers)
+		})
+		resp := w.clientCredentials(t, w.assertion(t, nil), nil)
+		requireRefused(t, resp, "invalid_client")
+		// The assertion is not verified yet, so the refusal says nothing about
+		// which issuers this server trusts.
+		assert.Contains(t, resp.RawBody, "invalid client credentials")
+		assert.NotContains(t, resp.RawBody, "disabled")
+	})
+}
+
+// A token minted from a federated client assertion is held by whatever runs
+// the agent's credential provider, so it cannot enroll a durable key on an
+// agent that was meant to hold no secret.
+func TestFederatedClientAssertion_TokenCannotEnrollAKey(t *testing.T) {
+	w := newWorkloadFed(t)
+	resp := w.clientCredentials(t, w.assertion(t, nil), nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+
+	key := generateKey(t)
+	raw, err := json.Marshal(map[string]any{
+		"new_public_key_pem": ecPublicKeyPEM(t, key),
+		"new_key_proof":      "not-checked-before-the-token",
+	})
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, w.f.http.URL+"/agents/self/public-key", bytes.NewReader(raw))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+resp.AccessToken)
+	enroll, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = enroll.Body.Close() }()
+	body := decode(t, enroll)
+	assert.Equal(t, http.StatusForbidden, enroll.StatusCode, "%v", body)
+	assert.Contains(t, body["detail"], "federated client assertion")
+}

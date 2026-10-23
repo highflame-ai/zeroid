@@ -30,6 +30,7 @@ func TestSelfKeyTokenRefusal(t *testing.T) {
 		{"ID-JAG under rfc8693", own(internalMiddleware.AgentClaims{GrantType: "jwt_bearer", PrincipalType: "user"}), false},
 		{"api key bound to a resource", internalMiddleware.AgentClaims{GrantType: "api_key", Issuer: iss, Audience: []string{"https://mcp.example.com"}}, false},
 		{"client credentials bound to a gateway", internalMiddleware.AgentClaims{GrantType: "client_credentials", Issuer: iss, Audience: []string{"https://gateway.example.com"}}, false},
+		{"client credentials from a federated client assertion", own(internalMiddleware.AgentClaims{GrantType: "client_credentials", ClientAuth: "federated_assertion"}), false},
 		{"ID-JAG under legacy", own(internalMiddleware.AgentClaims{GrantType: "jwt_bearer", UserIDIssuer: "https://idp.example.com"}), false},
 	}
 	for _, tc := range cases {

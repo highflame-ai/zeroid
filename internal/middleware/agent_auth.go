@@ -34,6 +34,9 @@ type AgentClaims struct {
 	// such as a gateway or an RFC 8707 resource.
 	Issuer   string
 	Audience []string
+	// ClientAuth is the client_auth claim: "federated_assertion" when the
+	// client authenticated with a federated client assertion.
+	ClientAuth string
 }
 
 type agentClaimsKey struct{}
@@ -220,6 +223,9 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	}
 	if v, ok := token.Audience(); ok {
 		claims.Audience = v
+	}
+	if v, err := jwt.Get[string](token, "client_auth"); err == nil {
+		claims.ClientAuth = v
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {
