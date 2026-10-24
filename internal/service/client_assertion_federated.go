@@ -193,6 +193,7 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	}
 
 	issue := IssueRequest{
+		TTL:                   federatedAccessTokenTTL(policy),
 		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
 		Identity:              identity,
 		IdentityPolicyID:      policy.ID,
@@ -230,4 +231,24 @@ func errorDescription(err error) string {
 // Issuer URLs carry no fragment, so the first '#' always separates the two.
 func federatedClientID(issuer, sub string) string {
 	return issuer + "#" + sub
+}
+
+// federatedAccessTokenMaxTTL is the lifetime (seconds) of a token minted on a
+// federated client assertion: 15 minutes, like the other paths where an
+// external issuer authenticates the caller (ADR 0042 D9; ID-JAG and ID-token
+// exchange set the same). Disabling a binding or an issuer row stops new
+// mints but does not revoke tokens already issued, so this bounds how long
+// one outlives that change.
+const federatedAccessTokenMaxTTL = 900
+
+// federatedAccessTokenTTL is federatedAccessTokenMaxTTL, or the identity
+// policy's max_ttl_seconds when that is shorter. IssueCredential holds a
+// requested lifetime to the policy as a hard limit, so asking for 15 minutes
+// under a stricter policy would refuse the mint instead of shortening it.
+func federatedAccessTokenTTL(policy *domain.CredentialPolicy) int {
+	if policy != nil && policy.MaxTTLSeconds > 0 && policy.MaxTTLSeconds < federatedAccessTokenMaxTTL {
+		return policy.MaxTTLSeconds
+	}
+
+	return federatedAccessTokenMaxTTL
 }
