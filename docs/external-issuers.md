@@ -35,7 +35,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | Field | Meaning |
 |---|---|
 | `issuer` | The `iss` tokens carry, matched exactly. https. |
-| `kind` | `person`: an IdP whose ID-JAGs and ID tokens name people. `workload`: a client-assertion issuer (P2, not yet accepted by any grant). |
+| `kind` | `person`: an IdP whose ID-JAGs and ID tokens name people. `workload`: a client-assertion issuer for agents acting as themselves (P2); see [The workload path](#the-workload-path-federated-client-assertions). |
 | `jwks_uri` | Never supplied by the caller. ZeroID reads it from the issuer's OpenID discovery document, `{issuer}/.well-known/openid-configuration`, whose `issuer` must equal the row's issuer exactly (OpenID Connect Discovery §4.3); both fetches go through the SSRF-guarded client. It changes only through `POST /external-issuers/{id}/refresh`, which re-reads discovery. A caller-chosen key set would let an admin sign tokens for anyone their IdP's issuer names. |
 | `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
 | `algorithms` | A subset of RS256, ES256, PS256. |
@@ -124,6 +124,7 @@ The subject key is the value the credential carries at runtime:
 |---|---|
 | ID-JAG (P1b) | `act.sub`, the agent's client id at the IdP; the ID-JAG's `client_id` when it has no `act` (`act` is OPTIONAL in the draft) |
 | ID-token exchange (P1c) | the presenting client's `client_id`, which is the ID token's `aud` |
+| Federated client assertion (P2) | the assertion's `sub`: an AWS role ARN, `system:serviceaccount:<ns>:<name>`, a SPIFFE ID |
 
 At most one **enabled** binding may exist per `(issuer row, subject key)`.
 A binding for an identity that is not `active` is created disabled, and enabling one requires the identity to be active.
@@ -131,6 +132,45 @@ ZeroID never enables a binding itself: the deployer (in SaaS, Admin) enables an 
 Each binding carries `explicitly_disabled`: true when an admin disabled it (`PATCH {"enabled": false}`) or created it with `"enabled": false`, false when it is disabled only because its identity was not active yet.
 At adoption the deployer enables bindings with the conditional PATCH below, which skips any with `explicitly_disabled: true`, so adoption never undoes an admin's decision; a plain `PATCH {"enabled": true}` clears it.
 Until then the mint refuses it as not adopted (D7), naming the state.
+
+## The workload path: federated client assertions
+
+An agent acting as itself, with no person behind it, gets a token with `grant_type=client_credentials` and a `client_assertion` that its platform signed for it (ADR 0042 D8, path P2): an AWS STS web identity token, a Kubernetes service account token, or a SPIFFE JWT-SVID. The agent holds no secret and registers no OAuth client. Entra app-only tokens are not accepted yet: they carry `uti` rather than `jti`, and live far longer than the age cap allows.
+
+```
+POST /oauth2/token
+grant_type=client_credentials
+client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+client_assertion=<token from the workload issuer>
+scope=tools:read                 (optional)
+resource=https://gateway.example (optional, RFC 8707)
+```
+
+Before an agent can use it:
+
+- The row's `audiences` must include ZeroID's issuer or its token endpoint (`<issuer>/oauth2/token`), whichever the platform puts in `aud`. Step 4 below requires `aud` to be both one of these and listed on the row.
+- The bound identity's credential policy must allow `client_credentials` in `allowed_grant_types`, or the grant is refused after the binding is read.
+
+When the assertion's `iss` names a `workload` row in database mode, ZeroID takes this path instead of looking for a registered client:
+
+1. Exactly one enabled `workload` row for `iss` matches the assertion's claims. An `iss` with workload rows that are disabled, unmatched or ambiguous is refused, not passed on to the registered-client path.
+2. `client_assertion_type` is jwt-bearer, and no `client_secret` is sent alongside the assertion.
+3. The assertion verifies against the row's JWKS, with the row's algorithms, issuer, `audiences`, claim constraints and token-age cap (measured since `iat`).
+
+   Every refusal up to here is the generic `invalid client credentials`, with the reason in the log: until the signature verifies, a distinct answer would tell an unsigned probe which issuers and claim values an account trusts.
+4. `aud` is exactly one value. It must be ZeroID's issuer or its token endpoint (RFC 7523 §3), and also one of the row's `audiences`. STS can put several audiences in one token, and a token minted for several servers, or for a broad audience such as a cluster's API server, could be replayed at each of them.
+5. `jti` is present, and the lifetime from `iat` to `exp` is at most the row's `max_token_age_seconds` (600 by default). That fits STS's 300-second default and Kubernetes' 600-second minimum, and refuses a long-lived token at any point in its life. A `client_id`, if sent, must be `sub` (RFC 7523 §3), `<iss>#<sub>`, or `iss`.
+6. The `jti` is recorded for single use, keyed on `(iss, sub, jti)` because a Kubernetes subject repeats across clusters. It is spent here, before the binding is read, so a captured assertion cannot replay binding refusals.
+7. An enabled binding maps `(row, sub)` to an `active` identity (D6, D7). The tenant is that identity's, and a request that names another tenant is refused (D5).
+
+The token is for the bound identity. Scopes are the request narrowed by the identity's policy and allowed scopes, as on the agent's own jwt-bearer grant. `client_id` is always `<iss>#<sub>`: a Kubernetes subject repeats across clusters, and any account can add its own issuer and bind any subject string, so `sub` alone never names one client. Issuer URLs carry no fragment, so the first `#` separates the two. `client_auth` is `federated_assertion`. No registered OAuth client can carry a `client_id` containing `#`: admin registration and a binding's presenting client refuse one with 400, and a CIMD client id containing `#` is invalid. So a registered client can never share a `client_id` with a federated one.
+
+A token with `client_auth=federated_assertion` cannot enroll a key through `POST /agents/self/public-key`. The token is held by whatever runs the agent's credential provider, such as an AgentCore token vault or a gateway, and the agent was meant to hold no secret.
+
+Failures before the binding is read are `invalid_client` (401): those in steps 1–3 with the generic answer, and a multi-valued or foreign `aud`, an over-long assertion, a missing `jti`, a mismatched `client_id` or a replay with their reason. A missing, disabled or unadopted binding is `invalid_grant`, with the same unmatched-agent and not-adopted events as the person grants.
+A server-side failure while verifying, such as an issuer whose JWKS cannot be fetched, keeps its 5xx status (`server_error`) but answers with the generic `client authentication is temporarily unavailable`; the detail, which names the issuer, goes to the log.
+
+The agent cannot revoke its own token at `POST /oauth2/token/revoke`. It has no registered client to authenticate as, so presenting the federated assertion, or `<iss>#<sub>` as `client_id`, is refused with `invalid_client` (401). A revocation with no client authentication is refused the same way unless `token.allow_unauthenticated_token_inspection` is set, which production never allows. The token lives out its lifetime unless an administrator revokes it through `POST /credentials/{id}/revoke`; disabling the binding or the row stops new tokens.
 
 ## The person grants with issuer rows
 

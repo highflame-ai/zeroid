@@ -264,8 +264,11 @@ var reservedClaims = map[string]bool{
 	// same authority — never a caller-supplied value.
 	"mission_id":     true,
 	"principal_type": true,
-	"may_act":        true,
-	"scope":          true,
+	// `client_auth` says the client authenticated with a federated client
+	// assertion; agent self-service refuses such tokens.
+	ClientAuthClaim: true,
+	"may_act":       true,
+	"scope":         true,
 	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
 	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
 	// neither, so additional_claims is the only way either reaches a signed
@@ -824,6 +827,14 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if (req.AccountID == "") != (req.ProjectID == "") {
 		return nil, oauthBadRequest(oautherror.InvalidRequest,
 			"account_id and project_id must be sent together, or both omitted")
+	}
+
+	// A client_assertion from a trusted workload issuer authenticates the
+	// agent with no registered client (ADR 0042 D8).
+	if entry, ok, err := s.workloadIssuerFor(ctx, req); err != nil {
+		return nil, err
+	} else if ok {
+		return s.federatedClientCredentials(ctx, req, entry)
 	}
 
 	// Authenticate the client with whatever its REGISTERED method requires —
