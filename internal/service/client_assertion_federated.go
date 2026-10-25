@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
@@ -172,6 +173,24 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 		return nil, oauthServerError("client assertion replay check failed", err)
 	}
 
+	accessToken, err := s.mintFederatedClientCredentials(ctx, req, row, sub, clientID)
+	if err != nil && federatedServerFailure(err) {
+		// Nothing was minted, and the caller was told to retry. The assertion
+		// is single use, and a Kubernetes or STS token can't be re-signed on
+		// demand, so a spent jti would turn that retry into "replay" until the
+		// platform token rotates. Releasing it still mints at most one token
+		// per assertion. Refusals (4xx) keep it spent, as above.
+		s.releaseClientAssertion(ctx, replayKey)
+	}
+
+	return accessToken, err
+}
+
+// mintFederatedClientCredentials resolves the agent bound to (row, sub) and
+// mints its token. The assertion has been verified and its jti spent.
+func (s *OAuthService) mintFederatedClientCredentials(
+	ctx context.Context, req TokenRequest, row *domain.ExternalIssuer, sub, clientID string,
+) (*domain.AccessToken, error) {
 	identity, err := s.bindFederatedAgent(ctx, row, sub, nil, federatedGrantClientCredentials)
 	if err != nil {
 		return nil, err
@@ -184,24 +203,30 @@ func (s *OAuthService) federatedClientCredentials(ctx context.Context, req Token
 	if err != nil {
 		return nil, oauthServerError("failed to resolve identity credential policy", err)
 	}
-	// No registered client sets a scope list here; the agent's policy and
-	// row ceilings bound the grant, as on the agent's own jwt-bearer grant.
+	// No registered client sets a scope list here, so the agent's policy and
+	// row ceilings are the only bound. With neither set, refuse: the
+	// registered client_credentials path refuses a client with no scopes for
+	// the same reason, and grantScopes would otherwise grant whatever the
+	// request names, nhi:manage included (highflame-authn#317).
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
+	if len(policyScopes) == 0 && len(rowScopes) == 0 {
+		return nil, oauthBadRequest(oautherror.InvalidScope,
+			"the agent has no scope limit: set allowed_scopes on its identity or credential policy")
+	}
 	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
 	}
 
 	issue := IssueRequest{
-		TTL:                   federatedAccessTokenTTL(policy),
-		ScopeCeilingUnbounded: len(policyScopes) == 0 && len(rowScopes) == 0,
-		Identity:              identity,
-		IdentityPolicyID:      policy.ID,
-		Scopes:                scopes,
-		GrantType:             domain.GrantTypeClientCredentials,
-		DPoPKeyThumbprint:     req.DPoPKeyThumbprint,
-		ClientID:              clientID,
-		FederatedClientAuth:   true,
+		TTL:                 federatedAccessTokenTTL(policy),
+		Identity:            identity,
+		IdentityPolicyID:    policy.ID,
+		Scopes:              scopes,
+		GrantType:           domain.GrantTypeClientCredentials,
+		DPoPKeyThumbprint:   req.DPoPKeyThumbprint,
+		ClientID:            clientID,
+		FederatedClientAuth: true,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -251,4 +276,32 @@ func federatedAccessTokenTTL(policy *domain.CredentialPolicy) int {
 	}
 
 	return federatedAccessTokenMaxTTL
+}
+
+// federatedServerFailure reports whether a mint failed on the server side
+// (the token endpoint answers 5xx), as opposed to a refusal of the request.
+func federatedServerFailure(err error) bool {
+	var oauthErr *OAuthError
+	if errors.As(err, &oauthErr) {
+		return oauthErr.HTTPStatus >= http.StatusInternalServerError
+	}
+
+	return !issuanceRefusal(err)
+}
+
+// clientAssertionReplayReleaser is implemented by replay stores that can
+// forget a jti (the Postgres store). A store without it keeps the jti spent.
+type clientAssertionReplayReleaser interface {
+	Release(ctx context.Context, jti string) error
+}
+
+// releaseClientAssertion forgets a spent client-assertion jti, best effort.
+func (s *OAuthService) releaseClientAssertion(ctx context.Context, replayKey string) {
+	releaser, ok := s.clientAssertionReplay.(clientAssertionReplayReleaser)
+	if !ok {
+		return
+	}
+	if err := releaser.Release(ctx, replayKey); err != nil {
+		log.Warn().Err(err).Msg("could not release a client assertion after a server error; its retry will be refused as a replay")
+	}
 }
