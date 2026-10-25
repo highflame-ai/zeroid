@@ -177,7 +177,8 @@ func (e *ExternalIssuer) Normalize() {
 	e.JWKSURI = strings.TrimSpace(e.JWKSURI)
 	e.DisplayName = strings.TrimSpace(e.DisplayName)
 	if len(e.Algorithms) == 0 {
-		e.Algorithms = []string{"RS256", "ES256", "PS256"}
+		// ES384 for AWS STS, which signs with RS256 or ES384 as the caller asks.
+		e.Algorithms = []string{"RS256", "ES256", "ES384", "PS256"}
 	}
 	if e.MaxTokenAgeSeconds == 0 {
 		e.MaxTokenAgeSeconds = DefaultIssuerMaxTokenAgeSeconds
@@ -244,7 +245,7 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	}
 	for _, alg := range e.Algorithms {
 		if !ExternalIssuerAlgorithmAllowed(alg) {
-			return issuerInvalid("invalid_algorithms", "algorithm %q is not supported (allowed: RS256, ES256, PS256)", alg)
+			return issuerInvalid("invalid_algorithms", "algorithm %q is not supported (allowed: RS256, ES256, ES384, PS256)", alg)
 		}
 	}
 	for _, c := range e.PropagateClaims {
