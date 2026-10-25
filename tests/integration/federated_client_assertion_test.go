@@ -7,6 +7,7 @@ package integration_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -364,6 +365,71 @@ func TestFederatedClientAssertion_TokenLifetime(t *testing.T) {
 
 	assert.InDelta(t, 300, lifetime(t, w.clientCredentials(t, w.assertion(t, nil), nil)), 1,
 		"a stricter policy shortens it instead of refusing the mint")
+}
+
+// An agent with no scope limit (no allowed_scopes on its identity or its
+// credential policy, as on the tenant default policy) is refused, whatever it
+// asks for, rather than granted the scopes it names (highflame-authn#317).
+func TestFederatedClientAssertion_NoScopeLimitIsRefused(t *testing.T) {
+	w := newWorkloadFed(t)
+
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":   uid("wl-agent-default"),
+		"identity_type": "agent",
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}, w.tn.headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	got := decode(t, resp)
+	_ = resp.Body.Close()
+
+	sub := "system:serviceaccount:agents:" + uid("dflt")
+	status, body := w.f.bind(t, w.tn, w.rowID, sub, got["id"].(string), false)
+	require.Equal(t, http.StatusCreated, status, "%v", body)
+
+	for _, scope := range []string{"nhi:manage credentials:manage anything", ""} {
+		tr := w.clientCredentials(t, w.assertion(t, map[string]any{"sub": sub}), map[string]any{"scope": scope})
+		assert.Equal(t, http.StatusBadRequest, tr.StatusCode, "scope %q: %s", scope, tr.RawBody)
+		assert.Equal(t, "invalid_scope", tr.Error, "scope %q", scope)
+		assert.Empty(t, tr.AccessToken, "scope %q", scope)
+	}
+
+	// An agent whose policy sets a limit still gets a token within it.
+	ok := w.clientCredentials(t, w.assertion(t, nil), nil)
+	require.Equal(t, http.StatusOK, ok.StatusCode, ok.RawBody)
+	assert.Equal(t, []any{"tools:read"}, decodeJWTPayload(t, ok.AccessToken)["scopes"])
+}
+
+// A server-side failure after the assertion's jti is spent releases it, so
+// retrying the same platform token works (highflame-authn#319). A refusal
+// keeps it spent: the retry of a refused assertion is a replay.
+func TestFederatedClientAssertion_RetryAfterServerFailure(t *testing.T) {
+	w := newWorkloadFed(t)
+	ctx := context.Background()
+
+	// Move the policy out of the agent's project, so resolving it fails (500).
+	_, err := testDB.ExecContext(ctx, "UPDATE credential_policies SET project_id = project_id || '-moved' WHERE id = ?", w.policy)
+	require.NoError(t, err)
+
+	assertion := w.assertion(t, nil)
+	first := w.clientCredentials(t, assertion, nil)
+	require.GreaterOrEqual(t, first.StatusCode, http.StatusInternalServerError, first.RawBody)
+
+	_, err = testDB.ExecContext(ctx, "UPDATE credential_policies SET project_id = replace(project_id, '-moved', '') WHERE id = ?", w.policy)
+	require.NoError(t, err)
+
+	retry := w.clientCredentials(t, assertion, nil)
+	require.Equal(t, http.StatusOK, retry.StatusCode, "retry after a 5xx: %s", retry.RawBody)
+
+	again := w.clientCredentials(t, assertion, nil)
+	assert.Equal(t, http.StatusUnauthorized, again.StatusCode, "a used assertion is still single use: %s", again.RawBody)
+
+	// A refusal (wrong tenant, 400) keeps the jti spent.
+	refused := w.assertion(t, nil)
+	r1 := w.clientCredentials(t, refused, map[string]any{"account_id": "acct-other", "project_id": "proj-other"})
+	require.Equal(t, http.StatusBadRequest, r1.StatusCode, r1.RawBody)
+	r2 := w.clientCredentials(t, refused, nil)
+	assert.Equal(t, http.StatusUnauthorized, r2.StatusCode, "a refused assertion stays spent: %s", r2.RawBody)
 }
 
 func TestFederatedClientAssertion_TokenCannotEnrollAKey(t *testing.T) {
