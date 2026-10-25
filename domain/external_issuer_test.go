@@ -74,7 +74,7 @@ func TestExternalIssuerConfigDefaults(t *testing.T) {
 	if got, want := cfg.JWKSCacheTTL, 5*time.Minute; got != want {
 		t.Errorf("JWKSCacheTTL default = %s, want %s", got, want)
 	}
-	if got, want := strings.Join(cfg.Algorithms, ","), "RS256,ES256,PS256"; got != want {
+	if got, want := strings.Join(cfg.Algorithms, ","), "RS256,ES256,ES384,PS256"; got != want {
 		t.Errorf("Algorithms default = %q, want %q", got, want)
 	}
 }

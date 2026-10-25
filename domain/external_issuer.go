@@ -42,7 +42,7 @@ type ExternalIssuerConfig struct {
 	Kind IssuerKind `koanf:"kind"`
 
 	// Algorithms is the allow-list of JWS algorithms accepted on incoming ID
-	// tokens. Defaults to {"RS256", "ES256"} when empty. Only RS256/ES256/PS256
+	// tokens. Defaults to {"RS256", "ES256", "ES384", "PS256"} when empty. Only RS256/ES256/ES384/PS256
 	// are supported by the underlying verifier; entries outside that set are
 	// rejected at validation time.
 	Algorithms []string `koanf:"algorithms"`
@@ -156,12 +156,12 @@ func (e *ExternalIssuerConfig) Validate() error {
 			return fmt.Errorf("external_issuer %s: allowed_accounts must not contain empty entries", e.Issuer)
 		}
 	}
-	// Only RS256/ES256/PS256 are supported by the verifier (jwtalg's asymmetric
+	// Only RS256/ES256/ES384/PS256 are supported by the verifier (jwtalg's asymmetric
 	// allow-list). Reject unsupported entries at config load instead of failing
 	// every exchange at runtime.
 	for _, alg := range e.Algorithms {
 		if !ExternalIssuerAlgorithmAllowed(alg) {
-			return fmt.Errorf("external_issuer %s: algorithm %q is not supported (allowed: RS256, ES256, PS256)", e.Issuer, alg)
+			return fmt.Errorf("external_issuer %s: algorithm %q is not supported (allowed: RS256, ES256, ES384, PS256)", e.Issuer, alg)
 		}
 	}
 	for _, claim := range e.PropagateClaims {
@@ -176,7 +176,7 @@ func (e *ExternalIssuerConfig) Validate() error {
 // verifier supports.
 func ExternalIssuerAlgorithmAllowed(alg string) bool {
 	switch alg {
-	case "RS256", "ES256", "PS256":
+	case "RS256", "ES256", "ES384", "PS256":
 		return true
 	}
 	return false
@@ -220,7 +220,9 @@ func (e *ExternalIssuerConfig) Defaults() {
 	if len(e.Algorithms) == 0 {
 		// PS256 alongside RS256/ES256: widely used by Google/Okta/Entra and
 		// recommended by FAPI, so it belongs in the out-of-the-box set.
-		e.Algorithms = []string{"RS256", "ES256", "PS256"}
+		// ES384: AWS STS signs web identity tokens with RS256 or ES384, as
+		// the caller asks (GetWebIdentityToken SigningAlgorithm).
+		e.Algorithms = []string{"RS256", "ES256", "ES384", "PS256"}
 	}
 	if e.MaxTokenAge == 0 {
 		e.MaxTokenAge = 10 * time.Minute
