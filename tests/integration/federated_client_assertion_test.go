@@ -342,6 +342,30 @@ func TestFederatedClientAssertion(t *testing.T) {
 // A token minted from a federated client assertion is held by whatever runs
 // the agent's credential provider, so it cannot enroll a durable key on an
 // agent that was meant to hold no secret.
+// A federated token lives 15 minutes (ADR 0042 D9), however long the
+// identity's policy would allow, and no longer than a stricter policy allows.
+func TestFederatedClientAssertion_TokenLifetime(t *testing.T) {
+	lifetime := func(t *testing.T, resp tokenResponse) float64 {
+		t.Helper()
+		require.Equal(t, http.StatusOK, resp.StatusCode, resp.RawBody)
+		claims := decodeJWTPayload(t, resp.AccessToken)
+
+		return claims["exp"].(float64) - claims["iat"].(float64)
+	}
+
+	w := newWorkloadFed(t) // policy max_ttl_seconds 3600
+	assert.InDelta(t, 900, lifetime(t, w.clientCredentials(t, w.assertion(t, nil), nil)), 1,
+		"15 minutes, not the policy's hour")
+
+	resp := doRequest(t, http.MethodPatch, adminPath("/credential-policies/"+w.policy),
+		map[string]any{"max_ttl_seconds": 300}, w.tn.headers)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	assert.InDelta(t, 300, lifetime(t, w.clientCredentials(t, w.assertion(t, nil), nil)), 1,
+		"a stricter policy shortens it instead of refusing the mint")
+}
+
 func TestFederatedClientAssertion_TokenCannotEnrollAKey(t *testing.T) {
 	w := newWorkloadFed(t)
 	resp := w.clientCredentials(t, w.assertion(t, nil), nil)
