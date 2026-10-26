@@ -1133,6 +1133,8 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	//      configured JWKS. The TrustedServiceValidator hook is *not* used —
 	//      this path is the trust anchor. Dispatch happens before the
 	//      actor_token check because direct federation never carries one.
+	//      An authenticated client that names the subject only as a JWT
+	//      takes this path too (jwtSubjectIsIDTokenExchange).
 	//   2. NHI delegation: subject_token (orchestrator) + actor_token
 	//      (sub-agent) → delegated token.
 	//   3. External principal exchange (broker): subject_token from a
@@ -1143,6 +1145,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return s.externalIDTokenExchange(ctx, req)
 	}
 	if req.ActorToken == "" {
+		if s.jwtSubjectIsIDTokenExchange(ctx, req) {
+			return s.externalIDTokenExchange(ctx, req)
+		}
 		return s.ExternalPrincipalExchange(ctx, req)
 	}
 

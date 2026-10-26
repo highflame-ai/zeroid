@@ -237,7 +237,9 @@ POST /oauth2/token
 
 `subject_token_type` is left blank (or anything other than `id_token`).
 The broker path is the default when `actor_token` is absent and the
-subject token type is not `id_token`.
+subject token type is not `id_token`. One exception: a request with the
+type `urn:ietf:params:oauth:token-type:jwt` that authenticates a client,
+from a caller that is not a trusted service, is an ID-token exchange.
 
 ### Issued-token claim shape
 

@@ -195,6 +195,11 @@ POST /oauth2/token
   scope              = <optional>
 ```
 
+A client may name the subject token with the generic type `urn:ietf:params:oauth:token-type:jwt` instead (RFC 8693 §3).
+Some credential brokers do this when they exchange, on a workload's behalf, the token the workload was called with.
+The request is then an ID-token exchange too, when it authenticates a client and the caller is not a trusted service, and the same rules apply.
+Any other request with that type keeps the broker path.
+
 All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_grant` (`invalid_client` for client authentication):
 
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
