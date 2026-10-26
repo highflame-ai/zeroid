@@ -166,6 +166,10 @@ type IssueRequest struct {
 	// marked with WithTrustedApprovalChannelWrite. ciba:approve is issued only
 	// when it is set; grants that present no such credential leave it false.
 	ChannelTrustedCredential bool
+
+	// FederatedClientAuth marks a token whose client authenticated with a
+	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
+	FederatedClientAuth bool
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
@@ -902,6 +906,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// our stack will look for.
 	if req.ClientID != "" {
 		_ = token.Set("client_id", req.ClientID)
+	}
+	if req.FederatedClientAuth {
+		_ = token.Set(ClientAuthClaim, ClientAuthFederatedAssertion)
 	}
 	if req.UserEmail != "" {
 		_ = token.Set("user_email", req.UserEmail)

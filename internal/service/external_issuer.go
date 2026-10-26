@@ -817,6 +817,9 @@ func (s *ExternalIssuerService) ensurePresentingClient(ctx context.Context, iden
 		if errors.Is(err, ErrOAuthClientAlreadyExists) {
 			return nil, issuerErr(http.StatusConflict, "client_conflict", "an OAuth client with this client_id already exists")
 		}
+		if errors.Is(err, ErrInvalidClientMetadata) {
+			return nil, issuerErr(http.StatusBadRequest, "invalid_request", err.Error())
+		}
 		return nil, err
 	}
 	return &BindingClientResult{ClientID: clientID, Created: true}, nil

@@ -156,6 +156,13 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	if req.ClientID == "" || req.Name == "" {
 		return nil, "", fmt.Errorf("clientID and name are required")
 	}
+	// '#' is reserved for federated client ids (<iss>#<sub>, see
+	// federatedClientID), so no registered client can carry one: a registered
+	// client_id equal to some issuer's <iss>#<sub> would put one client_id on
+	// tokens for two different clients.
+	if strings.Contains(req.ClientID, "#") {
+		return nil, "", fmt.Errorf("%w: client_id must not contain '#'", ErrInvalidClientMetadata)
+	}
 	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
 	// supplied. Reject http:// / non-URL values at registration so a faulty
 	// client cannot lead the server to POST credentials over plaintext. The

@@ -61,3 +61,12 @@ func isDuplicateKeyError(err error) bool {
 	var pgErr pgdriver.Error
 	return errors.As(err, &pgErr) && pgErr.Field('C') == "23505"
 }
+
+// Release forgets a jti, so the same proof or assertion can be presented
+// again. Used only when the request it authenticated failed on the server
+// side before anything was issued.
+func (s *DPoPReplayStore) Release(ctx context.Context, jti string) error {
+	_, err := s.db.NewDelete().Model((*dpopJTIRow)(nil)).Where("jti = ?", jti).Exec(ctx)
+
+	return err
+}

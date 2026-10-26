@@ -61,7 +61,7 @@ type ExternalIssuerCreateBody struct {
 	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https. Its {issuer}/.well-known/openid-configuration must name this issuer and the jwks_uri ZeroID uses."`
 	DisplayName         string              `json:"display_name,omitempty"`
 	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
-	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, PS256. Default all three."`
+	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, ES384, PS256. Default all four."`
 	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, scope, trust_level. role and privilege_scope are reserved (claim_mapping_reserved)."`
 	PropagateClaims     []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`
 	ClaimConstraints    map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`

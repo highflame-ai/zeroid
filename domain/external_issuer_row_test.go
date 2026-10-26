@@ -36,6 +36,8 @@ func TestExternalIssuerValidate(t *testing.T) {
 		want   string
 	}{
 		{name: "valid", mutate: func(*ExternalIssuer) {}},
+		{name: "ES384 (AWS STS)", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"RS256", "ES384"} }},
+		{name: "ES512 unsupported", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"ES512"} }, want: "invalid_algorithms"},
 		{name: "bad kind", mutate: func(e *ExternalIssuer) { e.Kind = "robot" }, want: "invalid_kind"},
 		{name: "http issuer", mutate: func(e *ExternalIssuer) { e.Issuer = "http://acme.okta.com" }, want: "invalid_issuer"},
 		{name: "http issuer allowed with private endpoints", mutate: func(e *ExternalIssuer) {
