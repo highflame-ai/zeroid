@@ -161,10 +161,11 @@ type externalIssuerCheckOutput struct {
 
 // BindingCreateBody is POST /external-issuers/{id}/bindings.
 type BindingCreateBody struct {
-	SubjectKey  string `json:"subject_key" doc:"The value the credential carries at runtime: the ID-JAG act.sub (P1b), the presenting client_id (P1c), the assertion sub (P2)."`
-	IdentityID  string `json:"identity_id" doc:"An identity in this account."`
-	Enabled     *bool  `json:"enabled,omitempty" doc:"Default true. A binding for an identity that is not active is created disabled."`
-	OAuthClient *struct {
+	SubjectKey    string `json:"subject_key" doc:"The value the credential carries at runtime: the ID-JAG act.sub (P1b), the presenting client_id (P1c), the assertion sub (P2)."`
+	IdentityID    string `json:"identity_id" doc:"An identity in this account."`
+	Enabled       *bool  `json:"enabled,omitempty" doc:"Default true. A binding for an identity that is not active is created disabled."`
+	AwaitAdoption bool   `json:"await_adoption,omitempty" doc:"Create the binding disabled for adoption to enable. explicitly_disabled is set only if the identity is already active, decided in the insert. Cannot be combined with enabled."`
+	OAuthClient   *struct {
 		ClientID string `json:"client_id,omitempty" doc:"Default subject_key."`
 	} `json:"oauth_client,omitempty" doc:"Also create (or confirm) the OAuth client the agent presents: private_key_jwt with the identity's registered key, linked to the identity."`
 }
@@ -461,7 +462,7 @@ func (a *API) createBindingOp(ctx context.Context, input *struct {
 	if err != nil {
 		return nil, err
 	}
-	in := service.BindingInput{SubjectKey: input.Body.SubjectKey, IdentityID: input.Body.IdentityID, Enabled: input.Body.Enabled}
+	in := service.BindingInput{SubjectKey: input.Body.SubjectKey, IdentityID: input.Body.IdentityID, Enabled: input.Body.Enabled, AwaitAdoption: input.Body.AwaitAdoption}
 	if input.Body.OAuthClient != nil {
 		in.Client = &service.BindingClientInput{ClientID: input.Body.OAuthClient.ClientID}
 	}

@@ -479,6 +479,11 @@ One issuer's bindings; takes the same `?identity_id=` filter.
 `oauth_client` also creates the OAuth client the agent presents on P1b/P1c, unless it exists already linked to this identity with `private_key_jwt`:
 `client_id` as given, `token_endpoint_auth_method: private_key_jwt`, `jwks` built from the identity's registered EC P-256 public key (kid = the identity id), grant types `token-exchange` and `jwt-bearer`, and `identity_id` = the agent.
 It is created in the same transaction as the binding.
+
+`await_adoption: true` creates the binding disabled for adoption to enable, and cannot be combined with `enabled` (400 `invalid_binding`).
+`explicitly_disabled` is set in the insert itself, from the identity's status at that moment: true if the identity is already `active` (adoption has passed, so an org admin must enable it), false otherwise.
+Omitting `enabled` and reading the status first leaves a gap in which the identity can be activated and the binding created enabled.
+
 On P1c the client id is the subject key; on Okta P1b the ID-JAG's `client_id` claim must equal the authenticated client, so set `client_id` to that value when it differs from `act.sub`.
 
 ```json
