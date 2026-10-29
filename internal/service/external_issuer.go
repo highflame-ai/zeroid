@@ -57,6 +57,8 @@ var (
 	// Deliberately generic: it never says which account holds the issuer.
 	errIssuerAlreadyTrusted = issuerErr(http.StatusConflict, "issuer_already_trusted",
 		"this issuer is already trusted and cannot be added again")
+	errIssuerChanged = issuerErr(http.StatusConflict, "issuer_changed",
+		"the issuer changed since it was read (if_updated_at); read it again")
 )
 
 // JWKSCheck is the result of probing an issuer's JWKS. It never carries an
@@ -166,6 +168,11 @@ type IssuerPatch struct {
 	JWKSCacheTTL     *int
 	TrustEmail       *bool
 	Enabled          *bool
+	// IfUpdatedAt, when set, applies the patch only if the row's updated_at
+	// still equals it (409 issuer_changed otherwise). A deployer that checked
+	// the row before enabling it (a workload row's proof of control) enables
+	// exactly the row it checked, not one changed in between.
+	IfUpdatedAt *time.Time
 }
 
 // Create adds a trusted issuer to accountID. The JWKS must be reachable and
@@ -216,6 +223,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 		return nil, nil, err
 	}
 	if uniquenessConflict(existing, row, pin) {
+		warnWorkloadIssuerConflict(row, accountID, actor)
 		return nil, nil, errIssuerAlreadyTrusted
 	}
 
@@ -244,6 +252,7 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 			return err
 		}
 		if conflict := uniquenessConflict(existing, row, pin); conflict {
+			warnWorkloadIssuerConflict(row, accountID, actor)
 			return errIssuerAlreadyTrusted
 		}
 		n, err := s.repo.CountByAccount(ctx, accountID)
@@ -268,6 +277,18 @@ func (s *ExternalIssuerService) Create(ctx context.Context, accountID, actor str
 	log.Info().Str("account_id", accountID).Str("issuer", row.Issuer).Str("kind", string(row.Kind)).
 		Str("id", row.ID).Str("actor", actor).Msg("external issuer trusted")
 	return row, check, nil
+}
+
+// warnWorkloadIssuerConflict logs a refused workload issuer: the first
+// account to add an issuer holds it, so a 409 here can be a rightful customer
+// blocked by a squatter's row (ADR 0042 open question 8), which an operator
+// resolves. The other account is not named; operators find it by issuer.
+func warnWorkloadIssuerConflict(row *domain.ExternalIssuer, accountID, actor string) {
+	if row.Kind != domain.IssuerKindWorkload {
+		return
+	}
+	log.Warn().Str("account_id", accountID).Str("issuer", row.Issuer).Str("actor", actor).
+		Str("reason", "issuer_already_trusted").Msg("workload issuer refused: already trusted by an account")
 }
 
 // uniquenessConflict applies ADR 0042 D4 to a candidate row against the rows
@@ -386,6 +407,11 @@ func (s *ExternalIssuerService) Update(ctx context.Context, accountID, id, actor
 		r, err := s.repo.Get(ctx, id, accountID)
 		if err != nil {
 			return notFoundOr(err, errIssuerNotFound)
+		}
+		// Under the issuer lock every writer of the row takes, so the check
+		// and the write are one step.
+		if p.IfUpdatedAt != nil && !r.UpdatedAt.Equal(*p.IfUpdatedAt) {
+			return errIssuerChanged
 		}
 		applyIssuerPatch(r, p)
 		r.UpdatedBy = actor
