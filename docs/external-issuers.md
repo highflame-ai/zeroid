@@ -39,7 +39,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 | `jwks_uri` | Never supplied by the caller. ZeroID reads it from the issuer's OpenID discovery document, `{issuer}/.well-known/openid-configuration`, whose `issuer` must equal the row's issuer exactly (OpenID Connect Discovery §4.3); both fetches go through the SSRF-guarded client. It changes only through `POST /external-issuers/{id}/refresh`, which re-reads discovery. A caller-chosen key set would let an admin sign tokens for anyone their IdP's issuer names. |
 | `audiences` | Optional on a `person` row, required on a `workload` row. Extra accepted `aud` values. On the ID-token exchange an enabled binding already makes the presenting client's `client_id` an accepted audience, so an agent's app id is written once, as the binding's subject key; an ID-JAG's `aud` must be ZeroID's issuer whatever this lists. |
 | `algorithms` | A subset of RS256, ES256, ES384, PS256 (all four by default). AWS STS signs with RS256 or ES384, as the caller asks. |
-| `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `scope`, `trust_level`. `role` and `privilege_scope` are reserved and refused (`claim_mapping_reserved`): an IdP claim never sets a token's role or capabilities, and the ID-JAG grant ignores them on a row stored before the refusal. A static `external_issuers` entry naming one still loads, with a warning naming the issuer and the key, and the grant ignores it the same way. |
+| `claim_mapping` | ZeroID name to token claim. `user_id` is the person's **user key** (Entra `oid`, Okta `sub`) and is required on a person row. Also `email`, `email_verified` (Entra `xms_edov`), `name`, `scope`, `trust_level`, and `groups`, the claim listing the person's groups (see [Groups](#groups)). `role` and `privilege_scope` are reserved and refused (`claim_mapping_reserved`): an IdP claim never sets a token's role or capabilities, and the ID-JAG grant ignores them on a row stored before the refusal. A static `external_issuers` entry naming one still loads, with a warning naming the issuer and the key, and the grant ignores it the same way. |
 | `propagate_claims` | A subset of `auth_time`, `acr`, `amr`. |
 | `claim_constraints` | Claim to accepted values. Every listed claim must be present and equal one of its values (for an array claim, contain one). Required on a shared issuer. |
 | `max_token_age_seconds` | 1 to 3600, default 600. |
@@ -85,12 +85,12 @@ A person row also refuses an issuer that only issues workload tokens (GitHub Act
 
 ### Presets
 
-`preset` fills only the fields the request leaves unset, except the identity claims, which it pins: a request naming another claim for `user_id`, `email` or `email_verified` is refused (`invalid_claim_mapping`).
+`preset` fills only the fields the request leaves unset (`claim_mapping.groups` included, so an admin whose IdP names the claim differently sets their own), except the identity claims, which it pins: a request naming another claim for `user_id`, `email` or `email_verified` is refused (`invalid_claim_mapping`).
 
 | Preset | Issuer | Fills |
 |---|---|---|
-| `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, and the constraint `tid: [<tid>]` |
-| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name` |
+| `entra` | `https://login.microsoftonline.com/<tenant-guid>/v2.0` | `algorithms` RS256, `claim_mapping` `user_id: oid`, `email`, `email_verified: xms_edov`, `name`, `groups`, and the constraint `tid: [<tid>]` |
+| `okta` | `https://<org>.okta.com` or `.../oauth2/<server-id>` | `algorithms` RS256, `claim_mapping` `user_id: sub`, `email`, `email_verified`, `name`, `groups` |
 | `generic` or absent | any | nothing |
 
 The user key is `oid` for Entra because Entra's `sub` is pairwise per application, so one person would carry a different `sub` in every agent's app.
@@ -267,6 +267,22 @@ The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceilin
 When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so under the `rfc8693` profile the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
 The legacy profile is frozen (ADR 0043 D1): there the exchange delegates as before, adding a level.
 `user_idp_iss` and `user_idp_sub` travel with `sub` onto every exchanged `rfc8693` token; a different agent becomes a new actor level as usual.
+
+## Groups
+
+An issuer that sets `claim_mapping.groups` copies the person's groups from the ID token or ID-JAG into the issued token's `groups` claim (RFC 9068 §2.2.3.1), an array of strings.
+A resource server reads it as `authjwt.Claims.Groups`.
+
+- The claim may be a JSON array of strings or a single string (one group). Entries that are not strings, are empty, or carry control or format characters are skipped; duplicates collapse.
+- No such claim in the IdP token means no `groups` claim. That is not an error.
+- A claim of any other shape (a number, an object) is ignored with a warning; the grant still succeeds.
+- At most 100 groups, each at most 256 bytes, 8 KiB in total. Above any limit the whole claim is dropped with a warning, never truncated, so a token's list is either the IdP's whole list or absent.
+- Entra sends an overage indicator instead of the list when a person is in too many groups (`_claim_names` naming the claim, or `hasgroups`). That reads as no groups, with a warning. Entra's `groups` claim holds group object ids unless the app registration emits names.
+- Groups are fixed at issue time, like the other person claims; a change at the IdP takes effect at the next exchange. They never set `role` or `privilege_scope`.
+- `groups` is reserved: `additional_claims` cannot set it. It is written only on a token whose `sub` is the person, and travels with `sub` onto every exchanged `rfc8693` token, like `user_idp_sub`. Under the legacy profile an exchanged token's `sub` is the actor, so it carries none.
+- An empty or absent `groups` means "unknown", not "a member of no group": do not grant access on its absence.
+
+`claim_mapping.groups` is not an identity key, so a PATCH may change or remove it.
 
 ## Admin API
 

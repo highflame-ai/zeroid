@@ -403,6 +403,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		UseRS256:              true,
 		UserEmail:             userEmail,
 		UserName:              userName,
+		Groups:                extractPersonGroups(rawClaims, cfg.ClaimMapping["groups"], upstreamIss),
 		ApplicationID:         req.ApplicationID,
 		// RFC 9068 §2.2 client_id: the relying party just authenticated and
 		// bound to the ID token's aud/azp (D13), so it is the client the

@@ -150,8 +150,10 @@ func ValidateIssuerURL(raw string, allowHTTP bool) error {
 // the same tokens.
 var unpinnableClaims = []string{"iss", "aud", "exp", "iat", "nbf", "jti"}
 
-// knownMappingKeys are the claim_mapping targets a grant reads.
-var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "scope", "trust_level"}
+// knownMappingKeys are the claim_mapping targets a grant reads. groups names
+// the ID token claim that lists the person's groups (RFC 9068 §2.2.3.1); it
+// is never an identity key, so it stays editable after create.
+var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "scope", "trust_level", "groups"}
 
 // reservedMappingKeys are token claims an IdP claim must never set: a
 // person's role and privilege scope come only from the deployer's own

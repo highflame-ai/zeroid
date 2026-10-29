@@ -63,6 +63,13 @@ type ExternalIssuerConfig struct {
 	//	claim_mapping:
 	//	  user_id: sub          # or "preferred_username", "oid", etc.
 	//	  email:   email
+	//	  groups:  groups       # optional: the claim listing the person's groups
+	//
+	// groups, when set, names the upstream claim that lists the person's
+	// groups (a JSON array of strings, or a single string). The person grants
+	// copy it to the issued token's RFC 9068 §2.2.3.1 `groups` claim. A
+	// missing, malformed or oversized claim yields no `groups` claim rather
+	// than a refused grant.
 	ClaimMapping map[string]string `koanf:"claim_mapping"`
 
 	// TrustEmail makes the issuer vouch for its own email claim. OpenID

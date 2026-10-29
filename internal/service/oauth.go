@@ -215,6 +215,11 @@ var reservedClaims = map[string]bool{
 	// RFC 9068 §2.2.3.1 `roles` comes only from the deployer's person-grant
 	// resolver, on a person root (see decidePersonGrant).
 	"roles": true,
+	// RFC 9068 §2.2.3.1 `groups` comes only from the IdP token, through the
+	// issuer's claim_mapping.groups, on the person grants (and from the
+	// verified parent on token exchange). A resource server may decide by
+	// group, so a caller must never be able to set it.
+	"groups": true,
 	// RFC 9068 §2.2 `client_id` — set from the OAuth client the grant actually
 	// authenticated or resolved (IssueRequest.ClientID), never from caller
 	// input. It exists so a resource server can attribute a call to a client,
@@ -1375,13 +1380,15 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 
 	// The principal's IdP pair (user_idp_iss, user_idp_sub) describes sub, which the
 	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
-	// from the verified parent; never from the request.
+	// from the verified parent; never from the request. The person's groups
+	// describe sub too and travel the same way.
 	if parent.Type == domain.PrincipalUser {
 		idpIss, _ := jwt.Get[string](subjectParsed, "user_idp_iss")
 		idpSub, _ := jwt.Get[string](subjectParsed, "user_idp_sub")
 		if idpIss != "" && idpSub != "" {
 			issue.IdPIssuer, issue.IdPSubject = idpIss, idpSub
 		}
+		issue.Groups = parentGroups(subjectParsed)
 	}
 
 	// RFC 8693 §4.1 actor chain, used under the rfc8693 profile: this actor

@@ -46,6 +46,15 @@ type Claims struct {
 	UserID      string `json:"user_id,omitempty"`
 	OwnerUserID string `json:"owner_user_id,omitempty"`
 
+	// Groups is the RFC 9068 §2.2.3.1 `groups` claim: the person's groups as
+	// their IdP listed them, copied at issue time through the trusted
+	// issuer's claim_mapping.groups. Present only on a token whose sub is
+	// that person (PrincipalType "user"), including tokens delegated from
+	// one. ZeroID reserves the claim, so a caller cannot inject it. Empty
+	// means the IdP sent none or ZeroID dropped an unusable list; it never
+	// means "a member of no group", so do not grant access on its absence.
+	Groups []string `json:"groups,omitempty"`
+
 	// NHI identity (agent/service flows: client_credentials, jwt_bearer, token_exchange)
 	ExternalID   string   `json:"external_id,omitempty"`
 	IdentityType string   `json:"identity_type,omitempty"`
@@ -368,7 +377,7 @@ func extractClaims(token jwt.Token) *Claims {
 		"iss": {}, "sub": {}, "aud": {}, "iat": {}, "exp": {}, "nbf": {}, "jti": {},
 		"resource":   {},
 		"account_id": {}, "project_id": {},
-		"user_id": {}, "owner_user_id": {},
+		"user_id": {}, "owner_user_id": {}, "groups": {},
 		"external_id": {}, "identity_type": {}, "sub_type": {}, "trust_level": {},
 		"status": {}, "name": {}, "framework": {}, "version": {}, "publisher": {},
 		"capabilities": {},
@@ -404,6 +413,7 @@ func extractClaims(token jwt.Token) *Claims {
 	// User identity
 	c.UserID = getString("user_id")
 	c.OwnerUserID = getString("owner_user_id")
+	c.Groups = getStringSlice("groups")
 
 	// NHI identity
 	c.ExternalID = getString("external_id")

@@ -153,6 +153,11 @@ type IssueRequest struct {
 	// UserEmail and UserName are set for human user tokens.
 	UserEmail string
 	UserName  string
+	// Groups are the person's groups, read from the IdP token through the
+	// issuer's claim_mapping.groups (or, on token exchange, from the verified
+	// parent), and emitted as the RFC 9068 §2.2.3.1 `groups` claim. Only on a
+	// token whose sub is the person; never from caller input.
+	Groups []string
 	// ActClaim, when non-nil, is an existing chain's act as issued (a CIBA
 	// step-up approved into a requesting chain). Under the legacy profile it is
 	// emitted verbatim, nested actors included, taking precedence over
@@ -936,6 +941,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.IdPSubject != "" && principal.Type == domain.PrincipalUser && (rfc8693 || req.SubjectOverride != "") {
 		_ = token.Set("user_idp_iss", req.IdPIssuer)
 		_ = token.Set("user_idp_sub", req.IdPSubject)
+	}
+
+	// RFC 9068 §2.2.3.1 `groups`: the person's IdP groups, only ever the
+	// grant's own value and only on a token whose sub is the person (under
+	// legacy an exchanged token's sub is the actor), like user_idp_sub.
+	_ = token.Remove("groups")
+	if len(req.Groups) > 0 && principal.Type == domain.PrincipalUser && (rfc8693 || req.SubjectOverride != "") {
+		_ = token.Set("groups", slices.Clone(req.Groups))
 	}
 
 	// RFC 9068 §2.2.3.1 `roles`: the person grant's roles, on a person root
