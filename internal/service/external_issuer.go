@@ -686,6 +686,10 @@ type BindingInput struct {
 	SubjectKey string
 	IdentityID string
 	Enabled    *bool
+	// AwaitAdoption creates the binding disabled and leaves it for adoption to enable.
+	// The identity's status is read in the insert itself, so it cannot go stale under the
+	// caller. It cannot be combined with Enabled.
+	AwaitAdoption bool
 	// Client, when set, also creates or links the OAuth client the agent
 	// presents on P1b/P1c.
 	Client *BindingClientInput
@@ -714,6 +718,10 @@ func (s *ExternalIssuerService) CreateBinding(ctx context.Context, accountID, is
 	if in.SubjectKey == "" || len(in.SubjectKey) > domain.MaxSubjectKeyBytes {
 		return nil, nil, issuerErr(http.StatusBadRequest, "invalid_subject_key",
 			fmt.Sprintf("subject_key is required (at most %d bytes)", domain.MaxSubjectKeyBytes))
+	}
+	if in.AwaitAdoption && in.Enabled != nil {
+		return nil, nil, issuerErr(http.StatusBadRequest, "invalid_binding",
+			"await_adoption cannot be combined with enabled")
 	}
 	if !validUUID(issuerID) {
 		return nil, nil, errIssuerNotFound
@@ -750,7 +758,11 @@ func (s *ExternalIssuerService) CreateBinding(ctx context.Context, accountID, is
 		if _, err := s.repo.GetForShare(ctx, issuerID, accountID); err != nil {
 			return notFoundOr(err, errIssuerNotFound)
 		}
-		if err := s.repo.InsertBinding(ctx, b); err != nil {
+		insert := s.repo.InsertBinding
+		if in.AwaitAdoption {
+			insert = s.repo.InsertBindingAwaitingAdoption
+		}
+		if err := insert(ctx, b); err != nil {
 			return bindingWriteError(err)
 		}
 		if in.Client != nil {

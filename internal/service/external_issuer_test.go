@@ -258,3 +258,20 @@ func TestExternalIssuerCreateRefusesReservedMapping(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateBindingAwaitAdoptionRefusesEnabled: await_adoption decides the
+// binding's state itself, so combining it with enabled is refused with 400
+// before anything is read. The service has no repository, so a refusal that
+// came later than validation would panic.
+func TestCreateBindingAwaitAdoptionRefusesEnabled(t *testing.T) {
+	svc := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{Store: IssuerStoreDB})
+	for _, enabled := range []bool{true, false} {
+		_, _, err := svc.CreateBinding(context.Background(), "acct", "issuer", "u", BindingInput{
+			SubjectKey: "agent", IdentityID: "id", Enabled: &enabled, AwaitAdoption: true,
+		})
+		var apiErr *IssuerAPIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || apiErr.Code != "invalid_binding" {
+			t.Fatalf("enabled=%v: err = %v (%+v), want 400 invalid_binding", enabled, err, apiErr)
+		}
+	}
+}

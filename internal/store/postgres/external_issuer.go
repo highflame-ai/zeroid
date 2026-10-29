@@ -243,6 +243,22 @@ func (r *ExternalIssuerRepository) InsertBinding(ctx context.Context, b *domain.
 	return nil
 }
 
+// InsertBindingAwaitingAdoption writes a new disabled binding that adoption enables.
+// explicitly_disabled is read from the identity's status in the same INSERT, so a status
+// change between the caller's read and this write cannot leave the binding enabled: it is
+// set when the identity is already active (adoption has passed and an org admin must
+// enable it) and clear otherwise.
+func (r *ExternalIssuerRepository) InsertBindingAwaitingAdoption(ctx context.Context, b *domain.IssuerBinding) error {
+	b.Enabled = false
+	_, err := dbOrTx(ctx, r.db).NewInsert().Model(b).
+		Value("explicitly_disabled", "(SELECT status = ? FROM identities WHERE id = ?)", string(domain.IdentityStatusActive), b.IdentityID).
+		Returning("*").Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to insert binding: %w", err)
+	}
+	return nil
+}
+
 // GetBinding returns one binding of an issuer row in an account.
 func (r *ExternalIssuerRepository) GetBinding(ctx context.Context, id, issuerID, accountID string) (*domain.IssuerBinding, error) {
 	b := &domain.IssuerBinding{}
