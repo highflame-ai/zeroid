@@ -596,7 +596,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 
 	// Global middleware.
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	// chi 5.4 deprecates RealIP. Kept for now so embedders see no behaviour
+	// change; replacing it with chi's ClientIP middleware is a separate change.
+	r.Use(chimiddleware.RealIP) //nolint:staticcheck // SA1019, see above
 	// oauthFormCompat must run before requestValidationMiddleware so that
 	// RFC-mandated form-encoded bodies on /oauth2/* endpoints are rewritten
 	// to JSON before the JSON-only Content-Type gate runs.
