@@ -294,6 +294,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `issuer_already_trusted` | The issuer is trusted by another account, or this account has a row of this kind (and constraints) already. Never names the other account |
 | 409 | `issuer_limit_reached` | The account has 20 issuers |
 | 409 | `issuer_store_config` | Any route but the list and `/check` on a `config`-mode server |
+| 409 | `issuer_changed` | A PATCH with `if_updated_at` whose value is no longer the row's `updated_at` |
 | 409 | `binding_conflict` | Another enabled binding maps this subject key under this issuer |
 | 409 | `binding_exists` | The same (issuer, subject key, identity) binding exists |
 | 409 | `binding_explicitly_disabled` | A conditional enable of a binding an admin disabled |
@@ -302,7 +303,7 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 422 | `wrong_kind` | `/discovery` or `/verify-id-token` on a `workload` row; `/verify-workload-token` on a `person` row |
 | 422 | `issuer_disabled` | `/verify-id-token` on a disabled row |
 | 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `nonce_mismatch` | `/verify-id-token` refused the token ([below](#post-external-issuersidverify-id-token--200)) |
-| 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `audience_not_a_challenge` | `/verify-workload-token` refused the token or the challenge ([below](#post-external-issuersidverify-workload-token--200)) |
+| 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `audience_not_a_challenge`, `pin_not_single` | `/verify-workload-token` refused the token or the challenge ([below](#post-external-issuersidverify-workload-token--200)) |
 | 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
 | 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
 | 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri`; on `/discovery`, also no usable `authorization_endpoint` or `token_endpoint` |
@@ -395,6 +396,8 @@ Neither do `claim_mapping.user_id`, `claim_mapping.email` and `claim_mapping.ema
 A `claim_mapping` patch replaces the whole map, so it must repeat those three unchanged; otherwise it is 422 `claim_mapping_immutable`. Delete and re-create the issuer to change them.
 The whole row is re-validated and re-checked for uniqueness, except for a patch that changes only `display_name` and/or disables the row, so rows stay manageable when the deployment's rules move under them (an issuer dropped from the shared list leaves rows in several accounts that can still be renamed and disabled).
 Any patch that enables a row is re-checked, so a row stranded in conflict cannot be re-enabled.
+`if_updated_at` (the row's `updated_at` as last read) makes the patch conditional: it applies only while the row is unchanged since then, checked under the issuer lock every writer takes, else 409 `issuer_changed`. A deployer that checked a row before enabling it, as for a workload row's proof of control, enables exactly the row it checked.
+A workload create refused with 409 `issuer_already_trusted` is logged as a warning (account, issuer, actor): the first account to add an issuer holds it, so it can be a rightful customer blocked by a squatter's row, for an operator to resolve.
 
 ### `POST /external-issuers/{id}/refresh` → 200
 
@@ -508,7 +511,7 @@ ZeroID verifies the token under this row with the routine a federated client ass
 - the row is `workload` (else `wrong_kind`); a **disabled row is accepted**, since a row waits disabled for this proof;
 - the signature, against the row's JWKS, with an algorithm on the row's list;
 - `iss` equal to the row's issuer; `exp`, `nbf` and `iat` with the 60-second skew; `iat` within `max_token_age_seconds`, and the whole lifetime (`exp` − `iat`) within it too; `sub` present;
-- the row's claim constraints, including a shared issuer's pinning claim, on the verified claims, so a row pinning another customer's `repository_owner` cannot be proven;
+- the row's claim constraints, including a shared issuer's pinning claim, on the verified claims, so a row pinning another customer's `repository_owner` cannot be proven; and a shared issuer's row must pin **exactly one** value (else 422 `pin_not_single`), since a token carries one and a proof with one value must not stand for a row that also pins another customer's;
 - `aud` exactly `[audience]`: one value, the challenge.
 
 `audience` itself must not be one of the row's `audiences` or ZeroID's own issuer (422 `audience_not_a_challenge`), so an ordinary P2 assertion, captured in transit, never stands in for the proof.

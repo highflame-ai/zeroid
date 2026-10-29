@@ -86,6 +86,7 @@ type ExternalIssuerPatchBody struct {
 	JWKSCacheTTLSeconds *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
 	TrustEmail          *bool                `json:"trust_email,omitempty"`
 	Enabled             *bool                `json:"enabled,omitempty"`
+	IfUpdatedAt         *time.Time           `json:"if_updated_at,omitempty" doc:"Apply the patch only if the row's updated_at still equals this (409 issuer_changed otherwise)."`
 }
 
 // ExternalIssuerView is an issuer row, with the JWKS probe made by the write
@@ -340,7 +341,7 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 		DisplayName: b.DisplayName, Audiences: b.Audiences, Algorithms: b.Algorithms,
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
-		Enabled: b.Enabled,
+		Enabled: b.Enabled, IfUpdatedAt: b.IfUpdatedAt,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")

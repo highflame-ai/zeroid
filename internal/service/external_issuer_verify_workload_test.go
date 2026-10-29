@@ -174,6 +174,15 @@ func TestVerifyWorkloadToken_Constraints(t *testing.T) {
 	// A shared issuer is squatted by pinning another customer's value
 	// (repository_owner on GitHub Actions): only a token carrying that value,
 	// one the squatter cannot obtain, proves the row.
+	t.Run("a shared issuer's row must pin exactly one value", func(t *testing.T) {
+		f := newWorkloadVerifyFixture(t, []domain.SharedIssuer{{Issuer: workloadVerifyIssuer, PinClaim: "repository_owner"}})
+		for _, pinned := range [][]string{{"acme", "victim"}, {}} {
+			row := *f.row
+			row.ClaimConstraints = map[string][]string{"repository_owner": pinned}
+			_, err := f.verifyWorkload(&row, f.workloadToken(t, map[string]any{"repository_owner": "acme"}), workloadVerifyChallenge)
+			requireIssuerCode(t, err, http.StatusUnprocessableEntity, "pin_not_single")
+		}
+	})
 	t.Run("a shared issuer's pin must match", func(t *testing.T) {
 		f := newWorkloadVerifyFixture(t, []domain.SharedIssuer{{Issuer: workloadVerifyIssuer, PinClaim: "repository_owner"}})
 		row := *f.row

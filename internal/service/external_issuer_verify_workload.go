@@ -99,6 +99,14 @@ func (s *ExternalIssuerService) verifyWorkloadTokenForRow(ctx context.Context, r
 		return nil, issuerErr(http.StatusUnprocessableEntity, "audience_not_a_challenge",
 			"audience must be a one-time challenge, not an audience the issuer or this server accepts")
 	}
+	// A shared issuer's row may pin several values (up to the constraint
+	// cap), and a token carries one. A proof with one value must not stand
+	// for a row that also pins another customer's, so such a row is proven
+	// only when it pins exactly one.
+	if pin := s.sharedPin(row.Issuer); pin != "" && len(row.ClaimConstraints[pin]) != 1 {
+		return nil, issuerErr(http.StatusUnprocessableEntity, "pin_not_single",
+			fmt.Sprintf("a shared issuer's workload row is proven only when it pins exactly one %s value", pin))
+	}
 	entry, err := s.cfg.Registry.EntryForRow(row)
 	if err != nil {
 		return nil, err
