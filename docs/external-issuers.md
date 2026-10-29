@@ -273,16 +273,17 @@ The legacy profile is frozen (ADR 0043 D1): there the exchange delegates as befo
 An issuer that sets `claim_mapping.groups` copies the person's groups from the ID token or ID-JAG into the issued token's `groups` claim (RFC 9068 §2.2.3.1), an array of strings.
 A resource server reads it as `authjwt.Claims.Groups`.
 
-- The claim may be a JSON array of strings or a single string (one group). Entries that are not strings, are empty, or carry control or format characters are skipped; duplicates collapse.
+- The claim may be a JSON array of strings or a single string (one group). Entries are skipped when they are not strings, are empty or blank, have leading or trailing whitespace, or contain control characters, format characters or any space separator other than U+0020 (such as a no-break space or a line separator). Duplicates collapse.
+- Names are copied byte for byte: no trimming, case folding or Unicode normalization, because a policy must match what the IdP sends. Matching a group is case-sensitive and exact.
 - No such claim in the IdP token means no `groups` claim. That is not an error.
 - A claim of any other shape (a number, an object) is ignored with a warning; the grant still succeeds.
-- At most 100 groups, each at most 256 bytes, 8 KiB in total. Above any limit the whole claim is dropped with a warning, never truncated, so a token's list is either the IdP's whole list or absent.
+- Limits: at most 1000 raw entries are read, and at most 100 groups are kept after skipped entries and duplicates are removed, each at most 256 bytes and 8 KiB in total. Above any limit the whole claim is dropped with a warning, never truncated, so a token's list is either the IdP's whole usable list or absent.
 - Entra sends an overage indicator instead of the list when a person is in too many groups (`_claim_names` naming the claim, or `hasgroups`). That reads as no groups, with a warning. Entra's `groups` claim holds group object ids unless the app registration emits names.
 - Groups are fixed at issue time, like the other person claims; a change at the IdP takes effect at the next exchange. They never set `role` or `privilege_scope`.
-- `groups` is reserved: `additional_claims` cannot set it. It is written only on a token whose `sub` is the person, and travels with `sub` onto every exchanged `rfc8693` token, like `user_idp_sub`. Under the legacy profile an exchanged token's `sub` is the actor, so it carries none.
-- An empty or absent `groups` means "unknown", not "a member of no group": do not grant access on its absence.
+- `groups` is reserved: `additional_claims` cannot set it. It is written only on a token whose `sub` is the person, and travels with `sub` onto every exchanged `rfc8693` token, like `user_idp_sub`, and onto a CIBA approval made with a `requesting_token` that carries it. Under the legacy profile an exchanged token's `sub` is the actor, so it carries none.
+- **An absent `groups` claim means unknown, not "a member of no group".** The list is dropped above the limits or on overage, and several person tokens never carry it: `authorization_code` and `refresh_token` grants, the trusted external-principal exchange, and legacy-profile delegated tokens. A resource server must never grant access on the absence of a group, and a deny rule keyed on a group must treat an absent claim as unknown (fail closed where that matters).
 
-`claim_mapping.groups` is not an identity key, so a PATCH may change or remove it.
+`claim_mapping.groups` is not an identity key, so a PATCH may change or remove it. It is refused (`invalid_claim_mapping`) with surrounding whitespace, and on a workload row, where nothing reads it.
 An empty value (`"groups": ""`) turns groups off: on create it keeps a preset from filling the key, and on create or PATCH it is stored as no mapping, so the row's `claim_mapping` has no `groups` key afterwards. A PATCH whose `claim_mapping` leaves `groups` out removes it the same way; presets apply on create only, so nothing refills it. Rows that existed before `groups` was added are not changed.
 
 `POST /external-issuers/{id}/verify-id-token` returns the groups it read as `groups`, filtered and limited exactly as the grants do, and omits the field when the mapping is unset or yields none.

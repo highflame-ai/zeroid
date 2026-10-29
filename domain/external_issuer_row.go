@@ -277,6 +277,17 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 			return issuerInvalid("invalid_claim_mapping", "claim_mapping.%s names no claim", k)
 		}
 	}
+	if g, set := e.ClaimMapping["groups"]; set {
+		// Only the person grants read groups; on a workload row the key
+		// would look configured and do nothing.
+		if e.Kind != IssuerKindPerson {
+			return issuerInvalid("invalid_claim_mapping", "claim_mapping.groups applies to a person issuer only")
+		}
+		// Claim names are matched exactly, so a padded name would never match.
+		if strings.TrimSpace(g) != g {
+			return issuerInvalid("invalid_claim_mapping", "claim_mapping.groups must name the claim without surrounding whitespace")
+		}
+	}
 	if e.Kind == IssuerKindPerson && e.ClaimMapping["user_id"] == "" {
 		return issuerInvalid("invalid_claim_mapping", "a person issuer needs claim_mapping.user_id, the claim that carries the person's user key")
 	}

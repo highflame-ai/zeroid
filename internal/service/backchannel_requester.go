@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ type RequestingToken struct {
 	IdentityID string
 	// DPoPKeyThumbprint is the token's cnf.jkt, "" when it is not DPoP-bound.
 	DPoPKeyThumbprint string
+	// Groups is the token's `groups` claim (the person's IdP groups), nil
+	// when it has none.
+	Groups []string
 }
 
 // Actor returns who made the request: act.sub, else client_id, else sub.
@@ -176,6 +180,10 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.SubjectOverride = row.RequesterSub
 	req.UserEmail = ""
 	req.UserName = ""
+	// The chain's person keeps their groups, as on a token exchange; the
+	// approver's are never read. IssueCredential writes them only when the
+	// chain's principal is a person.
+	req.Groups = slices.Clone(row.RequestingGroups)
 	req.ParentJTI = row.RequestingJTI
 	var act map[string]any
 	if row.RequestingAct != "" {

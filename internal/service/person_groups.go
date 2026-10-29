@@ -1,7 +1,7 @@
 package service
 
 import (
-	"slices"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -13,12 +13,16 @@ import (
 // issued token's `groups` claim (RFC 9068 §2.2.3.1). They keep a token from
 // growing without bound with the person's directory. Above any of them the
 // whole claim is dropped, never truncated: a partial list would look
-// complete to a resource server, while an absent one plainly says "unknown".
+// complete to a resource server, while an absent one says "unknown".
 const (
-	// MaxPersonGroups is the most groups a token carries. Okta caps its
+	// MaxPersonGroups is the most groups a token carries, counted after
+	// unusable entries are skipped and duplicates collapse. Okta caps its
 	// groups claim at 100; Entra switches to an overage indicator above 200
 	// in a JWT.
 	MaxPersonGroups = 100
+	// MaxPersonGroupsRawEntries bounds the entries read from the IdP's claim
+	// at all, before any filtering, so parsing work stays bounded.
+	MaxPersonGroupsRawEntries = 1000
 	// MaxPersonGroupLength is the longest single group name, in bytes.
 	MaxPersonGroupLength = 256
 	// MaxPersonGroupsBytes bounds the sum of the group names, in bytes.
@@ -32,9 +36,10 @@ const (
 // the values, which are directory data).
 //
 // Accepted shapes are a JSON array of strings and a single string (one
-// group). Entries that are not strings, are empty, are not valid UTF-8 or
-// carry control or format characters are skipped, and duplicates collapse,
-// in the IdP's order.
+// group). Entries that are not strings or not usable names (validGroupName)
+// are skipped, and duplicates collapse, in the IdP's order. Names are kept
+// byte for byte: no trimming, case folding or Unicode normalization, because
+// a policy must match exactly what the IdP sends.
 //
 // Entra omits the list when a person is in too many groups and names it in
 // _claim_names instead (a distributed claim, OIDC Core §5.6.2), or sets
@@ -65,11 +70,12 @@ func extractPersonGroups(claims map[string]any, claim, issuer string) []string {
 		warnGroupsDropped(issuer, claim, "not an array of strings or a string")
 		return nil
 	}
-	if len(raw) > MaxPersonGroups {
-		warnGroupsDropped(issuer, claim, "too many groups")
+	if len(raw) > MaxPersonGroupsRawEntries {
+		warnGroupsDropped(issuer, claim, "too many entries")
 		return nil
 	}
-	out := make([]string, 0, len(raw))
+	out := make([]string, 0, min(len(raw), MaxPersonGroups))
+	seen := make(map[string]struct{}, len(raw))
 	total, skipped := 0, 0
 	for _, e := range raw {
 		s, ok := e.(string)
@@ -81,8 +87,13 @@ func extractPersonGroups(claims map[string]any, claim, issuer string) []string {
 			warnGroupsDropped(issuer, claim, "a group name is too long")
 			return nil
 		}
-		if slices.Contains(out, s) {
+		if _, dup := seen[s]; dup {
 			continue
+		}
+		seen[s] = struct{}{}
+		if len(out) == MaxPersonGroups {
+			warnGroupsDropped(issuer, claim, "too many groups")
+			return nil
 		}
 		total += len(s)
 		if total > MaxPersonGroupsBytes {
@@ -101,15 +112,18 @@ func extractPersonGroups(claims map[string]any, claim, issuer string) []string {
 	return out
 }
 
-// validGroupName reports whether s is a group name a token may carry: non
-// empty, valid UTF-8, with no control or format characters (the same floor
-// sanitizePrincipalAttribute applies to the display attributes).
+// validGroupName reports whether s is a group name a token may carry: valid
+// UTF-8, not empty or blank, no leading or trailing whitespace, no control
+// or format characters (the floor sanitizePrincipalAttribute applies to the
+// display attributes), and no space separator other than U+0020 (a line or
+// paragraph separator, or a no-break or ideographic space, would make two
+// names that look the same compare unequal).
 func validGroupName(s string) bool {
-	if s == "" || !utf8.ValidString(s) {
+	if !utf8.ValidString(s) || strings.TrimSpace(s) == "" || strings.TrimSpace(s) != s {
 		return false
 	}
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || (unicode.Is(unicode.Z, r) && r != ' ') {
 			return false
 		}
 	}

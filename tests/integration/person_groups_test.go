@@ -1,8 +1,10 @@
 package integration_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -274,4 +276,57 @@ func TestPersonGroups_EmptyMappingTurnsGroupsOff(t *testing.T) {
 	}}, tn.headers)
 	require.Equal(t, http.StatusOK, status, "%v", body)
 	assert.NotContains(t, body["claim_mapping"], "groups", "a patch without groups removes it; nothing refills it")
+}
+
+// TestPersonGroups_CIBAContinuation: a CIBA approval made for a person token
+// (requesting_token) extends that chain, so the minted token keeps the
+// chain's person and their groups; the approver's are never read.
+func TestPersonGroups_CIBAContinuation(t *testing.T) {
+	p := newP1C(t)
+	mapGroups(t, p.f, p.tn, p.rowID, "groups")
+	person := p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, map[string]any{"groups": []string{"eng"}}), map[string]any{"scope": "tools:read"})
+	require.Equal(t, http.StatusOK, person.StatusCode, "body=%s", person.RawBody)
+	bare := p.exchange(t, p.idToken(t, mockidp.ProfileEntraIDToken, nil), map[string]any{"scope": "tools:read"})
+	require.Equal(t, http.StatusOK, bare.StatusCode, "body=%s", bare.RawBody)
+
+	clientID := uid("ciba-groups")
+	status, client := p.f.call(t, http.MethodPost, "/oauth/clients", map[string]any{
+		"client_id": clientID, "name": clientID, "confidential": true,
+		"grant_types": []string{zeroidGrantTypeCIBA},
+	}, p.tn.headers)
+	require.Equal(t, http.StatusCreated, status, "%v", client)
+	secret := client["client_secret"].(string)
+
+	run := func(t *testing.T, requesting string) map[string]any {
+		t.Helper()
+		b, err := json.Marshal(map[string]any{
+			"client_id": clientID, "client_secret": secret,
+			"account_id": p.tn.account, "project_id": p.tn.project,
+			"login_hint": "approver-1", "scope": "tools:read", "requesting_token": requesting,
+		})
+		require.NoError(t, err)
+		resp, err := http.Post(p.f.http.URL+"/oauth2/bc-authorize", "application/json", bytes.NewReader(b))
+		require.NoError(t, err)
+		var out map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode, "bc-authorize: %v", out)
+		id := out["auth_req_id"].(string)
+
+		status, body := p.f.call(t, http.MethodPost, "/oauth2/bc-authorize/"+id+"/approve", map[string]any{"subject_id": "approver-1"}, p.tn.headers)
+		require.Equal(t, http.StatusOK, status, "approve: %v", body)
+
+		tok := postFederation(t, p.f.http.URL, map[string]any{
+			"grant_type": zeroidGrantTypeCIBA, "auth_req_id": id,
+			"client_id": clientID, "client_secret": secret, "requesting_token": requesting,
+		})
+		require.Equal(t, http.StatusOK, tok.StatusCode, "poll: %s", tok.RawBody)
+		return decodeIssuedTokenClaims(t, tok.AccessToken)
+	}
+
+	claims := run(t, person.AccessToken)
+	assert.Equal(t, "user_hf_alice", claims["sub"], "the chain's person, not the approver")
+	assert.Equal(t, []any{"eng"}, claims["groups"], "the chain's person keeps their groups")
+
+	assert.NotContains(t, run(t, bare.AccessToken), "groups", "a chain without groups gains none")
 }

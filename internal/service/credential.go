@@ -154,9 +154,10 @@ type IssueRequest struct {
 	UserEmail string
 	UserName  string
 	// Groups are the person's groups, read from the IdP token through the
-	// issuer's claim_mapping.groups (or, on token exchange, from the verified
-	// parent), and emitted as the RFC 9068 §2.2.3.1 `groups` claim. Only on a
-	// token whose sub is the person; never from caller input.
+	// issuer's claim_mapping.groups (or, on token exchange and a CIBA chain
+	// continuation, from the verified parent), and emitted as the RFC 9068
+	// §2.2.3.1 `groups` claim. Only on a token whose sub is the person; never
+	// from caller input.
 	Groups []string
 	// ActClaim, when non-nil, is an existing chain's act as issued (a CIBA
 	// step-up approved into a requesting chain). Under the legacy profile it is

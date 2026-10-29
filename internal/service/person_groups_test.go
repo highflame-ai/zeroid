@@ -47,6 +47,46 @@ func TestExtractPersonGroups(t *testing.T) {
 			return out
 		}()},
 		{name: "above the count limit drops the claim", claims: map[string]any{"groups": many(MaxPersonGroups + 1)}, claim: "groups"},
+		{name: "the count limit applies after duplicates collapse", claims: map[string]any{"groups": func() []any {
+			out := make([]any, MaxPersonGroups+50)
+			for i := range out {
+				out[i] = "eng"
+			}
+			return append(out, "ops")
+		}()}, claim: "groups", want: []string{"eng", "ops"}},
+		{name: "the count limit applies after unusable entries are skipped", claims: map[string]any{"groups": func() []any {
+			out := make([]any, 0, MaxPersonGroups+60)
+			for i := 0; i < 60; i++ {
+				out = append(out, float64(i))
+			}
+			return append(out, many(MaxPersonGroups)...)
+		}()}, claim: "groups", want: func() []string {
+			out := make([]string, MaxPersonGroups)
+			for i := range out {
+				out[i] = fmt.Sprintf("g%03d", i)
+			}
+			return out
+		}()},
+		{name: "above the raw entry limit drops the claim, even when all collapse to one", claims: map[string]any{"groups": func() []any {
+			out := make([]any, MaxPersonGroupsRawEntries+1)
+			for i := range out {
+				out[i] = "eng"
+			}
+			return out
+		}()}, claim: "groups"},
+		{name: "at the raw entry limit", claims: map[string]any{"groups": func() []any {
+			out := make([]any, MaxPersonGroupsRawEntries)
+			for i := range out {
+				out[i] = "eng"
+			}
+			return out
+		}()}, claim: "groups", want: []string{"eng"}},
+		{name: "blank, padded and odd-space names are skipped", claims: map[string]any{"groups": []any{
+			" ", "\t", " eng", "eng ", "a\u2028b", "a\u2029b", "a\u00a0b", "a\u3000b", "Domain Users",
+		}}, claim: "groups", want: []string{"Domain Users"}},
+		{name: "names are byte-exact: case and normalization kept", claims: map[string]any{"groups": []any{
+			"Eng", "eng", "caf\u00e9", "cafe\u0301",
+		}}, claim: "groups", want: []string{"Eng", "eng", "caf\u00e9", "cafe\u0301"}},
 		{name: "a group name above the length limit drops the claim", claims: map[string]any{"groups": []any{"eng", strings.Repeat("x", MaxPersonGroupLength+1)}}, claim: "groups"},
 		{name: "a group name at the length limit", claims: map[string]any{"groups": []any{strings.Repeat("x", MaxPersonGroupLength)}}, claim: "groups", want: []string{strings.Repeat("x", MaxPersonGroupLength)}},
 		{name: "above the total size drops the claim", claims: map[string]any{"groups": func() []any {

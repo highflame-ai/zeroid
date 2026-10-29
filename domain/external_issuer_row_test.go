@@ -86,6 +86,12 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "groups mapping", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "groups" }},
 		{name: "groups mapping to a renamed claim", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "member_of" }},
 		{name: "groups mapping names no claim", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = " " }, want: "invalid_claim_mapping"},
+		{name: "groups mapping with surrounding whitespace", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = " groups" }, want: "invalid_claim_mapping"},
+		{name: "groups mapping with trailing whitespace", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "groups\t" }, want: "invalid_claim_mapping"},
+		{name: "groups mapping on a workload row", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.ClaimMapping["groups"] = "groups"
+		}, want: "invalid_claim_mapping"},
 		{name: "groups mapping too long", mutate: func(e *ExternalIssuer) {
 			e.ClaimMapping["groups"] = strings.Repeat("g", maxClaimNameBytes+1)
 		}, want: "invalid_claim_mapping"},

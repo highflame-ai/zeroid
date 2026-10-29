@@ -561,6 +561,7 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 	if cid, err := jwt.Get[string](parsed, "client_id"); err == nil {
 		rt.ClientID = cid
 	}
+	rt.Groups = parentGroups(parsed)
 	return rt, nil
 }
 
