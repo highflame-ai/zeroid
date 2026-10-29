@@ -55,9 +55,16 @@ func newDBFederation(t *testing.T) *dbFederation {
 	t.Helper()
 	idp, err := mockidp.New("https://placeholder")
 	require.NoError(t, err)
-	idpSrv := httptest.NewTLSServer(idp.Handler())
+	// Issuer rows outlive the test in the shared database, and the OS can hand
+	// a later test a port an earlier one used. A path prefix of its own keeps
+	// the issuer URLs from repeating, so they never collide with another
+	// account's row (409 issuer_already_trusted).
+	prefix := "/" + uid("idp")
+	mux := http.NewServeMux()
+	mux.Handle(prefix+"/", http.StripPrefix(prefix, idp.Handler()))
+	idpSrv := httptest.NewTLSServer(mux)
 	t.Cleanup(idpSrv.Close)
-	idp.SetBaseURL(idpSrv.URL)
+	idp.SetBaseURL(idpSrv.URL + prefix)
 
 	f := &dbFederation{idp: idp, idpSrv: idpSrv, members: map[string]string{}}
 	// One mock Entra tenant stands in for a shared issuer (like
