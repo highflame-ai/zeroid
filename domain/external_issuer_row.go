@@ -194,6 +194,12 @@ func (e *ExternalIssuer) Normalize() {
 	if e.ClaimMapping == nil {
 		e.ClaimMapping = map[string]string{}
 	}
+	// An empty groups mapping means "read no groups": it is stored as no
+	// mapping. Normalize runs after the preset on create, so an explicit ""
+	// also keeps a preset from filling the key; presets never run on update.
+	if g, set := e.ClaimMapping["groups"]; set && strings.TrimSpace(g) == "" {
+		delete(e.ClaimMapping, "groups")
+	}
 	if e.ClaimConstraints == nil {
 		e.ClaimConstraints = map[string][]string{}
 	}

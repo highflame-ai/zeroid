@@ -37,7 +37,7 @@ func TestExtractPersonGroups(t *testing.T) {
 		{name: "bool is malformed", claims: map[string]any{"groups": true}, claim: "groups"},
 		{name: "non-string entries are skipped", claims: map[string]any{"groups": []any{"eng", 7.0, nil, map[string]any{}, "ops"}}, claim: "groups", want: []string{"eng", "ops"}},
 		{name: "only non-string entries", claims: map[string]any{"groups": []any{1.0, false}}, claim: "groups"},
-		{name: "control and format characters are skipped", claims: map[string]any{"groups": []any{"eng\x1b[31m", "ad‮min", "ops"}}, claim: "groups", want: []string{"ops"}},
+		{name: "control and format characters are skipped", claims: map[string]any{"groups": []any{"eng\x1b[31m", "ad\u202emin", "ops"}}, claim: "groups", want: []string{"ops"}},
 		{name: "duplicates collapse in order", claims: map[string]any{"groups": []any{"b", "a", "b"}}, claim: "groups", want: []string{"b", "a"}},
 		{name: "at the count limit", claims: map[string]any{"groups": many(MaxPersonGroups)}, claim: "groups", want: func() []string {
 			out := make([]string, MaxPersonGroups)

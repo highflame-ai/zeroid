@@ -335,6 +335,26 @@ func TestApplyIssuerPreset(t *testing.T) {
 			}
 		}
 	})
+	t.Run("an explicit empty groups turns groups off: no preset fill, stored as no mapping", func(t *testing.T) {
+		for preset, iss := range map[string]string{
+			IssuerPresetEntra: "https://login.microsoftonline.com/" + tid + "/v2.0",
+			IssuerPresetOkta:  "https://acme.okta.com",
+		} {
+			for _, empty := range []string{"", " "} {
+				e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: iss, ClaimMapping: map[string]string{"groups": empty}}
+				if err := ApplyIssuerPreset(e, preset); err != nil {
+					t.Fatalf("%s: %v", preset, err)
+				}
+				e.Normalize()
+				if g, set := e.ClaimMapping["groups"]; set {
+					t.Fatalf("%s: claim_mapping.groups = %q, want no mapping", preset, g)
+				}
+				if err := e.Validate(IssuerValidation{JWKSURIPending: true}); err != nil {
+					t.Fatalf("%s: %v", preset, err)
+				}
+			}
+		}
+	})
 	t.Run("unknown preset", func(t *testing.T) {
 		if got := issuerCode(ApplyIssuerPreset(&ExternalIssuer{}, "auth0")); got != "invalid_preset" {
 			t.Fatalf("code = %q", got)

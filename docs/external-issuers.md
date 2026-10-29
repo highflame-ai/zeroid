@@ -283,6 +283,9 @@ A resource server reads it as `authjwt.Claims.Groups`.
 - An empty or absent `groups` means "unknown", not "a member of no group": do not grant access on its absence.
 
 `claim_mapping.groups` is not an identity key, so a PATCH may change or remove it.
+An empty value (`"groups": ""`) turns groups off: on create it keeps a preset from filling the key, and on create or PATCH it is stored as no mapping, so the row's `claim_mapping` has no `groups` key afterwards. A PATCH whose `claim_mapping` leaves `groups` out removes it the same way; presets apply on create only, so nothing refills it. Rows that existed before `groups` was added are not changed.
+
+`POST /external-issuers/{id}/verify-id-token` returns the groups it read as `groups`, filtered and limited exactly as the grants do, and omits the field when the mapping is unset or yields none.
 
 ## Admin API
 

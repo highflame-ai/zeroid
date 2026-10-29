@@ -223,3 +223,55 @@ func TestPersonGroups_StaticIssuer(t *testing.T) {
 	assert.Equal(t, []any{"eng", "ops"}, exchange(t, map[string]any{"groups": []string{"eng", "ops"}})["groups"])
 	assert.NotContains(t, exchange(t, nil), "groups")
 }
+
+// TestPersonGroups_VerifyIDToken: the issuer's ID-token verification returns
+// the groups it read, filtered and limited as the grants filter them.
+func TestPersonGroups_VerifyIDToken(t *testing.T) {
+	p := newProof(t)
+	verify := func(t *testing.T, extra map[string]any) map[string]any {
+		t.Helper()
+		status, body := p.verify(t, p.tn, p.rowID, p.body(p.idToken(t, mockidp.ProfileEntraIDToken, extra)))
+		require.Equal(t, http.StatusOK, status, "%v", body)
+		return body
+	}
+	assert.NotContains(t, verify(t, map[string]any{"groups": []string{"eng"}}), "groups", "unmapped: no groups")
+
+	mapGroups(t, p.f, p.tn, p.rowID, "groups")
+	assert.Equal(t, []any{"eng", "ops"}, verify(t, map[string]any{"groups": []any{"eng", 3, "ops", "eng"}})["groups"],
+		"non-strings skipped, duplicates collapsed")
+	assert.NotContains(t, verify(t, nil), "groups", "no claim: no groups")
+	assert.NotContains(t, verify(t, map[string]any{"groups": 42}), "groups", "malformed: no groups, still verified")
+}
+
+// TestPersonGroups_EmptyMappingTurnsGroupsOff: "groups": "" means read no
+// groups. It is stored as no mapping, so GET shows no groups key.
+func TestPersonGroups_EmptyMappingTurnsGroupsOff(t *testing.T) {
+	f := newDBFederation(t)
+	tn := newTITenant(t)
+	status, row := f.call(t, http.MethodPost, "/external-issuers", map[string]any{
+		"kind":          "person",
+		"issuer":        f.idp.OktaIssuer(),
+		"claim_mapping": map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified", "groups": ""},
+	}, tn.headers)
+	require.Equal(t, http.StatusCreated, status, "an empty groups mapping is accepted on create: %v", row)
+	assert.NotContains(t, row["claim_mapping"], "groups")
+	rowID := row["id"].(string)
+
+	mapGroups(t, f, tn, rowID, "groups")
+
+	status, body := f.call(t, http.MethodPatch, "/external-issuers/"+rowID, map[string]any{"claim_mapping": map[string]string{
+		"user_id": "sub", "email": "email", "email_verified": "email_verified", "groups": "",
+	}}, tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.NotContains(t, body["claim_mapping"], "groups", "an empty groups patch removes the mapping")
+	status, body = f.call(t, http.MethodGet, "/external-issuers/"+rowID, nil, tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.NotContains(t, body["claim_mapping"], "groups")
+
+	mapGroups(t, f, tn, rowID, "groups")
+	status, body = f.call(t, http.MethodPatch, "/external-issuers/"+rowID, map[string]any{"claim_mapping": map[string]string{
+		"user_id": "sub", "email": "email", "email_verified": "email_verified",
+	}}, tn.headers)
+	require.Equal(t, http.StatusOK, status, "%v", body)
+	assert.NotContains(t, body["claim_mapping"], "groups", "a patch without groups removes it; nothing refills it")
+}
