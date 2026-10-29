@@ -35,7 +35,7 @@ func newWorkloadVerifyFixture(t *testing.T, shared []domain.SharedIssuer) *verif
 		jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
 	t.Cleanup(reg.Close)
 	svc := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{
-		Store: IssuerStoreDB, Registry: reg, SelfIssuer: workloadVerifySelf,
+		Store: IssuerStoreDB, Registry: reg, SelfIssuer: workloadVerifySelf, SharedIssuers: shared,
 	})
 	return &verifyFixture{jwks: srv, row: row, svc: svc}
 }
