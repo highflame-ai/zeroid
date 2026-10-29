@@ -65,7 +65,7 @@ Writers check these rules under a per-issuer Postgres advisory lock (on the cano
 
 **Known limitation.** ZeroID itself does not prove that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
 For `person` rows the deployer closes the impersonation half with an ownership proof built on two routes, [`GET /external-issuers/{id}/discovery`](#get-external-issuersiddiscovery--200) and [`POST /external-issuers/{id}/verify-id-token`](#post-external-issuersidverify-id-token--200): the account's owner signs in through the issuer, ZeroID verifies the ID token as the ID-token exchange would, and the deployer (in SaaS, Admin) refuses person resolution through a row it has not verified.
-`workload` rows have no such proof yet.
+For `workload` rows the deployer closes it with a challenge, [`POST /external-issuers/{id}/verify-workload-token`](#post-external-issuersidverify-workload-token--200): it writes the row disabled, hands the account a one-time audience, and enables the row only once ZeroID verifies a token the issuer minted for that audience under the row.
 
 The built-in shared list (used when `federation.shared_issuers` is empty):
 
@@ -299,13 +299,14 @@ Every refusal is an RFC 9457 problem with a stable `code`:
 | 409 | `binding_explicitly_disabled` | A conditional enable of a binding an admin disabled |
 | 409 | `identity_not_active` | Enabling a binding for an identity that is not active |
 | 409 | `client_conflict` | The requested OAuth client exists and is not this identity's `private_key_jwt` client |
-| 422 | `wrong_kind` | `/discovery` or `/verify-id-token` on a `workload` row |
+| 422 | `wrong_kind` | `/discovery` or `/verify-id-token` on a `workload` row; `/verify-workload-token` on a `person` row |
 | 422 | `issuer_disabled` | `/verify-id-token` on a disabled row |
 | 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `nonce_mismatch` | `/verify-id-token` refused the token ([below](#post-external-issuersidverify-id-token--200)) |
+| 422 | `token_invalid`, `audience_mismatch`, `constraint_mismatch`, `audience_not_a_challenge` | `/verify-workload-token` refused the token or the challenge ([below](#post-external-issuersidverify-workload-token--200)) |
 | 422 | `discovery_unreachable` | `{issuer}/.well-known/openid-configuration` could not be fetched: unreachable, not 200, a redirect (discovery is never followed through one), or a private or reserved address (not told apart, so the API is no internal-DNS oracle; the log says which) |
 | 422 | `discovery_issuer_mismatch` | The discovery document names a different issuer |
 | 422 | `discovery_invalid` | The discovery document names no usable `jwks_uri`; on `/discovery`, also no usable `authorization_endpoint` or `token_endpoint` |
-| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned). On `/verify-id-token`, the row's key set could not be loaded |
+| 422 | `jwks_unreachable` | The JWKS could not be fetched, including from a private address; redirects are followed only to https, at most 3 (no upstream detail is returned). On `/verify-id-token` and `/verify-workload-token`, the row's key set could not be loaded |
 | 422 | `jwks_empty` | The JWKS has no RSA or EC signing key |
 | 422 | `shared_issuer_requires_constraints` | A shared-issuer row that does not constrain its pinning claim |
 | 422 | `claim_mapping_immutable` | A PATCH changing `claim_mapping.user_id`, `email` or `email_verified` |
@@ -491,6 +492,37 @@ A refused token is 422 with one of these codes, and never the token, its claims,
 
 Another account's row is 404.
 
+### `POST /external-issuers/{id}/verify-workload-token` → 200
+
+The proof of control for a `workload` row (ADR 0042 open question 8).
+The deployer issues a one-time challenge; the account mints a token from its issuer for that audience and nothing else, for example `aws sts get-web-identity-token --audience <challenge>`, `kubectl create token <sa> --audience <challenge>`, a SPIFFE JWT-SVID for it, or `core.getIDToken('<challenge>')` in a GitHub Actions workflow; and the deployer has ZeroID verify it here.
+
+```json
+{"token": "<a token from the issuer>", "audience": "<the challenge>"}
+```
+
+Both are required: `token` at most 16384 bytes, `audience` at most 512 (400 `invalid_request` otherwise).
+A body of 32 KiB or more is refused with 413, and a refusal before the handler runs redacts every echoed value, as on `/verify-id-token`.
+ZeroID verifies the token under this row with the routine a federated client assertion (P2) runs:
+
+- the row is `workload` (else `wrong_kind`); a **disabled row is accepted**, since a row waits disabled for this proof;
+- the signature, against the row's JWKS, with an algorithm on the row's list;
+- `iss` equal to the row's issuer; `exp`, `nbf` and `iat` with the 60-second skew; `iat` within `max_token_age_seconds`, and the whole lifetime (`exp` − `iat`) within it too; `sub` present;
+- the row's claim constraints, including a shared issuer's pinning claim, on the verified claims, so a row pinning another customer's `repository_owner` cannot be proven;
+- `aud` exactly `[audience]`: one value, the challenge.
+
+`audience` itself must not be one of the row's `audiences` or ZeroID's own issuer (422 `audience_not_a_challenge`), so an ordinary P2 assertion, captured in transit, never stands in for the proof.
+It needs no binding, mints nothing and records no `jti`; the deployer makes its challenge single-use.
+
+```json
+{"issuer_id": "6f1d...", "issuer": "https://oidc.eks.us-east-1.amazonaws.com/id/ABC...", "subject": "system:serviceaccount:agents:planner"}
+```
+
+A refused token is 422 with one of `token_invalid`, `audience_mismatch` (`aud` is not exactly the challenge), `constraint_mismatch`, `wrong_kind` or `jwks_unreachable`, and never the token or its claims.
+Another account's row is 404.
+
+An issuer whose tokens cannot name an arbitrary audience (an Entra or Okta access token's `aud` is fixed by its resource) cannot answer the challenge; the deployer may accept its `person` row's sign-in proof instead (see the deployer's rules).
+
 ### `GET /external-issuers/bindings` → 200
 
 The account's bindings across all its issuers, in one query.
@@ -594,9 +626,8 @@ Every insert, update and delete of a row or binding writes `identity_audit_logs`
 
 ## Not yet
 
-- Federated client assertions (P2) do not read workload rows yet.
 - Every issuer row needs OpenID discovery at `{issuer}/.well-known/openid-configuration` (Entra, Okta, Google, GitHub Actions, AWS STS and Kubernetes service-account issuer discovery all serve it). An issuer without it, such as a bare SPIFFE trust-domain bundle endpoint, cannot be a row yet.
 - The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
-- Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); `workload` rows and the ownership of a shared issuer's pinning value remain open.
+- Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); for `workload` rows, including a shared issuer's pinning value, it enables a row only after a challenge token verifies under it (`/verify-workload-token` above). ZeroID does not enforce either itself: a row written enabled through this API mints.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
 - JWKS refreshes on an unknown `kid` are rate-limited per key set (one every 10 seconds), and rows that share a `jwks_uri` share the key set. Tokens with made-up `kid`s, presented on the ID-token exchange or on `/verify-id-token`, can hold that slot, so a real key rotation at the IdP is picked up up to 10 seconds late for every account on the key set.
