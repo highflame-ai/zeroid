@@ -84,6 +84,9 @@ func TestExtractPersonGroups(t *testing.T) {
 		{name: "blank, padded and odd-space names are skipped", claims: map[string]any{"groups": []any{
 			" ", "\t", " eng", "eng ", "a\u2028b", "a\u2029b", "a\u00a0b", "a\u3000b", "Domain Users",
 		}}, claim: "groups", want: []string{"Domain Users"}},
+		{name: "replacement characters and blank fillers are skipped", claims: map[string]any{"groups": []any{
+			"\ufffd", "eng\ufffd", "\u3164", "a\u115fb", "\u1160", "x\uffa0", "ops",
+		}}, claim: "groups", want: []string{"ops"}},
 		{name: "names are byte-exact: case and normalization kept", claims: map[string]any{"groups": []any{
 			"Eng", "eng", "caf\u00e9", "cafe\u0301",
 		}}, claim: "groups", want: []string{"Eng", "eng", "caf\u00e9", "cafe\u0301"}},

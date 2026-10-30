@@ -3498,6 +3498,8 @@ func (s *OAuthService) Introspect(ctx context.Context, tokenStr string) (map[str
 	for _, claim := range []string{
 		"agent_id", "trust_level", "identity_type", "external_id", "delegation_depth", "act", "cnf", "authorization_details",
 		"client_id", "mission_id", "owner_user_id", "user_id",
+		// RFC 9068 §2.2.3.1 groups: what a resource server decides by group on.
+		"groups",
 	} {
 		if v, err := jwt.Get[any](parsed, claim); err == nil {
 			result[claim] = v

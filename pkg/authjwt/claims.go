@@ -57,7 +57,8 @@ type Claims struct {
 	// drops the whole list above its size limits or on an IdP overage
 	// indicator, and several person tokens never carry it at all
 	// (authorization_code and refresh_token grants, the trusted external
-	// principal exchange, and legacy-profile delegated tokens). So never
+	// principal exchange, CIBA approvals made without a requesting_token,
+	// and legacy-profile delegated tokens). So never
 	// grant access on the absence of a group, and treat a deny rule keyed on
 	// a group as unable to decide when Groups is empty: fail closed where
 	// that matters.

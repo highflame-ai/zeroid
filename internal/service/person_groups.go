@@ -112,18 +112,31 @@ func extractPersonGroups(claims map[string]any, claim, issuer string) []string {
 	return out
 }
 
+// blankOrReplacementRune reports the runes that are neither controls nor
+// separators but still make a name unusable: U+FFFD, which JSON decoding
+// substitutes for invalid UTF-8 (so two different malformed names would
+// collapse into one group), and the Hangul fillers, which render blank.
+func blankOrReplacementRune(r rune) bool {
+	switch r {
+	case utf8.RuneError, '\u3164', '\u115f', '\u1160', '\uffa0':
+		return true
+	}
+	return false
+}
+
 // validGroupName reports whether s is a group name a token may carry: valid
 // UTF-8, not empty or blank, no leading or trailing whitespace, no control
 // or format characters (the floor sanitizePrincipalAttribute applies to the
 // display attributes), and no space separator other than U+0020 (a line or
 // paragraph separator, or a no-break or ideographic space, would make two
-// names that look the same compare unequal).
+// names that look the same compare unequal), and no replacement character
+// or blank-rendering filler (blankOrReplacementRune).
 func validGroupName(s string) bool {
 	if !utf8.ValidString(s) || strings.TrimSpace(s) == "" || strings.TrimSpace(s) != s {
 		return false
 	}
 	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || (unicode.Is(unicode.Z, r) && r != ' ') {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || (unicode.Is(unicode.Z, r) && r != ' ') || blankOrReplacementRune(r) {
 			return false
 		}
 	}

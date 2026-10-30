@@ -180,10 +180,6 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.SubjectOverride = row.RequesterSub
 	req.UserEmail = ""
 	req.UserName = ""
-	// The chain's person keeps their groups, as on a token exchange; the
-	// approver's are never read. IssueCredential writes them only when the
-	// chain's principal is a person.
-	req.Groups = slices.Clone(row.RequestingGroups)
 	req.ParentJTI = row.RequestingJTI
 	var act map[string]any
 	if row.RequestingAct != "" {
@@ -213,6 +209,12 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.RequestBoundedRoot = false
 	p := requestingChainPrincipal(cred, row.RequesterSub, s.credentialSvc.issuer)
 	req.PrincipalType, req.PrincipalSub, req.PrincipalIss = p.Type, p.Sub, p.Iss
+	// The chain's person keeps their groups, as on a token exchange; the
+	// approver's are never read. Only when the minted token's sub is that
+	// person: under the legacy profile a delegated chain's sub is its actor.
+	if p.Type == domain.PrincipalUser && p.Sub == row.RequesterSub {
+		req.Groups = slices.Clone(row.RequestingGroups)
+	}
 
 	// Never outlive the chain: the chokepoint clamps exp to this bound.
 	chainExp := cred.ExpiresAt
