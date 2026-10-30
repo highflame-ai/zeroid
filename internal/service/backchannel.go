@@ -614,6 +614,9 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		row.RequesterActor = requesting.Actor()
 		row.RequestingJTI = requesting.JTI
 		row.RequestingAct = string(requesting.Act)
+		if len(requesting.Groups) > 0 {
+			row.RequestingGroups = requesting.Groups
+		}
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)

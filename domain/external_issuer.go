@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -63,6 +64,13 @@ type ExternalIssuerConfig struct {
 	//	claim_mapping:
 	//	  user_id: sub          # or "preferred_username", "oid", etc.
 	//	  email:   email
+	//	  groups:  groups       # optional: the claim listing the person's groups
+	//
+	// groups, when set, names the upstream claim that lists the person's
+	// groups (a JSON array of strings, or a single string). The person grants
+	// copy it to the issued token's RFC 9068 §2.2.3.1 `groups` claim. A
+	// missing, malformed or oversized claim yields no `groups` claim rather
+	// than a refused grant.
 	ClaimMapping map[string]string `koanf:"claim_mapping"`
 
 	// TrustEmail makes the issuer vouch for its own email claim. OpenID
@@ -138,6 +146,15 @@ func (e *ExternalIssuerConfig) Validate() error {
 	// the deployer. Zero is allowed — Defaults() fills it with 5m.
 	if e.JWKSCacheTTL > 0 && e.JWKSCacheTTL < 30*time.Second {
 		return fmt.Errorf("external_issuer %s: jwks_cache_ttl must be at least 30s (got %s)", e.Issuer, e.JWKSCacheTTL)
+	}
+	// The row rules for groups (ExternalIssuer.Validate), same messages.
+	if g, set := e.ClaimMapping["groups"]; set {
+		if e.EffectiveKind() != IssuerKindPerson {
+			return fmt.Errorf("external_issuer %s: claim_mapping.groups applies to a person issuer only", e.Issuer)
+		}
+		if strings.TrimSpace(g) != g {
+			return fmt.Errorf("external_issuer %s: claim_mapping.groups must name the claim without surrounding whitespace", e.Issuer)
+		}
 	}
 	if _, ok := e.ClaimMapping["user_id"]; !ok {
 		return fmt.Errorf("external_issuer %s: claim_mapping.user_id is required (need a stable subject identifier)", e.Issuer)

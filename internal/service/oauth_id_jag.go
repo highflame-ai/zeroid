@@ -439,6 +439,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		SubjectOverride: userID,
 		UserEmail:       userEmail,
 		UserName:        userName,
+		Groups:          extractPersonGroups(rawClaims, cfg.ClaimMapping["groups"], upstreamIss),
 		ApplicationID:   req.ApplicationID,
 		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
 		// this client and bound the ID-JAG's own client_id claim to it, so it
