@@ -86,6 +86,7 @@ type ExternalIssuerPatchBody struct {
 	JWKSCacheTTLSeconds *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
 	TrustEmail          *bool                `json:"trust_email,omitempty"`
 	Enabled             *bool                `json:"enabled,omitempty"`
+	IfUpdatedAt         *time.Time           `json:"if_updated_at,omitempty" doc:"Apply the patch only if the row's updated_at still equals this (409 issuer_changed otherwise)."`
 }
 
 // ExternalIssuerView is an issuer row, with the JWKS probe made by the write
@@ -245,6 +246,9 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-id-token", Method: http.MethodPost,
 		Path: "/external-issuers/{id}/verify-id-token", Summary: "Verify an ID token under a person issuer, as the ID-token exchange would", Tags: tags,
 		MaxBodyBytes: maxVerifyIDTokenBodyBytes}, a.verifyExternalIssuerIDTokenOp)
+	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-workload-token", Method: http.MethodPost,
+		Path: "/external-issuers/{id}/verify-workload-token", Summary: "Verify a challenge token under a workload issuer, as a federated client assertion would be", Tags: tags,
+		MaxBodyBytes: maxVerifyWorkloadTokenBodyBytes}, a.verifyExternalIssuerWorkloadTokenOp)
 
 	huma.Register(api, huma.Operation{OperationID: "list-account-issuer-bindings", Method: http.MethodGet,
 		Path: "/external-issuers/bindings", Summary: "List the account's credential bindings across issuers", Tags: tags}, a.listAccountBindingsOp)
@@ -337,7 +341,7 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 		DisplayName: b.DisplayName, Audiences: b.Audiences, Algorithms: b.Algorithms,
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
-		Enabled: b.Enabled,
+		Enabled: b.Enabled, IfUpdatedAt: b.IfUpdatedAt,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")
@@ -418,6 +422,39 @@ func (a *API) verifyExternalIssuerIDTokenOp(ctx context.Context, input *struct {
 		return nil, issuerProblemFrom(err, "verify id_token")
 	}
 	return &verifyIDTokenOutput{Body: out}, nil
+}
+
+// VerifyWorkloadTokenBody is POST /external-issuers/{id}/verify-workload-token.
+// No length tags, for the reason VerifyIDTokenBody has none; the service caps
+// the fields.
+type VerifyWorkloadTokenBody struct {
+	Token    string `json:"token" doc:"A token from the workload issuer whose aud is exactly the challenge. At most 16384 bytes."`
+	Audience string `json:"audience" doc:"The one-time challenge the token was minted for. At most 512 bytes."`
+}
+
+// maxVerifyWorkloadTokenBodyBytes bounds the verify-workload-token body, over
+// the sum of the service's field caps.
+const maxVerifyWorkloadTokenBodyBytes = 32 << 10
+
+type verifyWorkloadTokenOutput struct {
+	Body *service.WorkloadTokenVerification
+}
+
+func (a *API) verifyExternalIssuerWorkloadTokenOp(ctx context.Context, input *struct {
+	ID   string `path:"id" doc:"Issuer row id"`
+	Body VerifyWorkloadTokenBody
+}) (*verifyWorkloadTokenOutput, error) {
+	account, _, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := a.externalIssuerSvc.VerifyWorkloadToken(ctx, account, input.ID, service.VerifyWorkloadTokenInput{
+		Token: input.Body.Token, Audience: input.Body.Audience,
+	})
+	if err != nil {
+		return nil, issuerProblemFrom(err, "verify workload token")
+	}
+	return &verifyWorkloadTokenOutput{Body: out}, nil
 }
 
 func (a *API) listBindingsOp(ctx context.Context, input *bindingListInput) (*bindingListOutput, error) {

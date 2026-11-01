@@ -230,7 +230,8 @@ func zeroidHumaConfig() huma.Config {
 		"/oauth2/token/introspect",
 		"/oauth2/token/revoke",
 		"/oauth2/bc-authorize",
-		"/external-issuers/{id}/verify-id-token", // the body carries a person's ID token
+		"/external-issuers/{id}/verify-id-token",       // the body carries a person's ID token
+		"/external-issuers/{id}/verify-workload-token", // the body carries a workload token
 	))
 
 	return config
