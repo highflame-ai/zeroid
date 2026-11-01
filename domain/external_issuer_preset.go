@@ -58,7 +58,9 @@ func applyEntraPreset(e *ExternalIssuer) error {
 	if err := pinMapping(e, map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov"}); err != nil {
 		return err
 	}
-	fillMapping(e, map[string]string{"name": "name"})
+	// Filled, not pinned: groups does not decide who the person is, and an
+	// IdP admin can rename the claim.
+	fillMapping(e, map[string]string{"name": "name", "groups": "groups"})
 	if e.ClaimConstraints == nil {
 		e.ClaimConstraints = map[string][]string{}
 	}
@@ -85,7 +87,7 @@ func applyOktaPreset(e *ExternalIssuer) error {
 	if err := pinMapping(e, map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified"}); err != nil {
 		return err
 	}
-	fillMapping(e, map[string]string{"name": "name"})
+	fillMapping(e, map[string]string{"name": "name", "groups": "groups"})
 	return nil
 }
 

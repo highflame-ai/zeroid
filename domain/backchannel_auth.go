@@ -286,10 +286,16 @@ type BackchannelAuthRequest struct {
 	//   RequestingJTI    the requesting token's jti
 	//   RequestingAct    the requesting token's act claim as issued (JSON,
 	//                    nested actors included; "" when it had none)
+	//   RequestingGroups the requesting token's `groups` claim, so the minted
+	//                    token keeps the chain's person's groups (NULL when
+	//                    it had none, and on rows from before migration 064)
 	RequesterSub   string `bun:"requester_sub,type:text"                     json:"requester_sub,omitempty"`
 	RequesterActor string `bun:"requester_actor,type:text"                   json:"requester_actor,omitempty"`
 	RequestingJTI  string `bun:"requesting_jti,type:text"                    json:"-"`
 	RequestingAct  string `bun:"requesting_act,type:text"                    json:"-"`
+	// nil, never an empty slice: nullzero collapses only nil, and NULL is
+	// "none".
+	RequestingGroups []string `bun:"requesting_groups,array,nullzero" json:"-"`
 	// Approval record. ApprovedSubject* name the user who resolved the
 	// request (approved or denied); the fields below record how that user
 	// was authenticated and which binding check they satisfied.

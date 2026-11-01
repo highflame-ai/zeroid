@@ -73,6 +73,7 @@ with `kind: workload` is not accepted on this grant.
 | `user_id_iss`    | Upstream `iss`                                      | **IdP-granular provenance** — the headline addition.       |
 | `user_email`     | Upstream → `claim_mapping.email`                    | Optional.                                                  |
 | `user_name`      | Upstream → `claim_mapping.name`                     | Optional.                                                  |
+| `groups`         | Upstream → `claim_mapping.groups`                   | Optional. RFC 9068 §2.2.3.1; see [Groups](external-issuers.md#groups). |
 | `auth_time`      | Upstream `auth_time` (when configured to propagate) | RFC 9068 — copied through, never synthesized.              |
 | `acr`            | Upstream `acr` (when configured to propagate)       | RFC 9068.                                                  |
 | `amr`            | Upstream `amr` (when configured to propagate)       | RFC 9068.                                                  |
@@ -95,6 +96,7 @@ external_issuers:
     claim_mapping:
       user_id: sub # required
       email: email # optional
+      groups: groups # optional: the claim listing the person's groups
     allowed_accounts: ["acct-prod"] # REQUIRED, non-empty; an empty list is refused at startup
     propagate_claims: ["auth_time", "acr", "amr"]
 ```

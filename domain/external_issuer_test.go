@@ -35,6 +35,14 @@ func TestExternalIssuerConfigValidate(t *testing.T) {
 		{name: "empty allowed_accounts entry", mutate: func(c *ExternalIssuerConfig) {
 			c.AllowedAccounts = []string{""}
 		}, wantErr: "must not contain empty entries"},
+		{name: "groups mapping", mutate: func(c *ExternalIssuerConfig) { c.ClaimMapping["groups"] = "groups" }},
+		{name: "groups mapping with surrounding whitespace", mutate: func(c *ExternalIssuerConfig) {
+			c.ClaimMapping["groups"] = "groups "
+		}, wantErr: "claim_mapping.groups must name the claim without surrounding whitespace"},
+		{name: "groups mapping on a workload issuer", mutate: func(c *ExternalIssuerConfig) {
+			c.Kind = IssuerKindWorkload
+			c.ClaimMapping["groups"] = "groups"
+		}, wantErr: "claim_mapping.groups applies to a person issuer only"},
 		{name: "unsupported propagate claim", mutate: func(c *ExternalIssuerConfig) {
 			c.PropagateClaims = []string{"groups"}
 		}, wantErr: "propagate_claims entry"},

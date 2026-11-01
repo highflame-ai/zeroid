@@ -105,6 +105,9 @@ type personIDToken struct {
 	email         string
 	emailVerified bool
 	name          string
+	// groups is what claim_mapping.groups reads (extractPersonGroups): nil
+	// when unmapped, absent, malformed or over a limit.
+	groups []string
 }
 
 // verifyPersonIDToken verifies an OpenID Connect ID token naming a person,
@@ -152,6 +155,8 @@ func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerE
 	out.email, _ = extractMappedClaimString(claims, mapping["email"])
 	out.emailVerified = issuerEmailVerified(claims, entry.Config, out.email)
 	out.name, _ = extractMappedClaimString(claims, mapping["name"])
+	iss, _ := verified.Issuer()
+	out.groups = extractPersonGroups(claims, mapping["groups"], iss)
 	return out, nil
 }
 
@@ -403,6 +408,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		UseRS256:              true,
 		UserEmail:             userEmail,
 		UserName:              userName,
+		Groups:                idTok.groups,
 		ApplicationID:         req.ApplicationID,
 		// RFC 9068 §2.2 client_id: the relying party just authenticated and
 		// bound to the ID token's aud/azp (D13), so it is the client the
