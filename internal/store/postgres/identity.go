@@ -571,7 +571,7 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		Where("status = ?", string(domain.IdentityStatusActive)).
-		Returning("*").
+		Returning("?TableColumns").
 		Exec(ctx)
 	if err != nil {
 		return false, nil, fmt.Errorf("deactivate-if-active: %w", err)

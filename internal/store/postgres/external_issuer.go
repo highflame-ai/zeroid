@@ -108,7 +108,7 @@ func (r *ExternalIssuerRepository) CountByAccount(ctx context.Context, accountID
 
 // Insert writes a new row.
 func (r *ExternalIssuerRepository) Insert(ctx context.Context, row *domain.ExternalIssuer) error {
-	if _, err := dbOrTx(ctx, r.db).NewInsert().Model(row).Returning("*").Exec(ctx); err != nil {
+	if _, err := dbOrTx(ctx, r.db).NewInsert().Model(row).Returning("?Columns").Exec(ctx); err != nil {
 		return fmt.Errorf("failed to insert issuer: %w", err)
 	}
 	return nil
@@ -173,7 +173,7 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
 		Where("deleted_at IS NULL").
-		Returning("*").
+		Returning("?TableColumns").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to update issuer: %w", err)
@@ -192,7 +192,7 @@ func (r *ExternalIssuerRepository) SetJWKSURI(ctx context.Context, row *domain.E
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).
 		Where("deleted_at IS NULL").
-		Returning("*").
+		Returning("?TableColumns").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to update issuer keys: %w", err)
@@ -237,7 +237,7 @@ func (r *ExternalIssuerRepository) Delete(ctx context.Context, id, accountID str
 
 // InsertBinding writes a new binding.
 func (r *ExternalIssuerRepository) InsertBinding(ctx context.Context, b *domain.IssuerBinding) error {
-	if _, err := dbOrTx(ctx, r.db).NewInsert().Model(b).Returning("*").Exec(ctx); err != nil {
+	if _, err := dbOrTx(ctx, r.db).NewInsert().Model(b).Returning("?Columns").Exec(ctx); err != nil {
 		return fmt.Errorf("failed to insert binding: %w", err)
 	}
 	return nil
@@ -293,7 +293,7 @@ func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.
 	if unlessExplicitlyDisabled {
 		q = q.Where("NOT explicitly_disabled")
 	}
-	res, err := q.Returning("*").Exec(ctx)
+	res, err := q.Returning("?TableColumns").Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to update binding: %w", err)
 	}
