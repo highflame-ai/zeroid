@@ -540,6 +540,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// the https requirement at registration — an http loopback URL would be
 	// useless if the dialer refused loopback, so the two move together.
 	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
+	oauthClientSvc.SetBcryptClientSecrets(cfg.ClientAuth.BcryptClientSecrets)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -595,7 +596,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 
 	// Global middleware.
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	// chi 5.4 deprecates RealIP. Kept for now so embedders see no behaviour
+	// change; replacing it with chi's ClientIP middleware is a separate change.
+	r.Use(chimiddleware.RealIP) //nolint:staticcheck // SA1019, see above
 	// oauthFormCompat must run before requestValidationMiddleware so that
 	// RFC-mandated form-encoded bodies on /oauth2/* endpoints are rewritten
 	// to JSON before the JSON-only Content-Type gate runs.
@@ -625,7 +628,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// RequestURLMiddleware records the request's effective URL on context.Context
 	// so DPoP htu validation (RFC 9449 §4.3) compares against what the client
 	// actually hit, not against the static config value.
-	r.Use(internalMiddleware.RequestURLMiddleware(cfg.Server.TrustForwardedHeaders))
+	//
+	// Validate (above) has already rejected an unknown or conflicting mode, so
+	// the error here is unreachable; it is still checked rather than dropped,
+	// because a silent fallback would pick a trust level nobody configured.
+	fwdMode, err := cfg.Server.ForwardedHeadersMode()
+	if err != nil {
+		return nil, err
+	}
+	r.Use(internalMiddleware.RequestURLMiddleware(internalMiddleware.ForwardedTrust{
+		Proto: fwdMode == ForwardedHeadersProto || fwdMode == ForwardedHeadersProtoHost,
+		Host:  fwdMode == ForwardedHeadersProtoHost,
+	}))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 

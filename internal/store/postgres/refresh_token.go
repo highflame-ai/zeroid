@@ -91,7 +91,9 @@ func (r *RefreshTokenRepository) ClaimByTokenHash(ctx context.Context, db bun.ID
 		Where("token_hash = ?", tokenHash).
 		Where("state = ?", domain.RefreshTokenStateActive).
 		Where("expires_at > ?", now).
-		Returning("*").
+		// The model's columns, not *: a column the model lacks (schema drift)
+		// fails the scan, and with it every rotation.
+		Returning("?TableColumns").
 		Exec(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to claim refresh token: %w", err)
@@ -231,7 +233,7 @@ func (r *RefreshTokenRepository) RevokeFamily(ctx context.Context, familyID stri
 			Set("revoked_at = ?", time.Now()).
 			Where("family_id = ?", familyID).
 			Where("state = ?", domain.RefreshTokenStateActive).
-			Returning("*").
+			Returning("?TableColumns"). // model columns only, as in ClaimByTokenHash
 			Scan(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to revoke refresh token family: %w", err)

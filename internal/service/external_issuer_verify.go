@@ -87,6 +87,10 @@ type IDTokenVerification struct {
 	Subject       string `json:"subject"`
 	Email         string `json:"email"`
 	EmailVerified bool   `json:"email_verified"`
+	// Groups is what the row's claim_mapping.groups reads from the token,
+	// with the limits and filtering the grants apply before stamping the
+	// `groups` claim. Omitted when the mapping is unset or yields none.
+	Groups []string `json:"groups,omitempty"`
 }
 
 // VerifyIDToken verifies an ID token under one of accountID's person issuer
@@ -151,7 +155,7 @@ func (s *ExternalIssuerService) verifyIDTokenForRow(ctx context.Context, row *do
 	}
 	return &IDTokenVerification{
 		IssuerID: row.ID, Issuer: row.Issuer, Subject: tok.userID,
-		Email: tok.email, EmailVerified: tok.emailVerified,
+		Email: tok.email, EmailVerified: tok.emailVerified, Groups: tok.groups,
 	}, nil
 }
 

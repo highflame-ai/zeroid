@@ -73,6 +73,7 @@ with `kind: workload` is not accepted on this grant.
 | `user_id_iss`    | Upstream `iss`                                      | **IdP-granular provenance** — the headline addition.       |
 | `user_email`     | Upstream → `claim_mapping.email`                    | Optional.                                                  |
 | `user_name`      | Upstream → `claim_mapping.name`                     | Optional.                                                  |
+| `groups`         | Upstream → `claim_mapping.groups`                   | Optional. RFC 9068 §2.2.3.1; see [Groups](external-issuers.md#groups). |
 | `auth_time`      | Upstream `auth_time` (when configured to propagate) | RFC 9068 — copied through, never synthesized.              |
 | `acr`            | Upstream `acr` (when configured to propagate)       | RFC 9068.                                                  |
 | `amr`            | Upstream `amr` (when configured to propagate)       | RFC 9068.                                                  |
@@ -95,6 +96,7 @@ external_issuers:
     claim_mapping:
       user_id: sub # required
       email: email # optional
+      groups: groups # optional: the claim listing the person's groups
     allowed_accounts: ["acct-prod"] # REQUIRED, non-empty; an empty list is refused at startup
     propagate_claims: ["auth_time", "acr", "amr"]
 ```
@@ -237,7 +239,9 @@ POST /oauth2/token
 
 `subject_token_type` is left blank (or anything other than `id_token`).
 The broker path is the default when `actor_token` is absent and the
-subject token type is not `id_token`.
+subject token type is not `id_token`. One exception: a request with the
+type `urn:ietf:params:oauth:token-type:jwt` that authenticates a client,
+from a caller that is not a trusted service, is an ID-token exchange.
 
 ### Issued-token claim shape
 

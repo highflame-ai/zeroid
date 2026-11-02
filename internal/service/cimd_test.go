@@ -256,6 +256,7 @@ func TestCIMDResolveClient_InvalidClientID(t *testing.T) {
 		"https://app.example.com",                  // no path
 		"https://app.example.com/client.json?a=b",  // query (draft-02 §3 SHOULD NOT; we reject)
 		"https://app.example.com/client.json#frag", // fragment (§3 MUST NOT)
+		"https://app.example.com/client.json#",     // empty fragment: '#' is reserved for federated client ids
 
 		// Userinfo (§3 MUST NOT). Reads as legit.example.com wherever the
 		// client_id is displayed — consent screen, audit log — while resolving

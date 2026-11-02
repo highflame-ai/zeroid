@@ -47,11 +47,10 @@ func isIDJAGAssertion(assertion string) bool {
 // without a full mint (the repo's other ID-JAG tests are all fail-closed and
 // never reach issuance).
 //
-// role and privilege_scope are reservedClaims (an untrusted caller can never
-// inject them via additional_claims), but here ZeroID itself sources them from
-// the IdP-verified ID-JAG, so they are set directly into CustomClaims — which
-// bypasses the additional_claims blocklist by design, the same pattern the
-// trusted broker path uses.
+// role and privilege_scope are never set here, whatever the issuer's
+// claim_mapping says: an IdP claim must not place a role or capabilities in a
+// token (ADR 0044 D16). Validation refuses both as mapping keys, and a row
+// stored before that refusal may still name them, so they are not read.
 func buildIDJAGCustomClaims(
 	rawClaims map[string]any,
 	cfg domain.ExternalIssuerConfig,
@@ -61,16 +60,6 @@ func buildIDJAGCustomClaims(
 	customClaims := map[string]any{
 		"token_exchange": "id_jag",
 		"user_id_iss":    upstreamIss,
-	}
-
-	// Map IdP group/role claims into Cedar principal attributes (D3). OPTIONAL —
-	// present only when the ID-JAG carries the claim AND ClaimMapping routes it.
-	if role, ok := extractMappedClaimString(rawClaims, cfg.ClaimMapping["role"]); ok && role != "" {
-		customClaims["role"] = role
-	}
-
-	if ps, ok := extractMappedClaimStrings(rawClaims, cfg.ClaimMapping["privilege_scope"]); ok && len(ps) > 0 {
-		customClaims["privilege_scope"] = ps
 	}
 
 	// Honest propagation of RFC 9068 authentication-context claims — only
@@ -450,6 +439,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		SubjectOverride: userID,
 		UserEmail:       userEmail,
 		UserName:        userName,
+		Groups:          extractPersonGroups(rawClaims, cfg.ClaimMapping["groups"], upstreamIss),
 		ApplicationID:   req.ApplicationID,
 		// RFC 9068 §2.2 client_id (D8). The grant has already authenticated
 		// this client and bound the ID-JAG's own client_id claim to it, so it
@@ -545,15 +535,31 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		s.recordObservedResources(ctx, req.AccountID, req.ProjectID, upstreamIss, resources)
 	}
 
-	log.Info().
-		Str("upstream_iss", upstreamIss).
-		Str("account_id", req.AccountID).
-		Str("project_id", req.ProjectID).
-		Str("user_id", person.sub).
-		Strs("resources", resources).
-		Msg("ID-JAG jwt-bearer exchange succeeded")
+	upstreamSub, _ := verified.Subject()
+	logIDJAGRedeemed(upstreamIss, jti, upstreamSub, req.AccountID, req.ProjectID, person.sub, resources)
 
 	return accessToken, nil
+}
+
+// logIDJAGRedeemed writes the success line of an ID-JAG redemption. Beside the
+// tenant and the minted principal it names the ID-JAG itself — its jti and the
+// sub its identity provider issued it for — so an operator can match the
+// redemption to the provider's audit record of the ID-JAG it issued (zeroid#447).
+// Both are identifiers, not credentials; the ID-JAG itself is never logged.
+// upstream_sub is omitted when the ID-JAG names its subject only with an
+// RFC 9493 sub_id.
+func logIDJAGRedeemed(upstreamIss, idJAGJTI, upstreamSub, accountID, projectID, userID string, resources []string) {
+	ev := log.Info().
+		Str("upstream_iss", upstreamIss).
+		Str("id_jag_jti", idJAGJTI)
+	if upstreamSub != "" {
+		ev = ev.Str("upstream_sub", upstreamSub)
+	}
+	ev.Str("account_id", accountID).
+		Str("project_id", projectID).
+		Str("user_id", userID).
+		Strs("resources", resources).
+		Msg("ID-JAG jwt-bearer exchange succeeded")
 }
 
 // observedResourceRecordTimeout bounds the inventory write. It is generous

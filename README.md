@@ -988,6 +988,8 @@ only when `Server.EnsureClient` is called with a marked context.
 | PATCH | `/identities/{id}` | Update identity |
 | DELETE | `/identities/{id}` | Deactivate identity |
 | GET | `/identities` | List identities |
+| GET | `/identities/{id}/oauth-clients` | List the OAuth2 clients linked to an identity |
+| DELETE | `/identities/{id}/oauth-clients/{client_uuid}` | Delete an OAuth2 client linked to an identity (frees its `client_id`) |
 | POST | `/oauth/clients` | Register OAuth2 client |
 | POST | `/api-keys` | Create API key |
 | POST | `/credential-policies` | Create credential policy |

@@ -58,12 +58,24 @@ func NewCredentialPolicyService(repo *postgres.CredentialPolicyRepository) *Cred
 // EnsureDefaultPolicy returns the tenant's default credential policy, creating it if it doesn't exist.
 // This is called during agent registration to guarantee every agent has a policy from day one.
 func (s *CredentialPolicyService) EnsureDefaultPolicy(ctx context.Context, accountID, projectID string) (*domain.CredentialPolicy, error) {
-	existing, err := s.repo.GetDefaultByTenant(ctx, accountID, projectID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check for default policy: %w", err)
-	}
-	if existing != nil {
+	// Within a token request (see withPolicyMemo) the default is read once,
+	// and is then also a hit for GetPolicy by its ID.
+	existing, err := memoPolicy(ctx, defaultPolicyKey(accountID, projectID), func() (*domain.CredentialPolicy, error) {
+		p, err := s.repo.GetDefaultByTenant(ctx, accountID, projectID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check for default policy: %w", err)
+		}
+		if p == nil {
+			return nil, errNoDefaultPolicy
+		}
+		return p, nil
+	})
+	if err == nil {
+		memoPut(ctx, policyByIDKey(accountID, projectID, existing.ID), existing)
 		return existing, nil
+	}
+	if !errors.Is(err, errNoDefaultPolicy) {
+		return nil, err
 	}
 
 	// Create the tenant's default policy with sensible production defaults.
@@ -221,12 +233,15 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 }
 
 // GetPolicy retrieves a credential policy by ID.
+// Within a token request (see withPolicyMemo) each policy is read once.
 func (s *CredentialPolicyService) GetPolicy(ctx context.Context, id, accountID, projectID string) (*domain.CredentialPolicy, error) {
-	policy, err := s.repo.GetByID(ctx, id, accountID, projectID)
-	if err != nil {
-		return nil, ErrPolicyNotFound
-	}
-	return policy, nil
+	return memoPolicy(ctx, policyByIDKey(accountID, projectID, id), func() (*domain.CredentialPolicy, error) {
+		policy, err := s.repo.GetByID(ctx, id, accountID, projectID)
+		if err != nil {
+			return nil, ErrPolicyNotFound
+		}
+		return policy, nil
+	})
 }
 
 // ListPolicies returns all credential policies for a tenant.
@@ -266,6 +281,7 @@ type UpdatePolicyRequest struct {
 
 // UpdatePolicy updates mutable fields of an existing credential policy.
 func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountID, projectID string, req UpdatePolicyRequest) (*domain.CredentialPolicy, error) {
+	defer memoForget(ctx)
 	// Approval-channel grants need a trusted caller (approval_channel_write.go).
 	if err := requireTrustedApprovalChannelWrite(ctx, "", req.AllowedScopes); err != nil {
 		return nil, err
@@ -358,6 +374,7 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 //   - ErrPolicyInUse     → still referenced by at least one service key (409)
 //   - ErrPolicyNotFound  → no policy with this id in the tenant (404)
 func (s *CredentialPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
+	defer memoForget(ctx)
 	err := s.repo.Delete(ctx, id, accountID, projectID)
 	switch {
 	case err == nil:

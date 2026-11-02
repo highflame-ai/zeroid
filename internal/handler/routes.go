@@ -230,7 +230,8 @@ func zeroidHumaConfig() huma.Config {
 		"/oauth2/token/introspect",
 		"/oauth2/token/revoke",
 		"/oauth2/bc-authorize",
-		"/external-issuers/{id}/verify-id-token", // the body carries a person's ID token
+		"/external-issuers/{id}/verify-id-token",       // the body carries a person's ID token
+		"/external-issuers/{id}/verify-workload-token", // the body carries a workload token
 	))
 
 	return config
@@ -425,6 +426,7 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 		a.registerTenantSettingsRoutes(api)
 	}
 	a.registerOAuthClientRoutes(api)
+	a.registerIdentityOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)

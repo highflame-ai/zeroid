@@ -55,6 +55,31 @@ type OAuthClientService struct {
 	// SSRF guard on the fetch itself — the two must move together, since an
 	// http loopback URL is useless if the dialer refuses loopback.
 	allowPrivateJWKSEndpoints bool
+	// bcryptSecrets keeps writing bcrypt client-secret hashes, as builds
+	// before SHA-256 support did, and skips the upgrade of existing ones. Off
+	// (the zero value) means SHA-256. Verification accepts both formats
+	// either way.
+	bcryptSecrets bool
+}
+
+// SetBcryptClientSecrets keeps bcrypt client-secret storage, for deployments
+// that must stay able to roll back past SHA-256 support. Set from
+// ClientAuth.BcryptClientSecrets.
+func (s *OAuthClientService) SetBcryptClientSecrets(on bool) {
+	s.bcryptSecrets = on
+}
+
+// hashNewSecret is the stored form of a freshly generated secret: SHA-256, or
+// bcrypt at the caller's cost when bcrypt storage is kept.
+func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (string, error) {
+	if !s.bcryptSecrets {
+		return hashClientSecret(secret), nil
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(secret), bcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash client secret: %w", err)
+	}
+	return string(h), nil
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
@@ -83,7 +108,7 @@ func (s *OAuthClientService) SetAllowPrivateJWKSEndpoints(allow bool) {
 }
 
 // RegisterClientRequest holds all fields for creating an OAuth2 client.
-// Confidential clients get a generated bcrypt secret; public clients have none.
+// Confidential clients get a generated secret, stored SHA-256-hashed; public clients have none.
 type RegisterClientRequest struct {
 	ClientID                string
 	Name                    string
@@ -121,7 +146,7 @@ type RegisterClientRequest struct {
 
 // RegisterClient creates a new OAuth2 client.
 //
-// If req.Confidential is true, a client_secret is generated and bcrypt-hashed;
+// If req.Confidential is true, a client_secret is generated and SHA-256-hashed;
 // the plain-text secret is returned (shown once only). For public clients the
 // returned secret string is empty.
 //
@@ -130,6 +155,13 @@ type RegisterClientRequest struct {
 func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterClientRequest) (*domain.OAuthClient, string, error) {
 	if req.ClientID == "" || req.Name == "" {
 		return nil, "", fmt.Errorf("clientID and name are required")
+	}
+	// '#' is reserved for federated client ids (<iss>#<sub>, see
+	// federatedClientID), so no registered client can carry one: a registered
+	// client_id equal to some issuer's <iss>#<sub> would put one client_id on
+	// tokens for two different clients.
+	if strings.Contains(req.ClientID, "#") {
+		return nil, "", fmt.Errorf("%w: client_id must not contain '#'", ErrInvalidClientMetadata)
 	}
 	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
 	// supplied. Reject http:// / non-URL values at registration so a faulty
@@ -167,12 +199,12 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
-		hashed, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
+		hashed, err := s.hashNewSecret(secret, bcrypt.DefaultCost)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to hash client secret: %w", err)
+			return nil, "", err
 		}
 		plainSecret = secret
-		hashedSecret = string(hashed)
+		hashedSecret = hashed
 		clientType = "confidential"
 		authMethod = "client_secret_basic"
 	} else {
@@ -244,11 +276,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	//
 	// The predicates closed that by deriving the question from the registered
 	// method, which is right — but it leaves such a client unable to authenticate
-	// anywhere, because bcrypt against an empty stored hash refuses every secret
-	// it could present. Refusing the registration turns a 401 the operator debugs
-	// later, against a client they believe is correct, into an error at the one
-	// moment they can still fix it. Same reasoning and same shape as the refusal
-	// above.
+	// anywhere, because the verifier refuses every secret it could present
+	// against an empty stored hash. Refusing the registration turns a 401 the
+	// operator debugs later, against a client they believe is correct, into an
+	// error at the one moment they can still fix it. Same reasoning and same
+	// shape as the refusal above.
 	if !req.Confidential && (authMethod == "client_secret_basic" || authMethod == "client_secret_post") {
 		return nil, "", fmt.Errorf(
 			"%w: token_endpoint_auth_method %s requires confidential=true; without it no client_secret is "+
@@ -376,7 +408,7 @@ func (s *OAuthClientService) ListClients(ctx context.Context) ([]*domain.OAuthCl
 }
 
 // VerifyClientSecret looks up a client by client_id and verifies the provided
-// secret against the bcrypt hash.
+// secret against the stored hash (SHA-256, or legacy bcrypt; see secret_hash.go).
 func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, secret string) (*domain.OAuthClient, error) {
 	client, err := s.repo.GetByClientID(ctx, clientID)
 	if err != nil {
@@ -385,8 +417,22 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 	if !client.IsActive {
 		return nil, ErrOAuthClientNotFound
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(client.ClientSecret), []byte(secret)); err != nil {
+	ok, legacy := verifyClientSecret(client.ClientSecret, secret)
+	if !ok {
 		return nil, ErrInvalidClientSecret
+	}
+	if shouldUpgradeSecretHash(legacy, !s.bcryptSecrets, secret) {
+		// Upgrade a pre-SHA-256 bcrypt hash now that we hold the plaintext, so
+		// each existing client pays bcrypt once. Best-effort: the conditional
+		// write loses harmlessly to a concurrent rotation, and a failure only
+		// means the next verify tries again.
+		upgraded, err := s.repo.UpgradeSecretHash(ctx, client.ID, client.ClientSecret, hashClientSecret(secret))
+		switch {
+		case err != nil:
+			log.Warn().Err(err).Str("client_id", clientID).Msg("client secret hash upgrade failed")
+		case !upgraded:
+			log.Debug().Str("client_id", clientID).Msg("client secret hash upgrade skipped: secret changed concurrently")
+		}
 	}
 	return client, nil
 }
@@ -418,12 +464,11 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to generate secret: %w", err)
 	}
-	hashed, err := bcrypt.GenerateFromPassword([]byte(plainSecret), bcrypt.DefaultCost)
+	hashed, err := s.hashNewSecret(plainSecret, bcrypt.DefaultCost)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to hash secret: %w", err)
+		return nil, "", err
 	}
-
-	client.ClientSecret = string(hashed)
+	client.ClientSecret = hashed
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
 		return nil, "", fmt.Errorf("failed to update client secret: %w", err)
@@ -476,6 +521,37 @@ func (s *OAuthClientService) DeleteClient(ctx context.Context, id string) error 
 		}
 	}
 	return s.repo.Delete(ctx, id)
+}
+
+// ListClientsForIdentity returns the clients linked to identityID. The caller
+// has already resolved the identity in its tenant; a client carries no tenant
+// of its own, so the identity is what scopes this list.
+func (s *OAuthClientService) ListClientsForIdentity(ctx context.Context, identityID string) ([]*domain.OAuthClient, error) {
+	return s.repo.ListByIdentityID(ctx, identityID)
+}
+
+// DeleteClientForIdentity removes the client with UUID id only if it is
+// linked to identityID, so it frees the client_id for another identity. A
+// client linked to any other identity, or to none, is ErrOAuthClientNotFound.
+// A client registered by a trusted approval-channel caller is removed only by
+// one, as in DeleteClient. The caller has already resolved the identity in
+// its tenant.
+func (s *OAuthClientService) DeleteClientForIdentity(ctx context.Context, identityID, id string) error {
+	client, err := s.repo.GetByID(ctx, id)
+	if err != nil || client.IdentityID == nil || *client.IdentityID != identityID {
+		return ErrOAuthClientNotFound
+	}
+	if client.ChannelTrusted && !TrustedApprovalChannelWrite(ctx) {
+		return ErrApprovalChannelWriteNotTrusted
+	}
+	deleted, err := s.repo.DeleteForIdentity(ctx, id, identityID)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return ErrOAuthClientNotFound
+	}
+	return nil
 }
 
 // ── RFC 7591 / RFC 7592 Dynamic Client Registration ──────────────────────────
@@ -739,11 +815,10 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		if err != nil {
 			return nil, "", "", fmt.Errorf("failed to generate client_secret: %w", err)
 		}
-		hashed, hashErr := bcrypt.GenerateFromPassword([]byte(plainSecret), dcrBcryptCost)
-		if hashErr != nil {
-			return nil, "", "", fmt.Errorf("failed to hash client secret: %w", hashErr)
+		hashedSecret, err = s.hashNewSecret(plainSecret, dcrBcryptCost)
+		if err != nil {
+			return nil, "", "", err
 		}
-		hashedSecret = string(hashed)
 	}
 
 	scopes := req.Scopes

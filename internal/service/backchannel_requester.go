@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ type RequestingToken struct {
 	IdentityID string
 	// DPoPKeyThumbprint is the token's cnf.jkt, "" when it is not DPoP-bound.
 	DPoPKeyThumbprint string
+	// Groups is the token's `groups` claim (the person's IdP groups), nil
+	// when it has none.
+	Groups []string
 }
 
 // Actor returns who made the request: act.sub, else client_id, else sub.
@@ -205,6 +209,12 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	req.RequestBoundedRoot = false
 	p := requestingChainPrincipal(cred, row.RequesterSub, s.credentialSvc.issuer)
 	req.PrincipalType, req.PrincipalSub, req.PrincipalIss = p.Type, p.Sub, p.Iss
+	// The chain's person keeps their groups, as on a token exchange; the
+	// approver's are never read. Only when the minted token's sub is that
+	// person: under the legacy profile a delegated chain's sub is its actor.
+	if p.Type == domain.PrincipalUser && p.Sub == row.RequesterSub {
+		req.Groups = slices.Clone(row.RequestingGroups)
+	}
 
 	// Never outlive the chain: the chokepoint clamps exp to this bound.
 	chainExp := cred.ExpiresAt

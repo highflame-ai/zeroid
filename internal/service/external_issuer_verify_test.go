@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -88,7 +89,7 @@ func TestVerifyIDToken_HappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := IDTokenVerification{IssuerID: verifyRowID, Issuer: verifyIssuer, Subject: "person-1", Email: "owner@acme.example", EmailVerified: true}
-	if *got != want {
+	if !reflect.DeepEqual(*got, want) {
 		t.Fatalf("got %+v, want %+v", *got, want)
 	}
 	raw, _ := json.Marshal(got)

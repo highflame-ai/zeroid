@@ -150,8 +150,28 @@ func ValidateIssuerURL(raw string, allowHTTP bool) error {
 // the same tokens.
 var unpinnableClaims = []string{"iss", "aud", "exp", "iat", "nbf", "jti"}
 
-// knownMappingKeys are the claim_mapping targets a grant reads.
-var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "role", "privilege_scope", "scope", "trust_level"}
+// knownMappingKeys are the claim_mapping targets a grant reads. groups names
+// the ID token claim that lists the person's groups (RFC 9068 §2.2.3.1); it
+// is never an identity key, so it stays editable after create.
+var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "scope", "trust_level", "groups"}
+
+// reservedMappingKeys are token claims an IdP claim must never set: a
+// person's role and privilege scope come only from the deployer's own
+// membership store, never from the customer's IdP (ADR 0044 D16). A
+// claim_mapping naming one is refused with claim_mapping_reserved.
+var reservedMappingKeys = []string{"role", "privilege_scope"}
+
+// ReservedMappingKeysIn returns the reserved keys mapping names, in a fixed
+// order, so callers report the same key whatever the map's iteration order.
+func ReservedMappingKeysIn(mapping map[string]string) []string {
+	var found []string
+	for _, k := range reservedMappingKeys {
+		if _, ok := mapping[k]; ok {
+			found = append(found, k)
+		}
+	}
+	return found
+}
 
 // Normalize trims the row and applies defaults to unset fields.
 func (e *ExternalIssuer) Normalize() {
@@ -159,7 +179,8 @@ func (e *ExternalIssuer) Normalize() {
 	e.JWKSURI = strings.TrimSpace(e.JWKSURI)
 	e.DisplayName = strings.TrimSpace(e.DisplayName)
 	if len(e.Algorithms) == 0 {
-		e.Algorithms = []string{"RS256", "ES256", "PS256"}
+		// ES384 for AWS STS, which signs with RS256 or ES384 as the caller asks.
+		e.Algorithms = []string{"RS256", "ES256", "ES384", "PS256"}
 	}
 	if e.MaxTokenAgeSeconds == 0 {
 		e.MaxTokenAgeSeconds = DefaultIssuerMaxTokenAgeSeconds
@@ -172,6 +193,12 @@ func (e *ExternalIssuer) Normalize() {
 	}
 	if e.ClaimMapping == nil {
 		e.ClaimMapping = map[string]string{}
+	}
+	// An empty groups mapping means "read no groups": it is stored as no
+	// mapping. Normalize runs after the preset on create, so an explicit ""
+	// also keeps a preset from filling the key; presets never run on update.
+	if g, set := e.ClaimMapping["groups"]; set && strings.TrimSpace(g) == "" {
+		delete(e.ClaimMapping, "groups")
 	}
 	if e.ClaimConstraints == nil {
 		e.ClaimConstraints = map[string][]string{}
@@ -226,13 +253,18 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 	}
 	for _, alg := range e.Algorithms {
 		if !ExternalIssuerAlgorithmAllowed(alg) {
-			return issuerInvalid("invalid_algorithms", "algorithm %q is not supported (allowed: RS256, ES256, PS256)", alg)
+			return issuerInvalid("invalid_algorithms", "algorithm %q is not supported (allowed: RS256, ES256, ES384, PS256)", alg)
 		}
 	}
 	for _, c := range e.PropagateClaims {
 		if !ExternalIssuerPropagatableClaim(c) {
 			return issuerInvalid("invalid_propagate_claims", "propagate_claims entry %q is not supported (allowed: auth_time, acr, amr)", c)
 		}
+	}
+	// Before the per-key loop: map order must not decide between this code
+	// and invalid_claim_mapping when a mapping has both kinds of fault.
+	if reserved := ReservedMappingKeysIn(e.ClaimMapping); len(reserved) > 0 {
+		return issuerInvalid("claim_mapping_reserved", "claim_mapping key %q is reserved: an IdP claim cannot set a token's %s", reserved[0], reserved[0])
 	}
 	for k, claim := range e.ClaimMapping {
 		if len(claim) > maxClaimNameBytes {
@@ -243,6 +275,17 @@ func (e *ExternalIssuer) Validate(v IssuerValidation) error {
 		}
 		if strings.TrimSpace(claim) == "" {
 			return issuerInvalid("invalid_claim_mapping", "claim_mapping.%s names no claim", k)
+		}
+	}
+	if g, set := e.ClaimMapping["groups"]; set {
+		// Only the person grants read groups; on a workload row the key
+		// would look configured and do nothing.
+		if e.Kind != IssuerKindPerson {
+			return issuerInvalid("invalid_claim_mapping", "claim_mapping.groups applies to a person issuer only")
+		}
+		// Claim names are matched exactly, so a padded name would never match.
+		if strings.TrimSpace(g) != g {
+			return issuerInvalid("invalid_claim_mapping", "claim_mapping.groups must name the claim without surrounding whitespace")
 		}
 	}
 	if e.Kind == IssuerKindPerson && e.ClaimMapping["user_id"] == "" {

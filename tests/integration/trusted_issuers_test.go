@@ -404,6 +404,13 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
 		"unreachable discovery": {map[string]any{"kind": "person", "issuer": "https://127.0.0.1:1",
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "discovery_unreachable"},
+		// ADR 0044 D16 (EC-D16-03): an IdP claim never sets a token's role or capabilities.
+		"role in claim_mapping": {map[string]any{"kind": "person", "issuer": "https://rr.example",
+			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub", "role": "groups"}}, 400, "claim_mapping_reserved"},
+		"privilege_scope in claim_mapping": {map[string]any{"kind": "person", "issuer": "https://rp.example",
+			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub", "privilege_scope": "scp"}}, 400, "claim_mapping_reserved"},
+		"role in a preset's claim_mapping": {map[string]any{"kind": "person", "preset": "okta", "issuer": "https://rs.okta.com",
+			"claim_mapping": map[string]string{"role": "groups"}}, 400, "claim_mapping_reserved"},
 	} {
 		t.Run("refused: "+name, func(t *testing.T) {
 			status, body := f.call(t, http.MethodPost, "/external-issuers", tc.body, a.headers)
@@ -442,6 +449,18 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 			"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "given_name"}}, a.headers)
 		require.Equal(t, http.StatusOK, status, "other keys stay editable: %v", body)
 		assert.Equal(t, "given_name", body["claim_mapping"].(map[string]any)["name"])
+	})
+	t.Run("a patch cannot add a reserved mapping key (EC-D16-06)", func(t *testing.T) {
+		for _, k := range []string{"role", "privilege_scope"} {
+			m := map[string]string{"user_id": "oid", "email": "email", "email_verified": "xms_edov", "name": "given_name", k: "groups"}
+			status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{"claim_mapping": m}, a.headers)
+			assert.Equal(t, http.StatusBadRequest, status, "%s: %v", k, body)
+			assert.Equal(t, "claim_mapping_reserved", body["code"], k)
+		}
+		status, body := f.call(t, http.MethodGet, "/external-issuers/"+id, nil, a.headers)
+		require.Equal(t, http.StatusOK, status)
+		assert.NotContains(t, body["claim_mapping"], "role", "a refused patch writes nothing")
+		assert.NotContains(t, body["claim_mapping"], "privilege_scope")
 	})
 	t.Run("patch changes mutable fields only", func(t *testing.T) {
 		status, body := f.call(t, http.MethodPatch, "/external-issuers/"+id, map[string]any{
@@ -1018,6 +1037,42 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 	p.f.mu.Unlock()
 	assert.Equal(t, p.rowID, seen.IssuerID, "the issuer row that verified the ID-JAG")
 	assert.Equal(t, zeroid.PersonGrantIDJAG, seen.GrantType)
+}
+
+// TestTrustedIssuers_ReservedMappingOnStoredRow: a row stored before role and
+// privilege_scope were reserved may still map them (ADR 0044 D16). The ID-JAG
+// grant ignores both (EC-D16-04); a rename or a disable still works, and any
+// other edit must drop them.
+func TestTrustedIssuers_ReservedMappingOnStoredRow(t *testing.T) {
+	p := newP1B(t)
+	_, err := testDB.NewUpdate().Table("external_issuers").
+		Set("claim_mapping = claim_mapping || ?::jsonb", `{"role": "groups", "privilege_scope": "scp"}`).
+		Where("id = ?", p.rowID).Exec(context.Background())
+	require.NoError(t, err)
+
+	resp := p.redeem(t, p.idJAG(t, map[string]any{
+		"groups": "admin", "scp": []string{"tenant:write"},
+		"role": "owner", "privilege_scope": []string{"*"},
+	}), nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+	assert.NotContains(t, claims, "role", "an IdP claim never sets a token's role")
+	assert.NotContains(t, claims, "privilege_scope", "an IdP claim never sets a token's privilege_scope")
+	assert.Equal(t, "user_hf_alice", claims["sub"], "the rest of the grant is unaffected")
+
+	status, body := p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"display_name": "legacy"}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "a rename is not re-validated: %v", body)
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{"trust_email": true}, p.tn.headers)
+	assert.Equal(t, http.StatusBadRequest, status, "%v", body)
+	assert.Equal(t, "claim_mapping_reserved", body["code"])
+
+	status, body = p.f.call(t, http.MethodPatch, "/external-issuers/"+p.rowID, map[string]any{
+		"trust_email":   true,
+		"claim_mapping": map[string]string{"user_id": "sub", "email": "email", "email_verified": "email_verified"},
+	}, p.tn.headers)
+	require.Equal(t, http.StatusOK, status, "dropping the reserved keys makes the row editable: %v", body)
+	assert.NotContains(t, body["claim_mapping"], "role")
 }
 
 // TestTrustedIssuers_TrustEmail: an issuer that vouches for its own email

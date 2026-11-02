@@ -144,6 +144,60 @@ func TestDBRegistry_SharedIssuerConstraints(t *testing.T) {
 	}
 }
 
+// ResolveWorkload is the federated client assertion's lookup (ADR 0042 D8):
+// workload rows only, enabled, database mode only.
+func TestDBRegistry_ResolveWorkload(t *testing.T) {
+	jwksSrv := newFakeJWKSServer(t, "k1")
+	const iss = "https://cluster.example"
+	rows := &fakeIssuerRows{rows: []*domain.ExternalIssuer{issuerRow("w1", "acct-a", iss, domain.IssuerKindWorkload, jwksSrv.srv.URL)}}
+	reg := NewDBExternalIssuerRegistry(rows, true, nil, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
+	defer reg.Close()
+	ctx := context.Background()
+
+	entry, err := reg.ResolveWorkload(ctx, iss, nil)
+	if err != nil || entry.Row == nil || entry.Row.ID != "w1" {
+		t.Fatalf("entry = %+v, err = %v", entry, err)
+	}
+	if _, err := reg.ResolvePerson(ctx, iss, nil); !errors.Is(err, errIssuerNotPerson) {
+		t.Fatalf("a workload row serves no person grant: %v", err)
+	}
+	t.Run("a person row is not a workload issuer", func(t *testing.T) {
+		rows.set(func(r []*domain.ExternalIssuer) { r[0].Kind = domain.IssuerKindPerson })
+		defer rows.set(func(r []*domain.ExternalIssuer) { r[0].Kind = domain.IssuerKindWorkload })
+		if _, err := reg.ResolveWorkload(ctx, iss, nil); !errors.Is(err, errIssuerNotWorkload) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("a disabled row", func(t *testing.T) {
+		rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled = false })
+		defer rows.set(func(r []*domain.ExternalIssuer) { r[0].Enabled = true })
+		if _, err := reg.ResolveWorkload(ctx, iss, nil); !errors.Is(err, errIssuerDisabled) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("unknown issuer", func(t *testing.T) {
+		if _, err := reg.ResolveWorkload(ctx, "https://nobody", nil); !errors.Is(err, ErrUnknownExternalIssuer) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestStaticRegistry_ResolveWorkloadNeedsRows(t *testing.T) {
+	jwksSrv := newFakeJWKSServer(t, "k1")
+	reg, err := NewExternalIssuerRegistry(context.Background(), []domain.ExternalIssuerConfig{
+		{Issuer: "https://workload", JWKSURI: jwksSrv.srv.URL, Audience: "a", Kind: domain.IssuerKindWorkload, JWKSCacheTTL: time.Minute},
+	}, jwks.WithHTTPClient(insecureHTTPClient(2*time.Second)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	// A static issuer has no row to hang bindings on, so it authenticates no
+	// federated client.
+	if _, err := reg.ResolveWorkload(context.Background(), "https://workload", nil); !errors.Is(err, ErrUnknownExternalIssuer) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestStaticRegistry_ResolvePersonKind(t *testing.T) {
 	jwksSrv := newFakeJWKSServer(t, "k1")
 	reg, err := NewExternalIssuerRegistry(context.Background(), []domain.ExternalIssuerConfig{

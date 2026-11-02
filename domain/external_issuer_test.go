@@ -35,6 +35,14 @@ func TestExternalIssuerConfigValidate(t *testing.T) {
 		{name: "empty allowed_accounts entry", mutate: func(c *ExternalIssuerConfig) {
 			c.AllowedAccounts = []string{""}
 		}, wantErr: "must not contain empty entries"},
+		{name: "groups mapping", mutate: func(c *ExternalIssuerConfig) { c.ClaimMapping["groups"] = "groups" }},
+		{name: "groups mapping with surrounding whitespace", mutate: func(c *ExternalIssuerConfig) {
+			c.ClaimMapping["groups"] = "groups "
+		}, wantErr: "claim_mapping.groups must name the claim without surrounding whitespace"},
+		{name: "groups mapping on a workload issuer", mutate: func(c *ExternalIssuerConfig) {
+			c.Kind = IssuerKindWorkload
+			c.ClaimMapping["groups"] = "groups"
+		}, wantErr: "claim_mapping.groups applies to a person issuer only"},
 		{name: "unsupported propagate claim", mutate: func(c *ExternalIssuerConfig) {
 			c.PropagateClaims = []string{"groups"}
 		}, wantErr: "propagate_claims entry"},
@@ -74,7 +82,7 @@ func TestExternalIssuerConfigDefaults(t *testing.T) {
 	if got, want := cfg.JWKSCacheTTL, 5*time.Minute; got != want {
 		t.Errorf("JWKSCacheTTL default = %s, want %s", got, want)
 	}
-	if got, want := strings.Join(cfg.Algorithms, ","), "RS256,ES256,PS256"; got != want {
+	if got, want := strings.Join(cfg.Algorithms, ","), "RS256,ES256,ES384,PS256"; got != want {
 		t.Errorf("Algorithms default = %q, want %q", got, want)
 	}
 }

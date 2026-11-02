@@ -12,10 +12,21 @@ server:
   write_timeout: "15s"
   idle_timeout: "60s"
   shutdown_timeout_seconds: 30
-  # Trust X-Forwarded-Proto / X-Forwarded-Host when reconstructing the
-  # request URL for DPoP htu validation (RFC 9449 §4.3). Set true ONLY
-  # behind a trusted edge proxy that strips client-supplied values;
-  # leave false when ZeroID terminates TLS itself. Env: ZEROID_TRUST_FORWARDED_HEADERS
+  # Which X-Forwarded-* headers to trust when reconstructing the request URL
+  # for DPoP htu validation (RFC 9449 §4.3). Behind a TLS-terminating proxy
+  # SOME trust is required, or every correct proof fails htu.
+  #   none        TLS terminates at ZeroID itself.
+  #   proto       trust X-Forwarded-Proto only; host from Host. The safe
+  #               choice behind AWS ALB, which sets the scheme but passes a
+  #               client-supplied X-Forwarded-Host through untouched.
+  #   proto_host  trust both — ONLY behind an edge that sets and overwrites
+  #               both. Otherwise a client chooses the host htu is checked
+  #               against.
+  # Left empty so the deprecated trust_forwarded_headers below still applies
+  # to existing deployments. Env: ZEROID_FORWARDED_HEADERS
+  forwarded_headers: ""
+  # Deprecated — equivalent to forwarded_headers: proto_host. Conflicts with
+  # any other forwarded_headers value. Env: ZEROID_TRUST_FORWARDED_HEADERS
   trust_forwarded_headers: false
 
 database:
@@ -193,6 +204,14 @@ client_auth:
   # sets from localhost. Production MUST keep this false.
   # Env: ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS
   allow_private_jwks_endpoints: false
+  # Client secrets are stored as SHA-256 by default, and existing bcrypt hashes
+  # move to SHA-256 on their next successful verify. Secrets are 32 random
+  # bytes the server generates, so bcrypt (60-250 ms of CPU per verify) adds
+  # no protection. Set true to keep writing bcrypt, as older builds did, only
+  # if you need to roll back past this release: older builds cannot verify
+  # SHA-256 secrets. Verification accepts both formats regardless.
+  # Env: ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS
+  bcrypt_client_secrets: false
   # Bounds how many distinct client jwks_uri endpoints are cached at once.
   # Each cached entry owns a background refresh goroutine, so this caps
   # goroutines and outbound fetch loops, not just memory. 0 (default) => 256.
@@ -262,6 +281,7 @@ cimd:
 #     claim_mapping:
 #       user_id:        sub
 #       email:          email
+#       groups:         groups   # optional: the claim listing the person's groups (RFC 9068 groups claim)
 #     allowed_accounts: ["acct_123"]   # REQUIRED, non-empty: the tenants this IdP serves. An empty list is rejected at startup (it would let a token issued for one tenant be exchanged under another)
 #     propagate_claims: ["auth_time", "acr", "amr"]
 #     allow_private_endpoints: false  # true ONLY for an internal/VPN IdP or localhost dev — relaxes the SSRF guard on the jwks_uri fetch

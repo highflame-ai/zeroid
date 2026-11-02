@@ -36,6 +36,8 @@ func TestExternalIssuerValidate(t *testing.T) {
 		want   string
 	}{
 		{name: "valid", mutate: func(*ExternalIssuer) {}},
+		{name: "ES384 (AWS STS)", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"RS256", "ES384"} }},
+		{name: "ES512 unsupported", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"ES512"} }, want: "invalid_algorithms"},
 		{name: "bad kind", mutate: func(e *ExternalIssuer) { e.Kind = "robot" }, want: "invalid_kind"},
 		{name: "http issuer", mutate: func(e *ExternalIssuer) { e.Issuer = "http://acme.okta.com" }, want: "invalid_issuer"},
 		{name: "http issuer allowed with private endpoints", mutate: func(e *ExternalIssuer) {
@@ -81,6 +83,32 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "none alg", mutate: func(e *ExternalIssuer) { e.Algorithms = []string{"none"} }, want: "invalid_algorithms"},
 		{name: "propagate groups", mutate: func(e *ExternalIssuer) { e.PropagateClaims = []string{"groups"} }, want: "invalid_propagate_claims"},
 		{name: "unknown mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["sub"] = "sub" }, want: "invalid_claim_mapping"},
+		{name: "groups mapping", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "groups" }},
+		{name: "groups mapping to a renamed claim", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "member_of" }},
+		{name: "groups mapping names no claim", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = " " }, want: "invalid_claim_mapping"},
+		{name: "groups mapping with surrounding whitespace", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = " groups" }, want: "invalid_claim_mapping"},
+		{name: "groups mapping with trailing whitespace", mutate: func(e *ExternalIssuer) { e.ClaimMapping["groups"] = "groups\t" }, want: "invalid_claim_mapping"},
+		{name: "groups mapping on a workload row", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.ClaimMapping["groups"] = "groups"
+		}, want: "invalid_claim_mapping"},
+		{name: "groups mapping too long", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["groups"] = strings.Repeat("g", maxClaimNameBytes+1)
+		}, want: "invalid_claim_mapping"},
+		// ADR 0044 D16: an IdP claim never sets a token's role or capabilities.
+		{name: "role is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["role"] = "groups" }, want: "claim_mapping_reserved"},
+		{name: "privilege_scope is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["privilege_scope"] = "scp" }, want: "claim_mapping_reserved"},
+		{name: "reserved on a workload row too", mutate: func(e *ExternalIssuer) {
+			e.Kind = IssuerKindWorkload
+			e.ClaimMapping = map[string]string{"role": "roles"}
+		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to an over-long claim is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", maxClaimNameBytes+1)
+		}, want: "claim_mapping_reserved"},
+		{name: "role mapped to a claim over 255 bytes is still reserved", mutate: func(e *ExternalIssuer) {
+			e.ClaimMapping["role"] = strings.Repeat("r", 256)
+		}, want: "claim_mapping_reserved"},
+		{name: "a claim named role may feed another key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["name"] = "role" }},
 		{name: "person without user key", mutate: func(e *ExternalIssuer) { e.ClaimMapping = map[string]string{} }, want: "invalid_claim_mapping"},
 		{name: "workload without user key", mutate: func(e *ExternalIssuer) {
 			e.Kind = IssuerKindWorkload
@@ -285,6 +313,54 @@ func TestApplyIssuerPreset(t *testing.T) {
 			t.Fatalf("code = %q", got)
 		}
 	})
+	t.Run("presets fill groups when unset", func(t *testing.T) {
+		for preset, iss := range map[string]string{
+			IssuerPresetEntra: "https://login.microsoftonline.com/" + tid + "/v2.0",
+			IssuerPresetOkta:  "https://acme.okta.com",
+		} {
+			e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: iss}
+			if err := ApplyIssuerPreset(e, preset); err != nil {
+				t.Fatalf("%s: %v", preset, err)
+			}
+			if e.ClaimMapping["groups"] != "groups" {
+				t.Fatalf("%s: claim_mapping.groups = %q, want groups", preset, e.ClaimMapping["groups"])
+			}
+		}
+	})
+	t.Run("presets keep a groups claim the admin set", func(t *testing.T) {
+		for preset, iss := range map[string]string{
+			IssuerPresetEntra: "https://login.microsoftonline.com/" + tid + "/v2.0",
+			IssuerPresetOkta:  "https://acme.okta.com",
+		} {
+			e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: iss, ClaimMapping: map[string]string{"groups": "member_of"}}
+			if err := ApplyIssuerPreset(e, preset); err != nil {
+				t.Fatalf("%s: %v", preset, err)
+			}
+			if e.ClaimMapping["groups"] != "member_of" {
+				t.Fatalf("%s: claim_mapping.groups = %q, want the admin's member_of", preset, e.ClaimMapping["groups"])
+			}
+		}
+	})
+	t.Run("an explicit empty groups turns groups off: no preset fill, stored as no mapping", func(t *testing.T) {
+		for preset, iss := range map[string]string{
+			IssuerPresetEntra: "https://login.microsoftonline.com/" + tid + "/v2.0",
+			IssuerPresetOkta:  "https://acme.okta.com",
+		} {
+			for _, empty := range []string{"", " "} {
+				e := &ExternalIssuer{Kind: IssuerKindPerson, Issuer: iss, ClaimMapping: map[string]string{"groups": empty}}
+				if err := ApplyIssuerPreset(e, preset); err != nil {
+					t.Fatalf("%s: %v", preset, err)
+				}
+				e.Normalize()
+				if g, set := e.ClaimMapping["groups"]; set {
+					t.Fatalf("%s: claim_mapping.groups = %q, want no mapping", preset, g)
+				}
+				if err := e.Validate(IssuerValidation{JWKSURIPending: true}); err != nil {
+					t.Fatalf("%s: %v", preset, err)
+				}
+			}
+		}
+	})
 	t.Run("unknown preset", func(t *testing.T) {
 		if got := issuerCode(ApplyIssuerPreset(&ExternalIssuer{}, "auth0")); got != "invalid_preset" {
 			t.Fatalf("code = %q", got)
@@ -308,5 +384,34 @@ func TestExternalIssuerConfigAudienceAndKind(t *testing.T) {
 	c.Kind = IssuerKindWorkload
 	if err := c.Validate(); err != nil {
 		t.Fatalf("audiences alone satisfy the audience requirement: %v", err)
+	}
+}
+
+// A reserved key wins over any other claim_mapping fault, whatever order the
+// map iterates in (ADR 0044 D16).
+func TestExternalIssuerValidate_ReservedKeyCodeIsDeterministic(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		e := validRow()
+		e.ClaimMapping = map[string]string{
+			"user_id": "sub", "role": "groups", "sub": "x", "zzz": "y", "aaa": "z",
+			"name": strings.Repeat("n", maxClaimNameBytes+1), "email": " ",
+		}
+		err := e.Validate(IssuerValidation{})
+		if got := issuerCode(err); got != "claim_mapping_reserved" {
+			t.Fatalf("iteration %d: code = %q (err %v), want claim_mapping_reserved", i, got, err)
+		}
+		if !strings.Contains(err.Error(), `"role"`) {
+			t.Fatalf("iteration %d: %v does not name role", i, err)
+		}
+	}
+}
+
+func TestReservedMappingKeysIn(t *testing.T) {
+	got := ReservedMappingKeysIn(map[string]string{"privilege_scope": "a", "user_id": "sub", "role": "b"})
+	if fmt.Sprint(got) != "[role privilege_scope]" {
+		t.Fatalf("got %v, want [role privilege_scope] in fixed order", got)
+	}
+	if got := ReservedMappingKeysIn(map[string]string{"user_id": "sub"}); len(got) != 0 {
+		t.Fatalf("got %v, want none", got)
 	}
 }

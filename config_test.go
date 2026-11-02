@@ -1,6 +1,8 @@
 package zeroid
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
 )
@@ -377,6 +382,7 @@ func TestValidateWIMSEDomain(t *testing.T) {
 func TestLoadEnvVarsClientAuth(t *testing.T) {
 	t.Setenv("ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS", "true")
 	t.Setenv("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE", "64")
+	t.Setenv("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS", "true")
 
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -387,6 +393,9 @@ func TestLoadEnvVarsClientAuth(t *testing.T) {
 	}
 	if cfg.ClientAuth.JWKSCacheSize != 64 {
 		t.Errorf("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE=64 did not reach client_auth, got %d", cfg.ClientAuth.JWKSCacheSize)
+	}
+	if !cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS=true did not reach client_auth")
 	}
 }
 
@@ -401,6 +410,9 @@ func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
 	}
 	if cfg.ClientAuth.JWKSCacheSize != 0 {
 		t.Errorf("jwks_cache_size must default to 0 (meaning the built-in cap), got %d", cfg.ClientAuth.JWKSCacheSize)
+	}
+	if cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("bcrypt_client_secrets must default to false: client secrets are stored as SHA-256 unless a deployment opts back into bcrypt")
 	}
 }
 
@@ -846,6 +858,93 @@ func TestConfig_FederationIssuerStore(t *testing.T) {
 	}
 }
 
+// TestForwardedHeadersMode pins resolution of the forwarded-header trust mode,
+// including the deprecated all-or-nothing flag it replaces.
+func TestForwardedHeadersMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		legacy  bool
+		want    string
+		wantErr string
+	}{
+		{"unset and legacy off is none", "", false, ForwardedHeadersNone, ""},
+		{"unset honours the legacy flag as proto_host", "", true, ForwardedHeadersProtoHost, ""},
+		{"none", "none", false, ForwardedHeadersNone, ""},
+		{"proto", "proto", false, ForwardedHeadersProto, ""},
+		{"proto_host", "proto_host", false, ForwardedHeadersProtoHost, ""},
+		{"surrounding space tolerated", "  proto ", false, ForwardedHeadersProto, ""},
+		{"legacy flag agreeing with proto_host is fine", "proto_host", true, ForwardedHeadersProtoHost, ""},
+
+		// Refused, never resolved: letting either win would decide whether
+		// X-Forwarded-Host is trusted on the deployer's behalf.
+		{"legacy flag with proto conflicts", "proto", true, "", "conflicts"},
+		{"legacy flag with none conflicts", "none", true, "", "conflicts"},
+
+		// An unknown mode must fail, not read as "none" — a typo like
+		// "proto-host" silently trusting nothing would keep DPoP broken, and
+		// one silently trusting everything would be worse.
+		{"unknown mode", "proto-host", false, "", "not a known mode"},
+		{"case matters", "Proto", false, "", "not a known mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := ServerConfig{ForwardedHeaders: tc.mode, TrustForwardedHeaders: tc.legacy}
+			got, err := s.ForwardedHeadersMode()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got mode=%q err=%v", tc.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got (%q, %v), want (%q, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A static issuer mapping a reserved key still loads, with one warning per
+// key naming the issuer and the key: the grant ignores it (ADR 0044 D16).
+func TestConfig_StaticIssuerReservedMappingWarns(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() { log.Logger = orig })
+
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{
+		{
+			Issuer: "https://idp.example", JWKSURI: "https://idp.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping:    map[string]string{"user_id": "sub", "role": "groups", "privilege_scope": "scp"},
+			AllowedAccounts: []string{"acct"},
+		},
+		{
+			Issuer: "https://clean.example", JWKSURI: "https://clean.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a reserved key in a static issuer must not stop the boot: %v", err)
+	}
+
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if entry["level"] != "warn" {
+			t.Fatalf("level = %v, want warn: %s", entry["level"], line)
+		}
+		got = append(got, fmt.Sprintf("%v %v", entry["issuer"], entry["key"]))
+	}
+	want := []string{"https://idp.example role", "https://idp.example privilege_scope"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("warnings = %v, want %v (one per reserved key, none for the clean issuer)", got, want)
+	}
+}
+
 func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
 	cfg := baseValidConfig(t)
 	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com"}}
@@ -875,4 +974,69 @@ func TestConfig_StaticIssuerCannotBeSelf(t *testing.T) {
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "own issuer") {
 		t.Fatalf("err = %v", err)
 	}
+}
+
+// TestValidateRejectsBadForwardedHeaders confirms the resolution errors stop
+// startup, in every environment — neither case is ever right.
+func TestValidateRejectsBadForwardedHeaders(t *testing.T) {
+	for _, s := range []ServerConfig{
+		{ForwardedHeaders: "everything"},
+		{ForwardedHeaders: ForwardedHeadersProto, TrustForwardedHeaders: true},
+	} {
+		cfg := baseValidConfig(t)
+		cfg.Server.ForwardedHeaders = s.ForwardedHeaders
+		cfg.Server.TrustForwardedHeaders = s.TrustForwardedHeaders
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate accepted forwarded_headers=%q trust_forwarded_headers=%v",
+				s.ForwardedHeaders, s.TrustForwardedHeaders)
+		}
+	}
+
+	cfg := baseValidConfig(t)
+	cfg.Server.ForwardedHeaders = ForwardedHeadersProto
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("control: proto must validate, got %v", err)
+	}
+}
+
+// TestLoadForwardedHeaders pins the env var and the default, through the real
+// loader. The default must stay EMPTY rather than "none": empty defers to the
+// deprecated flag, so an existing deployment running
+// ZEROID_TRUST_FORWARDED_HEADERS=true keeps its behaviour instead of hitting
+// the conflict error on upgrade.
+func TestLoadForwardedHeaders(t *testing.T) {
+	t.Run("default is unset and resolves to none", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Server.ForwardedHeaders != "" {
+			t.Fatalf("default forwarded_headers = %q, want empty", cfg.Server.ForwardedHeaders)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersNone {
+			t.Fatalf("default resolves to %q, want none", m)
+		}
+	})
+
+	t.Run("env var binds", func(t *testing.T) {
+		t.Setenv("ZEROID_FORWARDED_HEADERS", "proto")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProto {
+			t.Fatalf("ZEROID_FORWARDED_HEADERS=proto resolved to %q", m)
+		}
+	})
+
+	t.Run("legacy env var alone still works on upgrade", func(t *testing.T) {
+		t.Setenv("ZEROID_TRUST_FORWARDED_HEADERS", "true")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("an existing deployment must not fail to start: %v", err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProtoHost {
+			t.Fatalf("legacy flag resolved to %q, want proto_host", m)
+		}
+	})
 }

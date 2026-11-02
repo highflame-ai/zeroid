@@ -757,6 +757,13 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 	return s.repo.GetByID(ctx, id, accountID, projectID)
 }
 
+// GetIdentitiesByIDs returns the identities among ids that live in the given
+// tenant. Ids that are missing or belong to another tenant are dropped, so a
+// caller can use the result as a tenant-membership check for a batch of ids.
+func (s *IdentityService) GetIdentitiesByIDs(ctx context.Context, ids []string, accountID, projectID string) ([]*domain.Identity, error) {
+	return s.repo.GetByIDs(ctx, ids, accountID, projectID)
+}
+
 // SetPublicKey replaces the identity's EC actor-assertion public key (the key
 // used to verify its self-signed assertion on the jwt_bearer and token_exchange
 // grants). The PEM is validated as an SPKI EC P-256 key. Persisted via

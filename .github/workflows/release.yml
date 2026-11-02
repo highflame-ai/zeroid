@@ -1,7 +1,6 @@
 name: Release Build - Zeroid
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -15,7 +14,6 @@ env:
 
 jobs:
   highflame-validate:
-    if: github.event_name == 'push'
     permissions:
       contents: 'read'
     runs-on: ubuntu-24.04
@@ -104,10 +102,6 @@ jobs:
       # broken go.mod, with goreleaser and tag-submodules skipped.
       # Under lockstep there is no drift to detect, and this check
       # fails BEFORE any submodule tag is created.
-      # Draft-a-release path. workflow_dispatch writes the pins and the
-      # tag together, so they already match. This is the other path:
-      # someone ran `make release-prep VERSION=vX.Y.Z`, committed it, then
-      # drafted a release. The version in that commit must be the tag.
       - name: make release-prep version matches the release tag
         shell: bash
         run: |-
@@ -144,7 +138,6 @@ jobs:
           echo "✓ make release-prep version matches release tag ${TAG}"
 
   tag-submodules:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -191,7 +184,6 @@ jobs:
           done
 
   highflame-sast:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
     permissions:
@@ -231,7 +223,6 @@ jobs:
           make test-integration
 
   highflame-goreleaser:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
@@ -279,7 +270,6 @@ jobs:
           args: release --clean
 
   highflame-trigger:
-    if: github.event_name == 'push'
     needs:
       - highflame-validate
       - highflame-sast
@@ -313,95 +303,3 @@ jobs:
             --repo ${{ github.repository_owner }}/${{ env.DEVOPS_REPO }} \
             --ref ${{ env.DEVOPS_BRANCH }} \
             -f RELEASE_VER=${{ env.RELEASE_TAG }}
-
-  # Manual run, before any tag exists. release-prep commits first; the
-  # release is created on that commit, so the tag and the cloud clone see
-  # the same go.mod. The app token is what makes `release: published` run
-  # afterwards. The default workflow token would not.
-  cut-release:
-    if: github.event_name == 'workflow_dispatch'
-    concurrency:
-      group: zeroid-cut-release
-      cancel-in-progress: false
-    permissions:
-      contents: read
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Create APP token
-        uses: actions/create-github-app-token@v3
-        id: app
-        with:
-          client-id: ${{ secrets.HIGHFLAME_GITHUB_APP_ID }}
-          private-key: ${{ secrets.HIGHFLAME_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-
-      - name: Checkout main
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          fetch-depth: 0
-          fetch-tags: true
-          token: ${{ steps.app.outputs.token }}
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Install GitHub CLI
-        run: sudo apt install gh -y
-
-      - name: Bump pins and publish the release
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch origin --tags --force
-          go install github.com/caarlos0/svu/v3@latest
-
-          RAW="$(svu next)"
-          CURRENT="$(svu current)"
-          VERSION="$(make -s --no-print-directory releasable-version)"
-          echo "svu current : ${CURRENT}"
-          echo "svu next    : ${RAW}"
-          echo "releasable  : ${VERSION}"
-
-          if [[ "${RAW}" == "${CURRENT}" ]]; then
-            echo "::error::No feat: or fix: commits since ${CURRENT}. Nothing to release."
-            exit 1
-          fi
-          if [[ ! "${VERSION}" =~ ${REGEX_PATTERN} ]]; then
-            echo "::error::Invalid version format: ${VERSION}"
-            exit 1
-          fi
-          echo "Valid version format: ${VERSION}"
-
-          if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
-            echo "::error::Tag ${VERSION} already exists. Refusing to move it."
-            exit 1
-          fi
-          if gh release view "${VERSION}" >/dev/null 2>&1; then
-            echo "::error::Release ${VERSION} already exists. Refusing to move it."
-            exit 1
-          fi
-          echo "Releasing ${VERSION}"
-
-          make release-prep VERSION="${VERSION}"
-          git add -- go.mod pkg/authjwt/go.mod go.sum pkg/authjwt/go.sum go.work.sum
-          if ! git diff --quiet; then
-            echo "::error::release-prep changed files other than the module pins:"
-            git status --porcelain
-            exit 1
-          fi
-          if ! git diff --cached --quiet; then
-            git config user.name "Highflame GitHub Bot"
-            git config user.email "bot@github.com"
-            git commit -m "devops: point nested-module pins at ${VERSION}"
-            git push origin HEAD:main
-          fi
-
-          SHA="$(git rev-parse HEAD)"
-          echo "Publishing ${VERSION} at ${SHA}"
-          gh release create "${VERSION}" --target "${SHA}" --title "${VERSION}" --generate-notes

@@ -1233,6 +1233,41 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 		status, body := redeem(idToken(map[string]any{"aud": []string{aud, other.ClientID}, "azp": aud}), &rp)
 		assert.Equal(t, http.StatusOK, status, "body=%v", body)
 	})
+	// RFC 8693 §3 lets a client name any JWT with the generic type. A broker
+	// that exchanges the token its workload was called with sends it for an ID
+	// token, and the relying party's authenticated request is an ID-token
+	// exchange all the same.
+	redeemAsJWT := func(token string, client *oauthClientResp) (int, map[string]any) {
+		body := map[string]any{
+			"grant_type":         "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":      token,
+			"subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+			"account_id":         fedCfg.AccountID,
+			"project_id":         fedCfg.ProjectID,
+		}
+		if client != nil {
+			withClientAuth(t, body, *client)
+		}
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		var got map[string]any
+		_ = json.Unmarshal([]byte(resp.RawBody), &got)
+		return resp.StatusCode, got
+	}
+	t.Run("subject named as a jwt: the relying party, authenticated", func(t *testing.T) {
+		status, body := redeemAsJWT(idToken(nil), &rp)
+		require.Equal(t, http.StatusOK, status, "body=%v", body)
+		assert.Equal(t, rp.ClientID, decodeIssuedTokenClaims(t, body["access_token"].(string))["client_id"])
+	})
+	t.Run("subject named as a jwt: a client the token was not issued to", func(t *testing.T) {
+		status, body := redeemAsJWT(idToken(nil), &other)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+	})
+	t.Run("subject named as a jwt: no client authentication keeps the broker path", func(t *testing.T) {
+		status, body := redeemAsJWT(idToken(nil), nil)
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, "invalid_grant", body["error"])
+	})
 }
 
 // authCodeToken redeems an authorization code for a person in the tenant

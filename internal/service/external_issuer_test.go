@@ -237,3 +237,24 @@ func TestUniquenessConflict_SharedPin(t *testing.T) {
 		})
 	}
 }
+
+// TestExternalIssuerCreateRefusesReservedMapping: role and privilege_scope are
+// reserved claim_mapping keys, refused with 400 claim_mapping_reserved before
+// anything is fetched or stored (ADR 0044 D16, EC-D16-03). The service has no
+// repository, so a refusal that came later than validation would panic.
+func TestExternalIssuerCreateRefusesReservedMapping(t *testing.T) {
+	svc := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{Store: IssuerStoreDB})
+	for _, key := range []string{"role", "privilege_scope"} {
+		t.Run(key, func(t *testing.T) {
+			_, _, err := svc.Create(context.Background(), "acct", "u", IssuerInput{
+				Kind:         domain.IssuerKindPerson,
+				Issuer:       "https://acme.okta.com",
+				ClaimMapping: map[string]string{"user_id": "sub", key: "groups"},
+			})
+			var apiErr *IssuerAPIError
+			if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest || apiErr.Code != "claim_mapping_reserved" {
+				t.Fatalf("err = %v (%+v), want 400 claim_mapping_reserved", err, apiErr)
+			}
+		})
+	}
+}

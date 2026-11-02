@@ -276,3 +276,39 @@ func TestExternalIDTokenExchange_IssuerNotResolvedBeforeClientAuth(t *testing.T)
 		t.Fatalf("issuer looked up %d times before client authentication", rows.calls)
 	}
 }
+
+// TestJWTSubjectIsIDTokenExchange: a subject named only as a JWT goes to the
+// ID-token exchange when a client authenticates and the caller is not a trusted
+// service. Every other request keeps its path, so the broker path still gets
+// unauthenticated and trusted-service callers.
+func TestJWTSubjectIsIDTokenExchange(t *testing.T) {
+	trusted := func(context.Context) (string, error) { return "broker", nil }
+	untrusted := func(context.Context) (string, error) { return "", errors.New("not trusted") }
+	cases := []struct {
+		name      string
+		validator trustedServiceValidatorFunc
+		req       TokenRequest
+		want      bool
+	}{
+		{"jwt, client id, no trusted-service hook", nil,
+			TokenRequest{SubjectTokenType: SubjectTokenTypeJWT, ClientID: "rp"}, true},
+		{"jwt, client assertion only, caller not trusted", untrusted,
+			TokenRequest{SubjectTokenType: SubjectTokenTypeJWT, ClientAssertion: "x", ClientAssertionType: "y"}, true},
+		{"jwt, no client authentication", untrusted,
+			TokenRequest{SubjectTokenType: SubjectTokenTypeJWT}, false},
+		{"jwt, client id, trusted service", trusted,
+			TokenRequest{SubjectTokenType: SubjectTokenTypeJWT, ClientID: "rp"}, false},
+		{"access token type, client id", nil,
+			TokenRequest{SubjectTokenType: TokenTypeAccessToken, ClientID: "rp"}, false},
+		{"no subject token type, client id", nil,
+			TokenRequest{ClientID: "rp"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &OAuthService{trustedServiceValidator: tc.validator}
+			if got := svc.jwtSubjectIsIDTokenExchange(context.Background(), tc.req); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

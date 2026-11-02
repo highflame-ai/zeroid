@@ -61,8 +61,8 @@ type ExternalIssuerCreateBody struct {
 	Issuer              string              `json:"issuer" doc:"The iss value tokens carry, matched exactly. https. Its {issuer}/.well-known/openid-configuration must name this issuer and the jwks_uri ZeroID uses."`
 	DisplayName         string              `json:"display_name,omitempty"`
 	Audiences           []string            `json:"audiences,omitempty" doc:"Optional on a person row, required on a workload row. Extra accepted aud values: on the ID-token exchange an enabled binding already admits the presenting client's client_id, and an ID-JAG's aud must be ZeroID's issuer."`
-	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, PS256. Default all three."`
-	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, role, privilege_scope, scope, trust_level."`
+	Algorithms          []string            `json:"algorithms,omitempty" doc:"Subset of RS256, ES256, ES384, PS256. Default all four."`
+	ClaimMapping        map[string]string   `json:"claim_mapping,omitempty" doc:"ZeroID name to token claim. user_id (the person's user key, required for person), email, email_verified, name, scope, trust_level, groups (the claim listing the person's groups, copied to the issued token's groups claim). role and privilege_scope are reserved (claim_mapping_reserved)."`
 	PropagateClaims     []string            `json:"propagate_claims,omitempty" doc:"Subset of auth_time, acr, amr."`
 	ClaimConstraints    map[string][]string `json:"claim_constraints,omitempty" doc:"claim to accepted values; every listed claim must match. Required for a shared issuer."`
 	MaxTokenAgeSeconds  int                 `json:"max_token_age_seconds,omitempty" doc:"1-3600, default 600."`
@@ -86,6 +86,7 @@ type ExternalIssuerPatchBody struct {
 	JWKSCacheTTLSeconds *int                 `json:"jwks_cache_ttl_seconds,omitempty"`
 	TrustEmail          *bool                `json:"trust_email,omitempty"`
 	Enabled             *bool                `json:"enabled,omitempty"`
+	IfUpdatedAt         *time.Time           `json:"if_updated_at,omitempty" doc:"Apply the patch only if the row's updated_at still equals this (409 issuer_changed otherwise)."`
 }
 
 // ExternalIssuerView is an issuer row, with the JWKS probe made by the write
@@ -245,6 +246,9 @@ func (a *API) registerExternalIssuerRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-id-token", Method: http.MethodPost,
 		Path: "/external-issuers/{id}/verify-id-token", Summary: "Verify an ID token under a person issuer, as the ID-token exchange would", Tags: tags,
 		MaxBodyBytes: maxVerifyIDTokenBodyBytes}, a.verifyExternalIssuerIDTokenOp)
+	huma.Register(api, huma.Operation{OperationID: "verify-external-issuer-workload-token", Method: http.MethodPost,
+		Path: "/external-issuers/{id}/verify-workload-token", Summary: "Verify a challenge token under a workload issuer, as a federated client assertion would be", Tags: tags,
+		MaxBodyBytes: maxVerifyWorkloadTokenBodyBytes}, a.verifyExternalIssuerWorkloadTokenOp)
 
 	huma.Register(api, huma.Operation{OperationID: "list-account-issuer-bindings", Method: http.MethodGet,
 		Path: "/external-issuers/bindings", Summary: "List the account's credential bindings across issuers", Tags: tags}, a.listAccountBindingsOp)
@@ -337,7 +341,7 @@ func (a *API) updateExternalIssuerOp(ctx context.Context, input *struct {
 		DisplayName: b.DisplayName, Audiences: b.Audiences, Algorithms: b.Algorithms,
 		ClaimMapping: b.ClaimMapping, PropagateClaims: b.PropagateClaims, ClaimConstraints: b.ClaimConstraints,
 		MaxTokenAge: b.MaxTokenAgeSeconds, JWKSCacheTTL: b.JWKSCacheTTLSeconds, TrustEmail: b.TrustEmail,
-		Enabled: b.Enabled,
+		Enabled: b.Enabled, IfUpdatedAt: b.IfUpdatedAt,
 	})
 	if err != nil {
 		return nil, issuerProblemFrom(err, "update external issuer")
@@ -418,6 +422,39 @@ func (a *API) verifyExternalIssuerIDTokenOp(ctx context.Context, input *struct {
 		return nil, issuerProblemFrom(err, "verify id_token")
 	}
 	return &verifyIDTokenOutput{Body: out}, nil
+}
+
+// VerifyWorkloadTokenBody is POST /external-issuers/{id}/verify-workload-token.
+// No length tags, for the reason VerifyIDTokenBody has none; the service caps
+// the fields.
+type VerifyWorkloadTokenBody struct {
+	Token    string `json:"token" doc:"A token from the workload issuer whose aud is exactly the challenge. At most 16384 bytes."`
+	Audience string `json:"audience" doc:"The one-time challenge the token was minted for. At most 512 bytes."`
+}
+
+// maxVerifyWorkloadTokenBodyBytes bounds the verify-workload-token body, over
+// the sum of the service's field caps.
+const maxVerifyWorkloadTokenBodyBytes = 32 << 10
+
+type verifyWorkloadTokenOutput struct {
+	Body *service.WorkloadTokenVerification
+}
+
+func (a *API) verifyExternalIssuerWorkloadTokenOp(ctx context.Context, input *struct {
+	ID   string `path:"id" doc:"Issuer row id"`
+	Body VerifyWorkloadTokenBody
+}) (*verifyWorkloadTokenOutput, error) {
+	account, _, err := issuerTenant(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out, err := a.externalIssuerSvc.VerifyWorkloadToken(ctx, account, input.ID, service.VerifyWorkloadTokenInput{
+		Token: input.Body.Token, Audience: input.Body.Audience,
+	})
+	if err != nil {
+		return nil, issuerProblemFrom(err, "verify workload token")
+	}
+	return &verifyWorkloadTokenOutput{Body: out}, nil
 }
 
 func (a *API) listBindingsOp(ctx context.Context, input *bindingListInput) (*bindingListOutput, error) {

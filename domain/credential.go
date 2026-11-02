@@ -99,9 +99,12 @@ type IssuedCredential struct {
 	RevokeReason    string     `bun:"revoke_reason,type:text"       json:"revoke_reason,omitempty"`
 	GrantType       GrantType  `bun:"grant_type,type:varchar(50)"   json:"grant_type"`
 	DelegationDepth int        `bun:"delegation_depth"              json:"delegation_depth"`
-	ParentJTI       string     `bun:"parent_jti,type:varchar(255)"  json:"parent_jti,omitempty"`
+	// ParentJTI is NULL, not '', for a credential with no parent: the cascade
+	// walk's partial index and planner stats assume undelegated rows are NULL.
+	ParentJTI string `bun:"parent_jti,type:varchar(255),nullzero" json:"parent_jti,omitempty"`
 	// DelegatedByWIMSEURI records the orchestrator that delegated authority (RFC 8693 token_exchange).
-	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text" json:"delegated_by_wimse_uri,omitempty"`
+	// NULL, not '', when nothing delegated: its index is partial on IS NOT NULL.
+	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text,nullzero" json:"delegated_by_wimse_uri,omitempty"`
 	// MissionID is a stable, opaque identifier for a delegation tree —
 	// equal to the root credential's JTI today; consumers MUST treat it
 	// as opaque so the population scheme can evolve. Denormalised onto

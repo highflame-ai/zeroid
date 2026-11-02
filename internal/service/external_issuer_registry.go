@@ -48,11 +48,12 @@ type ExternalIssuerRegistry struct {
 	shared []domain.SharedIssuer
 }
 
-// Resolution failures, wrapped by ResolvePerson. Grants map them to OAuth
+// Resolution failures, wrapped by ResolvePerson and ResolveWorkload. Grants map them to OAuth
 // errors: ErrUnknownExternalIssuer keeps each path's code, the rest are
 // invalid_grant.
 var (
 	errIssuerNotPerson    = errors.New("issuer is not trusted for person grants")
+	errIssuerNotWorkload  = errors.New("issuer is not trusted for workload client assertions")
 	errIssuerDisabled     = errors.New("issuer is disabled")
 	errIssuerConstraints  = errors.New("token does not satisfy the issuer's claim constraints")
 	errIssuerAmbiguous    = errors.New("token matches more than one trusted issuer row")
@@ -139,6 +140,23 @@ func (r *ExternalIssuerRegistry) DBMode() bool { return r != nil && r.rows != ni
 // they only choose among a shared issuer's rows, and the caller re-checks
 // the chosen row's constraints after verification.
 func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, claims map[string]any) (*ExternalIssuerEntry, error) {
+	return r.resolveKind(ctx, iss, claims, domain.IssuerKindPerson, errIssuerNotPerson)
+}
+
+// ResolveWorkload returns the row a federated client assertion (ADR 0042
+// D8) verifies iss against: an enabled workload row whose constraints the
+// unverified claims meet. Database mode only, since the assertion resolves
+// to an agent through a binding on the row.
+func (r *ExternalIssuerRegistry) ResolveWorkload(ctx context.Context, iss string, claims map[string]any) (*ExternalIssuerEntry, error) {
+	if r == nil || r.rows == nil {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, iss)
+	}
+	return r.resolveKind(ctx, iss, claims, domain.IssuerKindWorkload, errIssuerNotWorkload)
+}
+
+func (r *ExternalIssuerRegistry) resolveKind(ctx context.Context, iss string, claims map[string]any,
+	kind domain.IssuerKind, errWrongKind error,
+) (*ExternalIssuerEntry, error) {
 	if r == nil {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, iss)
 	}
@@ -147,8 +165,8 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 		if entry == nil {
 			return nil, fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, iss)
 		}
-		if entry.Config.EffectiveKind() != domain.IssuerKindPerson {
-			return nil, errIssuerNotPerson
+		if entry.Config.EffectiveKind() != kind {
+			return nil, errWrongKind
 		}
 		return entry, nil
 	}
@@ -160,16 +178,16 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 	if len(rows) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownExternalIssuer, iss)
 	}
-	var person, enabled, matched []*domain.ExternalIssuer
+	var ofKind, enabled, matched []*domain.ExternalIssuer
 	for _, row := range rows {
-		if row.Kind == domain.IssuerKindPerson {
-			person = append(person, row)
+		if row.Kind == kind {
+			ofKind = append(ofKind, row)
 		}
 	}
-	if len(person) == 0 {
-		return nil, errIssuerNotPerson
+	if len(ofKind) == 0 {
+		return nil, errWrongKind
 	}
-	for _, row := range person {
+	for _, row := range ofKind {
 		if row.Enabled {
 			enabled = append(enabled, row)
 		}

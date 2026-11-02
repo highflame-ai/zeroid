@@ -35,6 +35,36 @@ const externalIDTokenClockSkew = 60 * time.Second
 // direct-federation path (issue #88) instead of the broker path.
 const SubjectTokenTypeIDToken = "urn:ietf:params:oauth:token-type:id_token"
 
+// SubjectTokenTypeJWT is the RFC 8693 §3 subject_token_type for a JWT of no
+// more specific type.
+const SubjectTokenTypeJWT = "urn:ietf:params:oauth:token-type:jwt"
+
+// jwtSubjectIsIDTokenExchange reports whether a token exchange that names its
+// subject only as a JWT is an ID-token exchange. RFC 8693 §3 lets a client use
+// the generic JWT type for any JWT, and a credential broker that exchanges, on
+// a workload's behalf, the token the workload was called with sends it for an
+// OIDC ID token.
+//
+// It is one only when the request authenticates a client and the caller is not
+// a trusted service. The broker path refuses every other caller, so no request
+// it accepts today changes path. externalIDTokenExchange still authenticates the
+// client, requires an ID token issued to that client, and refuses an issuer that
+// is not a trusted person issuer, so a JWT of any other kind is refused there.
+func (s *OAuthService) jwtSubjectIsIDTokenExchange(ctx context.Context, req TokenRequest) bool {
+	if req.SubjectTokenType != SubjectTokenTypeJWT {
+		return false
+	}
+	if req.ClientID == "" && !clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType) {
+		return false
+	}
+	if s.trustedServiceValidator != nil {
+		if _, err := s.trustedServiceValidator(ctx); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // idTokenIssuedTo checks that an OIDC ID token was issued to clientID (D13),
 // per OpenID Connect Core §2 and §3.1.3.7: clientID must be one of the
 // token's audiences, and when the token names an authorized party (azp) it
@@ -75,6 +105,9 @@ type personIDToken struct {
 	email         string
 	emailVerified bool
 	name          string
+	// groups is what claim_mapping.groups reads (extractPersonGroups): nil
+	// when unmapped, absent, malformed or over a limit.
+	groups []string
 }
 
 // verifyPersonIDToken verifies an OpenID Connect ID token naming a person,
@@ -122,6 +155,8 @@ func verifyPersonIDToken(ctx context.Context, raw string, entry *ExternalIssuerE
 	out.email, _ = extractMappedClaimString(claims, mapping["email"])
 	out.emailVerified = issuerEmailVerified(claims, entry.Config, out.email)
 	out.name, _ = extractMappedClaimString(claims, mapping["name"])
+	iss, _ := verified.Issuer()
+	out.groups = extractPersonGroups(claims, mapping["groups"], iss)
 	return out, nil
 }
 
@@ -373,6 +408,7 @@ func (s *OAuthService) externalIDTokenExchange(ctx context.Context, req TokenReq
 		UseRS256:              true,
 		UserEmail:             userEmail,
 		UserName:              userName,
+		Groups:                idTok.groups,
 		ApplicationID:         req.ApplicationID,
 		// RFC 9068 §2.2 client_id: the relying party just authenticated and
 		// bound to the ID token's aud/azp (D13), so it is the client the

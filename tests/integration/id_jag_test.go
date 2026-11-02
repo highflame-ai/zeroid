@@ -49,8 +49,8 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		ClaimMapping: map[string]string{
 			"user_id": "sub",
 			"email":   "email",
-			// Map an IdP group/role claim into a Highflame Cedar attribute (D3):
-			// the upstream emits `roles` → minted token carries a `role` claim.
+			// A static issuer's mapping is not validated against reserved
+			// keys; the grant ignores role all the same (ADR 0044 D16).
 			"role": "idp_role",
 		},
 		AllowedAccounts: []string{"acct-fed-001"},
@@ -119,11 +119,11 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Equal(t, []any{mcpResource}, claims["aud"],
 			"minted token aud must equal the ID-JAG resource claim")
 
-		// D3 — identity mapping: sub mapped from the ID-JAG sub; email mapped;
-		// IdP group/role mapped into the `role` Cedar attribute.
+		// D3 — identity mapping: sub mapped from the ID-JAG sub; email mapped.
+		// The IdP's role claim is never copied (ADR 0044 D16).
 		require.Equal(t, "00uMCPAGENT01", claims["sub"])
 		require.Equal(t, "agent@corp.example.com", claims["user_email"])
-		require.Equal(t, "engineering", claims["role"])
+		require.NotContains(t, claims, "role")
 
 		// IdP provenance + structural fingerprint distinguishing this path.
 		require.Equal(t, upstreamIss, claims["user_id_iss"])

@@ -322,6 +322,12 @@ func selfKeyTokenRefusal(c internalMiddleware.AgentClaims) string {
 	if c.PrincipalType == "user" || c.UserIDIssuer != "" {
 		return "key enrollment needs the agent's own token, not one acting for a person"
 	}
+	// A token minted from a federated client assertion is held by whatever
+	// runs the agent's credential provider, for an agent meant to hold no
+	// secret (ADR 0042 D8). It must not become a durable key either.
+	if c.ClientAuth == service.ClientAuthFederatedAssertion {
+		return "key enrollment needs the agent's own token, not one minted from a federated client assertion"
+	}
 	// A token bound to another audience (a gateway, an RFC 8707 resource) is
 	// held by that audience too. It must not become a durable key: whoever
 	// holds it could otherwise enroll one on an agent that has none.
