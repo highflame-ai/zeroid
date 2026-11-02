@@ -1043,6 +1043,12 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.Status == domain.IdentityStatusExpired {
 		s.runDeactivationCleanup(ctx, identity, "expired")
 	}
+	// Fresh transition into suspended: the identity can already mint nothing
+	// (IsUsable), so cut off what it still holds. See runSuspensionCleanup.
+	if priorStatus != domain.IdentityStatusSuspended &&
+		identity.Status == domain.IdentityStatusSuspended {
+		s.runSuspensionCleanup(ctx, identity)
+	}
 	return identity, nil
 }
 
@@ -1437,13 +1443,7 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 			Msg("identity cleanup: failed to revoke linked API keys")
 	}
 
-	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
-		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
-			Msg("identity cleanup: failed to revoke active credentials")
-	} else if n > 0 {
-		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
-			Msg("identity cleanup: revoked active credentials (cascade)")
-	}
+	s.revokeActiveCredentials(ctx, identity, reason)
 
 	// Auto-expiry gets its own signal type so CAE subscribers can filter
 	// the indexed signal_type column directly (e.g. for offboarding-driven
@@ -1454,6 +1454,42 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 	if reason == "expired" {
 		signalType = domain.SignalTypeIdentityExpired
 	}
+	s.emitLifecycleSignal(ctx, identity, signalType, reason)
+}
+
+// runSuspensionCleanup cuts off the credentials a suspended identity already
+// holds. Without it a suspension only stopped issuance, and every live token
+// (and every token delegated from one) kept working until it expired.
+//
+// The revocation cascades over the parent_jti subtree, as deactivation does:
+// a sub-agent's delegated token carries the suspended identity's authority.
+// The sub-agent's own identity is not suspended and can still mint its own.
+//
+// Unlike deactivation, linked API keys are left alone, so a suspension stays
+// reversible: the IsUsable gate refuses issuance while suspended, and a
+// reactivated identity mints fresh credentials with the same keys.
+func (s *IdentityService) runSuspensionCleanup(ctx context.Context, identity *domain.Identity) {
+	const reason = "identity_suspended"
+	s.revokeActiveCredentials(ctx, identity, reason)
+	s.emitLifecycleSignal(ctx, identity, domain.SignalTypeIdentitySuspended, reason)
+}
+
+// revokeActiveCredentials cascade-revokes an identity's active credentials.
+// Best-effort, like the rest of the lifecycle cleanup: the status change has
+// already been written.
+func (s *IdentityService) revokeActiveCredentials(ctx context.Context, identity *domain.Identity, reason string) {
+	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: failed to revoke active credentials")
+	} else if n > 0 {
+		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
+			Msg("identity cleanup: revoked active credentials (cascade)")
+	}
+}
+
+// emitLifecycleSignal emits the high-severity CAE signal for a lifecycle
+// change. Best-effort: a failure is logged, not returned.
+func (s *IdentityService) emitLifecycleSignal(ctx context.Context, identity *domain.Identity, signalType domain.SignalType, reason string) {
 	if _, err := s.signalSvc.IngestSignal(
 		ctx,
 		identity.AccountID,

@@ -210,7 +210,9 @@ self-asserted.
 passed. Tokens are issued only for an `active` identity; the cleanup worker and
 CAE cascade move identities out of `active` fail-closed (an expired identity is
 swept to `expired` and its live credentials are cascade-revoked; see Section 9's
-`identity_expired` signal).
+`identity_expired` signal). Suspension also cascade-revokes the live credentials
+(`identity_suspended` signal) but keeps the identity's API keys, so it stays
+reversible.
 
 ## 4. JWT Claim Extensions
 
@@ -880,6 +882,7 @@ is a ZeroID-defined extension.
 | `retirement` | Identity is being retired. |
 | `owner_change` | The owner of an identity changed. |
 | `identity_expired` | A time-bound identity reached its expiry. |
+| `identity_suspended` | An identity was suspended (reversible; not a retirement). |
 
 ### 9.2 Severity
 
