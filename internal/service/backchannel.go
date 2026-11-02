@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -40,6 +41,7 @@ type BackchannelService struct {
 	repo                *postgres.BackchannelRequestRepository
 	oauthClientSvc      *OAuthClientService
 	credentialSvc       *CredentialService
+	identitySvc         *IdentityService
 	cfg                 BackchannelServiceConfig
 	mu                  sync.RWMutex
 	notifier            BackchannelNotifierFunc
@@ -53,6 +55,16 @@ type BackchannelService struct {
 	// the map is small (single-digit entries in practice) so RLock + map
 	// lookup is well under microsecond cost.
 	rarValidators map[string]AuthorizationDetailValidator
+
+	// approverAuthorizer is consulted for group_hint requests on approve/deny
+	// when enforce_hints is shadow or on. Guarded by mu.
+	approverAuthorizer ApproverAuthorizer
+
+	// verifyRequestingToken verifies bc-authorize requesting_token values,
+	// and isTrustedCaller applies the deployer's TrustedServiceValidator.
+	// Both wired by OAuthService.SetBackchannelService. Guarded by mu.
+	verifyRequestingToken requestingTokenVerifier
+	isTrustedCaller       func(ctx context.Context) bool
 
 	// svcCtx is the long-lived context used by detached notifier goroutines.
 	// Server.Shutdown cancels it via Stop() so in-flight notifier deliveries
@@ -96,6 +108,10 @@ type BackchannelNotification struct {
 	BindingMessage       string
 	ExpiresAt            time.Time
 	AuthorizationDetails domain.AuthorizationDetails
+	FourEyes             bool
+	RequesterOwner       string
+	RequesterSub         string
+	RequesterActor       string
 }
 
 // BackchannelServiceConfig bounds the request lifecycle.
@@ -127,6 +143,17 @@ type BackchannelServiceConfig struct {
 	// setter; both should be set from the same source in the deployer's
 	// server construction code.
 	AllowPrivateNotificationEndpoints bool
+
+	// RequireApproverIdentity makes approve/deny take the approver only from
+	// the request context (WithApproverIdentity). A call without one is
+	// refused with 401 invalid_client. When false, a body subject_id is still
+	// accepted when the context carries no identity.
+	RequireApproverIdentity bool
+
+	// EnforceHints governs the approver binding checks on approve/deny:
+	// "off" (or empty) skips them, "shadow" evaluates and records would-deny
+	// but allows, "on" refuses ineligible approvers with 403 access_denied.
+	EnforceHints string
 }
 
 // DefaultBackchannelConfig returns sensible defaults for production deployments.
@@ -148,6 +175,7 @@ func NewBackchannelService(
 	repo *postgres.BackchannelRequestRepository,
 	oauthClientSvc *OAuthClientService,
 	credentialSvc *CredentialService,
+	identitySvc *IdentityService,
 	cfg BackchannelServiceConfig,
 ) *BackchannelService {
 	if cfg.DefaultExpiry == 0 {
@@ -176,6 +204,7 @@ func NewBackchannelService(
 		repo:                repo,
 		oauthClientSvc:      oauthClientSvc,
 		credentialSvc:       credentialSvc,
+		identitySvc:         identitySvc,
 		cfg:                 cfg,
 		notifyDispatchAsync: true,
 		svcCtx:              svcCtx,
@@ -312,6 +341,17 @@ type CreateAuthRequestInput struct {
 	// token-side embed at issuance — see the exact JSON the client
 	// supplied.
 	AuthorizationDetailsRaw []byte
+	// FourEyes and RequesterOwner are extension parameters: with FourEyes
+	// set, the user named by RequesterOwner may not resolve the request.
+	// FourEyes requires a non-empty RequesterOwner. When RequestingToken was
+	// issued to an identity with an owner_user_id, that owner is used as
+	// RequesterOwner and a differing value here is ignored.
+	FourEyes       bool
+	RequesterOwner string
+	// RequestingToken is the access token of the request the approval is
+	// for. When present it must be an active token from this server in the
+	// same tenant; the token minted on approval then keeps its sub and act.
+	RequestingToken string
 }
 
 // CreateAuthRequestOutput is returned to the client on success.
@@ -362,6 +402,16 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		)
 	}
 
+	// With a requesting_token, requester_owner is derived from the
+	// requesting identity after the token is verified (below).
+	if in.FourEyes && in.RequesterOwner == "" && in.RequestingToken == "" {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
+	}
+	if utf8.RuneCountInString(in.RequesterOwner) > domain.MaxRequesterOwnerChars {
+		return nil, oauthBadRequest(oautherror.InvalidRequest,
+			fmt.Sprintf("requester_owner exceeds maximum length of %d characters", domain.MaxRequesterOwnerChars))
+	}
+
 	// Resolve the client. GetClientByClientID intentionally returns any
 	// client (public or confidential) WITHOUT an is_active filter (the
 	// underlying repo GetByClientID skips the check — tracked as a follow-up;
@@ -388,9 +438,19 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 	// approval prompts to an end user), so allowing an unauthenticated party to
 	// initiate against a confidential client lets them spam prompts at
 	// arbitrary users under that client's identity. Require + verify the
-	// client_secret when the client is confidential. A client is confidential
-	// if it declares so or carries a stored secret hash (belt-and-suspenders).
-	if client.ClientType == "confidential" || client.ClientSecret != "" {
+	// client_secret when the client must authenticate — a question derived from
+	// the REGISTERED method, with the old client_type/stored-hash test surviving
+	// inside the predicate as the fallback for rows that predate it.
+	//
+	// Before that test, refuse a client whose registered method this endpoint
+	// cannot enforce. A key-based client authenticates with an assertion
+	// bc-authorize does not accept, so it would otherwise reach a secret-shaped
+	// check it can never satisfy — and, before the predicate recognised its
+	// method, skip authentication entirely and be free to fire notifier prompts.
+	if err := requireNonAssertionClientAuth(client); err != nil {
+		return nil, err
+	}
+	if client.RequiresClientAuthentication() {
 		if in.ClientSecret == "" {
 			return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 		}
@@ -400,6 +460,49 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		// "unknown/deactivated client".
 		if _, verr := s.oauthClientSvc.VerifyClientSecret(ctx, in.ClientID, in.ClientSecret); verr != nil {
 			return nil, oauthBadRequestCause(oautherror.InvalidClient, "client authentication failed", verr)
+		}
+	}
+
+	// requesting_token and the group_hint-only refusal are evaluated only
+	// after the client has been resolved and authenticated, so the response
+	// reveals nothing about a token to an unauthenticated caller. Only a
+	// client that authenticated above, or a caller the deployer's
+	// TrustedServiceValidator accepts, may send requesting_token.
+	var requesting *RequestingToken
+	if in.RequestingToken != "" {
+		if !s.callerAuthenticated(ctx, client) {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "requesting_token requires an authenticated client")
+		}
+		rt, err := s.resolveRequestingToken(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		requesting = rt
+		// The requesting identity's owner is the requester_owner; a
+		// differing request parameter is ignored.
+		owner, err := s.requestingOwner(ctx, rt)
+		if err != nil {
+			return nil, err
+		}
+		if owner != "" {
+			if in.RequesterOwner != "" && in.RequesterOwner != owner {
+				log.Warn().
+					Str("client_id", in.ClientID).
+					Str("requester_owner", in.RequesterOwner).
+					Str("identity_owner", owner).
+					Msg("bc-authorize requester_owner differs from the requesting identity's owner; using the identity's owner")
+			}
+			in.RequesterOwner = owner
+		}
+		if in.FourEyes && in.RequesterOwner == "" {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "four_eyes requires requester_owner")
+		}
+	} else if in.GroupHint != "" && in.LoginHint == "" {
+		// Without a requesting token or login_hint nothing names the
+		// subject of the token, so an approver would become it. Refused
+		// when approvers are authenticated; unchanged otherwise.
+		if require, _, _ := s.approverSettings(); require {
+			return nil, oauthBadRequest(oautherror.InvalidRequest, "group_hint requires requesting_token")
 		}
 	}
 
@@ -496,6 +599,8 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		Scope:                      in.Scope,
 		BindingMessage:             bindingMsg,
 		AuthorizationDetailsRaw:    rarRaw,
+		FourEyes:                   in.FourEyes,
+		RequesterOwner:             in.RequesterOwner,
 		NotificationMode:           notificationMode,
 		ClientNotificationEndpoint: notificationEndpoint,
 		ClientNotificationToken:    in.ClientNotificationToken,
@@ -503,6 +608,15 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 		IntervalSeconds:            s.cfg.DefaultPollInterval,
 		ExpiresAt:                  now.Add(expiry),
 		CreatedAt:                  now,
+	}
+	if requesting != nil {
+		row.RequesterSub = requesting.Subject
+		row.RequesterActor = requesting.Actor()
+		row.RequestingJTI = requesting.JTI
+		row.RequestingAct = string(requesting.Act)
+		if len(requesting.Groups) > 0 {
+			row.RequestingGroups = requesting.Groups
+		}
 	}
 	if err := s.repo.Create(ctx, row); err != nil {
 		return nil, oauthServerError("failed to persist backchannel auth request", err)
@@ -518,6 +632,12 @@ func (s *BackchannelService) CreateAuthRequest(ctx context.Context, in CreateAut
 }
 
 // ApproveInput resolves a pending request positively.
+//
+// The approver comes from the request context (WithApproverIdentity) when
+// present; SubjectID/SubjectEmail/SubjectName are the request-body fields,
+// used as the approver only when the context carries no identity and
+// RequireApproverIdentity is off. A body SubjectID that differs from the
+// context subject is refused.
 type ApproveInput struct {
 	AuthReqID    string
 	AccountID    string
@@ -527,15 +647,22 @@ type ApproveInput struct {
 	SubjectName  string
 }
 
-// Approve transitions the request to approved and stamps the resolved subject.
-// Tenant isolation is enforced by re-loading the row and comparing
-// account_id/project_id — never trust the URL handle alone.
+// Approve transitions the request to approved and stamps the resolved subject
+// and approval record. Tenant isolation is enforced by re-loading the row and
+// comparing account_id/project_id — never trust the URL handle alone.
 //
 // Errors:
-//   - invalid_request: missing fields, tenant mismatch
+//   - invalid_client (401): approver identity required but absent
+//   - invalid_request: missing fields, tenant mismatch, subject_id mismatch
 //   - access_denied: row already in a terminal state, expired, or wrong tenant
+//   - access_denied (403): approver fails the binding checks (enforce_hints=on)
 func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error {
-	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" || in.SubjectID == "" {
+	require, _, _ := s.approverSettings()
+	approver, err := resolveApprover(ctx, require, in.SubjectID, in.SubjectEmail, in.SubjectName)
+	if err != nil {
+		return err
+	}
+	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" || approver.Subject == "" {
 		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id, subject_id are required to approve")
 	}
 	row, err := s.repo.GetByAuthReqID(ctx, in.AuthReqID)
@@ -556,7 +683,12 @@ func (s *BackchannelService) Approve(ctx context.Context, in ApproveInput) error
 		return oauthBadRequest(oautherror.AccessDenied, "request has expired")
 	}
 
-	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, in.SubjectID, in.SubjectEmail, in.SubjectName)
+	rec, err := s.authorizeResolution(ctx, "approve", row, approver)
+	if err != nil {
+		return err
+	}
+
+	affected, err := s.repo.MarkApproved(ctx, in.AuthReqID, rec)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request approved", err)
 	}
@@ -582,8 +714,17 @@ type DenyInput struct {
 	ProjectID string
 }
 
-// Deny transitions the request to denied. Same tenant-isolation guarantees as Approve.
+// Deny transitions the request to denied. Same tenant-isolation guarantees,
+// approver resolution and binding checks as Approve: a user who may not
+// approve a request may not deny it either. The approver comes only from the
+// request context; without one, deny proceeds only when neither
+// RequireApproverIdentity nor enforce_hints=on is set.
 func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
+	require, _, _ := s.approverSettings()
+	approver, err := resolveApprover(ctx, require, "", "", "")
+	if err != nil {
+		return err
+	}
 	if in.AuthReqID == "" || in.AccountID == "" || in.ProjectID == "" {
 		return oauthBadRequest(oautherror.InvalidRequest, "auth_req_id, account_id, project_id are required to deny")
 	}
@@ -600,7 +741,11 @@ func (s *BackchannelService) Deny(ctx context.Context, in DenyInput) error {
 	if row.Status != domain.BackchannelStatusPending {
 		return oauthBadRequest(oautherror.AccessDenied, fmt.Sprintf("request is in status %q and cannot be denied", row.Status))
 	}
-	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID)
+	rec, err := s.authorizeResolution(ctx, "deny", row, approver)
+	if err != nil {
+		return err
+	}
+	affected, err := s.repo.MarkDenied(ctx, in.AuthReqID, rec)
 	if err != nil {
 		return oauthServerError("failed to mark backchannel auth request denied", err)
 	}
@@ -661,6 +806,9 @@ type RedeemInput struct {
 	// authentication rules, same as refresh_token/authorization_code). Empty
 	// for public clients.
 	ClientSecret string
+	// RequestingToken must be the bc-authorize requesting_token when the
+	// request was made with one (see requireRequestingTokenHolder).
+	RequestingToken string
 	// DPoPKeyThumbprint forwards the proof key thumbprint from the token
 	// endpoint so a CIBA-redeemed token can still be DPoP-bound (RFC 9449).
 	// Non-empty when the polling /oauth2/token call carried a valid DPoP
@@ -702,7 +850,14 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 		if !client.IsActive {
 			return nil, oauthBadRequest(oautherror.InvalidClient, fmt.Sprintf("unknown client %s", in.ClientID))
 		}
-		if client.ClientType == "confidential" || client.ClientSecret != "" {
+		// Same precondition as bc-authorize: redemption does not accept a client
+		// assertion, so a key-based client must be refused here rather than sent
+		// to a secret-shaped check it cannot satisfy — and, before the predicate
+		// recognised its method, it skipped authentication on the poll path too.
+		if err := requireNonAssertionClientAuth(client); err != nil {
+			return nil, err
+		}
+		if client.RequiresClientAuthentication() {
 			if in.ClientSecret == "" {
 				return nil, oauthBadRequest(oautherror.InvalidClient, "client_secret is required for a confidential client")
 			}
@@ -729,6 +884,13 @@ func (s *BackchannelService) Redeem(ctx context.Context, in RedeemInput) (*domai
 	// single-use semantics.
 	if row.NotificationMode == domain.BackchannelNotificationPush {
 		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id is delivered via push callback; polling is not permitted")
+	}
+
+	// A request made with a requesting_token is redeemable only by the holder
+	// of that token (and of its DPoP key, when bound). Checked on every poll,
+	// so a poller without it learns nothing about the request's state.
+	if err := s.requireRequestingTokenHolder(ctx, row, in); err != nil {
+		return nil, err
 	}
 
 	now := time.Now()
@@ -802,29 +964,121 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// initiate a new bc-authorize. That's preferable to silently minting two
 	// tokens — the failure is loud (HTTP 500) and the client's
 	// retry-with-new-auth-req-id path handles it cleanly.
-	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
-	// additionally rejects an approved row that has outlived both expires_at
-	// and the post-approval grace window — the atomic DB-layer counterpart to
-	// the expired_token pre-check in Redeem. A row that lost that race (or any
-	// concurrent second redemption) yields affected=0 and is rejected below.
-	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
-	if mErr != nil {
-		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
-		return nil, oauthServerError("failed to commit issuance state", mErr)
+	// ── Bound-identity resolution and gates — BEFORE the MarkIssued claim ──
+	//
+	// Everything fallible that pure reads can decide runs before the row is
+	// burned: a refusal here is a 4xx that leaves the approval redeemable,
+	// instead of consuming the single-use auth_req_id and stranding the
+	// human's approval (the previous ordering did exactly that for transient
+	// lookup errors and deterministic policy refusals — and in push mode the
+	// loss was silent). MarkIssued below remains the at-most-once gate.
+	//
+	// Anchoring rationale: with a synthesised anonymous identity,
+	// issued_credentials.identity_id was NULL and both the owner-offboarding
+	// cascade (revoke_credentials_by_owner joins on identity_id) and
+	// identity-keyed CAE revocation silently missed every human-approved
+	// token. The credential is therefore anchored to the OAuth client's
+	// bound agent identity; SubjectOverride keeps the token's sub as the
+	// approving human (CIBA Core §10.1.2).
+	if s.identitySvc == nil {
+		// Fail closed AND loud: minting without the identity service would
+		// silently produce unanchored credentials invisible to the
+		// revocation planes — the exact bug the anchoring exists to fix.
+		return nil, oauthServerError("backchannel service is missing its identity service; refusing to mint unanchored credentials", nil)
 	}
-	if affected == 0 {
-		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
-	}
-
-	// Synthesise an identity for the approved user. CIBA Core §10.1.2 requires
-	// the issued token to identify the user; we mirror ExternalPrincipalExchange
-	// (the human-token path).
 	identity := &domain.Identity{
 		AccountID:    row.AccountID,
 		ProjectID:    row.ProjectID,
 		IdentityType: domain.IdentityTypeService,
 		Status:       domain.IdentityStatusActive,
 	}
+	ttl := 900 // seconds — short-lived, matching ExternalPrincipalExchange; clamped to the bound identity's policy ceiling below
+	var identityPolicyID string
+	client, cerr := s.oauthClientSvc.GetClientByClientID(ctx, row.ClientID)
+	if cerr != nil {
+		if !errors.Is(cerr, ErrOAuthClientNotFound) {
+			// Only a definitive not-found may fall back to the unbound shape.
+			// Any other error (a transient DB failure, say) must fail the
+			// request: falling back here would silently mint an unanchored
+			// credential for a client that IS bound — fail-open on the exact
+			// property this block exists to guarantee.
+			return nil, oauthServerError("failed to load the OAuth client for credential anchoring", cerr)
+		}
+		// The row was created for a registered client; a since-deleted client
+		// keeps the legacy unbound shape rather than stranding the approval.
+		log.Warn().Str("client_id", row.ClientID).Msg("CIBA redemption for a client that no longer resolves; minting unanchored")
+	} else if client.IdentityID != nil && *client.IdentityID != "" {
+		bound, ierr := s.identitySvc.GetIdentity(ctx, *client.IdentityID, row.AccountID, row.ProjectID)
+		if ierr != nil {
+			if errors.Is(ierr, ErrIdentityNotFound) {
+				// Tenant scoping: the identity exists in the client's home
+				// tenant but the bc-authorize carried a different
+				// account/project. Deterministic client error, not a 500.
+				return nil, oauthBadRequest(oautherror.InvalidGrant,
+					"the client's bound identity does not exist in the request's tenant")
+			}
+			return nil, oauthServerError("failed to load the client's bound identity", ierr)
+		}
+		if !bound.Status.IsUsable() {
+			return nil, oauthBadRequest(oautherror.AccessDenied,
+				"the client's bound identity is suspended or deactivated")
+		}
+		if bound.IsExpired() {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+		}
+		// Identity credential policy — the same governance ceiling the
+		// authorization_code path enforces for bound clients: resolve it here
+		// and hand its ID to the IssueCredential chokepoint. The axes
+		// checkable from the row are pre-enforced before the burn so a
+		// deterministic policy refusal costs the human's approval nothing.
+		policy, perr := s.identitySvc.ResolveCredentialPolicy(ctx, bound)
+		if perr != nil {
+			return nil, oauthServerError("failed to resolve the bound identity's credential policy", perr)
+		}
+		identityPolicyID = policy.ID
+		if !slices.Contains(policy.AllowedGrantTypes, string(domain.NormalizeGrantType(string(domain.GrantTypeCIBA)))) {
+			return nil, oauthBadRequest(oautherror.AccessDenied,
+				"the bound identity's credential policy does not permit the CIBA grant")
+		}
+		requested := parseScopeString(row.Scope)
+		if len(policy.AllowedScopes) > 0 {
+			allowed := make(map[string]bool, len(policy.AllowedScopes))
+			for _, sc := range policy.AllowedScopes {
+				allowed[sc] = true
+			}
+			for _, sc := range requested {
+				if !allowed[sc] {
+					return nil, oauthBadRequest(oautherror.InvalidScope,
+						fmt.Sprintf("scope %q is not permitted by the bound identity's credential policy", sc))
+				}
+			}
+		}
+		if len(bound.AllowedScopes) > 0 {
+			allowed := make(map[string]bool, len(bound.AllowedScopes))
+			for _, sc := range bound.AllowedScopes {
+				allowed[sc] = true
+			}
+			for _, sc := range requested {
+				if !allowed[sc] {
+					return nil, oauthBadRequest(oautherror.InvalidScope,
+						fmt.Sprintf("scope %q is not in the bound identity's allowed_scopes", sc))
+				}
+			}
+		}
+		if policy.MaxTTLSeconds > 0 && policy.MaxTTLSeconds < ttl {
+			ttl = policy.MaxTTLSeconds
+		}
+		// The anchor carries the bound identity's attributes, except Name:
+		// the OIDC-standard `name` claim must keep identifying the approving
+		// HUMAN (IssueCredential prefers Identity.Name over the UserName
+		// fallback) — sub, user_email and user_name all name the human, and
+		// an agent display name on that claim would misattribute the token
+		// in every RP and audit pipeline that reads it.
+		anchor := *bound
+		anchor.Name = ""
+		identity = &anchor
+	}
+
 	customClaims := map[string]any{
 		"token_exchange":        "ciba",
 		"backchannel_client_id": row.ClientID,
@@ -841,28 +1095,94 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 	// §5.2: also include it on the token response body so polling / push
 	// clients see what was granted.
 	//
-	// The raw bytes are passed through verbatim (as json.RawMessage) so
-	// jwx serialises the array structure rather than the {Type, Raw}
-	// surface of the domain type. The bc-authorize-side validator
-	// guarantees the persisted bytes are a valid RFC 9396 array (a
-	// legacy CIBA row stores the canonical empty `[]`); no re-parse or
-	// special-case filtering on issuance.
-	rarBytes := row.AuthorizationDetailsRaw
+	// Each entry is stamped with approval_id (this auth_req_id) and
+	// approver_auth so a resource server can tie a call to the approval and
+	// see how the approver was authenticated. The result is passed as
+	// json.RawMessage so jwx serialises the array structure rather than the
+	// {Type, Raw} surface of the domain type. The bc-authorize-side
+	// validator guarantees the persisted bytes are a valid RFC 9396 array (a
+	// legacy CIBA row stores the canonical empty `[]`).
+	rarBytes, rerr := stampAuthorizationDetails(row)
+	if rerr != nil {
+		return nil, oauthServerError("failed to prepare authorization_details", rerr)
+	}
 	customClaims["authorization_details"] = rarBytes
 
-	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-		Identity:          identity,
-		Scopes:            parseScopeString(row.Scope),
-		GrantType:         domain.GrantTypeCIBA,
-		TTL:               900, // 15 minutes — short-lived; matches ExternalPrincipalExchange
-		UseRS256:          true,
-		SubjectOverride:   row.ApprovedSubjectID,
-		UserEmail:         row.ApprovedSubjectEmail,
-		UserName:          row.ApprovedSubjectName,
-		CustomClaims:      customClaims,
-		DPoPKeyThumbprint: dpopKeyThumbprint,
-	})
+	issue := IssueRequest{
+		// CIBA approval is binary: a root grant is bounded by the requested
+		// scope and the bound agent's policy, if any (ceiling rule, P1).
+		// requestingChainIssue clears this for a step-up into a chain.
+		RequestBoundedRoot: true,
+		Identity:           identity,
+		IdentityPolicyID:   identityPolicyID,
+		Scopes:             parseScopeString(row.Scope),
+		GrantType:          domain.GrantTypeCIBA,
+		TTL:                ttl,
+		UseRS256:           true,
+		SubjectOverride:    row.ApprovedSubjectID,
+		UserEmail:          row.ApprovedSubjectEmail,
+		UserName:           row.ApprovedSubjectName,
+		CustomClaims:       customClaims,
+		DPoPKeyThumbprint:  dpopKeyThumbprint,
+		// RFC 9068 §2.2: the client that redeemed the grant, which Redeem has
+		// already required to be the one that initiated it. Same value as
+		// backchannel_client_id, kept for existing consumers.
+		ClientID: row.ClientID,
+	}
+	// A request made with a requesting_token is approved INTO that chain:
+	// the token keeps the chain's sub, act and identity claims, and the
+	// approver stays on the row only. Root grants keep sub = the approved
+	// user, as above.
+	if _, cerr := s.requestingChainIssue(ctx, row, &issue); cerr != nil {
+		return nil, cerr
+	}
+	// A root grant mints for the approved person, so the person's ceiling
+	// applies, before the burn (ADR 0041 D15). A step-up carries its chain's
+	// principal and is never a person root, so this is a no-op for it.
+	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
+		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
+	}
+	// ciba:approve is issued only from a trusted approval-channel credential,
+	// which a CIBA grant never is, so the chokepoint always refuses it here.
+	// Refuse it before the burn, whether the request named it or a requesting
+	// chain holds it.
+	if slices.Contains(issue.Scopes, domain.ScopeCIBAApprove) {
+		return nil, oauthBadRequest(oautherror.InvalidScope,
+			fmt.Sprintf("scope %q is never issued by a CIBA approval", domain.ScopeCIBAApprove))
+	}
+
+	// Pass time.Now() as the issuance cutoff. MarkIssued's WHERE clause
+	// additionally rejects an approved row that has outlived both expires_at
+	// and the post-approval grace window — the atomic DB-layer counterpart to
+	// the expired_token pre-check in Redeem. A row that lost that race (or any
+	// concurrent second redemption) yields affected=0 and is rejected below.
+	affected, mErr := s.repo.MarkIssued(ctx, row.AuthReqID, time.Now())
+	if mErr != nil {
+		log.Error().Err(mErr).Str("auth_req_id", row.AuthReqID).Msg("failed to mark backchannel request issued")
+		return nil, oauthServerError("failed to commit issuance state", mErr)
+	}
+	if affected == 0 {
+		return nil, oauthBadRequest(oautherror.AccessDenied, "auth_req_id has already been redeemed")
+	}
+
+	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
 	if err != nil {
+		// The pre-burn gates above catch the deterministic refusals; anything
+		// landing here is a race-window state change or an axis only the
+		// chokepoint can check (trust level, verified attestation). Map the
+		// known refusals to the 4xx codes sibling grant paths use instead of
+		// a blanket 500.
+		if mapped := personGrantOAuthError(err, oautherror.InvalidScope); mapped != err {
+			return nil, mapped
+		}
+		switch {
+		case errors.Is(err, ErrScopesNotAllowed):
+			return nil, oauthBadRequestCause(oautherror.InvalidScope, "requested scopes are not permitted for the bound identity", err)
+		case errors.Is(err, ErrPolicyViolation):
+			return nil, oauthBadRequestCause(oautherror.AccessDenied, "the bound identity's credential policy refused issuance", err)
+		case errors.Is(err, domain.ErrIdentityNotUsable), errors.Is(err, domain.ErrIdentityExpired):
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "the bound identity is no longer usable", err)
+		}
 		return nil, oauthServerError("failed to issue CIBA-grant token", err)
 	}
 
@@ -1019,6 +1339,10 @@ func (s *BackchannelService) dispatchNotifierWithRAR(
 		BindingMessage:       row.BindingMessage,
 		ExpiresAt:            row.ExpiresAt,
 		AuthorizationDetails: details,
+		FourEyes:             row.FourEyes,
+		RequesterOwner:       row.RequesterOwner,
+		RequesterSub:         row.RequesterSub,
+		RequesterActor:       row.RequesterActor,
 	}
 
 	deliver := func() {
@@ -1074,6 +1398,16 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 		// have delivered (or will deliver).
 		log.Warn().Err(err).Str("auth_req_id", row.AuthReqID).Msg("push approval mint failed")
 		_ = s.repo.SetLastNotifyError(ctx, row.AuthReqID, err.Error())
+		// A person-ceiling refusal is final for this request, and a push
+		// client cannot poll to learn it, so it gets the CIBA Core §12 error
+		// payload. A lost race is not answered: the winner delivers.
+		if code, desc, ok := pushPersonGrantError(err); ok {
+			s.postCallback(ctx, row, map[string]any{
+				"error":             code,
+				"error_description": desc,
+				"auth_req_id":       row.AuthReqID,
+			})
+		}
 		return
 	}
 
@@ -1103,6 +1437,20 @@ func (s *BackchannelService) dispatchPushApproval(ctx context.Context, row *doma
 	}
 
 	s.postCallback(ctx, row, payload)
+}
+
+// pushPersonGrantError maps a person-ceiling failure to a CIBA Core §12 push
+// error. §12 defines only access_denied, expired_token and
+// transaction_failed, so a refusal is access_denied and a resolver failure
+// transaction_failed.
+func pushPersonGrantError(err error) (code, description string, ok bool) {
+	switch {
+	case errors.Is(err, ErrPersonScopeDenied):
+		return oautherror.AccessDenied, "none of the requested scopes is granted to this user", true
+	case errors.Is(err, ErrPersonGrantUnavailable):
+		return oautherror.TransactionFailed, "the user's scope ceiling could not be resolved", true
+	}
+	return "", "", false
 }
 
 // dispatchPushDenial POSTs the OAuth error body (CIBA Core §10.3.2) to the

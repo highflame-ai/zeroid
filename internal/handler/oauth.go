@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -26,15 +27,47 @@ type TokenInput struct {
 	// the issued token is bound to the proof key (cnf.jkt) and token_type is
 	// returned as "DPoP" instead of "Bearer".
 	DPoPProof string `header:"DPoP" doc:"DPoP proof JWT (RFC 9449)"`
-	Body      struct {
+	// Authorization carries OPTIONAL client_secret_basic credentials
+	// (RFC 6749 §2.3.1). Body client_id/client_secret remain the
+	// client_secret_post path; using both methods at once is rejected per
+	// §2.3. A body client_id equal to the Basic id is an identifier, not a
+	// second method, and is accepted (see resolveBasicClientAuth).
+	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
+	Body          struct {
 		GrantType    string `json:"grant_type" required:"true" doc:"OAuth grant type"`
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret"`
-		Scope        string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
-		AccountID    string `json:"account_id,omitempty" doc:"Tenant account ID"`
-		ProjectID    string `json:"project_id,omitempty" doc:"Tenant project ID"`
-		Subject      string `json:"subject,omitempty" doc:"JWT assertion for jwt_bearer grant"`
-		APIKey       string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
+		// ClientAssertion / ClientAssertionType are RFC 7523 §2.2
+		// private_key_jwt CLIENT AUTHENTICATION — a JWT signed by a key the
+		// client published in its registered jwks/jwks_uri, presented instead
+		// of a client_secret. Not to be confused with `assertion` below, which
+		// is the §2.1 authorization GRANT; one request may carry both.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present (RFC 7521 §4.2)"`
+		Scope               string `json:"scope,omitempty" doc:"Requested scopes (space-delimited)"`
+		AccountID           string `json:"account_id,omitempty" doc:"Tenant account ID"`
+		ProjectID           string `json:"project_id,omitempty" doc:"Tenant project ID"`
+		// Assertion is the RFC 7523 §2.1 parameter name for the JWT presented
+		// on the jwt-bearer grant, and is the name every standards-conformant
+		// client sends. ZeroID originally read this value from `subject`
+		// (below) and nothing else, which meant no conformant client could
+		// redeem an ID-JAG against us at all — the assertion arrived under the
+		// spec's name, bound to no field, and the request failed as though it
+		// carried no assertion. Every EMA interop row passed only because our
+		// own harness spoke our own dialect.
+		Assertion string `json:"assertion,omitempty" doc:"JWT assertion for the jwt-bearer grant (RFC 7523 §2.1)"`
+		// Subject is the pre-RFC-7523 spelling of Assertion, kept because
+		// in-tree callers and deployed SDKs send it. DEPRECATED: new callers
+		// MUST use `assertion`. Both may be sent only if they carry the same
+		// value — see resolveAssertion for why a mismatch is refused rather
+		// than resolved.
+		// `deprecated:"true"` flows into the generated OpenAPI schema, so
+		// generated clients and spec tooling surface the parameter as
+		// deprecated. This PR's whole audience is standards-conformant external
+		// clients, and the schema is the channel they actually read — a doc
+		// string alone would deprecate it only for humans reading Go.
+		Subject string `json:"subject,omitempty" deprecated:"true" doc:"DEPRECATED alias for assertion — use assertion (RFC 7523 §2.1)"`
+		APIKey  string `json:"api_key,omitempty" doc:"zid_sk_* API key for api_key grant"`
 		// token_exchange (RFC 8693) fields:
 		SubjectToken     string `json:"subject_token,omitempty" doc:"Subject token being exchanged"`
 		SubjectTokenType string `json:"subject_token_type,omitempty" doc:"RFC 8693 subject token type URI"`
@@ -70,6 +103,36 @@ type TokenInput struct {
 		// external principal can self-rotate its session at /oauth2/token. Honoured
 		// only on that path AND only for a profiled Audience; ignored otherwise.
 		IssueRefreshToken bool `json:"issue_refresh_token,omitempty" doc:"Also mint a rotating refresh token (trusted external-principal exchange with a profiled audience only)"`
+		// Resource is the RFC 8707 §2 resource indicator: the protected
+		// resource(s) the minted token is bound to (CAP-IDN-026). Accepts a
+		// single URI string or an array of them; a form-encoded request may
+		// repeat the parameter. Mutually exclusive with Audience.
+		//
+		// A binding may be established at EITHER the authorization request or
+		// the token request (CAP-IDN-027). `/oauth2/authorize` now validates
+		// `resource` and records the consented value as the authorization
+		// code's ceiling, so:
+		//
+		//   - sent at authorize only  → the token binds to the code's ceiling
+		//   - sent at both            → must be a subset of the ceiling, else
+		//                               `invalid_target`
+		//   - sent at token only      → binds directly, as before
+		//
+		// The client SELECTS from what the resource owner consented to and can
+		// never add to it. The authorize leg accepts at most ONE resource: a
+		// multi-audience access token is not issuable on that grant.
+		//
+		// A resource-bound `authorization_code` exchange IS issued a refresh
+		// token, and the binding survives rotation — the ceiling is recorded on
+		// the refresh family and re-stamped on every successor. A refresh may
+		// name `resource` to select within that ceiling; omitting it re-stamps
+		// a single-valued ceiling.
+		//
+		// (The trusted external-principal exchange still returns no refresh
+		// token for a resource-bound request, but for an unrelated structural
+		// reason: refresh tokens there require a profiled `audience`, which is
+		// mutually exclusive with `resource`.)
+		Resource resourceParam `json:"resource,omitempty" doc:"RFC 8707 resource indicator(s) to bind the token to — absolute URI(s), no fragment. May be sent at /oauth2/authorize (recording the consented ceiling on the code, max 1) and/or here, where it must name a subset of that ceiling. A resource-bound authorization_code exchange receives a refresh_token whose rotations keep the binding."`
 		// authorization_code grant fields:
 		Code         string `json:"code,omitempty" doc:"Authorization code JWT"`
 		CodeVerifier string `json:"code_verifier,omitempty" doc:"PKCE S256 code verifier"`
@@ -78,15 +141,102 @@ type TokenInput struct {
 		RefreshToken string `json:"refresh_token,omitempty" doc:"Refresh token (zid_rt_*)"`
 		// CIBA (urn:openid:params:grant-type:ciba) grant fields:
 		AuthReqID string `json:"auth_req_id,omitempty" doc:"Backchannel auth_req_id returned from /oauth2/bc-authorize"`
+		// RequestingToken proves, on a CIBA poll, that the poller holds the
+		// requesting_token the bc-authorize request was made with.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension (CIBA grant) — required when the bc-authorize request carried a requesting_token: the same token. When that token is DPoP-bound, the poll must also carry a DPoP proof for its key."`
 		// RFC 6749 §3.1: the server MUST ignore unrecognized request
 		// parameters rather than rejecting the request outright.
 		_ struct{} `additionalProperties:"true"`
 	}
 }
 
+// resourceParam binds the RFC 8707 `resource` request parameter, which §2
+// defines as repeatable — "the parameter can be included multiple times to
+// indicate multiple resources". That shape has three encodings on the wire and
+// all three must land as the same []string:
+//
+//   - JSON array:  {"resource": ["https://a", "https://b"]}
+//   - JSON string: {"resource": "https://a"}          — the single-resource case
+//   - form body:   resource=https://a&resource=https://b
+//
+// The form case is normalized to a JSON array upstream by
+// oauthFormCompatMiddleware (see repeatableFormFields in server.go); a
+// single-occurrence form parameter still arrives here as a bare string, which is
+// why the string case is not merely a convenience.
+//
+// A JSON `null` binds to nil (parameter absent) rather than erroring: RFC 6749
+// §3.1 tells the server to ignore unrecognized/empty parameters, and a client
+// that serializes an unset optional field as null means "not supplied".
+type resourceParam []string
+
+// UnmarshalJSON accepts either a string or an array of strings. Anything else
+// (number, object, bool) is a client error surfaced by Huma as a 422 binding
+// failure — deliberately not coerced, since a caller sending the wrong type for
+// a security-relevant parameter should be told, not guessed at.
+func (r *resourceParam) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "null" {
+		*r = nil
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		var many []string
+		if err := json.Unmarshal(b, &many); err != nil {
+			return fmt.Errorf("resource must be a URI string or an array of URI strings: %w", err)
+		}
+		*r = many
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(b, &one); err != nil {
+		return fmt.Errorf("resource must be a URI string or an array of URI strings: %w", err)
+	}
+	*r = []string{one}
+	return nil
+}
+
+// Schema advertises the union shape in the OpenAPI document so generated
+// clients and the interop testers reading our spec see that both encodings are
+// accepted. Without this, Huma would infer a plain array from the underlying
+// []string and the string form would look unsupported.
+func (resourceParam) Schema(huma.Registry) *huma.Schema {
+	// Deliberately `type: string` with NO `format: uri`.
+	//
+	// huma validates formats at bind time, not only in the document, so a
+	// `format: uri` here would reject a malformed value with a binder 422 and a
+	// {"title":"Unprocessable Entity"} body. RFC 6749 §5.2 requires the token
+	// endpoint to answer with an error object — {"error":"invalid_target",…} —
+	// and an interop tester probing error handling reads the body, not just the
+	// status. It also made validateResourceIndicators' own parse-error branch
+	// unreachable over HTTP: two validators, one of them dead, disagreeing about
+	// the response shape.
+	//
+	// So the service is the single authority on what a resource indicator may
+	// be, and the schema documents the shape (string or array of strings)
+	// without enforcing the grammar. The RFC 8707 §2 rules — absolute URI, no
+	// fragment, no userinfo — live in one place and answer in one shape.
+	uri := &huma.Schema{Type: "string"}
+	return &huma.Schema{
+		Description: "RFC 8707 resource indicator(s): absolute URI(s) identifying the " +
+			"protected resource the token is bound to. A single URI or an array; " +
+			"form-encoded requests may repeat the parameter.",
+		OneOf: []*huma.Schema{
+			uri,
+			{Type: "array", Items: uri},
+		},
+	}
+}
+
 type TokenOutput struct {
 	Status int
-	Body   any // domain.AccessToken on success; oauthErrorBody on error
+	// WWWAuthenticate is set on 401 only when the failed attempt used the
+	// Authorization header. RFC 6749 §5.2: an authorization server that
+	// receives a request with an authentication scheme in the Authorization
+	// header MUST respond with a WWW-Authenticate header echoing that scheme.
+	// Mirrors IntrospectOutput, which has carried this since Basic support
+	// landed on the inspection endpoints.
+	WWWAuthenticate string `header:"WWW-Authenticate"`
+	Body            any    // domain.AccessToken on success; oauthErrorBody on error
 }
 
 // oauthErrorBody is the RFC 6749 §5.2 token error response.
@@ -109,6 +259,12 @@ func extractOAuthError(err error) (code, description string, status int) {
 	}
 	if errors.Is(err, service.ErrScopesNotAllowed) {
 		return oautherror.InsufficientScope, err.Error(), http.StatusBadRequest
+	}
+	if errors.Is(err, service.ErrPersonScopeDenied) {
+		return oautherror.InvalidScope, "none of the requested scopes is granted to this user", http.StatusBadRequest
+	}
+	if errors.Is(err, service.ErrPersonGrantUnavailable) {
+		return oautherror.ServerError, "the user's scope ceiling could not be resolved", http.StatusInternalServerError
 	}
 	// Identity gates can fire at the chokepoint after the per-grant
 	// check passed (TOCTOU window). Map to stable error_description
@@ -133,7 +289,8 @@ type IntrospectInput struct {
 	// Authorization carries OPTIONAL client_secret_basic credentials
 	// (RFC 6749 §2.3.1: `Basic base64(urlencode(id):urlencode(secret))`).
 	// Body client_id/client_secret remain the client_secret_post path; a
-	// request using both methods at once is rejected per RFC 6749 §2.3.
+	// request using both methods at once is rejected per RFC 6749 §2.3. A
+	// body client_id equal to the Basic id is accepted (resolveBasicClientAuth).
 	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
 	Body          struct {
 		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to introspect"`
@@ -143,6 +300,12 @@ type IntrospectInput struct {
 		// the endpoint preserves the internal/network-isolated access path.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// ClientAssertion / ClientAssertionType are the RFC 7523 §2.2
+		// private_key_jwt alternative to client_secret. A client registered for
+		// private_key_jwt has no secret, so without these it could not
+		// authenticate to this endpoint at all.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present"`
 		// RFC 7662 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
 		_ struct{} `additionalProperties:"true"`
 	}
@@ -161,11 +324,18 @@ type OAuthRevokeInput struct {
 	// IntrospectInput (RFC 7009 §2.1 client authorization).
 	Authorization string `header:"Authorization" doc:"Optional HTTP Basic client authentication (client_secret_basic)"`
 	Body          struct {
-		Token string `json:"token" required:"true" minLength:"1" doc:"JWT to revoke"`
+		Token string `json:"token" required:"true" minLength:"1" doc:"Access token (JWT) or refresh token to revoke"`
+		// TokenTypeHint is RFC 7009 §2.1's optional hint. It only orders the
+		// lookups; both token types are always tried, and an unknown value is
+		// ignored (§2.2).
+		TokenTypeHint string `json:"token_type_hint,omitempty" doc:"Optional hint: access_token or refresh_token (RFC 7009 §2.1)"`
 		// ClientID / ClientSecret are OPTIONAL client credentials (RFC 7009 §2.1
 		// authorization). Same accept-and-verify posture as introspection.
 		ClientID     string `json:"client_id,omitempty" doc:"OAuth client ID (optional client auth, client_secret_post)"`
 		ClientSecret string `json:"client_secret,omitempty" doc:"OAuth client secret (optional client auth, client_secret_post)"`
+		// Same RFC 7523 §2.2 private_key_jwt support as introspection.
+		ClientAssertion     string `json:"client_assertion,omitempty" doc:"Client authentication JWT (RFC 7523 §2.2 private_key_jwt)"`
+		ClientAssertionType string `json:"client_assertion_type,omitempty" doc:"Must be urn:ietf:params:oauth:client-assertion-type:jwt-bearer when client_assertion is present"`
 		// RFC 7009 §2.1 inherits RFC 6749 §3.1's ignore-unrecognized-params posture.
 		_ struct{} `additionalProperties:"true"`
 	}
@@ -178,8 +348,10 @@ type OAuthRevokeOutput struct {
 	Body            struct {
 		Revoked bool `json:"revoked"`
 		// Error / ErrorDescription are populated only when presented client
-		// credentials fail verification (invalid_client). On every other path
-		// the RFC 7009 §2.2 "always 200" contract holds.
+		// credentials fail verification (invalid_client) or the server failed
+		// to carry out the revocation (server_error). Unknown, invalid or
+		// already-revoked tokens — and tokens issued to another client — get
+		// the RFC 7009 §2.2 200, all with the same body.
 		Error            string `json:"error,omitempty"`
 		ErrorDescription string `json:"error_description,omitempty"`
 	}
@@ -189,18 +361,135 @@ type OAuthRevokeOutput struct {
 // client-auth attempt fails (RFC 6749 §5.2).
 const basicAuthChallenge = `Basic realm="zeroid", charset="UTF-8"`
 
-// resolveInspectionClientAuth merges the two supported client authentication
-// methods on the introspection/revocation endpoints: client_secret_basic
-// (Authorization header) and client_secret_post (body fields). Returns the
+// maxLoggedGrantType bounds grant_type in log output. The field is an
+// unvalidated, attacker-supplied string with no length cap of its own — a
+// deliberate design choice, since Server.RegisterGrant lets a deployer name a
+// custom grant anything, which is why an `enum` tag would be wrong here. Under
+// the endpoint's 10 MiB body cap that means one request could otherwise emit a
+// multi-megabyte log line. Log injection is not the concern (zerolog emits
+// JSON and escapes control characters); volume is.
+const maxLoggedGrantType = 64
+
+// truncateForLog bounds an untrusted string for log output, marking any value
+// it shortened so a truncated field is never mistaken for the real one.
+func truncateForLog(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	return s[:maxLen] + "…(truncated)"
+}
+
+// isJWTBearerGrant reports whether the wire grant_type names RFC 7523's
+// jwt-bearer grant. Goes through domain.NormalizeGrantType rather than matching
+// the URN literally so the short form (`jwt_bearer`) and the URN both count —
+// the token endpoint accepts either, and a check that recognised only one would
+// silently skip half the traffic it is meant to observe.
+func isJWTBearerGrant(grantType string) bool {
+	return domain.NormalizeGrantType(grantType) == domain.GrantTypeJWTBearer
+}
+
+// resolveAssertion picks the JWT for the jwt-bearer grant from the RFC 7523
+// §2.1 `assertion` parameter, falling back to ZeroID's legacy `subject`
+// spelling.
+//
+// A client that sends BOTH with DIFFERENT values is refused rather than
+// resolved. Silently preferring one would mean accepting a request that
+// presented two different assertions and picking a winner the caller did not
+// choose — the same "two meanings on one channel with no discriminator" shape
+// that produced the resource-binding bug in INV-IDN-006. Identical values are
+// allowed: a client migrating from `subject` to `assertion` may reasonably send
+// both during the transition, and that is unambiguous.
+//
+// LIMIT OF THIS CHECK — do not read it as an endpoint-wide guarantee. It
+// compares the two values AFTER the JSON binder has run, and the binder
+// (goccy/go-json, like encoding/json) matches field names case-insensitively
+// and takes last-key-wins on duplicates. So `{"assertion":"A","ASSERTION":"B"}`
+// arrives here as a single value with nothing to compare, and the form path
+// does not catch it either: oauthFormCompatMiddleware rejects duplicates by
+// comparing raw form keys case-SENSITIVELY, so `assertion=A&ASSERTION=B` is two
+// distinct keys that both bind to this one field. Closing that requires
+// canonicalising parameter names at the binder boundary for every OAuth
+// parameter — client_secret, api_key, refresh_token and subject_token bind the
+// same way — which is a behaviour change for callers relying on the current
+// case-insensitivity, so it is tracked separately rather than smuggled in here.
+// What this function guarantees is narrower than it first reads: two
+// canonically-spelled parameters carrying different assertions are refused.
+//
+// Returns "" with no error when neither is present; the grant handler owns the
+// "assertion is required" message so the error stays accurate per grant type
+// (only jwt-bearer requires one).
+func resolveAssertion(assertion, subject string) (string, error) {
+	switch {
+	case assertion != "" && subject != "" && assertion != subject:
+		return "", errors.New(
+			"assertion and subject are both present with different values — " +
+				"send only `assertion` (RFC 7523 §2.1); `subject` is a deprecated alias")
+	case assertion != "":
+		return assertion, nil
+	default:
+		return subject, nil
+	}
+}
+
+// resolveBasicClientAuth merges the two secret-carrying client authentication
+// methods — client_secret_basic (Authorization header) and client_secret_post
+// (body fields) — for the token, introspection and revocation endpoints.
+//
+// The token endpoint was NOT a caller until zeroid#206: it read client_secret
+// from the body only, while the RFC 8414 metadata advertised
+// client_secret_basic for it. A client following our own discovery document and
+// sending Basic had its credentials silently ignored and was treated as
+// presenting no secret at all. That failed closed (confidential clients got
+// "client_secret is required" rather than a bypass), but it made an advertised
+// auth method unusable. Returns the
 // effective credentials plus whether the Basic header was the source (drives
 // the RFC 6749 §5.2 WWW-Authenticate echo on failure).
 //
-// Per RFC 6749 §2.3 a client MUST NOT use more than one method in a single
-// request — presenting both is rejected as invalid_request. Non-Basic
-// Authorization schemes are ignored (treated as not presented) so bearer
-// headers from generic middleware don't break the anonymous internal path.
-// Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1.
-func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret string) (clientID, clientSecret string, viaBasic bool, err error) {
+// One method per request. RFC 6749 §2.3: "The client MUST NOT use more than
+// one authentication method in each request." OAuth 2.1
+// (draft-ietf-oauth-v2-1-14 §2.4) keeps the rule and states its purpose: "to
+// prevent a conflict of which authentication mechanism is authoritative for the
+// request". So alongside a Basic header this refuses, as invalid_request (RFC
+// 6749 §5.2: "utilizes more than one mechanism for authenticating the client"):
+//
+//   - a body client_secret — that is client_secret_post, a second method;
+//   - a body client_assertion / client_assertion_type — that is RFC 7523 §2.2
+//     private_key_jwt, a second method. Refused here rather than left to the
+//     service because the service only sees the merged secret: a Basic header
+//     carrying an EMPTY password plus an assertion would otherwise reach it as
+//     "no secret, one assertion" and pass as a single method.
+//
+// A body client_id on its own is NOT a method. It is an identifier: RFC 6749
+// §3.2.1 says "A client MAY use the "client_id" request parameter to identify
+// itself when sending requests to the token endpoint", and OAuth 2.1 §3.2.2
+// lists client_id as an OPTIONAL token-request parameter separate from client
+// authentication. The reference MCP SDK sends exactly this shape — Basic plus a
+// body client_id — so refusing it broke every partner on that SDK before the
+// grant was even read (highflame-firehog#700). When the two identifiers agree
+// there is one credential and one client, so nothing is ambiguous and the
+// request is accepted. When they disagree the request names two clients; that
+// is refused rather than resolved by a precedence rule, for the same reason as
+// two methods: a precedence rule is what an attacker uses to get the identity
+// they did not authenticate as evaluated.
+//
+// (RFC 6749 §2.3.1 also lets client_secret_post omit an empty secret, so a bare
+// client_id can be read as client_secret_post with an empty password. That
+// reading only matters when it would change who is authenticated or with what;
+// with matching ids it changes neither, and the only secret evaluated is the
+// one in the Basic header.)
+//
+// Non-Basic Authorization schemes are ignored (treated as not presented) so
+// bearer headers from generic middleware don't break the anonymous internal
+// path. Credentials inside Basic are form-urlencoded per RFC 6749 §2.3.1, so
+// the comparison with the body client_id is made AFTER decoding — an id the
+// client percent-encoded in the header still matches its plain body form.
+//
+// Error descriptions never echo request values (zeroid#221): both identifiers
+// are caller-controlled, and the description is reflected to the caller.
+func resolveBasicClientAuth(
+	authorization, bodyClientID, bodyClientSecret, bodyClientAssertion, bodyClientAssertionType string,
+) (clientID, clientSecret string, viaBasic bool, err error) {
 	badRequest := func(desc string) *service.OAuthError {
 		return &service.OAuthError{Code: oautherror.InvalidRequest, Description: desc, HTTPStatus: http.StatusBadRequest}
 	}
@@ -208,7 +497,7 @@ func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret s
 	if len(authorization) < len(prefix) || !strings.EqualFold(authorization[:len(prefix)], prefix) {
 		return bodyClientID, bodyClientSecret, false, nil
 	}
-	if bodyClientID != "" || bodyClientSecret != "" {
+	if bodyClientSecret != "" || bodyClientAssertion != "" || bodyClientAssertionType != "" {
 		return "", "", true, badRequest("only one client authentication method may be used per request (RFC 6749 §2.3)")
 	}
 	raw, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(authorization[len(prefix):]))
@@ -223,6 +512,10 @@ func resolveInspectionClientAuth(authorization, bodyClientID, bodyClientSecret s
 	secret, secErr := url.QueryUnescape(secret)
 	if idErr != nil || secErr != nil {
 		return "", "", true, badRequest("malformed Basic authorization header")
+	}
+	if bodyClientID != "" && bodyClientID != id {
+		return "", "", true, badRequest(
+			"client_id in the request body does not match the client identifier in the Basic authorization header")
 	}
 	return id, secret, true, nil
 }
@@ -275,6 +568,27 @@ func (a *API) registerOAuthRoutes(api huma.API) {
 			"user approves or denies via the deployer's notification channel.",
 		Tags: []string{"OAuth"},
 	}, a.bcAuthorizeOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "oauth-cimd-client-info",
+		Method:      http.MethodGet,
+		Path:        "/oauth2/cimd/client-info",
+		Summary:     "Display metadata for a CIMD client (consent screens)",
+		Description: "Resolves a Client ID Metadata Document and returns the fields a consent " +
+			"screen needs to tell a human who is asking.\n\n" +
+			"**Read-only. It decides nothing.** Admission is still `/oauth2/authorize`, which " +
+			"performs the same resolution against the same cache. This endpoint exists because " +
+			"that resolution happens AFTER the human has approved, which is one hop too late to " +
+			"inform the decision it exists to inform.\n\n" +
+			"**`client_name`, `client_uri` and `logo_uri` are UNTRUSTED.** They come from a " +
+			"document at a URL the client chose. The draft §4 self-reference check, which this " +
+			"endpoint applies, stops one client displaying another's name; it does not make the " +
+			"strings safe to render. Per §8.5 a consent screen MUST show `client_id_host` " +
+			"alongside them, never instead of them, and MUST escape them. `client_uri` and " +
+			"`logo_uri` are guaranteed absolute `https://` URLs or absent, so a `javascript:` " +
+			"value cannot reach an href.",
+		Tags: []string{"OAuth"},
+	}, a.cimdClientInfoOp)
 
 	advertiseFormContentType(api, "/oauth2/token", "/oauth2/token/introspect", "/oauth2/token/revoke", "/oauth2/bc-authorize")
 }
@@ -341,8 +655,20 @@ func advertiseFormContentType(api huma.API, paths ...string) {
 }
 
 func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, error) {
-	// DPoP: optional. When a proof is present the issued token is bound to the
-	// proof key via cnf.jkt and token_type is returned as "DPoP" (RFC 9449).
+	// DPoP: optional by default — a present proof binds the issued token to
+	// the proof key via cnf.jkt and token_type is returned as "DPoP"
+	// (RFC 9449). Under token.require_dpop the fallback is closed: issuance
+	// without a proof is refused outright, so every credential this AS mints
+	// is proof-of-possession-bound (the ODIS-L1-09 holder-of-key posture).
+	if a.dpopRequired.Load() && input.DPoPProof == "" {
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body: oauthErrorBody{
+				Error:            oautherror.InvalidDPoPProof,
+				ErrorDescription: "DPoP proof required: this authorization server issues only DPoP-bound tokens (RFC 9449 §5)",
+			},
+		}, nil
+	}
 	var dpopThumbprint string
 	if input.DPoPProof != "" {
 		if a.dpopVerifier == nil {
@@ -382,41 +708,138 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		dpopThumbprint = res.Thumbprint
 	}
 
+	// Adoption telemetry for the deprecated alias. Without a signal, deciding
+	// when `subject` can be removed is a guess, and the alias lives forever.
+	// Logged at the call site rather than inside resolveAssertion so the record
+	// carries grant_type — which tells you WHICH caller still needs migrating,
+	// not merely that someone does. Never log the assertion itself: it is
+	// credential material.
+	// Warn, not Debug: the point of this signal is deciding when the alias can
+	// be removed, and that decision needs PRODUCTION traffic. Prod runs zerolog
+	// at info, where Debug is dropped — so a debug line would have scoped the
+	// evidence to dev/test and the alias would outlive its usefulness for
+	// exactly the reason this telemetry exists. Warn is also the conventional
+	// level for deprecated-API use.
+	//
+	// KNOWN DOMINANT CALLER: highflame-cerberus MintAgentToken
+	// (internal/admin/token.go) sends `subject` on every code-agent root
+	// session-token mint. Until that migrates, this Warn reads "the alias is
+	// heavily used" when it actually means "cerberus hasn't been migrated yet",
+	// and it will be loud. Migrate cerberus in the window between this shipping
+	// and authn bumping to a release containing it — after that, remaining
+	// volume is genuinely external clients, which is the signal this exists for.
+	// Note the ordering: cerberus MUST NOT switch to `assertion` until the authn
+	// deployment it talks to accepts it, or every agent session mint breaks.
+	//
+	// Gated on the jwt-bearer grant for two reasons. It is the only grant that
+	// reads the field, so `subject` on client_credentials is noise, not a legacy
+	// client. And this runs before client authentication on an unauthenticated
+	// endpoint with no rate limiting, so an ungated Warn is an anonymous
+	// log-volume amplifier — and worse, lets anyone fabricate the very signal
+	// the alias-removal decision is meant to rest on. Even gated, treat the
+	// count as a lower bound from an anonymous-write channel rather than as
+	// proof migration is complete.
+	//
+	// Fires whenever `subject` is present, not only when `assertion` is absent:
+	// a client sending both (the mid-migration shape) is still using the alias
+	// and is exactly the population that needs chasing.
+	if isJWTBearerGrant(input.Body.GrantType) && input.Body.Subject != "" {
+		log.Warn().
+			Str("grant_type", truncateForLog(input.Body.GrantType, maxLoggedGrantType)).
+			Bool("also_sent_assertion", input.Body.Assertion != "").
+			Msg("deprecated `subject` parameter used; clients should send `assertion` (RFC 7523 §2.1)")
+	}
+
+	assertion, assertionErr := resolveAssertion(input.Body.Assertion, input.Body.Subject)
+	if assertionErr != nil {
+		// The one branch worth a record: a caller presented two conflicting
+		// credentials in a single request. Parameter names and grant type only —
+		// the values are assertions, i.e. credential material.
+		log.Warn().
+			Str("grant_type", truncateForLog(input.Body.GrantType, maxLoggedGrantType)).
+			Msg("conflicting `assertion` and `subject` parameters carrying different values; request refused")
+
+		return &TokenOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: oautherror.InvalidRequest, ErrorDescription: assertionErr.Error()},
+		}, nil
+	}
+
+	// client_secret_basic (Authorization header) or client_secret_post (body).
+	// Presenting two methods is invalid_request per RFC 6749 §2.3; a body
+	// client_id that merely repeats the Basic id is not a second method.
+	clientID, clientSecret, viaBasic, basicErr := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
+	if basicErr != nil {
+		code, desc, status := extractOAuthError(basicErr)
+		out := &TokenOutput{Status: status, Body: oauthErrorBody{Error: code, ErrorDescription: desc}}
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
+	}
+
+	// A private_key_jwt client may authenticate with client_assertion ALONE and
+	// omit client_id — RFC 7523 §3 already carries the client identifier in the
+	// assertion's iss, and conformant libraries rely on that. Fill it in here,
+	// once, so every downstream grant sees a populated ClientID and none of them
+	// needs to know about this spelling.
+	//
+	// Only when client_id was not supplied: if the caller sent both, the
+	// supplied value is kept and verifyClientAssertion enforces iss == client_id,
+	// so a mismatch is a verification failure rather than a silent override.
+	if clientID == "" {
+		if fromAssertion, ok := service.ClientIDFromAssertion(input.Body.ClientAssertion); ok {
+			clientID = fromAssertion
+		}
+	}
+
 	accessToken, err := a.oauthSvc.Token(ctx, service.TokenRequest{
-		GrantType:         input.Body.GrantType,
-		ClientID:          input.Body.ClientID,
-		ClientSecret:      input.Body.ClientSecret,
-		Scope:             input.Body.Scope,
-		AccountID:         input.Body.AccountID,
-		ProjectID:         input.Body.ProjectID,
-		Subject:           input.Body.Subject,
-		APIKey:            input.Body.APIKey,
-		SubjectToken:      input.Body.SubjectToken,
-		SubjectTokenType:  input.Body.SubjectTokenType,
-		ActorToken:        input.Body.ActorToken,
-		UserID:            input.Body.UserID,
-		UserEmail:         input.Body.UserEmail,
-		UserName:          input.Body.UserName,
-		ApplicationID:     input.Body.ApplicationID,
-		AdditionalClaims:  input.Body.AdditionalClaims,
-		Role:              input.Body.Role,
-		PrivilegeScope:    input.Body.PrivilegeScope,
-		Audience:          input.Body.Audience,
-		IssueRefreshToken: input.Body.IssueRefreshToken,
-		Code:              input.Body.Code,
-		CodeVerifier:      input.Body.CodeVerifier,
-		RedirectURI:       input.Body.RedirectURI,
-		RefreshTokenStr:   input.Body.RefreshToken,
-		AuthReqID:         input.Body.AuthReqID,
-		DPoPKeyThumbprint: dpopThumbprint,
+		GrantType:           input.Body.GrantType,
+		ClientID:            clientID,
+		ClientSecret:        clientSecret,
+		ClientAssertion:     input.Body.ClientAssertion,
+		ClientAssertionType: input.Body.ClientAssertionType,
+		Scope:               input.Body.Scope,
+		AccountID:           input.Body.AccountID,
+		ProjectID:           input.Body.ProjectID,
+		Assertion:           assertion,
+		APIKey:              input.Body.APIKey,
+		SubjectToken:        input.Body.SubjectToken,
+		SubjectTokenType:    input.Body.SubjectTokenType,
+		ActorToken:          input.Body.ActorToken,
+		UserID:              input.Body.UserID,
+		UserEmail:           input.Body.UserEmail,
+		UserName:            input.Body.UserName,
+		ApplicationID:       input.Body.ApplicationID,
+		AdditionalClaims:    input.Body.AdditionalClaims,
+		Role:                input.Body.Role,
+		PrivilegeScope:      input.Body.PrivilegeScope,
+		Audience:            input.Body.Audience,
+		IssueRefreshToken:   input.Body.IssueRefreshToken,
+		Resource:            []string(input.Body.Resource),
+		Code:                input.Body.Code,
+		CodeVerifier:        input.Body.CodeVerifier,
+		RedirectURI:         input.Body.RedirectURI,
+		RefreshTokenStr:     input.Body.RefreshToken,
+		AuthReqID:           input.Body.AuthReqID,
+		RequestingToken:     input.Body.RequestingToken,
+		DPoPKeyThumbprint:   dpopThumbprint,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
 		code, desc, status := extractOAuthError(err)
-		return &TokenOutput{
+		out := &TokenOutput{
 			Status: status,
 			Body:   oauthErrorBody{Error: code, ErrorDescription: desc},
-		}, nil
+		}
+		// RFC 6749 §5.2 — echo the scheme back when the client authenticated
+		// (or tried to) via the Authorization header and we answer 401.
+		if viaBasic && status == http.StatusUnauthorized {
+			out.WWWAuthenticate = basicAuthChallenge
+		}
+		return out, nil
 	}
 
 	return &TokenOutput{Status: http.StatusOK, Body: accessToken}, nil
@@ -427,9 +850,11 @@ func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*Intros
 	// (Authorization header) or client_secret_post (body). When credentials are
 	// presented they MUST verify; a bad secret is rejected with invalid_client.
 	// When absent, the existing internal/tenant-header access path is preserved.
-	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	if err == nil {
-		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret, input.Body.ClientAssertion, input.Body.ClientAssertionType)
 	}
 	if err != nil {
 		code, desc, status := extractOAuthError(err)
@@ -450,20 +875,37 @@ func (a *API) introspectOp(ctx context.Context, input *IntrospectInput) (*Intros
 
 func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevokeOutput, error) {
 	// Accept-and-verify client auth (RFC 7009 §2.1) via client_secret_basic
-	// (Authorization header) or client_secret_post (body). A presented-but-wrong
-	// secret is rejected with invalid_client; otherwise the RFC 7009 §2.2
-	// "always 200" contract holds (including for unknown/already-revoked tokens
-	// and anonymous internal-path callers).
-	clientID, clientSecret, viaBasic, err := resolveInspectionClientAuth(input.Authorization, input.Body.ClientID, input.Body.ClientSecret)
+	// (Authorization header), client_secret_post (body), private_key_jwt, or a
+	// public client's client_id alone. A presented-but-refused credential is
+	// rejected with invalid_client; a server-side failure to revoke is a
+	// server_error; otherwise the RFC 7009 §2.2 "always 200" contract holds
+	// (including for unknown/already-revoked tokens, tokens issued to another
+	// client, and anonymous internal-path callers).
+	clientID, clientSecret, viaBasic, err := resolveBasicClientAuth(
+		input.Authorization, input.Body.ClientID, input.Body.ClientSecret,
+		input.Body.ClientAssertion, input.Body.ClientAssertionType)
+	//
+	// Authorization and revocation are one service call because they are not
+	// separable: a public CIMD client identifying itself by client_id alone is
+	// accepted here (unlike introspection) only on the condition that the
+	// token was issued to that client, so the revoke itself carries the
+	// constraint. See OAuthService.RevokeForClient.
 	if err == nil {
-		err = a.oauthSvc.VerifyPresentedClientAuth(ctx, clientID, clientSecret)
+		err = a.oauthSvc.RevokeForClient(ctx, service.RevocationRequest{
+			Token:               input.Body.Token,
+			TokenTypeHint:       input.Body.TokenTypeHint,
+			ClientID:            clientID,
+			ClientSecret:        clientSecret,
+			ClientAssertion:     input.Body.ClientAssertion,
+			ClientAssertionType: input.Body.ClientAssertionType,
+		})
 	}
 	if err != nil {
 		code, desc, status := extractOAuthError(err)
 		out := &OAuthRevokeOutput{Status: status}
-		// Use the error's own code, not a hardcoded invalid_client — an
-		// operational failure maps to a 500/server_error and must not be
-		// labelled as a client authentication failure.
+		// Use the error's own code, not a hardcoded invalid_client — a
+		// server-side revocation failure maps to 500/server_error and must not
+		// be labelled as a client authentication failure.
 		out.Body.Error = code
 		out.Body.ErrorDescription = desc
 		if viaBasic && status == http.StatusUnauthorized {
@@ -472,7 +914,6 @@ func (a *API) revokeOp(ctx context.Context, input *OAuthRevokeInput) (*OAuthRevo
 		return out, nil
 	}
 
-	_ = a.oauthSvc.Revoke(ctx, input.Body.Token)
 	out := &OAuthRevokeOutput{Status: http.StatusOK}
 	out.Body.Revoked = true
 	return out, nil
@@ -506,6 +947,14 @@ type BcAuthorizeInput struct {
 		// to the BackchannelNotifier hook for typed approval-prompt
 		// rendering. Empty / omitted keeps the legacy CIBA flow unchanged.
 		AuthorizationDetails json.RawMessage `json:"authorization_details,omitempty" doc:"RFC 9396 Rich Authorization Requests payload (JSON array of typed objects)"`
+		// FourEyes / RequesterOwner are extension parameters. A string, not
+		// a bool, because form-encoded requests arrive as strings.
+		FourEyes       string `json:"four_eyes,omitempty" doc:"Extension — \"true\" or \"false\". When true, the user named by requester_owner may not approve or deny the request. Requires requester_owner."`
+		RequesterOwner string `json:"requester_owner,omitempty" doc:"Extension — user id of the owner of the requesting identity. Max 255 characters."`
+		// RequestingToken is the access token of the request the approval
+		// is for. Verified (this issuer, active, same tenant); the token
+		// minted on approval keeps its sub and act.
+		RequestingToken string `json:"requesting_token,omitempty" doc:"Extension — the access token (issued by this server, same tenant) of the request being approved. The token minted on approval keeps its subject and actor; the approver is recorded only on the approval record."`
 		// CIBA Core 1.0 §7.1 inherits RFC 6749 §3.1's ignore-unrecognized-params
 		// posture, same as TokenInput/IntrospectInput/OAuthRevokeInput.
 		_ struct{} `additionalProperties:"true"`
@@ -528,6 +977,17 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 			Body:   oauthErrorBody{Error: oautherror.UnsupportedGrantType, ErrorDescription: "CIBA is not enabled on this deployment"},
 		}, nil
 	}
+	var fourEyes bool
+	switch input.Body.FourEyes {
+	case "", "false":
+	case "true":
+		fourEyes = true
+	default:
+		return &BcAuthorizeOutput{
+			Status: http.StatusBadRequest,
+			Body:   oauthErrorBody{Error: oautherror.InvalidRequest, ErrorDescription: `four_eyes must be "true" or "false"`},
+		}, nil
+	}
 	out, err := a.backchannelSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
 		ClientID:                input.Body.ClientID,
 		ClientSecret:            input.Body.ClientSecret,
@@ -540,6 +1000,9 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 		RequestedExpiry:         input.Body.RequestedExpiry,
 		ClientNotificationToken: input.Body.ClientNotificationToken,
 		AuthorizationDetailsRaw: []byte(input.Body.AuthorizationDetails),
+		FourEyes:                fourEyes,
+		RequesterOwner:          input.Body.RequesterOwner,
+		RequestingToken:         input.Body.RequestingToken,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("client_id", input.Body.ClientID).Msg("bc-authorize failed")
@@ -551,10 +1014,13 @@ func (a *API) bcAuthorizeOp(ctx context.Context, input *BcAuthorizeInput) (*BcAu
 
 // BcApproveInput resolves a pending request positively. auth_req_id is the
 // URL path parameter; tenant is read from request headers via TenantContext.
+// The approver is taken from the request context when the deployer's
+// authentication layer set one (zeroid.WithApproverIdentity); subject_id is
+// then optional and, if present, must match it.
 type BcApproveInput struct {
 	AuthReqID string `path:"auth_req_id" required:"true"`
 	Body      struct {
-		SubjectID    string `json:"subject_id" required:"true" doc:"Approved end-user identifier (becomes JWT sub)"`
+		SubjectID    string `json:"subject_id,omitempty" doc:"Approved end-user identifier (becomes JWT sub). Required unless the deployment supplies the authenticated approver; must match it when it does."`
 		SubjectEmail string `json:"subject_email,omitempty" doc:"Approved user email (optional)"`
 		SubjectName  string `json:"subject_name,omitempty" doc:"Approved user display name (optional)"`
 	}
@@ -632,28 +1098,102 @@ func (a *API) bcDenyOp(ctx context.Context, input *BcDenyInput) (*BcDenyOutput, 
 	return out, nil
 }
 
-// mapBackchannelAdminError converts a service-layer OAuthError into a Huma
-// admin error. The admin endpoints are not OAuth token endpoints, so the
-// RFC 6749 §5.2 error_code/error_description envelope would be misleading
-// here; we use plain HTTP semantics instead.
+// mapBackchannelAdminError converts a service-layer OAuthError into an admin
+// error response.
 //
-// The backchannel service produces only 400 and 500 OAuthErrors — there's
-// no auth surface inside the service (admin auth happens at the handler /
-// edge layer, see bcApproveOp / bcDenyOp). 401 would be returned only if
-// the service started producing invalid_client errors directly, which it
-// doesn't today; if that ever changes, add a case here AND consider
-// whether the failure is really an OAuth client-auth failure (RFC 9728
-// §5.1 breadcrumb applies) or just a misuse of OAuthError shape (it
-// doesn't apply).
+// 4xx responses carry both the problem-details fields the admin API has
+// always returned (title, status, detail) and the OAuth error/
+// error_description pair, so callers can branch on the code (e.g.
+// access_denied for an ineligible approver) without parsing prose.
+//
+// 401 is produced when the approver identity is required but absent. It is
+// not an OAuth client-authentication failure at a token endpoint, so no
+// WWW-Authenticate challenge is attached (the RFC 9728 §5.1 breadcrumb does
+// not apply).
 func mapBackchannelAdminError(err error) error {
 	var oauthErr *service.OAuthError
 	if errors.As(err, &oauthErr) {
 		switch oauthErr.HTTPStatus {
-		case http.StatusBadRequest:
-			return huma.Error400BadRequest(oauthErr.Description)
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+			return &backchannelAdminError{
+				Title:            http.StatusText(oauthErr.HTTPStatus),
+				Status:           oauthErr.HTTPStatus,
+				Detail:           oauthErr.Description,
+				Code:             oauthErr.Code,
+				ErrorDescription: oauthErr.Description,
+			}
 		case http.StatusInternalServerError:
 			return huma.Error500InternalServerError(oauthErr.Description)
 		}
 	}
 	return huma.Error500InternalServerError("backchannel admin request failed")
+}
+
+// backchannelAdminError is the 4xx body for the CIBA approve/deny endpoints.
+// It implements huma.StatusError so Huma writes it as the response body.
+type backchannelAdminError struct {
+	Title            string `json:"title"`
+	Status           int    `json:"status"`
+	Detail           string `json:"detail"`
+	Code             string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+func (e *backchannelAdminError) Error() string  { return e.Code + ": " + e.ErrorDescription }
+func (e *backchannelAdminError) GetStatus() int { return e.Status }
+
+// CIMDClientInfoInput is the client_id whose document to resolve.
+type CIMDClientInfoInput struct {
+	ClientID string `query:"client_id" required:"true" doc:"The CIMD client_id: the https URL its metadata document is published at."`
+}
+
+// CIMDClientInfoOutput carries only what a consent screen renders. It is
+// deliberately NOT the synthesized client: redirect_uris, grant types and key
+// material are admission inputs, and a display endpoint has no business
+// handing them to whoever asks.
+type CIMDClientInfoOutput struct {
+	Body struct {
+		ClientID string `json:"client_id"`
+		// The host of client_id. Per draft §8.5 a consent screen shows this
+		// WHATEVER else it shows, because it is the only part of the identity
+		// the publisher does not choose. Returned pre-extracted so every
+		// surface derives it the same way.
+		ClientIDHost string `json:"client_id_host"`
+		ClientName   string `json:"client_name,omitempty"`
+		ClientURI    string `json:"client_uri,omitempty"`
+		LogoURI      string `json:"logo_uri,omitempty"`
+		// False always, today. The field is here so a consent screen can render
+		// "not verified" from a value rather than a hardcoded string, and so
+		// adding publisher vetting later does not change this contract.
+		Verified bool `json:"verified"`
+	}
+}
+
+// cimdClientInfoOp resolves a CIMD document for display. See the registration
+// above for the trust contract; the short version is that every string it
+// returns except client_id_host was chosen by whoever published the document.
+func (a *API) cimdClientInfoOp(
+	ctx context.Context, input *CIMDClientInfoInput,
+) (*CIMDClientInfoOutput, error) {
+	client, err := a.oauthSvc.ResolveCIMDClientForDisplay(ctx, input.ClientID)
+	if err != nil {
+		// One status for every failure, on purpose. Disabled, not allow-listed,
+		// unreachable, malformed and self-reference-mismatched are different
+		// facts about the DOCUMENT, and distinguishing them here would turn a
+		// read-only endpoint into a probe for which hosts a deployment admits.
+		// A consent screen treats any failure the same way regardless: fall
+		// back to the client_id host, which it must show anyway.
+		return nil, huma.Error404NotFound("no displayable metadata for this client_id")
+	}
+
+	out := &CIMDClientInfoOutput{}
+	out.Body.ClientID = client.ClientID
+	out.Body.ClientName = client.Name
+	out.Body.ClientURI = client.ClientURI
+	out.Body.LogoURI = client.LogoURI
+	if u, parseErr := url.Parse(client.ClientID); parseErr == nil {
+		out.Body.ClientIDHost = u.Hostname()
+	}
+
+	return out, nil
 }

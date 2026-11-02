@@ -44,3 +44,6 @@ tmp/
 .env
 .env.*
 
+
+# gstack scratch output (browse/QA session logs)
+.gstack/

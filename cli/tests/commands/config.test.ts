@@ -1,35 +1,34 @@
 /**
  * Tests for `zeroid config use-profile` and `zeroid config list-profiles`.
  *
- * Uses a temp HOME dir so reads/writes don't touch the real config file.
+ * Isolation: each test gets a fresh ZID_CONFIG_DIR (the same knob production
+ * code honors), so the direct setProfile() writes and the CLI reads land on
+ * the same throwaway config file — no homedir mocking.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCLI } from "../helpers.js";
+import { setProfile } from "../../src/lib/config.js";
 
-// Normalise the tmp base (strip trailing slash) and join with an explicit "/".
-// Plain concatenation crashed on Linux CI where TMPDIR is unset → "/tmp" with no
-// slash → "/tmpzeroid-config-cmd-test-<pid>" at the filesystem root → EACCES.
-const TEST_HOME = vi.hoisted(() => {
-  const base = (process.env.TMPDIR ?? process.env.TEMP ?? "/tmp").replace(/\/+$/, "");
-  return `${base}/zeroid-config-cmd-test-${process.pid}`;
-});
-vi.mock("node:os", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:os")>();
-  return { ...actual, homedir: () => TEST_HOME };
-});
-
-// Import config functions after mock is in place so they use TEST_HOME.
-const { setProfile } = await import("../../src/lib/config.js");
+let configDir: string;
+let savedConfigDir: string | undefined;
 
 beforeEach(() => {
-  mkdirSync(join(TEST_HOME, ".config", "zeroid"), { recursive: true });
+  savedConfigDir = process.env.ZID_CONFIG_DIR;
+  configDir = mkdtempSync(join(tmpdir(), "zeroid-config-cmd-test-"));
+  process.env.ZID_CONFIG_DIR = configDir;
 });
 
 afterEach(() => {
-  rmSync(TEST_HOME, { recursive: true, force: true });
+  rmSync(configDir, { recursive: true, force: true });
+  if (savedConfigDir === undefined) {
+    delete process.env.ZID_CONFIG_DIR;
+  } else {
+    process.env.ZID_CONFIG_DIR = savedConfigDir;
+  }
 });
 
 describe("zeroid config list-profiles", () => {

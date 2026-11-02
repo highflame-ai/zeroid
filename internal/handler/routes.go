@@ -15,10 +15,12 @@ import (
 	gojson "github.com/goccy/go-json"
 	"github.com/uptrace/bun"
 
+	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/signing"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
+	"sync/atomic"
 )
 
 // API holds all service dependencies and exposes Huma-compatible handler methods.
@@ -40,9 +42,16 @@ type API struct {
 	delegationSvc        *service.DelegationService
 	jwksSvc              *signing.JWKSService
 	signingCredSvc       *service.SigningCredentialService
-	db                   *bun.DB
-	issuer               string
-	startTime            time.Time
+	// tenantSettingsSvc backs the per-tenant settings routes (the token
+	// profile). Set with SetTenantSettingsService; the routes are registered
+	// only when it is non-nil.
+	tenantSettingsSvc *service.TenantSettingsService
+	// externalIssuerSvc backs /external-issuers (ADR 0042 D4). Set with
+	// SetExternalIssuerService; the routes are registered only when non-nil.
+	externalIssuerSvc *service.ExternalIssuerService
+	db                *bun.DB
+	issuer            string
+	startTime         time.Time
 
 	// cimdEnabled advertises CIMD support in the OAuth 2.0 Authorization Server
 	// Metadata document (client_id_metadata_document_supported). Set via
@@ -50,11 +59,48 @@ type API struct {
 	// wire CIMD doesn't advertise it.
 	cimdEnabled bool
 
+	// dpopRequired makes a valid DPoP proof mandatory on every /oauth2/token
+	// issuance (token.require_dpop). Atomic because tests toggle it while the
+	// server is handling requests; defaults false (Bearer fallback stands).
+	dpopRequired atomic.Bool
+
+	// registrationEndpoint, when non-nil and non-empty, replaces
+	// {issuer}/oauth2/register as the advertised registration_endpoint in AS
+	// metadata (token.registration_endpoint). Validated by the caller; atomic
+	// for the same reason as dpopRequired.
+	registrationEndpoint atomic.Pointer[string]
+	// authorizationCodeAvailable reports whether /oauth2/authorize can
+	// actually serve a request — i.e. whether the deployer registered any
+	// PrincipalResolver. A PREDICATE, not a snapshot: resolvers may be
+	// registered after NewServer and before Start, so a bool captured at
+	// construction time would be wrong. Nil means "assume available"
+	// (embedders that never call the setter keep the old behaviour).
+	authorizationCodeAvailable func() bool
+
+	// interactiveLoginURL returns where to send a user agent when a resolver
+	// reports ErrPrincipalInteractionRequired. Nil means the deployment has no
+	// login surface, in which case that sentinel degrades to access_denied — a
+	// resolver cannot conjure a surface that does not exist.
+	//
+	// A func rather than a string so the target can vary per request (tenant,
+	// client, locale) without the resolver having to construct redirects itself.
+	interactiveLoginURL func(*service.AuthorizeRequest) string
+
+	// interactiveLoginPassthrough returns the embedder's allowlist of extra
+	// authorize query parameters copied verbatim into return_to (see
+	// interactive_passthrough.go). Nil, or an empty list, copies nothing. A
+	// func so the server can change the list after construction.
+	interactiveLoginPassthrough func() []string
+
 	// resolvePrincipal walks the PrincipalResolver chain registered on
-	// the top-level Server. Wired by Server.NewServer via
-	// SetPrincipalResolverFunc; nil when no resolvers are registered
-	// (the /oauth2/authorize handler then returns 503 so deployers
-	// see a clear "not configured" signal).
+	// the top-level Server. Wired unconditionally by Server.NewServer via
+	// SetPrincipalResolverFunc, which passes a BOUND METHOD — so this is
+	// never nil, even with an empty registry. An empty chain surfaces as
+	// ErrNoResolversRegistered from the call, which the /oauth2/authorize
+	// handler maps to 503.
+	//
+	// It therefore cannot be used to test whether the deployment has any
+	// resolvers; that is what authorizationCodeAvailable is for.
 	resolvePrincipal PrincipalResolverFunc
 }
 
@@ -133,6 +179,27 @@ func NewHumaAPISpecless(router chi.Router) huma.API {
 	config.OpenAPIPath = ""
 	config.DocsPath = ""
 	config.SchemasPath = ""
+	// DefaultConfig installs the $schema link transformer via a create hook
+	// keyed to SchemasPath; with no schemas route those links would 404 in
+	// every response body. Drop the hook so specless responses carry no
+	// $schema field at all.
+	config.CreateHooks = nil
+	return humachi.New(router, config)
+}
+
+// NewHumaAPIAdmin creates the admin group's huma API with its spec, docs and
+// schemas under /admin/* (relative to wherever the group is mounted). The
+// admin group shares the router root with the public API by default, so it
+// cannot reuse the canonical /openapi.json — chi last-registration wins and
+// the shadow would drop the public OAuth paths from the served spec. Distinct
+// paths keep the ~70 admin operations documented (GET /admin/openapi.json,
+// /admin/docs) and keep response $schema links resolvable (/admin/schemas/*),
+// in both root-mounted and prefixed deployments.
+func NewHumaAPIAdmin(router chi.Router) huma.API {
+	config := zeroidHumaConfig()
+	config.OpenAPIPath = "/admin/openapi"
+	config.DocsPath = "/admin/docs"
+	config.SchemasPath = "/admin/schemas"
 	return humachi.New(router, config)
 }
 
@@ -163,6 +230,8 @@ func zeroidHumaConfig() huma.Config {
 		"/oauth2/token/introspect",
 		"/oauth2/token/revoke",
 		"/oauth2/bc-authorize",
+		"/external-issuers/{id}/verify-id-token",       // the body carries a person's ID token
+		"/external-issuers/{id}/verify-workload-token", // the body carries a workload token
 	))
 
 	return config
@@ -224,12 +293,124 @@ func (a *API) SetPrincipalResolverFunc(fn PrincipalResolverFunc) {
 	a.resolvePrincipal = fn
 }
 
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token (token.require_dpop):
+// when true, issuance without a valid proof is refused with invalid_dpop_proof
+// and the AS metadata advertises dpop_bound_access_tokens_required: true.
+// Safe to call at runtime.
+func (a *API) SetDPoPRequired(required bool) {
+	a.dpopRequired.Store(required)
+}
+
+// SetRegistrationEndpoint sets the registration_endpoint advertised in AS
+// metadata. Empty restores the default, {issuer}/oauth2/register. The value is
+// published verbatim; validation is the caller's job (Server does it). Safe to
+// call at runtime.
+func (a *API) SetRegistrationEndpoint(endpoint string) {
+	a.registrationEndpoint.Store(&endpoint)
+}
+
+// advertisedRegistrationEndpoint is the registration_endpoint value for AS
+// metadata: the configured override when one is set, else ZeroID's own.
+func (a *API) advertisedRegistrationEndpoint() string {
+	if p := a.registrationEndpoint.Load(); p != nil && *p != "" {
+		return *p
+	}
+
+	return a.issuer + "/oauth2/register"
+}
+
 // SetCIMDEnabled records whether CIMD (Client ID Metadata Documents) resolution
 // is active on this deployment, so the OAuth 2.0 Authorization Server Metadata
 // document advertises client_id_metadata_document_supported accordingly. Called
 // by Server.NewServer from cfg.CIMD.Enabled.
 func (a *API) SetCIMDEnabled(enabled bool) {
 	a.cimdEnabled = enabled
+}
+
+// refusesRedirectTo reports whether this deployment declines to send a user
+// agent somewhere on behalf of client. The single predicate behind the §4.1.2.1
+// carve-out (redirectAuthorizeError, used by failAuthorize and denyAuthorize)
+// and redirectToInteractiveLogin's refusal, so they cannot drift.
+//
+// It used to add a second gate for self-asserted clients: a remote https
+// redirect_uri was refused unless cimd.allowed_domains named the publisher.
+// That inverted the meaning of an empty allow-list. Everywhere else, empty is
+// the OPEN-ecosystem default — any public https host may publish, and the
+// documented contract is that an operator sets a list to close the ecosystem,
+// not to open it. Here alone, empty was the most restrictive setting, and
+// setting a list was what unlocked the flow.
+//
+// The effect was a deployment where a desktop or CLI client worked and a hosted
+// one could not reach the consent screen at all, failing with "interactive
+// authentication required but unavailable" — an error naming the login surface
+// rather than the allow-list that actually refused the hop. Loopback callbacks
+// were exempt, so the shape that most CIMD clients have hid it.
+//
+// cimd.allowed_domains is now enforced in ONE place: document resolution. A
+// host that is not listed never resolves, so a client that reached this point
+// has already been admitted by whatever policy the deployer set. Gating the
+// redirect again asked the same question twice and answered it differently.
+//
+// What this gives up, stated plainly: with an empty allow-list, an
+// unauthenticated caller can make /oauth2/authorize emit a §4.1.2.1 error
+// redirect to a host they chose by publishing a document that names it. That is
+// the open-redirect surface an open ecosystem has. A deployer who does not want
+// it sets cimd.allowed_domains, which is the lever that was always meant to
+// close the ecosystem.
+func (a *API) refusesRedirectTo(client *domain.OAuthClient, _ string) bool {
+	// A nil client refuses. Both callers happen to check that themselves, but a
+	// security predicate answering "go ahead" where there is no client to
+	// reason about is the wrong default to leave lying around for the third.
+	return client == nil
+}
+
+// SetAuthorizationCodeAvailable records a predicate reporting whether
+// /oauth2/authorize can serve a request on this deployment.
+//
+// AS metadata is a promise. ZeroID previously advertised
+// authorization_code and client_id_metadata_document_supported
+// unconditionally while /oauth2/authorize answered 503 for every
+// deployment that registered no PrincipalResolver — and an MCP client
+// that believed the metadata skipped CIMD and fell back to dynamic client
+// registration (#263). Discovery must not name a flow the endpoint cannot
+// complete.
+//
+// The predicate gates the endpoint as well as the document: authorizeHandler
+// answers 503 when it reports false, on both GET and POST. Editing only the
+// metadata would leave a deployer who turned the flow off still serving it.
+//
+// A predicate rather than a bool because RegisterPrincipalResolver is
+// documented as safe to call after NewServer.
+func (a *API) SetAuthorizationCodeAvailable(fn func() bool) {
+	a.authorizationCodeAvailable = fn
+}
+
+// canServeAuthorizationCode reports the predicate's answer, defaulting to
+// true when no predicate was set.
+func (a *API) canServeAuthorizationCode() bool {
+	return a.authorizationCodeAvailable == nil || a.authorizationCodeAvailable()
+}
+
+// SetInteractiveLoginURL records where to send a user agent when a
+// PrincipalResolver reports ErrPrincipalInteractionRequired. See
+// Server.SetInteractiveLoginURL for the contract.
+func (a *API) SetInteractiveLoginURL(fn func(*service.AuthorizeRequest) string) {
+	a.interactiveLoginURL = fn
+}
+
+// SetInteractiveLoginPassthroughParams records the source of the allowlist of
+// extra authorize parameters preserved into return_to. See
+// Server.SetInteractiveLoginPassthroughParams for the contract; the names it
+// returns must already have passed ValidateInteractiveLoginPassthroughParams.
+func (a *API) SetInteractiveLoginPassthroughParams(fn func() []string) {
+	a.interactiveLoginPassthrough = fn
+}
+
+// SetTenantSettingsService wires the per-tenant settings routes. Kept as a
+// setter, like the other optional wiring here, so NewAPI's signature does not
+// grow for every new admin surface.
+func (a *API) SetTenantSettingsService(svc *service.TenantSettingsService) {
+	a.tenantSettingsSvc = svc
 }
 
 // RegisterAdmin registers admin/management endpoints:
@@ -241,7 +422,11 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerCredentialRoutes(api)
 	a.registerAttestationRoutes(api)
 	a.registerAttestationPolicyRoutes(api)
+	if a.tenantSettingsSvc != nil {
+		a.registerTenantSettingsRoutes(api)
+	}
 	a.registerOAuthClientRoutes(api)
+	a.registerIdentityOAuthClientRoutes(api)
 	a.registerAPIKeyRoutes(api)
 	a.registerAgentRoutes(api)
 	a.registerSignalRoutes(api, router)
@@ -252,6 +437,9 @@ func (a *API) RegisterAdmin(api huma.API, router chi.Router) {
 	a.registerSigningCredentialRoutes(api)
 	a.registerDelegationRoutes(api)
 	a.registerObservedResourceRoutes(api)
+	if a.externalIssuerSvc != nil {
+		a.registerExternalIssuerRoutes(api)
+	}
 }
 
 // RegisterAgentAuth registers endpoints requiring agent-auth middleware (proof generation).

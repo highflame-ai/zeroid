@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/lestrrat-go/jwx/v4/jwt"
@@ -255,24 +256,27 @@ func TestRevocationNotifier_FiresOnRefreshReuse(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	_ = resp.Body.Close()
 
-	// Replaying the now-revoked original token (outside the grace window is not
-	// guaranteed here, but reuse detection still revokes the family) — assert at
-	// least that the reuse path can fire events. To force reuse outside the
-	// grace window deterministically we replay the consumed token again.
+	// Replaying the now-rotated original token after the reuse grace window is
+	// reuse: the family is revoked. (Within the window it would be refused as a
+	// concurrent retry, with no events.)
+	backdateRotation(t, refreshToken, time.Hour)
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "refresh_token",
 		"client_id":     testMCPClientID,
 		"refresh_token": refreshToken,
 	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	_ = resp.Body.Close()
 
-	// The replay is treated as a concurrent retry within the grace window
-	// (benign) OR as reuse (family revoked + events). Either way the call must
-	// not 5xx. When reuse fired, events carry the refresh_token_reuse reason and
-	// the refresh-token row UUID as the JTI surrogate.
+	// Events are dispatched on a detached goroutine; wait for them. The family
+	// revocation reaches the successor refresh token (one event, the row UUID
+	// as JTI surrogate) and the access tokens issued from the family.
+	require.Eventually(t, func() bool {
+		return len(revocationCapture.forReason("refresh_token_reuse")) > len(before)
+	}, 5*time.Second, 20*time.Millisecond, "reuse detection must emit revocation events")
 	after := revocationCapture.forReason("refresh_token_reuse")
 	for _, e := range after[len(before):] {
-		assert.NotEmpty(t, e.JTI, "refresh revocation event must carry the row UUID as JTI surrogate")
+		assert.NotEmpty(t, e.JTI, "refresh revocation event must carry a JTI (or the row UUID as surrogate)")
 		assert.Equal(t, "refresh_token_reuse", e.Reason)
 	}
 }

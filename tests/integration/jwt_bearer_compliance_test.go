@@ -11,10 +11,13 @@
 package integration_test
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/json"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 
@@ -62,9 +65,186 @@ func postJwtBearer(t *testing.T, assertion string) *http.Response {
 	t.Helper()
 	return post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"assertion":  assertion,
+		"scope":      "data:read",
+	}, nil)
+}
+
+// ── RFC 7523 §2.1 — The parameter carrying the assertion ────────────────────
+//
+// These three are positive-path by necessity, against COMPLIANCE.md's
+// negative-space default. The clause being asserted is the NAME of a request
+// parameter, and the only way to prove a name is accepted is to send it and get
+// a token back. Asserting it negatively — "some other name is rejected" — is
+// what the suite already did implicitly, and it is exactly why the gap survived:
+// every jwt-bearer test in this repo sent ZeroID's own `subject` spelling, so
+// the suite was green while no standards-conformant client could redeem an
+// assertion against us at all.
+
+func TestRFC7523_S2_1_AssertionParameterAccepted(t *testing.T) {
+	// RFC 7523 §2.1: "The value of the 'assertion' parameter MUST contain a
+	//   single JWT." The parameter is named `assertion`, and that is what every
+	//   conformant client — including Okta's Cross App Access and the MCP
+	//   reference client — puts the JWT in.
+	f := setupJwtBearerFixture(t)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"assertion":  buildAssertion(t, f.Key, f.WIMSEURI),
+		"scope":      "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"a conformant client sends the JWT in `assertion`; rejecting it makes "+
+			"the jwt-bearer grant unreachable from any standards-built client")
+
+	body := decode(t, resp)
+	assert.NotEmpty(t, body["access_token"])
+}
+
+func TestRFC7523_S2_1_AssertionAcceptedFormEncoded(t *testing.T) {
+	// RFC 7523 §2.1 assertions ride an OAuth token request, and RFC 6749 §4.1.3
+	// makes that request "application/x-www-form-urlencoded". A conformant
+	// client therefore sends form-encoded `assertion`, NOT JSON — so the
+	// JSON-bodied test above proves the field binds but not that the real wire
+	// shape works. This is the exact request an off-the-shelf client emits, and
+	// the one that returned 400 before the fix.
+	f := setupJwtBearerFixture(t)
+
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+	form.Set("assertion", buildAssertion(t, f.Key, f.WIMSEURI))
+	form.Set("scope", "data:read")
+
+	req, err := http.NewRequest(http.MethodPost,
+		testServer.URL+"/oauth2/token",
+		bytes.NewReader([]byte(form.Encode())),
+	)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"form-encoded `assertion` is the wire shape every conformant client "+
+			"sends; this is the request that used to 400")
+
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.NotEmpty(t, body["access_token"])
+}
+
+func TestRFC7523_S2_1_SubjectRemainsAcceptedAsDeprecatedAlias(t *testing.T) {
+	// Not an RFC clause — a ZeroID back-compat guarantee. `subject` predates
+	// conformance here and is what in-tree callers and deployed SDKs send.
+	// Adding `assertion` MUST NOT break them, so this is the regression that
+	// keeps the alias alive until those callers have migrated.
+	f := setupJwtBearerFixture(t)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"subject":    buildAssertion(t, f.Key, f.WIMSEURI),
+		"scope":      "data:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"the deprecated alias must keep working while callers migrate")
+
+	body := decode(t, resp)
+	assert.NotEmpty(t, body["access_token"])
+}
+
+func TestRFC7523_S2_1_MissingAssertionErrorNamesTheRFCParameter(t *testing.T) {
+	// Not an RFC clause — the diagnostic that teaches a client our dialect.
+	// The "required" error used to read "subject (assertion JWT) is required",
+	// so a conformant client that omitted the assertion was steered at the
+	// deprecated name by the very message meant to help it. Error text is how
+	// integrators learn a wire format; pointing them at `subject` here would
+	// keep reproducing the bug this suite exists to close.
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"scope":      "data:read",
+		// neither assertion nor subject supplied
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_request", body["error"])
+
+	desc, _ := body["error_description"].(string)
+	assert.Contains(t, desc, "assertion",
+		"the required-parameter error must name the RFC 7523 §2.1 parameter")
+	assert.NotContains(t, desc, "subject",
+		"the error must not steer a conformant client at the deprecated alias")
+}
+
+func TestRFC7523_S2_1_SubjectMarkedDeprecatedInOpenAPI(t *testing.T) {
+	// Not an RFC clause. The audience for this deprecation is machines —
+	// generated SDKs, spec tooling, the clients we are asking to migrate onto
+	// `assertion`. A Go doc string deprecates the field only for people reading
+	// our source, which is nobody in that audience. This asserts the signal
+	// reaches the channel they actually read, and keeps it from being dropped
+	// by a future refactor of the request struct.
+	resp := get(t, "/openapi.json", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	spec := decode(t, resp)
+	components, _ := spec["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	body, _ := schemas["TokenInputBody"].(map[string]any)
+	props, _ := body["properties"].(map[string]any)
+	require.NotNil(t, props, "TokenInputBody schema must expose its properties")
+
+	require.Contains(t, props, "assertion",
+		"the RFC 7523 §2.1 parameter must appear in the published schema, or a "+
+			"generated client has no way to discover it")
+
+	subject, _ := props["subject"].(map[string]any)
+	require.NotNil(t, subject, "the deprecated alias stays in the schema while it still works")
+	assert.Equal(t, true, subject["deprecated"],
+		"`subject` must be advertised as deprecated so generated clients and "+
+			"spec tooling steer callers to `assertion`")
+}
+
+func TestRFC7523_S2_1_ConflictingAssertionAndSubjectRejected(t *testing.T) {
+	// Not an RFC clause — the disambiguation rule the alias forces us to have.
+	// Two DIFFERENT assertions in one request is a red flag, not a merge:
+	// silently preferring one would accept a request that presented two
+	// credentials and pick a winner the caller never chose. Fail closed.
+	f := setupJwtBearerFixture(t)
+	other := setupJwtBearerFixture(t)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"assertion":  buildAssertion(t, f.Key, f.WIMSEURI),
+		"subject":    buildAssertion(t, other.Key, other.WIMSEURI),
+		"scope":      "data:read",
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"two different assertions in one request must be refused, not resolved")
+
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_request", body["error"])
+}
+
+func TestRFC7523_S2_1_IdenticalAssertionAndSubjectAccepted(t *testing.T) {
+	// The migration case: a client moving from `subject` to `assertion` may
+	// reasonably send both during the transition. Identical values are
+	// unambiguous, so the conflict rule above MUST NOT punish them.
+	f := setupJwtBearerFixture(t)
+	assertion := buildAssertion(t, f.Key, f.WIMSEURI)
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"assertion":  assertion,
 		"subject":    assertion,
 		"scope":      "data:read",
 	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"the same assertion under both names is unambiguous")
+
+	body := decode(t, resp)
+	assert.NotEmpty(t, body["access_token"])
 }
 
 // ── RFC 7523 §3 — Required claims on the assertion ──────────────────────────

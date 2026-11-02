@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -46,6 +47,53 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetByIDInAccounts retrieves an identity by its UUID, provided it belongs to
+// one of accountIDs. The project is not constrained: it is read FROM the row.
+//
+// It exists for one caller shape, where the id is a server-held reference and
+// the tenant is what the lookup is meant to discover: an OAuth client's
+// identity_id link, resolved against an external issuer's allowed_accounts on
+// the ID-JAG grant. The account constraint is applied in SQL, so a link into a
+// tenant the issuer does not admit is indistinguishable from no row at all and
+// nothing outside the admitted set is ever loaded. Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the project too.
+//
+// An empty accountIDs matches nothing. It short-circuits to sql.ErrNoRows
+// rather than emitting `IN ()`.
+func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, accountIDs []string) (*domain.Identity, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("failed to get identity: %w", sql.ErrNoRows)
+	}
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id IN (?)", bun.List(accountIDs)).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetLinkedByID loads the identity an OAuth client's registration links to
+// (oauth_clients.identity_id), in whatever tenant it lives. Unscoped on
+// purpose: the tenant is what the caller is trying to learn, and the link was
+// written by an administrator inside that identity's own tenant (the client
+// create handler refuses a foreign identity_id). Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the tenant.
+func (r *IdentityRepository) GetLinkedByID(ctx context.Context, id string) (*domain.Identity, error) {
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get linked identity: %w", err)
 	}
 	return identity, nil
 }
@@ -125,7 +173,10 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	q := db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
-		OrderExpr("created_at DESC")
+		// Adopted identities sort by when they were adopted, not when a
+		// connector first saw them (migration 045); everything else keeps its
+		// creation time. id breaks ties so offset pagination is stable.
+		OrderExpr("COALESCE(adopted_at, created_at) DESC, id DESC")
 
 	if len(identityTypes) == 1 {
 		q = q.Where("identity_type = ?", identityTypes[0])
@@ -224,6 +275,42 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 		return nil, 0, fmt.Errorf("failed to list identities: %w", err)
 	}
 	return identities, total, nil
+}
+
+// ListByOwnerForOffboard returns every not-yet-deactivated identity owned by
+// ownerUserID within accountID — deliberately ACROSS ALL PROJECTS, unlike List:
+// offboarding a human (INV-IDN-010 / ADR 0028 D5) must sweep every project the
+// account has, mirroring the (owner_user_id, account_id) scoping of the
+// revoke_credentials_by_owner cascade (migration 041). No status default is
+// applied beyond excluding already-deactivated rows: discovered/pending/
+// suspended/expired identities all transition legally to deactivated
+// (domain.CanTransitionTo), and an offboarding must not leave a suspended or
+// discovered row able to return to service later.
+//
+// Both arguments are required: identities.owner_user_id is NOT NULL, so
+// ownerless identities store the empty string and a blank owner would match
+// every one of them (the same footgun the service-layer and SQL guards on the
+// credential cascade close — see RevokeAllActiveForOwner).
+func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUserID, accountID string) ([]*domain.Identity, error) {
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return nil, fmt.Errorf(
+			"ListByOwnerForOffboard requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ownerUserID, accountID)
+	}
+
+	var identities []*domain.Identity
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
+		Where("account_id = ?", accountID).
+		Where("owner_user_id = ?", ownerUserID).
+		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		OrderExpr("created_at ASC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list identities for owner %s in account %s: %w", ownerUserID, accountID, err)
+	}
+	return identities, nil
 }
 
 // ListByExternalIDs fetches identities by external_id within a tenant. external_id
@@ -506,6 +593,15 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 // caller_name on the context stamps modified_by so the audit trigger records who
 // pruned. Scoped by source_id so one connector's sweep never touches another's
 // agents of the same origin. Returns the number of rows deactivated.
+// notApprovalChannel is the predicate the discovery sweeps (prune, release,
+// purge) add so they never touch an approval channel: sub_type
+// approval_channel, or ciba:approve listed on the identity or its credential
+// policy.
+const notApprovalChannel = `identities.sub_type IS DISTINCT FROM 'approval_channel'
+	AND NOT COALESCE('ciba:approve' = ANY(identities.allowed_scopes), false)
+	AND NOT EXISTS (SELECT 1 FROM credential_policies cp
+		WHERE cp.id = identities.credential_policy_id AND 'ciba:approve' = ANY(cp.allowed_scopes))`
+
 func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
 	db := dbOrTx(ctx, r.db)
 	q := db.NewUpdate().
@@ -522,6 +618,7 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 		Where("source_id = ?", sourceID).
 		Where("status = ?", string(domain.IdentityStatusDiscovered)).
 		Where("updated_at < ?", notSeenSince).
+		Where(notApprovalChannel).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
@@ -529,6 +626,110 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("deactivate stale discovered rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// ReleaseDiscoveredSource clears source_id on every still-`discovered` identity
+// belonging to (origin, source_id), returning the number of rows released.
+//
+// Called when a discovery connector is deleted. Reconcile adopts a source_id
+// only onto a row that has none — it never overwrites one, so that a live
+// connector cannot claim another live connector's rows. That guard is right,
+// but it leaves a deleted connector's rows pointing at it forever: the
+// connector never syncs again, and prune is scoped `WHERE source_id = ?`, so
+// nothing can sweep them. Releasing the claim at delete time lets the existing
+// adopt-when-empty branch hand those rows to whichever connector rediscovers
+// them next.
+//
+// Only `discovered` rows are touched. An adopted or dismissed identity keeps
+// its source_id as provenance — it is outside prune scope anyway, so a stale
+// pointer there is a historical record, not a leak.
+func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
+	db := dbOrTx(ctx, r.db)
+	q := db.NewUpdate().
+		TableExpr("identities").
+		Set("source_id = ?", "").
+		Set("updated_at = ?", time.Now())
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		q = q.Set("modified_by = ?", callerID)
+	}
+	res, err := q.
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("source_id = ?", sourceID).
+		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where(notApprovalChannel).
+		Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source rows: %w", err)
+	}
+	return int(n), nil
+}
+
+// PurgeDiscoveredSource hard-deletes every still-`discovered` identity belonging
+// to (origin, source_id), returning the number of rows removed.
+//
+// Called when a discovery connector is deleted: the agents it found are
+// inventory belonging to that connection, so removing the connection removes
+// them (highflame-discovery#65). A `discovered` row carries no owner and no
+// credentials — nothing cascades — so this is a plain delete rather than the
+// deactivation cascade a real identity would need.
+//
+// DELETE rather than a status flip on purpose. `deactivated` is terminal
+// (CanTransitionTo allows only →active) and reconcile never touches lifecycle,
+// so a deactivated row would be resurrected by nothing: re-adding the same
+// connector would rediscover the agent, reconcile onto the dead row, and leave
+// it invisible forever. Deleting lets a re-added connector recreate it cleanly.
+//
+// Only `discovered` rows are removed. Anything a human has acted on — `pending`
+// (owner assigned), `active`, `suspended` — has graduated past inventory and is
+// left alone; retiring those is a deliberate identity-lifecycle decision, not a
+// side effect of removing a connector.
+//
+// modified_by is stamped immediately before the delete because the audit trigger
+// reads OLD.modified_by on DELETE (see 012_identity_audit_trigger). Without it
+// the audit row attributes the removal to whoever last touched the identity
+// rather than to the purge. The audit log therefore survives the row.
+func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountID, projectID, origin, sourceID string) (int, error) {
+	db := dbOrTx(ctx, r.db)
+
+	// The stamp and the delete MUST match on exactly the same rows: a wider
+	// delete would remove identities the stamp never attributed, and a narrower
+	// one would leave rows stamped-but-present. bun.QueryBuilder is the shared
+	// interface over UpdateQuery and DeleteQuery, so both take their predicate
+	// from this one definition rather than from two lists kept in step by hand.
+	scope := func(qb bun.QueryBuilder) bun.QueryBuilder {
+		return qb.Where("account_id = ?", accountID).
+			Where("project_id = ?", projectID).
+			Where("origin = ?", origin).
+			Where("source_id = ?", sourceID).
+			Where("status = ?", string(domain.IdentityStatusDiscovered)).
+			Where(notApprovalChannel)
+	}
+
+	if callerID := middleware.GetCallerName(ctx); callerID != "" {
+		stamp := db.NewUpdate().TableExpr("identities").Set("modified_by = ?", callerID)
+		scope(stamp.QueryBuilder())
+		if _, err := stamp.Exec(ctx); err != nil {
+			return 0, fmt.Errorf("stamp modified_by before purge: %w", err)
+		}
+	}
+
+	del := db.NewDelete().TableExpr("identities")
+	scope(del.QueryBuilder())
+	res, err := del.Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source rows: %w", err)
 	}
 	return int(n), nil
 }

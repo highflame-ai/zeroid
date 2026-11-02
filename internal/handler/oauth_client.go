@@ -20,7 +20,7 @@ import (
 type CreateOAuthClientInput struct {
 	Body struct {
 		// Core
-		ClientID    string `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier"`
+		ClientID    string `json:"client_id" required:"true" minLength:"1" doc:"Globally unique client identifier. Must not contain '#', which is reserved for federated client ids (<iss>#<sub>)."`
 		Name        string `json:"name" required:"true" minLength:"1" doc:"Client display name"`
 		Description string `json:"description,omitempty" doc:"Human-readable description"`
 
@@ -53,9 +53,12 @@ type CreateOAuthClientInput struct {
 
 		// IdentityID optionally binds this client to an agent identity.
 		// When set, authorization_code and refresh_token grants gate token
-		// issuance on the linked identity's status + expires_at. The
-		// identity must exist in the caller's tenant (validated below).
-		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to — gates authorization_code and refresh_token grants on the linked identity's status and expires_at"`
+		// issuance on the linked identity's status + expires_at, and the
+		// link decides the identity AND tenant that client_credentials and
+		// ID-JAG tokens are minted for (a request naming another tenant is
+		// refused). The identity must exist in the caller's tenant
+		// (validated below).
+		IdentityID string `json:"identity_id,omitempty" doc:"Optional identity UUID to bind this client to. Gates authorization_code and refresh_token grants on the linked identity's status and expires_at, and decides the identity and tenant (account_id/project_id) that client_credentials and ID-JAG tokens are minted for: such a request may omit account_id/project_id, and one that names a different tenant is refused"`
 
 		// CIBA (OpenID CIBA Core 1.0) — registered callback for ping/push notifications.
 		// Must be HTTPS. Empty when the client only uses polling mode.
@@ -152,7 +155,14 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		if terr != nil {
 			return nil, huma.Error401Unauthorized("missing tenant context")
 		}
-		if _, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
+		bound, err := a.identitySvc.GetIdentity(ctx, input.Body.IdentityID, tenant.AccountID, tenant.ProjectID)
+		if err == nil {
+			// A client bound to an approval channel is a credential for it.
+			if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, bound); err != nil {
+				return nil, oauthClientWriteError(err)
+			}
+		}
+		if err != nil {
 			// Distinguish caller-fixable not-found-in-tenant (400) from
 			// transient DB errors (500). The repo wraps sql.ErrNoRows in
 			// its "failed to get identity" string, so unwrap to get the
@@ -162,6 +172,23 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 			}
 			log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("identity lookup failed during oauth client create")
 			return nil, huma.Error500InternalServerError("failed to validate identity_id")
+		}
+	}
+
+	// client_credentials resolves the identity whose external_id equals the
+	// client_id, so a client named after an approval channel in the caller's
+	// tenant is a credential for it. Other tenants are covered at issuance:
+	// ciba:approve is minted only from a client registered in the trusted
+	// context.
+	if tenant, terr := internalMiddleware.GetTenant(ctx); terr == nil && input.Body.ClientID != "" {
+		named, err := a.identitySvc.GetIdentityByExternalID(ctx, input.Body.ClientID, tenant.AccountID, tenant.ProjectID)
+		if err == nil {
+			if err := a.identitySvc.RequireTrustedCredentialWrite(ctx, named); err != nil {
+				return nil, oauthClientWriteError(err)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			log.Error().Err(err).Msg("identity lookup failed during oauth client create")
+			return nil, huma.Error500InternalServerError("failed to validate client_id")
 		}
 	}
 
@@ -190,6 +217,11 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 		if errors.Is(err, service.ErrOAuthClientAlreadyExists) {
 			return nil, huma.Error409Conflict("oauth client with this client_id already exists")
 		}
+		// Caller's metadata is bad — a 400 carrying the reason, not a 500 that
+		// blames the server and hides the actionable message in a log line.
+		if errors.Is(err, service.ErrInvalidClientMetadata) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		log.Error().Err(err).Msg("failed to register oauth client")
 		return nil, huma.Error500InternalServerError("failed to register oauth client")
 	}
@@ -206,7 +238,7 @@ func (a *API) createOAuthClientOp(ctx context.Context, input *CreateOAuthClientI
 }
 
 func (a *API) getOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientOutput, error) {
-	client, err := a.oauthClientSvc.GetClient(ctx, input.ID)
+	client, err := a.tenantScopedClient(ctx, input.ID)
 	if err != nil {
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
@@ -225,6 +257,11 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 		return nil, huma.Error500InternalServerError("failed to list oauth clients")
 	}
 
+	clients, err = a.filterClientsToTenant(ctx, clients)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to scope oauth clients to tenant")
+		return nil, huma.Error500InternalServerError("failed to list oauth clients")
+	}
 	if clients == nil {
 		clients = []*domain.OAuthClient{}
 	}
@@ -235,8 +272,18 @@ func (a *API) listOAuthClientsOp(ctx context.Context, _ *struct{}) (*OAuthClient
 }
 
 func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientIDInput) (*OAuthClientCreatedOutput, error) {
+	if _, err := a.tenantScopedClient(ctx, input.ID); err != nil {
+		if errors.Is(err, service.ErrOAuthClientNotFound) {
+			return nil, huma.Error404NotFound("oauth client not found")
+		}
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to get oauth client")
+		return nil, huma.Error500InternalServerError("failed to rotate secret")
+	}
 	client, plainSecret, err := a.oauthClientSvc.RotateSecret(ctx, input.ID)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		if errors.Is(err, service.ErrOAuthClientNotFound) {
 			return nil, huma.Error404NotFound("oauth client not found")
 		}
@@ -252,7 +299,24 @@ func (a *API) rotateOAuthClientSecretOp(ctx context.Context, input *OAuthClientI
 }
 
 func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput) (*DeleteOAuthClientOutput, error) {
+	// Deleting a client that does not exist answers 200 without doing anything.
+	// A client hidden from the caller's tenant is answered the same way, so a
+	// tenant cannot tell "not yours" from "not there", and is left untouched.
+	_, err := a.tenantScopedClient(ctx, input.ID)
+	switch {
+	case errors.Is(err, service.ErrOAuthClientNotFound):
+		out := &DeleteOAuthClientOutput{}
+		out.Body.Deleted = true
+		out.Body.ID = input.ID
+		return out, nil
+	case err != nil:
+		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to get oauth client")
+		return nil, huma.Error500InternalServerError("failed to delete oauth client")
+	}
 	if err := a.oauthClientSvc.DeleteClient(ctx, input.ID); err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		log.Error().Err(err).Str("client_id", input.ID).Msg("failed to delete oauth client")
 		return nil, huma.Error500InternalServerError("failed to delete oauth client")
 	}
@@ -261,4 +325,81 @@ func (a *API) deleteOAuthClientOp(ctx context.Context, input *OAuthClientIDInput
 	out.Body.Deleted = true
 	out.Body.ID = input.ID
 	return out, nil
+}
+
+// oauthClientWriteError maps a refused approval-channel write to 403 and any
+// other failure of the check to 500.
+func oauthClientWriteError(err error) error {
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
+	}
+	log.Error().Err(err).Msg("approval-channel check failed during oauth client create")
+	return huma.Error500InternalServerError("failed to validate the client's identity")
+}
+
+// Clients are global: an oauth_clients row has no tenant columns. A client
+// linked to an identity (identity_id) takes that identity's tenant, though,
+// and that link decides which tenant client_credentials and ID-JAG tokens are
+// minted into, so the admin routes must not let one tenant act on a client
+// linked into another.
+//
+// The rule: a caller with a tenant in context sees a client only when it is
+// unlinked (global) or its linked identity is in that tenant. A caller with no
+// tenant in context (a trusted internal service) sees every client, as before.
+
+// tenantScopedClient loads a client by UUID and returns
+// service.ErrOAuthClientNotFound for one the caller's tenant may not see, so
+// tenants cannot probe each other's clients.
+func (a *API) tenantScopedClient(ctx context.Context, id string) (*domain.OAuthClient, error) {
+	client, err := a.oauthClientSvc.GetClient(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	tenant, terr := internalMiddleware.GetTenant(ctx)
+	if terr != nil || client.IdentityID == nil {
+		return client, nil
+	}
+	if _, err := a.identitySvc.GetIdentity(ctx, *client.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, service.ErrOAuthClientNotFound
+		}
+		return nil, err
+	}
+	return client, nil
+}
+
+// filterClientsToTenant drops the clients tenantScopedClient would hide, using
+// one identity lookup for the whole list.
+func (a *API) filterClientsToTenant(ctx context.Context, clients []*domain.OAuthClient) ([]*domain.OAuthClient, error) {
+	tenant, terr := internalMiddleware.GetTenant(ctx)
+	if terr != nil {
+		return clients, nil
+	}
+	var linked []string
+	for _, c := range clients {
+		if c.IdentityID != nil {
+			linked = append(linked, *c.IdentityID)
+		}
+	}
+	if len(linked) == 0 {
+		return clients, nil
+	}
+	identities, err := a.identitySvc.GetIdentitiesByIDs(ctx, linked, tenant.AccountID, tenant.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	inTenant := make(map[string]struct{}, len(identities))
+	for _, id := range identities {
+		inTenant[id.ID] = struct{}{}
+	}
+	visible := make([]*domain.OAuthClient, 0, len(clients))
+	for _, c := range clients {
+		if c.IdentityID != nil {
+			if _, ok := inTenant[*c.IdentityID]; !ok {
+				continue
+			}
+		}
+		visible = append(visible, c)
+	}
+	return visible, nil
 }

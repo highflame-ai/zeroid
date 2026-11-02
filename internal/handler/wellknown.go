@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/lestrrat-go/jwx/v4/jwk"
@@ -34,6 +35,13 @@ type OAuthMetadataOutput struct {
 	Body map[string]any
 }
 
+// OpenIDConfigurationOutput is the OpenID Connect Discovery 1.0 document
+// published at /.well-known/openid-configuration. See openidConfigurationOp for
+// why ZeroID serves this path despite not being an OpenID Provider.
+type OpenIDConfigurationOutput struct {
+	Body map[string]any
+}
+
 // ProtectedResourceMetadataOutput is the RFC 9728 OAuth 2.0 Protected Resource
 // Metadata document published at /.well-known/oauth-protected-resource. Agents
 // that hit a 401 with a WWW-Authenticate: Bearer resource_metadata="…" header
@@ -44,6 +52,18 @@ type ProtectedResourceMetadataOutput struct {
 }
 
 // ── Well-known routes ────────────────────────────────────────────────────────
+
+// clientAssertionSigningAlgs is the algorithm set a private_key_jwt client may
+// sign its client_assertion with, advertised on every endpoint that accepts one.
+// Kept deliberately in step with internal/jwtalg's allow-list, which is what
+// actually gates the JWS header at verification time — this member is the
+// advertised view of that same set, and the two drifting apart would recreate
+// the advertised-but-unusable gap this whole change exists to close.
+var clientAssertionSigningAlgs = []string{
+	"ES256", "ES384", "ES512",
+	"RS256", "RS384", "RS512",
+	"PS256", "PS384", "PS512",
+}
 
 func (a *API) registerWellKnownRoutes(api huma.API) {
 	huma.Register(api, huma.Operation{
@@ -69,6 +89,14 @@ func (a *API) registerWellKnownRoutes(api huma.API) {
 		Summary:     "OAuth 2.0 Authorization Server Metadata",
 		Tags:        []string{"Discovery"},
 	}, a.oauthMetadataOp)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "openid-configuration",
+		Method:      http.MethodGet,
+		Path:        "/.well-known/openid-configuration",
+		Summary:     "OpenID Connect Discovery 1.0 metadata",
+		Tags:        []string{"Discovery"},
+	}, a.openidConfigurationOp)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "oauth-protected-resource",
@@ -113,16 +141,127 @@ func (a *API) spiffeTrustBundleOp(_ context.Context, _ *struct{}) (*SPIFFETrustB
 	return &SPIFFETrustBundleOutput{Body: body}, nil
 }
 
+// pruneEmptyClaims deletes every member whose value is a zero-length array.
+//
+// RFC 8414 §2 and OpenID Connect Discovery 1.0 §3 both say, in the same words:
+// "Claims with zero elements MUST be omitted from the response." An empty array
+// is not a weaker way of saying "none" — to a conformant consumer it is not a
+// legal value at all, so emitting one makes the whole document non-conformant
+// (zeroid#316).
+//
+// This is a sweep over the finished document rather than three careful
+// decisions at three literal sites, because the rule is about the SHAPE of any
+// member, not about the three members that happen to be empty today. A member
+// added later that turns out empty on some deployment is covered without anyone
+// remembering this clause exists — which is the failure mode that produced the
+// bug, since two of the three offenders were written by someone who had read the
+// RFC.
+//
+// Only empty arrays and nils are pruned. `false` is a meaningful value for a
+// boolean claim (backchannel_user_code_parameter_supported,
+// dpop_bound_access_tokens_required) and dropping it would silently flip the
+// claim's meaning to "unspecified" — a different bug in the same family as the
+// one being fixed. Likewise an empty STRING is left alone: it is a legal value
+// for a string-valued member, and the RFC clause is about elements, not bytes.
+//
+// Three kinds reach the "omit" decision, for one reason each:
+//
+//   - Slice — the live case. Covers []string, []any and whatever slice type a
+//     future member carries.
+//   - Array — a fixed-size [0]T also serialises to `[]`, so a member declared
+//     that way would be non-conformant in exactly the way this function exists
+//     to prevent, while slipping a slice-only check.
+//   - Invalid — a bare `nil` stored in the map serialises to `"member": null`,
+//     which is not a legal value for an array-valued member either. Omission is
+//     what the RFC asks for; emitting null just moves the non-conformance.
+//
+// Neither Array nor Invalid is reachable from any member built today. They are
+// here because the promise this function makes is about the SHAPE of a value,
+// and a promise with two uncovered shapes is the kind that gets relied on and
+// then quietly broken.
+//
+// ── One thing this sweep cannot decide, and a future member must ─────────────
+//
+// Omitting a member is only equivalent to "none" when the spec defines no
+// default for its absence. Three members here have RFC-defined defaults, so
+// dropping them would advertise MORE than an empty list, not less:
+//
+//	grant_types_supported                 RFC 8414 §2 → ["authorization_code",
+//	                                      "implicit"] — the implicit flow that
+//	                                      OAuth 2.1 removes
+//	token_endpoint_auth_methods_supported RFC 8414 §2 → client_secret_basic
+//	bearer_methods_supported              RFC 9728 §2 → re-opens `query`, i.e.
+//	                                      tokens in URLs and therefore in access
+//	                                      logs — the case prm_compliance_test.go
+//	                                      asserts against
+//
+// All three are non-empty literals today, so the sweep never sees them and the
+// hazard is latent. If one is ever made computed, give it an explicit non-empty
+// floor at its construction site rather than letting it reach this function —
+// "the sweep will handle it" is correct about conformance and wrong about
+// meaning.
+func pruneEmptyClaims(body map[string]any) map[string]any {
+	for name, value := range body {
+		switch rv := reflect.ValueOf(value); rv.Kind() {
+		case reflect.Invalid:
+			// value == nil; reflect.ValueOf yields the zero Value, whose Len
+			// would panic. Checked first so the length test below is safe.
+			delete(body, name)
+		case reflect.Slice, reflect.Array:
+			if rv.Len() == 0 {
+				delete(body, name)
+			}
+		}
+	}
+
+	return body
+}
+
 func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOutput, error) {
+	return &OAuthMetadataOutput{Body: pruneEmptyClaims(a.buildASMetadata())}, nil
+}
+
+// buildASMetadata constructs the RFC 8414 Authorization Server Metadata
+// document. Returns a FRESH map on every call — both /.well-known/
+// oauth-authorization-server and /.well-known/openid-configuration serve it,
+// and the OIDC document adds members to what it gets back. A shared or cached
+// map would let the OIDC-only members leak into the RFC 8414 document.
+func (a *API) buildASMetadata() map[string]any {
+	// Evaluate the gate ONCE per request. The predicate is deliberately
+	// dynamic — a deployer may register resolvers after NewServer — so calling
+	// it twice could emit a document advertising CIMD without the
+	// authorization_code grant CIMD applies to, or the reverse.
+	servesAuthorizationCode := a.canServeAuthorizationCode()
+
 	body := map[string]any{
-		"issuer":         a.issuer,
-		"token_endpoint": a.issuer + "/oauth2/token",
+		"issuer": a.issuer,
+		// REQUIRED by RFC 8414 §2 whenever the AS supports the
+		// authorization_code grant — which we advertise below. Omitting it
+		// broke more than discovery ergonomics: OAuthMetadata is a required
+		// field in the MCP Python SDK's model, so the whole document failed
+		// to parse, the client treated the AS as having no metadata, and it
+		// silently fell back to dynamic client registration instead of using
+		// CIMD (#263). A client cannot start the flow it is being told to use
+		// if it cannot find the endpoint.
+		"authorization_endpoint": a.issuer + "/oauth2/authorize",
+		"token_endpoint":         a.issuer + "/oauth2/token",
 		// "none" is advertised because public PKCE clients — including CIMD
 		// clients, whose metadata document is the registration — authenticate
 		// at the token endpoint with PKCE alone and carry no secret.
-		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
+		//
+		// private_key_jwt is advertised as of zeroid#206, and only as of then.
+		// Registration had accepted the value long before, but nothing
+		// validated a client_assertion, so advertising it would have pointed
+		// conformant clients at a method that could not work. It is listed now
+		// because verifyClientAssertion enforces RFC 7523 §2.2 against the
+		// client's registered jwks/jwks_uri.
+		//
+		// client_secret_basic is likewise only now TRUE for this endpoint: the
+		// token endpoint parses the Authorization header as of the same change.
+		// It had been advertised here before any Basic parsing existed, so a
+		// client following this very document had its header ignored.
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
 		"grant_types_supported": []string{
-			"authorization_code",
 			"refresh_token",
 			"client_credentials",
 			"urn:ietf:params:oauth:grant-type:jwt-bearer",
@@ -147,21 +286,64 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		// client_secret_post via body fields). "none" is included because
 		// VerifyPresentedClientAuth accepts a no-secret REGISTERED public
 		// client_id on these endpoints (RFC 7009 §2.1 / RFC 7662 §2.1).
-		// CIMD client_ids are not accepted there — see VerifyPresentedClientAuth.
-		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "none"},
-		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "none"},
-		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — the
-		// implicit "token" flow is not supported), so advertise "code".
-		"response_types_supported":                         []string{"code"},
-		"token_endpoint_auth_signing_alg_values_supported": []string{"ES256", "RS256"},
+		// Revocation additionally accepts CIMD clients (public by client_id,
+		// private_key_jwt by assertion), limited to tokens issued to that
+		// client (OAuthService.RevokeForClient); introspection does not — see
+		// VerifyPresentedClientAuth.
+		"introspection_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
+		"revocation_endpoint_auth_methods_supported":    []string{"client_secret_post", "client_secret_basic", "private_key_jwt", "none"},
+		// RFC 8414 §2 makes these two REQUIRED once the corresponding
+		// *_auth_methods_supported list contains private_key_jwt (or
+		// client_secret_jwt). They were correctly absent before private_key_jwt
+		// was advertised on these endpoints, and adding it without them made the
+		// document non-conformant — the same strict-parser failure class as
+		// #263, and self-defeating for a change whose point is that the
+		// advertisement is finally honest. Same set as the token endpoint: one
+		// allow-list (internal/jwtalg) gates every client assertion regardless
+		// of which endpoint receives it.
+		"introspection_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
+		"revocation_endpoint_auth_signing_alg_values_supported":    clientAssertionSigningAlgs,
+		// RFC 8414 §2 lists this member as REQUIRED, and the VALUE is gated
+		// below: it gains "code" only when the authorization_code flow is
+		// actually servable. When it is not, this stays empty and
+		// pruneEmptyClaims drops the member entirely — §2's "claims with zero
+		// elements MUST be omitted" wins over its REQUIRED, because the two
+		// cannot both be honoured by an AS that supports no response type and
+		// only one of them is unambiguous about what the consumer sees.
+		//
+		// This used to be emitted as an empty array on the theory that omitting
+		// it would break strict parsers the way #263 did. That was wrong, and
+		// specifically wrong about the parser it named: in the MCP Python SDK's
+		// OAuthMetadata model this member is `list[str] = ["code"]` — it has a
+		// DEFAULT, so omission parses fine. `authorization_endpoint` is the one
+		// with no default, which is why that member is still emitted
+		// unconditionally above and this one is not.
+		//
+		// The real cost of omitting is the other side of that same default: a
+		// client using the SDK fills in ["code"] and believes a flow this
+		// deployment cannot serve. It finds out at /oauth2/authorize, which
+		// answers 503 — a failed flow, not a security boundary, and the honest
+		// price of publishing a conformant document.
+		"response_types_supported": []string{},
+		// RFC 8414 — the algorithms a private_key_jwt client may sign its
+		// client_assertion with. Kept in step with internal/jwtalg's allow-list,
+		// which is what actually gates the header at verification time; this
+		// member is the advertised subset clients are expected to use.
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionSigningAlgs,
 
-		// RFC 7591 dynamic client registration.
-		"registration_endpoint": a.issuer + "/oauth2/register",
+		// RFC 7591 dynamic client registration. ZeroID's own endpoint unless
+		// the deployer advertises one hosted elsewhere
+		// (token.registration_endpoint) — RFC 8414 §2 puts no constraint on
+		// where this URL lives.
+		"registration_endpoint": a.advertisedRegistrationEndpoint(),
 
 		// RFC 9449 — Demonstrating Proof of Possession (DPoP). Algorithms the
 		// token endpoint will accept on the DPoP header. Symmetric algs are
 		// excluded by spec.
 		"dpop_signing_alg_values_supported": []string{"ES256", "RS256"},
+		// RFC 9449 §5.1 — true only under token.require_dpop, where the
+		// token endpoint refuses proof-less issuance.
+		"dpop_bound_access_tokens_required": a.dpopRequired.Load(),
 
 		// CIBA (OpenID CIBA Core 1.0) discovery metadata. The fields here
 		// let CIBA-aware clients auto-discover that this AS supports
@@ -171,9 +353,43 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 		"backchannel_user_code_parameter_supported":  false,
 		// We don't accept signed bc-authorize requests in v1 — clients
 		// authenticate via standard client_secret_basic/post against the
-		// backchannel endpoint. An empty array signals "no signing algs
-		// supported" per the spec's MAY clause.
+		// backchannel endpoint.
+		//
+		// Left empty deliberately, and pruneEmptyClaims then drops it: "no
+		// signing algs supported" is expressed by the member's ABSENCE, not by
+		// an empty array. Written as a literal empty slice rather than simply
+		// not listing it so that the reason it is absent stays recorded here —
+		// this was the one offender that was unconditionally non-conformant, on
+		// every deployment, and deleting the line would leave nothing to read.
 		"backchannel_authentication_request_signing_alg_values_supported": []string{},
+	}
+
+	// authorization_code is advertised only when /oauth2/authorize can
+	// actually serve it — i.e. a PrincipalResolver is registered. Prepended
+	// so the list keeps its conventional order. See
+	// API.SetAuthorizationCodeAvailable for why this is gated at all.
+	if servesAuthorizationCode {
+		grants, _ := body["grant_types_supported"].([]string)
+		body["grant_types_supported"] = append([]string{"authorization_code"}, grants...)
+
+		// Everything else that only describes the authorization_code flow rides
+		// the same gate. Advertising response_types_supported: ["code"] on an AS
+		// that cannot serve `code` is the same broken promise as advertising the
+		// grant — and a client that keys off response_types rather than
+		// grant_types would start the flow anyway.
+		//
+		// /oauth2/authorize enforces response_type=code (OAuth 2.1 — no implicit
+		// flow), and IssueAuthCode rejects any PKCE method but S256, so these are
+		// the accurate values when the flow IS servable.
+		body["response_types_supported"] = []string{"code"}
+		body["code_challenge_methods_supported"] = []string{"S256"}
+
+		// RFC 9207 §3 — every authorization response /oauth2/authorize
+		// redirects (success and error alike) carries iss=<issuer>, so a
+		// client talking to more than one AS can detect a mix-up. Same gate as
+		// the members above: with no servable flow there are no authorization
+		// responses to describe.
+		body["authorization_response_iss_parameter_supported"] = true
 	}
 
 	// CIMD (draft-ietf-oauth-client-id-metadata-document). Advertise support
@@ -181,11 +397,127 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 	// 2025-11-25) know they can present an https:// client_id URL and skip
 	// registration. Omitted entirely when disabled (the field's absence means
 	// "unsupported").
-	if a.cimdEnabled {
+	// Gated on the authorization_code grant too: CIMD only applies to that
+	// flow, so advertising it while the flow is unavailable is the same
+	// broken promise.
+	if a.cimdEnabled && servesAuthorizationCode {
 		body["client_id_metadata_document_supported"] = true
 	}
 
-	return &OAuthMetadataOutput{Body: body}, nil
+	// Swept here so the BASE document is conformant for whoever calls this, not
+	// only for the two ops that serve it today. Both callers also sweep, and
+	// that is not redundancy to be tidied away later: openidConfigurationOp adds
+	// two OIDC-only members AFTER this returns, and one of them
+	// (id_token_signing_alg_values_supported) can itself come back empty, so its
+	// sweep has to run after the addition. This one cannot cover that, and that
+	// one cannot cover a future caller who forgets. pruneEmptyClaims is
+	// idempotent, so running both costs a map walk and removes the requirement
+	// that anyone remember the rule.
+	return pruneEmptyClaims(body)
+}
+
+// openidConfigurationOp serves OpenID Connect Discovery 1.0 metadata at
+// /.well-known/openid-configuration.
+//
+// # Why an AS that issues no id_token serves an OIDC discovery document
+//
+// This document is here for FEDERATION TRUST ESTABLISHMENT, not for OIDC login.
+// Every cloud that can be taught to trust an external issuer — AWS IAM OIDC
+// identity providers, Azure federated identity credentials, GCP workload
+// identity pools — discovers that issuer by fetching this exact path to find
+// its `jwks_uri`. All three were written against OpenID Connect Discovery, not
+// against RFC 8414, so publishing only /.well-known/oauth-authorization-server
+// leaves ZeroID undiscoverable to all of them even though the keyset it would
+// verify against is already public at /.well-known/jwks.json. Serving this
+// document is what makes "configure your cloud to trust identities ZeroID
+// issued" a one-time setup rather than an impossibility (ADR 0028 D8).
+//
+// # ZeroID is NOT an OpenID Provider
+//
+// It issues no id_token. Do not read this document as evidence otherwise, and
+// do not add members here that imply an OIDC authentication flow. The structural
+// guard is `response_types_supported`, inherited from the RFC 8414 document: it
+// carries at most "code" and never "id_token"/"id_token token", so no relying
+// party can request an id_token from this AS no matter what it discovers here.
+// When id_token issuance lands, that is the member that changes — along with
+// adding "openid" to a scopes_supported list — and it should change in the same
+// PR that makes the claim true.
+//
+// Body is the RFC 8414 document plus the two members OIDC Discovery §3 makes
+// REQUIRED that RFC 8414 §2 does not define. The remaining OIDC-required
+// members (issuer, authorization_endpoint, token_endpoint, jwks_uri,
+// response_types_supported) are already in the base document, which is why this
+// is a superset rather than a separate document — two hand-maintained documents
+// describing one AS is how they drift.
+func (a *API) openidConfigurationOp(_ context.Context, _ *struct{}) (*OpenIDConfigurationOutput, error) {
+	body := a.buildASMetadata()
+
+	// OIDC Discovery §3 REQUIRED. "public" means every relying party sees the
+	// same `sub` for the same principal — which is what ZeroID does: `sub` is
+	// the stable identity ID. The alternative, "pairwise", would mean minting a
+	// per-RP pseudonymous subject, and a per-RP `sub` would break the federation
+	// use case this document exists for: a cloud role trust policy pins a
+	// literal `sub` value, so that value has to be stable across verifiers.
+	body["subject_types_supported"] = []string{"public"}
+
+	// OIDC Discovery §3 REQUIRED. Derived from the live keyset rather than
+	// hardcoded, so it cannot drift from what /.well-known/jwks.json actually
+	// publishes — a federation verifier that trusts an alg we no longer sign
+	// with (or refuses one we do) fails at token-verification time, far from
+	// this file.
+	//
+	// Read this as a statement about the algorithms this ISSUER SIGNS WITH,
+	// which is what a federation verifier consumes it as. It is not a promise
+	// that id_tokens are available — see the note above on response_types_supported.
+	body["id_token_signing_alg_values_supported"] = a.signingAlgValues()
+
+	// Pruned here rather than inside buildASMetadata: the two members above are
+	// added AFTER the base document is built, and signingAlgValues can itself
+	// come back empty (every published key lacking an `alg`). Pruning upstream
+	// would sweep the document before its last member existed.
+	return &OpenIDConfigurationOutput{Body: pruneEmptyClaims(body)}, nil
+}
+
+// signingAlgValues returns the distinct `alg` values of the published signing
+// keys, in keyset order (ES256 first — it is always loaded; RS256 only when the
+// deployer configured an RSA key). Keys with no `alg` are skipped rather than
+// emitted as "": an empty string is not a JWA algorithm name and would make the
+// discovery document invalid for every consumer, not just the one key.
+func (a *API) signingAlgValues() []string {
+	set := a.jwksSvc.KeySet()
+
+	// Non-nil zero-length start, but no longer for the reason this comment used
+	// to give. It argued that a nil slice marshals to `null` while `[]string{}`
+	// marshals to `[]`, and that the difference mattered. Since zeroid#316 it
+	// does not: pruneEmptyClaims deletes the member for BOTH — a typed nil slice
+	// and an empty one are alike Kind() == Slice with Len() == 0 — so each
+	// resolves to the same absence on the wire, which is what the RFC asks for.
+	//
+	// Kept because appending to a non-nil empty slice needs no nil check at any
+	// future call site, not because the two encode differently.
+	algs := []string{}
+	seen := map[string]struct{}{}
+
+	for i := range set.Len() {
+		key, ok := set.Key(i)
+		if !ok {
+			continue
+		}
+
+		alg, ok := key.Algorithm()
+		if !ok || alg.String() == "" {
+			continue
+		}
+
+		if _, dup := seen[alg.String()]; dup {
+			continue
+		}
+
+		seen[alg.String()] = struct{}{}
+		algs = append(algs, alg.String())
+	}
+
+	return algs
 }
 
 // protectedResourceMetadataOp serves RFC 9728 OAuth 2.0 Protected Resource
@@ -213,7 +545,11 @@ func (a *API) oauthMetadataOp(_ context.Context, _ *struct{}) (*OAuthMetadataOut
 // the JWT envelope from RFC 9701. When signed introspection lands, this
 // field gets added in the same PR — not before.
 func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*ProtectedResourceMetadataOutput, error) {
-	return &ProtectedResourceMetadataOutput{Body: map[string]any{
+	// No member here can currently be empty — every array is a non-empty
+	// literal. Swept anyway so the rule holds for the document rather than for
+	// today's contents: RFC 9728 §2 inherits the same zero-elements prohibition,
+	// and the next member added should not have to rediscover it.
+	return &ProtectedResourceMetadataOutput{Body: pruneEmptyClaims(map[string]any{
 		"resource":                 a.issuer,
 		"resource_name":            "ZeroID",
 		"authorization_servers":    []string{a.issuer},
@@ -229,5 +565,5 @@ func (a *API) protectedResourceMetadataOp(_ context.Context, _ *struct{}) (*Prot
 		// Note: `dpop_signing_alg_values_supported` is RFC 9449 §5.1 AS
 		// metadata, not PRM — it's already advertised in oauthMetadataOp.
 		"dpop_bound_access_tokens_required": false,
-	}}, nil
+	})}, nil
 }

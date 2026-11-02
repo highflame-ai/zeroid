@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -20,9 +21,9 @@ type CreateAPIKeyInput struct {
 	Body struct {
 		Name               string          `json:"name" required:"true" minLength:"1" doc:"Human-readable key name"`
 		Description        string          `json:"description,omitempty" doc:"Key description"`
-		IdentityID         string          `json:"identity_id,omitempty" doc:"Optional identity link"`
-		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: tenant default policy)"`
-		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping"`
+		IdentityID         string          `json:"identity_id,omitempty" doc:"Identity to link this key to. Required unless product is supplied"`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Credential policy to enforce on this key (default: the identity's own policy, or the tenant default when the identity has none)"`
+		Product            string          `json:"product,omitempty" doc:"Product namespace for key scoping. Required unless identity_id is supplied — a service identity is provisioned for the product"`
 		Scopes             []string        `json:"scopes,omitempty" doc:"Allowed scopes"`
 		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
 		ExpiresInDays      *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
@@ -44,7 +45,8 @@ type APIKeyOutput struct {
 
 type APIKeyListInput struct {
 	Product       string `query:"product" doc:"Filter by product namespace"`
-	ApplicationID string `query:"application_id" doc:"Filter by application identity ID"`
+	ApplicationID string `query:"application_id" doc:"Filter by owning identity ID (any identity type)"`
+	IdentityID    string `query:"identity_id" doc:"Filter by owning identity ID. Alias of application_id"`
 	State         string `query:"state" enum:"active,revoked,expired" doc:"Filter by key state (active, revoked, expired)"`
 	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
 	Page          int    `query:"page" default:"1" doc:"Page number"`
@@ -133,6 +135,15 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Metadata:           input.Body.Metadata,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
+		// Neither identity_id nor product supplied — the key has no identity to
+		// link. A caller-side omission, so return 400 naming both fields
+		// instead of a 500 from the failed UUID cast at insert time.
+		if errors.Is(err, service.ErrIdentityLinkRequired) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		// Caller-supplied credential_policy_id that doesn't exist in this tenant
 		// is a client error, not a server error — return 400 so the caller can
 		// correct the request.
@@ -172,7 +183,21 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		return nil, huma.Error401Unauthorized("missing tenant context")
 	}
 
-	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, input.ApplicationID, input.Product, input.State, input.Label, input.Page, input.Limit)
+	// identity_id was silently dropped before #391, returning every key.
+	ownerID := input.ApplicationID
+	if input.IdentityID != "" {
+		if ownerID != "" && ownerID != input.IdentityID {
+			return nil, huma.Error400BadRequest("identity_id and application_id must match when both are set")
+		}
+		ownerID = input.IdentityID
+	}
+	if ownerID != "" {
+		if _, err := uuid.Parse(ownerID); err != nil {
+			return nil, huma.Error400BadRequest("identity_id must be a UUID")
+		}
+	}
+
+	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, ownerID, input.Product, input.State, input.Label, input.Page, input.Limit)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")
@@ -200,6 +225,9 @@ func (a *API) revokeAPIKeyOp(ctx context.Context, input *RevokeAPIKeyInput) (*Re
 
 	n, err := a.apiKeySvc.RevokeKey(ctx, input.ID, tenant.AccountID, tenant.ProjectID, revokedBy, input.Body.Reason)
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		log.Error().Err(err).Str("key_id", input.ID).Msg("failed to revoke API key")
 		return nil, huma.Error500InternalServerError("failed to revoke API key")
 	}

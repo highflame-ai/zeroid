@@ -1,19 +1,24 @@
-FROM golang:1.26.0-alpine3.22 AS build-stage
+FROM golang:1.27.0-alpine3.23 AS build-stage
 LABEL maintainer="Highflame Team"
 
 ENV CGO_ENABLED=0
 ENV GOOS=linux
-# jwx v4 needs the encoding/json/v2 experiment (Go 1.26+). Set on the build
-# stage so go mod download / go build both compile against the right stdlib
-# variants.
-ENV GOEXPERIMENT=jsonv2
-
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
+# go.mod's replace directives point every nested module at ./pkg/<name>,
+# so `go mod download` resolves them from disk rather than the network.
+# EVERY nested module must be copied here: a replace target that is not
+# present fails the download outright, and because lockstep pins name the
+# version being released NEXT, the proxy has not indexed those tags yet
+# and cannot serve as a fallback.
+#
+# Adding a nested module? This COPY is one of the five places that need
+# it — see "Adding a new nested module" in RELEASING.md.
 COPY go.mod go.sum ./
 COPY pkg/authjwt/go.mod pkg/authjwt/go.sum ./pkg/authjwt/
 COPY pkg/dpop/go.mod pkg/dpop/go.sum ./pkg/dpop/
+COPY pkg/jwks/go.mod pkg/jwks/go.sum ./pkg/jwks/
 RUN go mod download
 
 COPY . .

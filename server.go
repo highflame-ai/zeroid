@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,15 +39,76 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 	"github.com/highflame-ai/zeroid/internal/telemetry"
 	"github.com/highflame-ai/zeroid/internal/worker"
-	"github.com/highflame-ai/zeroid/pkg/authjwt"
+	"github.com/highflame-ai/zeroid/pkg/jwks"
 )
 
-// middlewareHolder stores an optional middleware in a thread-safe way.
-// The middleware closure is registered at router-build time; the actual function
-// is set later (before Start) via a setter method.
+// middlewareHolder stores optional middleware in a thread-safe way.
+// The middleware closure is registered at router-build time; the actual
+// functions are set later (before Start) via a setter method.
+//
+// fns is a slice, not a single slot, so Server.Use can APPEND. A single slot
+// meant a second Use call silently discarded the first — see Server.Use.
+// adminAuthState still only ever holds one entry, set through fn().
 type middlewareHolder struct {
-	mu sync.RWMutex
-	fn func(http.Handler) http.Handler
+	mu  sync.RWMutex
+	fns []func(http.Handler) http.Handler
+	// composed is fns wrapped into a single middleware, rebuilt whenever fns
+	// changes. Cached rather than composed per call because chain() runs on EVERY
+	// request through EVERY route: composing there cost a slice copy plus a
+	// closure allocation per request, which the previous single-slot read did not.
+	// nil when fns is empty, so the router closure can skip the wrap entirely.
+	composed func(http.Handler) http.Handler
+}
+
+// rebuildLocked recomputes composed. Caller must hold the write lock.
+//
+// Wraps in reverse so fns[0] ends up OUTERMOST, matching chi and net/http:
+// middleware runs in registration order, and one that annotates context has to
+// run before one that reads it.
+func (h *middlewareHolder) rebuildLocked() {
+	if len(h.fns) == 0 {
+		h.composed = nil
+
+		return
+	}
+
+	fns := make([]func(http.Handler) http.Handler, len(h.fns))
+	copy(fns, h.fns)
+
+	h.composed = func(next http.Handler) http.Handler {
+		wrapped := next
+		for i := len(fns) - 1; i >= 0; i-- {
+			wrapped = fns[i](wrapped)
+		}
+
+		return wrapped
+	}
+}
+
+// fn returns the single registered middleware, or nil. For holders that only
+// ever carry one (adminAuthState), which is set by replacing the slice.
+func (h *middlewareHolder) fn() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.fns) == 0 {
+		return nil
+	}
+
+	return h.fns[0]
+}
+
+// chain returns the registered middleware composed so the FIRST registered is
+// outermost, matching chi and net/http convention. Nil when none are set.
+//
+// Read-only and allocation-free: it hands back the cached composition. Use is
+// documented as callable after NewServer, so the cache is rebuilt on mutation
+// rather than assumed immutable.
+func (h *middlewareHolder) chain() func(http.Handler) http.Handler {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	return h.composed
 }
 
 // Server is the main ZeroID server.
@@ -55,7 +117,7 @@ type middlewareHolder struct {
 //   - Public routes (/oauth2/*, /.well-known/*, /health, /ready): No authentication.
 //     These are the token endpoints agents and SDKs call directly.
 //   - Admin routes ({AdminPathPrefix}/*): Identity management, credential policies,
-//     attestation, signals. AdminPathPrefix defaults to "/api/v1" for standalone
+//     attestation, signals. AdminPathPrefix defaults to "" (router root) for standalone
 //     deployments. No built-in auth by default — protect at the network layer
 //     or use the AdminAuth hook.
 type Server struct {
@@ -69,6 +131,7 @@ type Server struct {
 	credentialSvc       *service.CredentialService
 	credentialPolicySvc *service.CredentialPolicyService
 	attestationSvc      *service.AttestationService
+	apiHandler          *handler.API
 	proofSvc            *service.ProofService
 	oauthSvc            *service.OAuthService
 	oauthClientSvc      *service.OAuthClientService
@@ -84,6 +147,12 @@ type Server struct {
 	// configured.
 	externalIssuerRegistry *service.ExternalIssuerRegistry
 
+	// clientJWKSCache holds a live JWKS client per registered client `jwks_uri`
+	// (RFC 7523 §2.2 private_key_jwt). Each cached entry owns a background
+	// refresh goroutine, so it must be closed on shutdown or those goroutines
+	// outlive the HTTP listener.
+	clientJWKSCache *service.ClientJWKSCache
+
 	// revocationDispatcher fans out RevocationEvents
 	// to the deployer-supplied RevocationNotifier. Shared by credentialSvc and
 	// refreshTokenSvc so SetRevocationNotifier wires every revocation path.
@@ -97,8 +166,21 @@ type Server struct {
 	mu                 sync.RWMutex
 	claimsEnrichers    []ClaimsEnricher
 	principalResolvers []namedPrincipalResolver
-	adminAuthState     *middlewareHolder
-	globalMWState      *middlewareHolder
+
+	// authzCodeAvailable is the deployer's override for whether
+	// /oauth2/authorize can complete an authorization_code flow. nil means
+	// "use the built-in guess". See SetAuthorizationCodeAvailable.
+	authzCodeAvailable func() bool
+	// interactiveLoginURL is the deployer's login surface for resolvers that
+	// report ErrPrincipalInteractionRequired. nil means "no surface", which
+	// degrades that sentinel to access_denied. See SetInteractiveLoginURL.
+	interactiveLoginURL func(*AuthorizeRequest) string
+	// interactiveLoginPassthrough is the validated allowlist of extra
+	// authorize parameters preserved into return_to. See
+	// SetInteractiveLoginPassthroughParams.
+	interactiveLoginPassthrough []string
+	adminAuthState              *middlewareHolder
+	globalMWState               *middlewareHolder
 }
 
 // namedPrincipalResolver pairs a registered PrincipalResolver with the
@@ -116,17 +198,47 @@ type ServerOption func(*serverOptions)
 
 // serverOptions is the internal accumulator behind ServerOption.
 type serverOptions struct {
-	externalIssuerJWKSOpts []authjwt.JWKSOption
+	externalIssuerJWKSOpts   []jwks.Option
+	externalIssuerHTTPClient *http.Client
+	cimdHTTPClient           *http.Client
 }
 
-// WithExternalIssuerJWKSOption forwards an authjwt JWKS option to the
+// WithExternalIssuerJWKSOption forwards a pkg/jwks option to the
 // external-issuer registry built inside NewServer. Intended primarily for
 // tests that need to bypass TLS verification when pointing the registry at
 // a fake JWKS server (httptest.NewTLSServer); production deployers should
 // not need this.
-func WithExternalIssuerJWKSOption(opt authjwt.JWKSOption) ServerOption {
+func WithExternalIssuerJWKSOption(opt jwks.Option) ServerOption {
 	return func(o *serverOptions) {
 		o.externalIssuerJWKSOpts = append(o.externalIssuerJWKSOpts, opt)
+	}
+}
+
+// WithExternalIssuerHTTPClient replaces the HTTP client used for issuer rows
+// (federation.issuer_store=db): their JWKS fetches and the admin JWKS probe.
+// For tests against httptest.NewTLSServer. SUPPLYING ONE REPLACES THE SSRF
+// GUARD; federation.allow_private_endpoints is the supported relaxation.
+func WithExternalIssuerHTTPClient(c *http.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.externalIssuerHTTPClient = c
+	}
+}
+
+// WithCIMDHTTPClient replaces the HTTP client the CIMD metadata-document
+// fetcher uses. Sibling of WithExternalIssuerJWKSOption and intended for the
+// same narrow reason: a test publishing documents on httptest.NewTLSServer
+// needs a client that trusts that server's self-signed cert, which no Config
+// field can express. Production deployers should not need this.
+//
+// SUPPLYING ONE REPLACES THE SSRF GUARD, which is the whole point and also the
+// hazard: the default client refuses a client_id URL resolving to a private,
+// loopback, link-local, multicast, CGN or unspecified address, and CIMD fetches
+// request-supplied URLs. Anything passed here is trusted to make that decision
+// itself. cimd.allow_private_metadata_endpoints is the supported way to relax
+// the guard without also replacing it.
+func WithCIMDHTTPClient(c *http.Client) ServerOption {
+	return func(o *serverOptions) {
+		o.cimdHTTPClient = c
 	}
 }
 
@@ -200,8 +312,13 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	authCodeRepo := postgres.NewAuthCodeRepository(db)
 	auditRepo := postgres.NewAuditLogRepository(db)
 	backchannelRepo := postgres.NewBackchannelRequestRepository(db)
+	// Validate() already rejected a malformed value.
+	if d, err := cfg.Backchannel.resolvedRetention(); err == nil {
+		backchannelRepo.SetResolvedRetention(d)
+	}
 	signingCredRepo := postgres.NewSigningCredentialRepository(db)
 	delegationRepo := postgres.NewDelegationRepository(db)
+	tenantSettingsRepo := postgres.NewTenantSettingsRepository(db)
 
 	// Build the attestation verifier registry. Real verifiers are wired
 	// first (OIDC today). Dev stubs cover image_hash and TPM only — those
@@ -230,7 +347,12 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// dependency-free and sits alongside credentialPolicySvc at the top.
 	auditSvc := service.NewAuditService(auditRepo)
 	credentialPolicySvc := service.NewCredentialPolicyService(credentialPolicyRepo)
+	tenantSettingsSvc := service.NewTenantSettingsService(tenantSettingsRepo)
 	credentialSvc := service.NewCredentialService(credentialRepo, jwksSvc, credentialPolicySvc, attestationRepo, cfg.Token.Issuer, cfg.Token.DefaultTTL, cfg.Token.MaxTTL, cfg.Token.AuditRetentionDays)
+	// The token profile decides the claim shape of every token, so the
+	// issuance chokepoint reads it (human-rooted delegation, phase 1).
+	credentialSvc.SetTenantSettingsService(tenantSettingsSvc)
+	tenantSettingsSvc.SetCredentialService(credentialSvc)
 	signalSvc := service.NewSignalService(signalRepo, credentialSvc, identityRepo)
 	signingCredSvc := service.NewSigningCredentialService(
 		signingCredRepo,
@@ -286,27 +408,68 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// dispatch, so a client_id URL can never make ZeroID reach a private /
 	// loopback / metadata address (unless the deployer opts into the test/dev
 	// relaxation). Enabled by default (cfg.CIMD.Enabled defaults true).
+	cimdHTTPClient := options.cimdHTTPClient
+	if cimdHTTPClient == nil {
+		cimdHTTPClient = attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints)
+	}
 	cimdSvc := service.NewCIMDService(service.CIMDConfig{
 		Enabled:          cfg.CIMD.Enabled,
 		AllowedDomains:   cfg.CIMD.AllowedDomains,
 		MaxDocumentBytes: cfg.CIMD.MaxDocumentBytes,
 		CacheTTL:         time.Duration(cfg.CIMD.CacheTTLSeconds) * time.Second,
-		HTTPClient:       attestation.NewSSRFGuardedHTTPClient(cfg.CIMD.AllowPrivateMetadataEndpoints),
+		HTTPClient:       cimdHTTPClient,
 	})
 	oauthSvc.SetCIMDService(cimdSvc)
 	if cfg.CIMD.Enabled {
+		// Report the EFFECTIVE allow-list, not len(cfg.CIMD.AllowedDomains).
+		// NewCIMDService lower-cases and drops blank/whitespace-only entries, so
+		// the raw slice and the policy actually in force disagree — and they
+		// disagree in the worst direction: allowed_domains: [""] has length 1
+		// and an effective count of 0, i.e. open mode reported as locked down.
+		effectiveDomains := cimdSvc.AllowedDomainCount()
+
 		log.Info().
-			Int("allowed_domains", len(cfg.CIMD.AllowedDomains)).
+			Int("allowed_domains", effectiveDomains).
 			Bool("allow_private_endpoints", cfg.CIMD.AllowPrivateMetadataEndpoints).
 			Msg("CIMD (Client ID Metadata Documents) enabled")
+		// cimd.allowed_domains is documented as the primary production
+		// hardening lever, and it ships off. Empty means any public HTTPS host
+		// can publish a document that mints a client here — anyone who can
+		// serve a path on any reachable domain, which inside an org is a low
+		// bar. That is a legitimate posture for an open ecosystem and a poor
+		// one for a closed deployment, and the difference is invisible unless
+		// somebody says so at boot.
+		if effectiveDomains == 0 {
+			log.Warn().Msg("CIMD: cimd.allowed_domains is empty — any public HTTPS host may publish a client_id metadata document. " +
+				"Set an allowlist to run CIMD as a closed ecosystem. Until then CIMD clients also get no error redirect and no " +
+				"interactive-login redirect (RFC 6749 4.1.2.1 carve-out), so a browser-driven CIMD client cannot sign a user in.")
+		}
 	}
 
 	// Build the external-issuer registry when the deployer has configured
-	// trusted upstream IdPs. JWKS warm-up is best-effort (authjwt does not
+	// trusted upstream IdPs. JWKS warm-up is best-effort (pkg/jwks does not
 	// fail on an unreachable issuer, to survive transient IdP outages during
 	// deploy); an issuer that never loads fails closed at token-exchange time.
+	//
+	// federation.issuer_store=db reads per-account rows live instead (ADR 0042
+	// D4); Validate() has already refused it alongside static entries.
+	externalIssuerRepo := postgres.NewExternalIssuerRepository(db)
+	issuerStore := service.IssuerStore(cfg.Federation.IssuerStore)
+	if issuerStore == "" {
+		issuerStore = service.IssuerStoreConfig
+	}
 	var externalIssuerRegistry *service.ExternalIssuerRegistry
-	if len(cfg.ExternalIssuers) > 0 {
+	if issuerStore == service.IssuerStoreDB {
+		jwksOpts := slices.Clone(options.externalIssuerJWKSOpts)
+		if options.externalIssuerHTTPClient != nil {
+			jwksOpts = append(jwksOpts, jwks.WithHTTPClient(options.externalIssuerHTTPClient))
+		}
+		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, cfg.Federation.SharedIssuers, jwksOpts...)
+		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
+		oauthSvc.SetIssuerBindings(externalIssuerRepo)
+		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).
+			Msg("Trusted issuers are per-account rows (federation.issuer_store=db)")
+	} else if len(cfg.ExternalIssuers) > 0 {
 		registry, err := service.NewExternalIssuerRegistry(context.Background(), cfg.ExternalIssuers, options.externalIssuerJWKSOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize external OIDC issuer registry (issue #88): %w", err)
@@ -329,6 +492,29 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// path: a failure here is logged and the token is still issued.
 	oauthSvc.SetObservedIDJAGResourceStore(postgres.NewObservedIDJAGResourceStore(db))
 
+	// RFC 7523 §2.2 private_key_jwt client authentication (zeroid#206).
+	//
+	// Both stores are wired UNCONDITIONALLY, for the same reason the ID-JAG
+	// replay store is: verifyClientAssertion fails closed on a nil replay store,
+	// so a deployment that conditionally skipped this wiring would reject every
+	// key-based client rather than degrade quietly — but the better outcome is
+	// simply never to be in that state.
+	//
+	// The jti ledger is the shared DPoP replay table; client-assertion jtis are
+	// namespaced "cla:" before insertion so they cannot collide with DPoP or
+	// actor-key-proof jtis living in the same table.
+	oauthSvc.SetClientAssertionReplayStore(postgres.NewDPoPReplayStore(db))
+	// The JWKS cache fetches from client-supplied `jwks_uri` values, which are
+	// attacker-controlled input wherever registration is open. It therefore gets
+	// the SAME SSRF-guarded HTTP client the external-issuer registry and the
+	// attestation OIDC verifier use — without it, a registered jwks_uri is a
+	// server-side request forgery primitive pointed at cloud metadata endpoints
+	// and internal services.
+	clientJWKSCache := service.NewClientJWKSCache(cfg.ClientAuth.JWKSCacheSize,
+		jwks.WithHTTPClient(attestation.NewSSRFGuardedHTTPClient(cfg.ClientAuth.AllowPrivateJWKSEndpoints)),
+	)
+	oauthSvc.SetClientJWKSCache(clientJWKSCache)
+
 	proofSvc := service.NewProofService(jwksSvc, proofRepo, cfg.Token.Issuer)
 	// DelegationService is read-only over credentialRepo / delegationRepo /
 	// identityRepo and has no service dependencies of its own.
@@ -344,11 +530,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// otherwise-circular dependency cleanly.
 	backchannelCfg := service.DefaultBackchannelConfig()
 	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
+	backchannelCfg.RequireApproverIdentity = cfg.Backchannel.RequireApproverIdentity
+	backchannelCfg.EnforceHints = cfg.Backchannel.EnforceHints
 	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.
 	oauthClientSvc.SetAllowPrivateNotificationEndpoints(backchannelCfg.AllowPrivateNotificationEndpoints)
-	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, backchannelCfg)
+	// Same flag that relaxes the SSRF guard on the jwks_uri fetch also relaxes
+	// the https requirement at registration — an http loopback URL would be
+	// useless if the dialer refused loopback, so the two move together.
+	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
+	oauthClientSvc.SetBcryptClientSecrets(cfg.ClientAuth.BcryptClientSecrets)
+	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
 	// DPoP verifier — validates RFC 9449 proofs (and the bh extension claim)
@@ -374,6 +567,24 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	)
 	// Advertise CIMD support in the AS metadata document only when enabled.
 	apiHandler.SetCIMDEnabled(cfg.CIMD.Enabled)
+	apiHandler.SetDPoPRequired(cfg.Token.RequireDPoP)
+	// Validate() already rejected a malformed value; empty keeps the default.
+	apiHandler.SetRegistrationEndpoint(cfg.Token.RegistrationEndpoint)
+	apiHandler.SetTenantSettingsService(tenantSettingsSvc)
+	apiHandler.SetExternalIssuerService(service.NewExternalIssuerService(externalIssuerRepo, identityRepo.GetByIDInAccounts, oauthClientSvc,
+		service.ExternalIssuerServiceConfig{
+			Store:                 issuerStore,
+			SharedIssuers:         cfg.Federation.SharedIssuers,
+			AllowPrivateEndpoints: cfg.Federation.AllowPrivateEndpoints,
+			StaticIssuers:         cfg.ExternalIssuers,
+			SelfIssuer:            cfg.Token.Issuer,
+			HTTPClient:            options.externalIssuerHTTPClient,
+			Registry:              externalIssuerRegistry, // VerifyIDToken needs db mode; EntryForRow refuses a static registry
+		}))
+	// An allow-list is the deployer vetting which hosts may publish a metadata
+	// document, which is what lets a CIMD client be redirected to at all. The
+	// EFFECTIVE count, for the same reason the startup log uses it: the raw
+	// slice counts entries the service already dropped.
 
 	// Shared middleware state — closures reference these holders; the actual functions
 	// are set after NewServer returns (before Start) via setter methods.
@@ -385,7 +596,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 
 	// Global middleware.
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
+	// chi 5.4 deprecates RealIP. Kept for now so embedders see no behaviour
+	// change; replacing it with chi's ClientIP middleware is a separate change.
+	r.Use(chimiddleware.RealIP) //nolint:staticcheck // SA1019, see above
 	// oauthFormCompat must run before requestValidationMiddleware so that
 	// RFC-mandated form-encoded bodies on /oauth2/* endpoints are rewritten
 	// to JSON before the JSON-only Content-Type gate runs.
@@ -401,11 +614,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// without blocking unauthenticated callers.
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			globalMW.mu.RLock()
-			mw := globalMW.fn
-			globalMW.mu.RUnlock()
-			if mw != nil {
+			if mw := globalMW.chain(); mw != nil {
 				mw(next).ServeHTTP(w, req)
+
 				return
 			}
 			next.ServeHTTP(w, req)
@@ -417,7 +628,18 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// RequestURLMiddleware records the request's effective URL on context.Context
 	// so DPoP htu validation (RFC 9449 §4.3) compares against what the client
 	// actually hit, not against the static config value.
-	r.Use(internalMiddleware.RequestURLMiddleware(cfg.Server.TrustForwardedHeaders))
+	//
+	// Validate (above) has already rejected an unknown or conflicting mode, so
+	// the error here is unreachable; it is still checked rather than dropped,
+	// because a silent fallback would pick a trust level nobody configured.
+	fwdMode, err := cfg.Server.ForwardedHeadersMode()
+	if err != nil {
+		return nil, err
+	}
+	r.Use(internalMiddleware.RequestURLMiddleware(internalMiddleware.ForwardedTrust{
+		Proto: fwdMode == ForwardedHeadersProto || fwdMode == ForwardedHeadersProtoHost,
+		Host:  fwdMode == ForwardedHeadersProtoHost,
+	}))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
 
@@ -426,8 +648,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// the self-service group below (public) and the proof-generation group on the
 	// admin router further down.
 	agentAuthCfg := internalMiddleware.AgentAuthConfig{
-		PublicKey: jwksSvc.PublicKey(),
-		Issuer:    cfg.Token.Issuer,
+		// The whole JWKS, not jwksSvc.PublicKey(): the grants sign RS256
+		// whenever RSA keys are loaded, so a single EC key verified none of
+		// the tokens this server issues (#357).
+		KeySet: jwksSvc.KeySet(),
+		Issuer: cfg.Token.Issuer,
 		// RFC 9728 §5.1 breadcrumb on 401s — points cold-start clients at the PRM
 		// document so they can chain resource → PRM → AS metadata.
 		ResourceMetadataURL: cfg.Token.Issuer + "/.well-known/oauth-protected-resource",
@@ -445,18 +670,16 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		apiHandler.RegisterAgentSelfService(handler.NewHumaAPISpecless(r))
 	})
 
-	// Admin routes — mounted under AdminPathPrefix (default "/api/v1").
+	// Admin routes — mounted under AdminPathPrefix (default "": router root).
 	// No built-in auth by default. Protected at the network layer or via AdminAuth hook.
 	adminPrefix := cfg.Server.GetAdminPathPrefix()
 	mountAdmin := func(r chi.Router) {
 		// Optional admin auth — checked at request time so it can be set after NewServer.
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-				authState.mu.RLock()
-				auth := authState.fn
-				authState.mu.RUnlock()
-				if auth != nil {
+				if auth := authState.fn(); auth != nil {
 					auth(next).ServeHTTP(w, req)
+
 					return
 				}
 				next.ServeHTTP(w, req)
@@ -466,15 +689,21 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		// Tenant context extraction from X-Account-ID / X-Project-ID headers.
 		r.Use(internalMiddleware.TenantContextMiddleware)
 
-		humaAdmin := handler.NewHumaAPI(r)
+		// The admin group's spec lives under {mount}/admin/* — it cannot reuse
+		// the canonical /openapi.json when sharing the router root with the
+		// public API (chi last-registration wins, and the shadow would drop
+		// the public OAuth paths from the served spec).
+		humaAdmin := handler.NewHumaAPIAdmin(r)
 		apiHandler.RegisterAdmin(humaAdmin, r)
 
 		// Agent-auth sub-group for proof generation (requires agent JWT). Reuses
 		// the agentAuthCfg defined above for the public self-service group.
+		// Specless: a spec route registered here would sit behind the 401
+		// middleware and shadow whichever sibling spec shares its path.
 		r.Group(func(r chi.Router) {
 			r.Use(internalMiddleware.AgentAuthMiddleware(agentAuthCfg))
 
-			humaAgentAuth := handler.NewHumaAPI(r)
+			humaAgentAuth := handler.NewHumaAPISpecless(r)
 			apiHandler.RegisterAgentAuth(humaAgentAuth)
 		})
 	}
@@ -500,6 +729,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		credentialSvc:          credentialSvc,
 		credentialPolicySvc:    credentialPolicySvc,
 		attestationSvc:         attestationSvc,
+		apiHandler:             apiHandler,
 		proofSvc:               proofSvc,
 		oauthSvc:               oauthSvc,
 		oauthClientSvc:         oauthClientSvc,
@@ -510,6 +740,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		jwksSvc:                jwksSvc,
 		refreshTokenSvc:        refreshTokenSvc,
 		externalIssuerRegistry: externalIssuerRegistry,
+		clientJWKSCache:        clientJWKSCache,
 		revocationDispatcher:   revocationDispatcher,
 		cleanupWorker:          worker.NewCleanupWorker(db, backchannelRepo, time.Hour, time.Duration(cfg.Token.MaxTTL)*time.Second),
 		adminAuthState:         authState,
@@ -528,6 +759,20 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// own dependencies (apiKeyRepo, credentialSvc, signalSvc) are already
 	// resolved.
 	srv.cleanupWorker.SetIdentityExpirer(identitySvc)
+	// Refresh-token reuse grace (token.refresh_reuse_grace_seconds): the
+	// service applies it, and the cleanup worker keeps rotated-out rows at
+	// least that long. Validate() already rejected an out-of-range value.
+	srv.SetRefreshReuseGrace(cfg.Token.RefreshReuseGrace())
+
+	// Discovery must not promise a flow /oauth2/authorize cannot serve: with no
+	// PrincipalResolver registered the endpoint 503s, so the authorization_code
+	// grant (and CIMD, which only applies to that flow) stays out of the
+	// metadata document. Evaluated per request, because
+	// RegisterPrincipalResolver is documented as safe to call after NewServer
+	// and before Start (#263).
+	apiHandler.SetAuthorizationCodeAvailable(srv.canServeAuthorizationCode)
+	apiHandler.SetInteractiveLoginURL(srv.resolveInteractiveLoginURL)
+	apiHandler.SetInteractiveLoginPassthroughParams(srv.interactiveLoginPassthroughParams)
 
 	// Hand the principal-resolver chain walker to the API handler. The
 	// handler invokes this on every /oauth2/authorize request to walk
@@ -554,8 +799,23 @@ func (s *Server) Start() error {
 			prefix = "/"
 		}
 		log.Info().Str("port", s.cfg.Server.Port).Msg("Starting ZeroID server")
-		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/*")
-		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*")
+		log.Info().Msg("  Public:  /health, /.well-known/*, /oauth2/* — except the admin CIBA endpoints /oauth2/bc-authorize/{id}/approve|deny")
+		log.Info().Str("prefix", prefix).Msg("  Admin:   identities/*, agents/*, api-keys/*, credentials/*, credential-policies/*, attestation/*, signals/*, oauth/*, proof/*, oauth2/bc-authorize/{id}/approve|deny")
+		// The admin plane has no built-in auth, and since the default mount
+		// moved from /api/v1 to the router root (PR #318) a network rule that
+		// matched /api/v1/* no longer covers it. Say so loudly on every start
+		// of a root-mounted deployment that has NOT installed an AdminAuth
+		// hook — embedders such as highflame-authn mount at the root by
+		// design and gate the admin group themselves, so for them the warning
+		// would be noise. (Config loading materializes the default into
+		// AdminPathPrefix, so test the effective value; the hook is checked
+		// at Start, after embedders have had NewServer→AdminAuth to set it.)
+		if s.cfg.Server.GetAdminPathPrefix() == "" && s.adminAuthState.fn() == nil {
+			log.Warn().Msg("admin routes are mounted at the router root with no AdminAuth hook and no built-in auth " +
+				"(default changed from /api/v1 in PR #318) — install an AdminAuth hook, or expose only " +
+				"/health, /.well-known/* and /oauth2/* publicly while denying the admin CIBA endpoints " +
+				"/oauth2/bc-authorize/{id}/approve|deny at the edge (see README, Admin)")
+		}
 		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -610,6 +870,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	var firstErr error
 	if err := s.http.Shutdown(ctx); err != nil && firstErr == nil {
 		firstErr = err
+	}
+	// Stop the per-client JWKS refresh goroutines (one per cached jwks_uri)
+	// AFTER the listener has drained. Closing before http.Shutdown lets an
+	// in-flight private_key_jwt verification repopulate the cache on its way
+	// out and spawn a refresh goroutine that nothing will ever close.
+	if s.clientJWKSCache != nil {
+		s.clientJWKSCache.Close()
 	}
 	if err := s.db.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -667,7 +934,9 @@ func (s *Server) RegisterGrant(name string, handler GrantHandler) {
 // let alone mint a token. The shared core (resolveAPIKeyContext) is
 // the single source of truth.
 //
-// Typical usage from a PrincipalResolver:
+// Typical usage from a PrincipalResolver. As with the example on
+// RegisterPrincipalResolver, req.Form is POST-only — read a header or
+// cookie instead if the resolver must serve the browser GET leg.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -712,7 +981,9 @@ func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest
 	})
 }
 
-// OnClaimsIssue registers a claims enricher called during JWT issuance.
+// OnClaimsIssue registers a claims enricher.
+//
+// Deprecated: enrichers are stored but never invoked. See ClaimsEnricher.
 func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -724,7 +995,13 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // the first to return a non-nil Principal wins. name is used for
 // log/metric attribution and must be non-empty.
 //
-// Typical usage from a deployer that owns api_key resolution:
+// Typical usage from a deployer that owns api_key resolution. NOTE this
+// shape serves POST ONLY: req.Form is bound to the POST body, so it
+// returns ErrPrincipalNotApplicable on every browser GET. A GET-capable
+// resolver must read req.Header(...) or req.Cookie(...) instead — and if
+// ALL your resolvers are form-based, call
+// Server.SetAuthorizationCodeAvailable(func() bool { return false }) so
+// AS metadata stops advertising a flow that will 401.
 //
 //	srv.RegisterPrincipalResolver("api_key", func(ctx context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 //	    key := req.Form("api_key")
@@ -747,6 +1024,39 @@ func (s *Server) OnClaimsIssue(enricher ClaimsEnricher) {
 // supported — register the most-specific first (e.g. session cookie
 // before api_key fallback) because order determines precedence on
 // overlapping requests.
+//
+// # Writing a cookie-based resolver
+//
+// /oauth2/authorize serves GET (RFC 6749 §3.1), so a resolver that
+// authenticates from a cookie is reachable by top-level navigation from
+// any site — SameSite=Lax still sends the cookie on a cross-site GET.
+// Combined with CIMD, which accepts any attacker-published client_id and
+// its own redirect_uri, a bare redirect would hand the attacker a code
+// for the victim's principal.
+//
+// A cookie resolver therefore MUST NOT be sufficient on its own. Code
+// issuance has to sit behind an explicit user interaction — a consent
+// screen carrying a CSRF token — the way a real authorization server does.
+//
+// A PrincipalResolver cannot render that screen itself: its signature
+// returns (*Principal, error), so it has no ResponseWriter. It CAN start
+// the interaction, though — return ErrPrincipalInteractionRequired and
+// zeroid redirects the user agent to the surface registered with
+// Server.SetInteractiveLoginURL, appending return_to so the flow resumes
+// once your surface has authenticated them. Your resolver then only has
+// to recognise the session that established. That keeps redirects out of
+// resolver code, which is the point of the split.
+//
+// Rendering and CSRF-protecting the consent screen itself remains yours.
+// Server.Use middleware is the other option if you want to own the whole
+// interaction, including the 302, before the handler runs; it chains, so
+// it composes with whatever you already registered. See docs/cimd.md and
+// highflame-authn#157 for a worked example.
+//
+// Header-based resolvers (api_key, mTLS, a signed assertion) do not have
+// this exposure: a browser cannot set a custom header on a top-level
+// navigation, which is also why the handler binds AuthorizeRequest.Form
+// to the POST body only.
 func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 	if name == "" || r == nil {
 		return
@@ -766,11 +1076,29 @@ func (s *Server) RegisterPrincipalResolver(name string, r PrincipalResolver) {
 //     (nil, "", ErrNoResolversRegistered). Handler maps this to 503
 //     so the deployer sees a clear "you forgot to wire this up"
 //     signal, distinct from the 401 "credential didn't match" case.
+//     AS metadata omits the authorization_code grant in that state, so
+//     discovery never promises a flow the endpoint cannot serve.
 //   - All registered resolvers returning ErrPrincipalNotApplicable →
-//     returns (nil, "", nil). Handler maps to 401 invalid_client.
-//   - Any resolver returning a non-sentinel error → returns
-//     (nil, resolverName, err). The chain stops at the first such
-//     error; handler surfaces it as 401 invalid_client.
+//     returns (nil, "", nil). The handler reports access_denied: on a GET
+//     that is a 302 back to the client's redirect_uri per RFC 6749
+//     §4.1.2.1, on a POST a 401 invalid_client JSON body.
+//   - A resolver returning ErrPrincipalInteractionRequired → returns
+//     (nil, resolverName, err) and STOPS the chain, like any other
+//     non-sentinel error. On a GET the handler redirects the user agent
+//     to Server.SetInteractiveLoginURL's target instead of refusing; with
+//     no target set, or on a POST, it degrades to access_denied. A
+//     resolver that wants the chain to continue must return
+//     ErrPrincipalNotApplicable instead.
+//   - A resolver returning ErrPrincipalAccessDenied (or wrapping it) →
+//     returns (nil, resolverName, err) and STOPS the chain — even when the
+//     error also matches ErrPrincipalNotApplicable. The handler
+//     redirects to the client's validated redirect_uri with
+//     error=access_denied on GET and POST alike; see
+//     ErrPrincipalAccessDenied.
+//   - Any other resolver error → returns (nil, resolverName, err). The
+//     chain stops at the first such error; the handler reports it the
+//     same way as the no-match case (access_denied / 401), without
+//     revealing which resolver matched.
 func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*Principal, string, error) {
 	s.mu.RLock()
 	resolvers := make([]namedPrincipalResolver, len(s.principalResolvers))
@@ -784,7 +1112,11 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 	for _, r := range resolvers {
 		p, err := r.fn(ctx, req)
 		if err != nil {
-			if errors.Is(err, ErrPrincipalNotApplicable) {
+			// A denial is terminal and outranks "not applicable": an error
+			// matching both (errors.Join, or a %w of each) must not hand the
+			// request to a later resolver that could authenticate it and issue
+			// the code the resource owner just declined.
+			if errors.Is(err, ErrPrincipalNotApplicable) && !errors.Is(err, ErrPrincipalAccessDenied) {
 				continue
 			}
 			return nil, r.name, err
@@ -804,10 +1136,21 @@ func (s *Server) resolvePrincipal(ctx context.Context, req *AuthorizeRequest) (*
 // Can be called after NewServer and before Start — the middleware is checked at
 // request time. When nil (default), admin routes have no built-in auth — protect
 // them at the network layer (reverse proxy, VPN, firewall).
+// Calling it again REPLACES the previous middleware — admin auth is one
+// decision, not a stack. Passing nil removes it.
 func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 	s.adminAuthState.mu.Lock()
 	defer s.adminAuthState.mu.Unlock()
-	s.adminAuthState.fn = middleware
+
+	if middleware == nil {
+		s.adminAuthState.fns = nil
+		s.adminAuthState.rebuildLocked()
+
+		return
+	}
+
+	s.adminAuthState.fns = []func(http.Handler) http.Handler{middleware}
+	s.adminAuthState.rebuildLocked()
 }
 
 // Use adds a global middleware that runs on ALL routes (public + admin).
@@ -818,11 +1161,216 @@ func (s *Server) AdminAuth(middleware AdminAuthMiddleware) {
 // trusted service identity from headers so that TrustedServiceValidator can read it
 // during external principal token exchange.
 //
+// Calling it more than once APPENDS. Middleware runs in registration order, so
+// the first registered is outermost — the same convention as chi and net/http.
+// It used to replace instead, which silently discarded everything but the last
+// registration: a deployer who added a second concern lost the first with no
+// error, and since the slot is typically already occupied (annotating trusted
+// service identity, say) the loss landed on whatever was registered first
+// (#276).
+//
+// A note on what belongs here. Middleware on this path sees /oauth2/authorize,
+// including requests from CIMD clients, which are unregistered and inherently
+// third-party. Treat anything registered here as security-relevant on that
+// route, and prefer to keep it to context annotation.
+//
 // Can be called after NewServer and before Start.
+//
+// Passing nil is IGNORED, not a way to unregister — there is no removal for an
+// appending registry, and silently dropping every previously registered
+// middleware would be a worse answer than doing nothing. This differs from
+// AdminAuth(nil), which does clear, because that one is a single slot.
 func (s *Server) Use(middleware func(http.Handler) http.Handler) {
+	if middleware == nil {
+		return
+	}
+
 	s.globalMWState.mu.Lock()
 	defer s.globalMWState.mu.Unlock()
-	s.globalMWState.fn = middleware
+	s.globalMWState.fns = append(s.globalMWState.fns, middleware)
+	s.globalMWState.rebuildLocked()
+}
+
+// SetInteractiveLoginURL supplies the login surface a user agent is sent to when
+// a PrincipalResolver reports ErrPrincipalInteractionRequired.
+//
+// This is the missing half of the resolver contract. A PrincipalResolver returns
+// (*Principal, error) and so cannot redirect — it has no ResponseWriter — which
+// left a cookie-based resolver with no way to start a login: declining reads as
+// "wrong credential type", and failing reads as "bad credential". Neither sends
+// the user anywhere. Now the resolver returns the sentinel and ZeroID does the
+// redirect, so the resolver still never touches the transport.
+//
+// The contract:
+//
+//   - fn is called only after the client and redirect_uri have been validated, so
+//     the request it receives is one ZeroID has already vetted.
+//   - ZeroID appends return_to, rebuilt from the validated protocol parameters,
+//     pointing back at /oauth2/authorize. Your surface should send the user there
+//     after authenticating, at which point your resolver should recognise the
+//     session it established. return_to deliberately excludes anything else from
+//     the inbound query — see redirectToInteractiveLogin — except parameters
+//     you allowlist with SetInteractiveLoginPassthroughParams.
+//   - Returning "" declines, as does leaving fn nil: the sentinel then degrades
+//     to access_denied, because a resolver cannot conjure a surface the
+//     deployment does not have.
+//   - Honoured on GET only. A POST caller has no user agent to redirect.
+//   - return_to is ZeroID's parameter name and is SET on whatever you return, so
+//     a target already carrying one loses it. Put your own state elsewhere.
+//
+// **Your surface must not bounce back to return_to unconditionally.** ZeroID has
+// no loop guard here: if the user is returned without a session established —
+// they cancelled, cookies are blocked, a third-party-cookie policy intervened —
+// your resolver reports the sentinel again and the redirect repeats. Send them
+// back only once you can satisfy the resolver, and show them a terminal error
+// otherwise.
+//
+// **Derive the target from configuration, not from the request.** fn receives the
+// AuthorizeRequest so the target can vary by tenant, client or locale — but
+// building it out of request data turns this into an open redirect, and ZeroID
+// does not validate what you return because deployer config is trusted.
+//
+// Passing nil removes the target. Safe to call after NewServer.
+func (s *Server) SetInteractiveLoginURL(fn func(*AuthorizeRequest) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactiveLoginURL = fn
+}
+
+// Limits on SetInteractiveLoginPassthroughParams: how many names may be listed,
+// and the longest value (in bytes) that is copied rather than dropped.
+const (
+	MaxInteractiveLoginPassthroughParams   = handler.MaxInteractiveLoginPassthroughParams
+	MaxInteractiveLoginPassthroughValueLen = handler.MaxInteractiveLoginPassthroughValueLen
+)
+
+// SetInteractiveLoginPassthroughParams names extra /oauth2/authorize query
+// parameters that survive the interactive-login round trip: each is copied
+// verbatim from the inbound authorize request into the return_to that
+// SetInteractiveLoginURL's surface receives, so the resumed request carries it
+// too. Use it for an embedder's own hint that is not an OAuth parameter — a
+// CLI pre-selecting the project a sign-in is for, for example.
+//
+// The contract:
+//
+//   - Names are validated: 1-64 characters of letters, digits, '_', '.' or '-',
+//     starting with a letter, at most MaxInteractiveLoginPassthroughParams of
+//     them. Any name with protocol or credential meaning at the authorization
+//     endpoint (client_id, redirect_uri, scope, state, resource, return_to,
+//     code_verifier, client_secret, api_key, …) is refused, compared
+//     case-insensitively — passthrough can never override or add to the
+//     validated request. An invalid list returns an error and leaves the
+//     current list unchanged.
+//   - A listed parameter is copied only when it appears exactly once with a
+//     non-empty value of at most MaxInteractiveLoginPassthroughValueLen bytes
+//     that is valid UTF-8 with no control or format (bidi, zero-width)
+//     characters. Anything else is dropped (and logged without
+//     its value); the redirect still happens, because the parameter is a hint,
+//     not part of the authorization request.
+//   - ZeroID does not interpret or validate the value. It is caller input:
+//     your login surface must treat it as untrusted and authorize whatever it
+//     selects against the signed-in user, exactly as if the user had typed it.
+//   - Only the interactive-login redirect is affected. The parameter has no
+//     effect on the authorization request, the code, or the token.
+//
+// Calling with no names clears the list. Safe to call after NewServer.
+func (s *Server) SetInteractiveLoginPassthroughParams(names ...string) error {
+	validated, err := handler.ValidateInteractiveLoginPassthroughParams(names)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interactiveLoginPassthrough = validated
+
+	return nil
+}
+
+// interactiveLoginPassthroughParams is wired into the handler at build time and
+// returns a snapshot of the allowlist. The slice is replaced, never mutated, so
+// handing out the stored one is safe.
+func (s *Server) interactiveLoginPassthroughParams() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.interactiveLoginPassthrough
+}
+
+// resolveInteractiveLoginURL is wired into the handler at build time, so the
+// deployer can call SetInteractiveLoginURL any time before Start. Returns "" when
+// no target is set, which the handler reads as "decline".
+func (s *Server) resolveInteractiveLoginURL(req *service.AuthorizeRequest) string {
+	// Snapshot under the lock, then release BEFORE calling the deployer's func —
+	// RWMutex is not reentrant, so invoking an arbitrary callback while holding
+	// s.mu deadlocks if it touches any locking Server method. Same pattern as
+	// canServeAuthorizationCode.
+	s.mu.RLock()
+	fn := s.interactiveLoginURL
+	s.mu.RUnlock()
+
+	if fn == nil {
+		return ""
+	}
+
+	return fn(req)
+}
+
+// SetAuthorizationCodeAvailable overrides ZeroID's guess about whether
+// /oauth2/authorize can actually complete an authorization_code flow on this
+// deployment. When the answer is false, AS metadata omits the
+// authorization_code grant, response_types_supported, the PKCE method list,
+// and client_id_metadata_document_supported, so no client discovers a flow it
+// cannot finish (#263).
+//
+// # Why an override exists
+//
+// ZeroID's built-in guess is "at least one PrincipalResolver is registered".
+// That is NECESSARY but NOT SUFFICIENT, and only the deployer knows the
+// difference: a resolver that reads its credential from req.Form cannot serve
+// a browser GET at all, because Form is bound to the POST body (see
+// RegisterPrincipalResolver). A deployment whose resolvers are all form-based
+// serves POST fine and 401s every browser redirect — while the default guess
+// happily advertises the grant.
+//
+// So: if your resolvers are form-only, call this with a func returning false
+// until you add a header- or cookie-based one. ZeroID cannot introspect what a
+// resolver reads, which is why it cannot work this out itself.
+//
+// A false answer turns the flow OFF, it does not merely stop advertising it:
+// /oauth2/authorize answers 503 on both GET and POST. That distinction matters
+// to a deployer running a cookie-based resolver, which is safe while POST is
+// the only route (SameSite=Lax withholds the cookie on a cross-site POST) and
+// CSRF-reachable once a top-level navigation can drive the endpoint. A hatch
+// that only edited the discovery document would have left that endpoint live.
+//
+// A predicate rather than a bool so the answer can change as resolvers are
+// registered. Passing nil restores the built-in guess. Safe to call after
+// NewServer.
+func (s *Server) SetAuthorizationCodeAvailable(fn func() bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authzCodeAvailable = fn
+}
+
+// canServeAuthorizationCode answers the deployer's override when one is set,
+// otherwise falls back to the built-in guess (any resolver registered).
+func (s *Server) canServeAuthorizationCode() bool {
+	// Snapshot under the lock, then release it BEFORE calling the deployer's
+	// predicate. Go's RWMutex is not reentrant, so invoking an arbitrary
+	// callback while holding s.mu deadlocks the moment that callback touches
+	// any Server method that locks — RegisterPrincipalResolver, for one. Same
+	// pattern resolvePrincipal uses for the resolver chain.
+	s.mu.RLock()
+	fn := s.authzCodeAvailable
+	resolverCount := len(s.principalResolvers)
+	s.mu.RUnlock()
+
+	if fn != nil {
+		return fn()
+	}
+
+	return resolverCount > 0
 }
 
 // SetBackchannelNotifier wires the BackchannelNotifier called when a new CIBA
@@ -853,6 +1401,10 @@ func (s *Server) SetBackchannelNotifier(fn BackchannelNotifier) {
 			BindingMessage:       n.BindingMessage,
 			ExpiresAt:            n.ExpiresAt,
 			AuthorizationDetails: n.AuthorizationDetails,
+			FourEyes:             n.FourEyes,
+			RequesterOwner:       n.RequesterOwner,
+			RequesterSub:         n.RequesterSub,
+			RequesterActor:       n.RequesterActor,
 		})
 	})
 }
@@ -941,6 +1493,70 @@ func (s *Server) RegisterAuthorizationDetailValidator(typ string, fn Authorizati
 	s.backchannelSvc.RegisterAuthorizationDetailValidator(typ, service.AuthorizationDetailValidator(fn))
 }
 
+// SetFederatedPersonResolver installs the hook that resolves the person in
+// an IdP token to the deployer's user on ID-JAG redemption and the ID-token
+// exchange (ADR 0042 D5a). It runs before any single-use credential is
+// consumed. nil removes it: static issuers then keep the IdP subject as sub,
+// and issuer rows refuse to mint. Safe to call at any time.
+func (s *Server) SetFederatedPersonResolver(fn FederatedPersonResolver) {
+	s.oauthSvc.SetFederatedPersonResolver(fn)
+}
+
+// SetPersonGrantResolver installs the deployer's person-grant hook (ADR 0041
+// D15 in Highflame's deployment). Every token minted for a person is then
+// bounded by the ceiling fn returns: in enforce mode the issued scope is the
+// request (or its default) ∩ the ceiling and a request that leaves nothing is
+// refused; in shadow mode issuance is unchanged and each narrowing, refusal or
+// resolver failure is logged as person_scope_ceiling_violation and counted in
+// zeroid_person_scope_ceiling_total. In both modes the returned roles are
+// stamped as the `roles` claim on the person's own token. PersonGrantModeOff
+// removes the hook (fn is ignored). A nil fn with shadow or enforce, an empty
+// mode or an unknown one is rejected and the hook left unchanged, so a wiring
+// mistake fails loudly instead of turning the ceiling off.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {
+	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
+}
+
+// SetApproverAuthorizer installs the hook consulted on CIBA approve/deny for
+// requests carrying a group_hint, when backchannel.enforce_hints is shadow or
+// on. zeroid treats group_hint as opaque; the authorizer decides whether the
+// approver satisfies it (e.g. holds the named role). The built-in login_hint
+// and four_eyes checks run first. With no authorizer installed, group_hint
+// requests fail the check with reason "no approver authorizer configured".
+// Passing nil removes the hook.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetApproverAuthorizer(a ApproverAuthorizer) {
+	if s.backchannelSvc == nil {
+		return
+	}
+	s.backchannelSvc.SetApproverAuthorizer(a)
+}
+
+// SetBackchannelRequireApproverIdentity toggles
+// backchannel.require_approver_identity at runtime. Turning it off while
+// backchannel.enforce_hints is shadow or on is rejected and the setting
+// unchanged; set enforce_hints to off first.
+func (s *Server) SetBackchannelRequireApproverIdentity(require bool) error {
+	if s.backchannelSvc == nil {
+		return nil
+	}
+	return s.backchannelSvc.SetRequireApproverIdentity(require)
+}
+
+// SetBackchannelEnforceHints sets backchannel.enforce_hints ("off", "shadow"
+// or "on") at runtime. An unknown mode, or shadow/on while
+// backchannel.require_approver_identity is false, is rejected and the setting
+// unchanged.
+func (s *Server) SetBackchannelEnforceHints(mode string) error {
+	if s.backchannelSvc == nil {
+		return nil
+	}
+	return s.backchannelSvc.SetEnforceHints(mode)
+}
+
 // SetBackchannelNotifyDispatchSync forces synchronous notifier dispatch.
 // Test-only — production must keep async dispatch (the default) so notifier
 // latency cannot block the bc-authorize response.
@@ -961,6 +1577,42 @@ func (s *Server) SetAttestationPermissive(enabled bool) {
 	s.attestationSvc.SetPermissive(enabled)
 }
 
+// SetDPoPRequired toggles mandatory DPoP on /oauth2/token at runtime.
+// Mirrors the token.require_dpop config gate: when true, issuance without a
+// valid RFC 9449 proof is refused with invalid_dpop_proof and the AS
+// metadata advertises dpop_bound_access_tokens_required: true.
+func (s *Server) SetDPoPRequired(required bool) {
+	s.apiHandler.SetDPoPRequired(required)
+}
+
+// SetRegistrationEndpoint sets the registration_endpoint advertised in both AS
+// metadata documents (/.well-known/oauth-authorization-server and
+// /.well-known/openid-configuration). It is the programmatic form of
+// token.registration_endpoint (ZEROID_REGISTRATION_ENDPOINT), for embedders that
+// configure the server in code.
+//
+// RFC 8414 §2 lets registration_endpoint be any URL, so a deployment that runs
+// client registration somewhere other than ZeroID's own /oauth2/register — which
+// requires an initial access token and registers machine clients only — can
+// advertise that endpoint instead. Only the advertisement changes; ZeroID's own
+// /oauth2/register stays mounted with its existing gate.
+//
+// The value is checked against the server's configured token.issuer with the
+// same rules as config load: an absolute, canonical https URL without
+// user-info, fragment, whitespace or control characters, with an ASCII host and
+// a port (if any) in 1-65535; http is accepted only for a loopback host or when
+// the issuer is itself http. An invalid value returns an error and leaves the
+// advertised endpoint unchanged. Empty restores the default,
+// {issuer}/oauth2/register. Safe to call at runtime.
+func (s *Server) SetRegistrationEndpoint(endpoint string) error {
+	if err := validateRegistrationEndpoint(endpoint, s.cfg.Token.Issuer); err != nil {
+		return err
+	}
+	s.apiHandler.SetRegistrationEndpoint(endpoint)
+
+	return nil
+}
+
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
 // introspection (RFC 7662) and revocation (RFC 7009) endpoints. Mirrors the
 // token.allow_unauthenticated_token_inspection config gate (require ==
@@ -968,6 +1620,17 @@ func (s *Server) SetAttestationPermissive(enabled bool) {
 // server without restarting it.
 func (s *Server) SetRequireTokenInspectionAuth(require bool) {
 	s.oauthSvc.SetRequireTokenInspectionAuth(require)
+}
+
+// SetRefreshReuseGrace sets the refresh-token reuse grace window: how long
+// after a rotation a second presentation of the rotated-out refresh token is
+// refused as a concurrent retry instead of revoking its family. Mirrors the
+// token.refresh_reuse_grace_seconds config key (0 = no grace, strict RFC
+// 9700); negative values are treated as 0. Exposed so integration tests can
+// exercise several windows on one server without restarting it.
+func (s *Server) SetRefreshReuseGrace(d time.Duration) {
+	s.refreshTokenSvc.SetReuseGrace(d)
+	s.cleanupWorker.SetRefreshReuseGrace(d)
 }
 
 // SetBackchannelPingTransport overrides the outbound HTTP RoundTripper used
@@ -994,8 +1657,20 @@ func (s *Server) SetBackchannelPingDispatchSync(sync bool) {
 // The validator reads from context (populated by deployer-provided global middleware
 // via Server.Use). When nil (default), external principal exchange is disabled.
 //
+// Passing nil disables external principal exchange, as the default does. It used
+// to wrap the nil in a non-nil closure, so the service saw a validator that
+// existed and called it — turning "disabled" into a nil-deref panic on the first
+// external-principal exchange, which is both the opposite of what this godoc
+// promised and a crash on a request path rather than at startup.
+//
 // Can be called after NewServer and before Start.
 func (s *Server) SetTrustedServiceValidator(v TrustedServiceValidator) {
+	if v == nil {
+		s.oauthSvc.SetTrustedServiceValidator(nil)
+
+		return
+	}
+
 	s.oauthSvc.SetTrustedServiceValidator(func(ctx context.Context) (string, error) {
 		return v(ctx)
 	})
@@ -1097,6 +1772,31 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 		existing.RefreshTokenTTL = cfg.RefreshTokenTTL
 		updated = true
 	}
+	// token_endpoint_auth_method and its key material are reconciled like any
+	// other config-declared field. They were previously omitted, which was
+	// harmless while the method was decorative — it is now the field that
+	// decides which credential authenticates the client, so leaving it
+	// unreconciled meant a deployer could set private_key_jwt + jwks_uri in
+	// config, restart, get no error and no log line, and still be running a
+	// client_secret_basic client whose old secret authenticates on every grant.
+	// That is the same advertised-but-silently-inert failure this change exists
+	// to remove, reproduced on the programmatic registration surface.
+	//
+	// UpdateClient validates the resulting combination, so an incoherent config
+	// (private_key_jwt with no keys, or alongside a stored secret) surfaces as
+	// an error here rather than persisting.
+	if cfg.TokenEndpointAuthMethod != "" && cfg.TokenEndpointAuthMethod != existing.TokenEndpointAuthMethod {
+		existing.TokenEndpointAuthMethod = cfg.TokenEndpointAuthMethod
+		updated = true
+	}
+	if len(cfg.JWKS) > 0 && !bytes.Equal(cfg.JWKS, existing.JWKS) {
+		existing.JWKS = cfg.JWKS
+		updated = true
+	}
+	if cfg.JWKSURI != "" && cfg.JWKSURI != existing.JWKSURI {
+		existing.JWKSURI = cfg.JWKSURI
+		updated = true
+	}
 	if cfg.ClientNotificationEndpoint != "" && cfg.ClientNotificationEndpoint != existing.ClientNotificationEndpoint {
 		existing.ClientNotificationEndpoint = cfg.ClientNotificationEndpoint
 		updated = true
@@ -1176,6 +1876,23 @@ func parseDurationOrDefault(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// logSafePath is what request loggers record instead of r.RequestURI.
+//
+// RequestURI carries the query string, and ZeroID does not control what a
+// caller puts there. /oauth2/authorize takes its protocol parameters from
+// the query on a GET, so a client author who mirrors a documented POST form
+// into a GET puts their api_key in the URL. The resolver correctly ignores
+// it — Form is bound to the POST body — but a logger reading RequestURI has
+// already written the secret to disk and shipped it to whatever log sink the
+// deployer runs, twice per request.
+//
+// The path alone cannot hide a credential, and no ZeroID endpoint takes a
+// query parameter worth logging. A deployer who wants query detail can add
+// their own middleware and decide their own redaction.
+func logSafePath(r *http.Request) string {
+	return r.URL.Path
+}
+
 // errorRecoveryMiddleware recovers from panics and returns a 500 JSON error response.
 func errorRecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1184,7 +1901,7 @@ func errorRecoveryMiddleware(next http.Handler) http.Handler {
 				log.Error().
 					Interface("panic", err).
 					Str("method", r.Method).
-					Str("path", r.RequestURI).
+					Str("path", logSafePath(r)).
 					Msg("Panic recovered in request handler")
 
 				w.Header().Set("Content-Type", "application/json")
@@ -1239,6 +1956,41 @@ var OAuthFormEndpoints = map[string]struct{}{
 // new JSON-shaped OAuth parameters land.
 var jsonShapedFormFields = map[string]struct{}{
 	"authorization_details": {},
+}
+
+// repeatableFormFields are OAuth form parameters that a spec explicitly permits
+// to appear MORE THAN ONCE, overriding RFC 6749 §3.1's blanket "MUST NOT be
+// included more than once".
+//
+// Today only RFC 8707 `resource` qualifies: §2 states "the parameter can be
+// included multiple times to indicate multiple resources". Without this set the
+// duplicate-key guard below would reject a conformant multi-resource request
+// with `duplicate OAuth parameter: resource` — a spec violation that would look
+// to an interop tester like we do not support the parameter at all.
+//
+// Repeats are collapsed into a JSON array so the downstream binder
+// (handler.resourceParam) sees the same shape a JSON caller would send.
+//
+// Scoped to /oauth2/token, the only endpoint that binds `resource`. Applying it
+// across every OAuthFormEndpoint would make a repeated `resource` on
+// /oauth2/bc-authorize parse cleanly and then be discarded by a body struct
+// that has no such field — advertising support for a parameter that does
+// nothing. Narrow the carve-out to where the parameter is real.
+var repeatableFormFields = map[string]map[string]struct{}{
+	"/oauth2/token": {
+		"resource": {},
+	},
+}
+
+// formFieldRepeatable reports whether parameter k may legally appear more than
+// once on the given endpoint.
+func formFieldRepeatable(path, k string) bool {
+	fields, ok := repeatableFormFields[path]
+	if !ok {
+		return false
+	}
+	_, repeatable := fields[k]
+	return repeatable
 }
 
 // mediaTypeEquals parses a Content-Type header and reports whether the media
@@ -1296,10 +2048,45 @@ func oauthFormCompatMiddleware(next http.Handler) http.Handler {
 		for k, vs := range r.PostForm {
 			// RFC 6749 §3.1: request parameters MUST NOT be included more
 			// than once. Duplicate keys are rejected rather than silently
-			// collapsed to vs[0].
+			// collapsed to vs[0] — EXCEPT where a later spec explicitly makes
+			// the parameter repeatable (repeatableFormFields), in which case
+			// every occurrence is preserved as a JSON array.
 			if len(vs) > 1 {
-				writeValidationError(w, r, "duplicate OAuth parameter: "+k)
-				return
+				if !formFieldRepeatable(r.URL.Path, k) {
+					writeValidationError(w, r, "duplicate OAuth parameter: "+k)
+					return
+				}
+				// Bound the repeat count HERE, not only at the service's
+				// stricter cap. The token endpoint is unauthenticated, and
+				// without this a 10 MiB body of repeated `resource=` produces
+				// ~800k values that are collected, re-marshalled to JSON, and
+				// URI-validated per element by the request binder before the
+				// service rejects the count. That work is linear rather than
+				// amplifying, so it is not a denial-of-service on its own — but
+				// it is unbounded work admitted on the caller's say-so, and one
+				// comparison removes it. Deliberately looser than the service's
+				// own limit so THAT stays the single authority on how many
+				// resources a request may name, with its own error message.
+				const maxFormRepeats = 64
+				if len(vs) > maxFormRepeats {
+					writeValidationError(w, r,
+						"too many repeated values for OAuth parameter: "+k)
+					return
+				}
+				// Drop valueless occurrences per RFC 6749 §3.2 before binding,
+				// so `resource=https://a&resource=` yields one resource rather
+				// than one resource plus an empty string.
+				kept := make([]string, 0, len(vs))
+				for _, v := range vs {
+					if v != "" {
+						kept = append(kept, v)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				flat[k] = kept
+				continue
 			}
 			if len(vs) == 0 {
 				continue
@@ -1393,7 +2180,7 @@ func writeValidationError(w http.ResponseWriter, r *http.Request, msg string) {
 	log.Info().
 		Str("request_id", reqID).
 		Str("method", r.Method).
-		Str("path", r.RequestURI).
+		Str("path", logSafePath(r)).
 		Str("content_type", r.Header.Get("Content-Type")).
 		Str("reason", msg).
 		Msg("request validation rejected")
@@ -1424,7 +2211,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		log.Info().
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Str("remote_addr", r.RemoteAddr).
 			Msg("request.start")
 
@@ -1443,7 +2230,7 @@ func structuredLoggingMiddleware(next http.Handler) http.Handler {
 		logLevel.
 			Str("request_id", requestID).
 			Str("method", r.Method).
-			Str("path", r.RequestURI).
+			Str("path", logSafePath(r)).
 			Int("status", ww.Status()).
 			Dur("duration", duration).
 			Msg("request.complete")

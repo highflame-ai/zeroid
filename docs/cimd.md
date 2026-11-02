@@ -2,7 +2,7 @@
 
 ZeroID implements **Client ID Metadata Documents** ([`draft-ietf-oauth-client-id-metadata-document`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), adopted by the OAuth WG in October 2025) — the client-onboarding model the [MCP Authorization specification (2025-11-25)](https://modelcontextprotocol.io/) names as its preferred default.
 
-CIMD lets an OAuth client complete an `authorization_code` + PKCE flow against ZeroID **with zero pre-registration**: no admin console, no RFC 7591 dynamic-registration call, no shared secret. The client uses a stable `https://` URL as its `client_id`; ZeroID fetches the JSON metadata document published at that URL, validates it, and treats it as an ephemeral public PKCE client for the duration of the flow.
+CIMD lets an OAuth client complete an `authorization_code` + PKCE flow against ZeroID **with zero pre-registration**: no admin console, no RFC 7591 dynamic-registration call, no shared secret. The client uses a stable `https://` URL as its `client_id`; ZeroID fetches the JSON metadata document published at that URL, validates it, and treats it as an ephemeral client for the duration of the flow — public PKCE by default, or key-authenticated when the document publishes a key set (zeroid#264).
 
 For where CIMD sits relative to ZeroID's other onboarding paths, see the [DCR reference](dpop-and-dcr.md#choosing-between-agent-identity-registration-and-oauth-dcr).
 
@@ -41,9 +41,219 @@ At a stable HTTPS URL it controls, e.g. `https://app.example.com/oauth/client.js
 }
 ```
 
+A client that would rather be **authenticated** than merely identified publishes a key set and declares `private_key_jwt` (zeroid#264). Everything else about the flow is identical; the only difference is at the token endpoint, where it must present a `client_assertion` signed by one of these keys:
+
+```json
+{
+  "client_id":    "https://app.example.com/oauth/client.json",
+  "client_name":  "Example MCP Client",
+  "redirect_uris": ["http://127.0.0.1:3000/callback"],
+  "grant_types":   ["authorization_code", "refresh_token"],
+  "token_endpoint_auth_method": "private_key_jwt",
+  "jwks": { "keys": [ { "kty": "EC", "crv": "P-256", "x": "...", "y": "..." } ] }
+}
+```
+
+`jwks_uri` works too — exactly one of the two, and it must be absolute `https://`. Note what this does and does not buy: it proves the presenter controls the key the document publishes, which is a real strengthening over "anyone may present any published `client_id`". It does **not** make the client vetted by anyone, and it does not widen what the client may ask for.
+
 ### 2. The client starts the flow with its URL as `client_id`
 
-`POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value):
+`GET` or `POST /oauth2/authorize` (unchanged from the [normal PKCE flow](../README.md#real-world-patterns) — the only difference is the `client_id` value).
+
+A browser-based client uses the RFC 6749 §4.1.1 redirect:
+
+```http
+GET /oauth2/authorize?client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+    &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+    &response_type=code
+    &code_challenge=<S256 challenge>
+    &code_challenge_method=S256
+    &state=<opaque> HTTP/1.1
+Cookie: <your session cookie>
+```
+
+`state` is **optional** here. PKCE is mandatory on this endpoint and carries the
+CSRF binding that `state` was originally needed for, so OAuth 2.1 leaves `state`
+to carry application state only. ZeroID round-trips it verbatim when present and
+does not require it. It is shown because most clients have somewhere to return
+the user to.
+
+Every authorization response — the success redirect and any error redirect —
+also carries `iss=<issuer>` (RFC 9207), and AS metadata advertises
+`authorization_response_iss_parameter_supported: true`. A client that talks to
+more than one authorization server should compare it with the issuer it started
+the flow against and drop the response on a mismatch (mix-up defense).
+
+**Serving the browser leg *directly* at `/oauth2/authorize` needs a GET-capable
+`PrincipalResolver`, which ZeroID does not ship.** A browser cannot set a custom
+header on a top-level navigation, and the resolver-facing `Form` accessor is
+bound to the POST body, so a resolver that reads `req.Form(...)` sees nothing on
+a GET.
+
+Direct access is not the only shape, though. There are two ways to connect the
+browser leg, and the second — which needs no GET-capable resolver at all — is
+usually the better one:
+
+1. **Register a cookie-reading resolver** (`req.Cookie(...)`) and own the login
+   and consent screens behind it. This makes `/oauth2/authorize` itself the
+   browser-facing endpoint, which brings the CSRF obligations described below —
+   `SameSite=Lax` still sends the cookie on a cross-site top-level navigation,
+   and CIMD accepts an attacker-published `client_id` with its own
+   `redirect_uri`.
+
+   ZeroID will send the user to that login screen for you: return
+   `ErrPrincipalInteractionRequired` from the resolver when there is no session
+   and register the surface with `Server.SetInteractiveLoginURL`. See the
+   resolver bullet below for what that does and does not do. A CIMD client is
+   offered this hop like any other; `cimd.allowed_domains` decides who may
+   publish a document at all, and a client that resolved has already passed it.
+2. **Front the browser leg above ZeroID and hand off over POST.** Your own
+   surface owns the redirect, authenticates the human however you already do,
+   and then POSTs to `/oauth2/authorize` with a credential a form-based resolver
+   reads — an RFC 7523 assertion signed by that surface, say, verified against
+   its published JWKS. The browser never reaches this endpoint, so no GET-capable
+   resolver is needed.
+
+   The surface also owns consent, so it needs a way to report "the user said
+   no". The client still expects RFC 6749 §4.1.2.1's `error=access_denied`
+   redirect, and the surface cannot build it — only ZeroID has validated
+   `client_id` and `redirect_uri`. Have the assertion carry the decision, and on
+   a denial return `ErrPrincipalAccessDenied` from the resolver (after verifying
+   the assertion — never for an unauthenticated request). ZeroID answers the POST
+   with a 302 to the validated `redirect_uri` carrying `error=access_denied`, the
+   request's `state` and `iss`, and the surface forwards that `Location` to the
+   browser exactly as it forwards the code redirect on approval. This is the only
+   error ZeroID redirects on POST, and it reaches a CIMD client's `redirect_uri`
+   like every other redirect: the client was admitted when its document
+   resolved (see step 3 of "How ZeroID resolves + validates a document").
+
+   What route 2 does **not** remove is authorization-request CSRF — it moves it
+   to your surface. An attacker can still navigate a victim's browser to that
+   surface with an attacker-published `client_id`; if it authenticates from a
+   `SameSite=Lax` session cookie and mints the assertion without further
+   interaction, the same code is issued for the victim, one hop earlier. The
+   CSRF-protected interaction — an explicit consent gesture behind an
+   anti-forgery token — has to happen at the fronting surface before the
+   assertion is minted. What the route removes is the exposure at
+   `/oauth2/authorize` itself, which is no longer reachable by navigation.
+
+Highflame's own deployment takes route 2 — Studio authenticates the user, mints
+an assertion, and POSTs; AuthN's assertion resolver verifies it and ZeroID mints
+the code. (For MCP clients specifically that routing is in flight: today Studio
+mints their codes locally with its own CIMD check, and highflame-studio#1392
+brings them back through this path.) Route 1 exists for deployers with no such
+surface. Either way ZeroID stays the engine: it validates the CIMD document,
+enforces the `redirect_uri` allow-list, and issues the code.
+
+**ZeroID cannot detect this for you.** Its AS metadata omits the
+`authorization_code` grant when *no* resolver is registered, but it cannot
+introspect what a registered resolver reads — so a deployment whose resolvers are
+all form-based *and* has no fronting surface advertises the grant and then 401s
+every browser redirect. If that is you, call
+`Server.SetAuthorizationCodeAvailable(func() bool { return false })` until one of
+the two routes above exists; otherwise the metadata promises a flow the
+endpoint cannot finish, which is exactly the failure this is meant to prevent.
+(A route-2 deployment is fine as-is: its form-based resolver *is* the browser
+leg's back end, fed by the surface.)
+
+A `false` answer turns the flow **off**, not merely unadvertised:
+`/oauth2/authorize` answers 503 on both GET and POST. Reach for it if you run a
+cookie-based resolver and are not yet ready for the CSRF obligations below — a
+cookie resolver is safe while POST is the only route, because `SameSite=Lax`
+withholds the cookie on a cross-site POST, and becomes reachable by cross-site
+top-level navigation once GET is mounted.
+
+**Errors are redirected to a CIMD destination, like any other.** RFC 6749 §4.1.2.1
+says report most `/oauth2/authorize` failures by redirecting to the client's
+registered `redirect_uri`, and ZeroID does, whatever the client's provenance.
+
+There used to be a carve-out here: a self-asserted client with a remote
+`https://` callback got the §5.2 JSON body instead, and the interactive-login
+redirect was refused for it too, unless `cimd.allowed_domains` named its
+publisher.
+
+That inverted the meaning of an empty allow-list. Everywhere else in CIMD, empty
+is the **open-ecosystem default** — any public `https` host may publish, and an
+operator sets a list to *close* the ecosystem. In this one place, empty was the
+most restrictive setting and adding a list was what unlocked the flow. The
+practical effect was a deployment where a desktop client worked and a hosted one
+could not reach the consent screen at all, failing with `interactive
+authentication required but unavailable` — an error naming the login surface
+rather than the allow-list that actually refused the hop. Loopback callbacks were
+exempt, so the shape most CIMD clients have hid it until a hosted client appeared.
+
+`cimd.allowed_domains` is now enforced in **one** place: document resolution. A
+host that is not listed never resolves, so a client that reached the redirect has
+already been admitted by whatever policy the deployer set. Asking again at the
+redirect asked the same question twice and answered it differently.
+
+**What an empty allow-list gives up.** An unauthenticated caller can make
+`/oauth2/authorize` emit a §4.1.2.1 error redirect to a host they chose, by
+publishing a document that names it. That is the open-redirect surface an open
+ecosystem has, and it is the reason the lever exists: a deployer who does not want
+it sets `cimd.allowed_domains`, which closes the ecosystem at the fetch and
+therefore at the redirect too. The success redirect was never gated by any of
+this — it follows user consent.
+
+**That hatch only works on a single-tenant deployment.** `allowed_domains` is one
+deployment-wide set — `domainAllowed` takes no tenant — so on a multi-tenant AS it
+cannot express one customer's policy, and setting it accepts one customer's
+publishers on behalf of all of them. There it is effectively all-or-nothing, which
+in practice means CIMD clients do not get error redirects. Tracked in zeroid#286;
+the tenant is not even known at the point CIMD resolves, so this is a design
+question rather than a missing config field.
+
+Three things a deployer must handle:
+
+* **The resolver starts the interaction; it does not render it.**
+  `PrincipalResolver` returns `(*Principal, error)` and has no `ResponseWriter`,
+  so it cannot render a consent screen — but it can ask for one. Return
+  `ErrPrincipalInteractionRequired` and ZeroID redirects the user agent to the
+  surface you registered with `Server.SetInteractiveLoginURL`, appending
+  `return_to` so the flow resumes at `/oauth2/authorize` once you have
+  authenticated them. Your resolver then only has to recognise the session that
+  established.
+
+  `return_to` is rebuilt from the parameters ZeroID validated, never copied from
+  the inbound URL, so nothing extraneous a caller appended — including a
+  credential in the wrong channel — is forwarded to your login surface.
+  If your clients send a parameter of your own that must survive the round trip
+  (a project or tenant hint, say), allowlist it by name with
+  `Server.SetInteractiveLoginPassthroughParams`: it is copied verbatim into
+  `return_to` when it appears exactly once with a short value. Protocol and
+  credential parameter names cannot be allowlisted, and the value is untrusted
+  caller input your surface must authorize against the signed-in user.
+
+  Only GET is redirected: a POST caller has no user agent. With no target
+  configured the sentinel degrades to `access_denied`, because a resolver cannot
+  conjure a surface the deployment does not have. A CIMD client is offered this
+  hop like any other — same check as the error redirect, either way.
+
+  Use `Server.Use` middleware instead if you want to own the whole interaction
+  including the 302.
+
+  `Server.Use` chains, so registering the consent gate alongside whatever else
+  you already use it for is safe: middleware runs in registration order, first
+  registered outermost. (It used to *replace*, silently dropping everything but
+  the last registration — if you are reading older notes that say to compose
+  manually at the call site, that is no longer necessary. Fixed in zeroid#276.)
+* **CSRF.** A cookie-authenticated `GET` is reachable by top-level navigation
+  from any site (`SameSite=Lax` still sends the cookie), and CIMD accepts any
+  attacker-published `client_id` + its own `redirect_uri`. Require an explicit
+  user interaction — a consent screen with a CSRF token — before issuing a code.
+  This is the same reason a real AS never mints on the bare redirect.
+* **Consent content.** CIMD's premise is that the AS shows the user something
+  about a client it has never seen, and marks it unverified. ZeroID does not
+  hand you that metadata today: `client_name` / `client_uri` / `logo_uri` are
+  parsed into the internal document type but dropped when it is synthesized
+  into a client (`domain.OAuthClient` has no such fields), and the document
+  type is unexported. Your consent surface must fetch and validate the CIMD
+  document itself — applying the same rules ZeroID does, in particular the
+  draft §4 self-reference check that the document's own `client_id` equals the
+  URL it was fetched from, without which the screen can be made to display
+  someone else's branding.
+
+A CLI client can post the same parameters as a form instead:
 
 ```http
 POST /oauth2/authorize HTTP/1.1
@@ -55,17 +265,26 @@ client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
 &code_challenge=<S256 challenge>
 &code_challenge_method=S256
 &state=<opaque>
+&api_key=zid_sk_...
 ```
 
-ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…`.
+**Credentials never travel in the query string.** On `GET`, the principal must
+arrive in a header (`X-API-Key`, or `Authorization: Bearer zid_sk_…`) or a
+cookie — a URL ends up in access logs, browser history, and `Referer`. The
+protocol parameters above are fine there; the credential is not.
+
+ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, checks the `redirect_uri` against the document's `redirect_uris`, mints the auth code, and 302s back to the callback with `?code=…&state=…&iss=…`.
 
 ### 3. The client exchanges the code
 
-`POST /oauth2/token` with `grant_type=authorization_code`, the same CIMD URL as `client_id`, the `code_verifier`, and the `redirect_uri`. No `client_secret` — CIMD clients are public; PKCE is the proof of possession. ZeroID re-resolves the document (served from cache) and issues the token.
+`POST /oauth2/token` with `grant_type=authorization_code`, the same CIMD URL as `client_id`, the `code_verifier`, and the `redirect_uri`. No `client_secret` — a CIMD client never has one. A document declaring `none` proves possession with PKCE alone; one declaring `private_key_jwt` must additionally present a `client_assertion` signed by a key from its own published set, and is refused without it. ZeroID re-resolves the document (served from cache) and issues the token.
 
 ### 4. Refresh, introspect, revoke
 
-When the document's `grant_types` includes `refresh_token`, the exchange also returns a rotating refresh token. On `grant_type=refresh_token` ZeroID re-resolves the document before rotating — which gives CIMD its lifecycle story: **a client that unpublishes its metadata document can no longer rotate** (the presented token is not consumed on resolution failure, so a transient outage doesn't brick the session). The introspection and revocation endpoints likewise accept a CIMD `client_id` as a public-client identification (RFC 7662/7009 §2.1), so stock OAuth libraries that attach `client_id` to those calls work unmodified.
+When the document's `grant_types` includes `refresh_token`, the exchange also returns a rotating refresh token. On `grant_type=refresh_token` ZeroID re-resolves the document before rotating — which gives CIMD its lifecycle story: **a client that unpublishes its metadata document can no longer rotate** (the presented token is not consumed on resolution failure, so a transient outage doesn't brick the session). The two token-inspection endpoints treat a CIMD `client_id` differently:
+
+- **Revocation** (`POST /oauth2/token/revoke`) accepts a CIMD client, authenticated as its document declares. A document declaring `none` is a public client and identifies itself with its `client_id` alone (RFC 7009 §2.1), so stock OAuth libraries that attach `client_id` to the call work unmodified. A document declaring `private_key_jwt` is a confidential client and must present a `client_assertion` (RFC 7523 §2.2) signed by a key its document publishes; `client_id` may be omitted, in which case the assertion's `iss` identifies the client. The client is resolved and authenticated exactly as on the token endpoint: registry first, then the document, under the same `allowed_domains` policy and cache, with the same assertion rules (accepted `aud` is this server's issuer identifier or its token endpoint URL, as for registered clients; `jti` single-use; same `alg` allow-list and `exp` bounds). Either way, the token — access or refresh — is revoked **only if it was issued to that same `client_id`**: for an access token, compared against the signed `client_id` claim in the token; for a refresh token, against the client the refresh token was issued to. Revoking the client's own refresh token ends the grant: its whole rotation family and the access tokens issued from it are revoked, as for any client. A token issued to anyone else is left untouched and the response is still `200` (RFC 7009 §2.2), so the endpoint does not reveal whose token it was. That constraint is what makes accepting a self-published identity safe here: anyone can publish a document, keys included, at a URL they control, so being that URL only ever reaches tokens that URL's client already holds. Refused with `401 invalid_client`: a `client_id` whose document does not resolve (disallowed domain, fetch failure, invalid document); a `private_key_jwt` client with no assertion or an assertion that does not verify; and a `none` client that presents an assertion. A failure on the server's side to look up or revoke the token is `500 server_error`, never a `200` the endpoint did not earn.
+- **Introspection** (`POST /oauth2/token/introspect`) does **not** accept a CIMD client, with or without a valid assertion. Introspection answers questions about any token presented, and authenticating as a CIMD client proves only control of a URL, so admitting it would turn introspection into a token oracle for anyone with a web server. It accepts registered clients only.
 
 ---
 
@@ -74,16 +293,28 @@ When the document's `grant_types` includes `refresh_token`, the exchange also re
 Implemented in [`internal/service/cimd.go`](../internal/service/cimd.go); wired into the auth-code flow at `OAuthService.IssueAuthCode` (`/oauth2/authorize`) and `OAuthService.authorizationCode` (`/oauth2/token`).
 
 1. **Detect — registry first.** The client registry is always consulted first; CIMD resolution only runs when the registry misses **and** the `client_id` is an absolute `https://` URL with a host and a non-root path (`IsCIMDClientID`). Registry-first keeps any pre-existing registry client whose `client_id` happens to be a URL working unchanged, and gives deployers a pinning mechanism: registering a client under a CIMD URL overrides the document. Anything not CIMD-shaped behaves exactly as before — CIMD is purely additive.
-2. **Validate the URL.** `https` scheme, non-empty host, path present, **no query string, no fragment** (the draft requires a canonical document location), and ≤ 255 characters (the `client_id` is persisted into `VARCHAR(255)` columns downstream).
-3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host.
+2. **Validate the URL** against draft-02 §3: `https` scheme, non-empty host, path present, **no fragment** (MUST NOT), **no userinfo** (MUST NOT), **no `.` or `..` path segments** (MUST NOT), and ≤ 255 characters (the `client_id` is persisted into `VARCHAR(255)` columns downstream).
+
+   Two of these carry their own weight beyond conformance. Userinfo is the phishing shape — `https://legit.example.com@evil.example/client.json` resolves to `evil.example` while *reading* as `legit.example.com` on a consent screen or in an audit log. Dot segments would give one document many spellings, splitting the resolution cache and handing one client several identities the §4 self-reference check cannot distinguish.
+
+   ZeroID also rejects a **query string**, where the draft says only SHOULD NOT. That is deliberate and stricter than required: the `client_id` a client presents must stay byte-identical to the URL the document was fetched from, which is exactly what the self-reference check compares.
+3. **Domain policy.** If `cimd.allowed_domains` is configured, the host must be in it (exact, case-insensitive). Empty allowlist ⇒ any public HTTPS host — which is the **default**, and ZeroID warns at startup when CIMD is enabled without one. Note what this control can and cannot do: it constrains *which hosts may publish*, at domain granularity — and, through the `redirect_uris` host check in step 5, *where documents from those hosts may send a user*. This is the only place the allowlist is enforced: there is no second gate at redirect time. A CIMD client that resolved has been admitted, and ZeroID sends the user agent to its validated `redirect_uri` — the code redirect, the RFC 6749 §4.1.2.1 error redirect, the interactive-login redirect and the `access_denied` redirect — exactly as for a registered client. With an empty allowlist that means an unauthenticated caller can publish a document and make `/oauth2/authorize` emit an error redirect to a host of their choosing; that is the open-redirect surface of an open ecosystem, and setting `allowed_domains` is how a deployer closes it. **Only list hosts whose publishing you control.** On a host where anyone can serve a path — user content, a raw-file CDN, a broadly writable bucket — allow-listing hands that party admission, and with it ZeroID's redirects. It does not establish that the party presenting a `client_id` controls that document — CIMD has no proof of possession, so any client may present any published URL, and for a native client whose document lists a loopback `redirect_uri` the code is delivered to the presenter's own listener. Treat the allowlist as ecosystem scoping, not client authentication.
 4. **Fetch (SSRF-guarded, no redirects).** `GET` via the same DNS-rebinding-safe client the OIDC attestation verifier and CIBA dispatch use ([`attestation.NewSSRFGuardedHTTPClient`](../internal/attestation/oidc.go)): the host is resolved once, every answer is checked against the private/loopback/link-local/multicast/CGN/reserved blocklist, and the connection is pinned to the validated IP. TLS still verifies against the original hostname. Response is size-capped (5 KiB default) and timeout-bounded (5 s). **HTTP redirects are not followed** — the `client_id` is a canonical location; a 3xx is a resolution failure.
 5. **Validate the document.**
    - **Self-reference** (draft §4): the document's `client_id` field MUST equal the URL it was fetched from. This is what stops a document from claiming someone else's identity.
    - `redirect_uris` is **required and non-empty** — CIMD's primary anti-impersonation control. Each entry must satisfy OAuth 2.1 scheme rules: `https://`, loopback `http://`, or a private-use scheme (native apps); plaintext non-loopback `http://` is rejected. The requested `redirect_uri` is matched against the list by the existing `redirectURIAllowed` logic (exact match, with RFC 8252 §7.3 port-agnostic matching for loopback callbacks).
-   - `token_endpoint_auth_method` must be `none` (omitted defaults to `none`). **Confidential CIMD clients (`private_key_jwt`) are not supported in v1.**
-   - `grant_types` defaults to `["authorization_code"]`, must include `authorization_code`, and may only contain `authorization_code` / `refresh_token`.
+
+     When `cimd.allowed_domains` is set, an `https://` entry must additionally be on the `client_id`'s own host or on that list — a **deviation**, and the reason the allowlist bounds where an admitted client can send a user (step 3). Allow-listing the *publisher* only vets the destination if the destination is vetted too; otherwise any host where more than one party can publish a path lets an attacker name `https://evil.example/cb` and collect codes from a real sign-in. Loopback and private-use schemes are exempt: they deliver to the caller's own machine, not to a published host. In open mode (empty allowlist) this check does not run and any `https://` destination is accepted.
+   - `token_endpoint_auth_method` must be `none` (omitted defaults to `none`) or `private_key_jwt`. A `private_key_jwt` document MUST publish exactly one of `jwks` (inline JWK Set) or `jwks_uri` — declaring the method with no key material is refused at resolution, because it describes a client that could never authenticate. `jwks_uri` must be absolute `https://` with **no** private-endpoint relaxation: the hatch the registered path offers for loopback test fixtures exists because an operator controls what they register, and a self-published document has no operator. The secret-based methods are refused and structurally always will be — there is no registration response in which a CIMD client could be handed a secret.
+
+     A document that publishes `jwks` while declaring `none` is **not** rejected; the keys are simply not copied onto the synthesized client, so nothing can ever verify an assertion against them. A CIMD document is one declaration published to every authorization server at once, so it may legitimately carry key material for a purpose this server has no part in — the same reasoning as the `grant_types` intersection below.
+   - `grant_types` defaults to `["authorization_code"]` and must include `authorization_code`. Entries outside `authorization_code` / `refresh_token` are **ignored, not rejected** — the document still resolves, and the synthesized client simply carries the supported subset. Publish your real grant list: you do **not** need to strip `device_code` or anything else ZeroID does not implement, and doing so would only break the document for the other authorization servers that share it. Only a `grant_types` with no `authorization_code` left is refused, because that is the flow CIMD exists for. (Before zeroid#344 any extra entry failed the whole document.)
    - `response_types`, if present, must include `code`.
-6. **Synthesize + cache.** The document becomes an ephemeral `domain.OAuthClient` (`client_type: public`, `token_endpoint_auth_method: none`, `registration_source: cimd`) that is **never written to the database**. Outcomes are memoized in a bounded in-memory cache (1000 entries): successes for the configured TTL (1 h default, 24 h hard cap), shortened when the document's `Cache-Control` `max-age` asks for less (floored at 60 s so a document can't force a fetch per request) — so the `/oauth2/authorize` → `/oauth2/token` round-trip doesn't fetch twice, and a client rotating its `redirect_uris` can shrink the staleness window; failures are negative-cached (10 s for transient fetch errors, 60 s for deterministic validation failures) so replaying a dead URL can't force a fresh timeout-bounded outbound fetch per request.
+6. **Synthesize + cache.** The document becomes an ephemeral `domain.OAuthClient` (`registration_source: cimd`) that is **never written to the database**. `token_endpoint_auth_method` carries the document's declared method; `client_type` follows the zeroid#348 convergence — `public` for `none`, `confidential` for `private_key_jwt`, since a key holder maintains the confidentiality of its credentials (RFC 6749 §2.1). No consumer reads that column directly, so the distinction is descriptive rather than load-bearing. Outcomes are memoized in a bounded in-memory cache (1000 entries): successes for the configured TTL (1 h default, 24 h hard cap), shortened when the document's `Cache-Control` `max-age` asks for less (floored at 60 s so a document can't force a fetch per request) — so the `/oauth2/authorize` → `/oauth2/token` round-trip doesn't fetch twice, and a client rotating its `redirect_uris` can shrink the staleness window; failures are negative-cached (10 s for transient fetch errors, 60 s for deterministic validation failures) so replaying a dead URL can't force a fresh timeout-bounded outbound fetch per request.
+
+   > **Key rotation is bounded by this TTL — set `Cache-Control` if you publish `jwks` inline.** An inline key set is part of the document, so it is frozen in the resolution cache for the full positive TTL (1 h by default, up to the 24 h cap). A client that needs to retire a compromised key cannot make ZeroID drop it sooner by editing the document: ZeroID will not re-fetch until the entry expires, and there is no invalidation endpoint. The lever is the document's own `Cache-Control: max-age`, floored at 60 s — publish a short one if your rotation story needs a short window.
+   >
+   > `jwks_uri` behaves differently and is the better choice for clients that rotate: the *document* cache holds only the URI, and the key set behind it lives in a separate cache that refreshes on its own interval, so replacing the keys served at that URI takes effect without waiting for the document TTL.
 
 ### Error mapping
 
@@ -148,6 +379,57 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 
 ---
 
+## Specification revision and deviations
+
+**Implemented against:** [`draft-ietf-oauth-client-id-metadata-document-02`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/), adopted by the OAuth WG in October 2025.
+
+This is a **draft at revision 02 and it will change.** The section exists so that when it does, the next reader can tell which behaviours were the spec, which were our choices, and which were deliberately left unbuilt — rather than reverse-engineering that from the validator.
+
+### Where ZeroID is deliberately STRICTER than the draft
+
+Both of these will reject a document some other implementation accepts. That is intended, but it is also the part most likely to age badly: a later revision can bless what we refuse, and then we are rejecting valid clients for a reason nobody remembers choosing. Revisit both on each draft bump.
+
+| Rule | Draft says | ZeroID does | Why |
+|---|---|---|---|
+| Query string in `client_id` | SHOULD NOT | **Rejects** | The `client_id` a client presents must stay byte-identical to the URL the document was fetched from — that is exactly what the §4 self-reference check compares. Stripping or tolerating a query gives one document two spellings. |
+| `client_name` | RECOMMENDED | **Required, non-empty** | It is the string a human is asked to trust on a consent screen. Absent, the prompt degrades to a raw URL — and for a URL an attacker chose, that is actively misleading. The publisher is anonymous by construction (no registration, no secret), so this label is most of what consent has to work with. |
+
+### Deliberately not implemented
+
+- **`software_statement`** — signed metadata is not consumed. CIMD trust here is domain-ownership based. This is an area the draft is more likely to move in than the core resolution rules, which is part of why it is not built on.
+
+> **Superseded (zeroid#264).** This section previously listed *confidential CIMD clients* here, on the grounds that honouring key-based auth from a self-published document "would let any party on the internet assert a confidential client identity with no registration step". That reasoning does not survive the §4 self-reference check: a CIMD `client_id` **is** the URL its document was fetched from, so the only identity anyone can assert is one for a URL they already control — which they already assert today as a public client. Requiring a signed assertion on top does not hand out a new identity; it adds a proof obligation to an existing one.
+>
+> What genuinely bounds a CIMD client's authority is unchanged by key-based auth, and is worth naming because it is the thing to protect: the grant-type intersection (a synthesized client's `grant_types` is provably a subset of `authorization_code` / `refresh_token`) and the three call sites that can yield a CIMD client at all. `client_credentials` for a CIMD client removes the user from the loop and is a genuinely different question — tracked as zeroid#266, not shipped here.
+
+### The change most likely to break silently
+
+A rename of the discovery field **`client_id_metadata_document_supported`**.
+
+If a later draft renames it, nothing errors. The authorization server keeps advertising a key clients no longer look for, every client falls back to `registration_endpoint` and DCR, and the whole flow keeps working — via exactly the row-per-client path CIMD exists to remove.
+
+Tests do not help here. They assert the server *emits* that field, so they stay green while no client can see it. The only guard is tracking the draft.
+
+### What makes drift survivable
+
+Two properties worth knowing about before a spec change forces a decision:
+
+- **DCR is retained as a fallback.** `registration_endpoint` stays advertised alongside CIMD deliberately, so a client that cannot complete CIMD still has a path.
+- **Registry-first resolution is a pinning mechanism.** A client registered under its CIMD URL overrides the document (see step 1 of resolution). So a specific client caught by a spec change can be pinned by registering it, without waiting on a ZeroID release.
+
+### Deployment note: the cache is per process
+
+`CIMDService` holds its resolution cache in memory, so a deployment running N replicas has N independent caches. Concurrent resolutions of the same `client_id` are coalesced **within** a process (singleflight), not across them.
+
+Two consequences worth planning around:
+
+- **Fan-out** is up to N fetches per document per TTL, and negative caching is likewise per replica — so replaying a dead URL costs N times as much. Bounded in practice by edge rate limiting, which is required for an open deployment anyway.
+- **Staleness is non-uniform.** Two replicas can serve different versions of one document for up to the TTL, so a client that removes a `redirect_uri` may find the change effective on some replicas and not others, with no way to tell which served it.
+
+A shared cache (Redis) would fix the fan-out and make replicas *consistently* stale — it would not make them *fresher*. Revocation latency is governed by the TTL and by the document's `Cache-Control` (ZeroID takes the shorter, floored at 60s), independent of where the cache lives. Note also that a shared cache holds `redirect_uris`, the primary anti-impersonation control, so write access to it becomes equivalent to choosing where authorization codes are delivered.
+
+---
+
 ## Security considerations
 
 - **Redirect-URI allow-list is the load-bearing control.** Copying a `client_id` is useless without control of a host in its `redirect_uris`. PKCE binds the code to the verifier on top of that.
@@ -155,14 +437,16 @@ CIMD-aware clients (MCP 2025-11-25, and any client that walks the draft's discov
 - **Localhost redirects.** Loopback `redirect_uris` are matched port-agnostically (RFC 8252) so native/CLI callbacks work, but any process on the user's machine can bind a loopback port. Treat localhost CIMD clients with the same caution as any native public client.
 - **DNS / TLS trust.** CIMD's integrity rests on the same DNS + TLS + certificate-transparency assumptions as any HTTPS-based trust model. **`allowed_domains` is the hard boundary** — see [Production hardening](#production-hardening--set-allowed_domains).
 - **No persistence, no secret.** CIMD clients are ephemeral and hold no symmetric secret at the broker — there is nothing to leak from ZeroID's side.
-- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — bounded cache (1000 entries), negative caching of failures (10 s fetch / 60 s validation), 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist — but the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch. Deployers running fully open CIMD (empty allowlist) should additionally rate-limit `/oauth2/authorize` at the edge like any public endpoint.
+- **Fetch abuse.** The resolution surface is unauthenticated (`/oauth2/authorize` is public, and client resolution runs *before* the principal chain), so a request-supplied `client_id` triggers an outbound fetch. It is deliberately hard to abuse — concurrent resolutions of the same `client_id` are **coalesced into one fetch** (singleflight), plus a bounded cache (1000 entries), negative caching of failures (10 s fetch / 60 s validation), 5 KiB response cap, 5 s timeout, no redirect following, and the SSRF blocklist.
+
+  Be precise about what each control bounds. The caps bound the cost of *one* fetch. Coalescing bounds *duplicate concurrent* work for one `client_id`. Neither bounds a caller cycling **distinct** URLs: each unique path is a fresh flight, misses the cache, walks past negative caching, and churns cache eviction. So the **primary control is `allowed_domains`**, which rejects unknown hosts before any fetch — and a deployment running fully open (empty allowlist) **must** rate-limit `/oauth2/authorize` at the edge. That is the deployer's job; no in-process control substitutes for it.
 
 ---
 
 ## Limitations / future work
 
-- **Confidential CIMD clients** (`token_endpoint_auth_method: private_key_jwt` with a published `jwks_uri`) are not supported — ZeroID does not yet accept `private_key_jwt` token-endpoint auth for any client. v1 is public-PKCE-only.
-- **`software_statement`** (signed metadata) — not consumed; CIMD trust is domain-ownership based.
+- **Unimplemented draft features** — `software_statement`. Covered under [Specification revision and deviations](#deliberately-not-implemented), which is the single place that records what is and is not built against the draft; they are not repeated here so the two cannot drift apart.
+- **Cross-replica cache coherence** — the resolution cache is per process, so N replicas hold N caches. See [Deployment note: the cache is per process](#deployment-note-the-cache-is-per-process) for the fan-out and staleness consequences, and why a shared cache addresses the first but not the second.
 
 ---
 

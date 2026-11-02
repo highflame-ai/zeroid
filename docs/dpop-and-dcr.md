@@ -32,6 +32,12 @@ DPoP: eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7...
 grant_type=client_credentials&client_id=...&client_secret=...&account_id=...&project_id=...&scope=payments:write
 ```
 
+`account_id` and `project_id` may be omitted when the client was registered
+with an `identity_id`: the token is then for that linked identity, in its
+tenant. A linked client that does send them must name the linked identity's
+tenant, or the request is refused with `invalid_request`. A client without a
+link must send both.
+
 Response:
 
 ```json
@@ -39,7 +45,9 @@ Response:
   "access_token": "eyJ0eXAi...",
   "token_type":   "DPoP",
   "expires_in":   3600,
-  "scope":        "payments:write"
+  "scope":        "payments:write",
+  "account_id":   "...",
+  "project_id":   "..."
 }
 ```
 
@@ -50,7 +58,7 @@ The access token's claims include a `cnf` (confirmation) member with `jkt` = the
 Per RFC 9449 §7, the access token is presented with the `DPoP` (not `Bearer`) auth scheme, and a **new** proof JWT is signed for **this** call. The new proof carries an `ath` claim — `base64url(SHA-256(access_token))` — that binds the proof to this specific access token.
 
 ```http
-POST /api/v1/transfer HTTP/1.1
+POST /transfer HTTP/1.1
 Host: payments.example.com
 Authorization: DPoP eyJ0eXAi...
 DPoP: eyJ0eXAiOiJkcG9wK2p3dCIsImFsZyI6IkVTMjU2IiwiandrIjp7... (different jti, ath claim set)
@@ -99,14 +107,24 @@ The 500 case is deliberate: a database-unreachable signal must never look like a
 
 ### Reverse-proxy deployments
 
-If ZeroID sits behind nginx / an AWS ALB / a GCP LB, set:
+Behind a TLS-terminating proxy, ZeroID sees its own URL as `http://…` while a correct client signs its proof for the public `https://…` URL — so without forwarded-header trust **every correct proof fails `htu`**. Pick the mode that matches what your edge actually does:
 
 ```yaml
 server:
-  trust_forwarded_headers: true
+  forwarded_headers: proto   # none | proto | proto_host
 ```
 
-`RequestURLMiddleware` will then read `X-Forwarded-Proto` and `X-Forwarded-Host` when reconstructing the URL the client signed. **Leave it `false` if the service terminates TLS itself** — otherwise a spoofed `X-Forwarded-Host` could move the `htu` goalpost.
+| Mode | Trusts | Use when |
+|---|---|---|
+| `none` (default) | nothing | ZeroID terminates TLS itself |
+| `proto` | `X-Forwarded-Proto`; host from `Host` | **AWS ALB**, or any edge that sets the scheme but does not overwrite `X-Forwarded-Host` |
+| `proto_host` | `X-Forwarded-Proto` and `X-Forwarded-Host` | only behind an edge that sets **and overwrites** both (a configured nginx, GCP LB, most CDNs) |
+
+**Why the split matters.** An AWS ALB sets `X-Forwarded-Proto` but never sets `X-Forwarded-Host`, so a client-supplied value reaches ZeroID untouched. Trusting it there lets the client choose the host its proof is checked against — a proof signed for another server then validates here, which is exactly the cross-server replay `htu` exists to prevent. `Host` is safer because the edge routes on it: a request naming another server never arrives. When unsure, `proto` is the safe choice behind a TLS-terminating proxy.
+
+Only `http` and `https` are honoured from `X-Forwarded-Proto`; any other value is ignored rather than written into the comparison URL.
+
+The older `trust_forwarded_headers: true` still works and means `proto_host`. It is deprecated because it cannot express `proto`; setting it alongside any other `forwarded_headers` value is rejected at startup as ambiguous.
 
 ### Replay store and cleanup
 
@@ -163,7 +181,7 @@ ZeroID has two registration paths; the right one depends on what you're register
 
 | Use case | Endpoint | Auth shape |
 |---|---|---|
-| **Agent identity** participating in delegation chains (`token_exchange`, multi-hop `jwt-bearer`) | `POST /api/v1/agents/register` with `public_key_pem` | Keypair owned by the agent; public PEM uploaded to the broker at registration. Self-signed JWT assertions verify against the stored key. |
+| **Agent identity** participating in delegation chains (`token_exchange`, multi-hop `jwt-bearer`) | `POST /agents/register` with `public_key_pem` | Keypair owned by the agent; public PEM uploaded to the broker at registration. Self-signed JWT assertions verify against the stored key. |
 | **Confidential OAuth client** — vendor MCP server, installer bootstrap, single-hop tool — that does not participate in delegation chains | `POST /oauth2/register` (this doc) with `client_secret_basic` / `client_secret_post`, optionally inline `jwks` for jwt-bearer assertions | Client secret minted at registration; assertion-signing keys (if used) held at the broker. |
 
 The split is deliberate. DCR-registered clients are **explicitly blocked from `token_exchange`** (enforced at the grant-type allow-list — see "What ZeroID enforces" below) because they have no `IdentityID` binding and cannot legitimately act as a delegation actor. Agents that need to participate in chains must register through the agent identity path. See the [agent registration walkthrough in the README](../README.md#1-register-an-agent) for that side of the API.
@@ -201,6 +219,8 @@ curl -s -X POST https://auth.example/oauth2/register \
 ```
 
 The response contains the new `client_id` + `client_secret` (the plaintext secret is shown once and **never** persisted in plain form) and a `registration_access_token` that authenticates subsequent management calls.
+
+`client_secret` is **omitted entirely** when the client registered with `token_endpoint_auth_method: private_key_jwt` — no secret is minted for a key-based client. RFC 7591 §3.2.1 makes the member OPTIONAL; emitting an empty string would tell the registrant they hold a credential they do not.
 
 ```json
 {
@@ -290,9 +310,15 @@ curl -s -X POST https://auth.example/oauth2/token \
 
 …the client authenticates **to the token endpoint** with HTTP Basic (its `client_secret`), and the `assertion` JWT is verified against the JWKS uploaded at registration. The two checks are independent: `token_endpoint_auth_method` governs how the client identifies itself to the endpoint; the `jwks` governs how its assertion signature is verified.
 
-**Why inline `jwks` rather than `jwks_uri`**: RFC 7591 §2 accepts both. Inline `jwks` uploads the keys to the broker once at registration time, the broker stores them, and verification is local. `jwks_uri` requires the broker to fetch keys from a URL the client publishes, which means the client must run an internet-reachable HTTPS endpoint solely for key publication — workable when client and broker live in different security domains, but unnecessary friction for self-hosted ZeroID deployments. For key rotation, use an RFC 7592 `PUT` to swap the inline JWKS (single round-trip, no DNS or TLS dependency).
+**Why prefer inline `jwks` over `jwks_uri`**: RFC 7591 §2 accepts both, and so does ZeroID — but inline is the lower-risk default. Inline `jwks` uploads the keys to the broker once at registration time, the broker stores them, and verification is local. `jwks_uri` requires the broker to fetch keys from a URL the client publishes, which means the client must run an internet-reachable HTTPS endpoint solely for key publication — workable when client and broker live in different security domains, but unnecessary friction for self-hosted ZeroID deployments. For key rotation, use an RFC 7592 `PUT` to swap the inline JWKS (single round-trip, no DNS or TLS dependency). Note that RFC 7592 `PUT` is a FULL replacement: key material must be re-sent or it is removed.
 
-> **`private_key_jwt` is not currently accepted** as `token_endpoint_auth_method` for DCR-registered clients (see "What ZeroID enforces" below). DCR clients authenticate to the token endpoint with their client secret; the jwt-bearer **grant** is the path where signed assertions and JWKS come into play.
+A registered `jwks_uri` is also a URL this server makes outbound requests to, on every cold cache. It is fetched through the same SSRF-guarded client the external-issuer registry uses, and private/loopback/link-local destinations are refused unless `client_auth.allow_private_jwks_endpoints` is set (dev only). Cached key sets are bounded and LRU-evicted via `client_auth.jwks_cache_size`, because each cached endpoint owns a background refresh goroutine.
+
+**Switching a DCR client off `private_key_jwt` is a one-way door.** An RFC 7592 `PUT` that does not restate `private_key_jwt` is refused, because DCR has no secret-issuance endpoint — allowing the switch would leave the client with no usable credential at all. If a key-based client's signing key is compromised, the recovery is to rotate the key material with a `PUT` that restates `private_key_jwt` plus the new `jwks`/`jwks_uri`. Genuinely moving to `client_secret_basic` requires `DELETE /oauth2/register/{client_id}` and a fresh registration, which yields a **new `client_id`** — so re-key rather than re-register unless the client identifier can change.
+
+**Key-revocation window**: a cached `jwks_uri` refreshes every 5 minutes, so a key removed from the client's published set keeps authenticating for up to that long. Inline `jwks` has no such window — an RFC 7592 `PUT` takes effect immediately. If prompt revocation matters, prefer inline.
+
+> **`private_key_jwt` IS accepted** as `token_endpoint_auth_method` for DCR-registered clients as of zeroid#206. Such a client supplies `jwks` or `jwks_uri` at registration and receives **no `client_secret`** — the key is the credential, and a secret that cannot be used but can still leak is worse than no secret. Keep the two mechanisms distinct: `token_endpoint_auth_method` governs how the client authenticates *itself* (RFC 7523 §2.2), while the jwt-bearer **grant** is about on whose authority a token is issued (§2.1). One request may legitimately carry both.
 
 ### What ZeroID enforces
 
@@ -318,7 +344,7 @@ Validated by `validateDCRClientMetadata`:
 - `grant_types` defaults to `["client_credentials"]`. The allow-list for DCR-registered clients is **`client_credentials`** and **`urn:ietf:params:oauth:grant-type:jwt-bearer`** only. Notably absent:
   - `authorization_code` — no interactive consent flow exists for self-registered clients.
   - `urn:ietf:params:oauth:grant-type:token-exchange` — DCR clients have no `IdentityID` binding and so cannot legitimately act as a delegation actor. Re-enable once that binding exists.
-- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, or empty (defaults to `client_secret_basic` per RFC 7591 §2). `"none"` is explicitly rejected — this server requires client authentication.
+- `token_endpoint_auth_method` is `client_secret_post`, `client_secret_basic`, `private_key_jwt`, or empty (defaults to `client_secret_basic` per RFC 7591 §2). `"none"` is explicitly rejected — this server requires client authentication. `private_key_jwt` additionally requires exactly one of `jwks` / `jwks_uri` (RFC 7591 §2 forbids both), and suppresses `client_secret` in the registration response.
 - `redirect_uris` is accepted for spec compliance but ignored.
 
 #### On the registration_access_token
@@ -353,10 +379,27 @@ A standards-conformant client walks two documents to find the registration endpo
 
 1. `/.well-known/oauth-protected-resource` (RFC 9728) — the *resource server's* metadata. Advertises `resource`, `authorization_servers` (pointers to the AS), `bearer_methods_supported: ["header"]`, `dpop_bound_access_tokens_required: false`. This is the document a 401 with `WWW-Authenticate: Bearer resource_metadata="…"` points the client at.
 2. `/.well-known/oauth-authorization-server` (RFC 8414) — the *authorization server's* metadata, fetched after PRM points the client here. Advertises the actual endpoints:
-   - `registration_endpoint` — set to `{baseURL}/oauth2/register` when DCR is wired (it always is in this build; the endpoint exists but every request 401s if the deployer doesn't mint `client:register`-scoped tokens).
+   - `registration_endpoint` — `{issuer}/oauth2/register` by default (the endpoint always exists in this build; every request 401s if the deployer doesn't mint `client:register`-scoped tokens). A deployer that hosts client registration elsewhere can advertise that URL instead with `token.registration_endpoint` — see [Advertising a registration endpoint hosted elsewhere](#advertising-a-registration-endpoint-hosted-elsewhere).
    - `dpop_signing_alg_values_supported: ["ES256", "RS256"]`.
 
 The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. Publishing both documents lets stock OAuth clients work without ZeroID-specific shimming.
+
+### Advertising a registration endpoint hosted elsewhere
+
+ZeroID's own `/oauth2/register` is built for machine onboarding: it requires an initial access token and accepts only `client_credentials` / `jwt-bearer` clients. An interactive client (an MCP client in a browser, say) that discovers it through AS metadata cannot use it. RFC 8414 §2 puts no constraint on where `registration_endpoint` lives, so a deployment that runs registration for such clients somewhere else — its own front end, typically, which can then create the client however it sees fit — can advertise that URL instead:
+
+```yaml
+token:
+  registration_endpoint: "https://app.example.com/oauth/register"   # env: ZEROID_REGISTRATION_ENDPOINT
+```
+
+Embedders that configure the server in code call `Server.SetRegistrationEndpoint(url) error` instead.
+
+- The override replaces `registration_endpoint` in **both** AS metadata documents (`/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`). Unset, they advertise `{issuer}/oauth2/register` exactly as before.
+- It must be an absolute `https` URL with no user-info, fragment, whitespace or control characters, an ASCII host (give an internationalized name in its `xn--` form), and a port, if any, in 1–65535. `http` is accepted for a loopback host (`localhost`, `127.0.0.0/8`, `::1`), and for any host when `token.issuer` is itself `http` (an in-cluster test stack, say); with an `https` issuer a non-loopback `http` endpoint is refused.
+- The value is advertised exactly as configured, so it must already be in canonical form: lowercase scheme and host, standard percent-escaping. A non-canonical value (`HTTPS://App.Example.com/…`) is rejected with the canonical form in the error rather than silently rewritten.
+- An invalid value fails config load (or is returned as an error by the setter) rather than being advertised. Errors never echo user-info, so a credential pasted into the URL does not reach the logs.
+- Only the advertisement changes. ZeroID's own `/oauth2/register` stays mounted with its initial-access-token gate, and `registration_client_uri` on its responses still points at ZeroID.
 
 ### Limitations / future work
 
@@ -370,10 +413,10 @@ The two-hop PRM → AS chain is what an RFC 8414/9728-conformant client walks. P
 
 ```yaml
 server:
-  trust_forwarded_headers: false   # set true when behind a trusted edge proxy (nginx/ALB/etc.) for DPoP htu correctness
+  forwarded_headers: none   # behind a TLS-terminating proxy: "proto" (e.g. AWS ALB), or "proto_host" only if the edge overwrites X-Forwarded-Host — see "Reverse-proxy deployments"
 ```
 
-No DCR-specific config knobs — the feature is governed by which clients hold `client:register` scope.
+DCR itself is governed by which clients hold `client:register` scope. The one related knob is `token.registration_endpoint` (`ZEROID_REGISTRATION_ENDPOINT`), which changes only which registration URL AS metadata advertises — see [Advertising a registration endpoint hosted elsewhere](#advertising-a-registration-endpoint-hosted-elsewhere).
 
 ## Operational signals
 

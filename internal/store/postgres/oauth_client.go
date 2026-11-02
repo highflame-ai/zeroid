@@ -21,7 +21,7 @@ func NewOAuthClientRepository(db *bun.DB) *OAuthClientRepository {
 
 // Create inserts a new OAuth2 client.
 func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuthClient) error {
-	_, err := r.db.NewInsert().Model(client).Exec(ctx)
+	_, err := dbOrTx(ctx, r.db).NewInsert().Model(client).Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create oauth client: %w", err)
 	}
@@ -31,7 +31,7 @@ func (r *OAuthClientRepository) Create(ctx context.Context, client *domain.OAuth
 // GetByClientID retrieves a client by its globally unique OAuth2 client_id.
 func (r *OAuthClientRepository) GetByClientID(ctx context.Context, clientID string) (*domain.OAuthClient, error) {
 	client := &domain.OAuthClient{}
-	err := r.db.NewSelect().Model(client).
+	err := dbOrTx(ctx, r.db).NewSelect().Model(client).
 		Where("client_id = ?", clientID).
 		Scan(ctx)
 	if err != nil {
@@ -78,6 +78,36 @@ func (r *OAuthClientRepository) List(ctx context.Context) ([]*domain.OAuthClient
 	return clients, nil
 }
 
+// ListByIdentityID returns the clients linked to one identity, newest first.
+func (r *OAuthClientRepository) ListByIdentityID(ctx context.Context, identityID string) ([]*domain.OAuthClient, error) {
+	var clients []*domain.OAuthClient
+	err := r.db.NewSelect().Model(&clients).
+		Where("identity_id = ?", identityID).
+		OrderExpr("created_at DESC").
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list oauth clients for identity: %w", err)
+	}
+	return clients, nil
+}
+
+// DeleteForIdentity removes a client only while it is still linked to
+// identityID, in one statement, so a link that changes between a caller's
+// read and this delete cannot remove another identity's client. It reports
+// whether a row was deleted.
+func (r *OAuthClientRepository) DeleteForIdentity(ctx context.Context, id, identityID string) (bool, error) {
+	res, err := r.db.NewDelete().
+		TableExpr("oauth_clients").
+		Where("id = ?", id).
+		Where("identity_id = ?", identityID).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete oauth client: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // Update persists changes to an OAuth2 client.
 func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuthClient) error {
 	_, err := r.db.NewUpdate().Model(client).Where("id = ?", client.ID).Exec(ctx)
@@ -85,6 +115,25 @@ func (r *OAuthClientRepository) Update(ctx context.Context, client *domain.OAuth
 		return fmt.Errorf("failed to update oauth client: %w", err)
 	}
 	return nil
+}
+
+// UpgradeSecretHash swaps a client's stored secret hash from oldHash to
+// newHash and reports whether it did. Conditional on oldHash so it never
+// overwrites a concurrent rotation, and column-scoped so it can't clobber
+// other fields. updated_at is left alone on purpose: the secret is unchanged,
+// only its storage format moves.
+func (r *OAuthClientRepository) UpgradeSecretHash(ctx context.Context, id, oldHash, newHash string) (bool, error) {
+	res, err := r.db.NewUpdate().
+		TableExpr("oauth_clients").
+		Set("client_secret = ?", newHash).
+		Where("id = ?", id).
+		Where("client_secret = ?", oldHash).
+		Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to upgrade oauth client secret hash: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // Delete removes an OAuth2 client (hard delete — clients are admin-controlled).

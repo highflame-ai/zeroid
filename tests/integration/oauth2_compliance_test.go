@@ -151,9 +151,11 @@ func TestRFC6749_S5_2_InvalidRequestOnMissingRequiredField(t *testing.T) {
 	// RFC 6749 §5.2: "invalid_request ... The request is missing a required
 	//   parameter, includes an invalid parameter value, includes a parameter
 	//   more than once, or is otherwise malformed."
+	// Omitting the tenant is no longer an example: client_credentials derives
+	// it from the client's registration. Naming half of it is still malformed.
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type": "client_credentials",
-		// account_id + project_id deliberately omitted
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
 		"client_id":     "any",
 		"client_secret": "any",
 	}, nil)

@@ -170,7 +170,7 @@ if dpop.IsClientFault(err) {
 - [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449) — OAuth 2.0 Demonstrating Proof of Possession (DPoP)
 - [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638) — JSON Web Key (JWK) Thumbprint
 - [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) — OAuth 2.0 Token Exchange (`cnf` semantics)
-- [draft-ietf-oauth-dpop-bh](https://datatracker.ietf.org/doc/draft-ietf-oauth-dpop-bh/) — body-hash extension claim
+- The `bh` body-hash proof claim is a ZeroID extension — no RFC or IETF draft of its own. For standards-track request-body integrity, see [RFC 9421](https://www.rfc-editor.org/rfc/rfc9421) (HTTP Message Signatures) over a signed [RFC 9530](https://www.rfc-editor.org/rfc/rfc9530) `Content-Digest`.
 
 ## License
 

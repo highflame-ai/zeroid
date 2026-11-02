@@ -37,9 +37,12 @@ func TestCIBAHardening(t *testing.T) {
 	// issueTokenForApprovedRow, and CreateAuthRequest never touches the
 	// credential service).
 	bcRepo := postgres.NewBackchannelRequestRepository(testDB)
+	// Minimum resolved retention (floored at the redemption grace), so the
+	// reaping assertions below observe the redemption bound itself.
+	bcRepo.SetResolvedRetention(0)
 	oauthClientRepo := postgres.NewOAuthClientRepository(testDB)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
-	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, service.DefaultBackchannelConfig())
+	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, nil, service.DefaultBackchannelConfig())
 
 	t.Run("Redeem_OmittedClientID_Refused", func(t *testing.T) {
 		// FIX #1: Redeem must require a non-empty client_id and always compare

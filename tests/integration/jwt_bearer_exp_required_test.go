@@ -57,7 +57,7 @@ func TestJwtBearer_ExpClaimRequired(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    bad,
+		"assertion":  bad,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
@@ -135,7 +135,7 @@ func TestJwtBearer_SubClaimRequired(t *testing.T) {
 
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    bad,
+		"assertion":  bad,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,

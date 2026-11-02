@@ -371,3 +371,50 @@ func TestRFC9449_S6_1_CnfJktEqualsRfc7638Thumbprint(t *testing.T) {
 	jkt, _ := cnf["jkt"].(string)
 	assert.Equal(t, expected, jkt, "cnf.jkt MUST equal base64url(SHA-256(JWK)) per RFC 7638")
 }
+
+// ── RFC 9449 §7.1 — The DPoP Authentication Scheme ──────────────────────────
+//
+// §6.1 covers how a bound token is MINTED (cnf.jkt). These cover how it is
+// PRESENTED: ZeroID returns token_type "DPoP", and docs/dpop-and-dcr.md tells
+// the client to send `Authorization: DPoP <token>`, so every endpoint that
+// reads a credential off that header must accept the scheme. Regression
+// origin: issue #256, where no call site did.
+
+func TestRFC9449_S7_1_DPoPSchemeIsAccepted(t *testing.T) {
+	// RFC 9449 §7.1: "The DPoP authentication scheme is a new authentication
+	// scheme ... used to transmit an access token that is bound to a key."
+	// A resource server that issues such tokens MUST read them under it.
+	//
+	// RFC 9110 §11.1 makes the scheme token case-insensitive, so every
+	// spelling below denotes this same scheme.
+	token := issueAPIKeyToken(t, uid("rfc9449-s71-scheme"))
+
+	for _, scheme := range []string{"DPoP", "dpop", "DPOP", "dPoP"} {
+		t.Run(scheme, func(t *testing.T) {
+			resp := get(t, "/oauth2/token/verify", map[string]string{
+				"Authorization": scheme + " " + token,
+				"DPoP":          "proof-placeholder",
+			})
+			defer func() { _ = resp.Body.Close() }()
+
+			assert.Equal(t, http.StatusOK, resp.StatusCode,
+				"the DPoP scheme must be read as a credential, not refused at the header parse")
+		})
+	}
+}
+
+func TestRFC9449_S7_1_DPoPSchemeWithoutProofIsRejected(t *testing.T) {
+	// RFC 9449 §7.1: a request presenting a token under the DPoP scheme
+	// carries a proof in the DPoP header — the scheme and the proof travel
+	// together. Accepting the scheme alone would let it present a token on
+	// weaker terms than Bearer, which inverts the point of the scheme.
+	token := issueAPIKeyToken(t, uid("rfc9449-s71-noproof"))
+
+	resp := get(t, "/oauth2/token/verify", map[string]string{
+		"Authorization": "DPoP " + token,
+	})
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+		"the DPoP scheme without a DPoP proof header must be refused")
+}

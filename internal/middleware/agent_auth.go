@@ -2,12 +2,10 @@ package middleware
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"encoding/json"
 	"net/http"
-	"strings"
 
-	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
@@ -17,7 +15,7 @@ import (
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
 // It is populated by AgentAuthMiddleware and available via GetAgentClaims.
 type AgentClaims struct {
-	Subject    string // WIMSE URI
+	Subject    string // WIMSE URI of the presenting agent: the current actor of an rfc8693 exchanged token, else `sub`
 	AccountID  string
 	ProjectID  string
 	AgentID    string
@@ -25,14 +23,42 @@ type AgentClaims struct {
 	Scopes     []string
 	JTI        string
 	IdentityID string
+	GrantType  string // the grant that issued the token, such as "api_key" or "token_exchange"
+	// PrincipalType is the rfc8693 profile's principal_type claim ("user",
+	// "workload"); empty on legacy-profile tokens.
+	PrincipalType string
+	// UserIDIssuer is the user_id_iss claim: set when the token's subject is
+	// a person vouched for by a federated IdP.
+	UserIDIssuer string // Issuer and Audience are the token's iss and aud. ZeroID's own tokens
+	// carry the issuer as aud unless they were bound to another audience,
+	// such as a gateway or an RFC 8707 resource.
+	Issuer   string
+	Audience []string
+	// ClientAuth is the client_auth claim: "federated_assertion" when the
+	// client authenticated with a federated client assertion.
+	ClientAuth string
 }
 
 type agentClaimsKey struct{}
 
 // AgentAuthConfig configures the AgentAuthMiddleware.
 type AgentAuthConfig struct {
-	// PublicKey is the ECDSA P-256 public key used to verify ES256 tokens.
-	PublicKey *ecdsa.PublicKey
+	// KeySet is the server's JWKS — every public key the issuer signs with,
+	// each carrying its own kid and alg.
+	//
+	// This must be the key SET, not a single key. Every OAuth grant path
+	// asks IssueCredential for RS256 (UseRS256: true), and credential.go
+	// honours that whenever RSA keys are loaded, which `make setup-keys`
+	// always produces. Pinning one algorithm and one key here therefore
+	// rejected every token the grants issued — see #357. Selecting by kid
+	// also keeps verification correct across a key rotation, where two keys
+	// of the same algorithm are live at once.
+	//
+	// Widening the algorithm set does NOT widen key trust: jwx resolves the
+	// header's kid against this set only, so a token signed by any other key
+	// is still refused. jwtalg.Validate runs first and rejects alg=none and
+	// HS* before the key lookup, so the asymmetric-only guard stands.
+	KeySet jwk.Set
 	// Issuer is the expected iss claim value.
 	Issuer string
 	// ResourceMetadataURL is the absolute URL of this server's RFC 9728
@@ -67,21 +93,35 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 				writeAgentAuthError(w, "", "", "Authorization header is required", cfg.ResourceMetadataURL)
 				return
 			}
-			if !strings.HasPrefix(authHeader, "Bearer ") {
+			// RFC 9110 §11.1: the scheme is case-insensitive. RFC 9449
+			// §7.1: a DPoP-bound access token is presented under the DPoP
+			// scheme, not Bearer — ZeroID issues such tokens, so refusing
+			// the scheme locks out its own spec-compliant clients.
+			tokenStr, scheme, ok := ExtractAuthToken(authHeader, SchemeBearer, SchemeDPoP)
+			if !ok {
 				// Credentials WERE sent, just not in a recognized scheme —
 				// RFC 6750 §3.1 error_code applies here.
-				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer scheme", "Authorization header must use the Bearer scheme", cfg.ResourceMetadataURL)
+				writeAgentAuthError(w, "invalid_request", "Authorization header must use the Bearer or DPoP scheme", "Authorization header must use the Bearer or DPoP scheme", cfg.ResourceMetadataURL)
 				return
 			}
-			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
 
-			// `Bearer ` with no token after the prefix is a malformed
-			// request, not a token-validation failure — there is no token
-			// to validate. RFC 6750 §3.1 invalid_request applies; short-
-			// circuiting before jwtalg.Validate also avoids an unnecessary
-			// JWS parse on input that can never succeed.
+			// A scheme with no token after it is a malformed request, not a
+			// token-validation failure — there is no token to validate. RFC
+			// 6750 §3.1 invalid_request applies; short-circuiting before
+			// jwtalg.Validate also avoids an unnecessary JWS parse on input
+			// that can never succeed.
 			if tokenStr == "" {
-				writeAgentAuthError(w, "invalid_request", "Authorization header carries an empty Bearer token", "Authorization header carries an empty Bearer token", cfg.ResourceMetadataURL)
+				writeAgentAuthError(w, "invalid_request", "Authorization header carries an empty "+scheme+" token", "Authorization header carries an empty "+scheme+" token", cfg.ResourceMetadataURL)
+				return
+			}
+
+			// RFC 9449 §7.1: the DPoP scheme asserts a proof accompanies the
+			// token. Refuse the request when it does not, so the scheme can
+			// never be used to present a token under weaker terms than
+			// Bearer. This is a syntactic check only — the proof is verified
+			// against cnf.jkt further down, once the claims are parsed.
+			if scheme == SchemeDPoP && r.Header.Get("DPoP") == "" {
+				writeAgentAuthError(w, "invalid_request", "DPoP scheme requires a DPoP proof header", "DPoP scheme requires a DPoP proof header", cfg.ResourceMetadataURL)
 				return
 			}
 
@@ -93,7 +133,7 @@ func AgentAuthMiddleware(cfg AgentAuthConfig) func(http.Handler) http.Handler {
 			}
 
 			parsed, err := jwt.Parse([]byte(tokenStr),
-				jwt.WithKey(jwa.ES256(), cfg.PublicKey),
+				jwt.WithKeySet(cfg.KeySet),
 				jwt.WithValidate(true),
 				jwt.WithIssuer(cfg.Issuer),
 			)
@@ -151,8 +191,41 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	if v, err := jwt.Get[string](token, "trust_level"); err == nil {
 		claims.TrustLevel = v
 	}
+	// Under the rfc8693 token profile (recognised by principal_type) an
+	// exchanged token's `sub` is the principal — possibly a person — and the
+	// agent presenting it is the current actor, whose attributes are carried
+	// inside the outermost `act`. Read it the RFC 8693 way: the current actor
+	// if there is one, otherwise `sub`. Legacy-shaped tokens are unchanged.
+	if _, err := jwt.Get[string](token, "principal_type"); err == nil {
+		if act, err := jwt.Get[map[string]any](token, "act"); err == nil {
+			if actor, _ := act["sub"].(string); actor != "" {
+				claims.Subject = actor
+			}
+			if tl, _ := act["trust_level"].(string); tl != "" {
+				claims.TrustLevel = tl
+			}
+		}
+	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v
+	}
+	if v, err := jwt.Get[string](token, "grant_type"); err == nil {
+		claims.GrantType = v
+	}
+	if v, err := jwt.Get[string](token, "principal_type"); err == nil {
+		claims.PrincipalType = v
+	}
+	if v, err := jwt.Get[string](token, "user_id_iss"); err == nil {
+		claims.UserIDIssuer = v
+	}
+	if v, ok := token.Issuer(); ok {
+		claims.Issuer = v
+	}
+	if v, ok := token.Audience(); ok {
+		claims.Audience = v
+	}
+	if v, err := jwt.Get[string](token, "client_auth"); err == nil {
+		claims.ClientAuth = v
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {

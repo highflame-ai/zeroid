@@ -11,13 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestIssuedTokenHasTypHeader locks in JWT-SVID §3's typ=JWT on issued
-// tokens. api_key hits the RS256 branch, client_credentials hits ES256 —
-// both have to set the header.
+// TestIssuedTokenHasTypHeader locks in the typ header on issued access tokens:
+// RFC 9068 §2.1's at+jwt by default, on a tenant with no settings. api_key hits
+// the RS256 branch, client_credentials hits ES256 — both have to set it. A
+// policy can choose JWT-SVID's JWT instead (TestAccessTokenTyp_PolicyToggle).
 func TestIssuedTokenHasTypHeader(t *testing.T) {
 	t.Run("api_key_RS256", func(t *testing.T) {
 		token := issueAPIKeyToken(t, uid("typ-rs"))
-		assertTokenTypIsJWT(t, token)
+		assertAccessTokenTyp(t, token)
 	})
 
 	t.Run("client_credentials_ES256", func(t *testing.T) {
@@ -36,11 +37,11 @@ func TestIssuedTokenHasTypHeader(t *testing.T) {
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		token := decode(t, resp)["access_token"].(string)
 
-		assertTokenTypIsJWT(t, token)
+		assertAccessTokenTyp(t, token)
 	})
 }
 
-func assertTokenTypIsJWT(t *testing.T, tokenStr string) {
+func assertAccessTokenTyp(t *testing.T, tokenStr string) {
 	t.Helper()
 	dot := strings.IndexByte(tokenStr, '.')
 	require.Greater(t, dot, 0, "token is not a compact JWS")
@@ -51,7 +52,7 @@ func assertTokenTypIsJWT(t *testing.T, tokenStr string) {
 	var hdr map[string]any
 	require.NoError(t, json.Unmarshal(raw, &hdr), "header is not valid JSON")
 
-	assert.Equal(t, "JWT", hdr["typ"], "JWT-SVID §3 expects typ=JWT in the header")
+	assert.Equal(t, "at+jwt", hdr["typ"], "RFC 9068 §2.1 types a JWT access token at+jwt")
 	// kid is required so verifiers can pick the right key from the JWKS.
 	// Asserted here too since this test already cracks the header open.
 	assert.NotEmpty(t, hdr["kid"], "issued tokens must carry a kid header")

@@ -425,20 +425,28 @@ func TestAPIKeyCreate_InheritsIdentityPolicyPasses(t *testing.T) {
 	headers := adminHeaders()
 	headers["X-User-ID"] = "test-user"
 
-	// Path 1: omit credential_policy_id — service auto-assigns tenant
-	// default. Since identity has a different (stricter) policy, this
-	// could trigger the subset check against the default. But the
-	// default is as permissive as possible and the identity policy is
-	// narrower — key(default) is broader than identity(stricter) so
-	// this SHOULD be rejected.
+	// Path 1: omit credential_policy_id — the key inherits the identity's own
+	// policy, so the subset check is trivially satisfied and the key is
+	// created. This previously assigned the tenant default, which is broader
+	// than a stricter identity policy and so was rejected: an identity could
+	// never be issued a second key, its first one surviving only because
+	// registration assigns the identity policy directly (#362).
 	respDefault := post(t, adminPath("/api-keys"), map[string]any{
 		"name":        "inherit-default-key",
 		"identity_id": identityID,
 	}, headers)
-	// Default policy (permissive) is broader than identityPolicy
-	// (allowed_scopes=[data:read]) — must be rejected.
-	assert.Equal(t, http.StatusBadRequest, respDefault.StatusCode,
-		"omitting credential_policy_id defaults to tenant default policy which is broader than the identity's stricter policy — must be rejected")
+	require.Equal(t, http.StatusCreated, respDefault.StatusCode,
+		"omitting credential_policy_id must inherit the identity's policy, not the broader tenant default")
+
+	// The create response doesn't echo the policy, so read the stored key back:
+	// inheriting is only the fix if the key is actually bound to the identity's
+	// policy, not merely allowed through the subset check.
+	createdID, ok := decode(t, respDefault)["id"].(string)
+	require.True(t, ok, "create response missing id")
+
+	stored := decode(t, get(t, adminPath("/api-keys/"+createdID), headers))
+	assert.Equal(t, identityPolicyID, stored["credential_policy_id"],
+		"the inherited key must be bound to the identity's policy, not the tenant default")
 
 	// Path 2: explicitly pass the identity's policy ID → trivially a
 	// subset of itself → must pass.
@@ -551,4 +559,174 @@ func fetchIdentityWIMSEByExternalID(t *testing.T, externalID string) string {
 	}
 	t.Fatalf("identity with external_id=%s not found", externalID)
 	return ""
+}
+
+// Regression: a credential policy that requires the very trust level (or
+// verified attestation) an attestation grants must not make attestation
+// verification fail. Verify used to issue the post-attestation credential
+// against the PRE-promotion identity, so required_trust_level turned every
+// verify into a 500 — a chicken-and-egg that made trust-gated policies
+// unusable. Promotion and record-verification now precede issuance in the
+// same tx (internal/service/attestation.go).
+func TestAttestationVerifySucceedsUnderTrustRequiringPolicy(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-trustgate-"+uid(""), "proj-trustgate-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("trust-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_trust_level": "verified_third_party",
+	}, headers)
+	idID := registerIdentityWithPolicy(t, uid("attest-gate"), polID, "", []string{"data:read"}, headers)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID,
+		"level":       "software",
+		"proof_type":  "oidc_token",
+		"proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode, "submit expected 201")
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verify must succeed under a trust-requiring policy (was a chicken-and-egg 500)")
+	body := decode(t, resp)
+	record, ok := body["record"].(map[string]any)
+	require.True(t, ok, "verify response missing record")
+	assert.Equal(t, true, record["is_verified"])
+	require.NotEmpty(t, body["token"], "post-attestation credential must be issued")
+
+	// Trust must be promoted (software-level attestation -> verified_third_party).
+	req := newRequest(t, http.MethodGet, adminPath("/identities/"+idID), nil, headers)
+	getResp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+	require.Equal(t, http.StatusOK, getResp.StatusCode)
+	ident := decode(t, getResp)
+	assert.Equal(t, "verified_third_party", ident["trust_level"])
+}
+
+// Companion to TestAttestationVerifySucceedsUnderTrustRequiringPolicy: the
+// required_attestation axis exercises the tx-internal read-back
+// (GetHighestVerifiedLevel) that depends on the attestation record being
+// marked verified BEFORE the post-attestation credential is issued. The
+// trust-level variant alone would stay green if that early Update were
+// merged away, silently regressing every attestation-gated policy.
+func TestAttestationVerifySucceedsUnderAttestationRequiringPolicy(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-attgate-"+uid(""), "proj-attgate-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("att-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_attestation": "software",
+	}, headers)
+	idID := registerIdentityWithPolicy(t, uid("att-gate"), polID, "", []string{"data:read"}, headers)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID, "level": "software",
+		"proof_type": "oidc_token", "proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode)
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verify must succeed under an attestation-requiring policy (needs is_verified=true visible in-tx before issuance)")
+	require.NotEmpty(t, decode(t, resp)["token"], "post-attestation credential must be issued")
+}
+
+// Verifying a WEAKER attestation must never demote an identity's trust level:
+// promotion is a clamp. Pre-clamp, a software-level attestation overwrote a
+// first_party identity down to verified_third_party — and with issuance
+// judging the post-write identity, a first_party-gated policy turned the
+// verify into a policy-violation rollback.
+func TestAttestationVerifyDoesNotDemoteTrust(t *testing.T) {
+	testZeroIDServer.SetAttestationPermissive(true)
+	t.Cleanup(func() { testZeroIDServer.SetAttestationPermissive(false) })
+
+	headers := tenantHeaders("acct-noclamp-"+uid(""), "proj-noclamp-"+uid(""))
+	polID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("first-party-gate"),
+		"max_ttl_seconds":      3600,
+		"allowed_grant_types":  []string{"client_credentials", "api_key"},
+		"required_trust_level": "first_party",
+	}, headers)
+
+	idResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id": uid("noclamp"), "owner_user_id": "user-noclamp-owner",
+		"trust_level": "first_party", "allowed_scopes": []string{"data:read"},
+		"credential_policy_id": polID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, idResp.StatusCode)
+	idID := decode(t, idResp)["id"].(string)
+
+	bogusToken := "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL2FueXRoaW5nIn0.AAAAAAAA"
+	subResp := doRequest(t, http.MethodPost, adminPath("/attestation/submit"), map[string]any{
+		"identity_id": idID, "level": "software",
+		"proof_type": "oidc_token", "proof_value": bogusToken,
+	}, headers)
+	require.Equal(t, http.StatusCreated, subResp.StatusCode)
+	attID := decode(t, subResp)["id"].(string)
+
+	resp := doRequest(t, http.MethodPost, adminPath("/attestation/verify"), map[string]any{
+		"attestation_id": attID,
+	}, headers)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"verifying a weaker attestation must not fail a first_party-gated identity")
+
+	req := newRequest(t, http.MethodGet, adminPath("/identities/"+idID), nil, headers)
+	getResp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+	assert.Equal(t, "first_party", decode(t, getResp)["trust_level"],
+		"trust level must be clamped, never demoted by a weaker attestation")
+}
+
+// TestIdentityPolicy_ExternalPrincipalPolicyRefusal: on the external-principal
+// exchange, a scope the named application's credential policy does not grant
+// is refused with 400 policy_violation, as on the sibling grants, not a
+// server_error.
+func TestIdentityPolicy_ExternalPrincipalPolicyRefusal(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("ep-refusal-policy"),
+		"allowed_grant_types": []string{"token_exchange"},
+		"allowed_scopes":      []string{"data:read"},
+	}, adminHeaders())
+	appID := registerIdentityWithPolicy(t, uid("ep-refusal-app"), policyID, "", nil, adminHeaders())
+
+	exchange := func(scope string) (int, map[string]any) {
+		resp := post(t, "/oauth2/token", map[string]any{
+			"grant_type":     "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token":  "external-principal-assertion",
+			"account_id":     testAccountID,
+			"project_id":     testProjectID,
+			"user_id":        uid("ep-refusal-user"),
+			"application_id": appID,
+			"scope":          scope,
+		}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+		return resp.StatusCode, decode(t, resp)
+	}
+
+	status, body := exchange("data:read")
+	require.Equal(t, http.StatusOK, status, "a granted scope is issued: %v", body)
+
+	status, body = exchange("data:write")
+	assert.Equal(t, http.StatusBadRequest, status, "body=%v", body)
+	assert.Equal(t, "policy_violation", body["error"])
+	assert.Empty(t, body["access_token"], "a refused grant mints nothing")
 }

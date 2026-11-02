@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,8 +15,17 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
+
+// ErrIdentityLinkRequired is returned by CreateKey when the caller supplies
+// neither IdentityID nor Product. Every API key links an identity: the caller
+// names one directly, or names a product and EnsureServiceIdentity provisions
+// a service identity for it. With neither there is nothing to link, and the
+// unlinked key would skip credential-policy resolution at grant time. The
+// omission is caller-fixable, so handlers map this to 400.
+var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
@@ -72,16 +82,47 @@ type CreateAPIKeyResponse struct {
 // Every key is linked to an identity and assigned a credential policy.
 // If IdentityID is empty and Product is set, a service identity is auto-provisioned
 // (or reused if one already exists for this account+project+product).
-// If CredentialPolicyID is empty, the tenant's default policy is auto-created and assigned.
+// If both are empty the request is rejected with ErrIdentityLinkRequired.
+// If CredentialPolicyID is empty, the key inherits the identity's credential
+// policy; the tenant's default policy is auto-created and assigned only when the
+// identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
-	// Ensure every key has an identity link.
-	// When no identity is provided, auto-provision a service identity for the product.
-	if req.IdentityID == "" && req.Product != "" {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, "", req.Scopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.credentialPolicySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
+	// Every key has an identity link, and the caller supplies one of the two
+	// ways to establish it. Reject the empty case here rather than letting an
+	// unlinked key reach the insert, where the empty IdentityID fails the
+	// UUID cast and surfaces a caller mistake as a server fault.
+	if req.IdentityID == "" && req.Product == "" {
+		return nil, ErrIdentityLinkRequired
+	}
+
+	// The caller named a product rather than an identity — provision (or
+	// reuse) the service identity that stands for that product.
+	if req.IdentityID == "" {
 		identity, err := s.identitySvc.EnsureServiceIdentity(ctx, req.AccountID, req.ProjectID, req.Product, req.CreatedBy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure service identity for product %s: %w", req.Product, err)
 		}
 		req.IdentityID = identity.ID
+	}
+
+	// The identity owns the authority ceiling this key is bound by, so it is
+	// loaded before the policy is chosen — an unset CredentialPolicyID
+	// inherits from it (#362).
+	identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load identity %s: %w", req.IdentityID, err)
+	}
+	// A key for an approval channel, including one that inherits the
+	// channel's ceiling, needs a trusted caller (approval_channel_write.go).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
 	}
 
 	// Ensure the key has a credential policy.
@@ -104,19 +145,38 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	//      opaque invalid_scope at token issuance.
 	var keyPolicy *domain.CredentialPolicy
 	policyID := req.CredentialPolicyID
-	if policyID == "" {
+
+	switch {
+	case policyID != "":
+		p, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
+		}
+		keyPolicy = p
+
+	case identity.CredentialPolicyID != "":
+		// Inherit the identity's own policy. Using the tenant default here
+		// instead would hand the key a policy broader than the ceiling it is
+		// about to be checked against, so every identity with a policy
+		// stricter than default could never be issued a second key — its
+		// first one works only because registration assigns the identity
+		// policy directly (#362).
+		p, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load identity policy %s: %w", identity.CredentialPolicyID, err)
+		}
+		policyID = p.ID
+		keyPolicy = p
+
+	default:
+		// The identity has no policy of its own, so the tenant default is the
+		// only ceiling there is.
 		defaultPolicy, err := s.credentialPolicySvc.EnsureDefaultPolicy(ctx, req.AccountID, req.ProjectID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to ensure default credential policy: %w", err)
 		}
 		policyID = defaultPolicy.ID
 		keyPolicy = defaultPolicy
-	} else {
-		p, err := s.credentialPolicySvc.GetPolicy(ctx, policyID, req.AccountID, req.ProjectID)
-		if err != nil {
-			return nil, fmt.Errorf("credential policy %s: %w", policyID, err)
-		}
-		keyPolicy = p
 	}
 
 	// Enforce the subset invariant against the identity that will own this
@@ -124,19 +184,13 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	// common case — EnsureServiceIdentity-provisioned keys, or callers who
 	// don't override CredentialPolicyID), because a policy is trivially a
 	// subset of itself.
-	if req.IdentityID != "" {
-		identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
+	if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
+		identityPolicy, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load identity %s for subset check: %w", req.IdentityID, err)
+			return nil, fmt.Errorf("failed to load identity policy %s for subset check: %w", identity.CredentialPolicyID, err)
 		}
-		if identity.CredentialPolicyID != "" && identity.CredentialPolicyID != policyID {
-			identityPolicy, err := s.credentialPolicySvc.GetPolicy(ctx, identity.CredentialPolicyID, identity.AccountID, identity.ProjectID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load identity policy %s for subset check: %w", identity.CredentialPolicyID, err)
-			}
-			if err := s.credentialPolicySvc.EnforceSubset(keyPolicy, identityPolicy); err != nil {
-				return nil, err
-			}
+		if err := s.credentialPolicySvc.EnforceSubset(keyPolicy, identityPolicy); err != nil {
+			return nil, err
 		}
 	}
 
@@ -183,6 +237,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ProjectID:          req.ProjectID,
 		IdentityID:         req.IdentityID,
 		CreatedBy:          req.CreatedBy,
+		CreatedActor:       middleware.GetCallerName(ctx),
 		CredentialPolicyID: policyID,
 		Product:            req.Product,
 		Scopes:             scopes,
@@ -190,6 +245,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ExpiresAt:          expiresAt,
 		State:              domain.APIKeyStateActive,
 		Metadata:           metadata,
+		ChannelTrusted:     TrustedApprovalChannelWrite(ctx),
 	}
 
 	if err := s.repo.Create(ctx, sk); err != nil {
@@ -246,7 +302,28 @@ func (s *APIKeyService) GetKey(ctx context.Context, id, accountID, projectID str
 // but the common revoke-by-ID path treats both as a silent no-op to avoid
 // leaking cross-tenant existence.
 func (s *APIKeyService) RevokeKey(ctx context.Context, id, accountID, projectID, revokedBy, reason string) (int64, error) {
+	if revokedBy == "" {
+		revokedBy = middleware.SystemCallerPrefix + "unattributed"
+	}
+	// A key created by a trusted approval-channel caller is revoked only by
+	// one (approval_channel_write.go). A key not found here falls through to
+	// the tenant-scoped revoke, which reports zero rows.
+	if !TrustedApprovalChannelWrite(ctx) {
+		if sk, err := s.repo.GetByID(ctx, id, accountID, projectID); err == nil && sk.ChannelTrusted {
+			return 0, ErrApprovalChannelWriteNotTrusted
+		}
+	}
 	return s.repo.Revoke(ctx, id, accountID, projectID, revokedBy, reason)
+}
+
+// revocationActor names who a bulk key revoke is recorded against: the
+// request's caller (a human, or a system: worker that set itself), else the
+// call site's system label.
+func revocationActor(ctx context.Context, fallback string) string {
+	if caller := middleware.GetCallerName(ctx); caller != "" {
+		return caller
+	}
+	return middleware.SystemCallerPrefix + fallback
 }
 
 // generateAPIKey creates a cryptographically random API key with the given prefix.

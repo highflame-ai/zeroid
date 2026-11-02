@@ -20,7 +20,7 @@
     "lint:fix": "eslint src tests --fix"
   },
   "dependencies": {
-    "@highflame/sdk": "^0.3.9",
+    "@highflame/sdk": "^0.3.23",
     "chalk": "^5.4.1",
     "cli-table3": "^0.6.5",
     "commander": "^13.1.0"
@@ -33,17 +33,17 @@
     "tsx": "^4",
     "typescript": "^5.4",
     "typescript-eslint": "^8",
-    "vitest": "^4"
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=18"
   },
   "overrides": {
-    "vite": "^6.4.3",
+    "vite": "^6.4.5",
     "postcss": "^8.5.10",
     "esbuild": "^0.28.1",
     "@typescript-eslint/typescript-estree": {
-      "brace-expansion": "^5.0.6"
+      "brace-expansion": "^5.0.12"
     }
   }
 }

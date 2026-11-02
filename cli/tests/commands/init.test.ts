@@ -7,10 +7,10 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
-import { runCLI, BASE_URL } from "../helpers.js";
+import { runCLI, BASE_URL, tokenMintHandler, emptyConfigDir } from "../helpers.js";
 import type { AgentRegistered, AgentResponse } from "@highflame/sdk";
 
-const server = setupServer();
+const server = setupServer(tokenMintHandler());
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
@@ -49,10 +49,10 @@ const OWNER = "user_xyz";
 afterEach(() => rmSync(join(process.cwd(), ".env.zeroid"), { force: true }));
 
 describe("zeroid init", () => {
-  it("POST /api/v1/agents/register with correct fields", async () => {
+  it("POST /agents/register with correct fields", async () => {
     let captured: Record<string, unknown> = {};
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, async ({ request }) => {
+      http.post(`${BASE_URL}/agents/register`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json(REGISTER_RESPONSE);
       }),
@@ -69,7 +69,7 @@ describe("zeroid init", () => {
   it("uses --id as external_id when provided", async () => {
     let captured: Record<string, unknown> = {};
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, async ({ request }) => {
+      http.post(`${BASE_URL}/agents/register`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json(REGISTER_RESPONSE);
       }),
@@ -84,7 +84,7 @@ describe("zeroid init", () => {
   it("includes framework and description when provided", async () => {
     let captured: Record<string, unknown> = {};
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, async ({ request }) => {
+      http.post(`${BASE_URL}/agents/register`, async ({ request }) => {
         captured = (await request.json()) as Record<string, unknown>;
         return HttpResponse.json(REGISTER_RESPONSE);
       }),
@@ -103,7 +103,7 @@ describe("zeroid init", () => {
 
   it("prints WIMSE URI and API key on success", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
+      http.post(`${BASE_URL}/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
     const { stdout, stderr } = await runCLI(["init", "--name", "github-mcp-server", "--owner", OWNER]);
@@ -116,7 +116,7 @@ describe("zeroid init", () => {
 
   it("writes .env.zeroid with the api_key", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
+      http.post(`${BASE_URL}/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
     await runCLI(["init", "--name", "github-mcp-server", "--owner", OWNER]);
@@ -128,7 +128,7 @@ describe("zeroid init", () => {
 
   it("outputs raw JSON with --json", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
+      http.post(`${BASE_URL}/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
     const { stdout } = await runCLI(["init", "--name", "agent", "--owner", OWNER, "--json"]);
@@ -140,7 +140,7 @@ describe("zeroid init", () => {
 
   it("still writes .env.zeroid when --json is given", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
+      http.post(`${BASE_URL}/agents/register`, () => HttpResponse.json(REGISTER_RESPONSE)),
     );
 
     await runCLI(["init", "--name", "agent", "--owner", OWNER, "--json"]);
@@ -153,7 +153,7 @@ describe("zeroid init", () => {
   it("bootstraps without ZID_API_KEY when tenant env vars are present", async () => {
     let authorization: string | null = null;
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, ({ request }) => {
+      http.post(`${BASE_URL}/agents/register`, ({ request }) => {
         authorization = request.headers.get("authorization");
         return HttpResponse.json(REGISTER_RESPONSE);
       }),
@@ -161,7 +161,10 @@ describe("zeroid init", () => {
 
     const { exitCode } = await runCLI(
       ["init", "--name", "bootstrap-agent", "--owner", OWNER],
-      { ZID_API_KEY: "" },
+      // Empty key AND a profile-free config dir: earlier tests in this file
+      // save profiles (whose api_key the SDK would otherwise mint a bearer
+      // from), and this test's point is credential-less bootstrap.
+      { ZID_API_KEY: "", ZID_CONFIG_DIR: emptyConfigDir() },
     );
 
     expect(exitCode).toBeUndefined();
@@ -170,7 +173,7 @@ describe("zeroid init", () => {
 
   it("exits 1 on conflict (agent already exists)", async () => {
     server.use(
-      http.post(`${BASE_URL}/api/v1/agents/register`, () =>
+      http.post(`${BASE_URL}/agents/register`, () =>
         HttpResponse.json({ title: "Conflict", detail: "agent already exists" }, { status: 409 }),
       ),
     );

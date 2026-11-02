@@ -1,0 +1,1542 @@
+# ZeroID OAuth 2.0 / OpenID Connect Extensions for Agent Identity
+
+| | |
+|---|---|
+| **Document** | `draft-highflame-zeroid-oauth-extensions-00` |
+| **Category** | Informational (implementation specification) |
+| **Status** | Authoritative for the ZeroID reference implementation on `main` |
+| **Published** | 2026-06-01 |
+| **Source of truth** | The ZeroID Go source tree. Where this document and the code disagree, the code wins; file a bug. |
+
+## Abstract
+
+ZeroID is an OAuth 2.1 / OpenID Connect authorization server purpose-built for
+non-human (agent) identity. To represent agents, delegation chains, and
+out-of-band approval, ZeroID layers a small set of extensions on top of the
+baseline IETF and OpenID specifications it implements. This document specifies
+those extensions — and *only* those extensions — at the wire level: the
+additional JWT claims, request parameters, URI scheme, gating rules,
+event types, workload identity federation, client-identifier-URL rules, and
+discovery metadata. It is the
+normative reference an
+independent implementer or a resource server would use to interoperate with
+ZeroID without reading its source.
+
+Baseline conformance (the parts of OAuth 2.1, RFC 8693, RFC 9449, OpenID CIBA
+Core 1.0, RFC 9396, RFC 7591/7592, RFC 7662/7009, RFC 8414, RFC 9728, and
+draft-ietf-oauth-client-id-metadata-document that ZeroID implements *as
+written*) is **out of scope** here. This document covers
+the deltas only.
+
+## Status of This Document
+
+This is an implementation specification, not an IETF/OpenID standards-track
+document. The `urn`/draft naming is a convenience for citation. None of the
+extensions defined here are registered with IANA; the registry in
+[Section 14](#14-claim--parameter-registry-iana-style) is informative and scoped
+to ZeroID deployments.
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Conventions and Terminology](#2-conventions-and-terminology)
+3. [Identity Model and WIMSE URIs](#3-identity-model-and-wimse-uris)
+4. [JWT Claim Extensions](#4-jwt-claim-extensions)
+5. [RFC 8693 Delegation Extensions](#5-rfc-8693-delegation-extensions)
+6. [CIBA Extensions](#6-ciba-extensions)
+7. [DPoP Extensions](#7-dpop-extensions)
+8. [Reserved-Claims Gating](#8-reserved-claims-gating)
+9. [CAE / SSF Signals](#9-cae--ssf-signals)
+10. [Workload Identity Federation](#10-workload-identity-federation)
+11. [Discovery Metadata Extensions](#11-discovery-metadata-extensions)
+12. [Client ID Metadata Documents (CIMD)](#12-client-id-metadata-documents-cimd)
+13. [Security Considerations](#13-security-considerations)
+14. [Claim / Parameter Registry (IANA-style)](#14-claim--parameter-registry-iana-style)
+15. [References](#15-references)
+
+---
+
+## 1. Introduction
+
+OAuth 2.x and OpenID Connect were designed around delegating a *user's* access to
+clients and authenticating humans to services; their non-human grants
+(`client_credentials`, JWT-bearer) model a flat machine credential. None of
+them natively model a credential whose holder is an autonomous agent, one agent
+delegating an attenuated subset of its authority to another, the resulting
+multi-hop chain remaining cryptographically attributable, or an agent pausing
+mid-task to obtain a human's out-of-band approval.
+
+ZeroID exists to solve **Agent Identity**. Human identity (the domain of
+OpenID Providers and enterprise IdPs) and general workload / machine identity
+(the domain of SPIFFE/SPIRE, cloud IAM, and secret managers) are separate,
+mature ecosystems; ZeroID builds on their primitives — WIMSE/SPIFFE URIs,
+OpenID Connect, RFC 8693 — and
+federates with them rather than replacing them. What it adds is the
+agent-shaped layer those baselines do not model.
+
+Because agents do not act in isolation — they call services, applications, and
+MCP servers — ZeroID also represents those non-agent principals so the wire
+claims are uniform. This document calls the whole set **NHIs** (non-human
+identities, Section 3.2) and reserves **agent** for the specialization that
+additionally carries the agent-shaped semantics: delegation depth, the `act`
+chain, an agent role, and agent metadata. NHI is the umbrella; agent is one kind
+of NHI; the two are kept distinct throughout (Section 2). The extensions below
+say which layer each belongs to.
+
+ZeroID closes those gaps with the smallest possible set of extensions. The
+design rule is: **extend the standard, never fork it.** Every extension is
+either (a) an additional claim that standard verifiers ignore, (b) an
+additional, optional request parameter, or (c) an additional discovery field. A
+baseline-only
+OAuth client or resource server continues to work against ZeroID; it simply
+sees less.
+
+This document enumerates each extension grouped by the baseline spec it builds
+on.
+
+## 2. Conventions and Terminology
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**,
+**SHOULD**, **SHOULD NOT**, **RECOMMENDED**, **MAY**, and **OPTIONAL** in this
+document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when,
+and only when, they appear in all capitals.
+
+This document uses the following terms:
+
+- **NHI (Non-Human Identity)** — the umbrella category for every non-human
+  principal ZeroID registers: a `service`, an `application`, an `mcp_server`,
+  **or** an `agent` (the four `identity_type`s of Section 3.2). Every NHI,
+  whatever its kind, gets a stable WIMSE URI (Section 3) and the core identity
+  claims — `identity_type`, `trust_level`, `status`, `external_id`.
+- **Agent** — the `identity_type = agent` **specialization** of an NHI. Every
+  agent is an NHI; not every NHI is an agent. An agent additionally carries the
+  *agent-shaped* claims a plain service or application does not: an agent
+  `sub_type` (Section 3.2), the delegation semantics `delegation_depth` and the
+  `act` chain (Sections 4.3, 4.4, 5), and the optional agent metadata and
+  coding-agent task claims (Sections 4.2, 4.8). This document writes **NHI**
+  for statements true of any non-human principal and **agent** only for the
+  agent specialization; the two are not interchangeable.
+- **Identity** — a persistent ZeroID record for an NHI (or, for the
+  human-delegation flows, a synthesised principal). Carries a stable WIMSE URI
+  (Section 3), a type, a sub-type, a trust level, and a status.
+- **Credential** — an issued, signed JWT (an `issued_credentials` row).
+- **Delegation tree** — the set of credentials reachable from a root credential
+  by following `parent_jti` edges. Identified by `mission_id` (Section 5.4).
+- **Deployer** — the operator embedding the ZeroID library/service and supplying
+  its pluggable hooks (`PrincipalResolver`, `BackchannelNotifier`,
+  `TrustedServiceValidator`, `RevocationNotifier`, `PersonGrantResolver`, grant
+  handlers).
+- **Trusted service** — an internal caller that has passed the deployer's
+  `TrustedServiceValidator` gate (Section 5.5).
+
+Tenancy is universal: every identity, credential, signal, and request is scoped
+to an `(account_id, project_id)` pair, surfaced as claims on every token.
+
+## 3. Identity Model and WIMSE URIs
+
+### 3.1 WIMSE URI scheme
+
+Every ZeroID identity is assigned a stable, globally unique identity URI in the
+SPIFFE ID syntax, used as the JWT `sub` of every credential issued to that
+identity. The template is:
+
+```
+spiffe://{trust_domain}/{account_id}/{project_id}/{identity_type}/{external_id}
+```
+
+- `trust_domain` — a per-deployment configurable host label (e.g.
+  `zeroid.dev`, `auth.highflame.ai`, `highflame.dev`). It is NOT derived from
+  the request; it is server configuration.
+- `account_id`, `project_id` — the tenant scope.
+- `identity_type` — one of the values in Section 3.2.
+- `external_id` — the registrant-supplied stable identifier for the principal,
+  unique within `(account_id, project_id, identity_type)`.
+
+Constraints:
+
+- Each path segment **MUST** consist only of the characters `a-z A-Z 0-9 . - _`.
+  Registration **MUST** reject any segment outside this set. Because the set
+  excludes `/ ? # @ :`, a segment cannot introduce an empty segment, a query
+  string, a fragment, user-info, or an embedded port. (ZeroID's implementation
+  intentionally permits uppercase letters `A-Z` in path segments — more
+  permissive than a strict-lowercase SPIFFE profile. The `trust_domain` is
+  server configuration, not request input, and is therefore not re-validated
+  per request.)
+- The assembled URI **MUST NOT** exceed **2048 bytes**. Registration **MUST**
+  reject a longer URI rather than persist a non-conformant subject.
+
+A resource server parses the account/project scope back out of a `sub` by
+stripping the `spiffe://{trust_domain}/` prefix and splitting the remainder into
+at most four segments; segments 1 and 2 are `account_id` and `project_id`.
+
+### 3.2 Identity classification vocabularies
+
+`identity_type` (the `/{identity_type}/` URI segment and the `identity_type`
+claim) is one of:
+
+| Value | Meaning |
+|---|---|
+| `agent` | An autonomous or semi-autonomous AI agent |
+| `application` | A user-facing application / OAuth client persona |
+| `mcp_server` | A Model Context Protocol server |
+| `service` | A backend service or internal worker |
+
+`identity_type = agent` denotes an **Agent Identity** — the specialization that
+also carries the agent-shaped claims of Sections 4–5 (an agent `sub_type`,
+`delegation_depth`, the `act` chain, and the optional agent metadata / task
+claims). The other three types are **non-agent NHIs**: they carry the core
+identity claims and any descriptive metadata, but the agent-shaped claims are
+absent or not meaningful for them. Everything in this document that is scoped to
+a `sub_type` of `agent` applies to Agent Identities specifically; everything
+keyed only on the WIMSE URI or the core claims applies to every NHI.
+
+`sub_type` (the `sub_type` claim) refines the type. The defined values are:
+
+| `sub_type` | Valid for `identity_type` |
+|---|---|
+| `orchestrator`, `autonomous`, `tool_agent`, `human_proxy`, `evaluator`, `code_agent` | `agent` |
+| `chatbot`, `assistant`, `api_service`, `custom` | `application` |
+| `llm_provider` | `service` |
+
+`trust_level` (the `trust_level` claim), in ascending order of trust:
+`unverified` → `verified_third_party` → `first_party`. Trust level is elevated
+only by the attestation framework (see `docs/attestation.md`); it cannot be
+self-asserted.
+
+`status` (the `status` claim): `pending` → `active` ⇄ `suspended` →
+`deactivated`, plus `expired` for a time-bound identity whose `expires_at` has
+passed. Tokens are issued only for an `active` identity; the cleanup worker and
+CAE cascade move identities out of `active` fail-closed (an expired identity is
+swept to `expired` and its live credentials are cascade-revoked; see Section 9's
+`identity_expired` signal).
+
+## 4. JWT Claim Extensions
+
+ZeroID-issued access tokens are JWS-signed JWTs. NHI flows
+(`client_credentials`, `jwt_bearer`, `token_exchange`) sign with **ES256**;
+human / SDK flows (`api_key`, `authorization_code`, external-principal exchange,
+CIBA) sign with **RS256**. The claims below are emitted for the relevant NHI;
+the ones flagged *agent-shaped* characterise an Agent Identity
+(`identity_type = agent`, Section 3.2) and are normally absent on a plain
+service, application, or MCP-server NHI. The `kid` header selects the verifying key
+from the JWKS. `typ` is `at+jwt` (RFC 9068 §2.1) under either token profile,
+unless the identity's credential policy sets `jwt_typ = JWT` so the token stays
+a conformant JWT-SVID (JWT-SVID
+§2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
+not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
+
+Each tenant issues in one **token profile** (Section 4.4): `rfc8693`, the
+default, which adopts the RFC 8693 delegation semantics, or `legacy`. Claims
+below are common to both unless marked.
+
+### 4.1 Tenancy and grant claims (always present)
+
+| Claim | Type | Description |
+|---|---|---|
+| `account_id` | string | Tenant account scope. |
+| `project_id` | string | Tenant project scope. |
+| `grant_type` | string | The grant that minted this credential. Most grants serialize in short form: `client_credentials`, `jwt_bearer`, `token_exchange`, `api_key`, `authorization_code`, `refresh_token`. CIBA is the exception — its claim value is the full URN `urn:openid:params:grant-type:ciba`. (Note: on the **request** the `grant_type` parameter for `token_exchange` and `jwt_bearer` uses the full IETF URN forms, e.g. `urn:ietf:params:oauth:grant-type:token-exchange`; the **claim** uses the short form for those two. CIBA matches in both places.) |
+| `mission_id` | string | Delegation-tree identifier; see Section 5.4. Always present. Opaque to consumers. |
+| `client_id` | string | RFC 9068 §2.2: the OAuth client the token was issued to. On an exchanged token this is the actor (its `external_id`); on `authorization_code`, `refresh_token`, ID-JAG and ID-token exchange it is the authenticated client. |
+| `principal_type` | string | *`rfc8693` profile only.* Whether `sub` is a person (`user`) or a workload (`workload`), or `unknown` for a chain exchanged from a delegated parent minted before principals were recorded. A private claim (RFC 7519 §4.3): no standard claim types `sub`. ZeroID records the principal of every credential for every tenant whatever the profile, and introspection reports it as `principal_type`, `principal_sub` and `principal_iss`, so a legacy token, whose `sub` is the actor, still names its principal. |
+
+`aud` is always present; when the request supplies no audience it defaults to
+the issuer URL (JWT-SVID §3 requires `aud`).
+
+### 4.2 Identity claims
+
+**Core identity claims** — present on every NHI-backed credential, regardless of
+kind:
+
+| Claim | Type | Presence | Description |
+|---|---|---|---|
+| `external_id` | string | always (may be empty) | Registrant-assigned stable id. |
+| `identity_type` | string | always | Section 3.2. |
+| `sub_type` | string | always (may be empty) | Section 3.2. For an agent this is an agent role (`orchestrator`, …); for other NHIs it is that type's own sub-type or empty. |
+| `trust_level` | string | always | Section 3.2. |
+| `status` | string | always | Section 3.2. |
+| `owner_user_id` | string | when non-empty | The user who **registered/owns** this identity. Distinct from `sub` (the principal) and from `act.sub` (the principal it acts for). |
+| `name` | string | when non-empty | Human-readable identity name. |
+
+**Agent metadata claims** — *agent-shaped*: descriptive metadata that
+characterises an Agent Identity. Optional and chiefly set on agents
+(`identity_type = agent`); a non-agent NHI normally omits them:
+
+| Claim | Type | Presence | Description |
+|---|---|---|---|
+| `framework` | string | when non-empty | Agent framework (e.g. `langgraph`). |
+| `version` | string | when non-empty | Agent / software version. |
+| `publisher` | string | when non-empty | Publisher of the agent. |
+| `capabilities` | JSON | when non-empty and not `[]` | Agent capability manifest, verbatim. |
+
+The metadata claims are embedded so a resource server can make identity-aware
+decisions without calling back to ZeroID. The remaining agent-shaped claims —
+`delegation_depth`, the delegation `act` chain, and the coding-agent task
+claims — are specified in Sections 4.3, 4.4, and 4.8.
+
+### 4.3 Authorization-context claims
+
+| Claim | Type | Presence | Description |
+|---|---|---|---|
+| `scopes` | array&lt;string&gt; | when non-empty | Granted scopes. (ZeroID emits the JSON array `scopes`, in addition to the standard space-delimited `scope` on the token *response*.) |
+| `scope` | string | when non-empty, `rfc8693` profile | The RFC 9068 §2.2.3 space-delimited form of `scopes`, emitted beside it until consumers move. |
+| `roles` | array&lt;string&gt; | person root, when the deployer's person-grant resolver returns roles | RFC 9068 §2.2.3.1 roles of the person `sub` names. Only on the token minted for the person, never on a token delegated from it. See Section 5.1c. |
+| `delegation_depth` | number | when &gt; 0 | Number of `token_exchange` hops from the root; see Section 5.2. Omitted (≡ 0) for a directly-issued credential. |
+| `application_id` | string | when set | OAuth client / application the token was issued for (`api_key`, `authorization_code`). |
+| `user_email` | string | when set | End-user email (human/external-principal/CIBA paths). |
+| `user_name` | string | when set | End-user display name (same paths). |
+
+### 4.4 Delegation: `sub`, `act` and the token profile
+
+**`rfc8693` profile.** ZeroID follows RFC 8693 §4.1 delegation semantics:
+
+- `sub` is the **principal** whose authority the chain uses — a person, or the
+  root workload — and is fixed for the life of the chain, through every
+  exchange and refresh (RFC 9068 §2.2). `principal_type` says which. A user
+  principal also carries `user_id_iss`, its issuer: the upstream IdP's for a
+  federated user whose `sub` is the IdP subject, otherwise ZeroID's own
+  (including a federated person a person resolver mapped to the deployer's
+  user, whose IdP pair is in `user_idp_iss`/`user_idp_sub`), forming an RFC 9493
+  `iss_sub` pair.
+- `act` is the **current actor**, with prior actors nested inside it, most
+  recent first:
+  `{"sub": "<C>", "identity_type": "agent", "trust_level": "...", "external_id": "<c>", "act": {"sub": "<B>", "act": {"sub": "<A>"}}}`.
+  Only workloads appear; the person is never an actor. The current actor's own
+  attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
+  the outermost `act` rather than at the top level, because the top level
+  describes the principal. Prior actors carry only `sub`. On an exchange from a
+  root grant, the root token's `client_id` becomes the first prior actor. The
+  chain is capped at 16 actors for token size; past it the deepest prior actors
+  are dropped, which §4.1 allows because they are informational.
+- A root grant has no `act`. An `api_key` token in particular carries none: the
+  key's creator is not acting, and stays identity metadata in `owner_user_id`.
+
+**Rule for resource servers.** Decide on the top-level claims and the current
+actor. The person behind a call is `sub` when `principal_type` is `user`;
+otherwise there is none. The agent is `act.sub`, or `sub` when there is no
+`act`. Nested actors are audit history, not grounds for access.
+
+**`legacy` profile (opt-in).** `act` is a single-level object
+`{"sub": "<x>"}` whose meaning depends on the grant: on an exchanged token it
+is the parent's `sub` (the delegating agent, or the person after the first hop),
+and `sub` is the actor; on an `api_key` token it is the key's creator. The full
+lineage is reconstructable from the `parent_jti` edges. Consumers should read a
+legacy token's current actor as `sub` (`pkg/authjwt` `CurrentActor()` does).
+Tokens are told apart by `principal_type`, which only the `rfc8693` profile
+emits.
+
+The profile is a per-tenant setting (`PUT /tenant-settings`, `token_profile`).
+A tenant that has not set one is on `rfc8693`.
+Switching a tenant to `rfc8693` revokes its user-subject access tokens
+longer-lived than the short default, cascading to their descendants.
+
+**`may_act` (RFC 8693 §4.4).** When a subject token carries `may_act`, the
+exchange's actor MUST be the party it names (`sub` equal to the actor's WIMSE
+URI; an `iss` member, if present, equal to ZeroID's issuer), or the exchange
+fails with `invalid_grant`. `may_act` is reserved (Section 8); ZeroID does not
+yet emit it.
+
+### 4.5 Sender-constraint claim (`cnf.jkt`)
+
+When the token request carries a valid DPoP proof (Section 7), ZeroID binds the
+issued token to the proof key by setting:
+
+```json
+"cnf": { "jkt": "<RFC 7638 JWK SHA-256 thumbprint, base64url, no padding>" }
+```
+
+and the token **response** `token_type` becomes `DPoP` instead of `Bearer`.
+`cnf` is set **only** from a server-validated proof; it can never be supplied by
+a caller (Section 8).
+
+### 4.6 Exchange-provenance claims
+
+Set by the token-exchange principal paths — the trusted-service external-principal
+broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
+
+| Claim | Type | Value | Description |
+|---|---|---|---|
+| `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
+| `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
+| `user_id_iss` | string | issuer of `sub` | The issuer of the person in `sub`, forming an RFC 9493 `iss_sub` pair with it. On the ID-JAG and `external_id_token` paths with no person resolver (static issuers), `sub` is the IdP subject and this is the upstream IdP's `iss`, copied from the verified token: **IdP-granular provenance** that answers "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). With a person resolver, `sub` is the deployer's user and this is ZeroID's issuer, and the IdP's pair is in `user_idp_iss`/`user_idp_sub` instead. Under `rfc8693` every user-subject token carries it (ZeroID's issuer for a locally resolved person, e.g. `authorization_code`), and exchanged tokens keep their parent's. Reserved (Section 8) so a caller cannot forge it. |
+| `user_idp_iss` / `user_idp_sub` | string | upstream `iss` / user key | The person's pair at the IdP — its issuer, and the subject the issuer's `claim_mapping.user_id` names (e.g. Entra `oid`, Okta `sub`) — when the deployer's person resolver mapped them to its own user. `sub` is then that user and `user_id_iss` ZeroID's issuer, so `user_id_iss` always names `sub`'s issuer. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
+| `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
+| `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
+| `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
+
+### 4.7 CIBA token claims
+
+CIBA-issued tokens (Section 6) additionally carry:
+
+| Claim | Type | Description |
+|---|---|---|
+| `token_exchange` | string | `ciba`. |
+| `backchannel_client_id` | string | The OAuth client that initiated the bc-authorize request. |
+| `binding_message` | string | The human-readable binding message shown to the approver, when one was supplied. |
+| `authorization_details` | JSON array | The granted RFC 9396 payload (Section 6.2). Always present on CIBA tokens; a legacy request with no RAR stores the canonical empty array `[]`. |
+
+The CIBA token's `sub` is the **approving user**, its `grant_type` claim is
+`urn:openid:params:grant-type:ciba`, it is RS256-signed, and its default TTL is
+900 seconds.
+
+### 4.8 Deployment-specific claims
+
+Deployers MAY inject additional claims through the `additional_claims`
+request field on the external-principal exchange (caller-supplied,
+blocklist-gated per Section 8). The `ClaimsEnricher` hook is deprecated: it
+was never invoked at issuance. A person's roles come from the person-grant
+resolver (Section 5.1c).
+
+Coding-agent task fields surfaced by the SDKs (`session_id`, `task_id`,
+`task_type`, `allowed_tools`, `workspace`, `environment`) are **not**
+first-class ZeroID claims; they travel through these deployment-specific
+mechanisms and are subject to the reserved-claims blocklist. Implementers
+relying on them MUST treat them as deployment convention, not protocol.
+
+## 5. RFC 8693 Delegation Extensions
+
+ZeroID's `token_exchange` (`urn:ietf:params:oauth:grant-type:token-exchange`)
+implements RFC 8693 and adds the following normative behaviour. The exchange
+mechanism itself is NHI-general — any NHI may be a subject or actor — but the
+`act` chain and `delegation_depth` it produces are the *agent-shaped* semantics
+that make agent orchestration attributable. The terms **orchestrator** and
+**sub-agent** below are agent roles (Section 3.2); a delegation between
+non-agent NHIs uses the same mechanism without those role labels.
+
+### 5.1 Scope attenuation (intersection)
+
+On an NHI delegation exchange the issued scope set **MUST** equal the
+intersection of (an empty set places no restriction, except the subject token's):
+
+1. the scopes **requested** (`scope` parameter),
+2. the scopes the **orchestrator** (subject_token) actually holds, and
+3. the **actor's ceiling**: the `allowed_scopes` of the sub-agent's credential
+   policy when the chain's principal is a workload, or its `user_grant_scopes`
+   when the principal is a person. An empty `user_grant_scopes` adds no cap; the
+   person's own grant, carried in the subject token's scopes, bounds the chain.
+4. the sub-agent **identity's own** `allowed_scopes`, its absolute ceiling under
+   either principal (see `docs/scope-ceilings.md`). `user_grant_scopes` replaces
+   the policy's `allowed_scopes` for a person's chain; it never lifts the
+   identity's ceiling.
+
+The split ceiling exists because an agent's own authority and what it may hold
+for a person rarely overlap: agents are registered for their own scopes and
+discover the resources they act on at run time. `user_grant_scopes` applies
+wherever the person's grant is itself bounded (a delegated user chain, ID-JAG,
+`authorization_code`, and refresh of an `authorization_code` family); the
+trusted-broker, ID-token and CIBA roots, bounded only by the caller's request,
+keep `allowed_scopes`.
+
+The response carries `issued_token_type`
+(`urn:ietf:params:oauth:token-type:access_token`, RFC 8693 §2.2.1) on every
+exchange mode.
+
+A delegated credential can therefore never hold a scope its delegator lacked,
+nor one the sub-agent's policy forbids. Requesting a scope outside the
+intersection is silently narrowed (the scope is dropped), not granted.
+
+### 5.1a Principal requirement (`required_principal_type`)
+
+A credential policy MAY set `required_principal_type = user`. Every grant the
+identity uses is then refused with `policy_violation` unless the token's chain
+acts for a person: the identity cannot mint its own workload token, and as an
+actor it refuses a workload-rooted subject token. A chain with an `unknown`
+principal never satisfies it. This closes authority laundering, where an agent
+holding both a person's token and its own broader workload token exchanges
+whichever is broader. An API key's policy may require more than its identity's
+policy, never less.
+
+### 5.1b Unbounded scopes (the ceiling rule)
+
+Somewhere in a chain, something other than the requester must bound the scopes.
+ZeroID counts, per identity, tokens issued for a named scope with no configured
+ceiling — a workload whose every ceiling was empty, or a request-bounded user
+root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` and
+whose person-grant ceiling (Section 5.1c) was not enforced — as
+`zeroid_workload_unbounded_scope_total`. These are not yet refused.
+
+### 5.1c A person's ceiling (person-grant resolver)
+
+A deployer MAY install a person-grant resolver. Every token minted for a
+person (`authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG,
+ID-token exchange, the trusted external-principal exchange) is then issued
+with scope = request (or its default) ∩ the ceiling the resolver returns for
+that person, and a request that leaves nothing is refused with
+`invalid_scope` (`invalid_grant` on `authorization_code` and refresh at the
+token endpoint; `invalid_scope` at the authorization endpoint). An empty ceiling grants
+nothing; `openid` is never removed. Token exchange and a CIBA step-up carry
+their chain's principal and are not consulted. A shadow mode counts what
+enforcement would change without changing it. The resolver's roles are
+emitted as `roles` (Section 4.3). Details: `docs/scope-ceilings.md`.
+
+### 5.2 Delegation depth tracking and capping
+
+Each exchange increments `delegation_depth` by 1 relative to the subject token.
+The actor's credential policy `max_delegation_depth` caps the chain: an exchange
+that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
+claim only when &gt; 0 (Section 4.3).
+
+Under the `rfc8693` profile, an exchange whose actor already **is** the subject
+token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
+delegation: the actor replaces itself as the current actor rather than
+nesting, and `delegation_depth` does not increase. The legacy profile is
+frozen (ADR 0043 D1) and delegates on every exchange as before. This is the agent narrowing the person
+token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
+still links the child for cascade revocation.
+
+The principal's IdP pair, `user_idp_iss` and `user_idp_sub` (Section 4.6), is copied from
+the verified subject token onto every exchanged token whose `sub` is that
+person (`rfc8693`), like `user_id_iss`; it describes the principal, never an
+actor, and remains reserved.
+
+### 5.3 NHI delegation requires an actor proof-of-possession
+
+For NHI → NHI delegation, both `subject_token` (the orchestrator's active
+credential) and `actor_token` (a JWT assertion the sub-agent self-signs with the
+private key matching its registered public key) are **REQUIRED**. The
+`actor_token`:
+
+- **MUST** use an asymmetric `alg`; `none` and HMAC algorithms are rejected
+  (JWT-SVID §3, same allow-list as Section 7.2);
+- **MUST** carry `iss` equal to the actor identity's WIMSE URI;
+- **MUST** carry `aud` equal to the ZeroID issuer;
+- **MUST** carry `sub` and `exp` — RFC 7523 §3 mandatory assertion claims,
+  inherited by the RFC 8693 token-exchange assertion contract (§1.2). ZeroID
+  enforces their presence explicitly, because the underlying JWT library honors
+  these claims when present but does not require them.
+
+ZeroID validates the assertion signature against the actor identity's registered
+ES256 public key before issuing. The issued token's `act.sub` is set to the
+orchestrator's WIMSE URI (Section 4.4 case 1).
+
+The `actor_token` is **NOT** replay-tracked. A `jti` is honoured if present but
+not consumed, so the same assertion can be exchanged repeatedly until it expires
+and `exp` is the only bound on the replay window. Clients choose their own `exp`;
+ZeroID does not cap it.
+
+This is worth stating explicitly because it cuts against two reasonable
+expectations. RFC 7523 assertions are conventionally single-use, and Section 7
+establishes that ZeroID *does* run an atomic `jti` replay store — for DPoP
+proofs, not for actor assertions. An implementer who reads §5.3 and §7 together
+would be entitled to assume otherwise.
+
+The consequence is that the assertion is bearer material rather than a proof of
+possession held only by its signer: anything that observes one in flight — a
+log, an error report, a proxy, a compromised orchestrator — can mint further
+delegated credentials for that sub-agent until it expires, without ever holding
+the sub-agent's private key. It is not an escalation on its own (the assertion
+still only attests the sub-agent's identity, and Section 5.1 still bounds the
+granted scope), but it weakens the non-shareable-credential property the rest of
+this section is built on. Tracked in zeroid#282.
+
+The registered key itself is enrolled and rotated self-service via
+`POST /agents/self/public-key` (caller authenticated by its access token; an
+identity can only manage its own key). First enrollment is trust-on-first-use:
+the request carries the new SPKI EC P-256 key (PEM) plus a `new_key_proof` —
+a short-lived, replay-guarded ES256 JWS signed by the *new* key proving
+control. Rotation of an already-enrolled key additionally **REQUIRES** a
+`current_key_proof` signed by the *incumbent* key, carrying an `nkt` claim
+(base64url SHA-256 thumbprint of the new key's SPKI DER) binding old key to
+new — so possession of a stolen access token alone cannot swap an enrolled
+key.
+
+An administrator can also supply the key as `public_key_pem` on
+`POST /agents/register`, `POST /identities`, `PATCH /agents/registry/{id}`
+(admin recovery, no proof-of-possession) and `PATCH /identities/{id}`. On every
+path the value **MUST** be a PEM `PUBLIC KEY` block holding an SPKI EC P-256
+key; anything else (an RSA or P-384 key, a private-key block, non-PEM text) is
+rejected with `400` and a detail of the form `invalid public_key_pem: must be a
+PEM-encoded P-256 (ES256) public key: <reason>`. On the two `PATCH` paths an
+empty or omitted value leaves the enrolled key unchanged; no admin path clears
+one.
+
+The agent registry (`GET /agents/registry`, `GET /agents/registry/{id}`, and
+every agent write response, including `POST /agents/self/public-key`) never
+returns the PEM. It reports enrollment as `has_public_key` (boolean, always
+present) and `public_key_thumbprint`: the RFC 7638 JWK SHA-256 thumbprint of the
+enrolled key, base64url without padding — the same form as a DPoP `cnf.jkt`,
+and **not** the SPKI-DER hash used for `nkt` above — omitted when no key is
+enrolled. `GET /identities/{id}` still returns `public_key_pem` itself.
+
+### 5.4 `mission_id` — delegation-tree identifier
+
+`mission_id` is an opaque, stable identifier shared by every credential in a
+delegation tree:
+
+- On a first-issuance grant (no inbound `mission_id`), ZeroID sets
+  `mission_id` to the new credential's own `jti`, making it the tree root.
+- On `token_exchange`, the value propagates verbatim from the subject token.
+- On `refresh_token`, the value propagates from the rotated token's stored
+  `mission_id` — a refresh continues an existing grant, it does not originate
+  a new delegation tree.
+
+The value is opaque to consumers. The "root happens to be a JTI" detail is an
+implementation artifact and **MUST NOT** be relied on through any API.
+`mission_id` scopes the Delegation Explorer queries and the CAE signal stream.
+
+### 5.5 External-principal exchange (synthesised subject, no actor)
+
+ZeroID adds a second exchange mode for a **trusted internal service** to mint a
+token for an external (typically human) principal it has already authenticated —
+e.g. a gateway translating an upstream IdP session into a ZeroID token. This
+mode:
+
+- **MUST** pass the deployer's `TrustedServiceValidator` gate; an untrusted
+  caller cannot reach it.
+- Takes `account_id`, `project_id`, `user_id` (becomes `sub` via subject
+  override), and OPTIONAL `user_email`, `user_name`, `application_id`,
+  `additional_claims`, `role`, `privilege_scope`.
+- Does **not** require an `actor_token`.
+- Emits `token_exchange=external_principal` and `trusted_by=<service>`.
+- Is RS256-signed with a short (900 s) TTL.
+
+### 5.6 Direct OIDC ID-token federation (external issuer)
+
+ZeroID adds a third exchange mode that verifies an upstream OpenID Provider's
+**ID token directly**, rather than trusting a relay to have verified it
+(contrast Section 5.5). This is the spec-aligned preferred path for ingesting
+upstream *user* identity: RFC 8693 defines
+`urn:ietf:params:oauth:token-type:id_token` precisely for a receiver that
+verifies the ID token itself, and it preserves IdP-granular provenance
+(`user_id_iss`, Section 4.6) that the broker path cannot — per NIST SP 800-63C
+§4.1 a federation assertion must name the IdP that authenticated the subject,
+not an aggregator.
+
+A request selects this mode with `subject_token_type =
+urn:ietf:params:oauth:token-type:id_token` and `subject_token` set to the
+upstream ID token. The mode:
+
+- Is gated by trusted **external issuers** (the static `external_issuers` list,
+  or per-account issuer rows), keyed by the upstream `iss`. The client is
+  authenticated first; a token whose `iss` is not trusted, or names a disabled
+  or workload issuer, **MUST** be rejected with one generic `invalid_grant`, so
+  an unverified token cannot reveal which issuers are trusted. The
+  `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
+  here — the JWKS signature check, issuer allowlist, audience binding and
+  client binding below *are* the trust anchor.
+- **MUST** authenticate the redeeming client (absent client credentials →
+  `invalid_client`) with its registered method; with per-account issuer rows
+  only `private_key_jwt` is accepted and a client secret is `invalid_client`
+  (ADR 0042 D3a); static issuers (standalone) keep secrets. And
+  **MUST** redeem only for the relying party the ID token was issued to (OpenID
+  Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
+  token's `aud` values, `azp`, if present, must be a string equal to it, and a token with
+  several audiences must carry `azp`. A mismatch is `invalid_grant`. Without
+  this, anyone holding a person's ID token could mint a token with that person
+  as `sub`. Since an ID token's `aud` is the relying party's `client_id`, the
+  ZeroID client is registered with that same `client_id`, and the issued token
+  carries it as `client_id`.
+- **MUST** verify the ID token's signature against the issuer's JWKS (fetched
+  from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
+  absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
+  matched issuer), `aud` (naming one of the issuer's configured audiences),
+  `exp`, `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
+  library honors but does not require them). A 60-second clock skew is tolerated.
+- **MUST** accept only a token that is positively an ID token: `iss`, `sub`,
+  `aud`, `exp` and `iat` present, and no access-token marker (`scp`, `scope`,
+  Entra's `azpacr`/`appidacr`, or a JWS `typ` of `at+jwt` / `application/at+jwt`
+  (RFC 9068 §2.1) or `oauth-id-jag+jwt`). Together
+  with the relying-party check above this separates an ID token from an access
+  token a trusted issuer also signs.
+- **MUST** accept only an issuer of kind `person`, and refuse a workload
+  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID,
+  a GitHub Actions `repo:` subject)
+  with `invalid_grant`, since the minted token carries `principal_type=user`.
+- **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
+  Section 7.2) and outside the issuer's configured `algorithms` (default
+  `RS256`, `ES256`, `PS256`); `none` and HMAC are rejected.
+- Caps replay: the ID token's `iat` **MUST** be within the issuer's
+  `max_token_age` (default 10 minutes).
+- With per-account issuer rows (`federation.issuer_store=db`), derives the
+  tenant instead: the account from the issuer row, the project from the agent
+  identity the authenticated client is bound to, and a caller-supplied
+  `account_id`/`project_id` that differs is `invalid_grant`. The bound agent is
+  the current actor in `act`, and the deployer's person resolver must find the
+  person in the account; the token's `sub` is the resolved user, its
+  `user_id_iss` is ZeroID's issuer, and the IdP's issuer and subject are carried
+  in the reserved `user_idp_iss` and `user_idp_sub` claims. See
+  [external-issuers.md](../external-issuers.md).
+- With a static issuer (standalone), binds the upstream token to a ZeroID
+  tenant via the issuer's
+  **`allowed_accounts`** — a **REQUIRED, non-empty** list; the request's
+  `account_id` **MUST** appear in it. Because the ID token's `aud` binds it to
+  ZeroID-the-RP (not to a tenant) and `account_id` is caller-supplied on the
+  public token endpoint, an empty allowlist would let a token validly issued
+  for one tenant be exchanged under another; ZeroID rejects an empty
+  `allowed_accounts` at config load (fail closed).
+- Maps the principal from the issuer's `claim_mapping` (`user_id` REQUIRED,
+  becomes `sub`; OPTIONAL `email`, `name`).
+- Emits `token_exchange=external_id_token` and, unless a person resolver mapped
+  `sub` to the deployer's user, `user_id_iss=<upstream iss>`, and
+  propagates `auth_time`/`acr`/`amr` per the issuer's `propagate_claims`
+  (Section 4.6). Is RS256-signed with a short (900 s) TTL and is governed by the
+  tenant credential-policy ceiling (the tenant default policy when no
+  `application_id` resolves a specific identity).
+- Fetches JWKS through an SSRF-guarded HTTP client: an issuer/`jwks_uri` host
+  resolving to a private/loopback/link-local/metadata address is rejected unless
+  the issuer sets `allow_private_endpoints` (for a deliberately internal IdP).
+  See Section 13.
+
+Out of scope: the interactive OIDC redirect/authentication flow is the
+deployer's responsibility — ZeroID is a token-exchange endpoint, not a
+browser-facing OIDC relying party. SAML and OpenID Federation trust chains are
+also out of scope; trusted issuers are configured explicitly.
+
+### 5.7 Cascade revocation
+
+Revoking any credential revokes the entire subtree beneath it (all credentials
+whose `parent_jti` chain reaches the revoked `jti`). Revoking an identity
+(deactivation) revokes all of its active credentials and, transitively, their
+delegated descendants. Cascade is bounded (see migration `007`/`029`).
+Revocation events are observable through the `RevocationNotifier` hook, one event
+per revoked `jti`; ZeroID ships no built-in deny-set transport.
+
+## 6. CIBA Extensions
+
+ZeroID implements OpenID CIBA Core 1.0 (poll / ping / push) and extends the
+`POST /oauth2/bc-authorize` request as follows.
+
+### 6.1 `group_hint` — role/group-targeted approval
+
+CIBA Core §7.1 requires at least one of `login_hint_token`, `id_token_hint`, or
+`login_hint` to identify the target user. ZeroID adds an extension parameter:
+
+| Parameter | Type | Constraints |
+|---|---|---|
+| `group_hint` | string | Opaque, deployer-namespaced. Max **255 codepoints** (multi-byte UTF-8 accepted). |
+
+- The bc-authorize request **MUST** carry at least one of `login_hint` **or**
+  `group_hint`. ZeroID accepts either to satisfy the CIBA "one hint" requirement.
+- `group_hint` is **opaque** to ZeroID. It is a deployer-namespaced selector for
+  approval by *whoever currently holds a role / fills a queue* rather than a
+  specific user — e.g. `highflame:role:finance_lead`, `pd:schedule:P12345`.
+- ZeroID passes `group_hint` verbatim to the deployer's `BackchannelNotifier`,
+  which resolves it to a set of approvers at fan-out time.
+- First-approver-wins is enforced by ZeroID's existing atomic single-use CAS on
+  `auth_req_id`; a `group_hint` fan-out to N approvers still yields exactly one
+  issued token.
+
+Both JSON and form-encoded bc-authorize bodies are accepted.
+
+### 6.2 Rich Authorization Requests on CIBA (RFC 9396)
+
+ZeroID accepts an RFC 9396 `authorization_details` JSON array on bc-authorize so
+the approver can be shown *exactly what is being authorized* at finer
+granularity than a scope string (e.g.
+`{"type":"tool_call","tool":"transfer_funds","amount":50000}`).
+
+- ZeroID validates the **outer shape** (a JSON array whose every element is an
+  object with a string `type`). Per-`type` schema validation is opt-in via the
+  `RegisterAuthorizationDetailValidator(type, fn)` hook.
+- A rejected payload maps to the RFC 9396 §5 error code
+  `invalid_authorization_details`.
+- The raw parsed slice is threaded verbatim to the `BackchannelNotifier` for a
+  per-action approval UX.
+- On approval the granted payload is (a) embedded in the access-token JWT as the
+  `authorization_details` claim (§6.1), (b) returned on the token response body
+  (§5.2), and (c) exposed via introspection (§7). A resource server can read the
+  typed grant from either the JWT or `/oauth2/token/introspect`.
+
+See `docs/rar.md` for worked examples.
+
+### 6.3 Delivery-mode and notification client metadata
+
+Two OAuth-client fields govern CIBA delivery (advertised in discovery,
+Section 11.1):
+
+| Client field | Values | Meaning |
+|---|---|---|
+| `backchannel_token_delivery_mode` | `poll` (default), `ping`, `push` | How the issued token reaches the client. |
+| `client_notification_endpoint` | HTTPS URL | Ping/push callback target. SSRF-guarded; private endpoints rejected unless the deployer sets `AllowPrivateNotificationEndpoints`. |
+
+## 7. DPoP Extensions
+
+ZeroID implements RFC 9449 DPoP (proof at `/oauth2/token`, `cnf.jkt` binding,
+atomic `jti` replay store, resource-server-side validation). The portable
+verifier lives in the standalone module `pkg/dpop`. ZeroID adds one extension
+claim.
+
+### 7.1 Body-hash claim (`bh`) — ZeroID extension
+
+`bh` is a **ZeroID extension** to the DPoP proof. RFC 9449 covers only the HTTP method 
+and URI (`htm`/`htu`) and the access-token hash (`ath`); it leaves request-body 
+integrity out of scope but notes that additional signed information may be added 
+to a proof — `bh` is such an addition. ZeroID's `bh`is a light-weight, DPoP-inline 
+alternative used by the agent hook flow; deployments that need full message-signature 
+semantics should layer RFC 9421 instead. The verifier binds a proof to a specific request 
+payload as:
+
+```
+bh = base64url( SHA-256( request-body ) )   // no padding
+```
+
+- **Default mode:** `bh` is OPTIONAL. If the request has a body **and** the
+  proof carries `bh`, the verifier **MUST** recompute and compare (constant-time)
+  and reject on mismatch (`ErrBodyHashMismatch`). If `bh` is absent, no body
+  check runs.
+- **Strict mode (`RequireBodyHash()`):** a body-bearing request whose proof
+  lacks `bh` **MUST** be rejected (`ErrBodyHashRequired`). RECOMMENDED for inline
+  gateways and guardrails.
+
+### 7.2 Algorithm policy
+
+The DPoP proof `alg` **MUST** be asymmetric: one of `ES256` `ES384` `ES512`
+`EdDSA` `RS256` `RS384` `RS512` `PS256` `PS384` `PS512`. `none` and all HMAC
+algorithms (`HS*`) and any unknown alg **MUST** be rejected **before** any
+cryptographic work, to foreclose algorithm-confusion attacks. (ZeroID's
+*issued-token* DPoP-alg discovery advertises the subset it accepts on the proof
+header; see Section 11.1.)
+
+### 7.3 Validation order
+
+The verifier applies checks cheap-first, committing replay state last:
+parse + `typ=dpop+jwt` + alg allow-list + embedded public JWK + signature →
+`htm` → `htu` (normalized) → `iat` freshness → `ath` (if access token present) →
+`bh` (if body present / required) → atomic `jti` replay insert. Earlier failures
+**MUST NOT** write to the replay store.
+
+See `docs/dpop-and-dcr.md` for the full DPoP + Dynamic Client Registration
+reference.
+
+## 8. Reserved-Claims Gating
+
+The external-principal exchange accepts a caller-supplied `additional_claims`
+map for deployment-specific data (e.g. `gateway_id`). To prevent
+privilege-escalation by claim injection, ZeroID maintains a **reserved-claims
+blocklist**. Any key in the blocklist supplied via `additional_claims` is
+**silently dropped** (never overrides the server-derived value), on **every**
+grant.
+
+The reserved set is:
+
+```
+# RFC 7519 registered
+iss sub aud exp nbf iat jti
+# ZeroID identity
+account_id project_id user_id owner_user_id external_id identity_type
+sub_type trust_level status name framework version publisher capabilities
+scopes grant_type delegation_depth user_email user_name
+# RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
+resource client_id scope may_act
+# ZeroID internal / provenance
+act token_exchange trusted_by user_id_iss user_idp_iss user_idp_sub mission_id principal_type
+# RFC 9449 sender-constraint
+cnf
+# RFC 8707 resource binding, RFC 9068 client attribution
+resource client_id
+# Authorization (gated)
+role privilege_scope roles
+# Step-up approvals (RFC 9396)
+authorization_details approval_id
+# Agent provenance
+origin agent_idp_iss agent_idp_parent
+```
+
+Special cases:
+
+- `cnf` is reserved so a trusted-service caller cannot forge a token that
+  *appears* DPoP-bound to an attacker-chosen key. `cnf.jkt` is set **only** from
+  a server-validated proof (Section 4.5).
+- `role` and `privilege_scope` are reserved against `additional_claims` on
+  **all** grants, but MAY be set on the trusted external-principal path through
+  **dedicated request fields** (`role`, `privilege_scope`) — i.e. only *after*
+  the `TrustedServiceValidator` gate. Empty values are omitted, preserving
+  byte-identical tokens for callers that don't use them.
+
+- `roles` is never settable through any request field: ZeroID writes it only
+  from the deployer's person-grant resolver, on a person's own token
+  (Section 5.1c).
+
+- `authorization_details` is written **only** on the CIBA path, from the
+  approved backchannel request, with ZeroID stamping `approval_id` into each
+  entry. A resource server that honours an approval entry (Highflame Shield's
+  step-up) relies on no other grant being able to carry one; `approval_id` is
+  also reserved at the top level so no caller can mint a look-alike.
+- `origin`, `agent_idp_iss` and `agent_idp_parent` describe where an agent was
+  registered (native, or an external IdP such as Entra or Okta). Policies use
+  them to tell the two apart, so no caller may set them; ZeroID does not mint
+  them yet.
+
+This makes the `additional_claims` route fail closed regardless of which grant
+is in play.
+
+## 9. CAE / SSF Signals
+
+ZeroID consumes Continuous Access Evaluation signals (OpenID Shared Signals
+Framework / CAEP family) to drive real-time revocation. The signal vocabulary
+is a ZeroID-defined extension.
+
+### 9.1 Signal types
+
+| `signal_type` | Meaning |
+|---|---|
+| `credential_change` | A credential's state changed. |
+| `session_revoked` | A session was revoked upstream. |
+| `ip_change` | Source IP changed unexpectedly. |
+| `anomalous_behavior` | Behavioural anomaly detected. |
+| `policy_violation` | A policy was violated. |
+| `retirement` | Identity is being retired. |
+| `owner_change` | The owner of an identity changed. |
+| `identity_expired` | A time-bound identity reached its expiry. |
+
+### 9.2 Severity
+
+`severity` ∈ { `low`, `medium`, `high`, `critical` }. A signal of severity
+`high` or `critical` triggers credential revocation (and cascade per
+Section 5.7).
+
+### 9.3 Signal shape and scoping
+
+A signal carries `identity_id`, `signal_type`, `severity`, a `source` string,
+and an arbitrary JSON `payload`. Signals are tenant-scoped and may carry
+`mission_id` so subscribers can filter to one delegation tree.
+
+## 10. Workload Identity Federation
+
+ZeroID participates in workload identity federation (WIF) in **both
+directions**, neither of which uses a long-lived secret:
+
+- **Inbound — ZeroID as relying party (§10.1–10.4).** A workload presents an
+  upstream platform OIDC token (GitHub Actions, GCP Workload Identity,
+  Kubernetes projected service-account tokens, AWS IAM/EKS, …); ZeroID verifies
+  it as an attestation and issues a ZeroID credential. Realised through the
+  attestation framework's OIDC verifier (see `docs/attestation.md`).
+- **Outbound — ZeroID as a federation issuer (§10.4).** A ZeroID-issued token is
+  itself federated by a downstream WIF relying party (e.g. Anthropic, GCP, AWS,
+  Azure); the workload uses its ZeroID credential to obtain access at that
+  provider with no provider-native secret. Realised purely through ZeroID's
+  standard, externally-verifiable token + JWKS surface — no provider-specific
+  code on either side.
+
+This section specifies both wire contracts. It concerns **workload** identity:
+an upstream *platform* OIDC token presented as an attestation that elevates an
+identity's trust level. It is distinct from direct OIDC **user**-identity
+federation (Section 5.6), where an upstream *user* ID token is exchanged for a
+ZeroID principal token via `token_exchange`; that path mints a token for the
+authenticated user rather than attesting a workload. Both verify an upstream
+issuer's signature against a configured JWKS and apply the same SSRF guard on
+the issuer/`jwks_uri` fetch (Section 13).
+
+### 10.1 Inbound — proof types
+
+An attestation submission carries a `proof_type`:
+
+| `proof_type` | Status | Use |
+|---|---|---|
+| `oidc_token` | Implemented | Federate an upstream platform OIDC token — the WIF path. |
+| `image_hash` | Reserved (not yet implemented) | Container image-digest attestation. |
+| `tpm` | Reserved (not yet implemented) | Hardware / TPM attestation. |
+
+The verifier contract is **fail-closed**: a missing verifier, a missing policy,
+or any verification failure yields no trust promotion and no credential.
+
+### 10.2 Inbound — per-tenant issuer policy (`oidc_token`)
+
+A tenant authorises upstream issuers through an `AttestationPolicy` whose
+`proof_type` is `oidc_token` and whose config is an `OIDCPolicyConfig`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `issuers` | array of issuer configs | Allowlist. The submitted token's `iss` **MUST** match one entry's `url` or verification fails; at least one issuer is required. |
+
+Each `issuers[]` entry (`OIDCIssuerConfig`):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `url` | string | Issuer URL. Matched against the token `iss` **and** used to discover the JWKS via `{url}/.well-known/openid-configuration`. The discovery fetch is size-bounded and **MUST** use HTTPS (loopback hosts excepted, for local dev/test). |
+| `audiences` | array&lt;string&gt; (OPTIONAL) | If non-empty, the token `aud` **MUST** contain at least one of these. Empty disables the audience check. |
+| `required_claims` | map&lt;string,string&gt; (OPTIONAL) | Exact-string-match requirements that bind the token to a specific workload. Every listed key **MUST** be present on the token and equal the configured value. E.g. for GitHub Actions OIDC: `{"repository":"myorg/myrepo","ref":"refs/heads/main"}`. |
+
+Issuer allowlisting and claim binding are configured per `(account_id,
+project_id)` — there is no global trust.
+
+### 10.3 Inbound — verification and trust-elevation flow
+
+WIF is a two-step exchange:
+
+1. The workload **submits** its platform OIDC token as an attestation record
+   bound to an identity.
+2. A **verify** step runs the OIDC verifier against that record and, on success,
+   **promotes the identity's trust level and issues a credential** in a single
+   transaction.
+
+The OIDC verifier applies, in order:
+
+1. Parse the submitted token; match its `iss` against the tenant's issuer
+   allowlist (Section 10.2). No match → reject.
+2. Discover the matched issuer's JWKS (`/.well-known/openid-configuration`,
+   HTTPS, size-bounded) and verify the token signature.
+3. If the issuer config sets `audiences`, require the token `aud` to contain one.
+4. Enforce every `required_claims` exact match.
+5. Require and validate `exp`; require `sub` and `iss`.
+6. On success, record the verified `sub` / `iss` / expiry, promote the
+   identity's trust level (mapping the attestation level to `first_party` or
+   `verified_third_party`, per Section 3.2), and issue a credential through the
+   credential service under the identity's policy.
+
+A workload therefore presents only its platform-issued OIDC token; ZeroID never
+holds a secret for it, and rotation is the platform's concern.
+
+### 10.4 Outbound — ZeroID as a federation issuer
+
+ZeroID-issued tokens are ordinary, externally-verifiable JWTs, so a downstream
+**WIF relying party** can be configured to trust ZeroID as an external OIDC
+issuer and accept a ZeroID credential in place of its own provider-native
+secret. The federation mechanism is **RFC 7523** (JWT-bearer assertion): the
+workload mints a ZeroID access token, then presents it to the relying party's
+token endpoint as the assertion in a
+`urn:ietf:params:oauth:grant-type:jwt-bearer` exchange; the relying party
+validates the signature against ZeroID's published JWKS and maps it — via a
+federation rule keyed on `iss`, `aud`, the `sub` prefix, and ZeroID claims such
+as `trust_level` — to a short-lived credential bound to one of its own
+service accounts. This is the outward mirror of ZeroID's own inbound RFC 7523 /
+RFC 8693 exchanges (Section 5), and requires no ZeroID-specific integration on
+either side — only ZeroID's standard issuer surface:
+
+- **Verifiable tokens.** Every issued token carries `iss` (the ZeroID issuer
+  URL), `sub` (the workload's WIMSE URI, Section 3.1), `aud`, `exp`, and a `kid`
+  header, signed ES256 (NHI flows) or RS256.
+- **JWKS at `/.well-known/jwks.json`.** Keys are published with `use="sig"`
+  (RFC 7517 §4.2) **specifically so external WIF validators accept them** — the
+  Anthropic, Azure, GCP, and AWS WIF validators reject keys whose `use` is
+  anything other than `sig`/`enc`. This is asserted by ZeroID's JWKS
+  compatibility test.
+- **Issuer discovery.** `/.well-known/oauth-authorization-server` (Section 11.1)
+  advertises `issuer` and `jwks_uri`; a relying party either points its JWKS
+  source at that discovery document or is given the JWKS URL explicitly.
+  Relying parties that discover an external issuer the OIDC way — AWS IAM OIDC
+  identity providers, Azure federated identity credentials and GCP workload
+  identity pools all fetch `/.well-known/openid-configuration` and do not read
+  RFC 8414's path — are served by the OIDC discovery document (Section 11.4).
+- **SPIFFE consumers.** `/.well-known/spiffe-trust-bundle.json` (Section 11.3)
+  serves the same keys with `use="JWT-SVID"` for SPIFFE-strict validators.
+
+A relying party configures (a) the trusted issuer = ZeroID's issuer URL,
+(b) the JWKS URI = `{issuer}/.well-known/jwks.json`, and (c) whatever audience /
+subject / claim constraints it enforces, then maps the verified ZeroID `sub`
+(a WIMSE URI) to a local principal. The workload presents its ZeroID access
+token to the relying party; no provider-native secret is involved.
+
+**Anthropic Workload Identity Federation** is a verified relying party for this
+path: configured to trust the ZeroID issuer and its JWKS, it accepts a
+ZeroID-issued token as a federated workload credential — granting Anthropic API
+access without a static Anthropic API key. GCP Workload Identity Federation,
+AWS, and Azure follow the same configuration shape.
+
+> **Audience note.** A token issued with no resource indicator defaults `aud` to
+> the ZeroID issuer URL, so a relying party on this federation path **MUST** be
+> configured to accept the issuer URL as the expected audience rather than
+> expecting a caller-chosen `aud`.
+>
+> `/oauth2/token` *does* accept an RFC 8707 `resource` parameter, and
+> `/oauth2/authorize` accepts one that becomes the authorization code's consented
+> ceiling. Both only ever NARROW where a token is honoured, which is why `aud`
+> still cannot be used as an authorization signal: any tenant principal may
+> request any value, so a relying party **MUST NOT** treat a matching `aud` as
+> evidence that the token was minted for it. Authorize on the `resource` claim,
+> the scopes, and the principal. The `audience` parameter is a separate
+> scope-profile mechanism, exposed only on the trusted external-principal
+> exchange and mutually exclusive with `resource`.
+
+## 11. Discovery Metadata Extensions
+
+### 11.1 Authorization Server Metadata (RFC 8414)
+
+`GET /.well-known/oauth-authorization-server` includes, beyond the RFC 8414
+baseline:
+
+| Field | Value (reference deployment) | Source spec |
+|---|---|---|
+| `dpop_signing_alg_values_supported` | `["ES256","RS256"]` | RFC 9449 §5.1 |
+| `backchannel_authentication_endpoint` | `<issuer>/oauth2/bc-authorize` | CIBA Core |
+| `backchannel_token_delivery_modes_supported` | `["poll","ping","push"]` | CIBA Core |
+| `backchannel_user_code_parameter_supported` | `false` | CIBA Core |
+| `backchannel_authentication_request_signing_alg_values_supported` | *omitted* (signed bc-authorize requests unsupported) | CIBA Core |
+| `client_id_metadata_document_supported` | `true` (gated — see Section 12.8) | CIMD draft-02 |
+
+**Zero-element claims are omitted, not emitted as `[]`.** RFC 8414 §2 and
+OpenID Connect Discovery 1.0 §3 both require it: *"Claims with zero elements
+MUST be omitted from the response."* Every discovery document ZeroID publishes
+is swept for this before it is served, so a member with nothing to list is
+absent rather than empty — `backchannel_authentication_request_signing_alg_values_supported`
+always, `response_types_supported` when the `authorization_code` flow is
+unservable (Section 12.8), `id_token_signing_alg_values_supported` if no
+published key carries an `alg`. For **those three members**, read an absent
+value as "none" rather than "unknown" (zeroid#316).
+
+That reading does **not** generalise to every absent array-valued member, and
+assuming it does is the more dangerous mistake of the two. Where a spec defines
+a default for the omitted case, absence means the default — which can be *wider*
+than an empty list, not narrower:
+
+| Member | Meaning of absence |
+|---|---|
+| `grant_types_supported` | RFC 8414 §2 → `["authorization_code", "implicit"]`, including the implicit flow OAuth 2.1 removes |
+| `token_endpoint_auth_methods_supported` | RFC 8414 §2 → `client_secret_basic` |
+| `bearer_methods_supported` (RFC 9728) | RFC 9728 §2 → re-opens `query`, i.e. bearer tokens in URLs and therefore in access logs |
+
+ZeroID publishes all three as non-empty literals, so none is ever omitted and
+the distinction is latent rather than live. It is stated because the sweep is
+unconditional: a member later made *computed* must be given an explicit
+non-empty floor where it is built, rather than left to the sweep. Section 11.4
+works through the one case where omission carries a real client-visible cost.
+
+### 11.2 Protected Resource Metadata (RFC 9728)
+
+`GET /.well-known/oauth-protected-resource`:
+
+| Field | Value |
+|---|---|
+| `resource` | `<issuer>` |
+| `resource_name` | `ZeroID` |
+| `jwks_uri` | `<issuer>/.well-known/jwks.json` |
+| `bearer_methods_supported` | `["header"]` |
+| `dpop_bound_access_tokens_required` | `false` (DPoP optional) |
+
+### 11.3 SPIFFE trust bundle
+
+`GET /.well-known/spiffe-trust-bundle.json` publishes the JWKS as a SPIFFE
+JWT-SVID trust bundle: each key's `use` is `JWT-SVID`, and the document carries
+`spiffe_sequence` and `spiffe_refresh_hint` per the SPIFFE bundle format. This
+lets SPIFFE-aware verifiers consume ZeroID's `sub` (a SPIFFE ID) natively.
+
+### 11.4 OpenID Connect Discovery metadata
+
+`GET /.well-known/openid-configuration` serves the Section 11.1 document plus
+the two members OpenID Connect Discovery 1.0 §3 makes REQUIRED that RFC 8414 §2
+does not define:
+
+| Field | Value | Source spec |
+|---|---|---|
+| `subject_types_supported` | `["public"]` | OIDC Discovery §3 |
+| `id_token_signing_alg_values_supported` | derived from the live keyset (`["ES256","RS256"]` in the reference deployment) | OIDC Discovery §3 |
+
+The document exists for **federation trust establishment**, not for OIDC login.
+It is the discovery path the cloud relying parties in Section 10 fetch to locate
+`jwks_uri`; publishing only RFC 8414's path leaves ZeroID undiscoverable to them
+even though the keyset is already public.
+
+`subject_types_supported` is `public` — not `pairwise` — because ZeroID's `sub`
+is the workload's WIMSE URI (Section 3.1) and is identical for every verifier. A
+per-relying-party pseudonymous subject would break the cloud role trust policies
+that pin a literal `sub` value.
+
+**ZeroID is not an OpenID Provider.** It issues no `id_token`, and this document
+**MUST NOT** be read as advertising one. `response_types_supported` is inherited
+from Section 11.1 and is either absent or carries at most `"code"` — never
+`"id_token"` or `"id_token token"` — so no relying party can request an ID Token
+from this authorization server. `scopes_supported` is not advertised, so
+`openid` is not offered either.
+
+The absent case deserves stating plainly, because it is the weaker half of that
+guarantee. When the `authorization_code` flow is unservable the member is
+omitted (see Section 11.1), and a client library that supplies its own default
+then supplies it unchecked — the MCP Python SDK's `OAuthMetadata` model, for
+instance, defaults `response_types_supported` to `["code"]`. That default is
+still not `"id_token"`, so the no-ID-Token guarantee holds on both paths. What
+it costs is the *`code`* half: such a client believes an authorization flow is
+available that this deployment will answer with `503` at `/oauth2/authorize`.
+That is a failed flow rather than a security boundary, and it is the accepted
+price of publishing a conformant document. The OIDC Discovery §5 UserInfo endpoint, §2 WebFinger issuer
+discovery, and every ID Token clause are out of scope.
+
+## 12. Client ID Metadata Documents (CIMD)
+
+ZeroID implements
+[`draft-ietf-oauth-client-id-metadata-document`](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/)
+(revision **-02**, July 2026), the client-onboarding model the MCP Authorization
+specification names as its preferred default. A client presents an `https://`
+URL as its `client_id`; ZeroID fetches and validates the metadata document
+published there and synthesises an **ephemeral** client from it — a public PKCE
+client by default, or a key-authenticated one when the document publishes a key
+set (zeroid#264). No row is written to the client registry.
+
+This section specifies ZeroID's deviations from the draft and the deployment
+controls around it. `docs/cimd.md` carries the worked examples.
+
+### 12.1 Client identifier URL
+
+Per draft-02 §3, a Client Identifier URL **MUST** use the `https` scheme, **MUST**
+carry a path, and **MUST NOT** carry userinfo, a fragment, or single-/double-dot
+path segments. ZeroID enforces all of these, and adds two constraints of its own:
+
+| Constraint | Draft-02 §3 | ZeroID |
+|---|---|---|
+| `https` scheme, host present, path present | MUST | enforced |
+| No fragment | MUST NOT | rejected |
+| No userinfo | MUST NOT | rejected |
+| No `.` / `..` path segments | MUST NOT | rejected (checked on the decoded path, so `%2e%2e` is caught) |
+| No query string | SHOULD NOT | **rejected** — stricter than the draft |
+| Length | — | **≤ 255 characters** |
+
+The query-string rejection is deliberate. The `client_id` a client presents must
+remain byte-identical to the URL the document was fetched from, because that is
+exactly what the §12.4 self-reference check compares; permitting a query would
+admit two spellings of one identity. The length cap is a deployment constraint —
+the `client_id` is persisted into `VARCHAR(255)` columns downstream, so an
+oversize URL is refused at the door rather than failing later at code
+consumption.
+
+Two of the draft's MUST NOTs carry weight beyond conformance. Userinfo is the
+phishing shape: `https://legit.example.com@evil.example/client.json` resolves to
+`evil.example` while *reading* as `legit.example.com` wherever the `client_id` is
+displayed — a consent screen, an audit log — which are the two places a human is
+asked to trust the string. Dot segments would give one document many spellings,
+splitting the resolution cache and handing one client several identities the
+self-reference check cannot distinguish.
+
+### 12.2 Registry-first precedence
+
+The client registry is **always** consulted first. CIMD resolution runs only when
+the registry holds **no row at all** for that `client_id`.
+
+That is stronger than "the registry lookup failed", and the distinction is
+load-bearing: a row that exists but is inactive or non-public was deliberately
+registered, so deactivation **MUST** remain a kill switch. Falling back to CIMD
+on a deactivated row would let a client whose `client_id` happens to be an
+`https://` URL resurrect itself by republishing its document.
+
+Registering a client under a CIMD URL therefore pins it: the registry row
+overrides the document.
+
+### 12.3 Document fetch
+
+- `GET` through the same DNS-rebinding-safe SSRF-guarded client used for OIDC
+  attestation and CIBA dispatch. The host is resolved once, every answer checked
+  against the private/loopback/link-local/multicast/CGN/reserved blocklist, and
+  the connection pinned to the validated IP; TLS still verifies the original
+  hostname. Draft-02 §8.6 requires this, permitting a loopback exception only
+  for development deployments whose authorization server is itself on loopback.
+- **Size-capped at 5 KiB**, matching the draft's §8.7 recommendation.
+- **Timeout-bounded at 5 s**, applied by wrapping the caller's context so the
+  bound holds regardless of the injected HTTP client's own timeout.
+- **HTTP redirects are not followed.** The `client_id` is a canonical document
+  location; a 3xx is a resolution failure.
+
+### 12.4 Document validation
+
+- **Self-reference** (draft-02 §4): the document's `client_id` **MUST** equal the
+  URL it was fetched from. This is what stops a document claiming another
+  client's identity.
+- `redirect_uris` is **REQUIRED and non-empty** — CIMD's primary
+  anti-impersonation control. Each entry must satisfy OAuth 2.1 scheme rules:
+  `https`, loopback `http`, or a private-use scheme (RFC 8252 §7.1 native-app
+  callbacks). Plaintext non-loopback `http` is rejected, as are userinfo and
+  fragments.
+- `client_name` is **REQUIRED and non-empty** (trimmed). **This is a deviation** —
+  the draft only RECOMMENDS it. It is the string a consent screen shows the user,
+  and a CIMD publisher is anonymous by construction, so this label is most of what
+  consent has to go on. ZeroID previously fell back to the `client_id`, which made
+  a document that declined to name itself indistinguishable from a well-formed one
+  and let whoever chose the URL choose what the user reads.
+- `token_endpoint_auth_method` **MUST** be `none` (an omitted value defaults to
+  `none`) or `private_key_jwt`. Draft-02 §8.2 *recommends* that a client be able
+  to establish itself as confidential via `token_endpoint_auth_method` and
+  `jwks_uri`; ZeroID supports that as of zeroid#264. The secret-based methods are
+  refused, and this is **not** a deviation so much as a structural fact: there is
+  no registration response in which a self-published client could be handed a
+  secret.
+
+  A `private_key_jwt` document **MUST** publish exactly one of `jwks` or
+  `jwks_uri` (RFC 7591 §2); declaring the method with no key material is refused
+  at resolution, because it describes a client that could never authenticate.
+
+  **Deviation — `jwks_uri` MUST be on the `client_id`'s own host**, and gets no
+  private-endpoint relaxation. The draft does not require this. Two reasons, and
+  the first is the principled one: CIMD's entire trust anchor is that the
+  document's *host* vouches for the identity, so honouring keys served by some
+  other host would trust B to speak for A with nothing establishing that it may.
+  The second is concrete — key resolution runs *before* signature verification,
+  so without the rule any anonymous document becomes an unauthenticated
+  outbound-fetch primitive aimed at a third party, and each distinct URL consumes
+  a bounded cache slot that owns a background refresh, evicting legitimate
+  clients' key sets. Inline `jwks` is the escape hatch for a publisher who keeps
+  keys elsewhere.
+
+  Earlier revisions of this document stated that accepting key-based auth "would
+  let any party on the internet claim a confidential client identity without
+  registering". That was wrong and is retracted: the §4 self-reference check
+  means a CIMD `client_id` **is** the URL its document was fetched from, so the
+  only identity assertable is one for a URL the caller already controls — which
+  a public CIMD client already asserts. A key is an added proof obligation, not a
+  new identity. What bounds a CIMD client's authority is the grant-type
+  intersection below, which key-based auth does not widen.
+- `grant_types` defaults to `["authorization_code"]` and **MUST** include
+  `authorization_code`. Values outside `{authorization_code, refresh_token}` are
+  **ignored**: the effective grant set is the intersection of the document's
+  list with that pair, and the synthesized client carries only the
+  intersection. A document is refused only when the intersection is empty of
+  `authorization_code`.
+
+  This follows RFC 7591 §2 (an AS MAY ignore metadata it does not understand)
+  and §3.2.1 (an AS MAY substitute the grant types it supports). A CIMD document
+  is published once to every authorization server the client uses and there is
+  no registration response to negotiate with, so rejecting it over a grant this
+  server does not implement would force the publisher to choose between servers.
+  The security property is preserved by the intersection, not by the rejection:
+  a grant absent from the synthesized client's `grant_types` cannot be obtained.
+  Changed in zeroid#344.
+- When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
+  entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
+  is a deviation.** ZeroID redirects to a resolved CIMD client's `redirect_uri`
+  like any other client's (Section 12.5), so allow-listing a publisher vets the
+  destination only if the destination is vetted too — on a host with multiple
+  publishers it otherwise does not. Loopback `http://` and private-use schemes are
+  exempt — they resolve on the caller's own device, not at a published host. With
+  an empty allow-list (open mode) this check does not run and any `https://`
+  destination is accepted; that is the open-redirect surface Section 12.5
+  describes.
+- `response_types`, when present, **MUST** include `code`.
+- Outer-shape validation only, by default. Per-type schema validation is opt-in
+  through the `RegisterAuthorizationDetailValidator`-style hook pattern.
+
+A CIMD `client_id` is **not** accepted as an authenticated client at the
+introspection or revocation endpoints; the `none` advertised in those metadata
+arrays (Section 11.1) applies to *registered* public clients only.
+
+### 12.5 Error reporting and redirects for CIMD clients
+
+RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
+redirecting to the client's `redirect_uri`. ZeroID does that for registered and
+CIMD clients alike, on GET, once the client and `redirect_uri` have been
+validated (step 3.5 of `/oauth2/authorize`). The interactive-authentication
+redirect (`ErrPrincipalInteractionRequired`, GET only) follows the same rule, and
+so does the `access_denied` redirect for a resource owner's explicit denial
+(`ErrPrincipalAccessDenied`), which is the one error also redirected on POST.
+Everything else is answered with an RFC 6749 §5.2 JSON body: the two §4.1.2.1
+exemptions (a `client_id` that does not resolve, a `redirect_uri` that is missing
+or not registered for the client), and every other failure on POST.
+
+`cimd.allowed_domains` (Section 12.7) is enforced in exactly one place: document
+resolution. A host that is not listed never resolves, so a CIMD client that reaches
+a redirect has already been admitted by the deployer's policy; gating the redirect
+again would ask the same question twice.
+
+What the open-ecosystem default gives up: with an empty allow-list, any public
+https host may publish a document naming any destination, so an unauthenticated
+caller can make `/oauth2/authorize` emit a §4.1.2.1 error redirect to a host they
+chose. That is the open-redirect surface an open ecosystem has. A deployer who
+does not want it sets `cimd.allowed_domains`.
+
+### 12.6 Caching
+
+Outcomes are memoised in a bounded in-memory cache (1000 entries, evicted on
+pressure). Nothing is persisted.
+
+| Outcome | TTL |
+|---|---|
+| Success | configured TTL, **1 h** default, **24 h** hard cap |
+| Success, document sets `Cache-Control: max-age` | shortened to that value, floored at **60 s** |
+| Transient fetch failure | negative-cached **10 s** |
+| Deterministic validation failure | negative-cached **60 s** |
+
+Draft-02 §5.2 permits an authorization server to impose its own bounds over the
+document's cache headers, which is what the 24 h cap and the 60 s floor are: the
+cap stops a document pinning a stale client indefinitely, and the floor stops one
+forcing a fetch per request. Negative caching means replaying a dead URL cannot
+force a fresh timeout-bounded outbound fetch on every request.
+
+The positive TTL is also why the `/oauth2/authorize` → `/oauth2/token`
+round-trip does not fetch twice.
+
+### 12.7 Deployment policy and what it cannot do
+
+`cimd.allowed_domains` restricts CIMD to `client_id` URLs whose host appears in
+an exact, case-insensitive allow-list, checked **before** any outbound fetch. It
+is the primary production hardening lever. **Empty is the default** and accepts
+any public HTTPS host; ZeroID warns at startup when CIMD is enabled without an
+allow-list.
+
+Deployers **SHOULD** understand its limits, because they are properties of the
+CIMD model rather than of this implementation:
+
+- **Domain granularity, not client authentication.** The allow-list constrains
+  *which hosts may publish*. Anyone able to serve a path under an allowed
+  domain can mint a client — inside an organisation, a low bar.
+- **No proof of possession.** A document URL is public, so any party may present
+  any published `client_id`. What bounds the impersonator is that the requested
+  `redirect_uri` must appear in that document — which, for a native client whose
+  document lists a loopback `redirect_uri`, is satisfied by the impersonator's
+  own listener. PKCE does not help, because the impersonator chooses its own
+  verifier.
+- **One document per application, not per installation.** Every installation of
+  a native client shares one document, so a future `jwks_uri` could only carry a
+  key shared across the whole population — a constraint on what "confidential
+  CIMD client" can mean (zeroid#264).
+
+### 12.8 Discovery
+
+`client_id_metadata_document_supported: true` is advertised in Authorization
+Server Metadata (Section 11.1) when CIMD is enabled **and** the deployment can
+actually serve the `authorization_code` flow. It is omitted otherwise: a
+discovery document that names a flow the endpoint cannot complete is worse than
+one that stays silent, since a CIMD-aware client gates its whole onboarding path
+on reading this field.
+
+## 13. Security Considerations
+
+- **No authority amplification on delegation.** Scope attenuation (5.1) and
+  depth capping (5.2) are enforced server-side; a delegated token is always a
+  subset of its delegator's authority capped by the sub-agent's policy. A
+  resource server SHOULD still enforce its own least-privilege check.
+- **Reserved-claims gating (8)** is the single chokepoint preventing
+  caller-injected privilege claims (`role`, `privilege_scope`, `cnf`, identity
+  claims). Any new authorization-bearing claim added in future **MUST** be added
+  to the reserved set in the same change.
+- **`cnf` provenance.** A resource server validating a DPoP-bound token **MUST**
+  obtain `cnf.jkt` from the token/introspection (set by ZeroID), not from any
+  caller-controlled input, and **MUST** validate a fresh per-request proof
+  against it. The `bh` extension (7.1) further binds a proof to its body; inline
+  guardrails SHOULD run in strict mode.
+- **`group_hint` is opaque and trust-sensitive.** ZeroID does not interpret it;
+  the deployer's `BackchannelNotifier` resolves it to approvers. A deployer
+  **MUST** namespace and authorize `group_hint` values so an agent cannot target
+  an approval queue it shouldn't reach. The 255-codepoint cap bounds persisted
+  row size.
+- **CIBA single-use.** `auth_req_id` is atomically single-use; group fan-out
+  cannot yield multiple tokens.
+- **External-principal exchange is a trust boundary.** It mints tokens for
+  arbitrary `user_id`s and is gated **only** by `TrustedServiceValidator`. The
+  deployer **MUST** restrict that gate to genuinely trusted internal callers; it
+  is effectively an impersonation capability.
+- **Direct OIDC federation moves the trust anchor to the IdP signature.** The
+  `id_token` exchange mode (5.6) deliberately has **no** `TrustedServiceValidator`
+  gate; trust rests entirely on (a) the upstream signature verified against a
+  configured JWKS, (b) the `iss` matching a configured issuer, (c) `aud` binding
+  to this ZeroID, and (d) the JWS `alg` being pinned to the asymmetric allow-list
+  (so a public verification key cannot be abused as an HMAC secret, and `none` is
+  refused). Two further controls are load-bearing and **MUST NOT** be relaxed in
+  multi-tenant deployments: `allowed_accounts` is required and non-empty (an empty
+  list is rejected at config load) — without it, a token validly issued for one
+  tenant could be exchanged under another, since `aud` binds only to ZeroID-the-RP
+  and `account_id` is caller-supplied; and the JWKS fetch is SSRF-guarded, with
+  `allow_private_endpoints` reserved for a deliberately internal IdP.
+- **Cascade revocation latency.** Revocation cascade and the `RevocationNotifier`
+  fan-out are asynchronous; a resource server requiring hard real-time
+  revocation **MUST** introspect rather than rely solely on local JWT
+  verification.
+- **Metadata is non-confidential.** The discovery documents (Section 11) expose
+  structural metadata; they are tenant-scoped but SHOULD be treated as readable
+  by anyone holding a tenant credential.
+- **Outbound federation extends the trust boundary.** When a relying party
+  federates ZeroID as an external issuer (Section 10.4), it inherits a
+  dependency on ZeroID's key custody and issuer security, and — if it validates
+  only signature + `exp` — it will **not** observe ZeroID-side revocation or CAE
+  cascade. Relying parties that need real-time revocation MUST introspect or
+  rely on short token TTLs; deployers SHOULD scope the `aud`/`sub`/claim
+  constraints a relying party accepts as tightly as the provider allows.
+
+## 14. Claim / Parameter Registry (IANA-style)
+
+Informative registry of every identifier this document defines, for ZeroID
+deployments. "Std" marks an identifier defined by a baseline spec but
+*populated* with ZeroID semantics.
+
+### 14.1 JWT claims
+
+| Claim | Kind | Defined in |
+|---|---|---|
+| `account_id` | string | §4.1 |
+| `project_id` | string | §4.1 |
+| `grant_type` | string | §4.1 |
+| `mission_id` | string | §4.1, §5.4 |
+| `external_id` | string | §4.2 |
+| `identity_type` | string | §4.2 |
+| `sub_type` | string | §4.2 |
+| `trust_level` | string | §4.2 |
+| `status` | string | §4.2 |
+| `owner_user_id` | string | §4.2 |
+| `name` `framework` `version` `publisher` | string | §4.2 |
+| `capabilities` | JSON | §4.2 |
+| `scopes` | array | §4.3 |
+| `delegation_depth` | number | §4.3, §5.2 |
+| `application_id` | string | §4.3 |
+| `user_email` `user_name` | string | §4.3 |
+| `act` | object | §4.4 (Std: RFC 8693) |
+| `cnf` | object | §4.5 (Std: RFC 9449) |
+| `token_exchange` | string | §4.6, §4.7 |
+| `trusted_by` | string | §4.6 |
+| `user_id_iss` | string | §4.6, §5.6 |
+| `user_idp_iss` `user_idp_sub` | string | §4.6, §5.6 |
+| `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
+| `role` | string | §4.6, §8 (gated) |
+| `privilege_scope` | array | §4.6, §8 (gated) |
+| `roles` | array | §4.3, §5.1c (Std: RFC 9068) |
+| `backchannel_client_id` | string | §4.7 |
+| `binding_message` | string | §4.7 |
+| `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |
+
+### 14.2 Request parameters
+
+| Parameter | Endpoint | Defined in |
+|---|---|---|
+| `group_hint` | `/oauth2/bc-authorize` | §6.1 |
+| `authorization_details` | `/oauth2/bc-authorize` | §6.2 |
+| `role`, `privilege_scope` | `/oauth2/token` (ext-principal exchange) | §5.5, §8 |
+| `additional_claims` | `/oauth2/token` (ext-principal exchange) | §4.8, §8 |
+| `subject_token_type` = `urn:ietf:params:oauth:token-type:id_token` | `/oauth2/token` (direct OIDC federation) | §5.6 (Std: RFC 8693) |
+
+### 14.3 DPoP proof claim
+
+| Claim | Defined in |
+|---|---|
+| `bh` | §7.1 (ZeroID extension — not in RFC 9449, no adopted IETF draft) |
+
+### 14.4 Signal types & severities
+
+See §9.1 / §9.2.
+
+### 14.5 Discovery fields
+
+See §11.1 / §11.2 / §11.3 / §11.4. `client_id_metadata_document_supported` is
+specified in §12.7.
+
+### 14.6 Workload Identity Federation
+
+Inbound: proof types (`oidc_token`, `image_hash`, `tpm`) and the
+`OIDCPolicyConfig` / `OIDCIssuerConfig` policy fields (`issuers`, `url`,
+`audiences`, `required_claims`) — §10.1–10.3. Outbound: the
+ZeroID-as-federation-issuer surface — JWKS `use="sig"`,
+`oauth-authorization-server` and `openid-configuration` `issuer`/`jwks_uri`, and
+the SPIFFE trust bundle (§10.4, §11.4).
+
+## 15. References
+
+### 15.1 Normative (baseline specs extended)
+
+| Specification | Used for |
+|---|---|
+| RFC 2119 / RFC 8174 | Requirement keywords |
+| RFC 6749 / OAuth 2.1 | OAuth framework |
+| RFC 7519 | JSON Web Token |
+| RFC 7638 | JWK Thumbprint (`cnf.jkt`) |
+| RFC 7591 / RFC 7592 | Dynamic Client Registration / Management |
+| RFC 7662 / RFC 7009 | Introspection / Revocation |
+| RFC 8414 | Authorization Server Metadata |
+| RFC 8693 | OAuth 2.0 Token Exchange (`act`, delegation) |
+| RFC 9396 | Rich Authorization Requests (`authorization_details`) |
+| RFC 9449 | DPoP |
+| RFC 9728 | Protected Resource Metadata |
+| draft-ietf-oauth-client-id-metadata-document-02 | Client ID Metadata Documents (URL as `client_id`) |
+| OpenID CIBA Core 1.0 | Backchannel Authentication |
+| OpenID Shared Signals Framework / CAEP | CAE signals |
+| SPIFFE / WIMSE | Identity URI scheme and trust bundle |
+
+### 15.2 Informative
+
+- The `bh` body-hash proof claim (Section 7.1) is a ZeroID extension with no RFC
+  or IETF draft of its own. For the standards-track approach to request-body
+  integrity, see the related work below.
+  - RFC 9421 — HTTP Message Signatures (application-layer request integrity,
+  including the body when a `Content-Digest` is signed).
+  - RFC 9530 — Digest Fields (`Content-Digest`).
+- OpenID Foundation, *Identity Management for Agentic AI* (Oct 2025).
+- Companion guides in this repository: `docs/dpop-and-dcr.md`, `docs/rar.md`,
+  `docs/attestation.md`, `docs/vs_entra_agentidentity.md`.
+
+---
+
+*This specification documents the ZeroID's Agent Identity implementation maintained by
+[Highflame](https://highflame.ai) at https://github.com/highflame-ai/zeroid*

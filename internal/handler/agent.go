@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,15 +18,39 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
+// approvalChannelWriteError maps a write refused for lacking a trusted
+// approval-channel context to 403, or returns nil for any other error.
+func approvalChannelWriteError(err error) error {
+	if errors.Is(err, service.ErrApprovalChannelWriteNotTrusted) {
+		return huma.Error403Forbidden(err.Error())
+	}
+	return nil
+}
+
 // mapErr converts service-layer errors to huma errors with proper HTTP status codes.
 // Internal details are logged server-side; only generic messages are returned to clients.
 func mapErr(err error) error {
 	if err == nil {
 		return nil
 	}
+	if herr := approvalChannelWriteError(err); herr != nil {
+		return herr
+	}
 	// Typed sentinels first. Service-layer callers wrap with these so
 	// callers see a 400 instead of a 500 on caller-fixable states.
 	if errors.Is(err, domain.ErrIdentityExpired) || errors.Is(err, domain.ErrIdentityNotUsable) {
+		return huma.Error400BadRequest(err.Error())
+	}
+	// Malformed owner/account on the owner-scoped destructive paths: a 400
+	// tells the SCIM outbox worker the event is a data bug to surface, not a
+	// transient fault to retry forever.
+	if errors.Is(err, service.ErrInvalidOwnerArgument) {
+		return huma.Error400BadRequest(err.Error())
+	}
+	// Caller-fixable field validation (e.g. a non-P-256 public_key_pem on
+	// PATCH /agents/registry/{id}). Checked before the substring fallbacks so a
+	// reason that happens to contain "not found" cannot turn it into a 404.
+	if errors.Is(err, service.ErrInvalidIdentityField) {
 		return huma.Error400BadRequest(err.Error())
 	}
 	msg := err.Error()
@@ -49,7 +74,7 @@ type RegisterAgentInput struct {
 		Name                     string          `json:"name" required:"true" minLength:"1" doc:"Human-readable name"`
 		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
-		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Operational role"`
+		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Operational role. approval_channel (identity_type service only) marks a CIBA approval channel."`
 		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
 		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
@@ -58,7 +83,7 @@ type RegisterAgentInput struct {
 		Capabilities             json.RawMessage `json:"capabilities,omitempty" doc:"JSON array of capabilities"`
 		Labels                   json.RawMessage `json:"labels,omitempty" doc:"JSON object of key-value labels"`
 		Metadata                 json.RawMessage `json:"metadata,omitempty" doc:"JSON object of opaque product-specific metadata"`
-		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"OAuth scopes this identity may request. Required for token_exchange since the exchange only grants scopes in the intersection of the subject's granted scopes and the actor's allowed_scopes."`
+		AllowedScopes            []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
 		CreatedBy                string          `json:"created_by,omitempty" doc:"User ID of the creator"`
 		PublicKeyPEM             string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 public key for JWT bearer and token_exchange grants"`
 		CredentialPolicyID       string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Also applied to the auto-created API key unless api_key_credential_policy_id is set. Defaults to the tenant default policy."`
@@ -86,6 +111,14 @@ type GetAgentOutput struct {
 
 // splitCSV expands comma-separated values in a []string slice so callers can
 // use either ?status=a,b or ?status=a&status=b.
+//
+// This only holds if the query tag carries `explode`. huma disables explode by
+// default for query params, and its non-explode slice path reads
+// strings.Split(ctx.Query(name), ",") — ctx.Query returns the FIRST occurrence
+// only, so a repeated ?status=a&status=b silently binds to just ["a"] before
+// this function ever sees it. Every multi-value filter below is therefore
+// tagged `,explode`, which makes huma collect all occurrences and leaves the
+// comma form to splitCSV. Both spellings then reach the repo intact.
 func splitCSV(vals []string) []string {
 	var out []string
 	for _, v := range vals {
@@ -101,15 +134,15 @@ func splitCSV(vals []string) []string {
 
 type ListAgentsInput struct {
 	AgentType      string   `query:"agent_type" doc:"Filter by agent type"`
-	IdentityType   []string `query:"identity_type" doc:"Filter by identity type. Comma-separated for multiple (e.g. agent,application)."`
+	IdentityType   []string `query:"identity_type,explode" doc:"Filter by identity type. Repeat or comma-separate for multiple (e.g. agent,application)."`
 	Label          string   `query:"label" doc:"Filter by label (key:value, e.g. product:guardrails)"`
-	TrustLevel     []string `query:"trust_level" doc:"Filter by trust level. Comma-separated for multiple."`
+	TrustLevel     []string `query:"trust_level,explode" doc:"Filter by trust level. Repeat or comma-separate for multiple."`
 	IsActive       string   `query:"is_active" doc:"Filter by active status"`
 	Search         string   `query:"search" doc:"Search by name or external_id"`
 	Metadata       string   `query:"metadata" doc:"Filter by metadata: \"key\" (key present) or \"key:value\" (containment), e.g. redteam_target"`
 	IdentityClass  string   `query:"identity_class" doc:"Filter by identity class: \"custom\" (user-created) or \"code_agent\" (auto-registered by hooks)"`
 	Origin         string   `query:"origin" doc:"Filter by provenance: an exact ecosystem (e.g. okta) or \"external\" for any discovered (non-native) identity"`
-	Status         []string `query:"status" doc:"Filter by lifecycle status. Comma-separated for multiple."`
+	Status         []string `query:"status,explode" doc:"Filter by lifecycle status. Repeat or comma-separate for multiple."`
 	OwnerUserID    string   `query:"owner_user_id" doc:"Filter by owner user ID"`
 	Ownerless      string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
 	Limit          int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
@@ -144,7 +177,7 @@ type UpdateAgentInput struct {
 		// possession — the admin recovery path. This route is secret-gated
 		// (management API), so admin authority is the authorization. Agents
 		// rotate their own key via POST /agents/self/public-key with proofs.
-		PublicKeyPEM *string `json:"public_key_pem,omitempty" doc:"Force-set the agent's actor-assertion public key (admin recovery; no proof-of-possession)."`
+		PublicKeyPEM *string `json:"public_key_pem,omitempty" doc:"Force-set the agent's actor-assertion public key, a PEM-encoded EC P-256 (ES256) SPKI key (admin recovery; no proof-of-possession). Empty leaves the key unchanged."`
 	}
 }
 
@@ -268,13 +301,71 @@ type SetOwnPublicKeyOutput struct {
 	Body *service.AgentResponse
 }
 
+// selfKeyGrantTypes are the grants that issue an agent a token for itself.
+// Every other token is refused: exchanged and CIBA tokens are held for a
+// delegation chain; proof tokens carry no grant_type and are meant for the
+// third party named in their audience; person grants act for a human.
+var selfKeyGrantTypes = map[string]bool{
+	string(domain.GrantTypeAPIKey):            true,
+	string(domain.GrantTypeClientCredentials): true,
+	string(domain.GrantTypeJWTBearer):         true,
+}
+
+// selfKeyTokenRefusal returns why a token may not set its agent's key, or ""
+// when it may. Setting a first key is trust-on-first-use, authorized by the
+// token alone, so only the agent's own credential qualifies.
+func selfKeyTokenRefusal(c internalMiddleware.AgentClaims) string {
+	if !selfKeyGrantTypes[c.GrantType] {
+		return "key enrollment needs the agent's own token (api_key, client_credentials or jwt-bearer)"
+	}
+	// jwt_bearer also redeems an IdP's ID-JAG, which acts for a person.
+	if c.PrincipalType == "user" || c.UserIDIssuer != "" {
+		return "key enrollment needs the agent's own token, not one acting for a person"
+	}
+	// A token minted from a federated client assertion is held by whatever
+	// runs the agent's credential provider, for an agent meant to hold no
+	// secret (ADR 0042 D8). It must not become a durable key either.
+	if c.ClientAuth == service.ClientAuthFederatedAssertion {
+		return "key enrollment needs the agent's own token, not one minted from a federated client assertion"
+	}
+	// A token bound to another audience (a gateway, an RFC 8707 resource) is
+	// held by that audience too. It must not become a durable key: whoever
+	// holds it could otherwise enroll one on an agent that has none.
+	if !slices.Contains(c.Audience, c.Issuer) {
+		return "key enrollment needs a token whose audience is this issuer, not one bound to another audience"
+	}
+	return ""
+}
+
 // setOwnPublicKeyOp enrolls or rotates the actor-assertion public key for the
 // authenticated agent identity (self-service). Identity + tenant come from the
 // agent's own access-token claims (AgentAuthMiddleware), never from caller input.
 func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput) (*SetOwnPublicKeyOutput, error) {
 	claims, ok := internalMiddleware.GetAgentClaims(ctx)
-	if !ok || claims.IdentityID == "" {
+	if !ok || claims.Subject == "" {
 		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+	if reason := selfKeyTokenRefusal(claims); reason != "" {
+		return nil, huma.Error403Forbidden(reason)
+	}
+
+	// The token must still be live: a revoked token could otherwise bind a
+	// key that outlives the revocation.
+	if _, active, err := a.credSvc.IntrospectToken(ctx, claims.JTI); err != nil || !active {
+		return nil, huma.Error401Unauthorized("missing or invalid agent token")
+	}
+
+	// The agent is the token's subject (the current actor under the rfc8693
+	// profile), looked up in the token's tenant. ZeroID sets no identity_id
+	// claim, and reserves it so a caller cannot supply one. A token whose
+	// subject is not a registered identity, such as one issued to a person,
+	// finds nothing.
+	identity, err := a.identitySvc.GetIdentityByWIMSEURI(ctx, claims.Subject, claims.AccountID, claims.ProjectID)
+	if err != nil {
+		if errors.Is(err, service.ErrIdentityNotFound) {
+			return nil, huma.Error401Unauthorized("missing or invalid agent token")
+		}
+		return nil, mapErr(err)
 	}
 
 	// Attribute the key change to the agent itself in the audit trail (this
@@ -282,7 +373,7 @@ func (a *API) setOwnPublicKeyOp(ctx context.Context, input *SetOwnPublicKeyInput
 	// unset).
 	ctx = internalMiddleware.SetCallerName(ctx, claims.Subject)
 
-	resp, err := a.agentSvc.SetPublicKey(ctx, claims.IdentityID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
+	resp, err := a.agentSvc.SetPublicKey(ctx, identity.ID, claims.AccountID, claims.ProjectID, service.SetPublicKeyRequest{
 		NewPublicKeyPEM: input.Body.NewPublicKeyPEM,
 		NewKeyProof:     input.Body.NewKeyProof,
 		CurrentKeyProof: input.Body.CurrentKeyProof,
@@ -337,6 +428,9 @@ func (a *API) registerAgentOp(ctx context.Context, input *RegisterAgentInput) (*
 		ExpiresAt:                input.Body.ExpiresAt,
 	})
 	if err != nil {
+		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
 		// A collision with a soft-deleted identity is actionable — surface the
 		// existing id so the caller can reactivate it instead of being stuck
 		// behind an opaque 409 for a row hidden from the active registry view.

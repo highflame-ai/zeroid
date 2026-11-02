@@ -3,12 +3,15 @@ package service
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,8 +25,8 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
-// ErrInvalidIdentityField marks caller-fixable input errors on registration
-// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+// ErrInvalidIdentityField marks caller-fixable input errors on identity writes
+// (SPIFFE path segments, enums, public_key_pem). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
 
 // ErrIdentityNotFound is returned by lookup methods when no identity matches
@@ -70,28 +73,49 @@ func NewIdentityService(
 	}
 }
 
+// invalidPublicKeyPEM is the caller-facing prefix for every public_key_pem
+// rejection; the specific reason follows it.
+const invalidPublicKeyPEM = "invalid public_key_pem: must be a PEM-encoded P-256 (ES256) public key"
+
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
-// Returns nil if keyPEM is empty (the field is optional).
+// Returns nil if keyPEM is empty (the field is optional). Every rejection wraps
+// ErrInvalidIdentityField so handlers answer 400, not 500.
 func validateECPublicKeyPEM(keyPEM string) error {
 	if keyPEM == "" {
 		return nil
 	}
 	block, _ := pem.Decode([]byte(keyPEM))
-	if block == nil || block.Type != "PUBLIC KEY" {
-		return errors.New("invalid public_key_pem: must be a PEM block of type PUBLIC KEY")
+	if block == nil {
+		return fmt.Errorf("%w: %s: no PEM block found", ErrInvalidIdentityField, invalidPublicKeyPEM)
+	}
+	if block.Type != "PUBLIC KEY" {
+		return fmt.Errorf("%w: %s: PEM block type is %q, want \"PUBLIC KEY\"", ErrInvalidIdentityField, invalidPublicKeyPEM, block.Type)
 	}
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("invalid public_key_pem: %w", err)
+		// The asn1 detail is noise to a caller; the shape that failed is not.
+		return fmt.Errorf("%w: %s: PEM body is not a DER-encoded SPKI public key", ErrInvalidIdentityField, invalidPublicKeyPEM)
 	}
 	ecKey, ok := pub.(*ecdsa.PublicKey)
 	if !ok {
-		return errors.New("invalid public_key_pem: not an ECDSA key")
+		return fmt.Errorf("%w: %s: key type is %s, want ECDSA", ErrInvalidIdentityField, invalidPublicKeyPEM, publicKeyKind(pub))
 	}
 	if ecKey.Curve.Params().Name != "P-256" {
-		return fmt.Errorf("invalid public_key_pem: must use P-256 curve, got %s", ecKey.Curve.Params().Name)
+		return fmt.Errorf("%w: %s: curve is %s, want P-256", ErrInvalidIdentityField, invalidPublicKeyPEM, ecKey.Curve.Params().Name)
 	}
 	return nil
+}
+
+// publicKeyKind names a parsed non-ECDSA public key for an error message.
+func publicKeyKind(pub any) string {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return "RSA"
+	case ed25519.PublicKey:
+		return "Ed25519"
+	default:
+		return fmt.Sprintf("%T", pub)
+	}
 }
 
 // RegisterIdentityRequest holds parameters for identity registration.
@@ -114,7 +138,7 @@ type RegisterIdentityRequest struct {
 	// native identities.
 	SourceID      string
 	OwnerUserID   string
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	PublicKeyPEM  string
 	Framework     string
 	Version       string
@@ -148,6 +172,13 @@ type RegisterIdentityRequest struct {
 // is adopted (identity-lifecycle.md). The discovery service reaches this path
 // through UpsertDiscoveredIdentity (idempotent on external_id), not directly.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.policySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	if req.Origin == "" {
 		req.Origin = domain.OriginNative
 	}
@@ -254,20 +285,23 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
 		PublicKeyPEM:       req.PublicKeyPEM,
-		Framework:          req.Framework,
-		Version:            req.Version,
-		Publisher:          req.Publisher,
-		Description:        req.Description,
-		Capabilities:       req.Capabilities,
-		Labels:             req.Labels,
-		Metadata:           req.Metadata,
-		CapabilityTier:     req.CapabilityTier,
-		RiskTier:           req.RiskTier,
-		IAL:                req.IAL,
-		ExpiresAt:          req.ExpiresAt,
-		CreatedBy:          req.CreatedBy,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		// The register gate above already refused an untrusted approval
+		// channel, so only the mark itself is recorded here.
+		PublicKeyChannelTrusted: req.PublicKeyPEM != "" && TrustedApprovalChannelWrite(ctx),
+		Framework:               req.Framework,
+		Version:                 req.Version,
+		Publisher:               req.Publisher,
+		Description:             req.Description,
+		Capabilities:            req.Capabilities,
+		Labels:                  req.Labels,
+		Metadata:                req.Metadata,
+		CapabilityTier:          req.CapabilityTier,
+		RiskTier:                req.RiskTier,
+		IAL:                     req.IAL,
+		ExpiresAt:               req.ExpiresAt,
+		CreatedBy:               req.CreatedBy,
+		CreatedAt:               time.Now(),
+		UpdatedAt:               time.Now(),
 	}
 
 	if err := s.repo.Create(ctx, identity); err != nil {
@@ -310,14 +344,23 @@ type DiscoveredIdentityRequest struct {
 	SubType      domain.SubType
 	TrustLevel   domain.TrustLevel
 	OwnerUserID  string // optional
-	Framework    string
-	Version      string
-	Publisher    string
-	Description  string
-	Capabilities json.RawMessage
-	Labels       json.RawMessage
-	Metadata     json.RawMessage
-	CreatedBy    string
+	// OwnerResolved attests that the connector DEFINITIVELY computed owner
+	// attribution this sync (CAP-DSC-004): it verified the IdP-asserted owner
+	// against the tenant human directory and OwnerUserID/TrustLevel carry the
+	// result — including an empty owner (verification failed or the agent is
+	// ownerless). Only with this attestation does a reconcile apply owner and
+	// trust to a still-discovered row, declaratively; without it (default, and
+	// whenever the directory was unreachable) the prior attribution is
+	// preserved, so a resolve outage never flaps verification state.
+	OwnerResolved bool
+	Framework     string
+	Version       string
+	Publisher     string
+	Description   string
+	Capabilities  json.RawMessage
+	Labels        json.RawMessage
+	Metadata      json.RawMessage
+	CreatedBy     string
 }
 
 // UpsertDiscoveredIdentity idempotently ingests an identity observed in an
@@ -336,6 +379,10 @@ type DiscoveredIdentityRequest struct {
 //
 // Returns the resulting identity and whether it was newly created.
 func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, nil); err != nil {
+		return nil, false, err
+	}
 	if !req.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
 	}
@@ -344,6 +391,19 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	// first create.
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
+	}
+	// The discovery path can only carry trust it can EARN: unverified or
+	// verified_third_party (directory verification, CAP-DSC-004). first_party
+	// is reserved for natively-registered identities, and anything else is a
+	// caller bug that must not be written — this guard is the single entry
+	// point for both the create and reconcile paths, so the attested
+	// declarative apply downstream never sees an unvalidated value.
+	switch req.TrustLevel {
+	case "", domain.TrustLevelUnverified, domain.TrustLevelVerifiedThirdParty:
+	case domain.TrustLevelFirstParty:
+		return nil, false, fmt.Errorf("%w: a discovered identity cannot be first_party", ErrInvalidIdentityField)
+	default:
+		return nil, false, fmt.Errorf("%w: invalid trust_level for a discovered identity: %q", ErrInvalidIdentityField, req.TrustLevel)
 	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
@@ -393,10 +453,40 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	return identity, true, nil
 }
 
+// applyDiscoveredOwnerAttribution applies a connector's verified owner
+// attribution (CAP-DSC-004) to a still-discovered row. Declarative on
+// purpose: with the OwnerResolved attestation, OwnerUserID and TrustLevel are
+// the definitive result of directory verification — including an empty owner
+// (verification failed, or the agent is ownerless) — and an empty trust level
+// normalizes to unverified so a cleared verification can never leave a stale
+// verified_third_party behind. Rows past `discovered` (adoption assigned the
+// accountable human) and requests without the attestation (resolve outage)
+// are untouched.
+func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredIdentityRequest) {
+	if !req.OwnerResolved || identity.Status != domain.IdentityStatusDiscovered {
+		return
+	}
+
+	identity.OwnerUserID = req.OwnerUserID
+
+	identity.TrustLevel = req.TrustLevel
+	if identity.TrustLevel == "" {
+		identity.TrustLevel = domain.TrustLevelUnverified
+	}
+}
+
 // reconcileDiscovered refreshes the connector-sourced descriptive fields on an
 // existing row without touching lifecycle, ownership, policy, or origin. Only
 // non-empty inputs overwrite, so a connector that omits a field leaves the
 // curated value intact. Returns (identity, created=false).
+//
+// One deliberate exception (CAP-DSC-004): when the request carries the
+// OwnerResolved attestation AND the row is still in the `discovered` state,
+// owner_user_id and trust_level are applied DECLARATIVELY — including clearing
+// them — because pre-adoption those fields are connector-owned (the verified
+// link to the tenant directory). The instant a row leaves `discovered`
+// (adoption assigns the accountable human), connector syncs stop touching
+// ownership and trust entirely.
 //
 // A native-origin row that happens to share this external_id is a genuine
 // collision, not the same agent: discovery must never mutate a natively-managed
@@ -407,6 +497,22 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
 	}
+	// Discovery never modifies an approval channel: its configuration
+	// (metadata included) is managed only through trusted writes. The row is
+	// returned unchanged.
+	channel, err := s.IsApprovalChannel(ctx, identity)
+	if err != nil {
+		return nil, false, err
+	}
+	if channel {
+		log.Info().
+			Str("identity_id", identity.ID).
+			Str("external_id", identity.ExternalID).
+			Str("origin", string(req.Origin)).
+			Msg("discovery reconcile skipped an approval-channel identity")
+		return identity, false, nil
+	}
+	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
 	// ingested manually first, then a connector picked it up). Never overwrite a
 	// non-empty source_id, so one connector can't claim another's row.
@@ -550,9 +656,112 @@ func (s *IdentityService) PruneStaleDiscovered(ctx context.Context, accountID, p
 	return n, nil
 }
 
+// ReleaseDiscoveredSource unclaims every still-`discovered` identity belonging
+// to one discovery source, so a future connector can adopt them. Returns the
+// number released.
+//
+// Called when a connector is DELETED. Reconcile only ever adopts a source_id
+// onto a row that has none (so a live connector can't claim another live
+// connector's rows), which means a deleted connector's rows stay bound to it
+// forever — it never syncs again, and prune is scoped to a single source_id, so
+// no sweep can reach them. They would sit as `discovered` indefinitely, reading
+// as live inventory. Releasing the claim restores them to the adoptable state
+// they had before that connector first saw them.
+//
+// Deliberately NOT a deactivation: these rows are a human's pending
+// adopt/dismiss queue, and a connector being replaced is not a decision about
+// the agents it found. Rows whose agent is genuinely gone from the source stay
+// `discovered` with no owner until dismissed by hand — the same as any other
+// discovered row nobody acts on.
+//
+// Scoped like prune: origin and sourceID are both required, so a release can
+// never unclaim a whole tenant's inventory.
+func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: release requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	// Shape-check too: IsExternal only rejects "" and "native", so a malformed
+	// value like "Okta" would reach the WHERE clause, match nothing, and return
+	// released=0 — indistinguishable from "there was nothing to release". Reject
+	// it instead, so a caller with a typo'd origin learns that rather than
+	// believing the release succeeded.
+	if !domain.ValidOrigin(string(origin)) {
+		return 0, fmt.Errorf("%w: invalid origin %q: must be a lowercase ecosystem identifier (e.g. okta, entra)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: release requires a source_id (a release is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_release_source")
+	n, err := s.repo.ReleaseDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("release discovered source: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery release: unclaimed discovered identities from a deleted source")
+	}
+	return n, nil
+}
+
+// PurgeDiscoveredSource removes every still-`discovered` identity found by one
+// discovery source. Returns the number removed.
+//
+// Called when a connector is DELETED: the agents it found are inventory
+// belonging to that connection, so removing the connection removes them
+// (highflame-discovery#65) — no stale agents left visible, and nothing left for
+// a user to act on.
+//
+// Only `discovered` rows. Anything a human has acted on — `pending` (an owner
+// was assigned), `active`, `suspended` — has graduated past inventory and is
+// deliberately left alone: retiring a real identity is an identity-lifecycle
+// decision, not a side effect of removing a connector.
+//
+// A delete rather than a deactivation, because `deactivated` is terminal
+// (CanTransitionTo permits only →active) and reconcile never touches lifecycle.
+// Deactivating would make the agents invisible forever, including after the
+// same connector is re-added — the rediscovery would reconcile onto the dead
+// row and leave it dead. Deleting lets a re-added connector rebuild the
+// inventory. The audit trigger records the deletion, so the history survives
+// the row.
+//
+// Scoped like prune and release: origin and sourceID are both required, so a
+// purge can never sweep a whole tenant's inventory.
+func (s *IdentityService) PurgeDiscoveredSource(ctx context.Context, accountID, projectID string, origin domain.Origin, sourceID string) (int, error) {
+	if !origin.IsExternal() {
+		return 0, fmt.Errorf("%w: purge requires an external origin (got %q)", ErrInvalidIdentityField, origin)
+	}
+	if !domain.ValidOrigin(string(origin)) {
+		return 0, fmt.Errorf("%w: invalid origin %q: must be a lowercase ecosystem identifier (e.g. okta, entra)", ErrInvalidIdentityField, origin)
+	}
+	if sourceID == "" {
+		return 0, fmt.Errorf("%w: purge requires a source_id (a purge is always scoped to one discovery source)", ErrInvalidIdentityField)
+	}
+	// This caller name is what attributes the removal in the audit log. The audit
+	// trigger reads OLD.modified_by on DELETE, so the store stamps it onto the
+	// matched rows immediately before deleting them; without it the audit entry
+	// would credit whoever last touched each identity rather than the purge.
+	ctx = middleware.SetCallerName(ctx, middleware.SystemCallerPrefix+"discovery_purge_source")
+	n, err := s.repo.PurgeDiscoveredSource(ctx, accountID, projectID, string(origin), sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("purge discovered source: %w", err)
+	}
+	if n > 0 {
+		log.Info().Int("count", n).Str("origin", string(origin)).Str("source_id", sourceID).
+			Msg("discovery purge: removed discovered identities of a deleted source")
+	}
+	return n, nil
+}
+
 // GetIdentity retrieves an identity by ID.
 func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
 	return s.repo.GetByID(ctx, id, accountID, projectID)
+}
+
+// GetIdentitiesByIDs returns the identities among ids that live in the given
+// tenant. Ids that are missing or belong to another tenant are dropped, so a
+// caller can use the result as a tenant-membership check for a batch of ids.
+func (s *IdentityService) GetIdentitiesByIDs(ctx context.Context, ids []string, accountID, projectID string) ([]*domain.Identity, error) {
+	return s.repo.GetByIDs(ctx, ids, accountID, projectID)
 }
 
 // SetPublicKey replaces the identity's EC actor-assertion public key (the key
@@ -565,13 +774,17 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 // identity.
 func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, projectID, publicKeyPEM string) (*domain.Identity, error) {
 	if err := validateECPublicKeyPEM(publicKeyPEM); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidIdentityField, err)
+		return nil, err
 	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
 	identity.PublicKeyPEM = publicKeyPEM
+	identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -670,6 +883,20 @@ type UpdateIdentityRequest struct {
 
 // UpdateIdentity updates mutable fields of an existing identity.
 func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, projectID string, req UpdateIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if req.CredentialPolicyID != nil {
+		if err := requireTrustedPolicyAttachment(ctx, s.policySvc, *req.CredentialPolicyID, accountID, projectID); err != nil {
+			return nil, err
+		}
+	}
+	// Input-only check, so it runs before the row is read. Empty means "leave
+	// the key unchanged" — this path cannot clear an enrolled key.
+	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		return nil, err
+	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
@@ -705,10 +932,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.AllowedScopes = req.AllowedScopes
 	}
 	if req.PublicKeyPEM != "" {
-		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
 			return nil, err
 		}
 		identity.PublicKeyPEM = req.PublicKeyPEM
+		identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	}
 	if req.Framework != nil {
 		identity.Framework = *req.Framework
@@ -753,6 +981,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) &&
 			identity.OwnerUserID == "" {
 			return nil, fmt.Errorf("%w: adopting a discovered identity requires an owner_user_id", ErrInvalidIdentityField)
+		}
+		if priorStatus == domain.IdentityStatusDiscovered &&
+			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) {
+			now := time.Now()
+			identity.AdoptedAt = &now
 		}
 		identity.Status = *req.Status
 	}
@@ -973,6 +1206,130 @@ func (s *IdentityService) DeactivateIdentity(ctx context.Context, id, accountID,
 	return updated, nil
 }
 
+// OffboardResult reports what an owner offboarding actually did, so the caller
+// (admin's SCIM outbox worker) can log evidence and decide whether to retry.
+type OffboardResult struct {
+	// IdentitiesDeactivated counts identities the loop successfully drove to
+	// deactivated. The list excludes already-deactivated rows, so this is the
+	// fresh count in practice; a row deactivated concurrently between list and
+	// loop is still counted (DeactivateIdentity no-ops idempotently). This is
+	// the field the SCIM worker should key evidence and zero-alerts on.
+	IdentitiesDeactivated int
+	// FailedIdentityIDs lists identities whose deactivation errored. Non-empty
+	// means the offboarding is INCOMPLETE and the caller must retry (the whole
+	// operation is idempotent).
+	FailedIdentityIDs []string
+	// CredentialsRevoked is the count from the FINAL owner-scoped cascade
+	// (revoke_credentials_by_owner) only. Expect it to be ~0 on a healthy run:
+	// each identity's deactivation cleanup already cascade-revokes that
+	// identity's credentials AND their delegated descendants
+	// (revoke_credentials_cascade, migration 031), so the final sweep usually
+	// finds nothing left. A non-zero value here means the sweep caught
+	// stragglers — descendants of identities that failed to deactivate, or
+	// credentials issued mid-loop. Do NOT alert on this being zero.
+	CredentialsRevoked int64
+}
+
+// OffboardOwner is the human-offboarding composition (INV-IDN-010 / ADR 0028
+// D5): when the org IdP deactivates a person, every agent identity they own in
+// the account — across all projects — is deactivated, and the owner-scoped
+// credential cascade sweeps anything delegation reached beyond them.
+//
+// Order matters and both halves are required:
+//
+//  1. Deactivate each owned identity via the shared DeactivateIdentity path
+//     (sweeps linked API keys, cascade-revokes that identity's credentials,
+//     emits the retirement CAE signal). Credential revocation alone would be
+//     cosmetic — a surviving zid_sk_* service key just re-exchanges for a
+//     fresh token via the api_key grant.
+//  2. RevokeAllActiveForOwner — the single-statement atomic sweep that also
+//     catches delegated descendants owned by other humans (parent_jti chain)
+//     and any credential issued while step 1 was looping.
+//
+// Failure semantics are retry-oriented, not fail-fast: a per-identity
+// deactivation error is recorded and the loop continues, and the credential
+// cascade runs regardless, so one bad row cannot shield the rest of the fleet.
+// A non-nil error alongside a non-nil result means "partially applied, retry
+// me" — every step is idempotent (already-deactivated identities no-op,
+// already-revoked credentials emit no duplicate revocation events).
+//
+// Re-activation is deliberately NOT offered here: a SCIM active:true after an
+// offboarding restores org membership only (ADR 0028 D6); agents are never
+// silently resurrected.
+func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accountID, reason string) (*OffboardResult, error) {
+	// Trim-aware, not just non-empty: " " passes a == "" check, matches NO row
+	// (ownerless identities store "", and Postgres VARCHAR equality is exact),
+	// and would turn the offboarding into a silent 200 no-op — the SCIM worker
+	// records success while the departing human's fleet keeps running. A
+	// padded owner (e.g. "alice ") likewise matches nothing stored as "alice".
+	// Both are malformed events that must fail loudly (ErrInvalidOwnerArgument
+	// → 400), not read as healthy.
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(ownerUserID) != ownerUserID ||
+		strings.TrimSpace(accountID) == "" || strings.TrimSpace(accountID) != accountID {
+		return nil, fmt.Errorf(
+			"%w: OffboardOwner requires trimmed, non-empty owner_user_id and account_id (got owner=%q account=%q): "+
+				"an empty owner matches every ownerless identity in the account, and a padded one silently matches nothing",
+			ErrInvalidOwnerArgument, ownerUserID, accountID)
+	}
+
+	if reason == "" {
+		reason = "owner_deactivated"
+	}
+
+	identities, err := s.repo.ListByOwnerForOffboard(ctx, ownerUserID, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &OffboardResult{}
+	for _, identity := range identities {
+		// A canceled caller must not burn one error log + one failure append
+		// per remaining identity on a large fleet; stop and report partial so
+		// the worker retries.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+
+			return result, fmt.Errorf("offboard interrupted after %d deactivations: %w", result.IdentitiesDeactivated, ctxErr)
+		}
+
+		if _, err := s.DeactivateIdentity(ctx, identity.ID, identity.AccountID, identity.ProjectID); err != nil {
+			log.Error().Err(err).
+				Str("identity_id", identity.ID).
+				Str("owner_user_id", ownerUserID).
+				Str("account_id", accountID).
+				Msg("offboard: failed to deactivate owned identity")
+			result.FailedIdentityIDs = append(result.FailedIdentityIDs, identity.ID)
+			continue
+		}
+		result.IdentitiesDeactivated++
+	}
+
+	// The owner-scoped cascade runs even when some deactivations failed — it
+	// does not depend on identity status and every credential it can reach
+	// must die on this call, not on the retry.
+	revoked, err := s.credentialSvc.RevokeAllActiveForOwner(ctx, ownerUserID, accountID, reason)
+	if err != nil {
+		return result, fmt.Errorf("offboard: owner-scoped credential cascade failed (deactivated %d identities first): %w",
+			result.IdentitiesDeactivated, err)
+	}
+	result.CredentialsRevoked = revoked
+
+	if len(result.FailedIdentityIDs) > 0 {
+		return result, fmt.Errorf("offboard incomplete: %d of %d identities failed to deactivate — retry (idempotent)",
+			len(result.FailedIdentityIDs), len(identities))
+	}
+
+	log.Info().
+		Str("owner_user_id", ownerUserID).
+		Str("account_id", accountID).
+		Str("reason", reason).
+		Int("identities_deactivated", result.IdentitiesDeactivated).
+		Int64("credentials_revoked", result.CredentialsRevoked).
+		Msg("offboard: owner offboarding complete")
+
+	return result, nil
+}
+
 // ExpireIdentity transitions an active identity to expired. It runs the same
 // cleanup cascade as deactivation (revoke keys, credentials, emit CAE signal).
 func (s *IdentityService) ExpireIdentity(ctx context.Context, id, accountID, projectID string) (*domain.Identity, error) {
@@ -1055,6 +1412,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		identity.Status = domain.IdentityStatusDiscovered
 		identity.OwnerUserID = ""
 		identity.CredentialPolicyID = defaultPolicyID
+		identity.AdoptedAt = nil
 		identity.UpdatedAt = time.Now()
 		if err := s.repo.Update(ctx, identity); err != nil {
 			return nil, err
@@ -1074,7 +1432,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 // CAE signal payload so subscribers can distinguish "deactivated" from
 // "deleted" cleanups.
 func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID); err != nil {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID, revocationActor(ctx, "identity_revocation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Msg("identity cleanup: failed to revoke linked API keys")
 	}

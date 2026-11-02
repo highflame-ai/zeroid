@@ -39,6 +39,41 @@ var (
 	IdentityOps        metric.Int64Counter
 	PolicyEnforcements metric.Int64Counter
 	AuthErrors         metric.Int64Counter
+	// WorkloadUnboundedScope counts tokens issued for a named scope with no
+	// configured ceiling: a workload subject whose every scope ceiling was
+	// empty, or a user-subject root bounded only by the caller's request.
+	// Exported to Prometheus as zeroid_workload_unbounded_scope_total. The
+	// ceiling rule (human-rooted delegation P1) counts in phase 1 and refuses
+	// in phase 2, so this lists the identities enforcement will affect.
+	WorkloadUnboundedScope metric.Int64Counter
+
+	// CIBAApproverWouldDeny counts CIBA approve/deny calls allowed under
+	// backchannel.enforce_hints=shadow that enforce_hints=on would refuse.
+	// Attribute: reason (low-cardinality refusal code).
+	CIBAApproverWouldDeny metric.Int64Counter
+
+	// PersonScopeCeiling counts person mints whose scopes the deployer's
+	// person-grant ceiling narrowed or refused, or whose resolver failed.
+	// Attributes: mode (shadow/enforce), outcome (narrowed/denied/
+	// resolver_error), grant_type, account_id, project_id. Exported to
+	// Prometheus as zeroid_person_scope_ceiling_total.
+	PersonScopeCeiling metric.Int64Counter
+
+	// FederationUnmatchedAgent counts federated person grants refused
+	// because no enabled credential binding maps the agent, or the presenting
+	// client is registered to a different identity (ADR 0042 D6, ADR 0027).
+	// Attributes: account_id, grant_type, reason.
+	FederationUnmatchedAgent metric.Int64Counter
+
+	// FederationAgentNotAdopted counts federated grants refused because the
+	// bound agent is not active (ADR 0042 D7): the adoption queue's demand.
+	// Attributes: account_id, grant_type, status.
+	FederationAgentNotAdopted metric.Int64Counter
+
+	// FederationIssuerRefused counts person grants whose token issuer was
+	// unknown, a workload issuer, disabled, or matched no single row. The
+	// wire answer is one generic invalid_grant. Attribute: reason.
+	FederationIssuerRefused metric.Int64Counter
 )
 
 func init() {
@@ -48,21 +83,46 @@ func init() {
 func initNoOpMetrics() {
 	Tracer = otel.Tracer("zeroid")
 	Meter = otel.Meter("zeroid")
+	registerInstruments(Meter)
+}
 
-	TokenIssuances, _ = Meter.Int64Counter("zeroid.token.issuances",
+// registerInstruments creates every instrument on m. It is the one place an
+// instrument is declared, called for the no-op defaults and again by Init with
+// the real meter, so a new instrument cannot be registered in one and silently
+// stay a no-op because it was missed in the other.
+func registerInstruments(m metric.Meter) {
+	TokenIssuances, _ = m.Int64Counter("zeroid.token.issuances",
 		metric.WithDescription("Total token issuances"),
 	)
-	TokenLatency, _ = Meter.Float64Histogram("zeroid.token.latency_ms",
+	TokenLatency, _ = m.Float64Histogram("zeroid.token.latency_ms",
 		metric.WithDescription("Token issuance latency in milliseconds"),
 	)
-	IdentityOps, _ = Meter.Int64Counter("zeroid.identity.operations",
+	IdentityOps, _ = m.Int64Counter("zeroid.identity.operations",
 		metric.WithDescription("Identity CRUD operations"),
 	)
-	PolicyEnforcements, _ = Meter.Int64Counter("zeroid.policy.enforcements",
+	PolicyEnforcements, _ = m.Int64Counter("zeroid.policy.enforcements",
 		metric.WithDescription("Credential policy enforcement decisions"),
 	)
-	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
+	AuthErrors, _ = m.Int64Counter("zeroid.errors",
 		metric.WithDescription("Authentication errors"),
+	)
+	WorkloadUnboundedScope, _ = m.Int64Counter("zeroid.workload.unbounded_scope",
+		metric.WithDescription("Tokens issued for a named scope with no configured scope ceiling (ceiling rule, counted before it is enforced)"),
+	)
+	CIBAApproverWouldDeny, _ = m.Int64Counter("ciba_approver_would_deny_total",
+		metric.WithDescription("CIBA approver checks that would deny under enforce_hints=on (shadow mode)"),
+	)
+	PersonScopeCeiling, _ = m.Int64Counter("zeroid.person.scope_ceiling",
+		metric.WithDescription("Person mints the person-grant ceiling narrowed or refused (counted in shadow and enforce), or whose resolver failed"),
+	)
+	FederationUnmatchedAgent, _ = m.Int64Counter("zeroid.federation.unmatched_agent",
+		metric.WithDescription("Federated grants refused because no enabled binding maps the agent, or its client is bound elsewhere"),
+	)
+	FederationAgentNotAdopted, _ = m.Int64Counter("zeroid.federation.agent_not_adopted",
+		metric.WithDescription("Federated grants refused because the bound agent identity is not active"),
+	)
+	FederationIssuerRefused, _ = m.Int64Counter("zeroid.federation.issuer_refused",
+		metric.WithDescription("Federated person grants refused at issuer resolution, by reason"),
 	)
 }
 
@@ -127,22 +187,7 @@ func Init(cfg Config) error {
 	// Re-initialise instruments with real providers.
 	Tracer = tracerProvider.Tracer("zeroid")
 	Meter = meterProvider.Meter("zeroid")
-
-	TokenIssuances, _ = Meter.Int64Counter("zeroid.token.issuances",
-		metric.WithDescription("Total token issuances"),
-	)
-	TokenLatency, _ = Meter.Float64Histogram("zeroid.token.latency_ms",
-		metric.WithDescription("Token issuance latency in milliseconds"),
-	)
-	IdentityOps, _ = Meter.Int64Counter("zeroid.identity.operations",
-		metric.WithDescription("Identity CRUD operations"),
-	)
-	PolicyEnforcements, _ = Meter.Int64Counter("zeroid.policy.enforcements",
-		metric.WithDescription("Credential policy enforcement decisions"),
-	)
-	AuthErrors, _ = Meter.Int64Counter("zeroid.errors",
-		metric.WithDescription("Authentication errors"),
-	)
+	registerInstruments(Meter)
 
 	return nil
 }

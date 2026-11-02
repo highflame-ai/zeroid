@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
+	"github.com/highflame-ai/zeroid/pkg/dpop"
 )
 
 // AgentService handles agent registration (atomic identity + API key creation)
@@ -63,7 +67,7 @@ type RegisterAgentRequest struct {
 	Capabilities  json.RawMessage
 	Labels        json.RawMessage
 	Metadata      json.RawMessage
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	CreatedBy     string
 	PublicKeyPEM  string
 	// CredentialPolicyID is the identity policy — the authority ceiling for
@@ -109,7 +113,14 @@ type AgentResponse struct {
 	CreatedAt          time.Time             `json:"created_at"`
 	CreatedBy          string                `json:"created_by"`
 	UpdatedAt          time.Time             `json:"updated_at"`
+	AdoptedAt          *time.Time            `json:"adopted_at,omitempty"`
 	DelegationDepth    int                   `json:"delegation_depth"`
+	// HasPublicKey reports whether an actor-assertion key is enrolled.
+	// PublicKeyThumbprint identifies it as an RFC 7638 JWK SHA-256 thumbprint
+	// (base64url, unpadded) — the same form as a DPoP cnf.jkt. The PEM itself
+	// is never returned on the agent registry; GET /identities/{id} carries it.
+	HasPublicKey        bool   `json:"has_public_key" doc:"Whether an actor-assertion public key is enrolled"`
+	PublicKeyThumbprint string `json:"public_key_thumbprint,omitempty" doc:"RFC 7638 JWK SHA-256 thumbprint (base64url, unpadded) of the enrolled P-256 key; omitted when none is enrolled"`
 }
 
 // AgentRegistrationResponse is returned on agent creation — includes plaintext API key.
@@ -510,6 +521,15 @@ func (s *AgentService) DeactivateAgent(ctx context.Context, id, accountID, proje
 // identity's expires_at so a rotated key on a time-bound agent expires
 // alongside its parent — without this, rotation silently extends the
 // key's lifetime past the agent's authority window.
+//
+// The new key also inherits a human in CreatedBy, because the api_key
+// grant copies that field into the token's act.sub (see oauth.go's
+// apiKeyGrant, ActingUserID: sk.CreatedBy). Rotation changes the secret,
+// not who is accountable, so stamping the rotation subsystem there
+// severed the human→agent audit chain for the rotated credential and
+// every identity delegated from it (#281). See rotationAttribution for
+// which human the new key names, and why it is not the operator who
+// performed the rotation.
 func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID string) (*AgentRegistrationResponse, error) {
 	identity, err := s.identitySvc.GetIdentity(ctx, id, accountID, projectID)
 	if err != nil {
@@ -522,15 +542,23 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 		return nil, fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 	}
 
+	// Checked before the existing keys are revoked, so a refused rotation
+	// leaves them in place (CreateKey applies the same check).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
+
 	// Revoke existing keys.
-	s.revokeKeysByIdentity(ctx, identity.ID)
+	s.revokeKeysByIdentity(ctx, identity.ID, "key rotated")
+
+	createdBy := rotationAttribution(identity, middleware.GetCallerName(ctx))
 
 	// Create new key. ExpiresAt propagates from the identity so the
 	// rotated key inherits the parent's time-bound window.
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:  identity.AccountID,
 		ProjectID:  identity.ProjectID,
-		CreatedBy:  "system:key_rotation",
+		CreatedBy:  createdBy,
 		Name:       fmt.Sprintf("Agent: %s", identity.Name),
 		IdentityID: identity.ID,
 		ExpiresAt:  identity.ExpiresAt,
@@ -542,6 +570,7 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	log.Info().
 		Str("external_id", identity.ExternalID).
 		Str("identity_id", identity.ID).
+		Str("created_by", createdBy).
 		Msg("Agent API key rotated")
 
 	return &AgentRegistrationResponse{
@@ -567,31 +596,63 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 	}
 
 	return AgentResponse{
-		ID:                 identity.ID,
-		AccountID:          identity.AccountID,
-		ProjectID:          identity.ProjectID,
-		Name:               identity.Name,
-		ExternalID:         identity.ExternalID,
-		WIMSEURI:           identity.WIMSEURI,
-		APIKeyPrefix:       keyPrefix,
-		IdentityType:       identity.IdentityType,
-		SubType:            identity.SubType,
-		TrustLevel:         identity.TrustLevel,
-		Status:             identity.Status,
-		Origin:             identity.Origin,
-		OwnerUserID:        identity.OwnerUserID,
-		CredentialPolicyID: identity.CredentialPolicyID,
-		Framework:          identity.Framework,
-		Version:            identity.Version,
-		Publisher:          identity.Publisher,
-		Description:        identity.Description,
-		Capabilities:       caps,
-		Labels:             labels,
-		Metadata:           metadata,
-		CreatedAt:          identity.CreatedAt,
-		CreatedBy:          identity.CreatedBy,
-		UpdatedAt:          identity.UpdatedAt,
+		ID:                  identity.ID,
+		AccountID:           identity.AccountID,
+		ProjectID:           identity.ProjectID,
+		Name:                identity.Name,
+		ExternalID:          identity.ExternalID,
+		WIMSEURI:            identity.WIMSEURI,
+		APIKeyPrefix:        keyPrefix,
+		IdentityType:        identity.IdentityType,
+		SubType:             identity.SubType,
+		TrustLevel:          identity.TrustLevel,
+		Status:              identity.Status,
+		Origin:              identity.Origin,
+		OwnerUserID:         identity.OwnerUserID,
+		CredentialPolicyID:  identity.CredentialPolicyID,
+		Framework:           identity.Framework,
+		Version:             identity.Version,
+		Publisher:           identity.Publisher,
+		Description:         identity.Description,
+		Capabilities:        caps,
+		Labels:              labels,
+		Metadata:            metadata,
+		CreatedAt:           identity.CreatedAt,
+		AdoptedAt:           identity.AdoptedAt,
+		CreatedBy:           identity.CreatedBy,
+		UpdatedAt:           identity.UpdatedAt,
+		HasPublicKey:        identity.PublicKeyPEM != "",
+		PublicKeyThumbprint: publicKeyThumbprint(identity),
 	}
+}
+
+// publicKeyThumbprint returns the RFC 7638 JWK SHA-256 thumbprint of the
+// identity's enrolled actor key, or "" when none is enrolled. Every write path
+// validates the key as P-256, so a failure here means a row written before that
+// check; it is logged and reported as has_public_key with no thumbprint.
+func publicKeyThumbprint(identity *domain.Identity) string {
+	if identity.PublicKeyPEM == "" {
+		return ""
+	}
+	jkt, err := ecPublicKeyJKT(identity.PublicKeyPEM)
+	if err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("stored public_key_pem has no thumbprint")
+		return ""
+	}
+	return jkt
+}
+
+// ecPublicKeyJKT computes the DPoP-style jkt of a PEM-encoded P-256 key.
+func ecPublicKeyJKT(publicKeyPEM string) (string, error) {
+	pub, err := parseECPublicKeyPEM(publicKeyPEM)
+	if err != nil {
+		return "", err
+	}
+	key, err := jwk.Import[jwk.Key](pub)
+	if err != nil {
+		return "", err
+	}
+	return dpop.JKT(key)
 }
 
 // agentMeta is the subset of an agent's opaque metadata this service reads to
@@ -700,8 +761,80 @@ func (s *AgentService) getKeyPrefix(ctx context.Context, identityID string) stri
 	return sk.KeyPrefix
 }
 
-func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID); err != nil {
+// maxAttributionLen bounds a human identifier written to service_keys.created_by,
+// which is VARCHAR(255) (migrations/006_service_keys.up.sql). RotateKey revokes
+// the outgoing keys BEFORE it creates the replacement, so an over-long value
+// would fail the INSERT and leave the identity with no usable key at all. A
+// caller-supplied header must never be able to reach that state.
+const maxAttributionLen = 255
+
+// usableHuman returns v as an attribution value, or "" when v cannot serve as
+// one. It rejects, rather than repairs, three shapes:
+//
+//   - padded or blank. A padded id matches nothing stored unpadded, so it is a
+//     silent audit break rather than a near-miss. IdentityService.OffboardOwner
+//     rejects the same shape for the same reason.
+//   - the reserved system: prefix, in any case. TenantContextMiddleware already
+//     drops this from X-User-ID, but identity.OwnerUserID and identity.CreatedBy
+//     reach us from columns that no write path filters — POST /agents/register
+//     takes created_by straight from the request body. Filtering at the point of
+//     use covers every source, not just the HTTP header.
+//   - longer than the destination column.
+//
+// Rejecting falls through to the next source in rotationAttribution, so a
+// malformed value degrades attribution instead of failing the rotation.
+func usableHuman(v string) string {
+	if v == "" || strings.TrimSpace(v) != v {
+		return ""
+	}
+	if len(v) > maxAttributionLen {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(v), middleware.SystemCallerPrefix) {
+		return ""
+	}
+	return v
+}
+
+// rotationAttribution picks the human that a rotated API key names in
+// CreatedBy, which the api_key grant copies into the token's act.sub.
+//
+// Precedence, and why the rotation operator is not first:
+//
+//  1. identity.OwnerUserID — the human accountable for what this agent does.
+//     act.sub means "the end user the principal acts on behalf of"
+//     (IssueRequest.ActingUserID), and the key mints tokens for the whole of
+//     its remaining life. An SRE who rotates a key after a leak scare is not
+//     who the agent subsequently acts for, and naming them would leave every
+//     token disagreeing with its own owner_user_id claim — a divergence that
+//     never occurs for a freshly registered agent, where RegisterAgent sets
+//     both from one value.
+//  2. identity.CreatedBy — the same fallback the identity store already uses
+//     to answer "who is the human for this identity"
+//     (COALESCE(NULLIF(owner_user_id, ”), created_by), see the created_by
+//     facet in store/postgres/identity.go). Covers rows predating the
+//     ownership invariant, and deployer-imported rows.
+//  3. callerName — a human performed this rotation and the row names nobody.
+//     Better than a subsystem, and the last human available.
+//  4. The system principal. Nothing names a human, and saying so is the
+//     honest answer.
+//
+// The operator is not lost by ranking them third: RotateKey logs created_by,
+// and identity_audit_logs records the X-User-ID caller separately from the
+// identity's owner (migrations/010_identity_audit_logs.up.sql). Who performed
+// the action and who the credential acts for are different questions, and
+// service_keys.created_by answers only the second.
+func rotationAttribution(identity *domain.Identity, callerName string) string {
+	for _, candidate := range []string{identity.OwnerUserID, identity.CreatedBy, callerName} {
+		if v := usableHuman(candidate); v != "" {
+			return v
+		}
+	}
+	return middleware.SystemCallerPrefix + "key_rotation"
+}
+
+func (s *AgentService) revokeKeysByIdentity(ctx context.Context, identityID, reason string) {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identityID, revocationActor(ctx, "key_rotation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identityID).Msg("Failed to revoke keys for identity")
 	}
 }

@@ -28,6 +28,9 @@ var codeoidScopeProfile = []string{
 	"pipeline:create",
 	"pipeline:answer",
 	"pipeline:manage",
+	"settings:read",
+	"settings:write",
+	"fleet:read",
 }
 
 // agentSandboxScopeProfile mirrors defaultAudienceScopeProfiles["agent-sandbox"]:

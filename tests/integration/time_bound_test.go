@@ -109,7 +109,7 @@ func TestExpiredIdentityDeniedJWTBearer(t *testing.T) {
 	assertion := buildAssertion(t, agentKey, identity.WIMSEURI)
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion,
+		"assertion":  assertion,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "baseline jwt_bearer must succeed; body=%v", decode(t, resp))
@@ -121,7 +121,7 @@ func TestExpiredIdentityDeniedJWTBearer(t *testing.T) {
 	assertion2 := buildAssertion(t, agentKey, identity.WIMSEURI)
 	resp = post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion2,
+		"assertion":  assertion2,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode, "jwt_bearer for expired identity must fail")
@@ -141,7 +141,7 @@ func TestExpiredIdentityDeniedTokenExchange(t *testing.T) {
 	orchAssertion := buildAssertion(t, orchKey, orchestrator.WIMSEURI)
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    orchAssertion,
+		"assertion":  orchAssertion,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -386,7 +386,7 @@ func TestExpiredIdentityCannotMintProofToken(t *testing.T) {
 	assertion := buildAssertion(t, agentKey, identity.WIMSEURI)
 	tokResp := post(t, "/oauth2/token", map[string]any{
 		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-		"subject":    assertion,
+		"assertion":  assertion,
 		"scope":      "data:read",
 	}, nil)
 	require.Equal(t, http.StatusOK, tokResp.StatusCode)
@@ -545,6 +545,7 @@ func TestSweepStampsModifiedByOnAuditRow(t *testing.T) {
 		Table("identity_audit_logs").
 		Column("action", "caller_user_id", "identity_id").
 		Where("identity_id = ?", reg.AgentID).
+		Where("table_name = ?", "identities").
 		Order("created_at DESC").
 		Limit(1).
 		Scan(context.Background(), &rows)

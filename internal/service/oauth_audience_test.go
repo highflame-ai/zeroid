@@ -99,3 +99,15 @@ func TestAudienceProfilesOrDefaultClones(t *testing.T) {
 			"adding a key to the returned map must not corrupt the input config")
 	})
 }
+
+// TestCodeoidProfileCoversSettingsAndFleet pins the scopes whose absence broke
+// the embedded codeoid UI (#400): the embed token is used verbatim, so a scope
+// missing here is unreachable from the embedded Settings screen / fleet board.
+func TestCodeoidProfileCoversSettingsAndFleet(t *testing.T) {
+	for _, sc := range []string{"settings:read", "settings:write", "fleet:read"} {
+		assert.Containsf(t, defaultAudienceScopeProfiles[audienceCodeoid], sc,
+			"the codeoid profile must grant %q", sc)
+		assert.Truef(t, allowedProfileScopes[sc],
+			"%q must be allowed in a profile, or a deployer config could not grant it", sc)
+	}
+}

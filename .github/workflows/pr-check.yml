@@ -17,10 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VER: "1.26.0"
-  # jwx v4 needs the encoding/json/v2 experiment (Go 1.26+). Workflow-level
-  # so every job step that invokes go {build,test,vet} inherits it.
-  GOEXPERIMENT: "jsonv2"
+  GO_VER: "1.27.0"
   PYTHON_VER: "3.12"
   NODE_VER: "22"
   DOCKER_BUILD_RECORD_UPLOAD: false
@@ -93,10 +90,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          # v2.7.2 is built with Go 1.25 and can't load Go 1.26 modules
-          # ("the Go language version used to build golangci-lint is lower
-          # than the targeted Go version"). v2.11.4 is built with Go 1.26.
-          version: v2.11.4
+          # The linter binary must be built with a Go >= the modules' go
+          # directive ("the Go language version used to build golangci-lint
+          # is lower than the targeted Go version"). Modules target 1.27.0;
+          # v2.13.2 is the current release built against it.
+          version: v2.13.2
           args: --timeout=5m
 
   highflame-docker-check:
@@ -185,13 +183,13 @@ jobs:
           CGO_ENABLED: 1
         shell: bash
         run: |-
-          go test ./tests/... -v -race -count=1 -timeout=600s
+          go test ./tests/... -v -race -count=1 -timeout=900s
 
       - name: Install Python SDK smoke dependencies
         shell: bash
         run: |-
           pip install --quiet "testcontainers[postgres]" "PyJWT>=2.8" cryptography pytest
-          pip install --quiet "highflame==0.3.17"
+          pip install --quiet --upgrade highflame
 
       - name: Run Python SDK smoke tests
         run: pytest tests/sdk/test_sdk_smoke.py -v --tb=short -x
@@ -202,7 +200,7 @@ jobs:
         run: |-
           npm init -y
           npm install --save-dev vitest typescript @testcontainers/postgresql
-          npm install @highflame/sdk@0.3.17
+          npm install @highflame/sdk@latest
 
       - name: Run TypeScript SDK smoke tests
         working-directory: tests/sdk
@@ -261,11 +259,32 @@ jobs:
 
       - name: Install notebook execution deps
         shell: bash
-        run: pip install --quiet pytest nbmake ipykernel "highflame==0.3.17" cryptography "PyJWT>=2.8"
+        run: pip install --quiet --upgrade pytest nbmake ipykernel highflame cryptography "PyJWT>=2.8" requests
 
-      - name: Execute the quickstart notebook against the live server
+      # Committed outputs must never contain credential material: raw JWTs,
+      # zeroid API keys, or private keys. Guards the ODIS walkthroughs' policy
+      # of printing decoded claims / selected fields only.
+      - name: Lint committed notebook outputs for credential material
         shell: bash
-        run: pytest --nbmake --nbmake-timeout=300 examples/zeroid_quickstart.ipynb -v
+        # git ls-files (not a shell glob) so a moved/renamed notebook dir can
+        # never silently disarm the lint: grep exit 2 (error) fails the step
+        # instead of reading as "no match", and an empty file list is an error.
+        run: |
+          files=$(git ls-files 'examples/**/*.ipynb' 'examples/*.ipynb')
+          if [ -z "$files" ]; then
+            echo "::error::no committed notebooks found — lint target list is broken"; exit 1
+          fi
+          status=0
+          grep -InE 'eyJ[A-Za-z0-9_-]{20,}|zid_(sk|rt)_[A-Za-z0-9_-]{20,}|BEGIN[A-Z ]*PRIVATE KEY' $files || status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "::error::credential-looking material found in committed notebook(s)"; exit 1
+          elif [ "$status" -ne 1 ]; then
+            echo "::error::credential lint failed to run (grep exit $status)"; exit "$status"
+          fi
+
+      - name: Execute the quickstart + ODIS notebooks against the live server
+        shell: bash
+        run: pytest --nbmake --nbmake-timeout=300 examples/zeroid_quickstart.ipynb examples/odis/odis-walkthrough.ipynb examples/odis/odis-walkthrough-sdk.ipynb -v
 
       - name: Dump zeroid logs on failure
         if: failure()

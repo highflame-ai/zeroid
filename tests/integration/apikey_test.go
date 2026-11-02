@@ -143,3 +143,61 @@ func TestCreateAPIKey_CrossTenantCredentialPolicyRejected(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"cross-tenant credential_policy_id must be rejected with 400, not stored on the key")
 }
+
+// TestCreateAPIKey_NoIdentityLinkRejected verifies that POST /api-keys rejects
+// a request that supplies neither identity_id nor product.
+//
+// CreateKey links an identity in one of two ways: the caller names one, or the
+// caller names a product and EnsureServiceIdentity provisions one. With
+// neither, the key has no identity to link. Before the fix bun wrote the empty
+// IdentityID into a UUID column and Postgres raised
+// `invalid input syntax for type uuid: ""`, which the handler surfaced as a
+// 500. The omission is a client error, so the endpoint must answer 400 and
+// name the two fields the caller can supply.
+func TestCreateAPIKey_NoIdentityLinkRejected(t *testing.T) {
+	headers := adminHeaders()
+	headers["X-User-ID"] = "test-user"
+
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name": "no-identity-no-product",
+	}, headers)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"a key with no identity link must be rejected with 400, not 500")
+
+	body := decode(t, resp)
+	detail, _ := body["detail"].(string)
+	assert.Contains(t, detail, "identity_id",
+		"the error must name identity_id so the caller can correct the request")
+	assert.Contains(t, detail, "product",
+		"the error must name product as the other way to link an identity")
+}
+
+// TestCreateAPIKey_IdentityIDOnlyAccepted verifies that the guard above does
+// not over-reject: an explicit identity_id with no product is a complete
+// request and must still create a key.
+func TestCreateAPIKey_IdentityIDOnlyAccepted(t *testing.T) {
+	headers := adminHeaders()
+	headers["X-User-ID"] = "test-user"
+
+	identityResp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":   uid("identity-only-key"),
+		"trust_level":   "unverified",
+		"owner_user_id": "user-test-owner",
+	}, headers)
+	require.Equal(t, http.StatusCreated, identityResp.StatusCode)
+	identityID := decode(t, identityResp)["id"].(string)
+	require.NotEmpty(t, identityID)
+
+	resp := post(t, adminPath("/api-keys"), map[string]any{
+		"name":        "identity-only-key",
+		"identity_id": identityID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode,
+		"identity_id alone is a complete request and must create a key")
+
+	keyID := decode(t, resp)["id"].(string)
+	fetched := get(t, adminPath("/api-keys/"+keyID), headers)
+	require.Equal(t, http.StatusOK, fetched.StatusCode)
+	assert.Equal(t, identityID, decode(t, fetched)["identity_id"],
+		"the created key must stay linked to the identity the caller named")
+}

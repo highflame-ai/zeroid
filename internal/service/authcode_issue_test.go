@@ -1,11 +1,16 @@
 package service
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/oautherror"
 )
 
 // Tests for mintAuthCodeJWT — the pure-function half of the
@@ -300,4 +305,156 @@ func TestRedirectURIAllowed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIssueAuthCode_PreResolvedClientStillChecksRedirectURI closes a gap the
+// pre-resolved-client optimisation opened.
+//
+// IssueAuthCodeRequest.Client lets a caller skip the registry/CIMD lookup because
+// ResolveAuthorizeClient already did it. Skipping the redirect_uri allow-list
+// alongside it would be a mistake: nothing stops a caller resolving one
+// (client, redirect_uri) pair and issuing against another, Client and RedirectURI
+// are both exported fields, and programmatic issuance is a documented use case.
+//
+// It matters more than an ordinary input check because redirect_uri is baked into
+// the code as the "ruri" claim and honoured at exchange — so a code minted for an
+// unregistered URI stays valid for it, and the allow-list would be defeated end to
+// end rather than only at issuance.
+//
+// No DB needed: the refusal happens before any lookup, which is the point.
+func TestIssueAuthCode_PreResolvedClientStillChecksRedirectURI(t *testing.T) {
+	svc := &OAuthService{
+		hmacSecret:     "test-hmac-secret-at-least-32-bytes-long",
+		authCodeIssuer: "https://as.example.test",
+	}
+
+	client := &domain.OAuthClient{
+		ClientID:     "cli-client",
+		ClientType:   "public",
+		IsActive:     true,
+		GrantTypes:   []string{string(domain.GrantTypeAuthorizationCode)},
+		RedirectURIs: []string{"http://127.0.0.1:3000/callback"},
+	}
+
+	base := IssueAuthCodeRequest{
+		ClientID:            client.ClientID,
+		CodeChallenge:       "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+		CodeChallengeMethod: "S256",
+		AccountID:           "acct-1",
+		Client:              client,
+	}
+
+	t.Run("a registered redirect_uri is accepted", func(t *testing.T) {
+		req := base
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err != nil {
+			t.Fatalf("the resolved pair must still issue: %v", err)
+		}
+	})
+
+	t.Run("loopback port still floats (RFC 8252 §7.3)", func(t *testing.T) {
+		req := base
+		req.RedirectURI = "http://127.0.0.1:54321/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err != nil {
+			t.Fatalf("re-running the allow-list must keep loopback port-agnostic matching: %v", err)
+		}
+	})
+
+	t.Run("an unregistered redirect_uri is refused", func(t *testing.T) {
+		req := base
+		req.RedirectURI = "https://evil.example/steal"
+
+		_, err := svc.IssueAuthCode(context.Background(), req)
+		if err == nil {
+			t.Fatal("a pre-resolved client must NOT let an unregistered redirect_uri through — " +
+				"it would be bound into the code as ruri and honoured at exchange")
+		}
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) || oauthErr.Code != oautherror.InvalidRequest {
+			t.Fatalf("want invalid_request, got %v", err)
+		}
+	})
+
+	// The gate that was still missed after the redirect_uri fix: "re-add the check
+	// to the other branch" does not scale, so both now run through one function.
+	t.Run("a client without the authorization_code grant is refused", func(t *testing.T) {
+		noGrant := *client
+		noGrant.GrantTypes = []string{"refresh_token"}
+
+		req := base
+		req.Client = &noGrant
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		_, err := svc.IssueAuthCode(context.Background(), req)
+		if err == nil {
+			t.Fatal("a pre-resolved client must NOT skip the grant-type allow-list")
+		}
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) || oauthErr.Code != oautherror.UnauthorizedClient {
+			t.Fatalf("want unauthorized_client, got %v", err)
+		}
+	})
+
+	// Third gate of the same class the shared policy function exists to protect:
+	// deactivation has to stay a kill switch even when the caller hands us a client
+	// it resolved earlier, and a confidential client must not obtain a code here.
+	t.Run("a deactivated pre-resolved client is refused", func(t *testing.T) {
+		inactive := *client
+		inactive.IsActive = false
+
+		req := base
+		req.Client = &inactive
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err == nil {
+			t.Fatal("a pre-resolved client must NOT skip the active/public gate — " +
+				"deactivation is the kill switch")
+		}
+	})
+
+	t.Run("a confidential pre-resolved client is refused", func(t *testing.T) {
+		confidential := *client
+		confidential.ClientType = "confidential"
+
+		req := base
+		req.Client = &confidential
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err == nil {
+			t.Fatal("a confidential client must not obtain an authorization code here")
+		}
+	})
+
+	// Ordering matters, not just presence: redirect_uri has to be settled before
+	// any redirectable failure, so the handler can tell whether §4.1.2.1 permits a
+	// redirect. A client that fails BOTH gates must report the redirect_uri one.
+	t.Run("an unregistered redirect_uri outranks a grant-type refusal", func(t *testing.T) {
+		noGrant := *client
+		noGrant.GrantTypes = []string{"refresh_token"}
+
+		req := base
+		req.Client = &noGrant
+		req.RedirectURI = "https://evil.example/steal"
+
+		_, err := svc.IssueAuthCode(context.Background(), req)
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) || oauthErr.Code != oautherror.InvalidRequest {
+			t.Fatalf("want the redirect_uri refusal (invalid_request) to win, got %v", err)
+		}
+	})
+
+	t.Run("a mismatched client_id is refused", func(t *testing.T) {
+		req := base
+		req.ClientID = "some-other-client"
+		req.RedirectURI = "http://127.0.0.1:3000/callback"
+
+		if _, err := svc.IssueAuthCode(context.Background(), req); err == nil {
+			t.Fatal("the pre-resolved client must be the one these parameters were validated against")
+		}
+	})
 }

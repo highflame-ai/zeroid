@@ -270,20 +270,29 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 			return fmt.Errorf("%w: identity %s expired at %s", domain.ErrIdentityExpired, identity.ID, identity.ExpiresAt.Format(time.RFC3339))
 		}
 
-		issued, issuedCred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
-			Identity:              identity,
-			GrantType:             domain.GrantTypeClientCredentials,
-			ResolveIdentityPolicy: true,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to issue post-attestation credential: %w", err)
-		}
-
-		promotedTrust := trustLevelForAttestation(locked.Level)
-		if _, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
-			TrustLevel: promotedTrust,
-		}); err != nil {
-			return fmt.Errorf("failed to promote identity trust level: %w", err)
+		// Promote trust and mark the record verified BEFORE issuing the
+		// post-attestation credential — all inside this tx, so a failed
+		// issuance rolls both back. The issuance chokepoint must judge the
+		// post-attestation state: a credential policy may require exactly
+		// the trust level (or verified attestation) this record grants, and
+		// issuing first made verification fail against the pre-promotion
+		// identity — a chicken-and-egg 500 for any trust-gated policy.
+		// Promotion is a CLAMP, never an overwrite: verifying a weaker
+		// attestation must not demote an identity that already holds a
+		// higher trust level (a first_party identity verifying a
+		// software-level attestation stays first_party — an unconditional
+		// write here previously demoted it, and with issuance judging the
+		// post-write identity, a first_party-gated policy then turned the
+		// verify into a rollback).
+		promoted := identity
+		if promotedTrust := trustLevelForAttestation(locked.Level); domain.TrustLevelRank(string(promotedTrust)) > domain.TrustLevelRank(string(identity.TrustLevel)) {
+			updated, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
+				TrustLevel: promotedTrust,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to promote identity trust level: %w", err)
+			}
+			promoted = updated
 		}
 
 		now := time.Now()
@@ -292,9 +301,29 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		if result.ExpiresAt != nil {
 			locked.ExpiresAt = result.ExpiresAt
 		}
-		locked.CredentialID = issuedCred.ID
+		// This first Update is LOAD-BEARING for required_attestation
+		// policies, not just bookkeeping: IssueCredential's policy
+		// chokepoint reads verification back through the tx-aware
+		// attestationRepo.GetHighestVerifiedLevel, so is_verified must be
+		// TRUE in this transaction before issuance or every
+		// attestation-gated policy regresses to a chicken-and-egg refusal.
+		// Do not merge it into the CredentialID update below.
 		if err := s.repo.Update(ctx, locked); err != nil {
 			return fmt.Errorf("failed to update attestation record: %w", err)
+		}
+
+		issued, issuedCred, err := s.credentialSvc.IssueCredential(ctx, IssueRequest{
+			Identity:              promoted,
+			GrantType:             domain.GrantTypeClientCredentials,
+			ResolveIdentityPolicy: true,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to issue post-attestation credential: %w", err)
+		}
+
+		locked.CredentialID = issuedCred.ID
+		if err := s.repo.Update(ctx, locked); err != nil {
+			return fmt.Errorf("failed to record post-attestation credential: %w", err)
 		}
 
 		// Promote local-success values to the outer scope. Last step in

@@ -39,7 +39,7 @@ internal/
 migrations/          # SQL migrations (embedded via go:embed)
 server.go            # Server builder (library entry point)
 config.go            # Configuration
-hooks.go             # Extensibility (ClaimsEnricher, GrantHandler)
+hooks.go             # Extensibility (GrantHandler, PersonGrantResolver, ...)
 ```
 
 ### Running Tests

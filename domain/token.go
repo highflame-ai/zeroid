@@ -50,11 +50,15 @@ type ActorClaims struct {
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
 type AccessToken struct {
 	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"` // "Bearer"
-	ExpiresIn   int    `json:"expires_in"` // seconds
-	Scope       string `json:"scope,omitempty"`
-	JTI         string `json:"jti"`
-	IssuedAt    int64  `json:"iat"`
+	// IssuedTokenType is the RFC 8693 §2.2.1 token type identifier of the
+	// issued token. REQUIRED on a token-exchange response and absent from
+	// every other grant's response, where RFC 6749 §5.1 does not define it.
+	IssuedTokenType string `json:"issued_token_type,omitempty"`
+	TokenType       string `json:"token_type"` // "Bearer"
+	ExpiresIn       int    `json:"expires_in"` // seconds
+	Scope           string `json:"scope,omitempty"`
+	JTI             string `json:"jti"`
+	IssuedAt        int64  `json:"iat"`
 	// Convenience fields — duplicated from JWT so callers don't need to decode.
 	AccountID    string `json:"account_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
@@ -87,6 +91,38 @@ type OAuthClient struct {
 	// Classification (RFC 6749 §2.1, RFC 7591)
 	ClientType              string `bun:"client_type"                json:"client_type"`
 	TokenEndpointAuthMethod string `bun:"token_endpoint_auth_method" json:"token_endpoint_auth_method,omitempty"`
+
+	// RFC 7591 display metadata. Populated ONLY on a CIMD-synthesized client,
+	// and never persisted: `bun:"-"` keeps both off oauth_clients, which has no
+	// columns for them and must not grow any — a CIMD client is ephemeral by
+	// definition and is never written to the registry.
+	//
+	// They exist for one reason. draft-ietf-oauth-client-id-metadata-document
+	// §8.5 asks the authorization server to fetch the document "in order to
+	// provide users with additional information about the request, such as the
+	// application name and logo", and to display the client_id hostname IN
+	// ADDITION to whatever it fetched. Without them a consent screen can offer
+	// a human nothing but a URL.
+	//
+	// UNTRUSTED, and the §8.5 context is phishing. Both are attacker-controlled
+	// strings from a document at a URL the attacker chose. The draft §4
+	// self-reference check is what stops one client displaying another's name;
+	// it does nothing to make the strings safe to render. A consent surface MUST
+	// show them beside the client_id host, never instead of it, and MUST escape
+	// them. The scheme is validated at synthesis — see cimdDisplayURI — so a
+	// `javascript:` value can never reach an href, but that is the only
+	// guarantee offered.
+	ClientURI string `bun:"-" json:"client_uri,omitempty"`
+	LogoURI   string `bun:"-" json:"logo_uri,omitempty"`
+
+	// IDJAGProfileContradicted is set only on a CIMD-synthesized client whose
+	// document claims the ID-JAG grant profile in
+	// authorization_grant_profiles_supported without declaring both
+	// token-exchange and jwt-bearer in grant_types, which
+	// draft-ietf-oauth-identity-assertion-authz-grant-04 §8 requires. Such a
+	// document contradicts itself about how it redeems an ID-JAG, so it may
+	// not redeem one. Never persisted, for the same reason as ClientURI.
+	IDJAGProfileContradicted bool `bun:"-" json:"-"`
 
 	// OAuth configuration
 	GrantTypes   []string `bun:"grant_types,array"  json:"grant_types"`
@@ -130,12 +166,22 @@ type OAuthClient struct {
 	// this client carry the identity_id forward (refresh_tokens.identity_id
 	// already exists) and gate token issuance on the linked identity's
 	// status + expires_at — same fail-closed semantics jwt_bearer and
-	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	// api_key paths have. It also decides the identity and tenant that
+	// client_credentials and ID-JAG tokens are minted for: the request need
+	// not name a tenant, and one naming a different tenant is refused.
+	// Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
+
+	// ChannelTrusted records that the client was registered by a caller
+	// marked with WithTrustedApprovalChannelWrite.
+	// ciba:approve is issued on client_credentials only when it is set.
+	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
 
 	// Dynamic Client Registration (RFC 7591/7592)
 	// RegistrationSource is "internal" for clients created via the admin/internal
-	// API path, "dynamic" for clients created via POST /oauth2/register.
+	// API path, "dynamic" for clients created via POST /oauth2/register, and
+	// RegistrationSourceCIMD for an ephemeral client synthesized from a Client ID
+	// Metadata Document. See SelfAsserted.
 	RegistrationSource string `bun:"registration_source" json:"registration_source,omitempty"`
 	// RegistrationAccessToken is a bcrypt hash of the management bearer token
 	// returned at RFC 7591 registration. NULL for internal clients (the column
@@ -148,6 +194,88 @@ type OAuthClient struct {
 	IsActive  bool      `bun:"is_active"   json:"is_active"`
 	CreatedAt time.Time `bun:"created_at"  json:"created_at"`
 	UpdatedAt time.Time `bun:"updated_at"  json:"updated_at"`
+}
+
+// ── Client-authentication predicates ─────────────────────────────────────────
+//
+// `client_type` used to carry a usable implication: a "public" client holds no
+// credential. RFC 7523 §2.2 private_key_jwt broke it (zeroid#206) — such a
+// client holds a real credential, its signing key, while being neither
+// confidential nor secret-bearing. Worse, the value it lands on depends on which
+// path registered it, so it is not even consistently wrong.
+//
+// These predicates exist so that no security decision keys off the raw column
+// again. Each names the question it answers, derives it from the REGISTERED
+// authentication method, and keeps the old column only as a fallback for rows
+// that predate the method being meaningful. Adding a bare `ClientType ==` check
+// on an auth path is what zeroid#348 exists to prevent; a ratchet test enforces
+// it.
+
+// authMethodPrivateKeyJWT is the RFC 7591 token_endpoint_auth_method value for
+// key-based client authentication. Declared here, not in internal/service, so
+// the predicates below can be a property of the type rather than of one package.
+const authMethodPrivateKeyJWT = "private_key_jwt"
+
+// UsesPrivateKeyJWT reports whether this client authenticates with an RFC 7523
+// §2.2 client assertion rather than a shared secret.
+func (c *OAuthClient) UsesPrivateKeyJWT() bool {
+	return c != nil && c.TokenEndpointAuthMethod == authMethodPrivateKeyJWT
+}
+
+// RequiresClientAuthentication reports whether this client MUST prove a
+// credential before a grant proceeds — the question the old
+// `ClientType == "confidential" || ClientSecret != ""` test was reaching for,
+// asked correctly.
+//
+// Derived from the registered method first, because that is the authoritative
+// statement of how the client authenticates. The ClientType/ClientSecret
+// fallback covers rows written before the method column was enforced (it is
+// unset on those), and is belt-and-braces against an inconsistent row carrying a
+// secret with a non-confidential type — which would otherwise skip verification.
+func (c *OAuthClient) RequiresClientAuthentication() bool {
+	if c == nil {
+		return false
+	}
+	switch c.TokenEndpointAuthMethod {
+	case authMethodPrivateKeyJWT, "client_secret_post", "client_secret_basic":
+		return true
+	case "none":
+		// Explicitly credential-less: PKCE is the proof of possession. Fall
+		// through to the fallback anyway — a "none" client that somehow carries
+		// a stored secret is an inconsistent row, and treating it as
+		// credential-less is the unsafe direction.
+	}
+	return c.ClientType == "confidential" || c.ClientSecret != ""
+}
+
+// MayObtainAuthorizationCode reports whether this client may obtain an
+// authorization code at /oauth2/authorize.
+//
+// NAMED FOR THE ONE ENDPOINT IT GOVERNS, deliberately. It is tempting to read a
+// broader "may this client run interactive flows" into it, and that reading is
+// wrong: CIBA is interactive too, does NOT consult this, and would get the
+// opposite answer from it — bc-authorize admits a secret-based confidential
+// client (authenticated, CIBA Core §7.1) and this refuses one. A predicate whose
+// name is wider than its meaning is the same defect zeroid#348 exists to remove,
+// one level up.
+//
+// The rule it replaces was `ClientType == "public"`, described in its own
+// comment as the inherited pre-CIMD GetPublicClient contract rather than a
+// reasoned property. That is preserved: a secret-based confidential client still
+// cannot obtain a code here, and widening that is deliberately NOT part of
+// zeroid#348.
+//
+// What changes is that a key-based client qualifies regardless of the
+// client_type its registration path happened to assign. A private_key_jwt client
+// running authorization_code is ordinary OAuth — it authenticates at the token
+// endpoint with its key — and gating it on a column whose value differs between
+// the admin and DCR paths made the same client legal or illegal depending on how
+// it was created.
+func (c *OAuthClient) MayObtainAuthorizationCode() bool {
+	if c == nil {
+		return false
+	}
+	return c.ClientType == "public" || c.UsesPrivateKeyJWT()
 }
 
 // ProofToken represents a persisted WIMSE Proof Token (WPT).
@@ -168,4 +296,22 @@ type ProofToken struct {
 	IsUsed     bool       `bun:"is_used"        json:"is_used"`
 	UsedAt     *time.Time `bun:"used_at"        json:"used_at,omitempty"`
 	CreatedAt  time.Time  `bun:"created_at"     json:"created_at"`
+}
+
+// RegistrationSourceCIMD marks a client synthesized from a Client ID Metadata
+// Document rather than registered. See OAuthClient.SelfAsserted.
+const RegistrationSourceCIMD = "cimd"
+
+// SelfAsserted reports whether this client's registration came from a document
+// the client itself published (CIMD) rather than from a registry row somebody
+// vetted.
+//
+// The distinction matters wherever ZeroID is about to act on the client's own
+// claims about itself. A CIMD document is anonymous by construction — no
+// registration, no secret, and by default no host allow-list — so its
+// redirect_uris are attacker-choosable, not merely attacker-supplied. Anywhere a
+// registered client's redirect_uri can be treated as a vetted destination, a
+// self-asserted one cannot.
+func (c *OAuthClient) SelfAsserted() bool {
+	return c != nil && c.RegistrationSource == RegistrationSourceCIMD
 }

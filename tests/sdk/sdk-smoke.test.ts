@@ -232,8 +232,11 @@ describe("Token lifecycle", () => {
       expect(session.active).toBe(true);
       expect(session.sub).toBeTruthy();
 
-      // Revoke
-      await client.tokens.revoke(token.access_token);
+      // Revoke — RFC 7009 authenticates the *client*, so tokens.revoke needs
+      // OAuth client credentials this api_key agent doesn't have. Deactivating
+      // the agent collapses its tokens instead (the SDK's own guidance for
+      // clientless revocation).
+      await client.agents.deactivate(reg.identity.id);
       const revoked = await client.tokens.introspect(token.access_token);
       expect(revoked.active).toBe(false);
     } finally {
@@ -392,14 +395,28 @@ describe("OAuth client credentials + delegation", () => {
       });
       expect(delegated.access_token).toBeTruthy();
 
-      // 7. Introspect: delegated token carries the act (delegation) chain.
+      // 7. Introspect: under the default rfc8693 profile `sub` stays the
+      //    chain's principal (the orchestrator, a workload) and the
+      //    delegated tool agent is the current actor in `act`.
       const introspection = await client.tokens.introspect(delegated.access_token);
       expect(introspection.active).toBe(true);
-      expect(introspection.sub).toBe(toolAgent.wimse_uri);
-      expect(introspection.act?.sub).toBe(orchestrator.wimse_uri);
+      expect(introspection.sub).toBe(orchestrator.wimse_uri);
+      expect(introspection.act?.sub).toBe(toolAgent.wimse_uri);
 
-      // 8. Revoke → inactive.
-      await client.tokens.revoke(delegated.access_token);
+      // 8. Revoke → inactive. RFC 7009 authenticates the client, and the TS
+      // SDK's tokens.revoke cannot carry client credentials yet (its body is
+      // just {token}) — post the authenticated revocation directly so the
+      // endpoint itself stays covered until the SDK gains credential support.
+      const revokeResp = await fetch(`${baseUrl}/oauth2/token/revoke`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          token: delegated.access_token,
+          client_id: orchExternalId,
+          client_secret: created.client_secret,
+        }),
+      });
+      expect(revokeResp.ok).toBe(true);
       const after = await client.tokens.introspect(delegated.access_token);
       expect(after.active).toBe(false);
     } finally {
