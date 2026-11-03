@@ -35,7 +35,7 @@ var ErrAttestationPolicyNotFound = errors.New("attestation policy not found")
 // than an opaque wrapped error.
 func (r *AttestationPolicyRepository) GetByTenantProofType(ctx context.Context, accountID, projectID string, pt domain.ProofType) (*domain.AttestationPolicy, error) {
 	p := &domain.AttestationPolicy{}
-	err := r.db.NewSelect().Model(p).
+	err := dbOrTx(ctx, r.db).NewSelect().Model(p).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		Where("proof_type = ?", string(pt)).
@@ -65,7 +65,7 @@ func (r *AttestationPolicyRepository) GetByTenantProofType(ctx context.Context, 
 // state (on conflict, the existing row's id and created_at are kept; only
 // the SET columns change).
 func (r *AttestationPolicyRepository) Upsert(ctx context.Context, p *domain.AttestationPolicy, updateIsActive bool) error {
-	q := r.db.NewInsert().Model(p).
+	q := dbOrTx(ctx, r.db).NewInsert().Model(p).
 		On("CONFLICT (account_id, project_id, proof_type) DO UPDATE").
 		Set("config = EXCLUDED.config").
 		Set("updated_at = NOW()")
@@ -81,7 +81,7 @@ func (r *AttestationPolicyRepository) Upsert(ctx context.Context, p *domain.Atte
 // List returns all policies for a tenant.
 func (r *AttestationPolicyRepository) List(ctx context.Context, accountID, projectID string) ([]*domain.AttestationPolicy, error) {
 	var policies []*domain.AttestationPolicy
-	err := r.db.NewSelect().Model(&policies).
+	err := dbOrTx(ctx, r.db).NewSelect().Model(&policies).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
 		OrderExpr("created_at DESC").
@@ -95,7 +95,7 @@ func (r *AttestationPolicyRepository) List(ctx context.Context, accountID, proje
 // Delete removes a policy by ID, scoped to tenant. Returns nil even if no
 // rows matched (idempotent delete semantics).
 func (r *AttestationPolicyRepository) Delete(ctx context.Context, id, accountID, projectID string) error {
-	_, err := r.db.NewDelete().Model((*domain.AttestationPolicy)(nil)).
+	_, err := dbOrTx(ctx, r.db).NewDelete().Model((*domain.AttestationPolicy)(nil)).
 		Where("id = ?", id).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
