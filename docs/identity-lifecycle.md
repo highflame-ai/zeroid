@@ -129,7 +129,7 @@ SDK / Cedar / DB contract for no functional gain).
 | **`discovered`** *(new)* | *(below "Established" — no SDO models a pre-authoritative identity)* | **false** | Observed in an external IdP. `origin` external, `external_id` set, owner **optional**, no ZeroID credential. |
 | `pending` | **Established** | false | Registered & **owned**, governable, not yet granted rights. The "adopted" state. |
 | `active` | **Active** | **true** | Granted rights: credential enrolled or reconciled via EMA. The "managed" state. |
-| `suspended` | **Suspended** | false | Reversible halt. |
+| `suspended` | **Suspended** | false | Reversible halt. Live credentials, and every credential delegated from them, are cascade-revoked; API keys are kept, so a reactivated identity mints fresh credentials with the same key. |
 | `deactivated` / `expired` | **Archived** | false | Soft-deleted, audit-retained, reactivatable (`deactivated → active`). The offboarded state. |
 
 **Transitions** (extending `CanTransitionTo`):
