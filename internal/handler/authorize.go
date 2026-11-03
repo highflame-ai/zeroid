@@ -517,9 +517,14 @@ func (a *API) authorizeHandler(w http.ResponseWriter, r *http.Request) {
 	q.Set("iss", a.issuer)
 	u.RawQuery = q.Encode()
 
+	// The redirect_uri and PKCE method the code is bound to, so the token
+	// request's "authorization code redeemed" line can be read against them.
+	// The challenge itself is not logged.
 	log.Info().
 		Str("resolver", resolverName).
 		Str("client_id", req.ClientID).
+		Str("redirect_uri", req.RedirectURI).
+		Str("code_challenge_method", req.CodeChallengeMethod).
 		Str("account_id", principal.AccountID).
 		Str("project_id", principal.ProjectID).
 		Str("user_id", principal.UserID).

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/lestrrat-go/jwx/v4/jwa"
 	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
@@ -756,6 +757,11 @@ type TokenRequest struct {
 	// Non-empty when the token endpoint received a valid DPoP proof (RFC 9449).
 	// The issued credential will carry cnf.jkt and token_type "DPoP" when set.
 	DPoPKeyThumbprint string
+	// AuthorizationHeaderSent is true when the token request carried an
+	// Authorization header, whatever its scheme. It authenticates nothing: only
+	// the success line of an authorization_code redemption reads it, so an
+	// operator can show that a public client sent no client credentials at all.
+	AuthorizationHeaderSent bool
 }
 
 // Token handles the /oauth2/token endpoint dispatch.
@@ -2919,6 +2925,20 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	if updateErr := s.authCodeRepo.UpdateTokenInfo(ctx, authCode.JTI, accessToken.JTI, refreshFamilyID); updateErr != nil {
 		log.Error().Err(updateErr).Str("auth_code_jti", authCode.JTI).Msg("Failed to store auth code token info for replay revocation")
 	}
+
+	logAuthorizationCodeRedeemed(authCodeRedemption{
+		requestID:               chimiddleware.GetReqID(ctx),
+		clientID:                req.ClientID,
+		cimd:                    viaCIMD,
+		clientAuth:              clientAuthRequired(oauthClient),
+		sentAuthorizationHeader: req.AuthorizationHeaderSent,
+		sentClientSecret:        req.ClientSecret != "",
+		sentClientAssertion:     clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType),
+		accountID:               authCode.AccountID,
+		projectID:               authCode.ProjectID,
+		userID:                  authCode.UserID,
+		jti:                     accessToken.JTI,
+	})
 
 	return accessToken, nil
 }
