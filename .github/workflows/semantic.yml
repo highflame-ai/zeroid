@@ -44,7 +44,9 @@ jobs:
         run: |-
           set -euo pipefail
           git fetch origin --tags --force
-          go install github.com/caarlos0/svu/v3@latest
+          # v3.4.2+ needs Go >= 1.27.3. setup-go sets GOTOOLCHAIN=local from
+          # go.mod (1.27.0), so this install fetches the toolchain svu asks for.
+          GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
 
           RAW="$(svu next)"
           CURRENT="$(svu current)"

@@ -73,8 +73,10 @@ cli-dev: cli-install ## Run CLI from source (no build needed)
 cli-test: cli-install ## Run CLI tests
 	cd cli && npm test
 
+# svu v3.4.2+ needs Go >= 1.27.3. GOTOOLCHAIN=auto fetches that toolchain
+# when the ambient one is pinned (setup-go sets GOTOOLCHAIN=local).
 next-version: ## Print svu's next semver and the version this module path can tag
-	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
+	@command -v svu >/dev/null 2>&1 || GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
 	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
 		echo "current    : $$($${SVU} current)"; \
 		echo "svu next   : $$($${SVU} next)"; \
@@ -86,7 +88,7 @@ next-version: ## Print svu's next semver and the version this module path can ta
 # feat!: makes svu ask for a new major. A module path without /vN can only be
 # v0 or v1, so that major is released as the next minor until the path moves.
 releasable-version: ## Print the tag this module path can carry
-	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
+	@command -v svu >/dev/null 2>&1 || GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
 	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
 	NEXT=$$($${SVU} next); \
 	MODULE=$$(awk 'NR==1 && $$1=="module" { print $$2; exit }' go.mod); \
