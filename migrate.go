@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io/fs"
 
-	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/internal/database"
@@ -27,7 +25,7 @@ import (
 //	zeroid.Migrate("postgres://user:pass@host:5432/zeroid?sslmode=disable")
 func Migrate(databaseURL string) error {
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(databaseURL)))
-	db := bun.NewDB(sqldb, pgdialect.New())
+	db := newBunDB(sqldb)
 	defer func() { _ = db.Close() }()
 
 	// Wait for postgres to actually accept connections before we let

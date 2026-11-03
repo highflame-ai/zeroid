@@ -441,7 +441,7 @@ func runTests(m *testing.M) int {
 	// Open a separate bun.DB handle for tests that need direct repo access.
 	// Uses the same connection string the server is wired to.
 	sqldb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(dbURL)))
-	testDB = bun.NewDB(sqldb, pgdialect.New())
+	testDB = bun.NewDB(sqldb, pgdialect.New(), bun.WithDiscardUnknownColumns())
 	defer testDB.Close() //nolint:errcheck
 
 	// Register the CLI and MCP test clients in the oauth_clients table.

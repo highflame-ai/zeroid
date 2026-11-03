@@ -24,7 +24,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/uptrace/bun"
-	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -1859,7 +1858,7 @@ func initDatabase(databaseURL string, maxOpenConns, maxIdleConns int) (*bun.DB, 
 	sqldb.SetConnMaxLifetime(30 * time.Minute)
 	sqldb.SetConnMaxIdleTime(5 * time.Minute)
 
-	db := bun.NewDB(sqldb, pgdialect.New())
+	db := newBunDB(sqldb)
 
 	if parsedURL, err := url.Parse(databaseURL); err == nil {
 		log.Info().Str("host", parsedURL.Host).Str("database", parsedURL.Path).Msg("Database connection established")

@@ -72,7 +72,7 @@ func (r *AttestationPolicyRepository) Upsert(ctx context.Context, p *domain.Atte
 	if updateIsActive {
 		q = q.Set("is_active = EXCLUDED.is_active")
 	}
-	if _, err := q.Returning("?Columns").Exec(ctx); err != nil {
+	if _, err := q.Returning("*").Exec(ctx); err != nil {
 		return fmt.Errorf("failed to upsert attestation policy: %w", err)
 	}
 	return nil

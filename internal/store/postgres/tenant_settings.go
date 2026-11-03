@@ -55,7 +55,7 @@ func (r *TenantSettingsRepository) UpsertTokenProfile(ctx context.Context, s *do
 		On("CONFLICT (account_id, project_id) DO UPDATE").
 		Set("token_profile = EXCLUDED.token_profile").
 		Set("updated_at = NOW()").
-		Returning("?Columns").
+		Returning("*").
 		Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to upsert tenant settings: %w", err)
