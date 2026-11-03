@@ -44,6 +44,7 @@
     "esbuild": "^0.28.1",
     "@typescript-eslint/typescript-estree": {
       "brace-expansion": "^5.0.12"
-    }
+    },
+    "minimatch": "^11.0.1"
   }
 }
