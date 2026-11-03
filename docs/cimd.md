@@ -279,6 +279,8 @@ ZeroID detects the `client_id` is a CIMD URL, fetches + validates the document, 
 
 `POST /oauth2/token` with `grant_type=authorization_code`, the same CIMD URL as `client_id`, the `code_verifier`, and the `redirect_uri`. No `client_secret` — a CIMD client never has one. A document declaring `none` proves possession with PKCE alone; one declaring `private_key_jwt` must additionally present a `client_assertion` signed by a key from its own published set, and is refused without it. ZeroID re-resolves the document (served from cache) and issues the token.
 
+Each successful exchange, for any client, is logged as `authorization code redeemed`, with the token request's `request_id`. The line records the client authentication ZeroID required (`client_auth`: `none`, `client_secret` or `private_key_jwt`), whether the request sent an Authorization header, a `client_secret` or a `client_assertion`, that the `code_verifier` matched the S256 challenge, and the issued token's `jti`. It records no values: no code, verifier, secret or assertion. The `authorization code issued` line at step 2 records the `redirect_uri` and `code_challenge_method` the code is bound to.
+
 ### 4. Refresh, introspect, revoke
 
 When the document's `grant_types` includes `refresh_token`, the exchange also returns a rotating refresh token. On `grant_type=refresh_token` ZeroID re-resolves the document before rotating — which gives CIMD its lifecycle story: **a client that unpublishes its metadata document can no longer rotate** (the presented token is not consumed on resolution failure, so a transient outage doesn't brick the session). The two token-inspection endpoints treat a CIMD `client_id` differently:
