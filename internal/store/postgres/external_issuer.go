@@ -283,6 +283,8 @@ var ErrBindingExplicitlyDisabled = errors.New("binding was explicitly disabled")
 // UpdateBinding rewrites a binding's enabled flag. With unlessExplicitlyDisabled
 // the write happens only if the stored row is not explicitly disabled, in the
 // same statement, so it cannot race an admin's disable.
+// When nothing matches, it returns ErrBindingExplicitlyDisabled only if the
+// binding still exists, and sql.ErrNoRows otherwise.
 func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.IssuerBinding, unlessExplicitlyDisabled bool) error {
 	q := dbOrTx(ctx, r.db).NewUpdate().Model(b).
 		Column("enabled", "explicitly_disabled", "updated_by").
@@ -299,7 +301,20 @@ func (r *ExternalIssuerRepository) UpdateBinding(ctx context.Context, b *domain.
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		if unlessExplicitlyDisabled {
-			return ErrBindingExplicitlyDisabled
+			// No row matched: either the binding is explicitly disabled, or
+			// it is gone (never existed, soft-deleted, another account's).
+			// Only the first is a policy refusal; the rest is a not-found.
+			exists, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.IssuerBinding)(nil)).
+				Where("id = ?", b.ID).
+				Where("account_id = ?", b.AccountID).
+				Where("deleted_at IS NULL").
+				Exists(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to update binding: %w", err)
+			}
+			if exists {
+				return ErrBindingExplicitlyDisabled
+			}
 		}
 		return fmt.Errorf("failed to update binding: %w", sql.ErrNoRows)
 	}
