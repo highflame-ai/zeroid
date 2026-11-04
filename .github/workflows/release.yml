@@ -59,10 +59,14 @@ jobs:
       # we'd be silently shipping a feature as a patch. Allow tags AT
       # OR ABOVE the recommendation so a maintainer can manually force
       # a higher bump (e.g., release a major from a fix-only window).
+      #
+      # svu v3.4.2+ needs Go >= 1.27.3. setup-go sets GOTOOLCHAIN=local
+      # from go.mod (1.27.0), so the install fetches the toolchain svu
+      # declares instead of building with the module's Go.
       - name: Validate semver against commit history (svu)
         shell: bash
         run: |-
-          go install github.com/caarlos0/svu/v3@latest
+          GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
           RAW="$(svu next)"
           # Same version cut-release already published. A feat!: makes svu
           # ask for v2, which Go rejects on a module path with no /v2 suffix.

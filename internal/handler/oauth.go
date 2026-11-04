@@ -826,6 +826,9 @@ func (a *API) tokenOp(ctx context.Context, input *TokenInput) (*TokenOutput, err
 		AuthReqID:           input.Body.AuthReqID,
 		RequestingToken:     input.Body.RequestingToken,
 		DPoPKeyThumbprint:   dpopThumbprint,
+		// Presence only, for the authorization_code success line; the header's
+		// value is never passed on.
+		AuthorizationHeaderSent: input.Authorization != "",
 	})
 	if err != nil {
 		log.Error().Err(err).Str("grant_type", input.Body.GrantType).Msg("oauth token request failed")
