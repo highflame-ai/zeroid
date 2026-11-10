@@ -1,4 +1,4 @@
--- 044_default_policy_add_ciba_grant.up.sql
+-- 065_default_policy_add_ciba_grant.up.sql
 -- Migration 009 backfilled each tenant's `default` credential policy with an
 -- allowed_grant_types list that "must mirror domain.DefaultAllowedGrantTypes()".
 -- PR #304 then added the CIBA grant (urn:openid:params:grant-type:ciba) to

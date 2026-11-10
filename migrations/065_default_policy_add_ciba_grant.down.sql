@@ -1,5 +1,5 @@
--- 044_default_policy_add_ciba_grant.down.sql
--- Remove the CIBA grant from default policies again. Restores the pre-044
+-- 065_default_policy_add_ciba_grant.down.sql
+-- Remove the CIBA grant from default policies again. Restores the pre-065
 -- shape for every default row (including fresh rows that were created with
 -- the grant by the Go defaults), which is what a downgrade to a pre-#304
 -- binary expects.
