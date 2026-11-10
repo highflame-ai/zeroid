@@ -170,6 +170,54 @@ func (r *CredentialRepository) RevokeAllActiveForOwner(ctx context.Context, owne
 //
 // Returns the affected credentials (the token itself + descendants), one entry
 // per revoked JTI, each stamped with the cascade's revoked_at timestamp.
+// ListActiveLongLivedUserAccessTokenIDs returns the ids of a tenant's active
+// authorization_code and refresh_token access tokens whose lifetime exceeds
+// maxTTLSeconds. Those grants always mint for a person, so these are the
+// long-lived user-subject roots the rfc8693 profile switch revokes (D14).
+func (r *CredentialRepository) ListActiveLongLivedUserAccessTokenIDs(ctx context.Context, accountID, projectID string, maxTTLSeconds int) ([]string, error) {
+	var ids []string
+	err := dbOrTx(ctx, r.db).NewSelect().
+		Model((*domain.IssuedCredential)(nil)).
+		Column("id").
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("grant_type IN (?)", bun.List([]string{string(domain.GrantTypeAuthorizationCode), string(domain.GrantTypeRefreshToken)})).
+		Where("ttl_seconds > ?", maxTTLSeconds).
+		Where("is_revoked = FALSE").
+		Where("expires_at > NOW()").
+		Scan(ctx, &ids)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list long-lived user access tokens: %w", err)
+	}
+	return ids, nil
+}
+
+// RefreshFamilyCredential identifies one active access token issued under a
+// refresh-token family, with the tenant scalars the revoke cascade guards on.
+type RefreshFamilyCredential struct {
+	ID        string `bun:"id"`
+	AccountID string `bun:"account_id"`
+	ProjectID string `bun:"project_id"`
+}
+
+// ListActiveByRefreshFamily returns the active (not revoked, not expired)
+// access tokens issued under the given refresh-token family. Backed by the
+// partial index idx_issued_credentials_refresh_family_id (migration 055).
+func (r *CredentialRepository) ListActiveByRefreshFamily(ctx context.Context, familyID string) ([]RefreshFamilyCredential, error) {
+	var rows []RefreshFamilyCredential
+	err := dbOrTx(ctx, r.db).NewSelect().
+		Model((*domain.IssuedCredential)(nil)).
+		Column("id", "account_id", "project_id").
+		Where("refresh_family_id = ?", familyID).
+		Where("is_revoked = FALSE").
+		Where("expires_at > NOW()").
+		Scan(ctx, &rows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list access tokens for refresh family: %w", err)
+	}
+	return rows, nil
+}
+
 func (r *CredentialRepository) Revoke(ctx context.Context, id, accountID, projectID, reason string) ([]RevokedCredential, error) {
 	now := time.Now()
 	var rows []RevokedCredential

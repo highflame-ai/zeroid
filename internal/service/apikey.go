@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -86,6 +87,13 @@ type CreateAPIKeyResponse struct {
 // policy; the tenant's default policy is auto-created and assigned only when the
 // identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, "", req.Scopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.credentialPolicySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	// Every key has an identity link, and the caller supplies one of the two
 	// ways to establish it. Reject the empty case here rather than letting an
 	// unlinked key reach the insert, where the empty IdentityID fails the
@@ -110,6 +118,11 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	identity, err := s.identitySvc.GetIdentity(ctx, req.IdentityID, req.AccountID, req.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load identity %s: %w", req.IdentityID, err)
+	}
+	// A key for an approval channel, including one that inherits the
+	// channel's ceiling, needs a trusted caller (approval_channel_write.go).
+	if err := s.identitySvc.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
 	}
 
 	// Ensure the key has a credential policy.
@@ -224,6 +237,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ProjectID:          req.ProjectID,
 		IdentityID:         req.IdentityID,
 		CreatedBy:          req.CreatedBy,
+		CreatedActor:       middleware.GetCallerName(ctx),
 		CredentialPolicyID: policyID,
 		Product:            req.Product,
 		Scopes:             scopes,
@@ -231,6 +245,7 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		ExpiresAt:          expiresAt,
 		State:              domain.APIKeyStateActive,
 		Metadata:           metadata,
+		ChannelTrusted:     TrustedApprovalChannelWrite(ctx),
 	}
 
 	if err := s.repo.Create(ctx, sk); err != nil {
@@ -287,7 +302,28 @@ func (s *APIKeyService) GetKey(ctx context.Context, id, accountID, projectID str
 // but the common revoke-by-ID path treats both as a silent no-op to avoid
 // leaking cross-tenant existence.
 func (s *APIKeyService) RevokeKey(ctx context.Context, id, accountID, projectID, revokedBy, reason string) (int64, error) {
+	if revokedBy == "" {
+		revokedBy = middleware.SystemCallerPrefix + "unattributed"
+	}
+	// A key created by a trusted approval-channel caller is revoked only by
+	// one (approval_channel_write.go). A key not found here falls through to
+	// the tenant-scoped revoke, which reports zero rows.
+	if !TrustedApprovalChannelWrite(ctx) {
+		if sk, err := s.repo.GetByID(ctx, id, accountID, projectID); err == nil && sk.ChannelTrusted {
+			return 0, ErrApprovalChannelWriteNotTrusted
+		}
+	}
 	return s.repo.Revoke(ctx, id, accountID, projectID, revokedBy, reason)
+}
+
+// revocationActor names who a bulk key revoke is recorded against: the
+// request's caller (a human, or a system: worker that set itself), else the
+// call site's system label.
+func revocationActor(ctx context.Context, fallback string) string {
+	if caller := middleware.GetCallerName(ctx); caller != "" {
+		return caller
+	}
+	return middleware.SystemCallerPrefix + fallback
 }
 
 // generateAPIKey creates a cryptographically random API key with the given prefix.

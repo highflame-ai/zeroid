@@ -1,6 +1,7 @@
 package service
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -74,9 +75,10 @@ func TestBuildIDJAGCustomClaims_PropagateClaimsCannotClobberResource(t *testing.
 	}
 }
 
-// TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope guards the claims that were
-// already there, so the extraction refactor is provably behavior-preserving.
-func TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope(t *testing.T) {
+// TestBuildIDJAGCustomClaims_IgnoresReservedMappings: a row stored before
+// role and privilege_scope were reserved may still map them; the ID-JAG grant
+// never copies either from the IdP's claims (ADR 0044 D16, EC-D16-04).
+func TestBuildIDJAGCustomClaims_IgnoresReservedMappings(t *testing.T) {
 	t.Parallel()
 
 	cfg := domain.ExternalIssuerConfig{
@@ -89,24 +91,66 @@ func TestBuildIDJAGCustomClaims_RoleAndPrivilegeScope(t *testing.T) {
 	raw := map[string]any{
 		"groups_role": "admin",
 		"groups_ps":   []any{"tenant:read", "tenant:write"},
+		// Same-named IdP claims are not read either.
+		"role":            "owner",
+		"privilege_scope": []any{"*"},
 	}
 
 	got := buildIDJAGCustomClaims(raw, cfg, "https://corp-idp.example", []string{"https://gw/mcp/github"})
 
-	if got["role"] != "admin" {
-		t.Errorf("role = %v, want admin", got["role"])
+	if _, present := got["role"]; present {
+		t.Errorf("role = %v, want absent: an IdP claim never sets a token's role", got["role"])
 	}
-	ps, ok := got["privilege_scope"].([]string)
-	if !ok || len(ps) != 2 {
-		t.Errorf("privilege_scope = %#v, want two entries", got["privilege_scope"])
+	if _, present := got["privilege_scope"]; present {
+		t.Errorf("privilege_scope = %v, want absent", got["privilege_scope"])
+	}
+	if got["token_exchange"] != "id_jag" {
+		t.Errorf("token_exchange = %v, the rest of the claim set is unaffected", got["token_exchange"])
+	}
+}
+
+// TestIDJAGActors names the redeeming application identity as the single
+// current actor, with the attributes token exchange gives its actor, and
+// names no actor for the synthetic carrier, which has no identity row.
+func TestIDJAGActors(t *testing.T) {
+	t.Parallel()
+
+	agent := &domain.Identity{
+		ID:           "id-1",
+		WIMSEURI:     "spiffe://example.test/acct/proj/agent/agent-1",
+		ExternalID:   "agent-1",
+		IdentityType: domain.IdentityTypeAgent,
+		TrustLevel:   domain.TrustLevel("verified_third_party"),
+	}
+	got := idJAGActors(agent)
+	want := []domain.Actor{{
+		Sub:          agent.WIMSEURI,
+		IdentityType: "agent",
+		TrustLevel:   "verified_third_party",
+		ExternalID:   "agent-1",
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("idJAGActors(agent) = %+v, want %+v", got, want)
+	}
+	act := actorChainClaim(got)
+	if act["sub"] != agent.WIMSEURI || act["external_id"] != "agent-1" ||
+		act["identity_type"] != "agent" || act["trust_level"] != "verified_third_party" {
+		t.Fatalf("act = %v, want the agent and its attributes", act)
+	}
+	if _, nested := act["act"]; nested {
+		t.Fatalf("act = %v, want a single actor", act)
 	}
 
-	// Absent mappings must not default-fill.
-	bare := buildIDJAGCustomClaims(map[string]any{}, cfg, "https://corp-idp.example", []string{"x"})
-	if _, present := bare["role"]; present {
-		t.Error("role must be absent when the IdP did not supply it (never default-fill)")
+	synthetic := &domain.Identity{
+		AccountID:    "acct",
+		ProjectID:    "proj",
+		IdentityType: domain.IdentityTypeService,
+		Status:       domain.IdentityStatusActive,
 	}
-	if _, present := bare["privilege_scope"]; present {
-		t.Error("privilege_scope must be absent when the IdP did not supply it")
+	if got := idJAGActors(synthetic); got != nil {
+		t.Fatalf("idJAGActors(synthetic) = %+v, want nil", got)
+	}
+	if got := idJAGActors(nil); got != nil {
+		t.Fatalf("idJAGActors(nil) = %+v, want nil", got)
 	}
 }

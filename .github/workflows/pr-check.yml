@@ -183,7 +183,7 @@ jobs:
           CGO_ENABLED: 1
         shell: bash
         run: |-
-          go test ./tests/... -v -race -count=1 -timeout=600s
+          go test ./tests/... -v -race -count=1 -timeout=900s
 
       - name: Install Python SDK smoke dependencies
         shell: bash

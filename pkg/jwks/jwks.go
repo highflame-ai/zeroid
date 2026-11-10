@@ -1,4 +1,4 @@
-package authjwt
+package jwks
 
 import (
 	"context"
@@ -13,22 +13,25 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// maxJWKSBodyBytes caps the JWKS response body to prevent a malicious or
+// maxBodyBytes caps the JWKS response body to prevent a malicious or
 // compromised issuer from exhausting memory during a fetch. JWKS documents
 // are typically a few KB; 1 MiB is generous headroom.
-const maxJWKSBodyBytes = 1 << 20 // 1 MiB
+const maxBodyBytes = 1 << 20 // 1 MiB
 
 const (
 	defaultRefreshInterval = 5 * time.Minute
 	defaultRequestTimeout  = 10 * time.Second
 	minRefreshInterval     = 30 * time.Second
+	// defaultOnDemandInterval spaces RefreshIfMissing fetches, so tokens
+	// naming made-up kids cannot drive one upstream fetch each.
+	defaultOnDemandInterval = 10 * time.Second
 )
 
-// JWKSClient fetches and caches a JWKS from a remote endpoint.
+// Client fetches and caches a JWKS from a remote endpoint.
 // It supports periodic background refresh and on-demand refresh when
 // a token presents an unknown kid.
-type JWKSClient struct {
-	jwksURL         string
+type Client struct {
+	url             string
 	refreshInterval time.Duration
 	requestTimeout  time.Duration
 	httpClient      *http.Client
@@ -42,38 +45,52 @@ type JWKSClient struct {
 	// elect a single leader (cold cache, no fetch in flight) or attach to
 	// an existing leader's broadcast channel.
 	loadMu       sync.Mutex
-	loadInFlight *jwksFetch
+	loadInFlight *fetchResult
+
+	// onDemandMu makes RefreshIfMissing single-flight; lastOnDemand and
+	// onDemandInterval rate-limit it.
+	onDemandMu       sync.Mutex
+	lastOnDemand     time.Time
+	onDemandInterval time.Duration
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
-// jwksFetch is the broadcast handle for an in-flight cold-cache fetch.
+// fetchResult is the broadcast handle for an in-flight cold-cache fetch.
 // The leader runs the fetch with its own fresh context; followers wait on
 // done with their own ctx so they can return on their own deadline rather
 // than blocking on whatever timeout the leader chose.
-type jwksFetch struct {
+type fetchResult struct {
 	done chan struct{} // closed when the fetch completes
 	err  error         // populated before close(done); read-only after
 }
 
-// JWKSOption configures a JWKSClient.
-type JWKSOption func(*JWKSClient)
+// Option configures a Client.
+type Option func(*Client)
 
 // WithRefreshInterval sets how often the JWKS is refreshed in the background.
 // Minimum 30 seconds. Default 5 minutes.
-func WithRefreshInterval(d time.Duration) JWKSOption {
-	return func(c *JWKSClient) {
+func WithRefreshInterval(d time.Duration) Option {
+	return func(c *Client) {
 		if d >= minRefreshInterval {
 			c.refreshInterval = d
 		}
 	}
 }
 
+// WithOnDemandRefreshInterval sets the minimum time between refreshes
+// triggered by an unknown kid. Default 10 seconds; 0 disables the limit.
+func WithOnDemandRefreshInterval(d time.Duration) Option {
+	return func(c *Client) {
+		c.onDemandInterval = d
+	}
+}
+
 // WithRequestTimeout sets the timeout for individual JWKS HTTP requests.
 // Default 10 seconds.
-func WithRequestTimeout(d time.Duration) JWKSOption {
-	return func(c *JWKSClient) {
+func WithRequestTimeout(d time.Duration) Option {
+	return func(c *Client) {
 		if d > 0 {
 			c.requestTimeout = d
 		}
@@ -81,20 +98,20 @@ func WithRequestTimeout(d time.Duration) JWKSOption {
 }
 
 // WithHTTPClient sets a custom HTTP client for JWKS fetching.
-func WithHTTPClient(client *http.Client) JWKSOption {
-	return func(c *JWKSClient) {
+func WithHTTPClient(client *http.Client) Option {
+	return func(c *Client) {
 		c.httpClient = client
 	}
 }
 
 // WithLogger sets the logger for the JWKS client.
-func WithLogger(logger zerolog.Logger) JWKSOption {
-	return func(c *JWKSClient) {
+func WithLogger(logger zerolog.Logger) Option {
+	return func(c *Client) {
 		c.logger = logger
 	}
 }
 
-// NewJWKSClient creates a JWKS client that fetches keys from the given URL.
+// New creates a JWKS client that fetches keys from the given URL.
 //
 // It attempts a best-effort initial fetch with the configured request timeout,
 // but does NOT fail if the endpoint is unreachable: a transient cross-service
@@ -104,19 +121,21 @@ func WithLogger(logger zerolog.Logger) JWKSOption {
 //
 // Returns an error only for config-level problems (empty URL). Call Close()
 // to stop the background refresh.
-func NewJWKSClient(jwksURL string, opts ...JWKSOption) (*JWKSClient, error) {
-	if jwksURL == "" {
+func New(url string, opts ...Option) (*Client, error) {
+	if url == "" {
 		return nil, fmt.Errorf("authjwt: JWKSURL is required")
 	}
 
-	c := &JWKSClient{
-		jwksURL:         jwksURL,
+	c := &Client{
+		url:             url,
 		refreshInterval: defaultRefreshInterval,
 		requestTimeout:  defaultRequestTimeout,
 		httpClient:      http.DefaultClient,
 		logger:          zerolog.Nop(),
 		kids:            make(map[string]struct{}),
-		done:            make(chan struct{}),
+
+		onDemandInterval: defaultOnDemandInterval,
+		done:             make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -130,7 +149,7 @@ func NewJWKSClient(jwksURL string, opts ...JWKSOption) (*JWKSClient, error) {
 	if err := c.refresh(context.Background()); err != nil {
 		c.logger.Warn().
 			Err(err).
-			Str("url", jwksURL).
+			Str("url", url).
 			Msg("initial JWKS fetch failed; continuing — will retry on first verify and via background refresh")
 	}
 
@@ -142,14 +161,14 @@ func NewJWKSClient(jwksURL string, opts ...JWKSOption) (*JWKSClient, error) {
 }
 
 // KeySet returns the current cached JWKS. Thread-safe.
-func (c *JWKSClient) KeySet() jwk.Set {
+func (c *Client) KeySet() jwk.Set {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.keySet
 }
 
 // HasKID returns true if the given key ID is in the current JWKS.
-func (c *JWKSClient) HasKID(kid string) bool {
+func (c *Client) HasKID(kid string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	_, ok := c.kids[kid]
@@ -158,7 +177,7 @@ func (c *JWKSClient) HasKID(kid string) bool {
 
 // EnsureLoaded fetches the JWKS synchronously if the local cache is empty.
 // This is the lazy path used on the first Verify() call when the initial
-// fetch from NewJWKSClient failed (e.g., the issuer's pod was still starting).
+// fetch from New failed (e.g., the issuer's pod was still starting).
 //
 // Concurrent callers coalesce on a single fetch: exactly one leader runs the
 // network request, the rest wait on a broadcast channel. Each waiter respects
@@ -168,7 +187,7 @@ func (c *JWKSClient) HasKID(kid string) bool {
 // for the others.
 //
 // Returns nil if the cache is populated (already, or by this call).
-func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
+func (c *Client) EnsureLoaded(ctx context.Context) error {
 	if c.populated() {
 		return nil
 	}
@@ -181,7 +200,7 @@ func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
 
 	leader := c.loadInFlight == nil
 	if leader {
-		c.loadInFlight = &jwksFetch{done: make(chan struct{})}
+		c.loadInFlight = &fetchResult{done: make(chan struct{})}
 	}
 	fetch := c.loadInFlight
 	c.loadMu.Unlock()
@@ -219,36 +238,50 @@ func (c *JWKSClient) EnsureLoaded(ctx context.Context) error {
 }
 
 // populated reports whether the cache currently holds at least one key.
-func (c *JWKSClient) populated() bool {
+func (c *Client) populated() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.keySet != nil && c.keySet.Len() > 0
 }
 
 // RefreshIfMissing triggers an immediate JWKS refresh if the given kid is not
-// in the current key set. Returns true if a refresh was performed.
-// This handles key rotation — when ZeroID rotates keys, the first request
-// with the new kid triggers a refresh rather than failing.
-func (c *JWKSClient) RefreshIfMissing(ctx context.Context, kid string) bool {
+// in the current key set. Returns true if the key set changed so the caller
+// should retry. This handles key rotation — the first request with a new
+// kid triggers a refresh rather than failing.
+//
+// Concurrent callers share one fetch, and fetches are at least the on-demand
+// interval apart: the kid comes from an unverified token, so without the
+// limit anyone could make ZeroID fetch the issuer's keys once per request.
+func (c *Client) RefreshIfMissing(ctx context.Context, kid string) bool {
 	if c.HasKID(kid) {
 		return false
 	}
+	c.onDemandMu.Lock()
+	defer c.onDemandMu.Unlock()
+	// Another caller may have fetched it while this one waited.
+	if c.HasKID(kid) {
+		return true
+	}
+	if c.onDemandInterval > 0 && time.Since(c.lastOnDemand) < c.onDemandInterval {
+		return false
+	}
+	c.lastOnDemand = time.Now()
 
 	c.logger.Info().Str("kid", kid).Msg("unknown kid, refreshing JWKS")
 	if err := c.refresh(ctx); err != nil {
 		c.logger.Error().Err(err).Msg("on-demand JWKS refresh failed")
 		return false
 	}
-	return true
+	return c.HasKID(kid)
 }
 
 // Close stops the background refresh goroutine and releases resources.
-func (c *JWKSClient) Close() {
+func (c *Client) Close() {
 	c.cancel()
 	<-c.done
 }
 
-func (c *JWKSClient) refresh(ctx context.Context) error {
+func (c *Client) refresh(ctx context.Context) error {
 	fetchCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancel()
 
@@ -256,7 +289,7 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 	// the optional jwx-go/jwkfetch companion module). We already manage an
 	// http.Client here, so do the GET ourselves and feed the body into
 	// jwk.Parse — keeps the dependency footprint flat.
-	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, c.jwksURL, nil)
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, c.url, nil)
 	if err != nil {
 		return fmt.Errorf("build JWKS request: %w", err)
 	}
@@ -268,7 +301,7 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("JWKS endpoint returned status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBodyBytes))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return fmt.Errorf("read JWKS body: %w", err)
 	}
@@ -307,7 +340,7 @@ func (c *JWKSClient) refresh(ctx context.Context) error {
 	return nil
 }
 
-func (c *JWKSClient) refreshLoop(ctx context.Context) {
+func (c *Client) refreshLoop(ctx context.Context) {
 	defer close(c.done)
 	ticker := time.NewTicker(c.refreshInterval)
 	defer ticker.Stop()

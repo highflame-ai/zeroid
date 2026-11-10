@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	zeroid "github.com/highflame-ai/zeroid"
@@ -416,4 +417,221 @@ func TestAuthorize_WhitespaceOnlyScopeDoesNotWiden(t *testing.T) {
 	scope, _ := decode(t, tokenResp)["scope"].(string)
 	assert.Equal(t, "tools:read", scope,
 		"the grant must stay at the principal's scopes; tools:admin is the client's registered scope and was never held or requested")
+}
+
+// TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling: an identity whose
+// row-level allowed_scopes is narrower than its identity policy must get the
+// intersection on an omitted-scope api_key grant. apiKeyGrant used to skip the
+// row-level narrowing whenever the policy had scopes of its own, then
+// IssueCredential's legacy subset check rejected the policy's extra scope —
+// so every such key failed to exchange at all. Forge's per-sandbox inference
+// identity (tools:* on the row, tenant default policy carrying nhi:manage)
+// hit exactly this, and the gateway answered 401 invalid_credential.
+func TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("apikey-wide-policy"),
+		"allowed_grant_types": []string{"api_key"},
+		"allowed_scopes":      []string{"nhi:manage", "tools:read", "tools:execute"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	externalID := uid("apikey-narrow-row")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":                 externalID,
+		"external_id":          externalID,
+		"sub_type":             "code_agent",
+		"created_by":           "test-user",
+		"credential_policy_id": policyID,
+		"allowed_scopes":       []string{"tools:read", "tools:execute"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode)
+	scope, _ := decode(t, tokenResp)["scope"].(string)
+	assert.Contains(t, scope, "tools:read")
+	assert.Contains(t, scope, "tools:execute")
+	assert.NotContains(t, scope, "nhi:manage")
+}
+
+// TestAPIKeyGrant_DisjointRowAndPolicyRejected: when the identity row and its
+// policy share no scope, an omitted-scope grant must be refused. Narrowing to
+// the empty set and minting anyway produced a token with no `scopes` claim,
+// which Shield reads as "no ceiling to check" — an unrestricted token for an
+// identity whose two ceilings together permit nothing.
+func TestAPIKeyGrant_DisjointRowAndPolicyRejected(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("apikey-disjoint-policy"),
+		"allowed_grant_types": []string{"api_key"},
+		"allowed_scopes":      []string{"nhi:manage"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	externalID := uid("apikey-disjoint-row")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":                 externalID,
+		"external_id":          externalID,
+		"sub_type":             "code_agent",
+		"created_by":           "test-user",
+		"credential_policy_id": policyID,
+		"allowed_scopes":       []string{"tools:read"},
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	tokenResp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, tokenResp.StatusCode,
+		"disjoint row and policy ceilings must refuse the grant, not mint a token with no scopes claim")
+	assert.Equal(t, "invalid_scope", decode(t, tokenResp)["error"])
+}
+
+// TestAPIKeyGrant_EmptyRowDoesNotRestrictPolicyScopes pins the other edge of
+// the unconditional row narrowing: an identity with no row-level
+// allowed_scopes places no restriction, so the policy alone decides — for
+// both an explicit and an omitted request.
+func TestAPIKeyGrant_EmptyRowDoesNotRestrictPolicyScopes(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("apikey-emptyrow-policy"),
+		"allowed_grant_types": []string{"api_key"},
+		"allowed_scopes":      []string{"nhi:manage", "tools:read"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	externalID := uid("apikey-emptyrow")
+	resp := post(t, adminPath("/agents/register"), map[string]any{
+		"name":                 externalID,
+		"external_id":          externalID,
+		"sub_type":             "code_agent",
+		"created_by":           "test-user",
+		"credential_policy_id": policyID,
+	}, adminHeaders())
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	apiKey, _ := decode(t, resp)["api_key"].(string)
+	require.NotEmpty(t, apiKey)
+
+	explicit := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+		"scope":      "tools:read",
+	}, nil)
+	require.Equal(t, http.StatusOK, explicit.StatusCode, "an empty row must not deny an explicit policy scope")
+	assert.Equal(t, "tools:read", decode(t, explicit)["scope"])
+
+	omitted := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "api_key",
+		"api_key":    apiKey,
+	}, nil)
+	require.Equal(t, http.StatusOK, omitted.StatusCode)
+	scope, _ := decode(t, omitted)["scope"].(string)
+	assert.ElementsMatch(t, []string{"nhi:manage", "tools:read"}, strings.Fields(scope),
+		"an omitted request on an empty row gets the policy's full ceiling")
+}
+
+// TestJWTBearer_IdentityAllowedScopesNarrowPolicyCeiling: the row-narrower-
+// than-policy case on jwt_bearer. This grant used to read the row only when
+// the policy was open, so it computed nhi:manage as grantable and
+// IssueCredential's row check then refused the whole request.
+func TestJWTBearer_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("jwtb-wide-policy"),
+		"allowed_grant_types": []string{"jwt_bearer"},
+		"allowed_scopes":      []string{"nhi:manage", "tools:read"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	agentKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	externalID := uid("jwtb-narrow-row")
+	registerIdentityWithPolicy(t, externalID, policyID, ecPublicKeyPEM(t, agentKey), []string{"tools:read"}, adminHeaders())
+	assertion := buildAssertion(t, agentKey, fetchIdentityWIMSEByExternalID(t, externalID))
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"assertion":  assertion,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "tools:read", decode(t, resp)["scope"])
+}
+
+// TestClientCredentials_IdentityAllowedScopesNarrowPolicyCeiling: the same
+// case on client_credentials, with the client registered for both scopes.
+func TestClientCredentials_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {
+	policyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                uid("cc-wide-policy"),
+		"allowed_grant_types": []string{"client_credentials"},
+		"allowed_scopes":      []string{"nhi:manage", "tools:read"},
+		"max_ttl_seconds":     3600,
+	}, adminHeaders())
+	clientID := uid("cc-narrow-row")
+	registerIdentityWithPolicy(t, clientID, policyID, "", []string{"tools:read"}, adminHeaders())
+	client := registerOAuthClient(t, clientID, []string{"nhi:manage", "tools:read"})
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     client.ClientID,
+		"client_secret": client.ClientSecret,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "tools:read", decode(t, resp)["scope"])
+}
+
+// TestTokenExchange_ActorRowNarrowsActorPolicy: the actor's registration binds
+// even when its policy restricts. A scope the policy permits but the row does
+// not is dropped from the delegation, and a request for only that scope is
+// refused with a denial that names the registration, not the policy.
+func TestTokenExchange_ActorRowNarrowsActorPolicy(t *testing.T) {
+	orchID := uid("tx-row-orch")
+	registerIdentity(t, orchID, []string{"data:read", "data:write"})
+	orchClient := registerOAuthClient(t, orchID, []string{"data:read", "data:write"})
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "client_credentials",
+		"account_id":    testAccountID,
+		"project_id":    testProjectID,
+		"client_id":     orchClient.ClientID,
+		"client_secret": orchClient.ClientSecret,
+		"scope":         "data:read data:write",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	orchToken := decode(t, resp)["access_token"].(string)
+
+	actorPolicyID := createRichCredentialPolicy(t, map[string]any{
+		"name":                 uid("tx-row-actor-cp"),
+		"allowed_grant_types":  []string{"token_exchange"},
+		"allowed_scopes":       []string{"data:read", "data:write"},
+		"max_delegation_depth": 5,
+		"max_ttl_seconds":      3600,
+	}, adminHeaders())
+	actorKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	actorExternalID := uid("tx-row-actor")
+	registerIdentityWithPolicy(t, actorExternalID, actorPolicyID,
+		ecPublicKeyPEM(t, actorKey), []string{"data:read"}, adminHeaders())
+	actorURI := fetchIdentityWIMSEByExternalID(t, actorExternalID)
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, actorKey, actorURI),
+		"scope":         "data:read data:write",
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "data:read", decode(t, resp)["scope"])
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": orchToken,
+		"actor_token":   buildAssertion(t, actorKey, actorURI),
+		"scope":         "data:write",
+	}, nil)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body := decode(t, resp)
+	assert.Equal(t, "invalid_scope", body["error"])
+	assert.Contains(t, body["error_description"], "the actor identity is not registered for [data:write]")
 }

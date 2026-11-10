@@ -92,9 +92,9 @@ func TestTokenGate_AudienceAndResourceRejectedBeforeAnythingElse(t *testing.T) {
 func TestTokenGate_MalformedResourceRejectedBeforeGrantDispatch(t *testing.T) {
 	svc := &OAuthService{}
 
-	// client_credentials would normally fail with invalid_request for a missing
-	// account_id/project_id. Getting invalid_target instead proves validation
-	// ran before dispatch.
+	// client_credentials would normally fail with invalid_client for a missing
+	// client_id. Getting invalid_target instead proves validation ran before
+	// dispatch.
 	_, err := svc.Token(context.Background(), TokenRequest{
 		GrantType: "client_credentials",
 		Resource:  []string{"https://gw.example/mcp#frag"},
@@ -106,10 +106,10 @@ func TestTokenGate_NoResourceLeavesGrantsUntouched(t *testing.T) {
 	svc := &OAuthService{}
 
 	// Without `resource`, client_credentials must reach its own validation and
-	// fail on the missing tenant — proving the gate is inert when the parameter
-	// is absent rather than intercepting every request.
+	// fail on the missing client authentication — proving the gate is inert
+	// when the parameter is absent rather than intercepting every request.
 	_, err := svc.Token(context.Background(), TokenRequest{GrantType: "client_credentials"})
-	wantOAuthError(t, err, oautherror.InvalidRequest)
+	wantOAuthError(t, err, oautherror.InvalidClient)
 }
 
 func TestTokenGate_UnknownGrantStillUnsupportedGrantType(t *testing.T) {

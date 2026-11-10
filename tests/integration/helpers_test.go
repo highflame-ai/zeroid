@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +88,16 @@ var testDB *bun.DB
 // service for external-principal exchange. The value is echoed back as the
 // service name (the `trusted_by` claim).
 const testTrustedServiceHeader = "X-Test-Trusted-Service"
+
+// testApproverSubHeader stands in for a deployer's user-authentication layer
+// on the CIBA approve/deny endpoints: when present, the test global middleware
+// sets a session-authenticated zeroid.ApproverIdentity with this subject.
+const testApproverSubHeader = "X-Test-Approver-Sub"
+
+// testApprovalChannelWriteHeader stands in for a deployer's most trusted admin
+// caller: when present, the test global middleware marks the request with
+// zeroid.WithTrustedApprovalChannelWrite.
+const testApprovalChannelWriteHeader = "X-Test-Approval-Channel-Write"
 
 // testInteractiveLoginURL is the stub consent surface for the #276 tests.
 const testInteractiveLoginURL = "https://studio.example.test/login"
@@ -264,6 +276,8 @@ func runTests(m *testing.M) int {
 		// fixtures serve a key set from an httptest listener on 127.0.0.1,
 		// which the SSRF guard blocks by default. Production keeps this false —
 		// a registered jwks_uri is attacker-supplied wherever DCR is open.
+		// Client secrets use the default (SHA-256) storage, so the bcrypt
+		// upgrade path runs end to end (client_secret_hash_test.go).
 		ClientAuth: zeroid.ClientAuthConfig{
 			AllowPrivateJWKSEndpoints: true,
 		},
@@ -307,6 +321,18 @@ func runTests(m *testing.M) int {
 			if r.Header.Get(testTrustedServiceHeader) != "" {
 				r = r.WithContext(context.WithValue(r.Context(), trustedServiceCtxKey{}, r.Header.Get(testTrustedServiceHeader)))
 			}
+			if r.Header.Get(testApprovalChannelWriteHeader) != "" {
+				r = r.WithContext(zeroid.WithTrustedApprovalChannelWrite(r.Context()))
+			}
+			if sub := r.Header.Get(testApproverSubHeader); sub != "" {
+				r = r.WithContext(zeroid.WithApproverIdentity(r.Context(), zeroid.ApproverIdentity{
+					Subject: sub,
+					Issuer:  testApproverIssuer,
+					Auth:    zeroid.ApproverAuthSession,
+					Email:   sub + "@approver.example.test",
+					Name:    "Approver " + sub,
+				}))
+			}
 			next.ServeHTTP(w, r)
 		})
 	})
@@ -342,6 +368,19 @@ func runTests(m *testing.M) int {
 			return nil, zeroid.ErrPrincipalInteractionRequired
 		}
 
+		// Denial trigger: stands in for a consent front end reporting that the
+		// authenticated user declined.
+		// "with-interaction" joins it with ErrPrincipalInteractionRequired, to
+		// pin that the denial wins: the handler must not restart a login the
+		// user has just declined.
+		switch req.Header("X-Test-Access-Denied") {
+		case "":
+		case "with-interaction":
+			return nil, errors.Join(zeroid.ErrPrincipalInteractionRequired, zeroid.ErrPrincipalAccessDenied)
+		default:
+			return nil, zeroid.ErrPrincipalAccessDenied
+		}
+
 		acct := req.Header("X-Test-Principal-Account")
 		if acct == "" {
 			return nil, zeroid.ErrPrincipalNotApplicable
@@ -363,10 +402,14 @@ func runTests(m *testing.M) int {
 	//   test_principal_account → AccountID (required to "apply")
 	//   test_principal_project → ProjectID
 	//   test_principal_user    → UserID
+	//   test_principal_email   → UserEmail
+	//   test_principal_name    → UserName
 	//   test_principal_scopes  → Scopes (space-separated; empty means the
 	//                            principal has no scope restriction of its
 	//                            own — see Principal.Scopes)
 	//   test_principal_reject  → "true" returns a non-sentinel error
+	//   test_principal_deny    → "true" returns ErrPrincipalAccessDenied,
+	//                            wrapped (resolvers may wrap it)
 	//   (anything else)        → ErrPrincipalNotApplicable
 	//
 	// Registered second, after the header stub above; it reads req.Form, so
@@ -374,6 +417,9 @@ func runTests(m *testing.M) int {
 	srv.RegisterPrincipalResolver("test-stub", func(_ context.Context, req *zeroid.AuthorizeRequest) (*zeroid.Principal, error) {
 		if req.Form("test_principal_reject") == "true" {
 			return nil, fmt.Errorf("stub resolver: deliberate rejection for test")
+		}
+		if req.Form("test_principal_deny") == "true" {
+			return nil, fmt.Errorf("stub consent: user declined: %w", zeroid.ErrPrincipalAccessDenied)
 		}
 		acct := req.Form("test_principal_account")
 		if acct == "" {
@@ -383,6 +429,8 @@ func runTests(m *testing.M) int {
 			AccountID: acct,
 			ProjectID: req.Form("test_principal_project"),
 			UserID:    req.Form("test_principal_user"),
+			UserEmail: req.Form("test_principal_email"),
+			UserName:  req.Form("test_principal_name"),
 			Scopes:    strings.Fields(req.Form("test_principal_scopes")),
 		}, nil
 	})
@@ -499,8 +547,12 @@ func adminHeaders() map[string]string {
 }
 
 // uid returns a unique agent ID for each test to avoid conflicts.
+// uidSeq breaks ties: two uid calls inside one clock tick (two in the same
+// struct literal, say) returned the same value and collided on unique keys.
+var uidSeq atomic.Int64
+
 func uid(prefix string) string {
-	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	return fmt.Sprintf("%s-%d-%d", prefix, time.Now().UnixNano(), uidSeq.Add(1))
 }
 
 // ── Platform setup helpers ────────────────────────────────────────────────────
@@ -515,6 +567,8 @@ type identityResp struct {
 type oauthClientResp struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
+	// Key is a private_key_jwt client's signing key; nil for a secret client.
+	Key *ecdsa.PrivateKey `json:"-"`
 }
 
 // registerIdentity calls POST /api/v1/identities and returns the created identity.

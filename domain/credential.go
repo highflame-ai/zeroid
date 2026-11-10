@@ -99,9 +99,12 @@ type IssuedCredential struct {
 	RevokeReason    string     `bun:"revoke_reason,type:text"       json:"revoke_reason,omitempty"`
 	GrantType       GrantType  `bun:"grant_type,type:varchar(50)"   json:"grant_type"`
 	DelegationDepth int        `bun:"delegation_depth"              json:"delegation_depth"`
-	ParentJTI       string     `bun:"parent_jti,type:varchar(255)"  json:"parent_jti,omitempty"`
+	// ParentJTI is NULL, not '', for a credential with no parent: the cascade
+	// walk's partial index and planner stats assume undelegated rows are NULL.
+	ParentJTI string `bun:"parent_jti,type:varchar(255),nullzero" json:"parent_jti,omitempty"`
 	// DelegatedByWIMSEURI records the orchestrator that delegated authority (RFC 8693 token_exchange).
-	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text" json:"delegated_by_wimse_uri,omitempty"`
+	// NULL, not '', when nothing delegated: its index is partial on IS NOT NULL.
+	DelegatedByWIMSEURI string `bun:"delegated_by_wimse_uri,type:text,nullzero" json:"delegated_by_wimse_uri,omitempty"`
 	// MissionID is a stable, opaque identifier for a delegation tree —
 	// equal to the root credential's JTI today; consumers MUST treat it
 	// as opaque so the population scheme can evolve. Denormalised onto
@@ -120,4 +123,22 @@ type IssuedCredential struct {
 	// rows written before migration 037; those fall back to the legacy
 	// expires_at prune rule.
 	AuditRetentionUntil *time.Time `bun:"audit_retention_until" json:"audit_retention_until,omitempty"`
+	// PrincipalType, PrincipalSub and PrincipalIss record the principal whose
+	// authority this credential's chain uses (RFC 8693 §4.1): the RFC 9493
+	// issuer-plus-subject pair, and whether it is a person or a workload.
+	// Written for every credential whatever the tenant's token profile, and
+	// copied unchanged down a delegation chain, so revoking a person reaches
+	// every chain acting for them in one indexed lookup. Empty on rows written
+	// before migration 048. PrincipalSub differs from Subject, which is always
+	// the identity's WIMSE URI.
+	PrincipalType PrincipalType `bun:"principal_type,type:varchar(20),nullzero" json:"principal_type,omitempty"`
+	PrincipalSub  string        `bun:"principal_sub,type:text,nullzero"         json:"principal_sub,omitempty"`
+	PrincipalIss  string        `bun:"principal_iss,type:text,nullzero"         json:"principal_iss,omitempty"`
+	// RefreshFamilyID is the refresh-token family this access token was issued
+	// under: the authorization_code exchange that started the family, every
+	// refresh_token rotation within it, and the external-principal exchange
+	// when it mints a refresh token. Revoking the family (refresh-token reuse,
+	// authorization-code replay) revokes these access tokens with it. Empty
+	// for every other grant and for rows written before migration 055.
+	RefreshFamilyID string `bun:"refresh_family_id,type:uuid,nullzero" json:"refresh_family_id,omitempty"`
 }

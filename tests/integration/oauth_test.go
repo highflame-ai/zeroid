@@ -119,6 +119,10 @@ func TestJWTBearerFlow(t *testing.T) {
 	accessToken := token["access_token"].(string)
 	assert.Equal(t, "Bearer", token["token_type"])
 	assert.NotEmpty(t, accessToken)
+	// The request named no tenant, so the response is where an embedder
+	// attributing issuance (AuthN's metering) learns it.
+	assert.Equal(t, testAccountID, token["account_id"], "response must name the token's tenant")
+	assert.Equal(t, testProjectID, token["project_id"], "response must name the token's tenant")
 
 	// Introspect: token should be active with correct sub.
 	result := introspect(t, accessToken)
@@ -153,7 +157,7 @@ func TestJWTBearerWrongKey(t *testing.T) {
 // TestTokenExchangeFlow exercises the full RFC 8693 token_exchange / agent delegation flow:
 // - orchestrator gets a client_credentials token (subject_token)
 // - sub-agent builds a signed assertion (actor_token)
-// - exchange produces a delegated token with act.sub = orchestrator WIMSE URI
+// - exchange produces a delegated token with sub = orchestrator, act.sub = sub-agent
 func TestTokenExchangeFlow(t *testing.T) {
 	// Set up orchestrator (billing agent) — uses client_credentials.
 	orchID := uid("orchestrator")
@@ -194,20 +198,24 @@ func TestTokenExchangeFlow(t *testing.T) {
 	delegatedToken := token["access_token"].(string)
 	assert.NotEmpty(t, delegatedToken)
 	assert.Equal(t, "data:read", token["scope"])
-
-	// Introspect: verify delegation chain.
-	result := introspect(t, delegatedToken)
-	assert.True(t, result["active"].(bool))
-	assert.Equal(t, subIdentity.WIMSEURI, result["sub"], "sub should be the sub-agent")
-
-	act, ok := result["act"].(map[string]any)
-	require.True(t, ok, "act claim must be present for token_exchange")
+	assert.Equal(t, testAccountID, token["account_id"], "response must name the token's tenant")
+	assert.Equal(t, testProjectID, token["project_id"], "response must name the token's tenant")
 
 	// Derive orchestrator WIMSE URI from introspecting its token.
 	orchIntrospect := introspect(t, orchToken)
 	orchWIMSEURI := orchIntrospect["sub"].(string)
 
-	assert.Equal(t, orchWIMSEURI, act["sub"], "act.sub should be the orchestrator WIMSE URI")
+	// Introspect: verify delegation chain.
+	result := introspect(t, delegatedToken)
+	assert.True(t, result["active"].(bool))
+	assert.Equal(t, orchWIMSEURI, result["sub"], "sub should stay the orchestrator")
+
+	act, ok := result["act"].(map[string]any)
+	require.True(t, ok, "act claim must be present for token_exchange")
+	assert.Equal(t, subIdentity.WIMSEURI, act["sub"], "act.sub should be the sub-agent WIMSE URI")
+	// The root grant's client acted for the orchestrator, so it is the prior
+	// actor nested inside: the orchestrator's client_id, its external_id.
+	assert.Equal(t, map[string]any{"sub": orchID}, act["act"], "the root's client is the prior actor")
 }
 
 // TestTokenExchangeScopeEnforcement verifies that a sub-agent cannot request scopes
@@ -380,13 +388,15 @@ func TestTokenExchangeWithRS256SubjectToken(t *testing.T) {
 	assert.Equal(t, "data:read", token["scope"])
 
 	// Introspect: verify delegation chain.
+	orchWIMSE := introspect(t, orchToken)["sub"].(string)
+	require.Contains(t, orchWIMSE, "spiffe://", "the api_key token's sub is the orchestrator WIMSE URI")
 	result := introspect(t, delegatedToken)
 	assert.True(t, result["active"].(bool))
-	assert.Equal(t, subIdentity.WIMSEURI, result["sub"], "sub should be the sub-agent WIMSE URI")
+	assert.Equal(t, orchWIMSE, result["sub"], "sub should stay the orchestrator WIMSE URI")
 
 	act, ok := result["act"].(map[string]any)
 	require.True(t, ok, "act claim must be present")
-	assert.Contains(t, act["sub"], "spiffe://", "act.sub should be the orchestrator WIMSE URI")
+	assert.Equal(t, subIdentity.WIMSEURI, act["sub"], "act.sub should be the sub-agent WIMSE URI")
 
 	depth, ok := result["delegation_depth"]
 	require.True(t, ok, "delegation_depth must be present")
@@ -435,8 +445,9 @@ func TestTokenExchangeES256SubjectTokenStillWorks(t *testing.T) {
 
 // TestMultiHopDelegation verifies that token_exchange can be chained:
 // orchestrator (depth 0) → sub-agent 1 (depth 1) → sub-agent 2 (depth 2).
-// delegation_depth must increment at each hop and act.sub must reflect the
-// immediate delegator (not the original orchestrator).
+// delegation_depth must increment at each hop, sub must stay the orchestrator
+// the chain acts for, and act must nest the actors with the current one
+// outermost (RFC 8693 §4.1).
 func TestMultiHopDelegation(t *testing.T) {
 	// ── Orchestrator: client_credentials (depth 0) ─────────────────────────
 	orchID := uid("mh-orch")
@@ -472,10 +483,12 @@ func TestMultiHopDelegation(t *testing.T) {
 
 	d1 := introspect(t, depth1Token)
 	assert.True(t, d1["active"].(bool))
-	assert.Equal(t, sub1Identity.WIMSEURI, d1["sub"], "depth-1 sub should be sub-agent 1")
+	assert.Equal(t, orchWIMSE, d1["sub"], "depth-1 sub should stay the orchestrator")
 	assert.EqualValues(t, 1, d1["delegation_depth"], "depth-1 token should have delegation_depth=1")
-	act1 := d1["act"].(map[string]any)
-	assert.Equal(t, orchWIMSE, act1["sub"], "depth-1 act.sub should be orchestrator")
+	// The root grant's client (the orchestrator's client_id, its external_id)
+	// acted for the orchestrator, so it is the innermost prior actor.
+	assert.Equal(t, []string{sub1Identity.WIMSEURI, orchID}, actChain(t, d1),
+		"depth-1 act should be sub-agent 1 with the root's client nested inside")
 
 	// ── Sub-agent 2: token_exchange from sub-agent 1 (depth 2) ─────────────
 	sub2Key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -494,10 +507,10 @@ func TestMultiHopDelegation(t *testing.T) {
 
 	d2 := introspect(t, depth2Token)
 	assert.True(t, d2["active"].(bool))
-	assert.Equal(t, sub2Identity.WIMSEURI, d2["sub"], "depth-2 sub should be sub-agent 2")
+	assert.Equal(t, orchWIMSE, d2["sub"], "depth-2 sub should stay the orchestrator")
 	assert.EqualValues(t, 2, d2["delegation_depth"], "depth-2 token should have delegation_depth=2")
-	act2 := d2["act"].(map[string]any)
-	assert.Equal(t, sub1Identity.WIMSEURI, act2["sub"], "depth-2 act.sub should be sub-agent 1 (immediate delegator)")
+	assert.Equal(t, []string{sub2Identity.WIMSEURI, sub1Identity.WIMSEURI, orchID}, actChain(t, d2),
+		"depth-2 act should be sub-agent 2 (current actor), then sub-agent 1, then the root's client")
 }
 
 // TestRevokeTokenCascadesToChildren verifies that revoking a parent token via

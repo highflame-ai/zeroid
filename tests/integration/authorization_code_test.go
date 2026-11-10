@@ -33,8 +33,10 @@ func TestAuthorizationCodeCLIFlow(t *testing.T) {
 	assert.Equal(t, "Bearer", token["token_type"])
 	assert.NotEmpty(t, accessToken)
 
-	// CLI tokens are 90 days (7776000 s).
-	assert.EqualValues(t, 90*24*3600, token["expires_in"], "CLI access token TTL should be 90 days")
+	// A client with no TTL of its own and no refresh grant gets the short
+	// user-subject default, not 90 days (D14): a 90-day sub=user root outlived
+	// the person's IdP session and clamped every delegated child only to itself.
+	assert.EqualValues(t, 3600, token["expires_in"], "a no-refresh client's user access token is short-lived")
 
 	// CLI clients do NOT receive a refresh token.
 	assert.Empty(t, token["refresh_token"], "CLI clients must not receive a refresh token")
@@ -439,4 +441,47 @@ func TestAuthorizationCodeReplayRevokesTokens(t *testing.T) {
 		"client_id":     testMCPClientID,
 	}, nil)
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "refresh token should be revoked after auth code replay")
+}
+
+// TestAuthorizationCodeReplayRevokesRefreshedAccessTokens extends the
+// RFC 6749 §4.1.2 revocation to access tokens minted by refreshing the
+// code's family: replaying the code revokes them too, not only the access
+// token recorded on the code.
+func TestAuthorizationCodeReplayRevokesRefreshedAccessTokens(t *testing.T) {
+	verifier, challenge := buildPKCEPair(t)
+	code := buildAuthCode(t, testMCPClientID, uid("user-replay-refreshed"), testRedirectURI, challenge, []string{"data:read"})
+	payload := map[string]any{
+		"grant_type":    "authorization_code",
+		"client_id":     testMCPClientID,
+		"code":          code,
+		"code_verifier": verifier,
+		"redirect_uri":  testRedirectURI,
+	}
+
+	resp := post(t, "/oauth2/token", payload, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	rt1 := decode(t, resp)["refresh_token"].(string)
+
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt1,
+		"client_id":     testMCPClientID,
+	}, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	refreshed := decode(t, resp)
+	at2 := refreshed["access_token"].(string)
+	rt2 := refreshed["refresh_token"].(string)
+	require.True(t, introspect(t, at2)["active"].(bool), "precondition: the refreshed access token is active")
+
+	resp = post(t, "/oauth2/token", payload, nil) // replay the code
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	assert.False(t, introspect(t, at2)["active"].(bool),
+		"an access token minted by refreshing the code's family must be revoked on code replay")
+	resp = post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "refresh_token",
+		"refresh_token": rt2,
+		"client_id":     testMCPClientID,
+	}, nil)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "the family's current refresh token is revoked too")
 }

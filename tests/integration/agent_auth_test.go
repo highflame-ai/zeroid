@@ -52,8 +52,8 @@ func TestAgentAuth_AcceptsIssuedToken(t *testing.T) {
 	token := issueAPIKeyToken(t, uid("agent-auth-accepts"))
 
 	resp := post(t, "/agents/self/public-key", map[string]any{
-		"new_public_key": "not-a-real-key",
-		"new_key_proof":  "not-a-real-proof",
+		"new_public_key_pem": "not-a-real-key",
+		"new_key_proof":      "not-a-real-proof",
 	}, map[string]string{"Authorization": "Bearer " + token})
 	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
@@ -76,8 +76,8 @@ func TestAgentAuth_SameTokenBothDoors(t *testing.T) {
 		"precondition: forward-auth must accept this token")
 
 	agent := post(t, "/agents/self/public-key", map[string]any{
-		"new_public_key": "not-a-real-key",
-		"new_key_proof":  "not-a-real-proof",
+		"new_public_key_pem": "not-a-real-key",
+		"new_key_proof":      "not-a-real-proof",
 	}, map[string]string{"Authorization": "Bearer " + token})
 	defer func() { _ = agent.Body.Close() }()
 
@@ -90,8 +90,8 @@ func TestAgentAuth_SameTokenBothDoors(t *testing.T) {
 // by a key outside the server's JWKS is still refused.
 func TestAgentAuth_RejectsForeignToken(t *testing.T) {
 	resp := post(t, "/agents/self/public-key", map[string]any{
-		"new_public_key": "not-a-real-key",
-		"new_key_proof":  "not-a-real-proof",
+		"new_public_key_pem": "not-a-real-key",
+		"new_key_proof":      "not-a-real-proof",
 	}, map[string]string{"Authorization": "Bearer " + foreignSignedToken(t)})
 	defer func() { _ = resp.Body.Close() }()
 

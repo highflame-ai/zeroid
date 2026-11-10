@@ -23,6 +23,11 @@ const (
 	// can filter the indexed signal_type column directly instead of
 	// destructuring the payload.
 	SignalTypeIdentityExpired SignalType = "identity_expired"
+	// SignalTypeIdentitySuspended fires when an identity is suspended. Kept
+	// distinct from SignalTypeRetirement because a suspension is reversible:
+	// a subscriber that tears down state for a retired identity should not
+	// do so for a suspended one.
+	SignalTypeIdentitySuspended SignalType = "identity_suspended"
 )
 
 // SignalSeverity indicates the severity level of a CAE signal.
@@ -49,7 +54,7 @@ func (t SignalType) Valid() bool {
 	switch t {
 	case SignalTypeCredentialChange, SignalTypeSessionRevoked, SignalTypeIPChange,
 		SignalTypeAnomalousBehavior, SignalTypePolicyViolation, SignalTypeRetirement,
-		SignalTypeOwnerChange, SignalTypeIdentityExpired:
+		SignalTypeOwnerChange, SignalTypeIdentityExpired, SignalTypeIdentitySuspended:
 		return true
 	}
 	return false

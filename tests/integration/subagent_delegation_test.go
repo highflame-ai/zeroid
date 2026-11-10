@@ -25,7 +25,8 @@ import (
 //   - delegation_depth = parent.depth + 1, capped by the child credential
 //     policy's max_delegation_depth,
 //   - parent_jti references the parent credential, mission_id is inherited,
-//   - the act chain records the delegating parent (act.sub = parent.sub).
+//   - sub stays the parent's sub (the principal the chain acts for) and act
+//     records the subagent as the current actor (act.sub = child WIMSE URI).
 //
 // The attenuation logic lives in OAuthService.tokenExchange +
 // CredentialService.IssueCredential + CredentialPolicyService.EnforcePolicy;
@@ -63,7 +64,7 @@ func TestSubagentDelegation_AttenuatedChildToken(t *testing.T) {
 	_, rootJTI, rootTok := issueRootCredential(t, policyID, "s9-attn-root",
 		[]string{"tools:read", "tools:write"})
 
-	_, childJTI, childTok := exchangeToken(t, policyID, "s9-attn-child",
+	childID, childJTI, childTok := exchangeToken(t, policyID, "s9-attn-child",
 		[]string{"tools:read", "tools:write"}, // child scope ceiling (superset of what it asks for)
 		[]string{"tools:read"},                // requested: strictly fewer than the parent holds
 		rootTok)
@@ -121,12 +122,22 @@ func TestSubagentDelegation_AttenuatedChildToken(t *testing.T) {
 	assert.Equal(t, parent["mission_id"], child["mission_id"],
 		"child must inherit the parent's mission_id")
 
-	// act chain records the delegating parent (RFC 8693 §4.1).
+	// sub stays the principal and act names the subagent (RFC 8693 §4.1).
+	require.NotEmpty(t, parent["sub"], "parent must carry a sub")
+	assert.Equal(t, parent["sub"], child["sub"],
+		"child sub must stay the parent's sub, the principal the chain acts for")
+	idResp := get(t, adminPath("/identities/"+childID), adminHeaders())
+	require.Equal(t, http.StatusOK, idResp.StatusCode)
+	childWIMSE, _ := decode(t, idResp)["wimse_uri"].(string)
+	_ = idResp.Body.Close()
+	require.NotEmpty(t, childWIMSE)
 	act, ok := child["act"].(map[string]any)
 	require.True(t, ok, "child token must carry an act claim")
-	require.NotEmpty(t, parent["sub"], "parent must carry a sub")
-	assert.Equal(t, parent["sub"], act["sub"],
-		"child act.sub must reference the delegating parent's sub")
+	assert.Equal(t, childWIMSE, act["sub"],
+		"child act.sub must be the subagent presenting the token")
+	require.NotEmpty(t, parent["client_id"], "parent must carry a client_id")
+	assert.Equal(t, map[string]any{"sub": parent["client_id"]}, act["act"],
+		"the root grant's client is the prior actor nested inside")
 }
 
 // TestSubagentDelegation_OverBroadScopeRejected proves the parent ceiling is

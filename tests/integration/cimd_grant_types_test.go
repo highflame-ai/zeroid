@@ -191,8 +191,10 @@ func TestCIMD_AddingAGrantToAPublishedDocumentKeepsRefreshUsable(t *testing.T) {
 			"the only revocation mechanism a zero-registration client has")
 }
 
-// Introspection and revocation stay REGISTRY-ONLY for CIMD clients, key or no
-// key (zeroid#264).
+// Introspection stays REGISTRY-ONLY for CIMD clients, key or no key
+// (zeroid#264). (Revocation accepts them since zeroid#419, but confined to the
+// client's own tokens — see cimd_revoke_test.go. Introspection has no such
+// confinement, which is why this still holds.)
 //
 // This is the regression that becomes tempting once CIMD documents carry
 // verifiable keys. VerifyPresentedClientAuth resolves the client through

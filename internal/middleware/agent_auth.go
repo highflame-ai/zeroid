@@ -15,7 +15,7 @@ import (
 // AgentClaims holds the agent identity claims extracted from a validated ES256 JWT.
 // It is populated by AgentAuthMiddleware and available via GetAgentClaims.
 type AgentClaims struct {
-	Subject    string // WIMSE URI
+	Subject    string // WIMSE URI of the presenting agent: the current actor of an rfc8693 exchanged token, else `sub`
 	AccountID  string
 	ProjectID  string
 	AgentID    string
@@ -23,6 +23,20 @@ type AgentClaims struct {
 	Scopes     []string
 	JTI        string
 	IdentityID string
+	GrantType  string // the grant that issued the token, such as "api_key" or "token_exchange"
+	// PrincipalType is the rfc8693 profile's principal_type claim ("user",
+	// "workload"); empty on legacy-profile tokens.
+	PrincipalType string
+	// UserIDIssuer is the user_id_iss claim: set when the token's subject is
+	// a person vouched for by a federated IdP.
+	UserIDIssuer string // Issuer and Audience are the token's iss and aud. ZeroID's own tokens
+	// carry the issuer as aud unless they were bound to another audience,
+	// such as a gateway or an RFC 8707 resource.
+	Issuer   string
+	Audience []string
+	// ClientAuth is the client_auth claim: "federated_assertion" when the
+	// client authenticated with a federated client assertion.
+	ClientAuth string
 }
 
 type agentClaimsKey struct{}
@@ -177,8 +191,41 @@ func extractAgentClaims(token jwt.Token) AgentClaims {
 	if v, err := jwt.Get[string](token, "trust_level"); err == nil {
 		claims.TrustLevel = v
 	}
+	// Under the rfc8693 token profile (recognised by principal_type) an
+	// exchanged token's `sub` is the principal — possibly a person — and the
+	// agent presenting it is the current actor, whose attributes are carried
+	// inside the outermost `act`. Read it the RFC 8693 way: the current actor
+	// if there is one, otherwise `sub`. Legacy-shaped tokens are unchanged.
+	if _, err := jwt.Get[string](token, "principal_type"); err == nil {
+		if act, err := jwt.Get[map[string]any](token, "act"); err == nil {
+			if actor, _ := act["sub"].(string); actor != "" {
+				claims.Subject = actor
+			}
+			if tl, _ := act["trust_level"].(string); tl != "" {
+				claims.TrustLevel = tl
+			}
+		}
+	}
 	if v, err := jwt.Get[string](token, "identity_id"); err == nil {
 		claims.IdentityID = v
+	}
+	if v, err := jwt.Get[string](token, "grant_type"); err == nil {
+		claims.GrantType = v
+	}
+	if v, err := jwt.Get[string](token, "principal_type"); err == nil {
+		claims.PrincipalType = v
+	}
+	if v, err := jwt.Get[string](token, "user_id_iss"); err == nil {
+		claims.UserIDIssuer = v
+	}
+	if v, ok := token.Issuer(); ok {
+		claims.Issuer = v
+	}
+	if v, ok := token.Audience(); ok {
+		claims.Audience = v
+	}
+	if v, err := jwt.Get[string](token, "client_auth"); err == nil {
+		claims.ClientAuth = v
 	}
 	// scopes can be []string or []any depending on issuance shape; try both.
 	if v, err := jwt.Get[[]string](token, "scopes"); err == nil {
