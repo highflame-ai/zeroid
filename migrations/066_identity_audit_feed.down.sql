@@ -3,8 +3,15 @@
 -- and drops credential policy auditing and the feed columns.
 SET LOCAL lock_timeout = '3s';
 
+DROP TRIGGER IF EXISTS credential_policy_audit_update_trigger ON credential_policies;
 DROP TRIGGER IF EXISTS credential_policy_audit_trigger ON credential_policies;
 DROP FUNCTION IF EXISTS create_credential_policy_audit_log();
+
+DROP TRIGGER IF EXISTS identity_audit_update_trigger ON identities;
+DROP TRIGGER IF EXISTS identity_audit_trigger ON identities;
+CREATE TRIGGER identity_audit_trigger
+    AFTER INSERT OR UPDATE OR DELETE ON identities
+    FOR EACH ROW EXECUTE FUNCTION create_identity_audit_log();
 
 CREATE OR REPLACE FUNCTION create_identity_audit_log()
 RETURNS trigger

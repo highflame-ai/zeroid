@@ -207,3 +207,37 @@ func TestAuditTriggers_FailClosed(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "the identity was saved without its audit row")
 }
+
+// An update that changes only bookkeeping (updated_at, which connector sync
+// bumps every pass, and modified_by) writes no audit row; a real change does.
+func TestAuditTriggers_SkipBookkeepingUpdates(t *testing.T) {
+	ctx := context.Background()
+	acct, proj := uid("acct-bookkeeping"), uid("proj-bookkeeping")
+	ident := registerIdentityIn(t, tenantHeaders(acct, proj), uid("bookkeeping"), nil)
+	h := tenantHeaders(acct, proj)
+	policyID := createCredentialPolicy(t, uid("bookkeeping-policy"), h)
+
+	count := func(table, id string) int {
+		n, err := testDB.NewSelect().Table("identity_audit_logs").
+			Where("table_name = ?", table).
+			Where("action = 'UPDATE'").
+			Where("identity_id = ? OR COALESCE(new_data, old_data) ->> 'id' = ?", id, id).
+			Count(ctx)
+		require.NoError(t, err)
+		return n
+	}
+
+	_, err := testDB.ExecContext(ctx, `UPDATE identities SET updated_at = now(), modified_by = 'system:sync' WHERE id = ?`, ident.ID)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `UPDATE credential_policies SET updated_at = now() WHERE id = ?`, policyID)
+	require.NoError(t, err)
+	assert.Zero(t, count("identities", ident.ID), "a last-seen bump is not a change")
+	assert.Zero(t, count("credential_policies", policyID))
+
+	_, err = testDB.ExecContext(ctx, `UPDATE identities SET name = 'renamed', updated_at = now() WHERE id = ?`, ident.ID)
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `UPDATE credential_policies SET max_ttl_seconds = 60 WHERE id = ?`, policyID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count("identities", ident.ID))
+	assert.Equal(t, 1, count("credential_policies", policyID))
+}

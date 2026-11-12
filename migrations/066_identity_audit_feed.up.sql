@@ -15,9 +15,13 @@
 -- OTHERS) and let the change commit without its audit row. They no longer
 -- do: a failed audit insert now fails the change.
 --
+-- BOOKKEEPING. Updates to identities and credential policies that change only
+-- updated_at (and, for identities, modified_by) are no longer audited, so
+-- connector sync's last-seen bump writes no row (see the triggers below).
+--
 -- LOCK POSTURE (cf. 045/047). Nullable columns with no default, then SET
 -- DEFAULT: both metadata-only, no table rewrite. CREATE TRIGGER takes SHARE
--- ROW EXCLUSIVE on credential_policies. lock_timeout bounds the queue wait;
+-- ROW EXCLUSIVE on identities and credential_policies. lock_timeout bounds the queue wait;
 -- a timeout leaves (66, dirty): recover with `migrate force 65`. Existing
 -- rows are numbered in 067.
 SET LOCAL lock_timeout = '3s';
@@ -264,7 +268,29 @@ BEGIN
 END;
 $BODY$;
 
+-- Updates are audited only when a column other than bookkeeping changed:
+-- updated_at, which connector sync bumps on every pass (045), and
+-- modified_by, which names who acted rather than what changed. An update
+-- trigger's WHEN can compare OLD and NEW; an insert or delete trigger's
+-- cannot, so each table gets two triggers.
 DROP TRIGGER IF EXISTS credential_policy_audit_trigger ON credential_policies;
 CREATE TRIGGER credential_policy_audit_trigger
-    AFTER INSERT OR UPDATE OR DELETE ON credential_policies
+    AFTER INSERT OR DELETE ON credential_policies
     FOR EACH ROW EXECUTE FUNCTION create_credential_policy_audit_log();
+DROP TRIGGER IF EXISTS credential_policy_audit_update_trigger ON credential_policies;
+CREATE TRIGGER credential_policy_audit_update_trigger
+    AFTER UPDATE ON credential_policies
+    FOR EACH ROW
+    WHEN ((to_jsonb(OLD) - 'updated_at') IS DISTINCT FROM (to_jsonb(NEW) - 'updated_at'))
+    EXECUTE FUNCTION create_credential_policy_audit_log();
+
+DROP TRIGGER IF EXISTS identity_audit_trigger ON identities;
+CREATE TRIGGER identity_audit_trigger
+    AFTER INSERT OR DELETE ON identities
+    FOR EACH ROW EXECUTE FUNCTION create_identity_audit_log();
+DROP TRIGGER IF EXISTS identity_audit_update_trigger ON identities;
+CREATE TRIGGER identity_audit_update_trigger
+    AFTER UPDATE ON identities
+    FOR EACH ROW
+    WHEN ((to_jsonb(OLD) - 'updated_at' - 'modified_by') IS DISTINCT FROM (to_jsonb(NEW) - 'updated_at' - 'modified_by'))
+    EXECUTE FUNCTION create_identity_audit_log();
