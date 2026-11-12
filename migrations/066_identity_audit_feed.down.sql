@@ -1,7 +1,10 @@
 -- 066_identity_audit_feed.down.sql
 -- Restores the 013/047/056 trigger functions, which catch their own errors,
--- and drops credential policy auditing and the feed columns.
+-- and drops credential policy auditing and the feed columns. Locks are taken
+-- up front in a live write's order, as in the up file.
 SET LOCAL lock_timeout = '3s';
+
+LOCK TABLE identities, credential_policies, identity_audit_logs IN ACCESS EXCLUSIVE MODE;
 
 DROP TRIGGER IF EXISTS credential_policy_audit_update_trigger ON credential_policies;
 DROP TRIGGER IF EXISTS credential_policy_audit_trigger ON credential_policies;

@@ -206,13 +206,10 @@ func (r *CredentialPolicyRepository) ListExpiringSoon(ctx context.Context, accou
 
 // Audited runs fn in a transaction that names actor as the author of its
 // credential policy writes, for the audit trigger (migration 066). It joins
-// the caller's transaction when there is one. With no actor, the rows are
-// recorded as ZeroID's own work, and fn runs as it would without this.
+// the caller's transaction when there is one, and then always sets the
+// actor, even to "", so an actor named earlier in that transaction does not
+// carry over. With no actor, the rows are recorded as ZeroID's own work.
 func (r *CredentialPolicyRepository) Audited(ctx context.Context, actor string, fn func(ctx context.Context) error) error {
-	if actor == "" {
-		return fn(ctx)
-	}
-
 	setActor := func(ctx context.Context) error {
 		if _, err := dbOrTx(ctx, r.db).ExecContext(ctx, "SELECT set_config('zeroid.audit_actor', ?, true)", actor); err != nil {
 			return fmt.Errorf("failed to set audit actor: %w", err)
@@ -222,6 +219,9 @@ func (r *CredentialPolicyRepository) Audited(ctx context.Context, actor string, 
 
 	if hasTx(ctx) {
 		return setActor(ctx)
+	}
+	if actor == "" {
+		return fn(ctx)
 	}
 
 	return r.db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {

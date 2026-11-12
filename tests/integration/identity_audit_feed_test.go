@@ -241,3 +241,41 @@ func TestAuditTriggers_SkipBookkeepingUpdates(t *testing.T) {
 	assert.Equal(t, 1, count("identities", ident.ID))
 	assert.Equal(t, 1, count("credential_policies", policyID))
 }
+
+// Deleting a credential policy clears it from the identities that used it
+// (ON DELETE SET NULL). Those identity rows name whoever deleted the policy,
+// not the identity's last editor.
+func TestIdentityAudit_PolicyDeleteCascadeNamesTheDeleter(t *testing.T) {
+	ctx := context.Background()
+	acct, proj := uid("acct-cascade"), uid("proj-cascade")
+	a := tenantHeaders(acct, proj)
+	a["X-User-ID"] = "user-cascade-a"
+	b := tenantHeaders(acct, proj)
+	b["X-User-ID"] = "user-cascade-b"
+
+	policyID := createCredentialPolicy(t, uid("cascade-policy"), a)
+	resp := post(t, adminPath("/identities"), map[string]any{
+		"external_id":          uid("cascade"),
+		"trust_level":          "unverified",
+		"owner_user_id":        "user-test-owner",
+		"credential_policy_id": policyID,
+	}, a)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	identityID := decode(t, resp)["id"].(string)
+
+	require.Equal(t, http.StatusNoContent, deleteCredentialPolicy(t, policyID, b))
+
+	var rows []zeroid.AuditFeedEntry
+	err := testDB.NewSelect().Model(&rows).
+		Where("table_name = 'identities' AND identity_id = ?", identityID).
+		OrderExpr("ial.txid, ial.seq").
+		Scan(ctx)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.Equal(t, "CREATE", rows[0].Action)
+	assert.Equal(t, "user-cascade-a", rows[0].UserID)
+	assert.Equal(t, "UPDATE", rows[1].Action)
+	assert.Equal(t, "user-cascade-b", rows[1].UserID)
+	assert.Contains(t, string(rows[1].OldData), policyID)
+	assert.Contains(t, string(rows[1].NewData), `"credential_policy_id": null`)
+}
