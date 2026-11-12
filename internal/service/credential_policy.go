@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
@@ -79,7 +80,9 @@ func (s *CredentialPolicyService) EnsureDefaultPolicy(ctx context.Context, accou
 	}
 
 	// Create the tenant's default policy with sensible production defaults.
-	policy, err := s.CreatePolicy(ctx, CreatePolicyRequest{
+	// It is ZeroID's own work, not the caller's, so its audit row names no one
+	// (migration 066).
+	policy, err := s.CreatePolicy(middleware.SetCallerName(ctx, ""), CreatePolicyRequest{
 		AccountID:          accountID,
 		ProjectID:          projectID,
 		Name:               domain.DefaultPolicyName,
@@ -202,7 +205,12 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 		// NOTHING means a concurrent/prior adoption of the same posture doesn't
 		// error (which would poison an enclosing transaction); if we didn't insert,
 		// return the existing row.
-		inserted, err := s.repo.CreateDerived(ctx, policy)
+		var inserted bool
+		err := s.repo.Audited(ctx, middleware.GetCallerName(ctx), func(ctx context.Context) error {
+			var err error
+			inserted, err = s.repo.CreateDerived(ctx, policy)
+			return err
+		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create credential policy: %w", err)
 		}
@@ -216,7 +224,9 @@ func (s *CredentialPolicyService) CreatePolicy(ctx context.Context, req CreatePo
 			}
 			return existing, nil
 		}
-	} else if err := s.repo.Create(ctx, policy); err != nil {
+	} else if err := s.repo.Audited(ctx, middleware.GetCallerName(ctx), func(ctx context.Context) error {
+		return s.repo.Create(ctx, policy)
+	}); err != nil {
 		if isDuplicateKeyError(err) {
 			return nil, ErrPolicyNameConflict
 		}
@@ -361,7 +371,9 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 	}
 
 	policy.UpdatedAt = time.Now()
-	if err := s.repo.Update(ctx, policy); err != nil {
+	if err := s.repo.Audited(ctx, middleware.GetCallerName(ctx), func(ctx context.Context) error {
+		return s.repo.Update(ctx, policy)
+	}); err != nil {
 		return nil, err
 	}
 
@@ -375,7 +387,9 @@ func (s *CredentialPolicyService) UpdatePolicy(ctx context.Context, id, accountI
 //   - ErrPolicyNotFound  → no policy with this id in the tenant (404)
 func (s *CredentialPolicyService) DeletePolicy(ctx context.Context, id, accountID, projectID string) error {
 	defer memoForget(ctx)
-	err := s.repo.Delete(ctx, id, accountID, projectID)
+	err := s.repo.Audited(ctx, middleware.GetCallerName(ctx), func(ctx context.Context) error {
+		return s.repo.Delete(ctx, id, accountID, projectID)
+	})
 	switch {
 	case err == nil:
 		return nil
