@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -105,4 +106,21 @@ func TestManagementMark_RequiresTrustedWrite(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, false, decode(t, resp)["management"], "the trusted caller still has to ask for the mark")
 	_ = resp.Body.Close()
+
+	// The audit feed records the mark on each create: one marked, the
+	// registration key and the second key not.
+	var marked, unmarked int
+	for _, r := range keyAuditRows(t, agent.AgentID) {
+		if r.Action != "CREATE_KEY" {
+			continue
+		}
+		switch {
+		case strings.Contains(r.NewData, `"management": true`):
+			marked++
+		case strings.Contains(r.NewData, `"management": false`):
+			unmarked++
+		}
+	}
+	assert.Equal(t, 1, marked)
+	assert.Equal(t, 2, unmarked)
 }
