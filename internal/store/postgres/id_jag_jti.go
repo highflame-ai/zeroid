@@ -69,3 +69,9 @@ func (s *IDJAGReplayStore) Insert(ctx context.Context, jti string, expiresAt tim
 	}
 	return err
 }
+
+// Redeemed reports whether jti has been recorded. A read-only pre-check; Insert
+// remains the atomic single-use gate.
+func (s *IDJAGReplayStore) Redeemed(ctx context.Context, jti string) (bool, error) {
+	return s.db.NewSelect().Model((*idJAGJTIRow)(nil)).Where("jti = ?", jti).Exists(ctx)
+}

@@ -3,6 +3,7 @@ package integration_test
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,5 +179,47 @@ func TestExternalPrincipalRefreshToken(t *testing.T) {
 		}, nil)
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "reused refresh token must be rejected")
 		assert.Equal(t, "invalid_grant", decode(t, resp)["error"])
+	})
+
+	// The exchange mints the family's first access token itself, before any
+	// refresh, so it has to be tied to the family at that point. Without that,
+	// reuse revokes the refresh tokens and every access token a rotation
+	// minted, but the exchange's own token stays valid until it expires.
+	t.Run("reuse revokes the exchange's own access token and the rotated one", func(t *testing.T) {
+		b := baseExchange("codeoid-rt-007")
+		b["audience"] = "codeoid"
+		b["issue_refresh_token"] = true
+
+		resp := post(t, "/oauth2/token", b, trusted)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		initial := decode(t, resp)
+		exchangeAccess := initial["access_token"].(string)
+		original := initial["refresh_token"].(string)
+
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "refresh_token",
+			"refresh_token": original,
+			"client_id":     "codeoid",
+		}, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		rotatedAccess := decode(t, resp)["access_token"].(string)
+		require.True(t, introspect(t, exchangeAccess)["active"].(bool), "precondition: the exchange's access token is active")
+		require.True(t, introspect(t, rotatedAccess)["active"].(bool), "precondition: the rotated access token is active")
+
+		// Past the reuse grace window, so the replay is reuse rather than a
+		// concurrent retry.
+		backdateRotation(t, original, time.Hour)
+		resp = post(t, "/oauth2/token", map[string]any{
+			"grant_type":    "refresh_token",
+			"refresh_token": original,
+			"client_id":     "codeoid",
+		}, nil)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		_ = resp.Body.Close()
+
+		assert.False(t, introspect(t, exchangeAccess)["active"].(bool),
+			"the access token the exchange minted belongs to the family and must be revoked with it")
+		assert.False(t, introspect(t, rotatedAccess)["active"].(bool),
+			"the access token a rotation minted must be revoked with the family")
 	})
 }

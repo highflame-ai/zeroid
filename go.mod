@@ -4,12 +4,13 @@ go 1.27.0
 
 require (
 	github.com/danielgtaylor/huma/v2 v2.37.3
-	github.com/go-chi/chi/v5 v5.2.5
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/goccy/go-json v0.10.6
-	github.com/golang-migrate/migrate/v4 v4.19.1
+	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/google/uuid v1.6.0
-	github.com/highflame-ai/zeroid/pkg/authjwt v0.0.0
-	github.com/highflame-ai/zeroid/pkg/dpop v1.6.2
+	github.com/highflame-ai/zeroid/pkg/authjwt v1.27.0
+	github.com/highflame-ai/zeroid/pkg/dpop v1.27.0
+	github.com/highflame-ai/zeroid/pkg/jwks v1.27.0
 	github.com/knadh/koanf/parsers/yaml v0.1.0
 	github.com/knadh/koanf/providers/file v1.2.0
 	github.com/knadh/koanf/v2 v2.2.0
@@ -28,8 +29,8 @@ require (
 	go.opentelemetry.io/otel/sdk v1.45.0
 	go.opentelemetry.io/otel/sdk/metric v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
-	golang.org/x/crypto v0.55.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/sync v0.24.0
 )
 
 require (
@@ -45,11 +46,10 @@ require (
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/docker v28.5.2+incompatible // indirect
-	github.com/docker/go-connections v0.6.0 // indirect
+	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
-	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -70,8 +70,8 @@ require (
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.3.0 // indirect
-	github.com/moby/moby/api v1.54.1 // indirect
-	github.com/moby/moby/client v0.4.0 // indirect
+	github.com/moby/moby/api v1.54.2 // indirect
+	github.com/moby/moby/client v0.4.1 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/moby/sys/sequential v0.7.0 // indirect
 	github.com/moby/sys/user v0.4.1 // indirect
@@ -91,12 +91,12 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.61.0 // indirect
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/grpc v1.83.2 // indirect
@@ -105,16 +105,32 @@ require (
 	mellium.im/sasl v0.3.2 // indirect
 )
 
-// pkg/authjwt is import-only-from-tests. Go does not follow test
-// imports across module boundaries, so the v0.0.0 placeholder in the
-// require directive above is invisible to downstream consumers — they
-// never try to resolve it.
+// LOCKSTEP VERSIONING. zeroid and its nested modules (pkg/authjwt,
+// pkg/dpop, pkg/jwks) all carry the SAME version, tagged at the same
+// commit on every release. The pins above therefore name the version
+// being released NEXT, not the last one — release.yml verifies they
+// equal the release tag, and tags all three modules at that commit.
+//
+// This is what makes drift impossible rather than merely detected. A
+// nested module's tag points at the commit whose go.mod names it, so
+// "go.mod references a stale submodule" has no representable state.
+// The previous scheme gave pkg/dpop a decoupled cadence and caught
+// drift with a guard at release time — but for a Go module PUBLISHING
+// IS PUSHING THE TAG, so the guard could only report a bad release
+// after it was already consumable. v1.9.3 shipped exactly that way.
+//
+// The cost is version numbers advancing without changes, and one
+// forward jump (pkg/dpop v1.6.3 -> v1.9.4) to join the shared line.
+// Both are cheap next to a release that cannot be un-published.
 //
 // Local replaces keep in-repo builds working when GOWORK=off (Docker
 // `go mod download`, some CI paths). Downstream consumers ignore
-// replace directives, so the require pins above remain what the proxy
-// serves. pkg/dpop's pin is still a real published tag (release-dpop
-// cadence + release.yml drift guard). See RELEASING.md.
+// replace directives, so the require pins above are what the proxy
+// actually serves — which is why they must name real tags, and why
+// pkg/authjwt's old v0.0.0 placeholder made every release from v1.7.1
+// unresolvable. See RELEASING.md.
 replace github.com/highflame-ai/zeroid/pkg/authjwt => ./pkg/authjwt
 
 replace github.com/highflame-ai/zeroid/pkg/dpop => ./pkg/dpop
+
+replace github.com/highflame-ai/zeroid/pkg/jwks => ./pkg/jwks

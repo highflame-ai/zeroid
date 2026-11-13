@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
@@ -23,8 +25,8 @@ import (
 // ErrIdentityAlreadyExists is returned when (account_id, project_id, external_id) already exists.
 var ErrIdentityAlreadyExists = errors.New("identity already exists")
 
-// ErrInvalidIdentityField marks caller-fixable input errors on registration
-// (currently the SPIFFE path-segment check). Maps to 400 at the HTTP boundary.
+// ErrInvalidIdentityField marks caller-fixable input errors on identity writes
+// (SPIFFE path segments, enums, public_key_pem). Maps to 400 at the HTTP boundary.
 var ErrInvalidIdentityField = errors.New("invalid identity field")
 
 // ErrIdentityNotFound is returned by lookup methods when no identity matches
@@ -71,28 +73,49 @@ func NewIdentityService(
 	}
 }
 
+// invalidPublicKeyPEM is the caller-facing prefix for every public_key_pem
+// rejection; the specific reason follows it.
+const invalidPublicKeyPEM = "invalid public_key_pem: must be a PEM-encoded P-256 (ES256) public key"
+
 // validateECPublicKeyPEM ensures the provided PEM string is a valid EC P-256 public key.
-// Returns nil if keyPEM is empty (the field is optional).
+// Returns nil if keyPEM is empty (the field is optional). Every rejection wraps
+// ErrInvalidIdentityField so handlers answer 400, not 500.
 func validateECPublicKeyPEM(keyPEM string) error {
 	if keyPEM == "" {
 		return nil
 	}
 	block, _ := pem.Decode([]byte(keyPEM))
-	if block == nil || block.Type != "PUBLIC KEY" {
-		return errors.New("invalid public_key_pem: must be a PEM block of type PUBLIC KEY")
+	if block == nil {
+		return fmt.Errorf("%w: %s: no PEM block found", ErrInvalidIdentityField, invalidPublicKeyPEM)
+	}
+	if block.Type != "PUBLIC KEY" {
+		return fmt.Errorf("%w: %s: PEM block type is %q, want \"PUBLIC KEY\"", ErrInvalidIdentityField, invalidPublicKeyPEM, block.Type)
 	}
 	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return fmt.Errorf("invalid public_key_pem: %w", err)
+		// The asn1 detail is noise to a caller; the shape that failed is not.
+		return fmt.Errorf("%w: %s: PEM body is not a DER-encoded SPKI public key", ErrInvalidIdentityField, invalidPublicKeyPEM)
 	}
 	ecKey, ok := pub.(*ecdsa.PublicKey)
 	if !ok {
-		return errors.New("invalid public_key_pem: not an ECDSA key")
+		return fmt.Errorf("%w: %s: key type is %s, want ECDSA", ErrInvalidIdentityField, invalidPublicKeyPEM, publicKeyKind(pub))
 	}
 	if ecKey.Curve.Params().Name != "P-256" {
-		return fmt.Errorf("invalid public_key_pem: must use P-256 curve, got %s", ecKey.Curve.Params().Name)
+		return fmt.Errorf("%w: %s: curve is %s, want P-256", ErrInvalidIdentityField, invalidPublicKeyPEM, ecKey.Curve.Params().Name)
 	}
 	return nil
+}
+
+// publicKeyKind names a parsed non-ECDSA public key for an error message.
+func publicKeyKind(pub any) string {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return "RSA"
+	case ed25519.PublicKey:
+		return "Ed25519"
+	default:
+		return fmt.Sprintf("%T", pub)
+	}
 }
 
 // RegisterIdentityRequest holds parameters for identity registration.
@@ -115,7 +138,7 @@ type RegisterIdentityRequest struct {
 	// native identities.
 	SourceID      string
 	OwnerUserID   string
-	AllowedScopes []string // Deprecated: set scope ceiling on the identity's credential policy.
+	AllowedScopes []string // The identity's absolute scope ceiling (docs/scope-ceilings.md).
 	PublicKeyPEM  string
 	Framework     string
 	Version       string
@@ -149,6 +172,13 @@ type RegisterIdentityRequest struct {
 // is adopted (identity-lifecycle.md). The discovery service reaches this path
 // through UpsertDiscoveredIdentity (idempotent on external_id), not directly.
 func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if err := requireTrustedPolicyAttachment(ctx, s.policySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
+		return nil, err
+	}
 	if req.Origin == "" {
 		req.Origin = domain.OriginNative
 	}
@@ -255,20 +285,23 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		CredentialPolicyID: policyID,
 		AllowedScopes:      req.AllowedScopes,
 		PublicKeyPEM:       req.PublicKeyPEM,
-		Framework:          req.Framework,
-		Version:            req.Version,
-		Publisher:          req.Publisher,
-		Description:        req.Description,
-		Capabilities:       req.Capabilities,
-		Labels:             req.Labels,
-		Metadata:           req.Metadata,
-		CapabilityTier:     req.CapabilityTier,
-		RiskTier:           req.RiskTier,
-		IAL:                req.IAL,
-		ExpiresAt:          req.ExpiresAt,
-		CreatedBy:          req.CreatedBy,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		// The register gate above already refused an untrusted approval
+		// channel, so only the mark itself is recorded here.
+		PublicKeyChannelTrusted: req.PublicKeyPEM != "" && TrustedApprovalChannelWrite(ctx),
+		Framework:               req.Framework,
+		Version:                 req.Version,
+		Publisher:               req.Publisher,
+		Description:             req.Description,
+		Capabilities:            req.Capabilities,
+		Labels:                  req.Labels,
+		Metadata:                req.Metadata,
+		CapabilityTier:          req.CapabilityTier,
+		RiskTier:                req.RiskTier,
+		IAL:                     req.IAL,
+		ExpiresAt:               req.ExpiresAt,
+		CreatedBy:               req.CreatedBy,
+		CreatedAt:               time.Now(),
+		UpdatedAt:               time.Now(),
 	}
 
 	if err := s.repo.Create(ctx, identity); err != nil {
@@ -346,6 +379,10 @@ type DiscoveredIdentityRequest struct {
 //
 // Returns the resulting identity and whether it was newly created.
 func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, nil); err != nil {
+		return nil, false, err
+	}
 	if !req.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: a discovered identity requires an external origin (got %q)", ErrInvalidIdentityField, req.Origin)
 	}
@@ -459,6 +496,21 @@ func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredId
 func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *domain.Identity, req DiscoveredIdentityRequest) (*domain.Identity, bool, error) {
 	if !identity.Origin.IsExternal() {
 		return nil, false, fmt.Errorf("%w: external_id %q already belongs to a native identity", ErrIdentityAlreadyExists, identity.ExternalID)
+	}
+	// Discovery never modifies an approval channel: its configuration
+	// (metadata included) is managed only through trusted writes. The row is
+	// returned unchanged.
+	channel, err := s.IsApprovalChannel(ctx, identity)
+	if err != nil {
+		return nil, false, err
+	}
+	if channel {
+		log.Info().
+			Str("identity_id", identity.ID).
+			Str("external_id", identity.ExternalID).
+			Str("origin", string(req.Origin)).
+			Msg("discovery reconcile skipped an approval-channel identity")
+		return identity, false, nil
 	}
 	applyDiscoveredOwnerAttribution(identity, req)
 	// Adopt a source_id only when the row doesn't already have one (e.g. it was
@@ -705,6 +757,13 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 	return s.repo.GetByID(ctx, id, accountID, projectID)
 }
 
+// GetIdentitiesByIDs returns the identities among ids that live in the given
+// tenant. Ids that are missing or belong to another tenant are dropped, so a
+// caller can use the result as a tenant-membership check for a batch of ids.
+func (s *IdentityService) GetIdentitiesByIDs(ctx context.Context, ids []string, accountID, projectID string) ([]*domain.Identity, error) {
+	return s.repo.GetByIDs(ctx, ids, accountID, projectID)
+}
+
 // SetPublicKey replaces the identity's EC actor-assertion public key (the key
 // used to verify its self-signed assertion on the jwt_bearer and token_exchange
 // grants). The PEM is validated as an SPKI EC P-256 key. Persisted via
@@ -715,13 +774,17 @@ func (s *IdentityService) GetIdentity(ctx context.Context, id, accountID, projec
 // identity.
 func (s *IdentityService) SetPublicKey(ctx context.Context, id, accountID, projectID, publicKeyPEM string) (*domain.Identity, error) {
 	if err := validateECPublicKeyPEM(publicKeyPEM); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidIdentityField, err)
+		return nil, err
 	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
+		return nil, err
+	}
 	identity.PublicKeyPEM = publicKeyPEM
+	identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	if err := s.repo.Update(ctx, identity); err != nil {
 		return nil, err
 	}
@@ -820,6 +883,20 @@ type UpdateIdentityRequest struct {
 
 // UpdateIdentity updates mutable fields of an existing identity.
 func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, projectID string, req UpdateIdentityRequest) (*domain.Identity, error) {
+	// Approval-channel grants need a trusted caller (approval_channel_write.go).
+	if err := requireTrustedApprovalChannelWrite(ctx, req.SubType, req.AllowedScopes); err != nil {
+		return nil, err
+	}
+	if req.CredentialPolicyID != nil {
+		if err := requireTrustedPolicyAttachment(ctx, s.policySvc, *req.CredentialPolicyID, accountID, projectID); err != nil {
+			return nil, err
+		}
+	}
+	// Input-only check, so it runs before the row is read. Empty means "leave
+	// the key unchanged" — this path cannot clear an enrolled key.
+	if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		return nil, err
+	}
 	identity, err := s.repo.GetByID(ctx, id, accountID, projectID)
 	if err != nil {
 		return nil, err
@@ -855,10 +932,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		identity.AllowedScopes = req.AllowedScopes
 	}
 	if req.PublicKeyPEM != "" {
-		if err := validateECPublicKeyPEM(req.PublicKeyPEM); err != nil {
+		if err := s.RequireTrustedCredentialWrite(ctx, identity); err != nil {
 			return nil, err
 		}
 		identity.PublicKeyPEM = req.PublicKeyPEM
+		identity.PublicKeyChannelTrusted = TrustedApprovalChannelWrite(ctx)
 	}
 	if req.Framework != nil {
 		identity.Framework = *req.Framework
@@ -903,6 +981,11 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) &&
 			identity.OwnerUserID == "" {
 			return nil, fmt.Errorf("%w: adopting a discovered identity requires an owner_user_id", ErrInvalidIdentityField)
+		}
+		if priorStatus == domain.IdentityStatusDiscovered &&
+			(*req.Status == domain.IdentityStatusPending || *req.Status == domain.IdentityStatusActive) {
+			now := time.Now()
+			identity.AdoptedAt = &now
 		}
 		identity.Status = *req.Status
 	}
@@ -959,6 +1042,12 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if priorStatus != domain.IdentityStatusExpired &&
 		identity.Status == domain.IdentityStatusExpired {
 		s.runDeactivationCleanup(ctx, identity, "expired")
+	}
+	// Fresh transition into suspended: the identity can already mint nothing
+	// (IsUsable), so cut off what it still holds. See runSuspensionCleanup.
+	if priorStatus != domain.IdentityStatusSuspended &&
+		identity.Status == domain.IdentityStatusSuspended {
+		s.runSuspensionCleanup(ctx, identity)
 	}
 	return identity, nil
 }
@@ -1329,6 +1418,7 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 		identity.Status = domain.IdentityStatusDiscovered
 		identity.OwnerUserID = ""
 		identity.CredentialPolicyID = defaultPolicyID
+		identity.AdoptedAt = nil
 		identity.UpdatedAt = time.Now()
 		if err := s.repo.Update(ctx, identity); err != nil {
 			return nil, err
@@ -1348,18 +1438,12 @@ func (s *IdentityService) DismissIdentity(ctx context.Context, id, accountID, pr
 // CAE signal payload so subscribers can distinguish "deactivated" from
 // "deleted" cleanups.
 func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *domain.Identity, reason string) {
-	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID); err != nil {
+	if err := s.apiKeyRepo.RevokeByIdentityID(ctx, identity.ID, revocationActor(ctx, "identity_revocation"), reason); err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
 			Msg("identity cleanup: failed to revoke linked API keys")
 	}
 
-	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
-		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
-			Msg("identity cleanup: failed to revoke active credentials")
-	} else if n > 0 {
-		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
-			Msg("identity cleanup: revoked active credentials (cascade)")
-	}
+	s.revokeActiveCredentials(ctx, identity, reason)
 
 	// Auto-expiry gets its own signal type so CAE subscribers can filter
 	// the indexed signal_type column directly (e.g. for offboarding-driven
@@ -1370,6 +1454,42 @@ func (s *IdentityService) runDeactivationCleanup(ctx context.Context, identity *
 	if reason == "expired" {
 		signalType = domain.SignalTypeIdentityExpired
 	}
+	s.emitLifecycleSignal(ctx, identity, signalType, reason)
+}
+
+// runSuspensionCleanup cuts off the credentials a suspended identity already
+// holds. Without it a suspension only stopped issuance, and every live token
+// (and every token delegated from one) kept working until it expired.
+//
+// The revocation cascades over the parent_jti subtree, as deactivation does:
+// a sub-agent's delegated token carries the suspended identity's authority.
+// The sub-agent's own identity is not suspended and can still mint its own.
+//
+// Unlike deactivation, linked API keys are left alone, so a suspension stays
+// reversible: the IsUsable gate refuses issuance while suspended, and a
+// reactivated identity mints fresh credentials with the same keys.
+func (s *IdentityService) runSuspensionCleanup(ctx context.Context, identity *domain.Identity) {
+	const reason = "identity_suspended"
+	s.revokeActiveCredentials(ctx, identity, reason)
+	s.emitLifecycleSignal(ctx, identity, domain.SignalTypeIdentitySuspended, reason)
+}
+
+// revokeActiveCredentials cascade-revokes an identity's active credentials.
+// Best-effort, like the rest of the lifecycle cleanup: the status change has
+// already been written.
+func (s *IdentityService) revokeActiveCredentials(ctx context.Context, identity *domain.Identity, reason string) {
+	if n, err := s.credentialSvc.RevokeAllActiveForIdentity(ctx, identity.ID, reason); err != nil {
+		log.Warn().Err(err).Str("identity_id", identity.ID).Str("reason", reason).
+			Msg("identity cleanup: failed to revoke active credentials")
+	} else if n > 0 {
+		log.Info().Str("identity_id", identity.ID).Str("reason", reason).Int64("count", n).
+			Msg("identity cleanup: revoked active credentials (cascade)")
+	}
+}
+
+// emitLifecycleSignal emits the high-severity CAE signal for a lifecycle
+// change. Best-effort: a failure is logged, not returned.
+func (s *IdentityService) emitLifecycleSignal(ctx context.Context, identity *domain.Identity, signalType domain.SignalType, reason string) {
 	if _, err := s.signalSvc.IngestSignal(
 		ctx,
 		identity.AccountID,

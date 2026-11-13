@@ -61,3 +61,31 @@ func (r *AuditLogRepository) List(ctx context.Context, accountID, projectID, ide
 	}
 	return entries, nil
 }
+
+// AuditFeedEntry is an audit row with its place in the feed (migration 066).
+type AuditFeedEntry struct {
+	AuditLogEntry `bun:",extend"`
+
+	// TxID is the writing transaction's id (xid8), in its decimal text form.
+	TxID string `bun:"txid" json:"txid"`
+	Seq  int64  `bun:"seq"  json:"seq"`
+}
+
+// Feed returns up to limit rows after (afterTxID, afterSeq), in (txid, seq)
+// order, from finished transactions only: a row whose transaction is still
+// open, or was open when this read's snapshot was taken, is left for a later
+// read. Every transaction below pg_snapshot_xmin has finished, so paging this
+// way never passes a row that commits late. Sequence order alone would.
+func (r *AuditLogRepository) Feed(ctx context.Context, afterTxID string, afterSeq int64, limit int) ([]AuditFeedEntry, error) {
+	var entries []AuditFeedEntry
+
+	err := r.db.NewSelect().
+		Model(&entries).
+		Where("(ial.txid, ial.seq) > (?::xid8, ?)", afterTxID, afterSeq).
+		Where("ial.txid < pg_snapshot_xmin(pg_current_snapshot())").
+		OrderExpr("ial.txid, ial.seq").
+		Limit(limit).
+		Scan(ctx)
+
+	return entries, err
+}

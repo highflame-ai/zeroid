@@ -126,7 +126,7 @@ This document uses the following terms:
   by following `parent_jti` edges. Identified by `mission_id` (Section 5.4).
 - **Deployer** — the operator embedding the ZeroID library/service and supplying
   its pluggable hooks (`PrincipalResolver`, `BackchannelNotifier`,
-  `TrustedServiceValidator`, `RevocationNotifier`, `ClaimsEnricher`, grant
+  `TrustedServiceValidator`, `RevocationNotifier`, `PersonGrantResolver`, grant
   handlers).
 - **Trusted service** — an internal caller that has passed the deployer's
   `TrustedServiceValidator` gate (Section 5.5).
@@ -210,7 +210,9 @@ self-asserted.
 passed. Tokens are issued only for an `active` identity; the cleanup worker and
 CAE cascade move identities out of `active` fail-closed (an expired identity is
 swept to `expired` and its live credentials are cascade-revoked; see Section 9's
-`identity_expired` signal).
+`identity_expired` signal). Suspension also cascade-revokes the live credentials
+(`identity_suspended` signal) but keeps the identity's API keys, so it stays
+reversible.
 
 ## 4. JWT Claim Extensions
 
@@ -221,8 +223,15 @@ CIBA) sign with **RS256**. The claims below are emitted for the relevant NHI;
 the ones flagged *agent-shaped* characterise an Agent Identity
 (`identity_type = agent`, Section 3.2) and are normally absent on a plain
 service, application, or MCP-server NHI. The `kid` header selects the verifying key
-from the JWKS; `typ` is `JWT`. Beyond the RFC 7519 registered claims, ZeroID
-emits the following.
+from the JWKS. `typ` is `at+jwt` (RFC 9068 §2.1) under either token profile,
+unless the identity's credential policy sets `jwt_typ = JWT` so the token stays
+a conformant JWT-SVID (JWT-SVID
+§2.3 permits only `JWT` or `JOSE`, so a token can satisfy one of the two specs,
+not both). Beyond the RFC 7519 registered claims, ZeroID emits the following.
+
+Each tenant issues in one **token profile** (Section 4.4): `rfc8693`, the
+default, which adopts the RFC 8693 delegation semantics, or `legacy`. Claims
+below are common to both unless marked.
 
 ### 4.1 Tenancy and grant claims (always present)
 
@@ -232,6 +241,8 @@ emits the following.
 | `project_id` | string | Tenant project scope. |
 | `grant_type` | string | The grant that minted this credential. Most grants serialize in short form: `client_credentials`, `jwt_bearer`, `token_exchange`, `api_key`, `authorization_code`, `refresh_token`. CIBA is the exception — its claim value is the full URN `urn:openid:params:grant-type:ciba`. (Note: on the **request** the `grant_type` parameter for `token_exchange` and `jwt_bearer` uses the full IETF URN forms, e.g. `urn:ietf:params:oauth:grant-type:token-exchange`; the **claim** uses the short form for those two. CIBA matches in both places.) |
 | `mission_id` | string | Delegation-tree identifier; see Section 5.4. Always present. Opaque to consumers. |
+| `client_id` | string | RFC 9068 §2.2: the OAuth client the token was issued to. On an exchanged token this is the actor (its `external_id`); on `authorization_code`, `refresh_token`, ID-JAG and ID-token exchange it is the authenticated client. |
+| `principal_type` | string | *`rfc8693` profile only.* Whether `sub` is a person (`user`) or a workload (`workload`), or `unknown` for a chain exchanged from a delegated parent minted before principals were recorded. A private claim (RFC 7519 §4.3): no standard claim types `sub`. ZeroID records the principal of every credential for every tenant whatever the profile, and introspection reports it as `principal_type`, `principal_sub` and `principal_iss`, so a legacy token, whose `sub` is the actor, still names its principal. |
 
 `aud` is always present; when the request supplies no audience it defaults to
 the issuer URL (JWT-SVID §3 requires `aud`).
@@ -272,26 +283,62 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
 | Claim | Type | Presence | Description |
 |---|---|---|---|
 | `scopes` | array&lt;string&gt; | when non-empty | Granted scopes. (ZeroID emits the JSON array `scopes`, in addition to the standard space-delimited `scope` on the token *response*.) |
+| `scope` | string | when non-empty, `rfc8693` profile | The RFC 9068 §2.2.3 space-delimited form of `scopes`, emitted beside it until consumers move. |
+| `roles` | array&lt;string&gt; | person root, when the deployer's person-grant resolver returns roles | RFC 9068 §2.2.3.1 roles of the person `sub` names. Only on the token minted for the person, never on a token delegated from it. See Section 5.1c. |
 | `delegation_depth` | number | when &gt; 0 | Number of `token_exchange` hops from the root; see Section 5.2. Omitted (≡ 0) for a directly-issued credential. |
 | `application_id` | string | when set | OAuth client / application the token was issued for (`api_key`, `authorization_code`). |
 | `user_email` | string | when set | End-user email (human/external-principal/CIBA paths). |
 | `user_name` | string | when set | End-user display name (same paths). |
 
-### 4.4 Delegation actor claim (`act`)
+### 4.4 Delegation: `sub`, `act` and the token profile
 
-ZeroID populates the RFC 8693 §4.1 `act` claim as a single-level object
-`{"sub": "<principal>"}`, used in two mutually-exclusive ways on a given token:
+**`rfc8693` profile.** ZeroID follows RFC 8693 §4.1 delegation semantics:
 
-1. **Agent delegation** (*agent-shaped*) — `act.sub` is the **orchestrator
-   agent's WIMSE URI** (the agent that delegated). Set on `token_exchange`-issued
-   tokens; this is the orchestrator → sub-agent chain of Section 5.
-2. **User context** (any NHI) — `act.sub` is the **end-user id** the NHI is
-   acting for. Set when an NHI acts on behalf of a human (e.g. `jwt_bearer`,
-   `authorization_code`-delegated flows). This case is not agent-specific.
+- `sub` is the **principal** whose authority the chain uses — a person, or the
+  root workload — and is fixed for the life of the chain, through every
+  exchange and refresh (RFC 9068 §2.2). `principal_type` says which. A user
+  principal also carries `user_id_iss`, its issuer: the upstream IdP's for a
+  federated user whose `sub` is the IdP subject, otherwise ZeroID's own
+  (including a federated person a person resolver mapped to the deployer's
+  user, whose IdP pair is in `user_idp_iss`/`user_idp_sub`), forming an RFC 9493
+  `iss_sub` pair.
+- `act` is the **current actor**, with prior actors nested inside it, most
+  recent first:
+  `{"sub": "<C>", "identity_type": "agent", "trust_level": "...", "external_id": "<c>", "act": {"sub": "<B>", "act": {"sub": "<A>"}}}`.
+  Only workloads appear; the person is never an actor. The current actor's own
+  attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
+  the outermost `act` rather than at the top level, because the top level
+  describes the principal. Prior actors carry only `sub`. On an exchange from a
+  root grant, the root token's `client_id` becomes the first prior actor. The
+  chain is capped at 16 actors for token size; past it the deepest prior actors
+  are dropped, which §4.1 allows because they are informational.
+- A root grant has no `act`. An `api_key` token in particular carries none: the
+  key's creator is not acting, and stays identity metadata in `owner_user_id`.
 
-A token carries at most one `act`. ZeroID's `act` is a single object, not the
-nested `act` chain RFC 8693 permits; the full lineage is reconstructable from
-the `parent_jti` edges rather than by nesting.
+**Rule for resource servers.** Decide on the top-level claims and the current
+actor. The person behind a call is `sub` when `principal_type` is `user`;
+otherwise there is none. The agent is `act.sub`, or `sub` when there is no
+`act`. Nested actors are audit history, not grounds for access.
+
+**`legacy` profile (opt-in).** `act` is a single-level object
+`{"sub": "<x>"}` whose meaning depends on the grant: on an exchanged token it
+is the parent's `sub` (the delegating agent, or the person after the first hop),
+and `sub` is the actor; on an `api_key` token it is the key's creator. The full
+lineage is reconstructable from the `parent_jti` edges. Consumers should read a
+legacy token's current actor as `sub` (`pkg/authjwt` `CurrentActor()` does).
+Tokens are told apart by `principal_type`, which only the `rfc8693` profile
+emits.
+
+The profile is a per-tenant setting (`PUT /tenant-settings`, `token_profile`).
+A tenant that has not set one is on `rfc8693`.
+Switching a tenant to `rfc8693` revokes its user-subject access tokens
+longer-lived than the short default, cascading to their descendants.
+
+**`may_act` (RFC 8693 §4.4).** When a subject token carries `may_act`, the
+exchange's actor MUST be the party it names (`sub` equal to the actor's WIMSE
+URI; an `iss` member, if present, equal to ZeroID's issuer), or the exchange
+fails with `invalid_grant`. `may_act` is reserved (Section 8); ZeroID does not
+yet emit it.
 
 ### 4.5 Sender-constraint claim (`cnf.jkt`)
 
@@ -315,7 +362,8 @@ broker (Section 5.5) and the direct OIDC ID-token federation path (Section 5.6):
 |---|---|---|---|
 | `token_exchange` | string | `external_principal`, `external_id_token`, or `ciba` | Marks a synthesised-principal token and which path minted it. `external_id_token` is the direct-federation path (Section 5.6). |
 | `trusted_by` | string | service name | The trusted internal service (from `TrustedServiceValidator`) that vouched for the external principal. Only on the `external_principal` path. |
-| `user_id_iss` | string | upstream `iss` | **IdP-granular provenance** — the issuer URL of the upstream OpenID Provider that authenticated the subject, copied verbatim from the verified ID token. Only on the `external_id_token` path (Section 5.6). Lets a consumer answer "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). Reserved (Section 8) so a caller cannot forge it. |
+| `user_id_iss` | string | issuer of `sub` | The issuer of the person in `sub`, forming an RFC 9493 `iss_sub` pair with it. On the ID-JAG and `external_id_token` paths with no person resolver (static issuers), `sub` is the IdP subject and this is the upstream IdP's `iss`, copied from the verified token: **IdP-granular provenance** that answers "*which* IdP authenticated this user" from the token alone (NIST SP 800-63C §4.1). With a person resolver, `sub` is the deployer's user and this is ZeroID's issuer, and the IdP's pair is in `user_idp_iss`/`user_idp_sub` instead. Under `rfc8693` every user-subject token carries it (ZeroID's issuer for a locally resolved person, e.g. `authorization_code`), and exchanged tokens keep their parent's. Reserved (Section 8) so a caller cannot forge it. |
+| `user_idp_iss` / `user_idp_sub` | string | upstream `iss` / user key | The person's pair at the IdP — its issuer, and the subject the issuer's `claim_mapping.user_id` names (e.g. Entra `oid`, Okta `sub`) — when the deployer's person resolver mapped them to its own user. `sub` is then that user and `user_id_iss` ZeroID's issuer, so `user_id_iss` always names `sub`'s issuer. On the ID-JAG and `external_id_token` paths, only with a resolver installed. Reserved (Section 8). |
 | `auth_time` / `acr` / `amr` | per RFC 9068 | passthrough | RFC 9068 authentication-context claims, copied verbatim from the upstream ID token **only** when the issuer's `propagate_claims` config lists them **and** the upstream token actually carried them. Never synthesised or default-filled — these are only meaningful as the IdP's own assertion. `external_id_token` path only. |
 | `role` | string | gated | Authorization role. Settable **only** on the trusted external-principal path, from a dedicated request field — never via `additional_claims`. See Section 8. |
 | `privilege_scope` | array&lt;string&gt; | gated | Authorization privilege scopes. Same gating as `role`. |
@@ -337,11 +385,11 @@ The CIBA token's `sub` is the **approving user**, its `grant_type` claim is
 
 ### 4.8 Deployment-specific claims
 
-Deployers MAY inject additional claims through two mechanisms:
-
-- the `ClaimsEnricher` hook (server-side, applies to issuance), and
-- the `additional_claims` request field on the external-principal exchange
-  (caller-supplied, blocklist-gated per Section 8).
+Deployers MAY inject additional claims through the `additional_claims`
+request field on the external-principal exchange (caller-supplied,
+blocklist-gated per Section 8). The `ClaimsEnricher` hook is deprecated: it
+was never invoked at issuance. A person's roles come from the person-grant
+resolver (Section 5.1c).
 
 Coding-agent task fields surfaced by the SDKs (`session_id`, `task_id`,
 `task_type`, `allowed_tools`, `workspace`, `environment`) are **not**
@@ -359,18 +407,71 @@ that make agent orchestration attributable. The terms **orchestrator** and
 **sub-agent** below are agent roles (Section 3.2); a delegation between
 non-agent NHIs uses the same mechanism without those role labels.
 
-### 5.1 Scope attenuation (three-way intersection)
+### 5.1 Scope attenuation (intersection)
 
 On an NHI delegation exchange the issued scope set **MUST** equal the
-intersection of:
+intersection of (an empty set places no restriction, except the subject token's):
 
 1. the scopes **requested** (`scope` parameter),
 2. the scopes the **orchestrator** (subject_token) actually holds, and
-3. the `allowed_scopes` of the **sub-agent's** (actor) credential policy.
+3. the **actor's ceiling**: the `allowed_scopes` of the sub-agent's credential
+   policy when the chain's principal is a workload, or its `user_grant_scopes`
+   when the principal is a person. An empty `user_grant_scopes` adds no cap; the
+   person's own grant, carried in the subject token's scopes, bounds the chain.
+4. the sub-agent **identity's own** `allowed_scopes`, its absolute ceiling under
+   either principal (see `docs/scope-ceilings.md`). `user_grant_scopes` replaces
+   the policy's `allowed_scopes` for a person's chain; it never lifts the
+   identity's ceiling.
+
+The split ceiling exists because an agent's own authority and what it may hold
+for a person rarely overlap: agents are registered for their own scopes and
+discover the resources they act on at run time. `user_grant_scopes` applies
+wherever the person's grant is itself bounded (a delegated user chain, ID-JAG,
+`authorization_code`, and refresh of an `authorization_code` family); the
+trusted-broker, ID-token and CIBA roots, bounded only by the caller's request,
+keep `allowed_scopes`.
+
+The response carries `issued_token_type`
+(`urn:ietf:params:oauth:token-type:access_token`, RFC 8693 §2.2.1) on every
+exchange mode.
 
 A delegated credential can therefore never hold a scope its delegator lacked,
 nor one the sub-agent's policy forbids. Requesting a scope outside the
 intersection is silently narrowed (the scope is dropped), not granted.
+
+### 5.1a Principal requirement (`required_principal_type`)
+
+A credential policy MAY set `required_principal_type = user`. Every grant the
+identity uses is then refused with `policy_violation` unless the token's chain
+acts for a person: the identity cannot mint its own workload token, and as an
+actor it refuses a workload-rooted subject token. A chain with an `unknown`
+principal never satisfies it. This closes authority laundering, where an agent
+holding both a person's token and its own broader workload token exchanges
+whichever is broader. An API key's policy may require more than its identity's
+policy, never less.
+
+### 5.1b Unbounded scopes (the ceiling rule)
+
+Somewhere in a chain, something other than the requester must bound the scopes.
+ZeroID counts, per identity, tokens issued for a named scope with no configured
+ceiling — a workload whose every ceiling was empty, or a request-bounded user
+root whose policy sets neither `allowed_scopes` nor `user_grant_scopes` and
+whose person-grant ceiling (Section 5.1c) was not enforced — as
+`zeroid_workload_unbounded_scope_total`. These are not yet refused.
+
+### 5.1c A person's ceiling (person-grant resolver)
+
+A deployer MAY install a person-grant resolver. Every token minted for a
+person (`authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG,
+ID-token exchange, the trusted external-principal exchange) is then issued
+with scope = request (or its default) ∩ the ceiling the resolver returns for
+that person, and a request that leaves nothing is refused with
+`invalid_scope` (`invalid_grant` on `authorization_code` and refresh at the
+token endpoint; `invalid_scope` at the authorization endpoint). An empty ceiling grants
+nothing; `openid` is never removed. Token exchange and a CIBA step-up carry
+their chain's principal and are not consulted. A shadow mode counts what
+enforcement would change without changing it. The resolver's roles are
+emitted as `roles` (Section 4.3). Details: `docs/scope-ceilings.md`.
 
 ### 5.2 Delegation depth tracking and capping
 
@@ -378,6 +479,19 @@ Each exchange increments `delegation_depth` by 1 relative to the subject token.
 The actor's credential policy `max_delegation_depth` caps the chain: an exchange
 that would exceed it **MUST** be rejected. `delegation_depth` is emitted as a
 claim only when &gt; 0 (Section 4.3).
+
+Under the `rfc8693` profile, an exchange whose actor already **is** the subject
+token's current actor (its `act.sub`, ADR 0043 D2) is a re-scoping, not a
+delegation: the actor replaces itself as the current actor rather than
+nesting, and `delegation_depth` does not increase. The legacy profile is
+frozen (ADR 0043 D1) and delegates on every exchange as before. This is the agent narrowing the person
+token an ID-JAG or ID-token exchange minted naming it as `act`. `parent_jti`
+still links the child for cascade revocation.
+
+The principal's IdP pair, `user_idp_iss` and `user_idp_sub` (Section 4.6), is copied from
+the verified subject token onto every exchanged token whose `sub` is that
+person (`rfc8693`), like `user_id_iss`; it describes the principal, never an
+actor, and remains reserved.
 
 ### 5.3 NHI delegation requires an actor proof-of-possession
 
@@ -430,6 +544,24 @@ control. Rotation of an already-enrolled key additionally **REQUIRES** a
 new — so possession of a stolen access token alone cannot swap an enrolled
 key.
 
+An administrator can also supply the key as `public_key_pem` on
+`POST /agents/register`, `POST /identities`, `PATCH /agents/registry/{id}`
+(admin recovery, no proof-of-possession) and `PATCH /identities/{id}`. On every
+path the value **MUST** be a PEM `PUBLIC KEY` block holding an SPKI EC P-256
+key; anything else (an RSA or P-384 key, a private-key block, non-PEM text) is
+rejected with `400` and a detail of the form `invalid public_key_pem: must be a
+PEM-encoded P-256 (ES256) public key: <reason>`. On the two `PATCH` paths an
+empty or omitted value leaves the enrolled key unchanged; no admin path clears
+one.
+
+The agent registry (`GET /agents/registry`, `GET /agents/registry/{id}`, and
+every agent write response, including `POST /agents/self/public-key`) never
+returns the PEM. It reports enrollment as `has_public_key` (boolean, always
+present) and `public_key_thumbprint`: the RFC 7638 JWK SHA-256 thumbprint of the
+enrolled key, base64url without padding — the same form as a DPoP `cnf.jkt`,
+and **not** the SPKI-DER hash used for `nkt` above — omitted when no key is
+enrolled. `GET /identities/{id}` still returns `public_key_pem` itself.
+
 ### 5.4 `mission_id` — delegation-tree identifier
 
 `mission_id` is an opaque, stable identifier shared by every credential in a
@@ -478,24 +610,58 @@ A request selects this mode with `subject_token_type =
 urn:ietf:params:oauth:token-type:id_token` and `subject_token` set to the
 upstream ID token. The mode:
 
-- Is gated by a deployer-configured allowlist of **external issuers**
-  (`external_issuers`), keyed by the upstream `iss`. A token whose `iss` is not
-  configured **MUST** be rejected (`invalid_request`). The
+- Is gated by trusted **external issuers** (the static `external_issuers` list,
+  or per-account issuer rows), keyed by the upstream `iss`. The client is
+  authenticated first; a token whose `iss` is not trusted, or names a disabled
+  or workload issuer, **MUST** be rejected with one generic `invalid_grant`, so
+  an unverified token cannot reveal which issuers are trusted. The
   `TrustedServiceValidator` gate of Section 5.5 deliberately does **not** apply
-  here — the JWKS signature check, issuer allowlist, and audience binding *are*
-  the trust anchor.
+  here — the JWKS signature check, issuer allowlist, audience binding and
+  client binding below *are* the trust anchor.
+- **MUST** authenticate the redeeming client (absent client credentials →
+  `invalid_client`) with its registered method; with per-account issuer rows
+  only `private_key_jwt` is accepted and a client secret is `invalid_client`
+  (ADR 0042 D3a); static issuers (standalone) keep secrets. And
+  **MUST** redeem only for the relying party the ID token was issued to (OpenID
+  Connect Core §2, §3.1.3.7): the authenticated `client_id` must be one of the
+  token's `aud` values, `azp`, if present, must be a string equal to it, and a token with
+  several audiences must carry `azp`. A mismatch is `invalid_grant`. Without
+  this, anyone holding a person's ID token could mint a token with that person
+  as `sub`. Since an ID token's `aud` is the relying party's `client_id`, the
+  ZeroID client is registered with that same `client_id`, and the issued token
+  carries it as `client_id`.
 - **MUST** verify the ID token's signature against the issuer's JWKS (fetched
   from the configured `jwks_uri`, cached, refreshed once on an unknown `kid` to
   absorb upstream key rotation), and **MUST** enforce `iss` (equal to the
-  matched issuer), `aud` (equal to the issuer's configured `audience`), `exp`,
-  `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
+  matched issuer), `aud` (naming one of the issuer's configured audiences),
+  `exp`, `nbf`, and the **presence** of both `sub` and `exp` (the underlying JWT
   library honors but does not require them). A 60-second clock skew is tolerated.
+- **MUST** accept only a token that is positively an ID token: `iss`, `sub`,
+  `aud`, `exp` and `iat` present, and no access-token marker (`scp`, `scope`,
+  Entra's `azpacr`/`appidacr`, or a JWS `typ` of `at+jwt` / `application/at+jwt`
+  (RFC 9068 §2.1) or `oauth-id-jag+jwt`). Together
+  with the relying-party check above this separates an ID token from an access
+  token a trusted issuer also signs.
+- **MUST** accept only an issuer of kind `person`, and refuse a workload
+  subject (Entra `idtyp=app`, a `system:serviceaccount:` subject, a SPIFFE ID,
+  a GitHub Actions `repo:` subject)
+  with `invalid_grant`, since the minted token carries `principal_type=user`.
 - **MUST** reject any JWS `alg` outside the asymmetric allow-list (JWT-SVID §3,
   Section 7.2) and outside the issuer's configured `algorithms` (default
   `RS256`, `ES256`, `PS256`); `none` and HMAC are rejected.
 - Caps replay: the ID token's `iat` **MUST** be within the issuer's
   `max_token_age` (default 10 minutes).
-- Binds the upstream token to a ZeroID tenant via the issuer's
+- With per-account issuer rows (`federation.issuer_store=db`), derives the
+  tenant instead: the account from the issuer row, the project from the agent
+  identity the authenticated client is bound to, and a caller-supplied
+  `account_id`/`project_id` that differs is `invalid_grant`. The bound agent is
+  the current actor in `act`, and the deployer's person resolver must find the
+  person in the account; the token's `sub` is the resolved user, its
+  `user_id_iss` is ZeroID's issuer, and the IdP's issuer and subject are carried
+  in the reserved `user_idp_iss` and `user_idp_sub` claims. See
+  [external-issuers.md](../external-issuers.md).
+- With a static issuer (standalone), binds the upstream token to a ZeroID
+  tenant via the issuer's
   **`allowed_accounts`** — a **REQUIRED, non-empty** list; the request's
   `account_id` **MUST** appear in it. Because the ID token's `aud` binds it to
   ZeroID-the-RP (not to a tenant) and `account_id` is caller-supplied on the
@@ -504,7 +670,8 @@ upstream ID token. The mode:
   `allowed_accounts` at config load (fail closed).
 - Maps the principal from the issuer's `claim_mapping` (`user_id` REQUIRED,
   becomes `sub`; OPTIONAL `email`, `name`).
-- Emits `token_exchange=external_id_token` and `user_id_iss=<upstream iss>`, and
+- Emits `token_exchange=external_id_token` and, unless a person resolver mapped
+  `sub` to the deployer's user, `user_id_iss=<upstream iss>`, and
   propagates `auth_time`/`acr`/`amr` per the issuer's `propagate_claims`
   (Section 4.6). Is RS256-signed with a short (900 s) TTL and is governed by the
   tenant credential-policy ceiling (the tenant default policy when no
@@ -653,12 +820,20 @@ iss sub aud exp nbf iat jti
 account_id project_id user_id owner_user_id external_id identity_type
 sub_type trust_level status name framework version publisher capabilities
 scopes grant_type delegation_depth user_email user_name
+# RFC 8707 / RFC 9068 / RFC 8693 issued-for and delegation
+resource client_id scope may_act
 # ZeroID internal / provenance
-act token_exchange trusted_by user_id_iss
+act token_exchange trusted_by user_id_iss user_idp_iss user_idp_sub mission_id principal_type
 # RFC 9449 sender-constraint
 cnf
+# RFC 8707 resource binding, RFC 9068 client attribution
+resource client_id
 # Authorization (gated)
-role privilege_scope
+role privilege_scope roles
+# Step-up approvals (RFC 9396)
+authorization_details approval_id
+# Agent provenance
+origin agent_idp_iss agent_idp_parent
 ```
 
 Special cases:
@@ -671,6 +846,20 @@ Special cases:
   **dedicated request fields** (`role`, `privilege_scope`) — i.e. only *after*
   the `TrustedServiceValidator` gate. Empty values are omitted, preserving
   byte-identical tokens for callers that don't use them.
+
+- `roles` is never settable through any request field: ZeroID writes it only
+  from the deployer's person-grant resolver, on a person's own token
+  (Section 5.1c).
+
+- `authorization_details` is written **only** on the CIBA path, from the
+  approved backchannel request, with ZeroID stamping `approval_id` into each
+  entry. A resource server that honours an approval entry (Highflame Shield's
+  step-up) relies on no other grant being able to carry one; `approval_id` is
+  also reserved at the top level so no caller can mint a look-alike.
+- `origin`, `agent_idp_iss` and `agent_idp_parent` describe where an agent was
+  registered (native, or an external IdP such as Entra or Okta). Policies use
+  them to tell the two apart, so no caller may set them; ZeroID does not mint
+  them yet.
 
 This makes the `additional_claims` route fail closed regardless of which grant
 is in play.
@@ -693,6 +882,7 @@ is a ZeroID-defined extension.
 | `retirement` | Identity is being retired. |
 | `owner_change` | The owner of an identity changed. |
 | `identity_expired` | A time-bound identity reached its expiry. |
+| `identity_suspended` | An identity was suspended (reversible; not a retirement). |
 
 ### 9.2 Severity
 
@@ -1093,12 +1283,14 @@ overrides the document.
   Changed in zeroid#344.
 - When `cimd.allowed_domains` is non-empty, every `https://` `redirect_uris`
   entry **MUST** be on the `client_id`'s own host or on that allow-list. **This
-  is a deviation**, and it is what makes the allow-list load-bearing for Section
-  12.5: allow-listing a publisher vets the destination only if the destination is
-  vetted too, and on a host with multiple publishers it otherwise does not.
-  Loopback `http://` and private-use schemes are exempt — they resolve on the
-  caller's own device, not at a published host. Constrains nothing in open mode,
-  where those redirects are refused regardless.
+  is a deviation.** ZeroID redirects to a resolved CIMD client's `redirect_uri`
+  like any other client's (Section 12.5), so allow-listing a publisher vets the
+  destination only if the destination is vetted too — on a host with multiple
+  publishers it otherwise does not. Loopback `http://` and private-use schemes are
+  exempt — they resolve on the caller's own device, not at a published host. With
+  an empty allow-list (open mode) this check does not run and any `https://`
+  destination is accepted; that is the open-redirect surface Section 12.5
+  describes.
 - `response_types`, when present, **MUST** include `code`.
 - Outer-shape validation only, by default. Per-type schema validation is opt-in
   through the `RegisterAuthorizationDetailValidator`-style hook pattern.
@@ -1107,47 +1299,29 @@ A CIMD `client_id` is **not** accepted as an authenticated client at the
 introspection or revocation endpoints; the `none` advertised in those metadata
 arrays (Section 11.1) applies to *registered* public clients only.
 
-### 12.5 Error reporting is not redirected to an unvetted remote destination
+### 12.5 Error reporting and redirects for CIMD clients
 
 RFC 6749 §4.1.2.1 requires most authorization-endpoint failures to be reported by
-redirecting to the client's registered `redirect_uri`. ZeroID does that for
-registered clients and **deliberately does not for CIMD clients whose publishing
-host is not on an allow-list**, which answer with an RFC 6749 §5.2 JSON body
-instead. The interactive-authentication redirect
-(`ErrPrincipalInteractionRequired`) is likewise refused for them.
+redirecting to the client's `redirect_uri`. ZeroID does that for registered and
+CIMD clients alike, on GET, once the client and `redirect_uri` have been
+validated (step 3.5 of `/oauth2/authorize`). The interactive-authentication
+redirect (`ErrPrincipalInteractionRequired`, GET only) follows the same rule, and
+so does the `access_denied` redirect for a resource owner's explicit denial
+(`ErrPrincipalAccessDenied`), which is the one error also redirected on POST.
+Everything else is answered with an RFC 6749 §5.2 JSON body: the two §4.1.2.1
+exemptions (a `client_id` that does not resolve, a `redirect_uri` that is missing
+or not registered for the client), and every other failure on POST.
 
-The rule presumes `redirect_uri` was vetted at registration. Under CIMD it is
-self-asserted, and with no `allowed_domains` allow-list (Section 12.7, the default)
-any host may publish a document naming any destination — so the redirect target is
-attacker-chosen. Honouring §4.1.2.1 there yields an unauthenticated open redirect
-from the authorization server's own origin, because the failure being reported is
-precisely "no credential was presented".
+`cimd.allowed_domains` (Section 12.7) is enforced in exactly one place: document
+resolution. A host that is not listed never resolves, so a CIMD client that reaches
+a redirect has already been admitted by the deployer's policy; gating the redirect
+again would ask the same question twice.
 
-Configuring `cimd.allowed_domains` re-establishes the vetting the rule assumes, and
-both redirects apply again — the error redirect and the interactive-login one,
-which are the same check. The discriminator is registration provenance
-(`registration_source`) qualified by that allow-list, not the CIMD mechanism.
-
-A loopback `http://` or private-use `redirect_uri` is **exempt from both
-refusals**, whatever the allow-list says. Those destinations resolve on the
-requester's own device, so the redirect has no remote hop and no third-party
-recipient — the property RFC 8252 §7.3 already relies on to accept such callbacks
-from unregistered native clients. The carve-out's premise is a remote
-attacker-chosen destination and does not hold for them.
-
-This is what makes a browser-driven CIMD client — the MCP 2025-11-25 case —
-completable. The ordinary desktop/CLI client publishes loopback callbacks and is
-therefore unaffected: it reaches the login surface and completes with no
-allow-list. A deployment serving CIMD clients whose callbacks are remote
-`https://` URLs **MUST** set `cimd.allowed_domains`, or those clients can never
-sign a user in.
-
-`allowed_domains` is deployment-wide, with no tenant dimension, so this
-re-enablement is meaningful only where the deployment serves a single tenant. A
-multi-tenant deployment cannot scope it per `(account_id, project_id)` — and the
-tenant is unknown at the point a CIMD document is resolved, since resolution
-precedes principal resolution by design (Section 12.5's whole premise). See
-zeroid#286.
+What the open-ecosystem default gives up: with an empty allow-list, any public
+https host may publish a document naming any destination, so an unauthenticated
+caller can make `/oauth2/authorize` emit a §4.1.2.1 error redirect to a host they
+chose. That is the open-redirect surface an open ecosystem has. A deployer who
+does not want it sets `cimd.allowed_domains`.
 
 ### 12.6 Caching
 
@@ -1288,9 +1462,11 @@ deployments. "Std" marks an identifier defined by a baseline spec but
 | `token_exchange` | string | §4.6, §4.7 |
 | `trusted_by` | string | §4.6 |
 | `user_id_iss` | string | §4.6, §5.6 |
+| `user_idp_iss` `user_idp_sub` | string | §4.6, §5.6 |
 | `auth_time` `acr` `amr` | per RFC 9068 | §4.6 (Std: RFC 9068, propagated from upstream) |
 | `role` | string | §4.6, §8 (gated) |
 | `privilege_scope` | array | §4.6, §8 (gated) |
+| `roles` | array | §4.3, §5.1c (Std: RFC 9068) |
 | `backchannel_client_id` | string | §4.7 |
 | `binding_message` | string | §4.7 |
 | `authorization_details` | array | §4.7, §6.2 (Std: RFC 9396) |

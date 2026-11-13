@@ -86,6 +86,9 @@ Request body fields:
    - `client_id` -- OAuth client ID
    - `client_secret` -- OAuth client secret
    - `scope` -- requested scopes
+   - `account_id` + `project_id` -- only when the client was registered without
+     an `identity_id`. A client linked to an identity mints for it, in its
+     tenant; if it sends a tenant anyway, it must be that one.
 
 2. **`api_key`** -- agent authenticates with its ZeroID API key
    - `api_key` -- the `zid_sk_...` key

@@ -1,11 +1,20 @@
 package zeroid
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 // TestValidateWIMSEDomain pins the SPIFFE §2.2 / RFC 1123 rules. The error
@@ -373,6 +382,7 @@ func TestValidateWIMSEDomain(t *testing.T) {
 func TestLoadEnvVarsClientAuth(t *testing.T) {
 	t.Setenv("ZEROID_CLIENT_AUTH_ALLOW_PRIVATE_JWKS_ENDPOINTS", "true")
 	t.Setenv("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE", "64")
+	t.Setenv("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS", "true")
 
 	cfg, err := LoadConfig("")
 	if err != nil {
@@ -383,6 +393,9 @@ func TestLoadEnvVarsClientAuth(t *testing.T) {
 	}
 	if cfg.ClientAuth.JWKSCacheSize != 64 {
 		t.Errorf("ZEROID_CLIENT_AUTH_JWKS_CACHE_SIZE=64 did not reach client_auth, got %d", cfg.ClientAuth.JWKSCacheSize)
+	}
+	if !cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("ZEROID_CLIENT_AUTH_BCRYPT_CLIENT_SECRETS=true did not reach client_auth")
 	}
 }
 
@@ -398,6 +411,109 @@ func TestClientAuthDefaultsAreProductionSafe(t *testing.T) {
 	if cfg.ClientAuth.JWKSCacheSize != 0 {
 		t.Errorf("jwks_cache_size must default to 0 (meaning the built-in cap), got %d", cfg.ClientAuth.JWKSCacheSize)
 	}
+	if cfg.ClientAuth.BcryptClientSecrets {
+		t.Error("bcrypt_client_secrets must default to false: client secrets are stored as SHA-256 unless a deployment opts back into bcrypt")
+	}
+}
+
+// CIBA approver settings: defaults keep standalone deployments unchanged, and
+// both env vars reach the typed fields.
+func TestBackchannelApproverConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Backchannel.RequireApproverIdentity {
+			t.Error("backchannel.require_approver_identity must default to false")
+		}
+		if cfg.Backchannel.EnforceHints != "off" {
+			t.Errorf("backchannel.enforce_hints must default to off, got %q", cfg.Backchannel.EnforceHints)
+		}
+		if cfg.Backchannel.ResolvedRetention != "720h" {
+			t.Errorf("backchannel.resolved_retention must default to 720h, got %q", cfg.Backchannel.ResolvedRetention)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "true")
+		t.Setenv("ZEROID_BACKCHANNEL_ENFORCE_HINTS", "shadow")
+		t.Setenv("ZEROID_BACKCHANNEL_RESOLVED_RETENTION", "48h")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if !cfg.Backchannel.RequireApproverIdentity {
+			t.Error("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY=true did not reach backchannel")
+		}
+		if cfg.Backchannel.ResolvedRetention != "48h" {
+			t.Errorf("ZEROID_BACKCHANNEL_RESOLVED_RETENTION=48h did not reach backchannel, got %q", cfg.Backchannel.ResolvedRetention)
+		}
+		if cfg.Backchannel.EnforceHints != "shadow" {
+			t.Errorf("ZEROID_BACKCHANNEL_ENFORCE_HINTS=shadow did not reach backchannel, got %q", cfg.Backchannel.EnforceHints)
+		}
+	})
+
+	t.Run("bad_bool", func(t *testing.T) {
+		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "maybe")
+		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid bool") {
+			t.Fatalf("expected a bool parse error, got %v", err)
+		}
+	})
+
+	t.Run("validate_resolved_retention", func(t *testing.T) {
+		for _, v := range []string{"", "0s", "720h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("resolved_retention=%q must validate, got %v", v, err)
+			}
+		}
+		for _, v := range []string{"30d", "-1h"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.ResolvedRetention = v
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "backchannel.resolved_retention") {
+				t.Errorf("resolved_retention=%q must be rejected naming the key, got %v", v, err)
+			}
+		}
+	})
+
+	t.Run("validate_enforce_hints", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = true
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q must validate, got %v", mode, err)
+			}
+		}
+		for _, mode := range []string{"", "off"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("enforce_hints=%q without require_approver_identity must validate, got %v", mode, err)
+			}
+		}
+		cfg := baseValidConfig(t)
+		cfg.Backchannel.EnforceHints = "strict"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") {
+			t.Fatalf("enforce_hints=strict must be rejected naming the key, got %v", err)
+		}
+	})
+
+	t.Run("validate_enforce_hints_requires_approver_identity", func(t *testing.T) {
+		for _, mode := range []string{"shadow", "on"} {
+			cfg := baseValidConfig(t)
+			cfg.Backchannel.EnforceHints = mode
+			cfg.Backchannel.RequireApproverIdentity = false
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "backchannel.enforce_hints") ||
+				!strings.Contains(err.Error(), "backchannel.require_approver_identity") {
+				t.Errorf("enforce_hints=%q without require_approver_identity must be rejected naming both keys, got %v", mode, err)
+			}
+		}
+	})
 }
 
 // Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
@@ -431,4 +547,496 @@ func TestSampleConfigEnvVarsAreAllWired(t *testing.T) {
 			t.Errorf("zeroid.yaml documents %s but envMapping never reads it — it is dead config", name)
 		}
 	}
+}
+
+// TestValidateRegistrationEndpoint pins token.registration_endpoint's shape
+// rules. The value is published verbatim as registration_endpoint in AS
+// metadata, so anything a client could not safely register against is refused
+// at load rather than advertised.
+func TestValidateRegistrationEndpoint(t *testing.T) {
+	const (
+		httpsIssuer = "https://auth.example.com"
+		httpIssuer  = "http://highflame-authn:8051"
+	)
+	cases := []struct {
+		name    string
+		input   string
+		issuer  string // "" means httpsIssuer
+		wantErr string // substring; "" means success
+	}{
+		{"empty_keeps_default", "", "", ""},
+		{"https", "https://register.example.com/oauth/register", "", ""},
+		{"https_with_port_and_query", "https://register.example.com:8443/r?tenant=a", "", ""},
+		{"https_port_max", "https://register.example.com:65535/r", "", ""},
+		{"https_idn_in_xn_form", "https://xn--bcher-kva.example/r", "", ""},
+		{"http_localhost", "http://localhost:3000/register", "", ""},
+		{"http_loopback_v4", "http://127.0.0.1:3000/register", "", ""},
+		{"http_loopback_v6", "http://[::1]:3000/register", "", ""},
+		{"http_beside_http_issuer", "http://highflame-studio:3000/oauth/register", httpIssuer, ""},
+		{"https_beside_http_issuer", "https://register.example.com/r", httpIssuer, ""},
+
+		{"http_non_loopback", "http://register.example.com/register", "", "http is accepted only for a loopback host or when token.issuer is itself http"},
+		{"http_non_loopback_https_issuer_cluster_name", "http://highflame-studio:3000/oauth/register", "", "must use https"},
+		{"http_name_resolving_loopback_is_not_trusted", "http://localhost.example.com/register", "", "http is accepted only for a loopback host"},
+		{"relative", "/oauth2/register", "", "absolute URL with a host"},
+		{"no_scheme", "register.example.com/register", "", "absolute URL with a host"},
+		{"other_scheme", "ftp://register.example.com/register", "", "must use https"},
+		{"other_scheme_http_issuer", "ftp://register.example.com/register", httpIssuer, "must use https"},
+		{"javascript_scheme", "javascript://register.example.com/x", "", "must use https"},
+		{"userinfo", "https://user:pass@register.example.com/register", "", "must not contain user-info"},
+		{"fragment", "https://register.example.com/register#x", "", "must not contain a fragment"},
+		{"empty_fragment", "https://register.example.com/register#", "", "must not contain a fragment"},
+		{"unparseable", "https://register.example.com/%zz", "", "must be a valid URL"},
+
+		{"leading_space", " https://register.example.com/r", "", "whitespace or control characters"},
+		{"trailing_space", "https://register.example.com/r ", "", "whitespace or control characters"},
+		{"trailing_newline", "https://register.example.com/r\n", "", "whitespace or control characters"},
+		{"inner_space", "https://register.example.com/a b", "", "whitespace or control characters"},
+		{"tab", "https://register.example.com/\tr", "", "whitespace or control characters"},
+		{"nul", "https://register.example.com/r\x00", "", "whitespace or control characters"},
+		{"unicode_space", "https://register.example.com/r\u00a0", "", "whitespace or control characters"},
+
+		{"unicode_host", "https://bücher.example/r", "", "host must be ASCII"},
+		{"percent_encoded_unicode_host", "https://b%C3%BCcher.example/r", "", "host must be ASCII"},
+
+		{"port_zero", "https://register.example.com:0/r", "", "port must be a number from 1 to 65535"},
+		{"port_too_large", "https://register.example.com:65536/r", "", "port must be a number from 1 to 65535"},
+		{"port_empty", "https://register.example.com:/r", "", "port must be a number from 1 to 65535"},
+		{"port_non_numeric", "https://register.example.com:abc/r", "", "must be a valid URL"},
+
+		{"uppercase_scheme", "HTTPS://register.example.com/r", "", "canonical form"},
+		{"uppercase_host", "https://Register.Example.com/r", "", "canonical form"},
+		{"non_ascii_path", "https://register.example.com/régister", "", "canonical form"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issuer := tc.issuer
+			if issuer == "" {
+				issuer = httpsIssuer
+			}
+			err := validateRegistrationEndpoint(tc.input, issuer)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateRegistrationEndpoint(%q, %q) unexpected error: %v", tc.input, issuer, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateRegistrationEndpoint(%q, %q) = %v, want error containing %q", tc.input, issuer, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateRegistrationEndpoint_CanonicalFormInError pins that a
+// non-canonical value is rejected (not rewritten) and the error names the form
+// to use instead.
+func TestValidateRegistrationEndpoint_CanonicalFormInError(t *testing.T) {
+	err := validateRegistrationEndpoint("HTTPS://Register.Example.com/r", "https://auth.example.com")
+	if err == nil || !strings.Contains(err.Error(), `want "https://register.example.com/r"`) {
+		t.Fatalf("got %v, want the canonical form in the error", err)
+	}
+}
+
+// TestURLValidatorsDoNotEchoCredentials pins that neither the issuer nor the
+// registration_endpoint validator quotes user-info back in its error — on any
+// rejection path, including values that fail to parse at all, where the
+// standard library's own error would repeat the whole URL.
+func TestURLValidatorsDoNotEchoCredentials(t *testing.T) {
+	const secret = "hunter2-s3cret"
+	inputs := []string{
+		"https://admin:" + secret + "@register.example.com/r",      // user-info rejection
+		"https://admin:" + secret + "@register.example.com:abc/r",  // parse failure (bad port)
+		"https://admin:" + secret + "@register.example.com/%zz",    // parse failure (bad escape)
+		"http://admin:" + secret + "@register.example.com/r",       // scheme rejection path
+		"ftp://admin:" + secret + "@register.example.com/r",        // other scheme
+		" https://admin:" + secret + "@register.example.com/r",     // whitespace
+		"https://admin:" + secret + "@register.example.com/r#frag", // fragment
+		"https://admin:" + secret + "@register.example.com:0/r",    // port
+		"https://admin:" + secret + "@register.example.com/",       // issuer trailing slash
+		"https://admin:" + secret + "@register.example.com/r?x=1",  // issuer query
+		"https://admin:" + secret + "@register.example.com/r#f",    // issuer fragment
+		"https://admin:" + secret + "@bücher.example/r",            // non-ASCII host
+	}
+	for _, in := range inputs {
+		for name, err := range map[string]error{
+			"registration_endpoint": validateRegistrationEndpoint(in, "https://auth.example.com"),
+			"issuer":                validateIssuer(in),
+		} {
+			if err == nil {
+				t.Errorf("%s: %q unexpectedly accepted", name, in)
+				continue
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Errorf("%s: error for %q leaks the password: %v", name, in, err)
+			}
+		}
+	}
+}
+
+func TestRedactUserinfo(t *testing.T) {
+	cases := map[string]string{
+		"https://u:p@host/x":         "https://redacted@host/x",
+		"https://u@host":             "https://redacted@host",
+		"https://u:p@w@host:1/x?y#z": "https://redacted@host:1/x?y#z",
+		"https://host/path@x":        "https://host/path@x",
+		"https://host?q=a@b":         "https://host?q=a@b",
+		"no-scheme@host":             "no-scheme@host",
+		"":                           "",
+	}
+	for in, want := range cases {
+		if got := redactUserinfo(in); got != want {
+			t.Errorf("redactUserinfo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The env var reaches the typed field, and Validate() runs the check so an
+// invalid value fails config load instead of being advertised.
+func TestRegistrationEndpointConfig(t *testing.T) {
+	t.Run("env_var_wired", func(t *testing.T) {
+		t.Setenv("ZEROID_REGISTRATION_ENDPOINT", "https://register.example.com/register")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.RegistrationEndpoint != "https://register.example.com/register" {
+			t.Errorf("ZEROID_REGISTRATION_ENDPOINT did not reach token.registration_endpoint, got %q", cfg.Token.RegistrationEndpoint)
+		}
+	})
+
+	t.Run("default_empty", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.RegistrationEndpoint != "" {
+			t.Errorf("token.registration_endpoint must default to empty (advertise ZeroID's own), got %q", cfg.Token.RegistrationEndpoint)
+		}
+	})
+
+	t.Run("validate_rejects_invalid", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RegistrationEndpoint = "http://register.example.com/register"
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
+			t.Fatalf("Validate must reject a non-loopback http registration endpoint, got: %v", err)
+		}
+	})
+
+	t.Run("validate_accepts_valid", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RegistrationEndpoint = "https://register.example.com/register"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate must accept an https registration endpoint: %v", err)
+		}
+	})
+
+	// Validate threads token.issuer into the check: the same http value is
+	// accepted beside an http issuer and refused beside an https one.
+	t.Run("validate_uses_issuer_scheme", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.Issuer = "http://highflame-authn:8051"
+		cfg.Token.RegistrationEndpoint = "http://highflame-studio:3000/oauth/register"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate must accept an http registration endpoint beside an http issuer: %v", err)
+		}
+		cfg.Token.Issuer = "https://highflame-authn:8051"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
+			t.Fatalf("Validate must refuse an http registration endpoint beside an https issuer, got: %v", err)
+		}
+	})
+}
+
+// TestRefreshReuseGraceConfig pins token.refresh_reuse_grace_seconds: unset
+// keeps the default (so a Config built in code, as embedders do, does not
+// silently go strict), 0 disables the grace, and Validate refuses negative or
+// over-long windows. The env var reaches the field.
+func TestRefreshReuseGraceConfig(t *testing.T) {
+	intPtr := func(v int) *int { return &v }
+
+	t.Run("unset is the default", func(t *testing.T) {
+		cfg := baseValidConfig(t)
+		cfg.Token.RefreshReuseGraceSeconds = nil
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("unset grace must validate: %v", err)
+		}
+		if got := cfg.Token.RefreshReuseGrace(); got != domain.RefreshTokenReuseGraceWindow {
+			t.Fatalf("unset grace = %v, want the default %v", got, domain.RefreshTokenReuseGraceWindow)
+		}
+	})
+	for _, ok := range []int{0, 1, domain.MaxRefreshTokenReuseGraceSeconds} {
+		t.Run(fmt.Sprintf("%d accepted", ok), func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Token.RefreshReuseGraceSeconds = intPtr(ok)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("grace %d must validate: %v", ok, err)
+			}
+			if got := cfg.Token.RefreshReuseGrace(); got != time.Duration(ok)*time.Second {
+				t.Fatalf("grace %d resolved to %v", ok, got)
+			}
+		})
+	}
+	for _, bad := range []int{-1, domain.MaxRefreshTokenReuseGraceSeconds + 1} {
+		t.Run(fmt.Sprintf("%d rejected", bad), func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Token.RefreshReuseGraceSeconds = intPtr(bad)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "token.refresh_reuse_grace_seconds must be between 0 and 300") {
+				t.Fatalf("grace %d must be rejected, got: %v", bad, err)
+			}
+		})
+	}
+	t.Run("env var reaches the config", func(t *testing.T) {
+		t.Setenv("ZEROID_REFRESH_REUSE_GRACE_SECONDS", "0")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Token.RefreshReuseGraceSeconds == nil || *cfg.Token.RefreshReuseGraceSeconds != 0 {
+			t.Fatalf("ZEROID_REFRESH_REUSE_GRACE_SECONDS=0 did not reach token.refresh_reuse_grace_seconds: %v", cfg.Token.RefreshReuseGraceSeconds)
+		}
+		if cfg.Token.RefreshReuseGrace() != 0 {
+			t.Fatal("0 must disable the grace")
+		}
+	})
+	t.Run("loaded default is 10", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+		if cfg.Token.RefreshReuseGrace() != 10*time.Second {
+			t.Fatalf("default grace = %v, want 10s", cfg.Token.RefreshReuseGrace())
+		}
+	})
+	t.Run("non-integer env var fails loud", func(t *testing.T) {
+		t.Setenv("ZEROID_REFRESH_REUSE_GRACE_SECONDS", "ten")
+		if _, err := LoadConfig(""); err == nil || !strings.Contains(err.Error(), "not a valid integer") {
+			t.Fatalf("expected a not-a-valid-integer error, got %v", err)
+		}
+	})
+}
+
+// ADR 0042 D4: trusted issuers come from one source. A deployment that reads
+// account rows must not also carry static entries, which would be a second,
+// unaudited trust list.
+func TestConfig_FederationIssuerStore(t *testing.T) {
+	static := domain.ExternalIssuerConfig{
+		Issuer: "https://idp.example", JWKSURI: "https://idp.example/keys", Audience: "https://zeroid.example",
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+	}
+	cases := []struct {
+		name    string
+		store   string
+		static  bool
+		wantErr string
+	}{
+		{name: "default config with static", store: "", static: true},
+		{name: "config with static", store: "config", static: true},
+		{name: "db alone", store: "db"},
+		{name: "db with static is refused", store: "db", static: true, wantErr: "both set"},
+		{name: "unknown store", store: "redis", wantErr: "must be config or db"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.Federation.IssuerStore = tc.store
+			if tc.static {
+				cfg.ExternalIssuers = []domain.ExternalIssuerConfig{static}
+			}
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestForwardedHeadersMode pins resolution of the forwarded-header trust mode,
+// including the deprecated all-or-nothing flag it replaces.
+func TestForwardedHeadersMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		legacy  bool
+		want    string
+		wantErr string
+	}{
+		{"unset and legacy off is none", "", false, ForwardedHeadersNone, ""},
+		{"unset honours the legacy flag as proto_host", "", true, ForwardedHeadersProtoHost, ""},
+		{"none", "none", false, ForwardedHeadersNone, ""},
+		{"proto", "proto", false, ForwardedHeadersProto, ""},
+		{"proto_host", "proto_host", false, ForwardedHeadersProtoHost, ""},
+		{"surrounding space tolerated", "  proto ", false, ForwardedHeadersProto, ""},
+		{"legacy flag agreeing with proto_host is fine", "proto_host", true, ForwardedHeadersProtoHost, ""},
+
+		// Refused, never resolved: letting either win would decide whether
+		// X-Forwarded-Host is trusted on the deployer's behalf.
+		{"legacy flag with proto conflicts", "proto", true, "", "conflicts"},
+		{"legacy flag with none conflicts", "none", true, "", "conflicts"},
+
+		// An unknown mode must fail, not read as "none" — a typo like
+		// "proto-host" silently trusting nothing would keep DPoP broken, and
+		// one silently trusting everything would be worse.
+		{"unknown mode", "proto-host", false, "", "not a known mode"},
+		{"case matters", "Proto", false, "", "not a known mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := ServerConfig{ForwardedHeaders: tc.mode, TrustForwardedHeaders: tc.legacy}
+			got, err := s.ForwardedHeadersMode()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("want error containing %q, got mode=%q err=%v", tc.wantErr, got, err)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got (%q, %v), want (%q, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// A static issuer mapping a reserved key still loads, with one warning per
+// key naming the issuer and the key: the grant ignores it (ADR 0044 D16).
+func TestConfig_StaticIssuerReservedMappingWarns(t *testing.T) {
+	var buf bytes.Buffer
+	orig := log.Logger
+	log.Logger = zerolog.New(&buf)
+	t.Cleanup(func() { log.Logger = orig })
+
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{
+		{
+			Issuer: "https://idp.example", JWKSURI: "https://idp.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping:    map[string]string{"user_id": "sub", "role": "groups", "privilege_scope": "scp"},
+			AllowedAccounts: []string{"acct"},
+		},
+		{
+			Issuer: "https://clean.example", JWKSURI: "https://clean.example/keys", Audience: "https://zeroid.example",
+			ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a reserved key in a static issuer must not stop the boot: %v", err)
+	}
+
+	var got []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if entry["level"] != "warn" {
+			t.Fatalf("level = %v, want warn: %s", entry["level"], line)
+		}
+		got = append(got, fmt.Sprintf("%v %v", entry["issuer"], entry["key"]))
+	}
+	want := []string{"https://idp.example role", "https://idp.example privilege_scope"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("warnings = %v, want %v (one per reserved key, none for the clean issuer)", got, want)
+	}
+}
+
+func TestConfig_SharedIssuersNeedAPinClaim(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "pin_claim") {
+		t.Fatalf("err = %v", err)
+	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "https://accounts.google.com", PinClaim: "hd"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Federation.SharedIssuers = []domain.SharedIssuer{{Issuer: "http://mockidp:8080/google", PinClaim: "hd"}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("an http shared issuer needs allow_private_endpoints")
+	}
+	cfg.Federation.AllowPrivateEndpoints = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("local mock as a shared issuer: %v", err)
+	}
+}
+
+func TestConfig_StaticIssuerCannotBeSelf(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.ExternalIssuers = []domain.ExternalIssuerConfig{{
+		Issuer: cfg.Token.Issuer + "/", JWKSURI: cfg.Token.Issuer + "/.well-known/jwks.json", Audience: "x",
+		ClaimMapping: map[string]string{"user_id": "sub"}, AllowedAccounts: []string{"acct"},
+	}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "own issuer") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestValidateRejectsBadForwardedHeaders confirms the resolution errors stop
+// startup, in every environment — neither case is ever right.
+func TestValidateRejectsBadForwardedHeaders(t *testing.T) {
+	for _, s := range []ServerConfig{
+		{ForwardedHeaders: "everything"},
+		{ForwardedHeaders: ForwardedHeadersProto, TrustForwardedHeaders: true},
+	} {
+		cfg := baseValidConfig(t)
+		cfg.Server.ForwardedHeaders = s.ForwardedHeaders
+		cfg.Server.TrustForwardedHeaders = s.TrustForwardedHeaders
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate accepted forwarded_headers=%q trust_forwarded_headers=%v",
+				s.ForwardedHeaders, s.TrustForwardedHeaders)
+		}
+	}
+
+	cfg := baseValidConfig(t)
+	cfg.Server.ForwardedHeaders = ForwardedHeadersProto
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("control: proto must validate, got %v", err)
+	}
+}
+
+// TestLoadForwardedHeaders pins the env var and the default, through the real
+// loader. The default must stay EMPTY rather than "none": empty defers to the
+// deprecated flag, so an existing deployment running
+// ZEROID_TRUST_FORWARDED_HEADERS=true keeps its behaviour instead of hitting
+// the conflict error on upgrade.
+func TestLoadForwardedHeaders(t *testing.T) {
+	t.Run("default is unset and resolves to none", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Server.ForwardedHeaders != "" {
+			t.Fatalf("default forwarded_headers = %q, want empty", cfg.Server.ForwardedHeaders)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersNone {
+			t.Fatalf("default resolves to %q, want none", m)
+		}
+	})
+
+	t.Run("env var binds", func(t *testing.T) {
+		t.Setenv("ZEROID_FORWARDED_HEADERS", "proto")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProto {
+			t.Fatalf("ZEROID_FORWARDED_HEADERS=proto resolved to %q", m)
+		}
+	})
+
+	t.Run("legacy env var alone still works on upgrade", func(t *testing.T) {
+		t.Setenv("ZEROID_TRUST_FORWARDED_HEADERS", "true")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("an existing deployment must not fail to start: %v", err)
+		}
+		if m, _ := cfg.Server.ForwardedHeadersMode(); m != ForwardedHeadersProtoHost {
+			t.Fatalf("legacy flag resolved to %q, want proto_host", m)
+		}
+	})
 }

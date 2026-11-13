@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -46,6 +47,53 @@ func (r *IdentityRepository) GetByID(ctx context.Context, id, accountID, project
 		Scan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetByIDInAccounts retrieves an identity by its UUID, provided it belongs to
+// one of accountIDs. The project is not constrained: it is read FROM the row.
+//
+// It exists for one caller shape, where the id is a server-held reference and
+// the tenant is what the lookup is meant to discover: an OAuth client's
+// identity_id link, resolved against an external issuer's allowed_accounts on
+// the ID-JAG grant. The account constraint is applied in SQL, so a link into a
+// tenant the issuer does not admit is indistinguishable from no row at all and
+// nothing outside the admitted set is ever loaded. Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the project too.
+//
+// An empty accountIDs matches nothing. It short-circuits to sql.ErrNoRows
+// rather than emitting `IN ()`.
+func (r *IdentityRepository) GetByIDInAccounts(ctx context.Context, id string, accountIDs []string) (*domain.Identity, error) {
+	if len(accountIDs) == 0 {
+		return nil, fmt.Errorf("failed to get identity: %w", sql.ErrNoRows)
+	}
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Where("account_id IN (?)", bun.List(accountIDs)).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity: %w", err)
+	}
+	return identity, nil
+}
+
+// GetLinkedByID loads the identity an OAuth client's registration links to
+// (oauth_clients.identity_id), in whatever tenant it lives. Unscoped on
+// purpose: the tenant is what the caller is trying to learn, and the link was
+// written by an administrator inside that identity's own tenant (the client
+// create handler refuses a foreign identity_id). Never pass a caller-supplied
+// id here; caller input belongs on GetByID, which pins the tenant.
+func (r *IdentityRepository) GetLinkedByID(ctx context.Context, id string) (*domain.Identity, error) {
+	identity := &domain.Identity{}
+	db := dbOrTx(ctx, r.db)
+	err := db.NewSelect().Model(identity).
+		Where("id = ?", id).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get linked identity: %w", err)
 	}
 	return identity, nil
 }
@@ -125,7 +173,10 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 	q := db.NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("project_id = ?", projectID).
-		OrderExpr("created_at DESC")
+		// Adopted identities sort by when they were adopted, not when a
+		// connector first saw them (migration 045); everything else keeps its
+		// creation time. id breaks ties so offset pagination is stable.
+		OrderExpr("COALESCE(adopted_at, created_at) DESC, id DESC")
 
 	if len(identityTypes) == 1 {
 		q = q.Where("identity_type = ?", identityTypes[0])
@@ -542,6 +593,15 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 // caller_name on the context stamps modified_by so the audit trigger records who
 // pruned. Scoped by source_id so one connector's sweep never touches another's
 // agents of the same origin. Returns the number of rows deactivated.
+// notApprovalChannel is the predicate the discovery sweeps (prune, release,
+// purge) add so they never touch an approval channel: sub_type
+// approval_channel, or ciba:approve listed on the identity or its credential
+// policy.
+const notApprovalChannel = `identities.sub_type IS DISTINCT FROM 'approval_channel'
+	AND NOT COALESCE('ciba:approve' = ANY(identities.allowed_scopes), false)
+	AND NOT EXISTS (SELECT 1 FROM credential_policies cp
+		WHERE cp.id = identities.credential_policy_id AND 'ciba:approve' = ANY(cp.allowed_scopes))`
+
 func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, accountID, projectID, origin, sourceID string, notSeenSince time.Time) (int, error) {
 	db := dbOrTx(ctx, r.db)
 	q := db.NewUpdate().
@@ -558,6 +618,7 @@ func (r *IdentityRepository) DeactivateStaleDiscovered(ctx context.Context, acco
 		Where("source_id = ?", sourceID).
 		Where("status = ?", string(domain.IdentityStatusDiscovered)).
 		Where("updated_at < ?", notSeenSince).
+		Where(notApprovalChannel).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("deactivate stale discovered: %w", err)
@@ -599,6 +660,7 @@ func (r *IdentityRepository) ReleaseDiscoveredSource(ctx context.Context, accoun
 		Where("origin = ?", origin).
 		Where("source_id = ?", sourceID).
 		Where("status = ?", string(domain.IdentityStatusDiscovered)).
+		Where(notApprovalChannel).
 		Exec(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("release discovered source: %w", err)
@@ -647,7 +709,8 @@ func (r *IdentityRepository) PurgeDiscoveredSource(ctx context.Context, accountI
 			Where("project_id = ?", projectID).
 			Where("origin = ?", origin).
 			Where("source_id = ?", sourceID).
-			Where("status = ?", string(domain.IdentityStatusDiscovered))
+			Where("status = ?", string(domain.IdentityStatusDiscovered)).
+			Where(notApprovalChannel)
 	}
 
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {

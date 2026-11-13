@@ -81,8 +81,43 @@ type CredentialPolicy struct {
 	// policy the same as an inactive one — identity policy, per-key policy,
 	// or both. NULL means "no expiry".
 	ExpiresAt *time.Time `bun:"expires_at"                       json:"expires_at,omitempty"`
-	CreatedAt time.Time  `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt time.Time  `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	// JWTTyp chooses the access token's JOSE `typ` header, under either token
+	// profile: JWTTypAccessToken (the default when empty, RFC 9068 §2.1) or
+	// JWTTypJWT for agents whose tokens must stay valid JWT-SVIDs (JWT-SVID
+	// §2.3 allows only JWT or JOSE). The two specs disagree and a token can
+	// satisfy only one.
+	JWTTyp string `bun:"jwt_typ,type:varchar(10),nullzero" json:"jwt_typ,omitempty"`
+	// RequiredPrincipalType requires that the chain a token belongs to is
+	// rooted in a person: "" (any, the default) or "user". Checked for every
+	// grant the identity uses, so an agent that requires a user subject can
+	// neither mint its own workload token nor accept one in an exchange — the
+	// authority-laundering path (P3). "owner" arrives with personal agents.
+	RequiredPrincipalType string `bun:"required_principal_type,type:varchar(20),nullzero" json:"required_principal_type,omitempty"`
+	// UserGrantScopes caps what this identity may hold for a person — tokens
+	// whose principal is a user, held as client or current actor — while
+	// AllowedScopes keeps capping its own authority (D10). Empty means no
+	// extra cap: the person's own grant bounds the chain. Applied only where
+	// that grant is itself bounded (a delegated user chain, ID-JAG,
+	// authorization_code and refresh); see IssueRequest.UserGrantBounded.
+	UserGrantScopes []string  `bun:"user_grant_scopes,array" json:"user_grant_scopes,omitempty"`
+	CreatedAt       time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt       time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+}
+
+// Access token `typ` header values a credential policy may choose.
+const (
+	// JWTTypAccessToken is the RFC 9068 §2.1 type of a JWT access token, and
+	// the rfc8693 profile's default.
+	JWTTypAccessToken = "at+jwt"
+	// JWTTypJWT keeps the token a conformant JWT-SVID (JWT-SVID §2.3), and is
+	// what the legacy profile always issues.
+	JWTTypJWT = "JWT"
+)
+
+// ValidJWTTyp reports whether v is a typ a policy may choose; empty means the
+// profile default.
+func ValidJWTTyp(v string) bool {
+	return v == "" || v == JWTTypAccessToken || v == JWTTypJWT
 }
 
 // IsExpired reports whether the policy has aged out. A nil ExpiresAt

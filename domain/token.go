@@ -50,11 +50,15 @@ type ActorClaims struct {
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
 type AccessToken struct {
 	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"` // "Bearer"
-	ExpiresIn   int    `json:"expires_in"` // seconds
-	Scope       string `json:"scope,omitempty"`
-	JTI         string `json:"jti"`
-	IssuedAt    int64  `json:"iat"`
+	// IssuedTokenType is the RFC 8693 §2.2.1 token type identifier of the
+	// issued token. REQUIRED on a token-exchange response and absent from
+	// every other grant's response, where RFC 6749 §5.1 does not define it.
+	IssuedTokenType string `json:"issued_token_type,omitempty"`
+	TokenType       string `json:"token_type"` // "Bearer"
+	ExpiresIn       int    `json:"expires_in"` // seconds
+	Scope           string `json:"scope,omitempty"`
+	JTI             string `json:"jti"`
+	IssuedAt        int64  `json:"iat"`
 	// Convenience fields — duplicated from JWT so callers don't need to decode.
 	AccountID    string `json:"account_id,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
@@ -87,6 +91,38 @@ type OAuthClient struct {
 	// Classification (RFC 6749 §2.1, RFC 7591)
 	ClientType              string `bun:"client_type"                json:"client_type"`
 	TokenEndpointAuthMethod string `bun:"token_endpoint_auth_method" json:"token_endpoint_auth_method,omitempty"`
+
+	// RFC 7591 display metadata. Populated ONLY on a CIMD-synthesized client,
+	// and never persisted: `bun:"-"` keeps both off oauth_clients, which has no
+	// columns for them and must not grow any — a CIMD client is ephemeral by
+	// definition and is never written to the registry.
+	//
+	// They exist for one reason. draft-ietf-oauth-client-id-metadata-document
+	// §8.5 asks the authorization server to fetch the document "in order to
+	// provide users with additional information about the request, such as the
+	// application name and logo", and to display the client_id hostname IN
+	// ADDITION to whatever it fetched. Without them a consent screen can offer
+	// a human nothing but a URL.
+	//
+	// UNTRUSTED, and the §8.5 context is phishing. Both are attacker-controlled
+	// strings from a document at a URL the attacker chose. The draft §4
+	// self-reference check is what stops one client displaying another's name;
+	// it does nothing to make the strings safe to render. A consent surface MUST
+	// show them beside the client_id host, never instead of it, and MUST escape
+	// them. The scheme is validated at synthesis — see cimdDisplayURI — so a
+	// `javascript:` value can never reach an href, but that is the only
+	// guarantee offered.
+	ClientURI string `bun:"-" json:"client_uri,omitempty"`
+	LogoURI   string `bun:"-" json:"logo_uri,omitempty"`
+
+	// IDJAGProfileContradicted is set only on a CIMD-synthesized client whose
+	// document claims the ID-JAG grant profile in
+	// authorization_grant_profiles_supported without declaring both
+	// token-exchange and jwt-bearer in grant_types, which
+	// draft-ietf-oauth-identity-assertion-authz-grant-04 §8 requires. Such a
+	// document contradicts itself about how it redeems an ID-JAG, so it may
+	// not redeem one. Never persisted, for the same reason as ClientURI.
+	IDJAGProfileContradicted bool `bun:"-" json:"-"`
 
 	// OAuth configuration
 	GrantTypes   []string `bun:"grant_types,array"  json:"grant_types"`
@@ -130,8 +166,16 @@ type OAuthClient struct {
 	// this client carry the identity_id forward (refresh_tokens.identity_id
 	// already exists) and gate token issuance on the linked identity's
 	// status + expires_at — same fail-closed semantics jwt_bearer and
-	// api_key paths have. Nil for plain human-session clients (CLI, MCP).
+	// api_key paths have. It also decides the identity and tenant that
+	// client_credentials and ID-JAG tokens are minted for: the request need
+	// not name a tenant, and one naming a different tenant is refused.
+	// Nil for plain human-session clients (CLI, MCP).
 	IdentityID *string `bun:"identity_id,type:uuid,nullzero" json:"identity_id,omitempty"`
+
+	// ChannelTrusted records that the client was registered by a caller
+	// marked with WithTrustedApprovalChannelWrite.
+	// ciba:approve is issued on client_credentials only when it is set.
+	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
 
 	// Dynamic Client Registration (RFC 7591/7592)
 	// RegistrationSource is "internal" for clients created via the admin/internal

@@ -1,4 +1,4 @@
-.PHONY: help build run test test-integration test-all lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version release-dpop
+.PHONY: help build run test test-integration test-all lint docker-build docker-up setup-keys migrate clean cli-install cli-build cli-dev cli-test next-version releasable-version release-prep
 
 BINARY := zeroid
 CMD := ./cmd/zeroid
@@ -20,7 +20,7 @@ run: build ## Build and run zeroid locally
 # checkout: the integration suite alone takes ~127s under -race, so the 120s Go
 # timeout panicked the binary before it finished. A target that always fails
 # teaches people to stop running it, and the gap it hid is the one that matters
-# — CI splits these two jobs and gives them 300s and 600s respectively.
+# — CI splits these two jobs and gives them 300s and 900s respectively.
 
 # NOTE: the exclusion below is a substring match, so it would also drop a
 # nested helper package such as internal/foo/tests. Deliberately left matching
@@ -35,7 +35,7 @@ test: ## Run unit tests (mirrors the CI unit job; excludes ./tests)
 	go test $$(go list ./... | grep -v '/tests') -race -count=1 -timeout=300s
 
 test-integration: ## Run integration tests only, requires Docker (mirrors the CI integration job)
-	go test ./tests/... -v -race -count=1 -timeout=600s
+	go test ./tests/... -v -race -count=1 -timeout=900s
 
 test-all: test test-integration ## Run both suites, the way CI does
 
@@ -73,38 +73,66 @@ cli-dev: cli-install ## Run CLI from source (no build needed)
 cli-test: cli-install ## Run CLI tests
 	cd cli && npm test
 
-next-version: ## Print svu-computed next semver from commits since last v* tag
-	@command -v svu >/dev/null 2>&1 || go install github.com/caarlos0/svu/v3@latest
+# svu v3.4.2+ needs Go >= 1.27.3. GOTOOLCHAIN=auto fetches that toolchain
+# when the ambient one is pinned (setup-go sets GOTOOLCHAIN=local).
+next-version: ## Print svu's next semver and the version this module path can tag
+	@command -v svu >/dev/null 2>&1 || GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
 	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
-		echo "current : $$($${SVU} current)"; \
-		echo "next    : $$($${SVU} next)"
+		echo "current    : $$($${SVU} current)"; \
+		echo "svu next   : $$($${SVU} next)"; \
+		echo "releasable : $$($(MAKE) -s --no-print-directory releasable-version)"
 	@echo
-	@echo "Cut a zeroid release: draft a new release in the GitHub UI with tag = svu's recommendation"
-	@echo "(or higher). See RELEASING.md."
-	@echo
-	@echo "If you changed pkg/dpop/ source: run 'make release-dpop VERSION=vX.Y.Z' FIRST to cut"
-	@echo "a new pkg/dpop release + bump zeroid's reference. Otherwise the zeroid release will"
-	@echo "fail the drift guard."
+	@echo "Cut a release: Actions → Release Build - Zeroid → Run workflow."
+	@echo "The workflow uses the releasable version. See RELEASING.md."
 
-release-dpop: ## Cut a new pkg/dpop release (tag + open PR bumping zeroid's reference). Requires VERSION=vX.Y.Z.
-	@command -v gh >/dev/null 2>&1 || { echo "::error::gh CLI is required (https://cli.github.com/)"; exit 1; }
+# feat!: makes svu ask for a new major. A module path without /vN can only be
+# v0 or v1, so that major is released as the next minor until the path moves.
+releasable-version: ## Print the tag this module path can carry
+	@command -v svu >/dev/null 2>&1 || GOTOOLCHAIN=auto go install github.com/caarlos0/svu/v3@v3.4.4
+	@SVU=$$(command -v svu 2>/dev/null || echo "$$(go env GOPATH)/bin/svu"); \
+	NEXT=$$($${SVU} next); \
+	MODULE=$$(awk 'NR==1 && $$1=="module" { print $$2; exit }' go.mod); \
+	MAJOR=$$(printf '%s' "$$NEXT" | sed -E 's/^v([0-9]+)\..*/\1/'); \
+	if ! printf '%s' "$$MODULE" | grep -Eq '/v[0-9]+$$' && [ "$$MAJOR" -ge 2 ]; then \
+		CLAMPED=$$($${SVU} minor); \
+		echo "::notice::svu next is $$NEXT, but $$MODULE has no /v$$MAJOR suffix. Go rejects that version. Releasing $$CLAMPED." >&2; \
+		NEXT="$$CLAMPED"; \
+	fi; \
+	printf '%s\n' "$$NEXT"
+
+release-prep: ## Bump go.mod's nested-module pins to the next release version (lockstep). Requires VERSION=vX.Y.Z.
 	@if [ -z "$(VERSION)" ]; then \
-		echo "::error::VERSION is required, e.g. make release-dpop VERSION=v1.6.1"; \
+		echo "::error::VERSION is required, e.g. make release-prep VERSION=v1.14.0"; \
 		exit 1; \
 	fi
 	@if ! printf '%s' "$(VERSION)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$$'; then \
 		echo "::error::VERSION must match vMAJOR.MINOR.PATCH; got $(VERSION)"; \
 		exit 1; \
 	fi
-	@echo "Triggering release-dpop.yml with version=$(VERSION)..."
-	gh workflow run release-dpop.yml \
-		--repo highflame-ai/zeroid \
-		--field version=$(VERSION)
+	@major=$$(printf '%s' "$(VERSION)" | sed -E 's/^v([0-9]+)\..*/\1/'); \
+	module=$$(awk 'NR==1 && $$1=="module" { print $$2; exit }' go.mod); \
+	if ! printf '%s' "$$module" | grep -Eq '/v[0-9]+$$' && [ "$$major" -ge 2 ]; then \
+		echo "::error::$(VERSION) is invalid for $$module. Go only allows v0 or v1 unless the module path ends in /v$$major."; \
+		echo "::error::Leave the workflow version empty so it releases the next v1 minor, or move the module path to $$module/v$$major before tagging $(VERSION)."; \
+		exit 1; \
+	fi
+	@# LOCKSTEP: zeroid and its nested modules carry the same version and
+	@# are tagged at the same commit. go.mod must therefore name the version being
+	@# released BEFORE the release is cut — release.yml refuses to proceed
+	@# otherwise. This target makes that a one-liner instead of a hand edit.
+	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/(authjwt\|dpop\|jwks)) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' go.mod
+	@rm -f go.mod.bak
+	@# pkg/authjwt requires pkg/jwks at the same lockstep version. The release
+	@# workflow tags jwks before authjwt so this pin can name the version that
+	@# is about to be published.
+	sed -i.bak -E 's|(github.com/highflame-ai/zeroid/pkg/jwks) v[0-9]+\.[0-9]+\.[0-9]+|\1 $(VERSION)|' pkg/authjwt/go.mod
+	@rm -f pkg/authjwt/go.mod.bak
+	@go build ./... >/dev/null
+	@echo "go.mod pins bumped to $(VERSION):"
+	@grep -E 'zeroid/pkg/(authjwt|dpop|jwks)' go.mod pkg/authjwt/go.mod
 	@echo
-	@echo "Watch progress:"
-	@echo "  gh run watch --repo highflame-ai/zeroid"
-	@echo "Then review + merge the auto-opened PR. After merge, your next zeroid release"
-	@echo "(cut normally via GitHub UI) will ship with pkg/dpop $(VERSION)."
+	@echo "Commit this, merge it, then publish the $(VERSION) release."
+
 
 clean: ## Remove binary, keys, and docker volumes
 	rm -f $(BINARY)

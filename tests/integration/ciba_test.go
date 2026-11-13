@@ -116,6 +116,7 @@ func TestCIBA_PollingLifecycle(t *testing.T) {
 	require.Equal(t, approvedUserID, claims["sub"], "sub must be the approved user, not the agent")
 	require.Equal(t, "ciba", claims["token_exchange"])
 	require.Equal(t, clientID, claims["backchannel_client_id"])
+	require.Equal(t, clientID, claims["client_id"], "RFC 9068 §2.2 client_id: the client that redeemed the grant")
 	require.Equal(t, approvedUserEmail, claims["user_email"])
 	require.NotEmpty(t, claims["jti"])
 	require.Equal(t, string(zeroidGrantTypeCIBA), claims["grant_type"])

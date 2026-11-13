@@ -152,7 +152,9 @@ func authVerifyHeaders(t *testing.T, token string) http.Header {
 }
 
 // TestAuthVerify_Headers_APIKeyGrant verifies that all identity headers are set
-// for an api_key token, including X-Zeroid-Act-Sub (act.sub = created_by user).
+// for an api_key token. Under the default rfc8693 profile the key's creator is
+// not an actor, so the token has no act and X-Zeroid-Act-Sub is absent; a
+// tenant on legacy still gets act.sub = the creator in X-Zeroid-Act-Sub.
 func TestAuthVerify_Headers_APIKeyGrant(t *testing.T) {
 	token := issueAPIKeyToken(t, uid("hdr-apikey-agent"))
 	h := authVerifyHeaders(t, token)
@@ -163,7 +165,17 @@ func TestAuthVerify_Headers_APIKeyGrant(t *testing.T) {
 	assert.Equal(t, testAccountID, h.Get("X-Zeroid-Account-Id"), "account_id → X-Zeroid-Account-Id")
 	assert.Equal(t, testProjectID, h.Get("X-Zeroid-Project-Id"), "project_id → X-Zeroid-Project-Id")
 	assert.NotEmpty(t, h.Get("X-Zeroid-External-Id"), "external_id → X-Zeroid-External-Id")
-	assert.NotEmpty(t, h.Get("X-Zeroid-Act-Sub"), "act.sub should be set for api_key grant (created_by user)")
+	assert.Empty(t, h.Get("X-Zeroid-Act-Sub"), "an rfc8693 api_key token has no act")
+	assert.Equal(t, "workload", h.Get("X-Zeroid-Principal-Type"), "the agent is a workload principal")
+	assert.Equal(t, h.Get("X-Forwarded-User"), h.Get("X-Zeroid-Subject"), "the subject is the agent")
+	assert.Equal(t, h.Get("X-Forwarded-User"), h.Get("X-Zeroid-Actor"), "with no act the agent is its own actor")
+
+	t.Run("legacy tenant", func(t *testing.T) {
+		tn := newTenant(t, "legacy")
+		token, _ := tn.apiKeyRoot(t, nil)
+		h := authVerifyHeaders(t, token)
+		assert.Equal(t, "test-user", h.Get("X-Zeroid-Act-Sub"), "legacy act.sub is the key's creator")
+	})
 }
 
 // TestAuthVerify_Headers_ClientCredentials verifies that all identity headers
@@ -194,8 +206,11 @@ func TestAuthVerify_Headers_ClientCredentials(t *testing.T) {
 	assert.Empty(t, h.Get("X-Zeroid-Act-Sub"), "X-Zeroid-Act-Sub must be absent for client_credentials (no delegation)")
 }
 
-// TestAuthVerify_Headers_TokenExchange verifies that X-Zeroid-Act-Sub is set to
-// the orchestrator's WIMSE URI for a delegated token_exchange token.
+// TestAuthVerify_Headers_TokenExchange verifies the headers of a delegated
+// token_exchange token under the default rfc8693 profile: sub (and so
+// X-Forwarded-User and X-Zeroid-Subject) stays the orchestrator the chain acts
+// for, and act.sub (X-Zeroid-Act-Sub, X-Zeroid-Actor) is the sub-agent
+// presenting the token.
 func TestAuthVerify_Headers_TokenExchange(t *testing.T) {
 	// Set up orchestrator with client_credentials.
 	orchID := uid("hdr-orch")
@@ -233,8 +248,12 @@ func TestAuthVerify_Headers_TokenExchange(t *testing.T) {
 
 	h := authVerifyHeaders(t, delegatedToken)
 
-	assert.Equal(t, subIdentity.WIMSEURI, h.Get("X-Forwarded-User"), "sub should be the sub-agent WIMSE URI")
-	assert.Equal(t, orchWIMSE, h.Get("X-Zeroid-Act-Sub"), "act.sub should be the orchestrator WIMSE URI")
+	assert.Equal(t, orchWIMSE, h.Get("X-Forwarded-User"), "sub should be the orchestrator WIMSE URI")
+	assert.Equal(t, orchWIMSE, h.Get("X-Zeroid-Subject"), "the subject is the orchestrator")
+	assert.Equal(t, "workload", h.Get("X-Zeroid-Principal-Type"))
+	assert.Equal(t, subIdentity.WIMSEURI, h.Get("X-Zeroid-Act-Sub"), "act.sub should be the sub-agent WIMSE URI")
+	assert.Equal(t, subIdentity.WIMSEURI, h.Get("X-Zeroid-Actor"), "the sub-agent is the current actor")
+	assert.Equal(t, subID, h.Get("X-Zeroid-External-Id"), "the actor's external_id, read from act")
 	assert.NotEmpty(t, h.Get("X-Zeroid-Trust-Level"))
 	assert.Equal(t, testAccountID, h.Get("X-Zeroid-Account-Id"))
 	assert.Equal(t, testProjectID, h.Get("X-Zeroid-Project-Id"))

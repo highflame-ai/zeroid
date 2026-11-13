@@ -581,8 +581,8 @@ func TestPrivateKeyJWT_DCRManagementDoesNotBrickTheClient(t *testing.T) {
 // halves, and the grant proceeded unauthenticated.
 //
 // Asking the REGISTERED METHOD instead closes it: the method says this client
-// authenticates with a secret, so one is demanded, and bcrypt against an empty
-// stored hash refuses whatever is offered.
+// authenticates with a secret, so one is demanded, and verifying against an
+// empty stored hash refuses whatever is offered.
 //
 // This is a real behaviour change for such rows — before, they were issued
 // tokens for free. Pinned here because nothing else fails if
@@ -660,7 +660,7 @@ func TestClientAuthDowngrade_SecretMethodWithoutASecret(t *testing.T) {
 		defer func() { _ = resp.Body.Close() }()
 
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
-			"bcrypt against an empty stored hash must fail closed")
+			"verifying against an empty stored hash must fail closed")
 		assert.Equal(t, "invalid_client", decode(t, resp)["error"])
 	})
 

@@ -545,6 +545,7 @@ func TestSweepStampsModifiedByOnAuditRow(t *testing.T) {
 		Table("identity_audit_logs").
 		Column("action", "caller_user_id", "identity_id").
 		Where("identity_id = ?", reg.AgentID).
+		Where("table_name = ?", "identities").
 		Order("created_at DESC").
 		Limit(1).
 		Scan(context.Background(), &rows)

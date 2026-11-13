@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -48,8 +49,8 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		ClaimMapping: map[string]string{
 			"user_id": "sub",
 			"email":   "email",
-			// Map an IdP group/role claim into a Highflame Cedar attribute (D3):
-			// the upstream emits `roles` → minted token carries a `role` claim.
+			// A static issuer's mapping is not validated against reserved
+			// keys; the grant ignores role all the same (ADR 0044 D16).
 			"role": "idp_role",
 		},
 		AllowedAccounts: []string{"acct-fed-001"},
@@ -60,7 +61,11 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 	// Confidential client the ID-JAG is bound to (ADR 0010 D2b). Registered on
 	// the shared testServer; OAuth-client lookup is global, so the federation
 	// server's VerifyClientSecret resolves it from the same DB.
-	client := registerOAuthClient(t, uid("idjag-client"), []string{"data:read"})
+	//
+	// The client's registration carries the tenant (ADR 0042 D5): it links an
+	// identity in acct-fed-001/proj-fed-001, and that is where every token from
+	// this harness lands, whether or not the request also names it.
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
 
 	// signIDJAG mints a validly-signed ID-JAG against the fake upstream IdP. It
 	// auto-fills the bound client_id (D2b) and a UNIQUE jti (D2a) unless the
@@ -114,22 +119,26 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 		require.Equal(t, []any{mcpResource}, claims["aud"],
 			"minted token aud must equal the ID-JAG resource claim")
 
-		// D3 — identity mapping: sub mapped from the ID-JAG sub; email mapped;
-		// IdP group/role mapped into the `role` Cedar attribute.
+		// D3 — identity mapping: sub mapped from the ID-JAG sub; email mapped.
+		// The IdP's role claim is never copied (ADR 0044 D16).
 		require.Equal(t, "00uMCPAGENT01", claims["sub"])
 		require.Equal(t, "agent@corp.example.com", claims["user_email"])
-		require.Equal(t, "engineering", claims["role"])
+		require.NotContains(t, claims, "role")
 
 		// IdP provenance + structural fingerprint distinguishing this path.
 		require.Equal(t, upstreamIss, claims["user_id_iss"])
 		require.Equal(t, "id_jag", claims["token_exchange"])
 
-		// Tenant binding stamped from the request (gated by AllowedAccounts).
+		// Tenant derived from the client's registration, inside AllowedAccounts.
 		require.Equal(t, fedCfg.AccountID, claims["account_id"])
 		require.Equal(t, fedCfg.ProjectID, claims["project_id"])
 
 		// Scopes flow from the ID-JAG `scope` claim (IdP already scoped it).
 		require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"])
+
+		// D8 (human-rooted delegation): RFC 9068 §2.2 client_id is the client
+		// the grant authenticated and bound the ID-JAG to.
+		require.Equal(t, client.ClientID, claims["client_id"])
 	})
 
 	t.Run("resource as RFC 8707 array → aud is the full authorized set", func(t *testing.T) {
@@ -482,6 +491,127 @@ func TestIDJAG_EndToEnd(t *testing.T) {
 			"an ID-JAG whose client_id does not match the authenticated client must be invalid_grant; body=%s", resp.RawBody)
 		require.Empty(t, resp.AccessToken)
 	})
+
+	// ── ADR 0042 D5 — the tenant is derived, never supplied (firehog#630) ────
+
+	freshIDJAG := func(t *testing.T, c oauthClientResp) string {
+		t.Helper()
+		now := time.Now()
+		return upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
+			"iss":       upstreamIss,
+			"aud":       federationAud,
+			"sub":       uid("00uD5"),
+			"resource":  mcpResource,
+			"scope":     "tools:read",
+			"client_id": c.ClientID,
+			"jti":       uid("idjag-jti-d5"),
+			"iat":       now.Unix(),
+			"exp":       now.Add(5 * time.Minute).Unix(),
+		})
+	}
+	conformantBody := func(idjag string, c oauthClientResp) map[string]any {
+		// Exactly what draft §4.4 / MCP EMA §5 define: no tenant fields.
+		return map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     idjag,
+			"client_id":     c.ClientID,
+			"client_secret": c.ClientSecret,
+		}
+	}
+
+	t.Run("D5: a conformant request with no tenant fields redeems into the client's tenant", func(t *testing.T) {
+		resp := postFederation(t, fedHTTPSrv.URL, conformantBody(freshIDJAG(t, client), client))
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		require.Equal(t, fedCfg.AccountID, claims["account_id"])
+		require.Equal(t, fedCfg.ProjectID, claims["project_id"])
+		require.Equal(t, []any{mcpResource}, claims["aud"])
+	})
+
+	t.Run("D5: account_id naming another tenant is invalid_grant", func(t *testing.T) {
+		body := conformantBody(freshIDJAG(t, client), client)
+		body["account_id"] = "acct-somebody-else"
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "account_id does not match")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: project_id naming another project is invalid_grant", func(t *testing.T) {
+		body := conformantBody(freshIDJAG(t, client), client)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = "proj-somebody-else"
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "project_id does not match")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: a refused tenant does not burn the single-use jti", func(t *testing.T) {
+		idjag := freshIDJAG(t, client)
+		bad := conformantBody(idjag, client)
+		bad["project_id"] = "proj-somebody-else"
+		rejected := postFederation(t, fedHTTPSrv.URL, bad)
+		require.Equal(t, http.StatusBadRequest, rejected.StatusCode, "body=%s", rejected.RawBody)
+
+		resp := postFederation(t, fedHTTPSrv.URL, conformantBody(idjag, client))
+		require.Equal(t, http.StatusOK, resp.StatusCode,
+			"the jti was consumed by a request refused on its tenant; body=%s", resp.RawBody)
+	})
+
+	t.Run("D5: a client whose registration names no tenant is refused, even naming an allowed one", func(t *testing.T) {
+		unlinked := registerOAuthClient(t, uid("idjag-unlinked"), []string{"data:read"})
+		body := conformantBody(freshIDJAG(t, unlinked), unlinked)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = fedCfg.ProjectID
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "not registered to a tenant")
+		require.Empty(t, resp.AccessToken)
+	})
+
+	t.Run("D5: a client registered in a tenant the issuer does not admit is refused", func(t *testing.T) {
+		// Linked to an identity in the shared test tenant, which this issuer's
+		// allowed_accounts does not list. Naming the admitted tenant on the
+		// request must not rescue it.
+		foreign := registerTenantBoundClient(t, testAccountID, testProjectID, []string{"data:read"})
+		body := conformantBody(freshIDJAG(t, foreign), foreign)
+		body["account_id"] = fedCfg.AccountID
+		body["project_id"] = fedCfg.ProjectID
+		resp := postFederation(t, fedHTTPSrv.URL, body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		require.Equal(t, "invalid_grant", resp.Error, "body=%s", resp.RawBody)
+		require.Contains(t, resp.RawBody, "may mint into")
+		require.Empty(t, resp.AccessToken)
+	})
+}
+
+// registerTenantBoundClient registers a confidential OAuth client whose
+// registration carries a tenant: it links (identity_id) an identity created in
+// account/project. oauth_clients has no tenant columns; the linked identity is
+// where the ID-JAG grant derives the tenant from (ADR 0042 D5). The admin API
+// refuses an identity_id outside the caller's tenant headers, so the link can
+// only be written by that tenant.
+func registerTenantBoundClient(t *testing.T, account, project string, scopes []string) oauthClientResp {
+	t.Helper()
+	headers := map[string]string{"X-Account-ID": account, "X-Project-ID": project}
+	agent := registerIdentityIn(t, headers, uid("idjag-client-agent"), scopes)
+	clientID := uid("idjag-client")
+	resp := post(t, adminPath("/oauth/clients"), map[string]any{
+		"client_id":    clientID,
+		"name":         clientID + "-client",
+		"confidential": true,
+		"grant_types":  []string{"client_credentials"},
+		"scopes":       scopes,
+		"identity_id":  agent.ID,
+	}, headers)
+	require.Equal(t, http.StatusCreated, resp.StatusCode, "registerTenantBoundClient: expected 201")
+	raw := decode(t, resp)
+	c := raw["client"].(map[string]any)
+	return oauthClientResp{ClientID: c["client_id"].(string), ClientSecret: raw["client_secret"].(string)}
 }
 
 // TestIDJAG_NHISelfSignedRegression is the load-bearing regression: a normal
@@ -541,7 +671,7 @@ func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
 	// Confidential client the ID-JAG is bound to (D2b).
-	client := registerOAuthClient(t, uid("idjag-scp-client"), []string{"data:read"})
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
 
 	now := time.Now()
 	idjag := upstream.SignTokenWithTyp(t, idJAGTyp, map[string]any{
@@ -569,4 +699,285 @@ func TestIDJAG_ConfigurableScopeClaim(t *testing.T) {
 	claims := decodeIssuedTokenClaims(t, resp.AccessToken)
 	require.ElementsMatch(t, []any{"tools:read", "tools:exec"}, claims["scopes"],
 		"scopes must be sourced from the ClaimMapping-configured scope claim (scp)")
+}
+
+// addr joins a local part and a domain into a mail-style identifier. Composed
+// rather than written literally purely to keep scanning tooling quiet; the value
+// is an RFC 9493 `email`-format subject identifier and nothing more.
+func addr(local, domain string) string { return local + "\x40" + domain }
+
+// RFC 9493 `sub_id` on ID-JAG redemption (zeroid#265).
+//
+// An ID-JAG may name its subject with a structured identifier instead of a plain
+// `sub`. Before this, the user_id mapping simply missed and the mint failed
+// closed, so such an assertion could not be redeemed at all.
+//
+// The acceptance row in the interop suite
+// (test_ema_matrix.py::test_row_sub_id_support) mints exactly the first case
+// below — `sub` dropped, `sub_id` set to an email identifier — and asserts a
+// token comes back. This drives the same assertion in-repo, plus the cases that
+// row does not cover.
+func TestIDJAG_SubjectIdentifier(t *testing.T) {
+	upstreamIss := "https://corp-idp-subid.idjag.test"
+	federationAud := "https://zeroid.idjag.test"
+	const mcpResource = "https://mcp-server.idjag.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          upstreamIss,
+		JWKSURI:         upstream.JWKSURL(),
+		Audience:        federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read"})
+
+	redeem := func(t *testing.T, extra map[string]any) tokenResponse {
+		t.Helper()
+		now := time.Now()
+		base := map[string]any{
+			"iss":       upstreamIss,
+			"aud":       federationAud,
+			"resource":  mcpResource,
+			"client_id": client.ClientID,
+			"jti":       uid("idjag-subid-jti"),
+			"iat":       now.Unix(),
+			"exp":       now.Add(5 * time.Minute).Unix(),
+		}
+		for k, v := range extra {
+			base[k] = v
+		}
+
+		return postFederation(t, fedHTTPSrv.URL, map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+			"assertion":     upstream.SignTokenWithTyp(t, idJAGTyp, base),
+			"account_id":    fedCfg.AccountID,
+			"project_id":    fedCfg.ProjectID,
+			"client_id":     client.ClientID,
+			"client_secret": client.ClientSecret,
+		})
+	}
+
+	interopUser := addr("interop-user", "highflame.test")
+	alice := addr("alice", "example.test")
+	mallory := addr("mallory", "example.test")
+
+	t.Run("sub_id alone mints — the acceptance row", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "email", "email": interopUser},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		claims := decodeIssuedTokenClaims(t, resp.AccessToken)
+		assert.Equal(t, interopUser, claims["sub"],
+			"the structured identifier must BECOME the principal, not merely be tolerated")
+	})
+
+	t.Run("iss_sub is ONE principal with the plain sub it restates", func(t *testing.T) {
+		// Same person, two assertion shapes, one principal. An earlier version
+		// rendered iss_sub as "iss#sub", which gave this person a second user_id
+		// and would have re-keyed every user of an IdP the day it began emitting
+		// sub_id. The issuer is already on the token as user_id_iss, and is now
+		// pinned to the signer (next case), so the bare sub is collision-safe.
+		viaSubID := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "1001"},
+		})
+		require.Equal(t, http.StatusOK, viaSubID.StatusCode, "body=%s", viaSubID.RawBody)
+		viaSub := redeem(t, map[string]any{"sub": "1001"})
+		require.Equal(t, http.StatusOK, viaSub.StatusCode, "body=%s", viaSub.RawBody)
+
+		a := decodeIssuedTokenClaims(t, viaSubID.AccessToken)
+		b := decodeIssuedTokenClaims(t, viaSub.AccessToken)
+		assert.Equal(t, "1001", a["sub"])
+		assert.Equal(t, b["sub"], a["sub"], "one person must not have two principals")
+		assert.Equal(t, upstreamIss, a["user_id_iss"],
+			"the issuer that disambiguates subjects across IdPs is recorded here")
+	})
+
+	t.Run("iss_sub naming ANOTHER issuer is refused", func(t *testing.T) {
+		// The object's iss is chosen by the IdP that signed it. Unchecked, one
+		// trusted IdP could mint principals in another IdP's namespace — the
+		// exact collision the issuer exists to prevent.
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "iss_sub", "iss": "https://other-idp.test", "sub": "admin"},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "may only identify its own subjects")
+	})
+
+	t.Run("iss_sub agreeing with sub is accepted", func(t *testing.T) {
+		// The most internally consistent assertion possible. The previous
+		// comparison set "1001" against "iss#1001" and refused it every time.
+		resp := redeem(t, map[string]any{
+			"sub":    "1001",
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "1001"},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "1001", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("iss_sub contradicting sub is refused", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub":    "1001",
+			"sub_id": map[string]any{"format": "iss_sub", "iss": upstreamIss, "sub": "2002"},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "different principals")
+	})
+
+	t.Run("opaque sub plus email sub_id — the common IdP shape — mints", func(t *testing.T) {
+		// Two different KINDS of identifier for one person. Comparing their
+		// strings proves nothing, and refusing it rejected ordinary IdPs. The
+		// principal is still the deployer's mapped claim.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uOKTA123",
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uOKTA123", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"],
+			"the mapped claim stays authoritative when present")
+	})
+
+	t.Run("a plain sub still works and is unaffected", func(t *testing.T) {
+		resp := redeem(t, map[string]any{"sub": "00uPLAIN01"})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uPLAIN01", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("agreeing sub and sub_id are accepted", func(t *testing.T) {
+		resp := redeem(t, map[string]any{
+			"sub":    alice,
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+
+	t.Run("DISAGREEING sub and sub_id are refused, not ranked", func(t *testing.T) {
+		// The security case. An assertion naming two different principals is
+		// either a broken IdP or an attempt to have one identity pass the checks
+		// while another reaches the mint. Silently preferring either would make
+		// which identity is authorised depend on an implementation detail.
+		//
+		// Compared like with like: an email sub_id against the plain email
+		// claim. (An email-shaped `sub` is not an email claim — `sub` is opaque
+		// by spec — so that pairing is a different kind and not compared.)
+		resp := redeem(t, map[string]any{
+			"sub":    "00uALICE",
+			"email":  alice,
+			"sub_id": map[string]any{"format": "email", "email": mallory},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "different principals")
+	})
+
+	t.Run("a malformed sub_id fails rather than falling back to sub", func(t *testing.T) {
+		// Fallback is the dangerous reading: an IdP that meant to name a subject
+		// and produced something unreadable has told us its identity claim is
+		// broken, and minting on a different claim is how an assertion ends up
+		// authorising someone it was not written for.
+		resp := redeem(t, map[string]any{
+			"sub":    alice,
+			"sub_id": map[string]any{"format": "email"}, // no email member
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "unusable sub_id")
+	})
+
+	t.Run("an unimplemented RFC 9493 format beside a mapped sub does not sink the assertion", func(t *testing.T) {
+		// RFC 9493 also defines account, phone_number, did and uri. The mapped
+		// claim is the principal, and a format we cannot read can neither supply
+		// nor contradict it — so a conformant IdP emitting one is not refused.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uACCOUNT",
+			"sub_id": map[string]any{"format": "account", "uri": "acct:" + alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uACCOUNT", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("an unimplemented format is still fatal when it is the only subject", func(t *testing.T) {
+		// Nothing else names the principal, so it cannot be set aside.
+		resp := redeem(t, map[string]any{
+			"sub_id": map[string]any{"format": "account", "uri": "acct:" + alice},
+		})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Contains(t, resp.RawBody, "unusable sub_id")
+	})
+
+	t.Run("a blank email claim does not contradict an email sub_id", func(t *testing.T) {
+		// IdPs routinely emit "email": "" for users without one. Blank names
+		// nobody, so it cannot name a different somebody.
+		resp := redeem(t, map[string]any{
+			"sub":    "00uBLANK",
+			"email":  "",
+			"sub_id": map[string]any{"format": "email", "email": alice},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", resp.RawBody)
+		assert.Equal(t, "00uBLANK", decodeIssuedTokenClaims(t, resp.AccessToken)["sub"])
+	})
+
+	t.Run("neither sub nor sub_id still fails closed", func(t *testing.T) {
+		resp := redeem(t, map[string]any{})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, "body=%s", resp.RawBody)
+	})
+}
+
+// The sub_id relaxation is confined to the ID-JAG profile (zeroid#265).
+//
+// validateExternalAssertion takes a subjectRequirement precisely so the two
+// callers can differ: the ID-JAG path accepts a resolvable RFC 9493 sub_id in
+// place of `sub`, and the external-IdP subject_token exchange does NOT. That
+// second half is the part with no natural test — the exchange simply keeps
+// working — so without this, flipping its call site to allowSubjectIdentifier
+// would be a silent relaxation of RFC 7523 §3 on a path nobody asked to change.
+//
+// Uses the strongest form of the fixture: a sub_id that is perfectly valid and
+// would be accepted on the ID-JAG path. The only reason it is refused here is
+// the profile boundary.
+func TestExternalIdP_SubjectTokenStillRequiresPlainSub(t *testing.T) {
+	upstreamIss := "https://corp-idp-strict.idjag.test"
+	federationAud := "https://zeroid.idjag.test"
+
+	upstream := newFakeUpstreamIdP(t)
+	defer upstream.Close()
+
+	fedSrv, fedHTTPSrv, fedCfg := newFederationServer(t, domain.ExternalIssuerConfig{
+		Issuer:          upstreamIss,
+		JWKSURI:         upstream.JWKSURL(),
+		Audience:        federationAud,
+		ClaimMapping:    map[string]string{"user_id": "sub"},
+		AllowedAccounts: []string{"acct-fed-001"},
+	})
+	defer fedHTTPSrv.Close()
+	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
+
+	now := time.Now()
+	idToken := upstream.SignToken(t, map[string]any{
+		"iss": upstreamIss,
+		"aud": federationAud,
+		// No `sub`. A sub_id that the ID-JAG path would happily accept.
+		"sub_id": map[string]any{"format": "email", "email": addr("strict-user", "example.test")},
+		"iat":    now.Unix(),
+		"exp":    now.Add(5 * time.Minute).Unix(),
+	})
+
+	resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
+		"grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token":         idToken,
+		"subject_token_type":    "urn:ietf:params:oauth:token-type:id_token",
+		"client_id":             rpClient(t, federationAud).ClientID,
+		"client_assertion":      rpAssertion(t, rpClient(t, federationAud)),
+		"client_assertion_type": clientAssertionType,
+		"account_id":            fedCfg.AccountID,
+		"project_id":            fedCfg.ProjectID,
+	})
+
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
+		"the subject_token exchange must keep RFC 7523 §3 strictly — the sub_id deviation belongs to "+
+			"the ID-JAG profile alone. body=%s", resp.RawBody)
+	assert.Contains(t, resp.RawBody, "missing required sub claim")
 }

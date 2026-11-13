@@ -10,7 +10,7 @@ import (
 	"github.com/lestrrat-go/jwx/v4/jwk"
 
 	"github.com/highflame-ai/zeroid/domain"
-	"github.com/highflame-ai/zeroid/pkg/authjwt"
+	"github.com/highflame-ai/zeroid/pkg/jwks"
 )
 
 // defaultClientJWKSCacheSize bounds how many remote client JWKS endpoints are
@@ -21,7 +21,7 @@ import (
 // Least-recently-used entries are evicted and closed when the cap is reached.
 const defaultClientJWKSCacheSize = 256
 
-// ClientJWKSCache holds a live authjwt.JWKSClient per remote client `jwks_uri`.
+// ClientJWKSCache holds a live jwks.Client per remote client `jwks_uri`.
 //
 // Keyed by clientID+"\x00"+jwksURI rather than clientID alone: when a client
 // rotates its jwks_uri, a clientID-only key would keep serving keys fetched from
@@ -32,19 +32,19 @@ type ClientJWKSCache struct {
 	maxSize int
 	entries map[string]*list.Element // key -> element in lru
 	lru     *list.List               // front = most recently used; values are *clientJWKSEntry
-	opts    []authjwt.JWKSOption
+	opts    []jwks.Option
 }
 
 type clientJWKSEntry struct {
 	key    string
-	client *authjwt.JWKSClient
+	client *jwks.Client
 }
 
 // NewClientJWKSCache builds an empty cache. opts are applied to every JWKS
 // client it creates — server.go supplies the SSRF-guarded HTTP client there, so
 // a registered jwks_uri cannot be used to probe link-local metadata endpoints or
 // internal services (the same guard the external-issuer registry uses).
-func NewClientJWKSCache(maxSize int, opts ...authjwt.JWKSOption) *ClientJWKSCache {
+func NewClientJWKSCache(maxSize int, opts ...jwks.Option) *ClientJWKSCache {
 	if maxSize <= 0 {
 		maxSize = defaultClientJWKSCacheSize
 	}
@@ -59,7 +59,7 @@ func NewClientJWKSCache(maxSize int, opts ...authjwt.JWKSOption) *ClientJWKSCach
 // get returns a JWKS client for the given client_id + jwks_uri, creating one on
 // a miss and evicting the least-recently-used entry when the cache is full.
 // The construction is deliberately performed OUTSIDE the lock.
-// authjwt.NewJWKSClient does a synchronous warm-up fetch of a client-supplied
+// jwks.New does a synchronous warm-up fetch of a client-supplied
 // URL, bounded only by a 10s timeout. Holding the cache mutex across it would
 // let anyone who can register clients stall every private_key_jwt verification
 // server-wide: point >maxSize registrations at hosts that accept TCP and never
@@ -72,7 +72,7 @@ func NewClientJWKSCache(maxSize int, opts ...authjwt.JWKSOption) *ClientJWKSCach
 // same key may both construct; the loser is closed immediately and the winner
 // is returned to both callers, so no goroutine leaks and callers still share one
 // client.
-func (c *ClientJWKSCache) get(clientID, jwksURI string) (*authjwt.JWKSClient, error) {
+func (c *ClientJWKSCache) get(clientID, jwksURI string) (*jwks.Client, error) {
 	key := clientID + "\x00" + jwksURI
 
 	c.mu.Lock()
@@ -84,7 +84,7 @@ func (c *ClientJWKSCache) get(clientID, jwksURI string) (*authjwt.JWKSClient, er
 	}
 	c.mu.Unlock()
 
-	client, err := authjwt.NewJWKSClient(jwksURI, c.opts...)
+	client, err := jwks.New(jwksURI, c.opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (c *ClientJWKSCache) get(clientID, jwksURI string) (*authjwt.JWKSClient, er
 	// Evict before insert so the cache never exceeds maxSize. Collect the
 	// evicted clients and Close them AFTER releasing the lock — Close blocks on
 	// the refresh goroutine winding down, which can itself be inside a fetch.
-	var evicted []*authjwt.JWKSClient
+	var evicted []*jwks.Client
 	for c.lru.Len() >= c.maxSize {
 		oldest := c.lru.Back()
 		if oldest == nil {
