@@ -52,7 +52,7 @@ func postBcAuthorize(t *testing.T, clientID string, authorizationDetails any) *h
 		body["authorization_details"] = authorizationDetails
 	}
 
-	return post(t, "/oauth2/bc-authorize", body, nil)
+	return post(t, "/oauth2/bc-authorize", body, cibaInitiatorHeaders())
 }
 
 // ── RFC 9396 §2 — Request Parameter "authorization_details" ────────────────
@@ -260,6 +260,7 @@ func TestRFC9396_S3_FormEncodedAuthorizationDetailsAccepted(t *testing.T) {
 	)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set(testTrustedServiceHeader, "ciba-test-initiator")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()

@@ -187,6 +187,16 @@ backchannel:
   # Env: ZEROID_BACKCHANNEL_RESOLVED_RETENTION
   resolved_retention: 720h
 
+  # Let a PUBLIC client start a CIBA request on /oauth2/bc-authorize without
+  # authenticating. Default false: a public client's request is accepted only
+  # from a caller the embedding application's TrustedServiceValidator accepts
+  # (Server.SetTrustedServiceValidator), and is otherwise refused with
+  # invalid_client. Confidential clients authenticate with their secret either
+  # way. Migration aid only — turn it off once callers authenticate. The
+  # client's registered scopes bound every request regardless.
+  # Env: ZEROID_BACKCHANNEL_ALLOW_UNAUTHENTICATED_PUBLIC_CLIENTS
+  allow_unauthenticated_public_clients: false
+
 # OAuth CLIENT authentication — RFC 7523 §2.2 private_key_jwt, where a client
 # proves its identity with a JWT signed by a key it published rather than with a
 # shared secret.

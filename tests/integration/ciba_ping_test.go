@@ -63,7 +63,7 @@ func TestCIBA_PingMode_HappyPath(t *testing.T) {
 		"login_hint":                "bob@example.com",
 		"scope":                     "openid",
 		"client_notification_token": notificationToken,
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, bcResp.StatusCode)
 	bcBody := decode(t, bcResp)
 	authReqID, _ := bcBody["auth_req_id"].(string)

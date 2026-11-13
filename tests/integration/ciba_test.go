@@ -32,7 +32,7 @@ import (
 // on the payload deterministically without sleeping for a goroutine.
 func TestCIBA_PollingLifecycle(t *testing.T) {
 	clientID := uid("ciba-client")
-	registerTestOAuthClient(clientID, []string{"client_credentials"})
+	registerCIBATestClient(clientID, "openid", "profile")
 
 	notifier := newRecordingNotifier()
 	testZeroIDServer.SetBackchannelNotifier(notifier.notify)
@@ -59,7 +59,7 @@ func TestCIBA_PollingLifecycle(t *testing.T) {
 		"login_hint":      "alice@example.com",
 		"scope":           "openid profile",
 		"binding_message": bindingMessage,
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode, "bc-authorize must return 200")
 	body := decode(t, resp)
 
@@ -142,7 +142,7 @@ func TestCIBA_PollingLifecycle(t *testing.T) {
 		"project_id": testProjectID,
 		"login_hint": "alice@example.com",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp2.StatusCode)
 	authReqID2, _ := decode(t, resp2)["auth_req_id"].(string)
 	require.NotEmpty(t, authReqID2)
@@ -177,7 +177,7 @@ func TestCIBA_TenantIsolation_OnApprove(t *testing.T) {
 		"account_id": testAccountID,
 		"project_id": testProjectID,
 		"login_hint": "alice@example.com",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 
@@ -291,7 +291,7 @@ func TestCIBAOffboardByOwnerReachesCIBACredentials(t *testing.T) {
 		"client_id": clientID, "client_secret": clientSecret,
 		"account_id": testAccountID, "project_id": testProjectID,
 		"login_hint": "carol@example.com", "scope": "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID := decode(t, resp)["auth_req_id"].(string)
 
@@ -353,7 +353,7 @@ func TestCIBAPreBurnGatesPreserveApproval(t *testing.T) {
 		"client_id": clientID, "client_secret": clientSecret,
 		"account_id": testAccountID, "project_id": testProjectID,
 		"login_hint": "carol@example.com", "scope": "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID := decode(t, resp)["auth_req_id"].(string)
 

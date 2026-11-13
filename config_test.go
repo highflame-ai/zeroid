@@ -433,12 +433,16 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		if cfg.Backchannel.ResolvedRetention != "720h" {
 			t.Errorf("backchannel.resolved_retention must default to 720h, got %q", cfg.Backchannel.ResolvedRetention)
 		}
+		if cfg.Backchannel.AllowUnauthenticatedPublicClients {
+			t.Error("backchannel.allow_unauthenticated_public_clients must default to false")
+		}
 	})
 
 	t.Run("env", func(t *testing.T) {
 		t.Setenv("ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY", "true")
 		t.Setenv("ZEROID_BACKCHANNEL_ENFORCE_HINTS", "shadow")
 		t.Setenv("ZEROID_BACKCHANNEL_RESOLVED_RETENTION", "48h")
+		t.Setenv("ZEROID_BACKCHANNEL_ALLOW_UNAUTHENTICATED_PUBLIC_CLIENTS", "true")
 		cfg, err := LoadConfig("")
 		if err != nil {
 			t.Fatalf("LoadConfig failed: %v", err)
@@ -451,6 +455,9 @@ func TestBackchannelApproverConfig(t *testing.T) {
 		}
 		if cfg.Backchannel.EnforceHints != "shadow" {
 			t.Errorf("ZEROID_BACKCHANNEL_ENFORCE_HINTS=shadow did not reach backchannel, got %q", cfg.Backchannel.EnforceHints)
+		}
+		if !cfg.Backchannel.AllowUnauthenticatedPublicClients {
+			t.Error("ZEROID_BACKCHANNEL_ALLOW_UNAUTHENTICATED_PUBLIC_CLIENTS=true did not reach backchannel")
 		}
 	})
 

@@ -753,6 +753,42 @@ Section 11.1):
 | `backchannel_token_delivery_mode` | `poll` (default), `ping`, `push` | How the issued token reaches the client. |
 | `client_notification_endpoint` | HTTPS URL | Ping/push callback target. SSRF-guarded; private endpoints rejected unless the deployer sets `AllowPrivateNotificationEndpoints`. |
 
+### 6.4 Client authentication and the client scope bound
+
+- **Initiator.** CIBA Core §7.1 has the client authenticate to the backchannel
+  authentication endpoint. A confidential client **MUST** present its
+  `client_secret`. A public client cannot authenticate, so its request is
+  accepted only when the deployer's `TrustedServiceValidator` accepts the
+  caller; otherwise it is refused with `invalid_client` and nothing is
+  persisted or notified. `requesting_token` has the same requirement. The
+  deployment setting `backchannel.allow_unauthenticated_public_clients`
+  (default `false`) restores acceptance of unauthenticated public clients as a
+  migration aid.
+- **Scope bound.** Every scope in the request other than `openid` **MUST** be
+  in the client's registered `scopes`, or the request is refused with
+  `invalid_scope`. `openid` asks for authentication, not authority, and is
+  always permitted. A public client registered with no scopes may request
+  `openid` only; a confidential client registered with no scopes has no
+  client-level ceiling (RFC 6749 §3.3). The check is repeated at issuance,
+  before the `auth_req_id` is consumed, so a registration narrowed while a
+  request is pending refuses issuance (`invalid_scope`) and leaves the approval
+  redeemable if the registration is restored.
+- **Redemption.** The CIBA grant takes no scope at the token endpoint. The
+  issued token's scope is the scope the user was asked to approve, then
+  narrowed by the bound identity's policy, the person ceiling, and — for a
+  step-up — the requesting token.
+- **Holder of `auth_req_id`.** A request made with `requesting_token` is
+  redeemable only by a poll presenting that token (and its DPoP key, when
+  bound). A request without one is redeemable by its client: a confidential
+  client authenticates, and for a public client the `auth_req_id` (256 bits
+  from a CSPRNG, returned to the initiator and passed to the deployer's
+  `BackchannelNotifier`) is a bearer handle. Because a public client's request
+  can be started only through a trusted caller, the initiator that receives
+  the handle is that caller. The notifier receives it too, so a deployer's
+  approval channel **SHOULD** treat `auth_req_id` as a credential and not
+  disclose it beyond the approvers it addresses. A deployment that needs the
+  poll itself authenticated should register the client as confidential.
+
 ## 7. DPoP Extensions
 
 ZeroID implements RFC 9449 DPoP (proof at `/oauth2/token`, `cnf.jkt` binding,

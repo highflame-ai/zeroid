@@ -458,6 +458,75 @@ func requestingChainScopes(chainScopes, requested []string) ([]string, error) {
 // authentication request.
 const cibaProtocolScope = "openid"
 
+// requireAuthenticatedInitiator refuses a bc-authorize request from a caller
+// that did not authenticate, unless the deployment opted into the legacy
+// behaviour. It is reached only when callerAuthenticated is false: the client
+// is public and the deployer's TrustedServiceValidator did not accept the
+// caller.
+//
+// CIBA Core 1.0 §7.1 has the client authenticate to the backchannel
+// authentication endpoint. A public client cannot, so without this anyone who
+// knows its client_id could start a request in its name — choosing the tenant,
+// the user to prompt, and the binding_message and authorization_details the
+// approver is shown — and, the client being public, poll for the approved
+// token themselves. A deployment that fronts public CIBA clients with its own
+// service authenticates that service through TrustedServiceValidator, which
+// callerAuthenticated already accepts.
+func (s *BackchannelService) requireAuthenticatedInitiator(client *domain.OAuthClient) error {
+	if s.cfg.AllowUnauthenticatedPublicClients {
+		log.Warn().
+			Str("client_id", client.ClientID).
+			Msg("bc-authorize accepted from an unauthenticated public client (backchannel.allow_unauthenticated_public_clients=true)")
+		return nil
+	}
+	// 400 invalid_client, matching this endpoint's other client-authentication
+	// refusals.
+	return oauthBadRequest(oautherror.InvalidClient,
+		"client authentication is required for bc-authorize; a public client's requests must come from a trusted service")
+}
+
+// requireCIBAScopeWithinClient refuses a bc-authorize scope that names
+// anything the client was not registered for. The approver is shown the
+// requested scope and the token is minted with it, so the client's
+// registration is the ceiling on what a request through it may ask for:
+// without one, any caller entitled to use the client could have a human
+// approve authority the client was never granted.
+//
+// openid is the CIBA protocol scope; it asks for authentication, not
+// authority, and is always permitted (the same reading requestingChainScopes
+// and the person ceiling give it).
+//
+// A client registered with no scopes:
+//   - public: may request openid only. Deny-by-default, because a public
+//     client has no credential of its own and its registration is the only
+//     statement of what it was meant to obtain.
+//   - confidential: keeps the long-standing reading of an empty registration
+//     as "no client-level ceiling" (RFC 6749 §3.3, as authorization_code
+//     applies it). The client authenticated, and the bound identity's policy
+//     and the person ceiling still bound the result.
+//
+// A scope outside the ceiling is refused with invalid_scope rather than
+// dropped: a silently narrower token would leave the client believing it
+// holds authority it does not, and the approver would have been shown more
+// than was granted.
+func requireCIBAScopeWithinClient(client *domain.OAuthClient, rawScope string) error {
+	ceiling := client.Scopes
+	if len(ceiling) == 0 && client.RequiresClientAuthentication() {
+		return nil
+	}
+	allowed := make(map[string]bool, len(ceiling)+1)
+	allowed[cibaProtocolScope] = true
+	for _, sc := range ceiling {
+		allowed[sc] = true
+	}
+	for _, sc := range parseScopeString(rawScope) {
+		if !allowed[sc] {
+			return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not registered for this client", sc))
+		}
+	}
+	return nil
+}
+
 // requestingChainPrincipal returns the principal of the chain a step-up is
 // approved into. A requesting credential minted since migration 048 records
 // it; an older one does not, and the exchange's legacy rule applies (see

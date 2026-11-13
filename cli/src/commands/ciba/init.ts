@@ -12,6 +12,10 @@ export function registerCibaInit(cibaCmd: Command): void {
     .command("init")
     .description("Initiate a CIBA backchannel authentication request (Core §7)")
     .requiredOption("--client-id <id>", "OAuth client initiating the CIBA request")
+    .option(
+      "--client-secret <secret>",
+      "Client secret for a confidential client (or ZID_CLIENT_SECRET); public clients must be relayed by a trusted service",
+    )
     .requiredOption("--login-hint <hint>", "User identifier to send to the backchannel notifier")
     .option("--scope <scopes>", "Space-separated scopes to request", "")
     .option("--binding-message <text>", "Human-readable context shown to the approving user")
@@ -30,6 +34,7 @@ export function registerCibaInit(cibaCmd: Command): void {
 
         const response = await postPublicJSON<CibaInitResponse>(context.base_url, "/oauth2/bc-authorize", {
           client_id: opts.clientId as string,
+          client_secret: nonEmpty((opts.clientSecret as string | undefined) ?? process.env.ZID_CLIENT_SECRET),
           account_id: context.account_id,
           project_id: context.project_id,
           login_hint: opts.loginHint as string,

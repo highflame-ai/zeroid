@@ -642,6 +642,7 @@ func TestPersonGrant_CIBAPushRefusalIsDelivered(t *testing.T) {
 				RedirectURIs:                 []string{testRedirectURI},
 				ClientNotificationEndpoint:   endpoint,
 				BackchannelTokenDeliveryMode: "push",
+				Scopes:                       []string{"pg:a"},
 			}))
 			user := uid("pg-push-user")
 			grants.set(user, tc.grant, tc.err)
@@ -649,7 +650,7 @@ func TestPersonGrant_CIBAPushRefusalIsDelivered(t *testing.T) {
 			resp := post(t, "/oauth2/bc-authorize", map[string]any{
 				"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
 				"login_hint": user, "scope": "pg:a", "client_notification_token": "push-bearer",
-			}, nil)
+			}, cibaInitiatorHeaders())
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			id := decode(t, resp)["auth_req_id"].(string)
 			approveInTenant(t, id, user, adminHeaders())

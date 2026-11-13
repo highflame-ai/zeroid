@@ -89,6 +89,14 @@ var testDB *bun.DB
 // service name (the `trusted_by` claim).
 const testTrustedServiceHeader = "X-Test-Trusted-Service"
 
+// cibaInitiatorHeaders marks a bc-authorize call as coming from a trusted
+// service, the way a deployer that fronts public CIBA clients with its own
+// service relays them. Public clients are refused at bc-authorize without it
+// (backchannel.allow_unauthenticated_public_clients defaults to false).
+func cibaInitiatorHeaders() map[string]string {
+	return map[string]string{testTrustedServiceHeader: "ciba-test-initiator"}
+}
+
 // testApproverSubHeader stands in for a deployer's user-authentication layer
 // on the CIBA approve/deny endpoints: when present, the test global middleware
 // sets a session-authenticated zeroid.ApproverIdentity with this subject.
@@ -721,6 +729,21 @@ func registerTestOAuthClient(clientID string, grantTypes []string) {
 	})
 	if err != nil {
 		panic(fmt.Sprintf("registerTestOAuthClient(%s): %v", clientID, err))
+	}
+}
+
+// registerCIBATestClient registers a public client whose registered scopes
+// bound the CIBA requests made through it.
+func registerCIBATestClient(clientID string, scopes ...string) {
+	err := testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
+		ClientID:     clientID,
+		Name:         clientID + "-test-client",
+		GrantTypes:   []string{"client_credentials"},
+		RedirectURIs: []string{testRedirectURI},
+		Scopes:       scopes,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("registerCIBATestClient(%s): %v", clientID, err))
 	}
 }
 

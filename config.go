@@ -189,6 +189,20 @@ type BackchannelConfig struct {
 	// Default "720h" (30 days); values below the 10-minute post-approval
 	// redemption grace act as that floor.
 	ResolvedRetention string `koanf:"resolved_retention"`
+
+	// AllowUnauthenticatedPublicClients lets a PUBLIC client start a CIBA
+	// request on /oauth2/bc-authorize without authenticating, as releases
+	// before this setting allowed. Default false: a public client's request
+	// is accepted only when the deployer's TrustedServiceValidator accepts
+	// the caller (Server.SetTrustedServiceValidator), and is otherwise
+	// refused with invalid_client. Confidential clients authenticate with
+	// their secret either way.
+	//
+	// A migration aid for deployments whose public CIBA clients are called
+	// directly rather than through a service the validator recognises; turn
+	// it off once those callers authenticate. The client's registered scopes
+	// bound every request whatever this is set to.
+	AllowUnauthenticatedPublicClients bool `koanf:"allow_unauthenticated_public_clients"`
 }
 
 // resolvedRetention parses ResolvedRetention; empty means the default.
@@ -1120,6 +1134,8 @@ func loadDefaults(k *koanf.Koanf) error {
 		"backchannel.require_approver_identity": false,
 		"backchannel.enforce_hints":             "off",
 		"backchannel.resolved_retention":        "720h",
+		// Public CIBA clients must come through a trusted service.
+		"backchannel.allow_unauthenticated_public_clients": false,
 
 		"cimd.enabled":                          true,
 		"cimd.allow_private_metadata_endpoints": false,
@@ -1214,10 +1230,11 @@ var envMapping = map[string]string{
 
 	// Backchannel (CIBA) — SSRF guard relaxation for single-tenant
 	// test/dev deployments only. Production MUST leave this false.
-	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS":   "backchannel.allow_private_notification_endpoints",
-	"ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY": "backchannel.require_approver_identity",
-	"ZEROID_BACKCHANNEL_ENFORCE_HINTS":             "backchannel.enforce_hints",
-	"ZEROID_BACKCHANNEL_RESOLVED_RETENTION":        "backchannel.resolved_retention",
+	"ZEROID_BACKCHANNEL_ALLOW_PRIVATE_ENDPOINTS":              "backchannel.allow_private_notification_endpoints",
+	"ZEROID_BACKCHANNEL_REQUIRE_APPROVER_IDENTITY":            "backchannel.require_approver_identity",
+	"ZEROID_BACKCHANNEL_ENFORCE_HINTS":                        "backchannel.enforce_hints",
+	"ZEROID_BACKCHANNEL_RESOLVED_RETENTION":                   "backchannel.resolved_retention",
+	"ZEROID_BACKCHANNEL_ALLOW_UNAUTHENTICATED_PUBLIC_CLIENTS": "backchannel.allow_unauthenticated_public_clients",
 
 	// CIMD (Client ID Metadata Documents). Enabled by default; disable with
 	// ZEROID_CIMD_ENABLED=false. The private-endpoint relaxation is for
