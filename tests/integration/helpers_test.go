@@ -332,6 +332,9 @@ func runTests(m *testing.M) int {
 			if r.Header.Get(testApprovalChannelWriteHeader) != "" {
 				r = r.WithContext(zeroid.WithTrustedApprovalChannelWrite(r.Context()))
 			}
+			if r.Header.Get(testManagementKeyWriteHeader) != "" {
+				r = r.WithContext(zeroid.WithManagementKeyWrite(r.Context()))
+			}
 			if sub := r.Header.Get(testApproverSubHeader); sub != "" {
 				r = r.WithContext(zeroid.WithApproverIdentity(r.Context(), zeroid.ApproverIdentity{
 					Subject: sub,

@@ -28,3 +28,12 @@ func TestReservedClaims_PrincipalTypeAndMissionID(t *testing.T) {
 		}
 	}
 }
+
+// TestAPIKeyIDIsReserved: an embedding service looks a key up by api_key_id to
+// read its management mark and creator (ADR 0051 D2), so a caller who could set
+// it through additional_claims would borrow another key's authority.
+func TestAPIKeyIDIsReserved(t *testing.T) {
+	if !reservedClaims["api_key_id"] {
+		t.Fatal("api_key_id must be in reservedClaims: additional_claims would otherwise be able to forge it")
+	}
+}

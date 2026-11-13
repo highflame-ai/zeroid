@@ -90,6 +90,11 @@ type Claims struct {
 	// populated with the root JTI. See zeroid issue #81.
 	MissionID string `json:"mission_id,omitempty"`
 
+	// APIKeyID is the API key an api_key-grant token was minted from. ZeroID
+	// reserves the claim and sets it only on that grant, so it is empty on
+	// every other token, including ones exchanged from an api_key token.
+	APIKeyID string `json:"api_key_id,omitempty"`
+
 	// RFC 8693 delegation. Under the rfc8693 token profile this is the current
 	// actor, with prior actors nested in its Actor field. Under the legacy
 	// profile it is a single level whose meaning depends on the grant (the
@@ -397,6 +402,7 @@ func extractClaims(token jwt.Token) *Claims {
 		"act":            {},
 		"mission_id":     {},
 		"principal_type": {},
+		"api_key_id":     {},
 	}
 
 	// RFC 8707 resource binding. Per RFC 8707 the value is a single URI string
@@ -444,6 +450,7 @@ func extractClaims(token jwt.Token) *Claims {
 	c.Scopes = getStringSlice("scopes")
 	c.DelegationDepth = getInt("delegation_depth")
 	c.MissionID = getString("mission_id")
+	c.APIKeyID = getString("api_key_id")
 	c.principalType = getString("principal_type")
 
 	// RFC 8693 delegation. The act claim is a nested object; pull it as

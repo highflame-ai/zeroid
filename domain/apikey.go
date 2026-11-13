@@ -55,9 +55,14 @@ type APIKey struct {
 	// ChannelTrusted records that the key was created by a caller marked with
 	// WithTrustedApprovalChannelWrite. ciba:approve is issued from a key only
 	// when it is set.
-	ChannelTrusted bool      `bun:"channel_trusted,notnull" json:"-"`
-	CreatedAt      time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
-	UpdatedAt      time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
+	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
+	// Management records that the key was marked for management at creation
+	// by a caller marked with WithManagementKeyWrite (ADR 0053 D3). ZeroID
+	// grants nothing on it; the embedding service reads it by key ID (the
+	// api_key_id claim) and decides.
+	Management bool      `bun:"management,notnull" json:"management"`
+	CreatedAt  time.Time `bun:"created_at,nullzero,notnull,default:current_timestamp" json:"created_at"`
+	UpdatedAt  time.Time `bun:"updated_at,nullzero,notnull,default:current_timestamp" json:"updated_at"`
 }
 
 // IsExpired reports whether the API key has aged out. A nil ExpiresAt

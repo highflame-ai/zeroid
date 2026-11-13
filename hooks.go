@@ -473,3 +473,19 @@ func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
 func TrustedApprovalChannelWrite(ctx context.Context) bool {
 	return service.TrustedApprovalChannelWrite(ctx)
 }
+
+// WithManagementKeyWrite returns ctx marked as coming from the caller the
+// deployer trusts to mark API keys for management (ADR 0053 D3). Without it,
+// a create-key request with management=true is refused with 403. ZeroID only
+// stores the mark (APIKey.Management) and grants nothing on it; the deployer
+// reads it by the token's api_key_id claim and checks the key's creator.
+// Set it in the AdminAuth layer for the most trusted caller class only.
+func WithManagementKeyWrite(ctx context.Context) context.Context {
+	return service.WithManagementKeyWrite(ctx)
+}
+
+// ManagementKeyWrite reports whether ctx carries the mark set by
+// WithManagementKeyWrite.
+func ManagementKeyWrite(ctx context.Context) bool {
+	return service.ManagementKeyWrite(ctx)
+}
