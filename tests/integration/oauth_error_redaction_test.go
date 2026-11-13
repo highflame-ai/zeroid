@@ -92,7 +92,7 @@ func TestOAuthBcAuthorizeIgnoresUnknownParams(t *testing.T) {
 		"group_hint":            "highflame:role:finance_lead",
 		"scope":                 "openid",
 		"not_a_real_ciba_field": "123",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"unrecognized request parameters must be ignored, not rejected (RFC 6749 §3.1, "+
 			"inherited by CIBA Core 1.0 §7.1)")
@@ -148,7 +148,7 @@ func TestOAuthBcAuthorizeValidationErrorRedactsSecrets(t *testing.T) {
 		"project_id":                testProjectID,
 		"login_hint":                "user@example.com",
 		"client_notification_token": "should-never-leak-either",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode,
 		"missing client_id is a schema-level required-field failure")
 	assertNoSecretLeak(t, resp, "should-never-leak-either")

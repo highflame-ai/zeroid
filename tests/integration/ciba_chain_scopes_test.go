@@ -23,7 +23,7 @@ func bcAuthorizeIn(t *testing.T, c cibaClient, account, project string, body map
 	body["client_secret"] = c.Secret
 	body["account_id"] = account
 	body["project_id"] = project
-	resp := post(t, "/oauth2/bc-authorize", body, nil)
+	resp := post(t, "/oauth2/bc-authorize", body, cibaInitiatorHeaders())
 	got := decode(t, resp)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "bc-authorize: %v", got)
 	id, _ := got["auth_req_id"].(string)

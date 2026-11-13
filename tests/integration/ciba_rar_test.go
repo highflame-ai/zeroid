@@ -55,7 +55,7 @@ func TestCIBA_RAR_NotifierReceivesParsedDetails(t *testing.T) {
 				"actions": []string{"log"},
 			},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode, "bc-authorize must accept well-formed RAR")
 
 	got := notifier.last()
@@ -97,7 +97,7 @@ func TestCIBA_RAR_BackwardCompatibleWhenOmitted(t *testing.T) {
 		"project_id": testProjectID,
 		"login_hint": "alice@example.com",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"legacy bc-authorize (no RAR) must keep working unchanged")
 
@@ -166,7 +166,7 @@ func TestCIBA_RAR_MalformedRejects(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			resp := post(t, "/oauth2/bc-authorize", c.body, nil)
+			resp := post(t, "/oauth2/bc-authorize", c.body, cibaInitiatorHeaders())
 			require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 				"malformed RAR must be rejected with 400")
 			body := decode(t, resp)
@@ -224,7 +224,7 @@ func TestCIBA_RAR_PerTypeValidator(t *testing.T) {
 		"authorization_details": []map[string]any{
 			{"type": "highflame_tool_call", "tool": "transfer_funds"},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, respOK.StatusCode, "registered validator must accept allowed tool")
 	require.Equal(t, 1, validatorCalls, "validator must have been invoked once for the matching element")
 
@@ -238,7 +238,7 @@ func TestCIBA_RAR_PerTypeValidator(t *testing.T) {
 		"authorization_details": []map[string]any{
 			{"type": "highflame_tool_call", "tool": "drain_funds"},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusBadRequest, respBad.StatusCode)
 	body := decode(t, respBad)
 	require.Equal(t, "invalid_authorization_details", body["error"])
@@ -257,7 +257,7 @@ func TestCIBA_RAR_PerTypeValidator(t *testing.T) {
 		"authorization_details": []map[string]any{
 			{"type": "some_other_type", "anything": "goes"},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, respUnregistered.StatusCode,
 		"unregistered types pass through under the permissive default")
 	require.Equal(t, 2, validatorCalls,
@@ -289,7 +289,7 @@ func TestCIBA_RAR_ExplicitEmptyArray(t *testing.T) {
 		"login_hint":            "alice@example.com",
 		"scope":                 "openid",
 		"authorization_details": []map[string]any{},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"explicit empty authorization_details must succeed (legacy CIBA semantics)")
 
@@ -328,7 +328,7 @@ func TestCIBA_RAR_ValidatorPanicMapsToOAuthError(t *testing.T) {
 		"authorization_details": []map[string]any{
 			{"type": "highflame_panicky", "any": "payload"},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode,
 		"validator panic must map to 400, not 500")
 	body := decode(t, resp)
@@ -370,6 +370,7 @@ func TestCIBA_RAR_FormEncoded(t *testing.T) {
 	)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set(testTrustedServiceHeader, "ciba-test-initiator")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
@@ -409,6 +410,7 @@ func TestCIBA_RAR_FormEncodedMalformed(t *testing.T) {
 	)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set(testTrustedServiceHeader, "ciba-test-initiator")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
@@ -456,7 +458,7 @@ func TestCIBA_RAR_TokenSideEndToEnd(t *testing.T) {
 				"amount": 50000,
 			},
 		},
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 	require.NotEmpty(t, authReqID)
@@ -539,7 +541,7 @@ func TestCIBA_RAR_LegacyFlowCarriesEmptyArray(t *testing.T) {
 		"project_id": testProjectID,
 		"login_hint": "legacy@example.com",
 		"scope":      "openid",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	authReqID, _ := decode(t, resp)["auth_req_id"].(string)
 

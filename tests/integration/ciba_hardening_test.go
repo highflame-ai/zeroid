@@ -42,7 +42,14 @@ func TestCIBAHardening(t *testing.T) {
 	bcRepo.SetResolvedRetention(0)
 	oauthClientRepo := postgres.NewOAuthClientRepository(testDB)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
-	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, nil, service.DefaultBackchannelConfig())
+	// Built without OAuthService, so no TrustedServiceValidator can vouch for
+	// a public client's caller; the legacy setting lets the redemption
+	// subtests below create requests through public clients. strictSvc keeps
+	// the default and pins the initiator gate.
+	legacyCfg := service.DefaultBackchannelConfig()
+	legacyCfg.AllowUnauthenticatedPublicClients = true
+	bcSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, nil, legacyCfg)
+	strictSvc := service.NewBackchannelService(bcRepo, oauthClientSvc, nil, nil, service.DefaultBackchannelConfig())
 
 	t.Run("Redeem_OmittedClientID_Refused", func(t *testing.T) {
 		// FIX #1: Redeem must require a non-empty client_id and always compare
@@ -223,19 +230,23 @@ func TestCIBAHardening(t *testing.T) {
 		require.NoError(t, e3, "confidential client with correct secret must be accepted")
 		require.NotEmpty(t, out.AuthReqID)
 
-		// Public clients per CIBA may remain unauthenticated — confirm the
-		// enforcement is scoped to confidential clients only.
+		// The confidential-client check never asks a public client for a
+		// secret. By default a public client's request is still refused unless
+		// a trusted service relays it; the legacy setting accepts it.
 		pubClientID := uid("ciba-hard-pub")
 		registerTestOAuthClient(pubClientID, []string{"client_credentials"})
-		pubOut, e4 := bcSvc.CreateAuthRequest(ctx, service.CreateAuthRequestInput{
+		pubIn := service.CreateAuthRequestInput{
 			ClientID:  pubClientID,
 			AccountID: testAccountID,
 			ProjectID: testProjectID,
 			LoginHint: "erin@example.com",
 			Scope:     "openid",
 			// no client_secret
-		})
-		require.NoError(t, e4, "public client must remain unauthenticated at bc-authorize")
+		}
+		_, e4 := strictSvc.CreateAuthRequest(ctx, pubIn)
+		requireOAuthError(t, e4, oautherror.InvalidClient)
+		pubOut, e5 := bcSvc.CreateAuthRequest(ctx, pubIn)
+		require.NoError(t, e5, "the legacy setting accepts an unauthenticated public client")
 		require.NotEmpty(t, pubOut.AuthReqID)
 	})
 

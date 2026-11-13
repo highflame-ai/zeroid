@@ -713,6 +713,7 @@ def handle_query_database(request_headers: dict, query: str) -> dict:
 #    in the approval prompt.
 curl -s -X POST https://auth.highflame.ai/oauth2/bc-authorize \
   -d 'client_id=alice-agent' \
+  -d 'client_secret=<client_secret>' \
   -d 'login_hint=alice@example.com' \
   -d 'scope=gmail:read' \
   -d 'binding_message=alice-agent wants to read your unread Gmail'
@@ -728,7 +729,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/bc-authorize \
 curl -s -X POST https://auth.highflame.ai/oauth2/token \
   -d 'grant_type=urn:openid:params:grant-type:ciba' \
   -d 'auth_req_id=<auth_req_id>' \
-  -d 'client_id=alice-agent'
+  -d 'client_id=alice-agent' \
+  -d 'client_secret=<client_secret>'
 # After Alice approves:
 # {
 #   "access_token": "...",       ← sub = alice@example.com, backchannel_client_id = alice-agent
@@ -736,6 +738,8 @@ curl -s -X POST https://auth.highflame.ai/oauth2/token \
 #   "expires_in": 900
 # }
 ```
+
+**Who may start a request, and for what.** The client authenticates at `/oauth2/bc-authorize` (CIBA Core §7.1): a confidential client with its `client_secret`. A public client has nothing to authenticate with, so its requests are accepted only from a caller your `TrustedServiceValidator` accepts — typically the service of yours that fronts it — and are otherwise refused with `invalid_client` (`backchannel.allow_unauthenticated_public_clients` restores the old behaviour while callers migrate; it defaults to off). The requested `scope` must be within the client's registered `scopes`; anything else is refused with `invalid_scope` before a prompt is sent, and checked again when the token is issued. `openid` is always allowed. A public client registered with no scopes may request only `openid`; a confidential client registered with none has no client-level ceiling, as on the other grants. Redemption carries no scope: the token holds what the user was asked to approve, never more.
 
 **Requests made with a `requesting_token`.** A bc-authorize request may carry the access token of the request it is for (`requesting_token`, accepted from an authenticated client or a caller your `TrustedServiceValidator` accepts). The approved token then keeps that token's `sub`, `act`, identity claims and DPoP binding (`cnf.jkt`) and never outlives it. It also keeps that token's scopes: `scope=openid` (the CIBA protocol scope) or no scope means "no narrowing", other named scopes narrow the result to those, and a named scope the requesting token does not hold is refused with `invalid_scope`, because a step-up never adds a scope to its chain. The requesting identity's `allowed_scopes` and credential policy still bound the result; for a chain acting for a person the policy's `user_grant_scopes` applies in place of its `allowed_scopes`. A requesting token issued to no identity is bounded instead by the polling client's bound identity, as a root grant is, and `ciba:approve` is never issued by an approval. Each of these refusals leaves the approval redeemable. Redeeming such a request requires the same token on every poll, as the `requesting_token` form parameter (`-d 'requesting_token=<token>'`); when that token is DPoP-bound, the poll must also carry a `DPoP` proof for its key. A poll without them gets `access_denied` and leaves the approval redeemable. Requests made without `requesting_token` are polled as shown above.
 

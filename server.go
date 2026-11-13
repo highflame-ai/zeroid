@@ -532,6 +532,11 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	backchannelCfg.AllowPrivateNotificationEndpoints = cfg.Backchannel.AllowPrivateNotificationEndpoints
 	backchannelCfg.RequireApproverIdentity = cfg.Backchannel.RequireApproverIdentity
 	backchannelCfg.EnforceHints = cfg.Backchannel.EnforceHints
+	backchannelCfg.AllowUnauthenticatedPublicClients = cfg.Backchannel.AllowUnauthenticatedPublicClients
+	if backchannelCfg.AllowUnauthenticatedPublicClients {
+		log.Warn().Msg("backchannel.allow_unauthenticated_public_clients=true: public CIBA clients may start requests " +
+			"without client authentication or a trusted-service caller; use only while migrating callers")
+	}
 	// Mirror the SSRF-guard relaxation flag onto OAuthClientService so the
 	// registration-time check (in OAuthClientService.RegisterClient) and the
 	// request-time check (in BackchannelService.CreateAuthRequest) agree.

@@ -74,6 +74,11 @@ func newApproverBackchannelSvc(t *testing.T, o approverSvcOpts) (*service.Backch
 	cfg := service.DefaultBackchannelConfig()
 	cfg.RequireApproverIdentity = o.requireIdentity
 	cfg.EnforceHints = o.enforceHints
+	// These services are built without OAuthService, so no
+	// TrustedServiceValidator can vouch for the initiator; the legacy setting
+	// lets their public test clients start requests. The initiator gate itself
+	// is covered by TestCIBAPublicClientInitiator.
+	cfg.AllowUnauthenticatedPublicClients = true
 	repo := postgres.NewBackchannelRequestRepository(testDB)
 	svc := service.NewBackchannelService(repo, service.NewOAuthClientService(postgres.NewOAuthClientRepository(testDB)), nil, nil, cfg)
 	if o.authorizer != nil {
@@ -530,7 +535,7 @@ func TestCIBAFourEyesParameters(t *testing.T) {
 		resp := post(t, "/oauth2/bc-authorize", map[string]any{
 			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
 			"group_hint": "highflame:role:admin", "four_eyes": "true", "requester_owner": "user-owner",
-		}, nil)
+		}, cibaInitiatorHeaders())
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 
@@ -549,7 +554,7 @@ func TestCIBAFourEyesParameters(t *testing.T) {
 		resp := post(t, "/oauth2/bc-authorize", map[string]any{
 			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
 			"login_hint": "user-a", "four_eyes": "false",
-		}, nil)
+		}, cibaInitiatorHeaders())
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 		require.False(t, loadBackchannelRow(t, postgres.NewBackchannelRequestRepository(testDB), id).FourEyes)
@@ -561,7 +566,7 @@ func TestCIBAFourEyesParameters(t *testing.T) {
 		resp := post(t, "/oauth2/bc-authorize", map[string]any{
 			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
 			"login_hint": "user-a", "four_eyes": "maybe",
-		}, nil)
+		}, cibaInitiatorHeaders())
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 		require.Equal(t, "invalid_request", decode(t, resp)["error"])
 	})
@@ -591,7 +596,7 @@ func TestCIBAApproverHTTP(t *testing.T) {
 		resp := post(t, "/oauth2/bc-authorize", map[string]any{
 			"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID,
 			"login_hint": loginHint,
-		}, nil)
+		}, cibaInitiatorHeaders())
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		id, _ := decode(t, resp)["auth_req_id"].(string)
 		return id
@@ -1099,7 +1104,7 @@ func TestCIBARequestingTokenClientAuth(t *testing.T) {
 				"client_id": c.ID, "client_secret": "wrong-secret",
 				"account_id": account, "project_id": project,
 				"login_hint": "user-a", "requesting_token": tok,
-			}, nil)
+			}, cibaInitiatorHeaders())
 			return resp.StatusCode, decode(t, resp)
 		}
 		validStatus, validBody := attempt(valid, testAccountID, testProjectID)
@@ -1275,7 +1280,7 @@ func TestCIBADeniedAtExposed(t *testing.T) {
 	registerTestOAuthClient(clientID, []string{"client_credentials"})
 	resp := post(t, "/oauth2/bc-authorize", map[string]any{
 		"client_id": clientID, "account_id": testAccountID, "project_id": testProjectID, "login_hint": "user-a",
-	}, nil)
+	}, cibaInitiatorHeaders())
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	id, _ := decode(t, resp)["auth_req_id"].(string)
 
