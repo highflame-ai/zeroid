@@ -172,6 +172,9 @@ type IssueRequest struct {
 	// marked with WithTrustedApprovalChannelWrite. ciba:approve is issued only
 	// when it is set; grants that present no such credential leave it false.
 	ChannelTrustedCredential bool
+	// APIKeyID is the API key the api_key grant resolved, emitted as the
+	// reserved api_key_id claim. Empty on every other grant.
+	APIKeyID string
 
 	// FederatedClientAuth marks a token whose client authenticated with a
 	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
@@ -933,6 +936,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// CustomClaims, and the lineage a token is grafted onto must come from the
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
+
+	// api_key_id: like mission_id, only ever the grant's own value, so neither
+	// CustomClaims nor a later exchange from this token can carry one.
+	_ = token.Remove("api_key_id")
+	if req.APIKeyID != "" {
+		_ = token.Set("api_key_id", req.APIKeyID)
+	}
 
 	// user_idp_iss / user_idp_sub: like mission_id, only ever the grant's own values.
 	_ = token.Remove("user_idp_iss")

@@ -28,6 +28,7 @@ type CreateAPIKeyInput struct {
 		Environment        string          `json:"environment,omitempty" enum:"live,test" doc:"Environment (default: live)"`
 		ExpiresInDays      *int            `json:"expires_in_days,omitempty" doc:"Expiry in days (nil = never)"`
 		Metadata           json.RawMessage `json:"metadata,omitempty" doc:"Arbitrary JSON metadata for extensions"`
+		Management         bool            `json:"management,omitempty" doc:"Mark the key for management (ADR 0053 D3). Refused (403) unless the deployer marked the request with WithManagementKeyWrite"`
 	}
 }
 
@@ -133,10 +134,14 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		Environment:        input.Body.Environment,
 		ExpiresInDays:      input.Body.ExpiresInDays,
 		Metadata:           input.Body.Metadata,
+		Management:         input.Body.Management,
 	})
 	if err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
 			return nil, herr
+		}
+		if errors.Is(err, service.ErrManagementKeyWriteNotTrusted) {
+			return nil, huma.Error403Forbidden(err.Error())
 		}
 		// Neither identity_id nor product supplied — the key has no identity to
 		// link. A caller-side omission, so return 400 naming both fields
