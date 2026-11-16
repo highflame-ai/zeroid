@@ -29,6 +29,7 @@ var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
+	reserved            *ReservedScopes
 	repo                *postgres.APIKeyRepository
 	credentialPolicySvc *CredentialPolicyService
 	identitySvc         *IdentityService
@@ -63,9 +64,6 @@ type CreateAPIKeyRequest struct {
 	// flow so agent + linked key expire at the same moment.
 	ExpiresAt *time.Time
 	Metadata  json.RawMessage
-	// Management asks for the management mark (ADR 0053 D3). Refused with
-	// ErrManagementKeyWriteNotTrusted unless ctx carries WithManagementKeyWrite.
-	Management bool
 }
 
 // CreateAPIKeyResponse is returned once on creation — contains the full key (shown once).
@@ -97,8 +95,11 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 	if err := requireTrustedPolicyAttachment(ctx, s.credentialPolicySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
 		return nil, err
 	}
-	if req.Management && !ManagementKeyWrite(ctx) {
-		return nil, ErrManagementKeyWriteNotTrusted
+	// Reserved scopes (the deployer's own, see ReservedScopes) go onto a key
+	// only from the deployer's trusted path. Keys have no scope-update path,
+	// so this create is the only place a key's scopes are written.
+	if len(s.reserved.in(req.Scopes)) > 0 && !ReservedScopeWrite(ctx) {
+		return nil, ErrReservedScopeWriteNotTrusted
 	}
 	// Every key has an identity link, and the caller supplies one of the two
 	// ways to establish it. Reject the empty case here rather than letting an
@@ -252,7 +253,6 @@ func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) 
 		State:              domain.APIKeyStateActive,
 		Metadata:           metadata,
 		ChannelTrusted:     TrustedApprovalChannelWrite(ctx),
-		Management:         req.Management,
 	}
 
 	if err := s.repo.Create(ctx, sk); err != nil {

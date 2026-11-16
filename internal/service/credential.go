@@ -24,6 +24,7 @@ import (
 
 // CredentialService handles JWT issuance, rotation, and revocation.
 type CredentialService struct {
+	reserved        *ReservedScopes
 	repo            *postgres.CredentialRepository
 	jwksSvc         *signing.JWKSService
 	policySvc       *CredentialPolicyService
@@ -175,6 +176,15 @@ type IssueRequest struct {
 	// APIKeyID is the API key the api_key grant resolved, emitted as the
 	// reserved api_key_id claim. Empty on every other grant.
 	APIKeyID string
+
+	// ReservedScopesAuthorized is set only by the api_key grant after it has
+	// applied the reserved-scope rules (see ReservedScopes). Without it,
+	// IssueCredential refuses any reserved scope.
+	ReservedScopesAuthorized bool
+
+	// MaxTTL caps the token's lifetime in seconds after every other clamp.
+	// 0 = no extra cap. Set by the api_key grant for reserved scopes.
+	MaxTTL int
 
 	// FederatedClientAuth marks a token whose client authenticated with a
 	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
@@ -595,6 +605,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 			ttl = remaining
 		}
 	}
+	if req.MaxTTL > 0 && ttl > req.MaxTTL {
+		ttl = req.MaxTTL
+	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
 	}
@@ -627,6 +640,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// context, so a credential obtained any other way never carries it.
 	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !req.ChannelTrustedCredential {
 		return nil, nil, fmt.Errorf("%w: %q is issued only from a credential created by a trusted approval-channel write", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
+	}
+
+	// Reserved scopes are issued only through the api_key grant's checks; an
+	// unbounded ceiling, an exchange or any other grant never yields one.
+	if r := s.reserved.in(req.Scopes); len(r) > 0 && !req.ReservedScopesAuthorized {
+		return nil, nil, fmt.Errorf("%w: %q is issued only on the api_key grant, from a key that lists it", ErrScopesNotAllowed, r[0])
 	}
 
 	// The identity's allowed_scopes is its absolute ceiling (RFC 7591 §2 client
