@@ -47,8 +47,10 @@ type ReservedScopeGrant struct {
 
 // ReservedScopeAuthorizer decides an api_key exchange that would issue
 // reserved scopes (Highflame: is the key's creator still an org owner or
-// admin). A non-nil error refuses the grant with invalid_grant and its text.
-// It must honour ctx.
+// admin). Return an error wrapping ErrReservedScopeDenied to refuse: the grant
+// fails with invalid_grant and that error's text. Any other error (a lookup
+// that failed) fails it closed with a generic server_error, so internal
+// detail never reaches the client. It must honour ctx.
 type ReservedScopeAuthorizer func(ctx context.Context, g ReservedScopeGrant) error
 
 // ErrReservedScopeWriteNotTrusted is returned when a create-key request lists
@@ -56,6 +58,9 @@ type ReservedScopeAuthorizer func(ctx context.Context, g ReservedScopeGrant) err
 // to 403.
 var ErrReservedScopeWriteNotTrusted = errors.New(
 	"reserved scopes can be written onto an API key only by the deployer's trusted path")
+
+// ErrReservedScopeDenied is what a ReservedScopeAuthorizer wraps to refuse.
+var ErrReservedScopeDenied = errors.New("reserved scopes denied")
 
 // reservedScopeTimeout bounds one authorizer call.
 const reservedScopeTimeout = 5 * time.Second
@@ -153,7 +158,10 @@ func (s *OAuthService) authorizeReservedScopes(ctx context.Context, issue *Issue
 	if err := authorize(actx, ReservedScopeGrant{
 		AccountID: sk.AccountID, ProjectID: sk.ProjectID, APIKeyID: sk.ID, CreatedBy: creator, Scopes: scopes,
 	}); err != nil {
-		return oauthBadRequestCause(oautherror.InvalidGrant, err.Error(), err)
+		if errors.Is(err, ErrReservedScopeDenied) {
+			return oauthBadRequestCause(oautherror.InvalidGrant, err.Error(), err)
+		}
+		return oauthServerError("could not authorize the key's reserved scopes", err)
 	}
 	issue.ReservedScopesAuthorized = true
 	issue.MaxTTL = maxTTL

@@ -14,8 +14,9 @@ import (
 const (
 	testReservedPrefix           = "testreserved."
 	testReservedScope            = "testreserved.config.manage"
-	testReservedMaxTTL           = 15 * time.Minute
+	testReservedMaxTTL           = 2 * time.Minute // well under the 1h default, so the cap shows
 	testDemotedUser              = "demoted-user"
+	testBrokenAuthorizerUser     = "broken-authorizer-user"
 	testReservedScopeWriteHeader = "X-Test-Reserved-Scope-Write"
 )
 
@@ -145,4 +146,16 @@ func TestReservedScope_AuthorizerRefuses(t *testing.T) {
 	code, body := exchangeKey(t, key, "")
 	assert.Equal(t, http.StatusBadRequest, code)
 	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// An authorizer that fails (not refuses) fails the grant closed, without
+// passing its error text to the client.
+func TestReservedScope_AuthorizerFailureIsServerError(t *testing.T) {
+	status, _, key := createProductKey(t, testBrokenAuthorizerUser, []string{testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "")
+	assert.Equal(t, http.StatusInternalServerError, code)
+	assert.Equal(t, "server_error", body["error"])
+	assert.NotContains(t, body["error_description"], "internal-admin")
 }

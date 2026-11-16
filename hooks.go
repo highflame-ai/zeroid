@@ -480,6 +480,9 @@ type (
 	ReservedScopeAuthorizer = service.ReservedScopeAuthorizer
 )
 
+// ErrReservedScopeDenied is what a ReservedScopeAuthorizer wraps to refuse.
+var ErrReservedScopeDenied = service.ErrReservedScopeDenied
+
 // WithReservedScopeWrite returns ctx marked as the deployer's trusted path,
 // which may write reserved scopes (Server.SetReservedScopes) onto an API key.
 // Without it, a create-key request listing one is refused with 403. Set it in

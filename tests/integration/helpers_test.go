@@ -325,7 +325,10 @@ func runTests(m *testing.M) int {
 	// affected. The authorizer refuses keys created by testDemotedUser.
 	if err := srv.SetReservedScopes([]string{testReservedPrefix}, func(_ context.Context, g zeroid.ReservedScopeGrant) error {
 		if g.CreatedBy == testDemotedUser {
-			return errors.New("the key's creator is no longer an org owner or admin")
+			return fmt.Errorf("%w: the key's creator is no longer an org owner or admin", zeroid.ErrReservedScopeDenied)
+		}
+		if g.CreatedBy == testBrokenAuthorizerUser {
+			return errors.New("admin unreachable at http://internal-admin:8040")
 		}
 		return nil
 	}, testReservedMaxTTL); err != nil {
