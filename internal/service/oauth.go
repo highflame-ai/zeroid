@@ -282,6 +282,11 @@ var reservedClaims = map[string]bool{
 	// on it through POST /agents/self/public-key.
 	"identity_id": true,
 	"agent_id":    true,
+	// `api_key_id` names the API key an api_key-grant token was minted from
+	// (ADR 0051 D2). An embedding service records it in its audit trail, so a
+	// forged value would attribute a change to another key. Set only from the
+	// key apiKeyGrant resolved.
+	"api_key_id": true,
 }
 
 // audienceCodeoid is the audience profile for codeoid embedded-UI SSO tokens.
@@ -2002,6 +2007,10 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 		ScopeCeilingUnbounded: len(sk.Scopes) == 0 && len(keyPolicyScopes) == 0 && len(identityPolicyScopes) == 0 && len(rowScopes) == 0,
 
 		ChannelTrustedCredential: sk.ChannelTrusted,
+		APIKeyID:                 sk.ID,
+	}
+	if err := s.authorizeReservedScopes(ctx, &issue, sk, identity); err != nil {
+		return nil, err
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 

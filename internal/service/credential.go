@@ -24,6 +24,7 @@ import (
 
 // CredentialService handles JWT issuance, rotation, and revocation.
 type CredentialService struct {
+	reserved        *ReservedScopes
 	repo            *postgres.CredentialRepository
 	jwksSvc         *signing.JWKSService
 	policySvc       *CredentialPolicyService
@@ -172,6 +173,18 @@ type IssueRequest struct {
 	// marked with WithTrustedApprovalChannelWrite. ciba:approve is issued only
 	// when it is set; grants that present no such credential leave it false.
 	ChannelTrustedCredential bool
+	// APIKeyID is the API key the api_key grant resolved, emitted as the
+	// reserved api_key_id claim. Empty on every other grant.
+	APIKeyID string
+
+	// ReservedScopesAuthorized is set only by the api_key grant after it has
+	// applied the reserved-scope rules (see ReservedScopes). Without it,
+	// IssueCredential refuses any reserved scope.
+	ReservedScopesAuthorized bool
+
+	// MaxTTL caps the token's lifetime in seconds after every other clamp.
+	// 0 = no extra cap. Set by the api_key grant for reserved scopes.
+	MaxTTL int
 
 	// FederatedClientAuth marks a token whose client authenticated with a
 	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
@@ -512,6 +525,74 @@ func (s *CredentialService) cibaApproveListed(ctx context.Context, req IssueRequ
 	return false
 }
 
+// issueTTL is IssueCredential's token lifetime in seconds: the request's or the
+// default, capped by the service maximum, the identity's and credential's
+// remaining lifetimes, and req.MaxTTL. requested reports whether the caller
+// named a lifetime.
+func (s *CredentialService) issueTTL(req IssueRequest) (ttl int, requested bool, err error) {
+	ttl = req.TTL
+	// A grant that names no lifetime gets the server default, which a stricter
+	// policy shortens (clampDefaultTTLToPolicy) instead of refusing. Only a
+	// lifetime the caller asked for is held to the policy as a hard limit.
+	requested = ttl > 0
+	if ttl <= 0 {
+		ttl = s.defaultTTL
+	}
+	if ttl > s.maxTTL {
+		ttl = s.maxTTL
+	}
+	// Clamp TTL by the authority's remaining lifetime. A JWT whose exp
+	// claim outlives its authority window would still verify locally
+	// (tokens.verify() doesn't check revocation) for the gap between
+	// authority-expiry and JWT-exp. Clamping here makes time-bound
+	// authority an enforced invariant on the issued token itself, not
+	// just on the cascade-revocation side.
+	//
+	// Both bounds (identity + per-credential) are min-combined with the
+	// requested TTL. Already-expired authority short-circuits to error
+	// — the IsExpired() check above caught the identity case; here we
+	// defend against per-credential expiry that the chokepoint doesn't
+	// otherwise see.
+	clampNow := time.Now()
+	if req.Identity.ExpiresAt != nil {
+		remaining := int(req.Identity.ExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return 0, false, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			// Debug level: a busy agent making frequent requests near its
+			// expiry would emit this on every issuance — that's normal
+			// near-end-of-life behavior, not something operators need
+			// flagged at Info. Enable debug logging when diagnosing
+			// surprises about shorter-than-expected token lifetimes.
+			log.Debug().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("identity_remaining_seconds", remaining).
+				Msg("clamping token TTL to identity remaining lifetime")
+			ttl = remaining
+		}
+	}
+	if req.CredentialExpiresAt != nil {
+		remaining := int(req.CredentialExpiresAt.Sub(clampNow).Seconds())
+		if remaining <= 0 {
+			return 0, false, fmt.Errorf("%w: credential expired at %s", domain.ErrCredentialExpired, req.CredentialExpiresAt.Format(time.RFC3339))
+		}
+		if ttl > remaining {
+			log.Debug().
+				Str("identity_id", req.Identity.ID).
+				Int("requested_ttl", ttl).
+				Int("credential_remaining_seconds", remaining).
+				Msg("clamping token TTL to credential remaining lifetime")
+			ttl = remaining
+		}
+	}
+	if req.MaxTTL > 0 && ttl > req.MaxTTL {
+		ttl = req.MaxTTL
+	}
+	return ttl, requested, nil
+}
+
 // IssueCredential issues a short-lived JWT for an identity.
 //
 // Gate: identities not in a usable status never receive a fresh credential.
@@ -535,62 +616,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
 	}
 
-	ttl := req.TTL
-	// A grant that names no lifetime gets the server default, which a stricter
-	// policy shortens (clampDefaultTTLToPolicy) instead of refusing. Only a
-	// lifetime the caller asked for is held to the policy as a hard limit.
-	ttlRequested := ttl > 0
-	if ttl <= 0 {
-		ttl = s.defaultTTL
-	}
-	if ttl > s.maxTTL {
-		ttl = s.maxTTL
-	}
-	// Clamp TTL by the authority's remaining lifetime. A JWT whose exp
-	// claim outlives its authority window would still verify locally
-	// (tokens.verify() doesn't check revocation) for the gap between
-	// authority-expiry and JWT-exp. Clamping here makes time-bound
-	// authority an enforced invariant on the issued token itself, not
-	// just on the cascade-revocation side.
-	//
-	// Both bounds (identity + per-credential) are min-combined with the
-	// requested TTL. Already-expired authority short-circuits to error
-	// — the IsExpired() check above caught the identity case; here we
-	// defend against per-credential expiry that the chokepoint doesn't
-	// otherwise see.
-	clampNow := time.Now()
-	if req.Identity.ExpiresAt != nil {
-		remaining := int(req.Identity.ExpiresAt.Sub(clampNow).Seconds())
-		if remaining <= 0 {
-			return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
-		}
-		if ttl > remaining {
-			// Debug level: a busy agent making frequent requests near its
-			// expiry would emit this on every issuance — that's normal
-			// near-end-of-life behavior, not something operators need
-			// flagged at Info. Enable debug logging when diagnosing
-			// surprises about shorter-than-expected token lifetimes.
-			log.Debug().
-				Str("identity_id", req.Identity.ID).
-				Int("requested_ttl", ttl).
-				Int("identity_remaining_seconds", remaining).
-				Msg("clamping token TTL to identity remaining lifetime")
-			ttl = remaining
-		}
-	}
-	if req.CredentialExpiresAt != nil {
-		remaining := int(req.CredentialExpiresAt.Sub(clampNow).Seconds())
-		if remaining <= 0 {
-			return nil, nil, fmt.Errorf("%w: credential expired at %s", domain.ErrCredentialExpired, req.CredentialExpiresAt.Format(time.RFC3339))
-		}
-		if ttl > remaining {
-			log.Debug().
-				Str("identity_id", req.Identity.ID).
-				Int("requested_ttl", ttl).
-				Int("credential_remaining_seconds", remaining).
-				Msg("clamping token TTL to credential remaining lifetime")
-			ttl = remaining
-		}
+	ttl, ttlRequested, err := s.issueTTL(req)
+	if err != nil {
+		return nil, nil, err
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
@@ -624,6 +652,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// context, so a credential obtained any other way never carries it.
 	if slices.Contains(req.Scopes, domain.ScopeCIBAApprove) && !req.ChannelTrustedCredential {
 		return nil, nil, fmt.Errorf("%w: %q is issued only from a credential created by a trusted approval-channel write", ErrScopesNotAllowed, domain.ScopeCIBAApprove)
+	}
+
+	// Reserved scopes are issued only through the api_key grant's checks; an
+	// unbounded ceiling, an exchange or any other grant never yields one.
+	if r := s.reserved.in(req.Scopes); len(r) > 0 && !req.ReservedScopesAuthorized {
+		return nil, nil, fmt.Errorf("%w: %q is issued only on the api_key grant, from a key that lists it", ErrScopesNotAllowed, r[0])
 	}
 
 	// The identity's allowed_scopes is its absolute ceiling (RFC 7591 §2 client
@@ -933,6 +967,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// CustomClaims, and the lineage a token is grafted onto must come from the
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
+
+	// api_key_id: like mission_id, only ever the grant's own value, so neither
+	// CustomClaims nor a later exchange from this token can carry one.
+	_ = token.Remove("api_key_id")
+	if req.APIKeyID != "" {
+		_ = token.Set("api_key_id", req.APIKeyID)
+	}
 
 	// user_idp_iss / user_idp_sub: like mission_id, only ever the grant's own values.
 	_ = token.Remove("user_idp_iss")

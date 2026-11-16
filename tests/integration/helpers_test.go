@@ -321,6 +321,21 @@ func runTests(m *testing.M) int {
 	})
 	srv.SetRevocationNotifyDispatchSync(true)
 
+	// Reserved scopes under a test-only prefix, so no other test's scopes are
+	// affected. The authorizer refuses keys created by testDemotedUser.
+	if err := srv.SetReservedScopes([]string{testReservedPrefix}, func(_ context.Context, g zeroid.ReservedScopeGrant) error {
+		if g.CreatedBy == testDemotedUser {
+			return fmt.Errorf("%w: the key's creator is no longer an org owner or admin", zeroid.ErrReservedScopeDenied)
+		}
+		if g.CreatedBy == testBrokenAuthorizerUser {
+			return errors.New("admin unreachable at http://internal-admin:8040")
+		}
+		return nil
+	}, testReservedMaxTTL); err != nil {
+		fmt.Fprintf(os.Stderr, "set reserved scopes: %v\n", err)
+		return 1
+	}
+
 	// Wire a TrustedServiceValidator gated on a test header so the
 	// external-principal exchange (role / privilege_scope) tests can exercise
 	// both the trusted and untrusted caller paths against the same server.
@@ -331,6 +346,9 @@ func runTests(m *testing.M) int {
 			}
 			if r.Header.Get(testApprovalChannelWriteHeader) != "" {
 				r = r.WithContext(zeroid.WithTrustedApprovalChannelWrite(r.Context()))
+			}
+			if r.Header.Get(testReservedScopeWriteHeader) != "" {
+				r = r.WithContext(zeroid.WithReservedScopeWrite(r.Context()))
 			}
 			if sub := r.Header.Get(testApproverSubHeader); sub != "" {
 				r = r.WithContext(zeroid.WithApproverIdentity(r.Context(), zeroid.ApproverIdentity{

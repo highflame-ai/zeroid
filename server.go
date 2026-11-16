@@ -129,6 +129,7 @@ type Server struct {
 	// Services
 	identitySvc         *service.IdentityService
 	credentialSvc       *service.CredentialService
+	reservedScopes      *service.ReservedScopes
 	credentialPolicySvc *service.CredentialPolicyService
 	attestationSvc      *service.AttestationService
 	apiHandler          *handler.API
@@ -367,6 +368,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	attestationSvc := service.NewAttestationService(attestationRepo, credentialSvc, identitySvc, attestationVerifiers, attestationPolicySvc, db, cfg.Attestation.AllowUnsafeDevStub)
 	oauthClientSvc := service.NewOAuthClientService(oauthClientRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo, credentialPolicySvc, identitySvc)
+	reservedScopes := &service.ReservedScopes{}
+	apiKeySvc.SetReservedScopes(reservedScopes)
+	credentialSvc.SetReservedScopes(reservedScopes)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 
 	// RevocationNotifier plumbing. One shared
@@ -732,6 +736,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		router:                 r,
 		identitySvc:            identitySvc,
 		credentialSvc:          credentialSvc,
+		reservedScopes:         reservedScopes,
 		credentialPolicySvc:    credentialPolicySvc,
 		attestationSvc:         attestationSvc,
 		apiHandler:             apiHandler,
@@ -1522,6 +1527,20 @@ func (s *Server) SetFederatedPersonResolver(fn FederatedPersonResolver) {
 // Can be called any time after NewServer; safe to call concurrently.
 func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrantMode) error {
 	return s.credentialSvc.SetPersonGrantResolver(fn, mode)
+}
+
+// SetReservedScopes reserves scope prefixes for the deployer's own APIs
+// (Highflame: "highflame."). A reserved scope is written onto an API key only
+// in a WithReservedScopeWrite context, and issued only on the api_key grant
+// from a key whose row lists it, linked to a service identity with a recorded
+// creator (named in owner_user_id), after authorize allows it. Every other
+// path refuses it. Tokens carrying one last at most maxTTL
+// (0 = no extra cap; a negative or sub-second maxTTL is refused). Prefixes
+// with a nil authorize are refused; no prefixes turns it off.
+//
+// Can be called any time after NewServer; safe to call concurrently.
+func (s *Server) SetReservedScopes(prefixes []string, authorize ReservedScopeAuthorizer, maxTTL time.Duration) error {
+	return s.reservedScopes.Set(prefixes, authorize, maxTTL)
 }
 
 // SetApproverAuthorizer installs the hook consulted on CIBA approve/deny for

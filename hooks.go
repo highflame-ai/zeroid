@@ -473,3 +473,25 @@ func WithTrustedApprovalChannelWrite(ctx context.Context) context.Context {
 func TrustedApprovalChannelWrite(ctx context.Context) bool {
 	return service.TrustedApprovalChannelWrite(ctx)
 }
+
+// ReservedScopeGrant and ReservedScopeAuthorizer: see Server.SetReservedScopes.
+type (
+	ReservedScopeGrant      = service.ReservedScopeGrant
+	ReservedScopeAuthorizer = service.ReservedScopeAuthorizer
+)
+
+// ErrReservedScopeDenied is what a ReservedScopeAuthorizer wraps to refuse.
+var ErrReservedScopeDenied = service.ErrReservedScopeDenied
+
+// WithReservedScopeWrite returns ctx marked as the deployer's trusted path,
+// which may write reserved scopes (Server.SetReservedScopes) onto an API key.
+// Without it, a create-key request listing one is refused with 403. Set it in
+// the AdminAuth layer for the most trusted caller class only.
+func WithReservedScopeWrite(ctx context.Context) context.Context {
+	return service.WithReservedScopeWrite(ctx)
+}
+
+// ReservedScopeWrite reports whether ctx carries WithReservedScopeWrite.
+func ReservedScopeWrite(ctx context.Context) bool {
+	return service.ReservedScopeWrite(ctx)
+}
