@@ -1,6 +1,9 @@
 package integration_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"net/http"
 	"testing"
 	"time"
@@ -158,4 +161,56 @@ func TestReservedScope_AuthorizerFailureIsServerError(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, code)
 	assert.Equal(t, "server_error", body["error"])
 	assert.NotContains(t, body["error_description"], "internal-admin")
+}
+
+// A token carrying a reserved scope cannot pass it on: an RFC 8693 exchange
+// that names it is refused, while the same subject token still delegates its
+// ordinary scopes. (An exchange naming no scope is refused anyway: it has no
+// default.) The api_key grant issues no refresh token, so there is no refresh
+// path to cover.
+func TestReservedScope_NotCarriedThroughExchange(t *testing.T) {
+	status, _, key := createProductKey(t, "test-user", []string{"data:read", testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+	code, body := exchangeKey(t, key, "")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	assert.NotContains(t, body, "refresh_token")
+	root := body["access_token"].(string)
+	require.Contains(t, decodeJWTPayload(t, root)["scopes"], testReservedScope)
+
+	// The actor's ceilings allow the reserved scope, so only the reserved-scope
+	// rule can stop it.
+	tn := hrdTenant{account: testAccountID, project: testProjectID, headers: adminHeaders()}
+	scopes := []string{"data:read", testReservedScope}
+	policyID := tn.policy(t, scopes)
+	exchange := func(scope string) (int, map[string]any) {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		wimse := tn.register(t, uid("rs-actor"), policyID, ecPublicKeyPEM(t, k), scopes)
+		req := map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": root,
+			"actor_token":   buildAssertion(t, k, wimse),
+		}
+		if scope != "" {
+			req["scope"] = scope
+		}
+		resp := post(t, "/oauth2/token", req, nil)
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode, decode(t, resp)
+	}
+
+	code, body = exchange("data:read")
+	require.Equal(t, http.StatusOK, code, "the subject token still delegates ordinary scopes: %v", body)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope)
+
+	for _, scope := range []string{testReservedScope, "data:read " + testReservedScope} {
+		code, body = exchange(scope)
+		if code == http.StatusOK {
+			assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope, "scope=%q", scope)
+			continue
+		}
+		// The exchange reports the chokepoint's refusal as insufficient_scope.
+		assert.Equal(t, http.StatusBadRequest, code, "scope=%q: %v", scope, body)
+		assert.Contains(t, body["error_description"], "is issued only on the api_key grant", "scope=%q: %v", scope, body)
+	}
 }

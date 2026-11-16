@@ -1534,9 +1534,9 @@ func (s *Server) SetPersonGrantResolver(fn PersonGrantResolver, mode PersonGrant
 // in a WithReservedScopeWrite context, and issued only on the api_key grant
 // from a key whose row lists it, linked to a service identity with a recorded
 // creator (named in owner_user_id), after authorize allows it. Every other
-// path refuses it with invalid_scope. Tokens carrying one last at most maxTTL
-// (0 = no extra cap). Prefixes with a nil authorize are refused; no prefixes
-// turns it off.
+// path refuses it. Tokens carrying one last at most maxTTL
+// (0 = no extra cap; a negative or sub-second maxTTL is refused). Prefixes
+// with a nil authorize are refused; no prefixes turns it off.
 //
 // Can be called any time after NewServer; safe to call concurrently.
 func (s *Server) SetReservedScopes(prefixes []string, authorize ReservedScopeAuthorizer, maxTTL time.Duration) error {

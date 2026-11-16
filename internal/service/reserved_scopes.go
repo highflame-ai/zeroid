@@ -67,7 +67,8 @@ const reservedScopeTimeout = 5 * time.Second
 
 // Set configures the prefixes, the authorizer and the lifetime cap. Prefixes
 // without an authorizer are refused, so a wiring mistake cannot issue
-// reserved scopes unchecked. Empty prefixes turn the feature off.
+// reserved scopes unchecked. Empty prefixes turn the feature off. maxTTL is
+// 0 (no extra cap) or at least a second; anything else would round to no cap.
 func (r *ReservedScopes) Set(prefixes []string, authorize ReservedScopeAuthorizer, maxTTL time.Duration) error {
 	clean := make([]string, 0, len(prefixes))
 	for _, p := range prefixes {
@@ -77,6 +78,9 @@ func (r *ReservedScopes) Set(prefixes []string, authorize ReservedScopeAuthorize
 	}
 	if len(clean) > 0 && authorize == nil {
 		return errors.New("reserved scope prefixes need an authorizer")
+	}
+	if maxTTL < 0 || (maxTTL > 0 && maxTTL < time.Second) {
+		return fmt.Errorf("reserved scope max TTL must be 0 or at least 1s, got %s", maxTTL)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
