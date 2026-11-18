@@ -138,6 +138,8 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// No account_id / project_id requirement. The tenant is derived below from
 	// the issuer and the authenticated client (ADR 0042 D5); a conformant
 	// client sends neither field (draft §4.4, EMA §5).
+	trace := scopeTraceFrom(ctx)
+	trace.setGrant(scopeTraceGrantIDJAG)
 
 	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
 	// not be redeemable by another party: the draft (with §9.1) requires
@@ -170,6 +172,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 			return nil, err
 		}
 	}
+	trace.setClient(authedClient)
 
 	if s.externalIssuerRegistry == nil || !s.externalIssuerRegistry.HasAny() {
 		// No external issuers configured → ID-JAG federation is disabled. The
@@ -417,6 +420,10 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		scopeClaim = "scope"
 	}
 	scopes, _ := extractMappedClaimStrings(rawClaims, scopeClaim)
+	// The ID-JAG's scope claim is what this redemption asks for: an IdP's
+	// grant is a request to this server, not a listing it controls.
+	trace.setIdentity(identity)
+	trace.ask(scopes, true)
 
 	issue := IssueRequest{
 		Identity:         identity,

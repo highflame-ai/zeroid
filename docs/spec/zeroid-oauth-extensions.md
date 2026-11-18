@@ -473,6 +473,20 @@ their chain's principal and are not consulted. A shadow mode counts what
 enforcement would change without changing it. The resolver's roles are
 emitted as `roles` (Section 4.3). Details: `docs/scope-ceilings.md`.
 
+### 5.1d Stricter scope rules (counted, not enforced)
+
+A deployment MAY set `token.scope_rules` to `shadow`. Every grant is then
+evaluated against four stricter rules a later release may enforce: a request
+that names no scope is issued only an API key's stored scopes or an audience
+profile's scopes, and otherwise none; a scope is issued only when a ceiling
+the deployer controls lists it (a client's own metadata is a request, never a
+listing, and an empty ceiling lists nothing); a request that would be narrowed
+is refused whole with `invalid_scope`, and a delegation that names no scope is
+issued none; and every scope refusal answers `invalid_scope`. Each request
+whose outcome would differ is logged as `scope_rule_would_change` and counted
+in `zeroid_scope_rule_would_change_total`. Issuance is unchanged. Details:
+`docs/scope-ceilings.md`.
+
 ### 5.2 Delegation depth tracking and capping
 
 Each exchange increments `delegation_depth` by 1 relative to the subject token.

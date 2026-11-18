@@ -523,6 +523,49 @@ func TestBackchannelApproverConfig(t *testing.T) {
 	})
 }
 
+// token.scope_rules: off by default, the env var reaches it, and Validate
+// refuses anything but off or shadow, naming the key, so a typo never runs as
+// off unnoticed.
+func TestScopeRulesConfig(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.ScopeRules != "off" {
+			t.Errorf("token.scope_rules must default to off, got %q", cfg.Token.ScopeRules)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		t.Setenv("ZEROID_SCOPE_RULES", "shadow")
+		cfg, err := LoadConfig("")
+		if err != nil {
+			t.Fatalf("LoadConfig failed: %v", err)
+		}
+		if cfg.Token.ScopeRules != "shadow" {
+			t.Errorf("ZEROID_SCOPE_RULES=shadow did not reach token.scope_rules, got %q", cfg.Token.ScopeRules)
+		}
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "shadow"} {
+			cfg := baseValidConfig(t)
+			cfg.Token.ScopeRules = mode
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("scope_rules=%q must validate, got %v", mode, err)
+			}
+		}
+		for _, mode := range []string{"enforce", "on", "SHADOW"} {
+			cfg := baseValidConfig(t)
+			cfg.Token.ScopeRules = mode
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.scope_rules") {
+				t.Errorf("scope_rules=%q must be rejected naming the key, got %v", mode, err)
+			}
+		}
+	})
+}
+
 // Ratchet: every `# Env: ZEROID_*` line in the shipped sample config must name a
 // variable the loader actually reads.
 //

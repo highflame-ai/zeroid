@@ -188,6 +188,18 @@ const (
 // authorization_code and refresh) and /oauth2/authorize answers invalid_scope.
 var ErrPersonScopeDenied = service.ErrPersonScopeDenied
 
+// ScopeRulesMode is what the stricter scope issuance rules do: off (default)
+// or shadow, which evaluates them on every grant and records each request
+// whose outcome they would change, without changing any token or response.
+// Set it with token.scope_rules or Server.SetScopeRulesMode. See
+// docs/scope-ceilings.md, "Stricter scope rules".
+type ScopeRulesMode = service.ScopeRulesMode
+
+const (
+	ScopeRulesModeOff    = service.ScopeRulesModeOff
+	ScopeRulesModeShadow = service.ScopeRulesModeShadow
+)
+
 // FederatedPersonRequest names the person in a verified IdP token (ID-JAG or
 // ID-token exchange) for a FederatedPersonResolver. See
 // internal/service/person_federation.go for the field docs.
