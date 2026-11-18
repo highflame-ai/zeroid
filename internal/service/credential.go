@@ -49,6 +49,9 @@ type CredentialService struct {
 	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
 	// consulted for every person root. Nil-safe: unset, nothing changes.
 	personGrant personGrantState
+	// scopeRules is the stricter scope rules' mode. Off by default; shadow
+	// only counts what they would change.
+	scopeRules scopeRulesState
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -524,6 +527,11 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.Identity == nil {
 		return nil, nil, fmt.Errorf("identity is required")
 	}
+	// The stricter scope rules' shadow count (nil when off) attributes the
+	// request to the identity and client the token is for.
+	trace := scopeTraceFrom(ctx)
+	trace.setIdentity(req.Identity)
+	trace.setClientID(req.ClientID)
 	if !req.Identity.Status.IsUsable() {
 		return nil, nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, req.Identity.Status)
 	}
@@ -684,7 +692,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	//
 	// The identity's governing policy, kept for choices beyond enforcement
 	// (the token's typ header). Nil when no identity policy governs the grant.
-	var identityPolicy *domain.CredentialPolicy
+	// keyPolicy is the API key's own policy, when distinct from it.
+	var identityPolicy, keyPolicy *domain.CredentialPolicy
 	if s.policySvc != nil {
 		var attestationLevel string
 		if s.attestationRepo != nil && req.Identity.ID != "" {
@@ -769,6 +778,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 					Msg("Credential policy enforcement denied issuance")
 				return nil, nil, err
 			}
+			keyPolicy = policy
 		}
 	}
 
@@ -1073,6 +1083,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		Msg("Credential issued")
 
 	s.recordUnboundedScope(ctx, req, principal, identityPolicy)
+	if trace != nil {
+		trace.minted(req.Scopes, scopeListings(req, principal, identityPolicy, keyPolicy)...)
+	}
 
 	tokenType := "Bearer"
 	if req.DPoPKeyThumbprint != "" {
