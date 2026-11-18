@@ -452,6 +452,15 @@ type Identity struct {
 	// identities and for discovered rows ingested without a source.
 	SourceID string `bun:"source_id,type:varchar(255),nullzero" json:"source_id,omitempty"`
 
+	// ParentIdentityID is the identity that registered this one: set when the
+	// embedding service authenticated the registration request as that
+	// identity acting as itself (zeroid.WithCallerIdentity), never from request
+	// input. Empty for identities registered by anyone else. Written once, at
+	// registration. A child is bound by its parent's scope ceilings and
+	// inherits its owner, and deactivating an identity deactivates every
+	// identity below it. See docs/identity-tree.md.
+	ParentIdentityID string `bun:"parent_identity_id,type:uuid,nullzero" json:"parent_identity_id,omitempty"`
+
 	// Ownership and governance.
 	//
 	// CredentialPolicyID is the identity policy — the authority ceiling for

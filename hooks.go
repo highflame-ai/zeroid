@@ -513,3 +513,34 @@ func WithReservedScopeWrite(ctx context.Context) context.Context {
 func ReservedScopeWrite(ctx context.Context) bool {
 	return service.ReservedScopeWrite(ctx)
 }
+
+// CallerIdentity names the registered identity an admin request was
+// authenticated as, when the caller is that identity acting as itself. Set
+// IdentityID, WIMSEURI or both (they must then agree). See WithCallerIdentity.
+//
+// See internal/service/identity_tree.go for the canonical doc comment.
+type CallerIdentity = service.CallerIdentity
+
+// WithCallerIdentity returns ctx marked as an admin request made by the given
+// registered identity, acting as itself. An identity registered by such a
+// request (POST /identities, POST /agents/register) becomes the caller's
+// child: it records the caller as parent_identity_id, takes the caller's
+// owner, takes the caller's allowed_scopes and credential policy where the
+// request names none, may hold no scope the caller cannot, and is deactivated
+// whenever the caller is. See docs/identity-tree.md.
+//
+// Set it in the AdminAuth layer, from the credential that layer verified, and
+// only when that credential is the identity's own: its API key, client
+// credentials or signed assertion, or a token issued to it for itself (no
+// actor, not held for a person). Never derive it from a header or body field
+// the client controls. The identity must belong to the account and project
+// the request is made in; a caller from another tenant, or one that is not
+// active, is refused with 403. Without the mark, registration is unchanged.
+func WithCallerIdentity(ctx context.Context, c CallerIdentity) context.Context {
+	return service.WithCallerIdentity(ctx, c)
+}
+
+// CallerIdentityFromContext returns the identity set by WithCallerIdentity.
+func CallerIdentityFromContext(ctx context.Context) (CallerIdentity, bool) {
+	return service.CallerIdentityFromContext(ctx)
+}

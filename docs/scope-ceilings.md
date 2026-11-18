@@ -103,6 +103,7 @@ Rules:
 | Scenario | Behaviour |
 |---|---|
 | Registration (`POST /identities`, `PATCH /identities/{id}`, `POST /agents/register`) | Stores the ceiling. No check that it is a subset of the policy, or the reverse: the intersection at issuance makes either order safe |
+| Registration by an identity acting as itself (a child), and changes to a child's ceiling | The child takes its parent's `allowed_scopes` and credential policy where the request names none, and its ceilings must stay within the parent's: a scope outside them, or a named policy with no ceiling under a restricted parent, is refused with `400` ([identity-tree.md](identity-tree.md)) |
 | API key with its own policy | The key's policy must be a subset of the identity's policy; the identity ceiling then applies on top |
 | `client_credentials`, `jwt_bearer`, `api_key` | Scopes = request ∩ client or key scopes ∩ key policy ∩ identity policy ∩ identity ceiling; an omitted request gets the narrowest layer; nothing left is refused |
 | `client_credentials` with a federated client assertion | No client or key scopes, so: request ∩ identity policy ∩ identity ceiling. An agent with neither set is refused with `invalid_scope` ([external-issuers.md](external-issuers.md)) |

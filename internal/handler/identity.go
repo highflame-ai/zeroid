@@ -24,9 +24,9 @@ type CreateIdentityInput struct {
 		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Sub-type within identity type"`
-		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner"`
-		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
-		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy."`
+		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner. Ignored when the request is authenticated as an identity: the new identity is its child and takes the parent's owner."`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling. When the request is authenticated as an identity, the new identity is its child: empty takes the parent's allowed_scopes, and every scope must be within the parent's ceiling."`
+		CredentialPolicyID string          `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling for this identity. Defaults to tenant default policy, or, when the request is authenticated as an identity, to that parent identity's policy."`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"ECDSA P-256 public key in PEM format for jwt_bearer grant"`
 		Framework          string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version            string          `json:"version,omitempty" doc:"Agent version string"`
@@ -98,6 +98,7 @@ type ListIdentitiesInput struct {
 	Status        []string `query:"status,explode" doc:"Filter by exact lifecycle status. Repeat or comma-separate for multiple (e.g. discovered,pending,active)."`
 	OwnerUserID   string   `query:"owner_user_id" doc:"Filter by owner user ID"`
 	Ownerless     string   `query:"ownerless" doc:"Filter for identities with no owner (true or false)"`
+	ParentID      string   `query:"parent_identity_id" doc:"Filter to the identities registered by this identity (its direct children)"`
 	Limit         int      `query:"limit" default:"20" doc:"Items per page (max 100)"`
 	Offset        int      `query:"offset" default:"0" doc:"Offset for pagination"`
 }
@@ -119,8 +120,8 @@ type UpdateIdentityInput struct {
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
 		OwnerUserID        string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`
-		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling."`
-		CredentialPolicyID *string         `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Empty string resets to tenant default; omit to leave unchanged."`
+		AllowedScopes      []string        `json:"allowed_scopes,omitempty" doc:"The identity's absolute scope ceiling: no token for this identity carries a scope outside it. Credential policies narrow within it. Empty places no ceiling. For an identity registered by another identity, it must stay within the parent's ceiling."`
+		CredentialPolicyID *string         `json:"credential_policy_id,omitempty" doc:"Identity policy — authority ceiling. Empty string resets to tenant default (for an identity registered by another identity, to its parent's policy); omit to leave unchanged."`
 		PublicKeyPEM       string          `json:"public_key_pem,omitempty" doc:"PEM-encoded EC P-256 (ES256) SPKI public key. Empty or omitted leaves the key unchanged; this field cannot clear an enrolled key."`
 		Framework          *string         `json:"framework,omitempty" doc:"Agent framework"`
 		Version            *string         `json:"version,omitempty" doc:"Agent version"`
@@ -218,7 +219,7 @@ func (a *API) registerIdentityRoutes(api huma.API) {
 		OperationID: "delete-identity",
 		Method:      http.MethodDelete,
 		Path:        "/identities/{id}",
-		Summary:     "Deactivate an identity (soft delete)",
+		Summary:     "Deactivate an identity and every identity registered below it (soft delete)",
 		Description: "Soft-deletes the identity and returns the deactivated record. The published SDKs (highflame on PyPI, @highflame/sdk on npm) parse the response as an Identity, so this must stay 200 + body — a 204 breaks them.",
 		Tags:        []string{"Identities"},
 	}, a.deleteIdentityOp)
@@ -357,9 +358,13 @@ func (a *API) createIdentityOp(ctx context.Context, input *CreateIdentityInput) 
 		RiskTier:           input.Body.RiskTier,
 		IAL:                input.Body.IAL,
 		ExpiresAt:          input.Body.ExpiresAt,
+		RegisteredBy:       callerIdentity(ctx),
 	})
 	if err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
+		if herr := treeWriteError(err); herr != nil {
 			return nil, herr
 		}
 		// A collision with a soft-deleted identity is actionable — surface the
@@ -484,8 +489,12 @@ func (a *API) listIdentitiesOp(ctx context.Context, input *ListIdentitiesInput) 
 	if input.Ownerless != "" && input.Ownerless != "true" && input.Ownerless != "false" {
 		return nil, huma.Error400BadRequest("invalid ownerless filter: must be true or false")
 	}
+	parentID, herr := parentFilter(input.ParentID)
+	if herr != nil {
+		return nil, herr
+	}
 
-	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, limit, offset)
+	identities, total, err := a.identitySvc.ListIdentities(ctx, tenant.AccountID, tenant.ProjectID, identityTypes, input.Label, trustLevels, input.IsActive, input.Search, input.Metadata, input.IdentityClass, input.Origin, statuses, input.OwnerUserID, input.Ownerless, parentID, limit, offset)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list identities")
 		return nil, huma.Error500InternalServerError("failed to list identities")
@@ -554,6 +563,9 @@ func (a *API) updateIdentityOp(ctx context.Context, input *UpdateIdentityInput) 
 	})
 	if err != nil {
 		if herr := approvalChannelWriteError(err); herr != nil {
+			return nil, herr
+		}
+		if herr := treeWriteError(err); herr != nil {
 			return nil, herr
 		}
 		if errors.Is(err, service.ErrPolicyNotFound) {
