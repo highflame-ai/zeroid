@@ -140,9 +140,9 @@ type firstContactFunc func(ctx context.Context) (bool, error)
 // firstContactFor returns the first-contact step for a credential that
 // verified under row, or nil when nothing would register: no registrar, a
 // static issuer, a disabled row, or first_contact off. prepare, when set,
-// runs before anything is registered: it spends what the grant must spend
-// first, and may decline with an outcome (nothing is registered and the
-// grant refuses as without first contact) or refuse the request.
+// runs before anything is registered and may decline with an outcome
+// (nothing is registered, the attempt is logged, and the grant refuses as
+// without first contact) or refuse the request with an error.
 func (s *OAuthService) firstContactFor(row *domain.ExternalIssuer, subjectKey, grant string, claims map[string]any,
 	prepare func(ctx context.Context) (firstContactOutcome, error),
 ) firstContactFunc {
