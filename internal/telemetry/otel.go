@@ -64,8 +64,8 @@ var (
 	// where a token is issued today or the reverse, or a scope refusal
 	// answered with another error code. Counted with token.scope_rules=shadow;
 	// nothing is enforced. Attributes: mode, rule (omitted_request, listing,
-	// all_or_nothing, one_code), grant_type, account_id, project_id,
-	// identity_id. Exported to Prometheus as
+	// all_or_nothing, one_code), grant_type, account_id, project_id. The
+	// identity is in the log line only. Exported to Prometheus as
 	// zeroid_scope_rule_would_change_total.
 	ScopeRuleWouldChange metric.Int64Counter
 

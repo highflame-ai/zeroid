@@ -118,7 +118,7 @@ token:
 
   # scope_rules counts what stricter scope issuance rules would change, before
   # any of them is enforced (docs/scope-ceilings.md, "Stricter scope rules"):
-  #   off     (default) nothing is evaluated.
+  #   off     (default) no rule is evaluated, and nothing is logged or counted.
   #   shadow  every grant is evaluated, and each request whose outcome the
   #           rules would change is logged as scope_rule_would_change and
   #           counted in zeroid_scope_rule_would_change_total. Tokens and

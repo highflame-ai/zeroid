@@ -222,10 +222,11 @@ func TestScopeRules_Changes(t *testing.T) {
 			today: issued("a"),
 		},
 		{
-			name:  "an omitted request refused over its default would be issued none",
+			// A refusal is never loosened into a token with no scopes claim.
+			name:  "an omitted request refused today stays refused",
 			trace: scopeTrace{asked: true, omittedApplies: true},
 			today: refused(oautherror.InvalidScope),
-			want:  []string{"omitted_request→issued[]"},
+			want:  nil,
 		},
 		// Rule B, listing.
 		{
@@ -307,7 +308,7 @@ func TestScopeRules_Changes(t *testing.T) {
 			name:  "an omitted request refused with another code",
 			trace: scopeTrace{asked: true, omittedApplies: true},
 			today: refused(oautherror.InsufficientScope),
-			want:  []string{"omitted_request→issued[]", "one_code→refused/invalid_scope"},
+			want:  []string{"one_code→refused/invalid_scope"},
 		},
 		{
 			name:  "a request the rules would not change",
@@ -403,13 +404,13 @@ func TestScopeTrace_Records(t *testing.T) {
 
 	assert.Equal(t, []map[string]string{{
 		"mode": "shadow", "rule": "listing", "grant_type": "client_credentials",
-		"account_id": "acct", "project_id": "proj", "identity_id": "identity-1",
-	}}, points())
+		"account_id": "acct", "project_id": "proj",
+	}}, points(), "identity_id is unbounded, so it stays out of the metric")
 
 	got := lines()
 	require.Len(t, got, 1)
 	line := got[0]
-	assert.Equal(t, "warn", line["level"])
+	assert.Equal(t, "info", line["level"])
 	assert.Equal(t, "shadow", line["mode"])
 	assert.Equal(t, "listing", line["rule"])
 	assert.Equal(t, "client_credentials", line["grant_type"])

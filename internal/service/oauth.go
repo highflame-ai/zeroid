@@ -847,7 +847,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	trace := scopeTraceFrom(ctx)
 	trace.ask(parseScopeString(req.Scope), true)
-	trace.setTenant(req.AccountID, req.ProjectID)
+	// The tenant is recorded from the identity once it resolves, never from
+	// the request: a caller could otherwise name any tenant it likes.
 
 	// A client_assertion from a trusted workload issuer authenticates the
 	// agent with no registered client (ADR 0042 D8).

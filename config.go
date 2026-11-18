@@ -610,7 +610,8 @@ type TokenConfig struct {
 	// ScopeRules is what the stricter scope issuance rules do (see
 	// docs/scope-ceilings.md, "Stricter scope rules"):
 	//
-	//   off    (default) nothing is evaluated.
+	//   off    (default) no rule is evaluated, and nothing is logged or
+	//          counted.
 	//   shadow every grant is evaluated against the stricter rules, and each
 	//          request whose outcome they would change is logged as
 	//          scope_rule_would_change and counted in

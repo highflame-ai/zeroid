@@ -370,7 +370,9 @@ func (t *scopeTrace) changes(today scopeOutcome) []scopeRuleChange {
 
 	// A: a request that names no scope gets none, unless the deployer
 	// configured its default (omittedApplies is false then).
-	if t.omittedApplies && !named && (today.refused || len(authorityScopes(today.scopes)) > 0) {
+	// A request refused today stays refused: a token with no scopes claim is
+	// never a stricter outcome than a refusal.
+	if t.omittedApplies && !named && !today.refused && len(authorityScopes(today.scopes)) > 0 {
 		out = append(out, scopeRuleChange{rule: scopeRuleOmittedRequest, would: scopeOutcome{}})
 	}
 
@@ -449,9 +451,8 @@ func (t *scopeTrace) record(ctx context.Context, today scopeOutcome, c scopeRule
 		attribute.String("grant_type", t.grant),
 		attribute.String("account_id", t.accountID),
 		attribute.String("project_id", t.projectID),
-		attribute.String("identity_id", t.identityID),
 	))
-	ev := log.Warn().
+	ev := log.Info().
 		Str("mode", string(ScopeRulesModeShadow)).
 		Str("rule", c.rule).
 		Str("grant_type", t.grant).

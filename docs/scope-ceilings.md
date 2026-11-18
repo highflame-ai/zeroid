@@ -221,7 +221,7 @@ or at runtime with `Server.SetScopeRulesMode`:
 
 | Mode | Evaluated | Tokens and responses |
 |---|---|---|
-| `off` (default) | nothing | unchanged |
+| `off` (default) | no rule; nothing is logged or counted | unchanged |
 | `shadow` | every grant, against each rule below | unchanged |
 
 An empty value means `off`. Any other value is refused, by config validation
@@ -233,7 +233,7 @@ with the request.
 
 | Rule | Recorded as | Planned | Today |
 |---|---|---|---|
-| A, omitted request | `omitted_request` | A request that names no scope is issued only the scopes stored on the API key it exchanges (`api_key`) or an audience profile's scopes (the trusted external-principal exchange), and otherwise none. | An omitted request gets the client's registered scopes on `authorization_code` (for a client identified by a metadata document, the scopes the document publishes) and the first restricting ceiling on the self-mint grants. |
+| A, omitted request | `omitted_request` | A request that names no scope is issued only the scopes stored on the API key it exchanges (`api_key`) or an audience profile's scopes (the trusted external-principal exchange), and otherwise none. A request refused today stays refused. | An omitted request gets the client's registered scopes on `authorization_code` (for a client identified by a metadata document, the scopes the document publishes) and the first restricting ceiling on the self-mint grants. |
 | B, listing | `listing` | A scope is issued only when at least one ceiling the deployer controls lists it: the API key's scopes or the key's own credential policy, the identity's `allowed_scopes`, the governing credential policy's ceiling (`allowed_scopes`, or `user_grant_scopes` for a chain bounded by a person's grant), or the registered scopes of a client created through the admin API. A client's own metadata (a metadata document's `scope`, or a dynamically registered client's `scope`) is a request, never a listing. An empty ceiling neither lists nor excludes. | An empty ceiling places no restriction, so a scope nothing lists is granted. |
 | C, all or nothing | `all_or_nothing` | A request is issued every scope it names, or refused whole with `invalid_scope`. A delegation (RFC 8693) that names no scope is issued none. | A named scope is dropped silently where a layer narrows (delegation, the self-mint grants, an enforced person ceiling). A delegation that names no scope is refused. |
 | D, one code | `one_code` | Every scope refusal answers `invalid_scope`. | A scope refusal answers `invalid_scope`, `insufficient_scope` (outside the identity's `allowed_scopes`), `policy_violation` (outside a credential policy), `invalid_grant` (a person ceiling at the token endpoint) or `access_denied` (a CIBA policy refusal, or a person ceiling sent to a push client). |
@@ -245,15 +245,15 @@ scope that was dropped, unlisted or issued by default.
 
 | Grant | The request | Notes |
 |---|---|---|
-| `authorization_code` | The authorization request's `scope` | Rules A and C are judged when `/oauth2/authorize` issues the code, where an omitted or narrowed request is visible. Rules B and D are judged when the code is redeemed, where the code's scopes are the request. |
-| `refresh_token` | The family's scopes | An omitted scope repeats the grant (RFC 6749 §6), so rule A does not apply. An audience-profile family's scopes are server-defined and so listed. |
+| `authorization_code` | The authorization request's `scope` | Rules A and C are judged when `/oauth2/authorize` issues the code, where an omitted or narrowed request is visible. Rule C is judged again at redemption when a person ceiling narrows the code's scopes. Rules B and D are judged when the code is redeemed, where the code's scopes are the request. |
+| `refresh_token` | The family's scopes | An omitted scope repeats the grant (RFC 6749 §6), so rule A does not apply. Rule C applies when a person ceiling narrows the family's scopes. An audience-profile family's scopes are server-defined and so listed. |
 | `api_key` | `scope` | Rule A keeps the key's stored scopes as the default. |
 | `client_credentials`, self-signed `jwt_bearer` | `scope` | |
 | Token exchange (delegation) | `scope` | Rule C, not rule A, covers a delegation that names no scope. |
 | Trusted external-principal exchange | `scope`, or the audience profile | A profiled audience's scopes are the request, kept by rule A and listed for rule B. |
 | ID-token exchange | `scope` | |
 | ID-JAG | The ID-JAG's `scope` claim | The IdP's grant is a request to ZeroID, not a listing it controls. |
-| CIBA | The bc-authorize request's `scope` | A step-up into a requesting chain that names no scope beside `openid` keeps the chain's scopes today; rule A treats it as a request that names none. Push-mode mints are judged too. |
+| CIBA | The bc-authorize request's `scope` | A step-up into a requesting chain that names no scope beside `openid` keeps the chain's scopes today; rule A treats it as a request that names none. Push-mode mints are judged too; their recorded code is the one the token endpoint would answer, and a push client is sent a callback only for a person-ceiling refusal. |
 
 Grants registered with `RegisterGrant` are not evaluated, nor is issuance that
 is not an OAuth grant: the admin issue and rotate endpoints and attestation.
@@ -261,7 +261,7 @@ is not an OAuth grant: the admin issue and rotate endpoints and attestation.
 **What is recorded.** Each rule that would change a request is counted in
 `zeroid_scope_rule_would_change_total` (OpenTelemetry
 `zeroid.scope.rule_would_change`) by `mode`, `rule`, `grant_type`,
-`account_id`, `project_id` and `identity_id`, and logged at warn as
+`account_id` and `project_id`, and logged at info as
 `scope_rule_would_change`:
 
 | Field | Value |
