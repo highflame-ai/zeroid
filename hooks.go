@@ -526,8 +526,9 @@ type CallerIdentity = service.CallerIdentity
 // request (POST /identities, POST /agents/register) becomes the caller's
 // child: it records the caller as parent_identity_id, takes the caller's
 // owner, takes the caller's allowed_scopes and credential policy where the
-// request names none, may hold no scope the caller cannot, and is deactivated
-// whenever the caller is. See docs/identity-tree.md.
+// request names none, may hold no scope the caller cannot nor a trust_level
+// above the caller's, and is deactivated whenever the caller is. See
+// docs/identity-tree.md.
 //
 // Set it in the AdminAuth layer, from the credential that layer verified, and
 // only when that credential is the identity's own: its API key, client

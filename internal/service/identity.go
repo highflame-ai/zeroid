@@ -178,9 +178,14 @@ type RegisterIdentityRequest struct {
 	// set, the new identity becomes its child (docs/identity-tree.md): it
 	// records the caller as its parent, takes the caller's owner and, for any
 	// of allowed_scopes and credential_policy_id the request leaves empty, the
-	// caller's own, and may hold no scope the caller cannot.
+	// caller's own, and may hold no scope the caller cannot nor a trust level
+	// above the caller's.
 	RegisteredBy *CallerIdentity
 }
+
+// defaultTrustLevel is the trust level an identity is registered with when
+// the request names none.
+const defaultTrustLevel = domain.TrustLevelUnverified
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
 //
@@ -208,6 +213,12 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		parent = p
 		req.OwnerUserID = p.identity.OwnerUserID
 		req.CreatedBy = childCreatedBy(p.identity)
+		// A child is no more trusted than its parent.
+		level, err := childTrustLevel(req.TrustLevel, defaultTrustLevel, p.identity.TrustLevel)
+		if err != nil {
+			return nil, err
+		}
+		req.TrustLevel = level
 		if !rowNamed {
 			req.AllowedScopes = slices.Clone(p.identity.AllowedScopes)
 		}
@@ -256,7 +267,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	}
 
 	if req.TrustLevel == "" {
-		req.TrustLevel = domain.TrustLevelUnverified
+		req.TrustLevel = defaultTrustLevel
 	}
 	if req.IdentityType == "" {
 		req.IdentityType = domain.IdentityTypeAgent
@@ -975,6 +986,11 @@ type UpdateIdentityRequest struct {
 	//   pointer to ""          → clear to NULL (remove expiry, extend forever)
 	//   pointer to RFC3339 str → set new expiry
 	ExpiresAt *string
+	// trustFromAttestation marks TrustLevel as earned by a verified
+	// attestation rather than chosen by the caller. Only then may a child's
+	// trust level rise above its parent's. Unexported, so only this package
+	// (AttestationService) can set it.
+	trustFromAttestation bool
 }
 
 // UpdateIdentity updates mutable fields of an existing identity.
@@ -1000,6 +1016,7 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 	if req.Name != "" {
 		identity.Name = req.Name
 	}
+	priorTrust := identity.TrustLevel
 	if req.TrustLevel != "" {
 		identity.TrustLevel = req.TrustLevel
 	}
@@ -1085,11 +1102,18 @@ func (s *IdentityService) UpdateIdentity(ctx context.Context, id, accountID, pro
 		}
 		identity.Status = *req.Status
 	}
-	// A child's scope ceilings stay inside its parent's (docs/identity-tree.md),
-	// so a write to either loads the parent to check against.
+	// A child's scope ceilings and trust level stay within its parent's
+	// (docs/identity-tree.md), so a write to any of them loads the parent to
+	// check against. A trust level a verified attestation earned is not capped.
+	capTrust := req.TrustLevel != "" && !req.trustFromAttestation
 	var parent *registeringParent
-	if identity.ParentIdentityID != "" && (req.AllowedScopes != nil || req.CredentialPolicyID != nil) {
+	if identity.ParentIdentityID != "" && (req.AllowedScopes != nil || req.CredentialPolicyID != nil || capTrust) {
 		if parent, err = s.loadParent(ctx, identity); err != nil {
+			return nil, err
+		}
+	}
+	if parent != nil && capTrust {
+		if err := checkChildTrustRaise(priorTrust, req.TrustLevel, parent.identity.TrustLevel); err != nil {
 			return nil, err
 		}
 	}

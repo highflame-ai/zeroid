@@ -51,6 +51,7 @@ type treeIdentity struct {
 	WIMSEURI           string   `json:"wimse_uri"`
 	Status             string   `json:"status"`
 	OwnerUserID        string   `json:"owner_user_id"`
+	TrustLevel         string   `json:"trust_level"`
 	CreatedBy          string   `json:"created_by"`
 	ParentIdentityID   string   `json:"parent_identity_id"`
 	CredentialPolicyID string   `json:"credential_policy_id"`
@@ -689,4 +690,94 @@ func TestIdentityTree_RegistrationRacingDeactivation(t *testing.T) {
 		require.Len(t, children, 1)
 		assert.Equal(t, child.ID, children[0].ID)
 	})
+}
+
+// treeDetail returns the detail of an error response.
+func treeDetail(t *testing.T, raw []byte) string {
+	t.Helper()
+	var problem struct {
+		Detail string `json:"detail"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &problem), "%s", raw)
+	return problem.Detail
+}
+
+// TestIdentityTree_TrustLevelCapped verifies that a child is never registered
+// above its parent's trust level, on either registration route: a named
+// level above the parent's is refused, an equal or lower one is kept, and a
+// child that names none gets the default, which is no higher than any parent.
+func TestIdentityTree_TrustLevelCapped(t *testing.T) {
+	tn := newTreeTenant()
+	parent := mustTreeIdentity(t, tn.headers(), map[string]any{"trust_level": "verified_third_party"})
+	const refusal = `trust_level "first_party" is above the parent's "verified_third_party"`
+
+	status, raw := postTreeIdentity(t, tn.as(parent.ID), map[string]any{"trust_level": "first_party"})
+	assert.Equal(t, http.StatusBadRequest, status, "%s", raw)
+	assert.Contains(t, treeDetail(t, raw), refusal)
+
+	ext := uid("tree-trust-agent")
+	status, raw = treeRequest(t, http.MethodPost, adminPath("/agents/register"),
+		map[string]any{"name": ext, "external_id": ext, "trust_level": "first_party"}, tn.as(parent.ID))
+	assert.Equal(t, http.StatusBadRequest, status, "%s", raw)
+	assert.Contains(t, treeDetail(t, raw), refusal)
+	_, ids := treeList(t, adminPath("/identities?parent_identity_id="+parent.ID), "identities", tn)
+	assert.Empty(t, ids, "a refused registration registers nothing")
+
+	equal := mustTreeIdentity(t, tn.as(parent.ID), map[string]any{"trust_level": "verified_third_party"})
+	assert.Equal(t, "verified_third_party", equal.TrustLevel, "the parent's own level is allowed")
+	lower, _ := mustTreeAgent(t, tn.as(parent.ID), map[string]any{"trust_level": "unverified"})
+	assert.Equal(t, "unverified", lower.TrustLevel, "a lower level is allowed")
+	unnamed := mustTreeIdentity(t, tn.as(parent.ID), map[string]any{})
+	assert.Equal(t, "unverified", unnamed.TrustLevel, "naming none gets the default")
+
+	// The default is the lowest level, so it is already within the lowest
+	// parent's; the cap leaves it there.
+	lowest := mustTreeIdentity(t, tn.headers(), map[string]any{"trust_level": "unverified"})
+	assert.Equal(t, "unverified", mustTreeIdentity(t, tn.as(lowest.ID), map[string]any{}).TrustLevel)
+	status, raw = postTreeIdentity(t, tn.as(lowest.ID), map[string]any{"trust_level": "verified_third_party"})
+	assert.Equal(t, http.StatusBadRequest, status, "%s", raw)
+	assert.Contains(t, treeDetail(t, raw), "trust_level")
+}
+
+// TestIdentityTree_TrustLevelRaiseRefused verifies that an update cannot raise
+// a child above its parent's trust level, on either update route, while
+// lowering it, or keeping a level it already holds, is allowed.
+func TestIdentityTree_TrustLevelRaiseRefused(t *testing.T) {
+	tn := newTreeTenant()
+	parent := mustTreeIdentity(t, tn.headers(), map[string]any{"trust_level": "verified_third_party"})
+	child, _ := mustTreeAgent(t, tn.as(parent.ID), map[string]any{})
+	require.Equal(t, "unverified", child.TrustLevel)
+
+	patch := func(path, level string) (int, []byte) {
+		t.Helper()
+		return treeRequest(t, http.MethodPatch, adminPath(path), map[string]any{"trust_level": level}, tn.headers())
+	}
+
+	for _, path := range []string{"/identities/" + child.ID, "/agents/registry/" + child.ID} {
+		status, raw := patch(path, "first_party")
+		assert.Equal(t, http.StatusBadRequest, status, "PATCH %s: %s", path, raw)
+		assert.Contains(t, treeDetail(t, raw), `trust_level "first_party" is above the parent's "verified_third_party"`)
+	}
+	assert.Equal(t, "unverified", getTreeIdentity(t, tn, child.ID).TrustLevel, "a refused update changes nothing")
+
+	status, raw := patch("/identities/"+child.ID, "verified_third_party")
+	require.Equal(t, http.StatusOK, status, "raising to the parent's level: %s", raw)
+	status, raw = patch("/agents/registry/"+child.ID, "unverified")
+	require.Equal(t, http.StatusOK, status, "lowering: %s", raw)
+	assert.Equal(t, "unverified", getTreeIdentity(t, tn, child.ID).TrustLevel)
+
+	// A parent lowered after its child was registered: the child keeps its
+	// level and may be lowered, but not raised again past the parent.
+	root := mustTreeIdentity(t, tn.headers(), map[string]any{"trust_level": "first_party"})
+	kept := mustTreeIdentity(t, tn.as(root.ID), map[string]any{"trust_level": "first_party"})
+	status, raw = treeRequest(t, http.MethodPatch, adminPath("/identities/"+root.ID), map[string]any{"trust_level": "unverified"}, tn.headers())
+	require.Equal(t, http.StatusOK, status, "%s", raw)
+
+	status, raw = patch("/identities/"+kept.ID, "first_party")
+	assert.Equal(t, http.StatusOK, status, "naming the level it holds is not a raise: %s", raw)
+	status, raw = patch("/identities/"+kept.ID, "verified_third_party")
+	assert.Equal(t, http.StatusOK, status, "lowering is allowed even above the parent: %s", raw)
+	status, raw = patch("/identities/"+kept.ID, "first_party")
+	assert.Equal(t, http.StatusBadRequest, status, "raising past the parent again: %s", raw)
+	assert.Contains(t, treeDetail(t, raw), "trust_level")
 }

@@ -21,7 +21,7 @@ type CreateIdentityInput struct {
 	Body struct {
 		ExternalID         string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified). When the request is authenticated as an identity, the new identity is its child and may not be above the parent's trust level."`
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Sub-type within identity type"`
 		OwnerUserID        string          `json:"owner_user_id" required:"true" minLength:"1" doc:"User ID of the identity owner. Ignored when the request is authenticated as an identity: the new identity is its child and takes the parent's owner."`
@@ -116,7 +116,7 @@ type UpdateIdentityInput struct {
 	ID   string `path:"id" doc:"Identity UUID"`
 	Body struct {
 		Name               string          `json:"name,omitempty" doc:"Human-readable identity name"`
-		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		TrustLevel         string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level. An identity registered by another identity cannot be raised above its parent's."`
 		IdentityType       string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type"`
 		SubType            string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent" doc:"Sub-type"`
 		OwnerUserID        string          `json:"owner_user_id,omitempty" doc:"Owner user ID"`

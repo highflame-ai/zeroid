@@ -4,7 +4,8 @@
 registered identity acting as itself, every identity that request registers is
 that identity's child. The child records its parent, takes the parent's owner
 and, unless the request names its own, the parent's scope ceilings. It can
-hold no scope its parent cannot, and it is deactivated whenever its parent is.
+hold no scope its parent cannot and no higher trust level, and it is
+deactivated whenever its parent is.
 The parent comes only from the authenticated caller, never from the request.
 
 This lets a workload that provisions other workloads (an orchestrator that
@@ -63,6 +64,7 @@ provisions for a product never record a parent.
 | `parent_identity_id` | The caller's id. Written once, at registration |
 | `owner_user_id` | The caller's owner. A value in the request is ignored |
 | `created_by` | The caller's WIMSE URI: the creation is attributed to the identity that made it. Its id when the URI is longer than the column (255 characters) |
+| `trust_level` | As the request names it, which may not be above the caller's; otherwise the registration default (`unverified`), capped at the caller's |
 | `allowed_scopes` | As the request names it, otherwise the caller's |
 | `credential_policy_id` | As the request names it, otherwise the caller's policy. Never the tenant default |
 | API key from `POST /agents/register` | `created_by` is the inherited owner, the human the key's tokens are attributed to |
@@ -106,8 +108,31 @@ tenant default.
 The check is made when a child's ceiling is written. Narrowing a parent later,
 or editing a credential policy that a child uses, does not rewrite its
 children; every token is still checked at issuance against its own identity's
-layers. Narrow or deactivate the children too. Trust level, sub-type and
-expiry are not compared with the parent's.
+layers. Narrow or deactivate the children too. Sub-type and expiry are not
+compared with the parent's.
+
+## Trust level
+
+A child is no more trusted than its parent, so an identity cannot use its own
+credential to mint identities that policies requiring a higher
+`trust_level` would accept. Levels are ordered `unverified` <
+`verified_third_party` < `first_party`.
+
+- **Registration.** A `trust_level` above the caller's is refused with `400`,
+  for example
+  `invalid identity field: exceeds the parent identity's trust level: trust_level "first_party" is above the parent's "verified_third_party"`.
+  The caller's level or a lower one is accepted. A request that names none
+  gets the registration default, `unverified`, capped at the caller's level.
+- **Changes.** `PATCH /identities/{id}` and `PATCH /agents/registry/{id}`
+  refuse, the same way, a `trust_level` that would raise a child above its
+  parent's. Lowering a child is always allowed, and so is naming the level it
+  already holds.
+- **Attestation.** A verified attestation (`/attestation/verify`) still
+  promotes a child by its own evidence, above its parent's level if the proof
+  earns it. The cap applies to levels a caller chooses, not to ones a proof
+  earns.
+- Lowering a parent later does not lower its children; lower them too if they
+  must follow.
 
 ## Deactivation
 

@@ -288,6 +288,9 @@ func (s *AttestationService) VerifyAttestation(ctx context.Context, id, accountI
 		if promotedTrust := trustLevelForAttestation(locked.Level); domain.TrustLevelRank(string(promotedTrust)) > domain.TrustLevelRank(string(identity.TrustLevel)) {
 			updated, err := s.identitySvc.UpdateIdentity(ctx, locked.IdentityID, accountID, projectID, UpdateIdentityRequest{
 				TrustLevel: promotedTrust,
+				// Earned by the verified proof, not chosen by the caller, so a
+				// registered child is not capped at its parent's level here.
+				trustFromAttestation: true,
 			})
 			if err != nil {
 				return fmt.Errorf("failed to promote identity trust level: %w", err)

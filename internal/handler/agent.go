@@ -104,7 +104,7 @@ type RegisterAgentInput struct {
 		ExternalID               string          `json:"external_id" required:"true" minLength:"1" doc:"Unique identifier within this project"`
 		IdentityType             string          `json:"identity_type,omitempty" enum:"agent,application,mcp_server,service" doc:"Identity type (defaults to agent)"`
 		SubType                  string          `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy,evaluator,chatbot,assistant,api_service,custom,code_agent,approval_channel" doc:"Operational role. approval_channel (identity_type service only) marks a CIBA approval channel."`
-		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified)"`
+		TrustLevel               string          `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level (defaults to unverified). When the request is authenticated as an identity, the agent is its child and may not be above the parent's trust level."`
 		Framework                string          `json:"framework,omitempty" doc:"Agent framework (e.g. langchain, autogen, crewai)"`
 		Version                  string          `json:"version,omitempty" doc:"Agent version string"`
 		Publisher                string          `json:"publisher,omitempty" doc:"Agent publisher or organization"`
@@ -207,7 +207,7 @@ type UpdateAgentInput struct {
 	Body struct {
 		Name         *string         `json:"name,omitempty" doc:"Human-readable name"`
 		SubType      *string         `json:"sub_type,omitempty" enum:"orchestrator,autonomous,tool_agent,human_proxy" doc:"Agent role"`
-		TrustLevel   *string         `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level"`
+		TrustLevel   *string         `json:"trust_level,omitempty" enum:"unverified,verified_third_party,first_party" doc:"Trust level. An agent registered by another identity cannot be raised above its parent's."`
 		Framework    *string         `json:"framework,omitempty" doc:"Framework"`
 		Version      *string         `json:"version,omitempty" doc:"Version"`
 		Publisher    *string         `json:"publisher,omitempty" doc:"Publisher"`

@@ -222,3 +222,89 @@ func TestChildCreatedBy(t *testing.T) {
 		t.Errorf("got %q, want the parent's id for a URI longer than the column", got)
 	}
 }
+
+// TestChildTrustLevel pins the registration rule: a child is registered at
+// the level it names, never above its parent's, or at the default capped at
+// the parent's.
+func TestChildTrustLevel(t *testing.T) {
+	t.Parallel()
+
+	const (
+		unverified = domain.TrustLevelUnverified
+		thirdParty = domain.TrustLevelVerifiedThirdParty
+		firstParty = domain.TrustLevelFirstParty
+	)
+	tests := []struct {
+		name                    string
+		requested, def, parent  domain.TrustLevel
+		want                    domain.TrustLevel
+		wantRefused, wantParent bool
+	}{
+		{name: "above the parent is refused", requested: firstParty, def: unverified, parent: thirdParty, wantRefused: true},
+		{name: "equal to the parent", requested: thirdParty, def: unverified, parent: thirdParty, want: thirdParty},
+		{name: "below the parent", requested: unverified, def: unverified, parent: firstParty, want: unverified},
+		{name: "none gets the default", def: unverified, parent: thirdParty, want: unverified},
+		{name: "none gets the default capped at the parent", def: firstParty, parent: unverified, want: unverified},
+		{name: "a parent with no valid level is refused", def: unverified, parent: "", wantParent: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := childTrustLevel(tc.requested, tc.def, tc.parent)
+			switch {
+			case tc.wantRefused:
+				if !errors.Is(err, ErrInvalidIdentityField) || !errors.Is(err, ErrExceedsParentTrust) {
+					t.Fatalf("want a trust refusal, got level %q, err %v", got, err)
+				}
+				if !strings.Contains(err.Error(), `trust_level "first_party" is above the parent's "verified_third_party"`) {
+					t.Errorf("refusal %q must name trust_level and both levels", err)
+				}
+			case tc.wantParent:
+				if !errors.Is(err, ErrParentIdentityRefused) {
+					t.Fatalf("want ErrParentIdentityRefused, got level %q, err %v", got, err)
+				}
+			default:
+				if err != nil || got != tc.want {
+					t.Fatalf("got %q, %v; want %q", got, err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckChildTrustRaise pins the update rule: a change may not raise a
+// child above its parent, but may lower it or keep the level it holds.
+func TestCheckChildTrustRaise(t *testing.T) {
+	t.Parallel()
+
+	const (
+		unverified = domain.TrustLevelUnverified
+		thirdParty = domain.TrustLevelVerifiedThirdParty
+		firstParty = domain.TrustLevelFirstParty
+	)
+	tests := []struct {
+		name                string
+		prior, next, parent domain.TrustLevel
+		wantRefused         bool
+	}{
+		{name: "raised above the parent", prior: unverified, next: firstParty, parent: thirdParty, wantRefused: true},
+		{name: "raised to the parent", prior: unverified, next: thirdParty, parent: thirdParty},
+		{name: "lowered", prior: thirdParty, next: unverified, parent: thirdParty},
+		{name: "kept above a parent lowered later", prior: firstParty, next: firstParty, parent: unverified},
+		{name: "lowered but still above the parent", prior: firstParty, next: thirdParty, parent: unverified},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkChildTrustRaise(tc.prior, tc.next, tc.parent)
+			if tc.wantRefused != (err != nil) {
+				t.Fatalf("refused = %v (%v), want %v", err != nil, err, tc.wantRefused)
+			}
+			if err != nil && !errors.Is(err, ErrExceedsParentTrust) {
+				t.Errorf("refusal %v must wrap ErrExceedsParentTrust", err)
+			}
+		})
+	}
+}

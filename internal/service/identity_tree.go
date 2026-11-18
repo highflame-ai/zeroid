@@ -3,8 +3,8 @@ package service
 // The registration tree. An identity registered by another identity, acting
 // as itself, records that identity as its parent, inherits its owner and
 // (unless the request names its own) its scope ceilings, can hold no scope
-// its parent cannot, and is deactivated whenever its parent is. See
-// docs/identity-tree.md.
+// its parent cannot nor a higher trust level, and is deactivated whenever its
+// parent is. See docs/identity-tree.md.
 
 import (
 	"context"
@@ -63,6 +63,11 @@ var ErrParentIdentityRefused = errors.New("the calling identity cannot register 
 // scope its parent cannot. It is always joined with ErrInvalidIdentityField,
 // so handlers answer 400 with the message, which names the offending scope.
 var ErrExceedsParentCeiling = errors.New("exceeds the parent identity's scope ceiling")
+
+// ErrExceedsParentTrust marks a write that would make a child identity more
+// trusted than its parent. It is always joined with ErrInvalidIdentityField,
+// so handlers answer 400 with the message, which names trust_level.
+var ErrExceedsParentTrust = errors.New("exceeds the parent identity's trust level")
 
 // ErrCascadeIncomplete is returned when an identity was deactivated but some
 // identity below it in the registration tree was not. The identity's own
@@ -213,6 +218,48 @@ func sameUUID(a, b string) bool {
 	ua, errA := uuid.Parse(a)
 	ub, errB := uuid.Parse(b)
 	return errA == nil && errB == nil && ua == ub
+}
+
+// ── Trust level ──────────────────────────────────────────────────────────────
+
+// childTrustLevel returns the trust level a child of a parent at level parent
+// is registered with: the level the request names, or, when it names none,
+// def (the registration default) capped at the parent's level. A named level
+// above the parent's is refused. Levels are ordered by domain.TrustLevelRank.
+func childTrustLevel(requested, def, parent domain.TrustLevel) (domain.TrustLevel, error) {
+	parentRank := domain.TrustLevelRank(string(parent))
+	if parentRank < 0 {
+		// The column's CHECK constraint rules this out; refuse rather than guess.
+		return "", fmt.Errorf("%w: the calling identity has no valid trust_level", ErrParentIdentityRefused)
+	}
+	if requested == "" {
+		if domain.TrustLevelRank(string(def)) > parentRank {
+			return parent, nil
+		}
+		return def, nil
+	}
+	if domain.TrustLevelRank(string(requested)) > parentRank {
+		return "", trustError(requested, parent)
+	}
+	return requested, nil
+}
+
+// checkChildTrustRaise refuses a change of a child's trust level from prior to
+// next that raises it above its parent's. Lowering is always allowed, and so
+// is keeping a level the child already holds even when it is above the
+// parent's: a verified attestation can raise a child past its parent, and a
+// parent can be lowered after its children were registered.
+func checkChildTrustRaise(prior, next, parent domain.TrustLevel) error {
+	nextRank := domain.TrustLevelRank(string(next))
+	if nextRank > domain.TrustLevelRank(string(prior)) && nextRank > domain.TrustLevelRank(string(parent)) {
+		return trustError(next, parent)
+	}
+	return nil
+}
+
+// trustError reports a child trust level above its parent's.
+func trustError(level, parent domain.TrustLevel) error {
+	return fmt.Errorf("%w: %w: trust_level %q is above the parent's %q", ErrInvalidIdentityField, ErrExceedsParentTrust, level, parent)
 }
 
 // ── Scope ceilings ───────────────────────────────────────────────────────────
