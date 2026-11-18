@@ -162,6 +162,14 @@ type RegisterIdentityRequest struct {
 	// (historical default). When set, the cleanup worker deactivates the
 	// identity past this time and IssueCredential fail-closes on it.
 	ExpiresAt *time.Time
+
+	// firstContact admits the reserved first_contact origin. Set only by
+	// first-contact registration, so no API caller can claim that origin.
+	firstContact bool
+	// adopted creates the external-origin identity active (adopted) rather
+	// than discovered. First contact sets it under an issuer row whose
+	// standing mapping is the adoption; it needs an owner.
+	adopted bool
 }
 
 // RegisterIdentity creates a new identity with a WIMSE URI.
@@ -185,20 +193,28 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, fmt.Errorf("%w: invalid origin: %q (allowed: a lowercase identifier, e.g. native, okta, entra)", ErrInvalidIdentityField, req.Origin)
 	}
+	if req.Origin == domain.OriginFirstContact && !req.firstContact {
+		return nil, errFirstContactOriginReserved
+	}
 	discovered := req.Origin.IsExternal()
 
 	// Ownership is mandatory for native identities and relaxed for discovered
 	// (ownerless is the posture signal). It becomes mandatory again at adoption
 	// (discovered → pending/active), enforced in UpdateIdentity.
-	if !discovered && req.OwnerUserID == "" {
+	if (!discovered || req.adopted) && req.OwnerUserID == "" {
 		return nil, fmt.Errorf("owner_user_id is required")
 	}
 
 	// A discovered identity is pre-authoritative; a native one is active on
 	// registration (the historical default).
 	initialStatus := domain.IdentityStatusActive
-	if discovered {
+	if discovered && !req.adopted {
 		initialStatus = domain.IdentityStatusDiscovered
+	}
+	var adoptedAt *time.Time
+	if discovered && req.adopted {
+		now := time.Now()
+		adoptedAt = &now
 	}
 
 	if req.TrustLevel == "" {
@@ -299,6 +315,7 @@ func (s *IdentityService) RegisterIdentity(ctx context.Context, req RegisterIden
 		RiskTier:                req.RiskTier,
 		IAL:                     req.IAL,
 		ExpiresAt:               req.ExpiresAt,
+		AdoptedAt:               adoptedAt,
 		CreatedBy:               req.CreatedBy,
 		CreatedAt:               time.Now(),
 		UpdatedAt:               time.Now(),
@@ -392,6 +409,9 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	if !domain.ValidOrigin(string(req.Origin)) {
 		return nil, false, fmt.Errorf("%w: invalid origin: %q", ErrInvalidIdentityField, req.Origin)
 	}
+	if req.Origin == domain.OriginFirstContact {
+		return nil, false, errFirstContactOriginReserved
+	}
 	// The discovery path can only carry trust it can EARN: unverified or
 	// verified_third_party (directory verification, CAP-DSC-004). first_party
 	// is reserved for natively-registered identities, and anything else is a
@@ -407,6 +427,13 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 	}
 
 	if existing, err := s.repo.GetByExternalID(ctx, req.ExternalID, req.AccountID, req.ProjectID); err == nil && existing != nil {
+		return s.reconcileDiscovered(ctx, existing, req)
+	}
+	// An agent first contact already registered, keyed on the same runtime
+	// subject: the inventory merges into it instead of adding a second one.
+	if existing, err := s.firstContactMatch(ctx, req); err != nil {
+		return nil, false, err
+	} else if existing != nil {
 		return s.reconcileDiscovered(ctx, existing, req)
 	}
 
@@ -534,6 +561,7 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if req.Version != "" {
 		identity.Version = req.Version
 	}
+	prevLabels, prevMetadata := identity.Labels, identity.Metadata
 	if len(req.Labels) > 0 {
 		identity.Labels = req.Labels
 	}
@@ -543,6 +571,9 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	if len(req.Metadata) > 0 {
 		identity.Metadata = req.Metadata
 	}
+	// A first-contact identity keeps its marker and the claims it arrived
+	// with, whatever the inventory sends.
+	keepFirstContactProvenance(identity, prevLabels, prevMetadata)
 	// Re-type a still-discovered row from the connector's current classification
 	// (e.g. application → mcp_server once it's recognised as an MCP server,
 	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows untouched and

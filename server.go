@@ -467,6 +467,12 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 		externalIssuerRegistry = service.NewDBExternalIssuerRegistry(externalIssuerRepo, cfg.Federation.AllowPrivateEndpoints, cfg.Federation.SharedIssuers, jwksOpts...)
 		oauthSvc.SetExternalIssuerRegistry(externalIssuerRegistry)
 		oauthSvc.SetIssuerBindings(externalIssuerRepo)
+		// First contact registers through bindings, so it exists only with
+		// issuer rows; each row's first_contact switches it on.
+		oauthSvc.SetFirstContact(service.NewFirstContactRegistrar(externalIssuerRepo, identitySvc, service.FirstContactConfig{
+			RatePerMinute:           cfg.Federation.FirstContact.RatePerMinute,
+			MaxDiscoveredPerAccount: cfg.Federation.FirstContact.MaxDiscoveredPerAccount,
+		}))
 		log.Info().Bool("allow_private_endpoints", cfg.Federation.AllowPrivateEndpoints).
 			Msg("Trusted issuers are per-account rows (federation.issuer_store=db)")
 	} else if len(cfg.ExternalIssuers) > 0 {

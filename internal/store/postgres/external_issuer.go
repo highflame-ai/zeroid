@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/uptrace/bun"
 
@@ -53,6 +54,36 @@ func (r *ExternalIssuerRepository) LockAccount(ctx context.Context, accountID st
 		return fmt.Errorf("failed to lock account issuers: %w", err)
 	}
 	return nil
+}
+
+// LockFirstContact serialises first-contact registrations in one account
+// until the transaction ends, so the per-row rate limit and the per-account
+// cap are counted exactly, and two first contacts for one subject create one
+// identity. A key space apart from LockAccount's: it never waits on, or holds
+// up, an admin's issuer writes.
+func (r *ExternalIssuerRepository) LockFirstContact(ctx context.Context, accountID string) error {
+	if !hasTx(ctx) {
+		return errors.New("LockFirstContact requires a transaction")
+	}
+	_, err := dbOrTx(ctx, r.db).ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended(?, 4200069))", accountID)
+	if err != nil {
+		return fmt.Errorf("failed to lock first contact: %w", err)
+	}
+	return nil
+}
+
+// CountBindingsCreatedBySince counts the bindings actor created under an
+// issuer row since t, deleted ones included: the per-row first-contact rate.
+func (r *ExternalIssuerRepository) CountBindingsCreatedBySince(ctx context.Context, issuerID, actor string, since time.Time) (int, error) {
+	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.IssuerBinding)(nil)).
+		Where("issuer_id = ?", issuerID).
+		Where("created_by = ?", actor).
+		Where("created_at > ?", since).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count bindings: %w", err)
+	}
+	return n, nil
 }
 
 // SetAuditActor names who makes this transaction's writes, for the audit
@@ -168,7 +199,8 @@ func (r *ExternalIssuerRepository) Update(ctx context.Context, row *domain.Exter
 	res, err := dbOrTx(ctx, r.db).NewUpdate().Model(row).
 		Column("display_name", "audiences", "algorithms", "claim_mapping", "propagate_claims",
 			"claim_constraints", "constraints_key", "max_token_age_seconds", "jwks_cache_ttl_seconds",
-			"trust_email", "enabled", "updated_by").
+			"trust_email", "enabled", "first_contact", "first_contact_project_id", "first_contact_owner_user_id",
+			"updated_by").
 		Set("updated_at = clock_timestamp()").
 		Where("id = ?", row.ID).
 		Where("account_id = ?", row.AccountID).

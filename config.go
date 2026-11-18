@@ -97,6 +97,24 @@ type FederationConfig struct {
 	// every row on it must pin that claim. Empty means the built-in list
 	// (domain.DefaultSharedIssuers).
 	SharedIssuers []domain.SharedIssuer `koanf:"shared_issuers"`
+
+	// FirstContact bounds first-contact registration, which an issuer row
+	// switches on with first_contact (docs/external-issuers.md, "First
+	// contact"). Database rows only.
+	FirstContact FirstContactConfig `koanf:"first_contact"`
+}
+
+// FirstContactConfig bounds first-contact registration. Past either bound a
+// credential that would register an agent gets the plain no-binding refusal
+// instead, and the reason is logged.
+type FirstContactConfig struct {
+	// RatePerMinute caps the agents first contact registers under one issuer
+	// row in any minute. 0 means the default, 10.
+	RatePerMinute int `koanf:"rate_per_minute"`
+	// MaxDiscoveredPerAccount caps an account's first-contact identities that
+	// are still discovered (unadopted), so a discover row cannot fill an
+	// account's adoption queue without end. 0 means the default, 500.
+	MaxDiscoveredPerAccount int `koanf:"max_discovered_per_account"`
 }
 
 // ClientAuthConfig governs OAuth CLIENT authentication — specifically RFC 7523
@@ -768,6 +786,9 @@ func (c *Config) Validate() error {
 	if err := domain.ValidateSharedIssuers(c.Federation.SharedIssuers, c.Federation.AllowPrivateEndpoints); err != nil {
 		return fmt.Errorf("federation.%w", err)
 	}
+	if c.Federation.FirstContact.RatePerMinute < 0 || c.Federation.FirstContact.MaxDiscoveredPerAccount < 0 {
+		return fmt.Errorf("federation.first_contact.rate_per_minute and max_discovered_per_account must not be negative (0 = default)")
+	}
 	switch c.Federation.IssuerStore {
 	case "", "config":
 	case "db":
@@ -1144,6 +1165,9 @@ func loadDefaults(k *koanf.Koanf) error {
 		// into account rows.
 		"federation.issuer_store":            "config",
 		"federation.allow_private_endpoints": false,
+		// First-contact bounds, per issuer row and per account.
+		"federation.first_contact.rate_per_minute":            10,
+		"federation.first_contact.max_discovered_per_account": 500,
 
 		// Workload-attested signing credentials. Operational signing
 		// window is short (1h, keys are ephemeral + rotated); the public
@@ -1252,6 +1276,9 @@ var envMapping = map[string]string{
 	// rows). The private-endpoint relaxation is for local development only.
 	"ZEROID_FEDERATION_ISSUER_STORE":            "federation.issuer_store",
 	"ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS": "federation.allow_private_endpoints",
+	// First-contact bounds.
+	"ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE":            "federation.first_contact.rate_per_minute",
+	"ZEROID_FEDERATION_FIRST_CONTACT_MAX_DISCOVERED_PER_ACCOUNT": "federation.first_contact.max_discovered_per_account",
 
 	"ZEROID_CIMD_ENABLED":                 "cimd.enabled",
 	"ZEROID_CIMD_ALLOW_PRIVATE_ENDPOINTS": "cimd.allow_private_metadata_endpoints",
