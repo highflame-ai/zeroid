@@ -1407,9 +1407,10 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 	// No OAuth client authenticated here: the actor proved its identity key,
 	// and external_id is a name its tenant chose. A name the deployment
-	// reserved for its own clients is not written as client_id, so an
-	// identity named after one cannot mint a token that reads as that client.
-	if s.oauthClientSvc.IsReservedClientID(issue.ClientID) {
+	// reserved for its own clients is written as client_id only when that
+	// reserved client is linked to this very identity, so an identity merely
+	// named after one cannot mint a token that reads as that client.
+	if s.oauthClientSvc.IsReservedClientID(issue.ClientID) && !s.clientLinkedTo(ctx, issue.ClientID, actorIdentity.ID) {
 		issue.ClientID = ""
 	}
 	issue.PrincipalType = parent.Type
@@ -1565,15 +1566,17 @@ func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *dom
 // resolves tenant context, and calls the token endpoint with:
 //
 //	grant_type=urn:ietf:params:oauth:grant-type:token-exchange
-//	subject_token=<external_jwt>
+//	subject_token=<a token this server issued for user_id>
 //	subject_token_type=urn:ietf:params:oauth:token-type:jwt
 //	account_id=<resolved_tenant>
 //	project_id=<resolved_tenant>
 //	user_id=<external_user_id>
 //
-// ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
-// external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
-// with the external principal's claims embedded.
+// ZeroID trusts the caller (verified by TrustedServiceValidator), refuses a
+// workload URI as user_id, verifies a presented subject_token
+// (verifyExternalPrincipalSubject) unless the deployment opted out, and issues
+// a ZeroID-signed RS256 token with the external principal's claims embedded. A
+// deployer's own grant calling this in-process presents no subject_token.
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
 // Exported so deployers can call it from custom grant handlers.
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
@@ -1846,6 +1849,14 @@ func delegationDepthOf(tok jwt.Token) int {
 	return 0
 }
 
+// clientLinkedTo reports whether the registered client clientID is linked to
+// identityID. Any lookup failure reads as "not linked": the caller then
+// withholds a claim rather than writes one it could not confirm.
+func (s *OAuthService) clientLinkedTo(ctx context.Context, clientID, identityID string) bool {
+	c, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+	return err == nil && c.IdentityID != nil && *c.IdentityID == identityID
+}
+
 // isWorkloadURI reports whether v is a SPIFFE/WIMSE workload URI, ignoring
 // case and surrounding space, so "SPIFFE://..." is caught too.
 func isWorkloadURI(v string) bool {
@@ -1870,7 +1881,11 @@ func (s *OAuthService) verifyExternalPrincipalSubject(ctx context.Context, req T
 		return refuse(errors.New("subject_token has no jti"))
 	}
 	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
-	if err != nil || cred == nil || !active {
+	if err != nil {
+		// A store failure is not a bad token: let the caller retry.
+		return oauthServerError("failed to check subject_token", err)
+	}
+	if cred == nil || !active {
 		return refuse(errors.New("subject_token is inactive or revoked"))
 	}
 	// The credential row, not the token, is the tenant of record.

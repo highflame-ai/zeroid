@@ -1734,10 +1734,12 @@ func (s *Server) GetIdentity(ctx context.Context, id, accountID, projectID strin
 
 // ErrClientNotOwned is returned by EnsureClient when a client with the
 // seed's client_id already exists and the seed cannot show it is the seed's
-// own: it is linked to a different identity (or to none, when the seed names
-// one), or its confidentiality differs from the seed's. EnsureClient refuses
-// rather than rewriting that row, because whoever registered it first may
-// hold its credential. Remove the row (or rename the seed) to proceed.
+// own (see ownsExistingClient): for a linked seed, the row is linked to
+// another identity or none, or was not registered by seeding; for an unlinked
+// seed, the row is linked, was registered dynamically, or differs from the
+// seed in whether it authenticates. EnsureClient refuses rather than
+// rewriting that row, because whoever registered it first may hold its
+// credential. Remove the row (or rename the seed) to proceed.
 var ErrClientNotOwned = errors.New("oauth client exists and is not owned by this seed")
 
 // EnsureClient registers an OAuth client if it doesn't exist, or updates it if the
@@ -1801,6 +1803,16 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 	// Client exists — update mutable fields from config.
 	// Secret is NOT touched (rotated explicitly via RotateSecret).
 	updated := false
+
+	// An unlinked seed adopting a row it did not register (one registered
+	// before seeding recorded itself, or through the admin route): say so
+	// once, and record the row as seeded from now on.
+	if existing.RegistrationSource != domain.RegistrationSourceSeed {
+		log.Warn().Str("client_id", cfg.ClientID).Str("registration_source", existing.RegistrationSource).
+			Msg("EnsureClient adopted an existing client it did not register; check it is the operator's own")
+		existing.RegistrationSource = domain.RegistrationSourceSeed
+		updated = true
+	}
 
 	if cfg.Name != "" && cfg.Name != existing.Name {
 		existing.Name = cfg.Name
@@ -1905,8 +1917,10 @@ var ErrServiceIdentityConflict = errors.New("identity exists and is not a servic
 //
 // An existing service identity is returned as it is: its status, trust level,
 // keys and policy are not rewritten, so an operator who suspends a service
-// identity keeps it suspended across restarts. An existing identity of any
-// other type is refused with ErrServiceIdentityConflict.
+// identity keeps it suspended across restarts. It is adopted whoever created
+// it, so the tenant that holds service identities must not be writable by
+// anyone else. An existing identity of any other type is refused with
+// ErrServiceIdentityConflict.
 //
 // Pair it with EnsureClient and OAuthClientConfig.IdentityID to give the
 // service a client linked to this identity.
@@ -1968,14 +1982,17 @@ func (s *Server) EnsureServiceIdentity(ctx context.Context, cfg ServiceIdentityC
 //   - An unlinked seed never owns a linked row: the link makes the row a
 //     credential of that identity's tenant, and rewriting its redirect URIs,
 //     scopes or keys from the seed would hand the seed's configuration to it.
-//   - An unlinked seed owns an unlinked row only when both are public, or
-//     both authenticate: a public seed must not adopt a row whose secret or
-//     key someone else holds, and a confidential seed must not adopt a public
-//     row someone else registered. Moving between the confidential methods
-//     (client_secret_* to private_key_jwt) stays allowed, as before.
+//   - An unlinked seed owns an unlinked, non-dynamic row only when both are
+//     public, or both authenticate: a public seed must not adopt a row whose
+//     secret or key someone else holds, and a confidential seed must not
+//     adopt a public row someone else registered. Moving between the
+//     confidential methods (client_secret_* to private_key_jwt) stays
+//     allowed, as before.
 //
-// Nothing here can tell a squatter's unlinked confidential row from the
-// operator's own; only a link can. Seed service clients with IdentityID.
+// For an unlinked seed, nothing here can tell a squatter's row from one an
+// earlier release of EnsureClient registered (both read "internal"), so such
+// a row is adopted, logged, and marked as seeded. Seed service clients with
+// IdentityID, which is held to the stricter rule.
 func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) error {
 	notOwned := func(why string) error {
 		return fmt.Errorf("%w: client_id %q %s", ErrClientNotOwned, cfg.ClientID, why)
@@ -1995,6 +2012,11 @@ func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) err
 	}
 	if existing.IdentityID != nil {
 		return notOwned("is linked to an identity and the seed is not")
+	}
+	// A dynamically registered client's registrant holds a registration
+	// access token and could rewrite the seed's configuration through RFC 7592.
+	if existing.RegistrationSource == "dynamic" {
+		return notOwned("was registered dynamically")
 	}
 	if seedIsPublicClient(cfg) != (existing.TokenEndpointAuthMethod == "none" || existing.TokenEndpointAuthMethod == "") {
 		return notOwned("differs from the seed in whether it authenticates")

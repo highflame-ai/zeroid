@@ -308,11 +308,11 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   Only workloads appear; the person is never an actor. The current actor's own
   attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
   the outermost `act` rather than at the top level, because the top level
-  describes the principal. A grant that authenticated the current actor as an
-  OAuth client also writes that client as `act.client_id`; it is never copied
-  from a parent token, so it always describes the grant that minted the token,
-  and a resource server pairs it with `act.sub` rather than trusting either
-  alone. Prior actors carry only `sub`. On an exchange from a
+  describes the principal. `act.client_id` is reserved for the OAuth client
+  the current actor authenticated as in the grant that minted the token; no
+  grant writes it yet. It is never copied from a parent token, so it always
+  describes the minting grant, and a resource server pairs it with `act.sub`
+  rather than trusting either alone. Prior actors carry only `sub`. On an exchange from a
   root grant, the root token's `client_id` becomes the first prior actor. The
   chain is capped at 16 actors for token size; past it the deepest prior actors
   are dropped, which §4.1 allows because they are informational.

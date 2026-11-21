@@ -181,7 +181,8 @@ type OAuthClient struct {
 	ChannelTrusted bool `bun:"channel_trusted,notnull" json:"-"`
 
 	// Dynamic Client Registration (RFC 7591/7592)
-	// RegistrationSource is "internal" for clients created via the admin/internal
+	// RegistrationSource is "seed" for clients created by Server.EnsureClient
+	// (RegistrationSourceSeed), and "internal" for clients created via the admin/internal
 	// API path, "dynamic" for clients created via POST /oauth2/register, and
 	// RegistrationSourceCIMD for an ephemeral client synthesized from a Client ID
 	// Metadata Document. See SelfAsserted.

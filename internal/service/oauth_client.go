@@ -106,10 +106,10 @@ func (s *OAuthClientService) SetReservedClientIDs(names, prefixes []string) {
 }
 
 // IsReservedClientID reports whether clientID is reserved for operator
-// seeding. Case is ignored, so a look-alike differing only in case is
-// reserved too.
+// seeding. Case and surrounding space are ignored, so an id differing from a
+// reserved one only in those is reserved too.
 func (s *OAuthClientService) IsReservedClientID(clientID string) bool {
-	id := strings.ToLower(clientID)
+	id := strings.ToLower(strings.TrimSpace(clientID))
 	if _, ok := s.reservedNames[id]; ok {
 		return true
 	}
@@ -528,6 +528,10 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	client.ClientSecret = hashed
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
+		// Deleted since it was read: the new secret was never stored.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", ErrOAuthClientNotFound
+		}
 		return nil, "", fmt.Errorf("failed to update client secret: %w", err)
 	}
 

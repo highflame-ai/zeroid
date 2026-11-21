@@ -79,7 +79,7 @@ if err := claims.RequireResource("urn:example:svc:billing"); err != nil {
 }
 
 claims.ClientID()           // client_id: the client the token was issued to
-claims.ActorClientID()      // act.client_id: the client the current actor authenticated as
+claims.ActorClientID()      // act.client_id: the client the current actor authenticated as (no ZeroID grant writes it yet)
 claims.CurrentActor()       // act.sub (rfc8693 profile), else sub
 claims.TenantSource()       // "asserted" when the caller named the tenant; empty otherwise
 claims.ResolvedUserID()     // the user ZeroID resolved for delegated credentials, if any

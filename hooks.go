@@ -246,8 +246,9 @@ type OAuthClientConfig struct {
 	// API's identity_id does: client_credentials then mints for that identity
 	// and in its tenant only. Set it for a service's own client (see
 	// Server.EnsureServiceIdentity). EnsureClient then adopts an existing row
-	// only when it is linked to this identity, and refuses any other with
-	// ErrClientNotOwned. Empty keeps an unlinked client, as before.
+	// only when EnsureClient registered it and it is linked to this identity,
+	// and refuses any other with ErrClientNotOwned. Empty keeps an unlinked
+	// client, as before.
 	IdentityID string
 }
 

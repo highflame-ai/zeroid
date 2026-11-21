@@ -234,6 +234,33 @@ func TestEnsureClient_UnlinkedSeed(t *testing.T) {
 		assert.Equal(t, "none", clientRowByClientID(t, clientID).TokenEndpointAuthMethod)
 	})
 
+	t.Run("adopts a public row registered elsewhere, and records it as seeded", func(t *testing.T) {
+		// A row registered before seeding recorded itself reads "internal",
+		// like one from the admin route. It is adopted (and logged), as before.
+		clientID := uid("cli-legacy")
+		resp := post(t, adminPath("/oauth/clients"), map[string]any{
+			"client_id": clientID, "name": "legacy", "grant_types": []string{"authorization_code"},
+			"redirect_uris": []string{testRedirectURI},
+		}, nil)
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		_ = resp.Body.Close()
+		require.Equal(t, "internal", clientRowByClientID(t, clientID).RegistrationSource)
+
+		require.NoError(t, testZeroIDServer.EnsureClient(ctx, publicSeed(clientID)))
+		assert.Equal(t, domain.RegistrationSourceSeed, clientRowByClientID(t, clientID).RegistrationSource)
+	})
+
+	t.Run("refuses a dynamically registered row", func(t *testing.T) {
+		// Its registrant holds a registration access token and could rewrite
+		// the seed's configuration through RFC 7592.
+		clientID := uid("cli-dynamic")
+		require.NoError(t, testZeroIDServer.EnsureClient(ctx, publicSeed(clientID)))
+		_, err := testDB.ExecContext(ctx, "UPDATE oauth_clients SET registration_source = 'dynamic' WHERE client_id = ?", clientID)
+		require.NoError(t, err)
+		err = testZeroIDServer.EnsureClient(ctx, publicSeed(clientID))
+		require.True(t, errors.Is(err, zeroid.ErrClientNotOwned), "got %v", err)
+	})
+
 	t.Run("a public seed still adopts its own public row", func(t *testing.T) {
 		clientID := uid("cli-own")
 		require.NoError(t, testZeroIDServer.EnsureClient(ctx, publicSeed(clientID)))

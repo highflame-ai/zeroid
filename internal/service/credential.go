@@ -928,15 +928,13 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	if req.ApplicationID != "" {
 		_ = token.Set("application_id", req.ApplicationID)
 	}
-	// RFC 9068 §2.2. Emitted alongside `application_id` rather than replacing
-	// it: the authorization_code path has been setting `application_id` to the
+	// RFC 9068 §2.2 `client_id` is set after CustomClaims, below. It is emitted
+	// alongside `application_id` rather than replacing it: the
+	// authorization_code path has been setting `application_id` to the
 	// client_id since long before this claim existed, so anything already
 	// keying on that keeps working. New consumers should read `client_id` —
 	// the registered name, and the one a resource server that has never seen
 	// our stack will look for.
-	if req.ClientID != "" {
-		_ = token.Set("client_id", req.ClientID)
-	}
 	if req.FederatedClientAuth {
 		_ = token.Set(ClientAuthClaim, ClientAuthFederatedAssertion)
 	}
@@ -954,8 +952,8 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// client_id and act identify the client and the actor a resource server
 	// attributes the call to, so they are only ever the grant's own values,
 	// never CustomClaims (every grant filters caller input against
-	// reservedClaims, but internal callers pass CustomClaims too). client_id
-	// is set again here; act is set below, from the grant, or not at all.
+	// reservedClaims, but internal callers pass CustomClaims too). act is set
+	// below, from the grant, or not at all.
 	_ = token.Remove("client_id")
 	if req.ClientID != "" {
 		_ = token.Set("client_id", req.ClientID)

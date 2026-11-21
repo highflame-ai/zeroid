@@ -164,10 +164,13 @@ type ClientAuthConfig struct {
 // something the deployer controls, such as the account the token was issued
 // in.
 //
-// Matching ignores case, so a look-alike such as "Billing" is refused when
-// "billing" is reserved. Empty (the default) reserves nothing. Reserving an
-// id does not affect a client already registered under it: Server.EnsureClient
-// refuses to adopt a row it does not own, so an operator finds out at seeding.
+// Matching ignores case and surrounding space, so "Billing" is refused when
+// "billing" is reserved; other look-alikes are not. Empty (the default)
+// reserves nothing. Reserving an id does not remove a client already
+// registered under it. A seed linked to an identity refuses such a row with
+// ErrClientNotOwned; an unlinked seed adopts an unlinked row alike in whether
+// it authenticates, and logs that it did. Seed the deployment's own services
+// with OAuthClientConfig.IdentityID.
 type ReservedClientIDsConfig struct {
 	// Names are reserved client ids, matched whole.
 	Names []string `koanf:"names"`

@@ -45,4 +45,5 @@ func TestSetReservedClientIDs_Trims(t *testing.T) {
 	s.SetReservedClientIDs([]string{" billing "}, []string{" svc-"})
 	assert.True(t, s.IsReservedClientID("billing"))
 	assert.True(t, s.IsReservedClientID("svc-x"))
+	assert.True(t, s.IsReservedClientID(" billing "), "surrounding space does not escape the reservation")
 }

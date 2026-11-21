@@ -126,7 +126,8 @@ type ActorClaims struct {
 	// only from that client authentication, on the current actor only, and
 	// never copies it from a parent token; `act` is reserved, so a caller
 	// cannot set it. Empty when the grant did not authenticate the actor as a
-	// client. Read it through Claims.ActorClientID.
+	// client, which today is every ZeroID grant: the field is in place for
+	// grants that will. Read it through Claims.ActorClientID.
 	ClientID string `json:"client_id,omitempty"`
 
 	// Actor is the prior actor, if any (RFC 8693 §4.1 nesting).
@@ -231,8 +232,8 @@ func (c *Claims) ClientID() string {
 // ActorClientID returns the outermost `act.client_id`: the OAuth client the
 // current actor authenticated as in the grant that minted this token. Empty
 // when the token has no actor, or when its grant did not authenticate the
-// actor as a client. ZeroID never copies it from a parent token, so it
-// describes this token's grant only. A resource server identifying the actor
+// actor as a client (no ZeroID grant does yet). ZeroID never copies it from
+// a parent token, so it describes this token's grant only. A resource server identifying the actor
 // checks it together with `act.sub`, never alone.
 func (c *Claims) ActorClientID() string {
 	if c.ActorClaims == nil {

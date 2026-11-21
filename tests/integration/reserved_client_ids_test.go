@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -76,4 +77,37 @@ func TestReservedClientIDs_NotWrittenAsExchangeClientID(t *testing.T) {
 
 	body, _ = tn.exchange(t, policyID, testReservedClientPrefix+uid("actor"), scopes, root)
 	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string)), "client_id")
+}
+
+// The deployment's own service acting in an exchange keeps its client_id: the
+// reserved client of that name is linked to the acting identity itself.
+func TestReservedClientIDs_ExchangeKeepsClientIDOfItsOwnLinkedClient(t *testing.T) {
+	ctx := context.Background()
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+
+	extID := testReservedClientPrefix + uid("own")
+	key := generateKey(t)
+	wimse := tn.register(t, extID, policyID, ecPublicKeyPEM(t, key), scopes)
+	var identityID string
+	require.NoError(t, testDB.NewRaw("SELECT id FROM identities WHERE external_id = ? AND account_id = ?", extID, tn.account).
+		Scan(ctx, &identityID))
+	jwks, err := json.Marshal(clientJWKS(t, generateKey(t)))
+	require.NoError(t, err)
+	require.NoError(t, testZeroIDServer.EnsureClient(ctx, zeroid.OAuthClientConfig{
+		ClientID: extID, Name: extID, IdentityID: identityID,
+		TokenEndpointAuthMethod: "private_key_jwt", JWKS: jwks, GrantTypes: []string{"client_credentials"},
+	}))
+
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+		"subject_token": root,
+		"actor_token":   buildAssertion(t, key, wimse),
+		"scope":         "data:read",
+	}, nil)
+	body := decode(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "%v", body)
+	assert.Equal(t, extID, decodeJWTPayload(t, body["access_token"].(string))["client_id"])
 }
