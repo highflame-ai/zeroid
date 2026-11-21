@@ -242,6 +242,13 @@ type OAuthClientConfig struct {
 	// supports: "poll" (default), "ping", or "push". ping/push require a
 	// non-empty ClientNotificationEndpoint.
 	BackchannelTokenDeliveryMode string
+	// IdentityID links the client to an identity (its UUID), as the admin
+	// API's identity_id does: client_credentials then mints for that identity
+	// and in its tenant only. Set it for a service's own client (see
+	// Server.EnsureServiceIdentity). EnsureClient then adopts an existing row
+	// only when it is linked to this identity, and refuses any other with
+	// ErrClientNotOwned. Empty keeps an unlinked client, as before.
+	IdentityID string
 }
 
 // TrustedServiceValidator checks whether the current request comes from a trusted
