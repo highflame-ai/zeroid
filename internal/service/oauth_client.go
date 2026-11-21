@@ -97,11 +97,11 @@ func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (strin
 func (s *OAuthClientService) SetReservedClientIDs(names, prefixes []string) {
 	s.reservedNames = make(map[string]struct{}, len(names))
 	for _, n := range names {
-		s.reservedNames[strings.ToLower(n)] = struct{}{}
+		s.reservedNames[strings.ToLower(strings.TrimSpace(n))] = struct{}{}
 	}
-	s.reservedPrefixes = s.reservedPrefixes[:0]
+	s.reservedPrefixes = nil
 	for _, p := range prefixes {
-		s.reservedPrefixes = append(s.reservedPrefixes, strings.ToLower(p))
+		s.reservedPrefixes = append(s.reservedPrefixes, strings.ToLower(strings.TrimSpace(p)))
 	}
 }
 
@@ -831,14 +831,22 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		return nil, "", "", fmt.Errorf("name is required")
 	}
 
-	clientID, err := generateSecureToken(16)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
-	}
 	// The id is random, so it is reserved only if the deployment reserved a
-	// prefix it happens to start with. Refuse rather than register it: the
-	// registrant retries and gets another.
-	if s.IsReservedClientID(clientID) {
+	// prefix it happens to start with (a short hex one, say). Draw again
+	// rather than refuse a registrant who chose nothing; refuse only if every
+	// draw lands in the reservation.
+	var clientID string
+	for range 8 {
+		id, err := generateSecureToken(16)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
+		}
+		if !s.IsReservedClientID(id) {
+			clientID = id
+			break
+		}
+	}
+	if clientID == "" {
 		return nil, "", "", ErrReservedClientID
 	}
 

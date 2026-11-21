@@ -401,6 +401,10 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
 	oauthSvc.SetAllowUnverifiedExternalPrincipalSubject(cfg.Token.AllowUnverifiedExternalPrincipalSubject)
+	if cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		log.Warn().Msg("token.allow_unverified_external_principal_subject=true: the external-principal exchange accepts " +
+			"a subject_token without verifying it. Move the trusted services that rely on it to the ID-token exchange and turn it off.")
+	}
 
 	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
 	// the authorization_code flow by fetching + validating their published

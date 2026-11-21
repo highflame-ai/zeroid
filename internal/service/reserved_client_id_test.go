@@ -37,3 +37,12 @@ func TestRegisterClient_RefusesReservedClientID(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrReservedClientID))
 	assert.True(t, errors.Is(err, ErrInvalidClientMetadata), "handlers map it to 400 like other bad metadata")
 }
+
+// Configured values are trimmed, so a stray space in config does not leave the
+// intended id unreserved.
+func TestSetReservedClientIDs_Trims(t *testing.T) {
+	s := &OAuthClientService{}
+	s.SetReservedClientIDs([]string{" billing "}, []string{" svc-"})
+	assert.True(t, s.IsReservedClientID("billing"))
+	assert.True(t, s.IsReservedClientID("svc-x"))
+}
