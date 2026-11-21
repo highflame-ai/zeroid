@@ -1609,6 +1609,16 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	// TrustedServiceValidator alone, as before.
 	if req.SubjectToken != "" && !s.allowUnverifiedExternalPrincipalSubject.Load() {
 		if err := s.verifyExternalPrincipalSubject(ctx, req); err != nil {
+			// The response does not say which check failed; the log does, and
+			// names the opt-out, since a deployment whose trusted service
+			// relays another issuer's token first meets this on upgrade.
+			var oe *OAuthError
+			if errors.As(err, &oe) && oe.Code == oautherror.InvalidGrant {
+				log.Warn().Err(errors.Unwrap(err)).Str("trusted_service", serviceName).
+					Msg("external principal exchange refused its subject_token; a trusted service that presents " +
+						"another issuer's token there needs token.allow_unverified_external_principal_subject " +
+						"until it moves to the ID-token exchange")
+			}
 			return nil, err
 		}
 	}

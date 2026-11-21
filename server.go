@@ -1994,8 +1994,11 @@ func (s *Server) EnsureServiceIdentity(ctx context.Context, cfg ServiceIdentityC
 // a row is adopted, logged, and marked as seeded. Seed service clients with
 // IdentityID, which is held to the stricter rule.
 func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) error {
+	// The message names the way out: an operator meets it at startup, often
+	// right after an upgrade that introduced this check.
 	notOwned := func(why string) error {
-		return fmt.Errorf("%w: client_id %q %s", ErrClientNotOwned, cfg.ClientID, why)
+		return fmt.Errorf("%w: client_id %q %s; delete that client or give the seed another client_id",
+			ErrClientNotOwned, cfg.ClientID, why)
 	}
 	if cfg.IdentityID != "" {
 		if existing.IdentityID == nil || *existing.IdentityID != cfg.IdentityID {
@@ -2019,7 +2022,8 @@ func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) err
 		return notOwned("was registered dynamically")
 	}
 	if seedIsPublicClient(cfg) != (existing.TokenEndpointAuthMethod == "none" || existing.TokenEndpointAuthMethod == "") {
-		return notOwned("differs from the seed in whether it authenticates")
+		return notOwned("differs from the seed in whether it authenticates " +
+			"(a seed for a confidential client sets Confidential, or a client_secret_* or private_key_jwt TokenEndpointAuthMethod)")
 	}
 	return nil
 }

@@ -12,11 +12,14 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
@@ -92,24 +95,49 @@ func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (strin
 }
 
 // SetReservedClientIDs reserves client ids for operator seeding: names match
-// whole, prefixes match the start, both ignoring case. Set from
+// whole, prefixes match the start, both compared as ReservedClientIDKey. Set from
 // ReservedClientIDsConfig in server.go.
 func (s *OAuthClientService) SetReservedClientIDs(names, prefixes []string) {
 	s.reservedNames = make(map[string]struct{}, len(names))
+	// An entry that normalises to nothing is skipped: as a prefix it would
+	// reserve every id. Config.Validate refuses one before it gets here.
 	for _, n := range names {
-		s.reservedNames[strings.ToLower(strings.TrimSpace(n))] = struct{}{}
+		if k := ReservedClientIDKey(n); k != "" {
+			s.reservedNames[k] = struct{}{}
+		}
 	}
 	s.reservedPrefixes = nil
 	for _, p := range prefixes {
-		s.reservedPrefixes = append(s.reservedPrefixes, strings.ToLower(strings.TrimSpace(p)))
+		if k := ReservedClientIDKey(p); k != "" {
+			s.reservedPrefixes = append(s.reservedPrefixes, k)
+		}
 	}
 }
 
+// ReservedClientIDKey is the form reserved ids are compared in: surrounding space
+// and invisible format characters (zero-width space and joiners, soft hyphen,
+// bidi marks) removed, case folded, and Unicode compatibility forms
+// normalised (NFKC), so "Billing", "ｂｉｌｌｉｎｇ" and "bil\u200bling" all
+// compare equal to "billing". Letters from different scripts that merely look
+// alike (Cyrillic "а" for Latin "a") stay distinct: a resource server compares
+// client_id byte for byte, so such an id never reads as the reserved one.
+func ReservedClientIDKey(id string) string {
+	id = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, id)
+	id = norm.NFKC.String(cases.Fold().String(norm.NFKC.String(id)))
+	return strings.TrimSpace(id)
+}
+
 // IsReservedClientID reports whether clientID is reserved for operator
-// seeding. Case and surrounding space are ignored, so an id differing from a
-// reserved one only in those is reserved too.
+// seeding. Both sides are compared as ReservedClientIDKey, so an id differing from
+// a reserved one only in case, surrounding space, invisible characters or
+// Unicode compatibility forms is reserved too.
 func (s *OAuthClientService) IsReservedClientID(clientID string) bool {
-	id := strings.ToLower(strings.TrimSpace(clientID))
+	id := ReservedClientIDKey(clientID)
 	if _, ok := s.reservedNames[id]; ok {
 		return true
 	}
@@ -452,9 +480,23 @@ func (s *OAuthClientService) GetClientByClientID(ctx context.Context, clientID s
 
 // GetClient retrieves a client by UUID.
 func (s *OAuthClientService) GetClient(ctx context.Context, id string) (*domain.OAuthClient, error) {
-	client, err := s.repo.GetByID(ctx, id)
+	return s.clientByID(ctx, id)
+}
+
+// clientByID loads a client by UUID. A missing row, or an id that is not a
+// UUID and so cannot name one, is ErrOAuthClientNotFound; a store failure is
+// returned as it is, so the caller answers it as a server error.
+func (s *OAuthClientService) clientByID(ctx context.Context, id string) (*domain.OAuthClient, error) {
+	parsed, err := uuid.Parse(id)
 	if err != nil {
 		return nil, ErrOAuthClientNotFound
+	}
+	client, err := s.repo.GetByID(ctx, parsed.String())
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrOAuthClientNotFound
+	}
+	if err != nil {
+		return nil, err
 	}
 	return client, nil
 }
@@ -497,9 +539,9 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 // RotateSecret generates and stores a new secret for a client.
 // Returns the new plain-text secret (only shown once).
 func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*domain.OAuthClient, string, error) {
-	client, err := s.repo.GetByID(ctx, id)
+	client, err := s.clientByID(ctx, id)
 	if err != nil {
-		return nil, "", ErrOAuthClientNotFound
+		return nil, "", err
 	}
 	// A client registered in the trusted approval-channel context gets a new
 	// secret only from a caller in that context (approval_channel_write.go).
@@ -1070,6 +1112,11 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	client.Metadata = req.Metadata
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
+		// Deleted since it was read: the handler answers as it does for a
+		// client that no longer exists, not with a server error.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOAuthClientNotFound
+		}
 		return nil, fmt.Errorf("failed to update dynamic client: %w", err)
 	}
 	return client, nil

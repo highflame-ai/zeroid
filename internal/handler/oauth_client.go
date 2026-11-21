@@ -365,6 +365,11 @@ func (a *API) tenantScopedClient(ctx context.Context, id string) (*domain.OAuthC
 	// first-party client, say), so a caller acting for a tenant may not read,
 	// rotate or delete it.
 	if client.IdentityID == nil {
+		// Logged because a deployment that sends tenant headers on every
+		// admin call stops reaching its unlinked clients on upgrade, and the
+		// 404 alone does not say why.
+		log.Info().Str("client_id", client.ClientID).Str("account_id", tenant.AccountID).
+			Msg("oauth client hidden from a tenant-scoped caller: it is unlinked; manage it without X-Account-ID/X-Project-ID")
 		return nil, service.ErrOAuthClientNotFound
 	}
 	if _, err := a.identitySvc.GetIdentity(ctx, *client.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {

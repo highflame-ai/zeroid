@@ -1060,6 +1060,8 @@ func TestValidateReservedClientIDs(t *testing.T) {
 		{"empty name", []string{" "}, nil, true},
 		{"name with #", []string{"https://iss#sub"}, nil, true},
 		{"empty prefix reserves everything", nil, []string{""}, true},
+		{"invisible-only prefix reserves everything", nil, []string{"\u200b"}, true},
+		{"invisible-only name", []string{"\u00a0\u200d"}, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := baseValidConfig(t)

@@ -157,19 +157,22 @@ type ClientAuthConfig struct {
 // /oauth/clients route, dynamic registration and trusted-issuer bindings
 // refuse it, whoever the caller.
 //
-// A reserved id is also never written as the client_id of a token exchange,
-// where client_id comes from the actor identity's external_id rather than
-// from an authenticated client. client_id is still only a name: a resource
-// server identifying one of the deployment's services pairs it with
-// something the deployer controls, such as the account the token was issued
-// in.
+// On a token exchange, where client_id comes from the actor identity's
+// external_id rather than from an authenticated client, a reserved id is
+// written only when the reserved client is linked to that very identity.
+// client_id is still only a name: a resource server identifying one of the
+// deployment's services pairs it with something the deployer controls, such
+// as the account the token was issued in.
 //
-// Matching ignores case and surrounding space, so "Billing" is refused when
-// "billing" is reserved; other look-alikes are not. Empty (the default)
-// reserves nothing. Reserving an id does not remove a client already
+// Matching ignores case, surrounding space, invisible format characters and
+// Unicode compatibility forms (NFKC), so "Billing" or a fullwidth "billing" is
+// refused when "billing" is reserved. Letters of another script that only look
+// alike (Cyrillic for Latin) are not: a resource server compares client_id
+// byte for byte, so such an id never reads as the reserved one. Empty (the
+// default) reserves nothing. Reserving an id does not remove a client already
 // registered under it. A seed linked to an identity refuses such a row with
-// ErrClientNotOwned; an unlinked seed adopts an unlinked row alike in whether
-// it authenticates, and logs that it did. Seed the deployment's own services
+// ErrClientNotOwned; an unlinked seed adopts an unlinked, non-dynamic row
+// alike in whether it authenticates, and logs that it did. Seed the deployment's own services
 // with OAuthClientConfig.IdentityID.
 type ReservedClientIDsConfig struct {
 	// Names are reserved client ids, matched whole.
@@ -722,12 +725,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("database URL is required: provide ZEROID_DATABASE_URL or individual DB_ vars")
 	}
 	for _, n := range c.ReservedClientIDs.Names {
-		if strings.TrimSpace(n) == "" || strings.Contains(n, "#") {
+		if service.ReservedClientIDKey(n) == "" || strings.Contains(n, "#") {
 			return fmt.Errorf("reserved_client_ids.names: %q is not a client id (empty, or contains '#')", n)
 		}
 	}
 	for _, p := range c.ReservedClientIDs.Prefixes {
-		if strings.TrimSpace(p) == "" {
+		if service.ReservedClientIDKey(p) == "" {
 			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
 		}
 	}
