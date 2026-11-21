@@ -307,6 +307,9 @@ func actorChainClaim(actors []domain.Actor) map[string]any {
 			if actors[i].ExternalID != "" {
 				a["external_id"] = actors[i].ExternalID
 			}
+			if actors[i].ClientID != "" {
+				a["client_id"] = actors[i].ClientID
+			}
 		}
 		if nested != nil {
 			a["act"] = nested
@@ -330,9 +333,30 @@ func rfc8693Act(actors []domain.Actor, actClaim map[string]any) map[string]any {
 		return actorChainClaim(actors)
 	}
 	if carriesActorAttributes(actClaim) {
-		return actClaim
+		return withoutActorClientID(actClaim)
 	}
 	return nil
+}
+
+// withoutActorClientID returns act without its outermost `client_id`. An `act`
+// copied verbatim from an earlier token (a CIBA step-up into a requesting
+// chain) keeps its actor, but `act.client_id` records the client the actor
+// authenticated as in the grant that minted that earlier token, and nothing
+// authenticated it as a client in this one. Copying it would let a token
+// carry an actor client authentication its own grant never performed. Nested
+// levels never carry it (prior actors carry only `sub`). act itself is not
+// modified, since the caller's map may be shared.
+func withoutActorClientID(act map[string]any) map[string]any {
+	if _, ok := act["client_id"]; !ok {
+		return act
+	}
+	out := make(map[string]any, len(act))
+	for k, v := range act {
+		if k != "client_id" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // carriesActorAttributes reports whether an `act` claim's outermost level
@@ -996,7 +1020,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		//   2. User context: NHI acts on behalf of an end user. act.sub = user ID.
 		// These are mutually exclusive per token — a delegated token already has act from the orchestrator.
 		if req.ActClaim != nil {
-			_ = token.Set("act", req.ActClaim)
+			_ = token.Set("act", withoutActorClientID(req.ActClaim))
 		} else if req.DelegatedBy != "" {
 			_ = token.Set("act", map[string]string{"sub": req.DelegatedBy})
 		} else if req.ActingUserID != "" {

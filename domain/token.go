@@ -45,6 +45,9 @@ type TokenClaims struct {
 type ActorClaims struct {
 	Subject string `json:"sub"`
 	Issuer  string `json:"iss,omitempty"`
+	// ClientID is the OAuth client the actor authenticated as, when the grant
+	// that minted the token authenticated it as one (`act.client_id`).
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // AccessToken is the RFC 6749 §5.1 token response returned to the caller after issuance.
