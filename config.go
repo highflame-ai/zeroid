@@ -157,6 +157,13 @@ type ClientAuthConfig struct {
 // /oauth/clients route, dynamic registration and trusted-issuer bindings
 // refuse it, whoever the caller.
 //
+// A reserved id is also never written as the client_id of a token exchange,
+// where client_id comes from the actor identity's external_id rather than
+// from an authenticated client. client_id is still only a name: a resource
+// server identifying one of the deployment's services pairs it with
+// something the deployer controls, such as the account the token was issued
+// in.
+//
 // Matching ignores case, so a look-alike such as "Billing" is refused when
 // "billing" is reserved. Empty (the default) reserves nothing. Reserving an
 // id does not affect a client already registered under it: Server.EnsureClient

@@ -1405,6 +1405,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
+	// No OAuth client authenticated here: the actor proved its identity key,
+	// and external_id is a name its tenant chose. A name the deployment
+	// reserved for its own clients is not written as client_id, so an
+	// identity named after one cannot mint a token that reads as that client.
+	if s.oauthClientSvc.IsReservedClientID(issue.ClientID) {
+		issue.ClientID = ""
+	}
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss

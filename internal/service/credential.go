@@ -951,6 +951,16 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	for k, v := range req.CustomClaims {
 		_ = token.Set(k, v)
 	}
+	// client_id and act identify the client and the actor a resource server
+	// attributes the call to, so they are only ever the grant's own values,
+	// never CustomClaims (every grant filters caller input against
+	// reservedClaims, but internal callers pass CustomClaims too). client_id
+	// is set again here; act is set below, from the grant, or not at all.
+	_ = token.Remove("client_id")
+	if req.ClientID != "" {
+		_ = token.Set("client_id", req.ClientID)
+	}
+	_ = token.Remove("act")
 
 	// mission_id is set after CustomClaims, not before: every grant filters
 	// caller input against reservedClaims, but internal callers also pass

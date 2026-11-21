@@ -4,6 +4,7 @@ package integration_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,8 +14,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/google/uuid"
+
 	zeroid "github.com/highflame-ai/zeroid"
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // ── EnsureClient and EnsureServiceIdentity ───────────────────────────────────
@@ -112,6 +116,7 @@ func TestEnsureClient_LinkedSeed(t *testing.T) {
 		row := clientRowByClientID(t, clientID)
 		require.NotNil(t, row.IdentityID)
 		assert.Equal(t, svc.ID, *row.IdentityID)
+		assert.Equal(t, domain.RegistrationSourceSeed, row.RegistrationSource)
 
 		require.NoError(t, testZeroIDServer.EnsureClient(ctx, seed(clientID, "renamed")))
 		assert.Equal(t, "renamed", clientRowByClientID(t, clientID).Name)
@@ -146,6 +151,18 @@ func TestEnsureClient_LinkedSeed(t *testing.T) {
 		assert.Equal(t, before.Name, after.Name, "the row is left as its owner registered it")
 		assert.Equal(t, other.ID, *after.IdentityID)
 		assert.Equal(t, before.TokenEndpointAuthMethod, after.TokenEndpointAuthMethod)
+	})
+
+	t.Run("refuses a row linked to the same identity but not seeded", func(t *testing.T) {
+		// Anyone who can register a client in the service identity's tenant
+		// could link one to it before the first seed, and would hold its
+		// secret. The link alone does not make the row the seed's.
+		clientID := uid("svc-prelinked")
+		linkedClient(t, clientID, svc.ID, tenantHeaders(acct, proj))
+		err := testZeroIDServer.EnsureClient(ctx, seed(clientID, "platform"))
+		require.True(t, errors.Is(err, zeroid.ErrClientNotOwned), "got %v", err)
+		assert.Equal(t, "client_secret_basic", clientRowByClientID(t, clientID).TokenEndpointAuthMethod,
+			"the row is left as registered")
 	})
 
 	t.Run("refuses an unlinked row", func(t *testing.T) {
@@ -225,4 +242,14 @@ func TestEnsureClient_UnlinkedSeed(t *testing.T) {
 		require.NoError(t, testZeroIDServer.EnsureClient(ctx, cfg))
 		assert.Equal(t, "cli renamed", clientRowByClientID(t, clientID).Name)
 	})
+}
+
+// An update of a row that no longer exists is an error, not a silent success:
+// EnsureClient read the row, and it was deleted (and its client_id perhaps
+// re-registered by someone else) before the write.
+func TestOAuthClientRepository_UpdateOfMissingRowFails(t *testing.T) {
+	repo := postgres.NewOAuthClientRepository(testDB)
+	err := repo.Update(context.Background(), &domain.OAuthClient{ID: uuid.NewString(), ClientID: uid("gone"), Name: "gone"})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, sql.ErrNoRows), "got %v", err)
 }

@@ -301,6 +301,12 @@ type ProofToken struct {
 	CreatedAt  time.Time  `bun:"created_at"     json:"created_at"`
 }
 
+// RegistrationSourceSeed marks a client registered by the operator's seeding
+// path (Server.EnsureClient). A seed linked to an identity adopts only a row
+// it created itself, so a client someone else registered and linked to the
+// same identity is never taken over.
+const RegistrationSourceSeed = "seed"
+
 // RegistrationSourceCIMD marks a client synthesized from a Client ID Metadata
 // Document rather than registered. See OAuthClient.SelfAsserted.
 const RegistrationSourceCIMD = "cimd"

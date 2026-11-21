@@ -89,6 +89,20 @@ func TestExternalPrincipalExchange_VerifiesSubjectToken(t *testing.T) {
 		assert.Empty(t, got["access_token"])
 	}
 
+	t.Run("a delegated token acting for the person names that person", func(t *testing.T) {
+		// rfc8693: an agent acting for a person carries the person as sub,
+		// so a gateway holding the agent's token may name the person.
+		tn := newTenant(t, "rfc8693")
+		scopes := []string{"data:read"}
+		policyID := tn.policy(t, scopes)
+		root, person := tn.userRoot(t, scopes)
+		child, _ := tn.exchange(t, policyID, uid("ep-agent"), scopes, root)
+		resp := post(t, "/oauth2/token",
+			brokerExchange(child["access_token"].(string), tn.account, tn.project, person), trustedServiceHeaders)
+		body := decode(t, resp)
+		require.Equal(t, http.StatusOK, resp.StatusCode, "%v", body)
+	})
+
 	t.Run("another person is refused", func(t *testing.T) {
 		refused(t, brokerExchange(subject, testAccountID, testProjectID, uid("someone-else")))
 	})

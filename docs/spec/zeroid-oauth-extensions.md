@@ -308,7 +308,11 @@ claims — are specified in Sections 4.3, 4.4, and 4.8.
   Only workloads appear; the person is never an actor. The current actor's own
   attributes (`identity_type`, `trust_level`, `external_id`) are carried inside
   the outermost `act` rather than at the top level, because the top level
-  describes the principal. Prior actors carry only `sub`. On an exchange from a
+  describes the principal. A grant that authenticated the current actor as an
+  OAuth client also writes that client as `act.client_id`; it is never copied
+  from a parent token, so it always describes the grant that minted the token,
+  and a resource server pairs it with `act.sub` rather than trusting either
+  alone. Prior actors carry only `sub`. On an exchange from a
   root grant, the root token's `client_id` becomes the first prior actor. The
   chain is capped at 16 actors for token size; past it the deepest prior actors
   are dropped, which §4.1 allows because they are informational.
@@ -593,6 +597,16 @@ mode:
 - Does **not** require an `actor_token`.
 - Emits `token_exchange=external_principal` and `trusted_by=<service>`.
 - Is RS256-signed with a short (900 s) TTL.
+- Refuses a `user_id` that is a SPIFFE/WIMSE URI (`invalid_request`): the token
+  names a person, never a workload.
+- Verifies a presented `subject_token`: it MUST be an active token this server
+  issued, for the request's `account_id` and `project_id`, whose person is
+  `user_id` (`sub` when `principal_type` is `user`; under the legacy profile
+  `user_id`, else a delegated token's `act.sub`, else `sub`; never a workload
+  URI); otherwise `invalid_grant`. A deployer's own grant that calls the
+  exchange in-process presents none and rests on the trusted caller alone.
+  `token.allow_unverified_external_principal_subject` restores accepting an
+  unverified subject while a deployment migrates.
 
 ### 5.6 Direct OIDC ID-token federation (external issuer)
 
@@ -870,6 +884,8 @@ role privilege_scope roles
 authorization_details approval_id
 # Agent provenance
 origin agent_idp_iss agent_idp_parent
+# Internal service tokens
+tenant_source resolved_user_id resolved_user_source
 ```
 
 Special cases:
@@ -896,6 +912,12 @@ Special cases:
   registered (native, or an external IdP such as Entra or Okta). Policies use
   them to tell the two apart, so no caller may set them; ZeroID does not mint
   them yet.
+
+- `tenant_source`, `resolved_user_id` and `resolved_user_source` describe how
+  a grant chose a token's tenant and the user whose delegated credentials it
+  may use. A resource server identifying an internal service token relies on
+  ZeroID being their only writer, so issuance also strips them from internal
+  callers' custom claims. No grant writes them yet.
 
 This makes the `additional_claims` route fail closed regardless of which grant
 is in play.

@@ -165,9 +165,11 @@ type RegisterClientRequest struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
-	// AllowReservedClientID lets this registration take a reserved client id.
-	// Only the operator's seeding path (Server.EnsureClient) sets it; every
-	// tenant-reachable registration leaves it false and is refused.
+	// AllowReservedClientID lets this registration take a reserved client id,
+	// and records the row as seeded (RegistrationSourceSeed). Only the
+	// operator's seeding path (Server.EnsureClient) sets it; every
+	// tenant-reachable registration leaves it false and is refused a
+	// reserved id.
 	AllowReservedClientID bool
 
 	// IdentityID optionally binds this OAuth client to an agent identity.
@@ -366,6 +368,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		identityID = &id
 	}
 
+	source := "internal"
+	if req.AllowReservedClientID {
+		source = domain.RegistrationSourceSeed
+	}
+
 	now := time.Now()
 	client := &domain.OAuthClient{
 		ID:                           uuid.New().String(),
@@ -389,7 +396,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		IdentityID:                   identityID,
 		ClientNotificationEndpoint:   req.ClientNotificationEndpoint,
 		BackchannelTokenDeliveryMode: deliveryMode,
-		RegistrationSource:           "internal",
+		RegistrationSource:           source,
 		ChannelTrusted:               TrustedApprovalChannelWrite(ctx),
 		IsActive:                     true,
 		CreatedAt:                    now,

@@ -1960,9 +1960,11 @@ func (s *Server) EnsureServiceIdentity(ctx context.Context, cfg ServiceIdentityC
 // ownsExistingClient decides whether an existing client row is the seed's
 // own, so EnsureClient may update it in place.
 //
-//   - A seed linked to an identity owns only a row linked to that same
-//     identity. A row linked elsewhere, or to nothing, was registered by
-//     someone else (or before the link existed) and is not adopted.
+//   - A seed linked to an identity owns only a row that EnsureClient itself
+//     registered (registration_source "seed") linked to that same identity.
+//     A row linked elsewhere, to nothing, or registered through another path
+//     was registered by someone else (or before the link existed) and is not
+//     adopted.
 //   - An unlinked seed never owns a linked row: the link makes the row a
 //     credential of that identity's tenant, and rewriting its redirect URIs,
 //     scopes or keys from the seed would hand the seed's configuration to it.
@@ -1981,6 +1983,13 @@ func ownsExistingClient(existing *domain.OAuthClient, cfg OAuthClientConfig) err
 	if cfg.IdentityID != "" {
 		if existing.IdentityID == nil || *existing.IdentityID != cfg.IdentityID {
 			return notOwned("is not linked to the seed's identity")
+		}
+		// Linked to the right identity is not enough: anyone who can register
+		// a client in that identity's tenant can link one to it before the
+		// first seed runs, and would keep its credential. Only a row this
+		// seeding path created is adopted.
+		if existing.RegistrationSource != domain.RegistrationSourceSeed {
+			return notOwned("was not registered by seeding")
 		}
 		return nil
 	}

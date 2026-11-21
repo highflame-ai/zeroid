@@ -58,3 +58,22 @@ func TestReservedClientIDs_RefusedOnBinding(t *testing.T) {
 		Scan(context.Background(), &n))
 	assert.Zero(t, n)
 }
+
+// On a token exchange client_id is the actor identity's external_id, a name
+// its tenant chose, not a client that authenticated. A reserved name is not
+// written there, so an identity named after a reserved client cannot mint a
+// token that reads as that client.
+func TestReservedClientIDs_NotWrittenAsExchangeClientID(t *testing.T) {
+	tn := newTenant(t, "")
+	scopes := []string{"data:read"}
+	policyID := tn.policy(t, scopes)
+	root, _ := tn.workloadRoot(t, policyID, scopes)
+
+	ordinary := uid("plain-actor")
+	body, _ := tn.exchange(t, policyID, ordinary, scopes, root)
+	assert.Equal(t, ordinary, decodeJWTPayload(t, body["access_token"].(string))["client_id"],
+		"control: an ordinary actor's external_id is the client_id")
+
+	body, _ = tn.exchange(t, policyID, testReservedClientPrefix+uid("actor"), scopes, root)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string)), "client_id")
+}
