@@ -203,9 +203,19 @@ func TestExternalIDTokenFederation_EndToEnd(t *testing.T) {
 			return "test-broker", nil
 		})
 
+		// The broker arm verifies a presented subject_token, so present a
+		// token this server issued for the same person and tenant, minted the
+		// way an embedder's session grant does (no subject_token at all).
+		subject, err := fedSrv.ExternalPrincipalExchange(context.Background(), zeroid.GrantRequest{
+			AccountID: fedCfg.AccountID,
+			ProjectID: fedCfg.ProjectID,
+			UserID:    "alice",
+		})
+		require.NoError(t, err)
+
 		resp := postFederation(t, fedHTTPSrv.URL, map[string]any{
 			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token": "opaque-broker-presented-token",
+			"subject_token": subject.AccessToken,
 			"account_id":    fedCfg.AccountID,
 			"project_id":    fedCfg.ProjectID,
 			"user_id":       "alice",

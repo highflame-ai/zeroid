@@ -836,11 +836,10 @@ func TestCIBAApproveScopeRequiresExplicitListing(t *testing.T) {
 func externalPrincipalToken(t *testing.T, accountID, projectID, userID string) string {
 	t.Helper()
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    accountID,
-		"project_id":    projectID,
-		"user_id":       userID,
+		"grant_type": testUserSessionGrant,
+		"account_id": accountID,
+		"project_id": projectID,
+		"user_id":    userID,
 	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	tok, _ := decode(t, resp)["access_token"].(string)

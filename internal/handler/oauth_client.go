@@ -343,9 +343,11 @@ func oauthClientWriteError(err error) error {
 // minted into, so the admin routes must not let one tenant act on a client
 // linked into another.
 //
-// The rule: a caller with a tenant in context sees a client only when it is
-// unlinked (global) or its linked identity is in that tenant. A caller with no
-// tenant in context (a trusted internal service) sees every client, as before.
+// The rule: a caller with a tenant in context sees a client only when its
+// linked identity is in that tenant. An unlinked client belongs to no tenant;
+// it is the operator's, so only a caller with no tenant in context (the
+// operator, or a trusted internal service) sees, rotates or deletes it, and
+// that caller sees every client, as before.
 
 // tenantScopedClient loads a client by UUID and returns
 // service.ErrOAuthClientNotFound for one the caller's tenant may not see, so
@@ -356,8 +358,14 @@ func (a *API) tenantScopedClient(ctx context.Context, id string) (*domain.OAuthC
 		return nil, err
 	}
 	tenant, terr := internalMiddleware.GetTenant(ctx)
-	if terr != nil || client.IdentityID == nil {
+	if terr != nil {
 		return client, nil
+	}
+	// An unlinked client belongs to no tenant: it is the operator's (a seeded
+	// first-party client, say), so a caller acting for a tenant may not read,
+	// rotate or delete it.
+	if client.IdentityID == nil {
+		return nil, service.ErrOAuthClientNotFound
 	}
 	if _, err := a.identitySvc.GetIdentity(ctx, *client.IdentityID, tenant.AccountID, tenant.ProjectID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -368,8 +376,8 @@ func (a *API) tenantScopedClient(ctx context.Context, id string) (*domain.OAuthC
 	return client, nil
 }
 
-// filterClientsToTenant drops the clients tenantScopedClient would hide, using
-// one identity lookup for the whole list.
+// filterClientsToTenant drops the clients tenantScopedClient would hide,
+// unlinked ones included, using one identity lookup for the whole list.
 func (a *API) filterClientsToTenant(ctx context.Context, clients []*domain.OAuthClient) ([]*domain.OAuthClient, error) {
 	tenant, terr := internalMiddleware.GetTenant(ctx)
 	if terr != nil {
@@ -382,7 +390,7 @@ func (a *API) filterClientsToTenant(ctx context.Context, clients []*domain.OAuth
 		}
 	}
 	if len(linked) == 0 {
-		return clients, nil
+		return []*domain.OAuthClient{}, nil
 	}
 	identities, err := a.identitySvc.GetIdentitiesByIDs(ctx, linked, tenant.AccountID, tenant.ProjectID)
 	if err != nil {
@@ -394,10 +402,11 @@ func (a *API) filterClientsToTenant(ctx context.Context, clients []*domain.OAuth
 	}
 	visible := make([]*domain.OAuthClient, 0, len(clients))
 	for _, c := range clients {
-		if c.IdentityID != nil {
-			if _, ok := inTenant[*c.IdentityID]; !ok {
-				continue
-			}
+		if c.IdentityID == nil {
+			continue
+		}
+		if _, ok := inTenant[*c.IdentityID]; !ok {
+			continue
 		}
 		visible = append(visible, c)
 	}

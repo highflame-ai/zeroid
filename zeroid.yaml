@@ -116,6 +116,26 @@ token:
   # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
   # refresh_reuse_grace_seconds: 10
 
+  # allow_unverified_external_principal_subject: the external-principal
+  # exchange (token-exchange with no actor_token, gated by the deployer's
+  # TrustedServiceValidator) verifies a presented subject_token: it must be an
+  # active token this server issued, for the account_id/project_id and the
+  # person (user_id) the request names, or the exchange fails with
+  # invalid_grant. A request with no subject_token is unaffected. Set true only
+  # while a trusted service still presents tokens from another issuer there;
+  # move it to the ID-token exchange instead. Default false.
+  # Env: ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT
+  # allow_unverified_external_principal_subject: false
+
+# reserved_client_ids: OAuth client ids only the operator may register, via
+# Server.EnsureClient. POST /oauth/clients, dynamic registration and
+# trusted-issuer bindings refuse them for every caller. Use it for the client
+# ids your own services authenticate as, which resource servers recognise by
+# name. Matching ignores case. Empty (default) reserves nothing.
+# reserved_client_ids:
+#   names: ["billing-service"]
+#   prefixes: ["svc-"]
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.

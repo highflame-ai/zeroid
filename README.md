@@ -994,7 +994,9 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET | `/identities` | List identities |
 | GET | `/identities/{id}/oauth-clients` | List the OAuth2 clients linked to an identity |
 | DELETE | `/identities/{id}/oauth-clients/{client_uuid}` | Delete an OAuth2 client linked to an identity (frees its `client_id`) |
-| POST | `/oauth/clients` | Register OAuth2 client |
+| POST | `/oauth/clients` | Register OAuth2 client (a [reserved](#reserved-client-ids) `client_id` is refused) |
+| GET | `/oauth/clients`, `/oauth/clients/{id}` | List or get OAuth2 clients. With a tenant in context, only clients linked to an identity in that tenant |
+| POST, DELETE | `/oauth/clients/{id}/rotate-secret`, `/oauth/clients/{id}` | Rotate a secret or delete a client, under the same visibility rule: an unlinked client is reached only with no tenant in context |
 | POST | `/api-keys` | Create API key |
 | POST | `/credential-policies` | Create credential policy |
 | GET | `/credential-policies/{id}` | Get credential policy |
@@ -1021,6 +1023,9 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET, PATCH, DELETE | `/external-issuers/{id}/bindings/{binding_id}` | Read, enable/disable or remove a binding |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/approve` | Approve a pending CIBA request (tenant-scoped) |
 | POST | `/oauth2/bc-authorize/{auth_req_id}/deny` | Deny a pending CIBA request (tenant-scoped) |
+
+<a id="reserved-client-ids"></a>
+**Reserved client ids.** `reserved_client_ids` (names and prefixes, case-insensitive) keeps client ids your own services authenticate as for the operator: only `Server.EnsureClient` registers them, and `POST /oauth/clients`, dynamic registration and trusted-issuer bindings refuse them. A reserved id is also never written as a token-exchange `client_id`, which there comes from the actor's `external_id`. `EnsureClient` updates only a row that is the seed's own (for a linked seed, one it registered itself and linked to the seed's `IdentityID`; for an unlinked seed, an unlinked, non-dynamic row alike in whether it authenticates, adopted with a logged warning if seeding did not register it) and otherwise returns `ErrClientNotOwned`. `Server.EnsureServiceIdentity` seeds the service identity a linked client authenticates as.
 
 `public_key_pem` on the agent and identity write paths must be an SPKI EC P-256 (ES256) key; anything else is a `400` naming the reason.
 The agent registry never returns the PEM: each agent carries `has_public_key` and, when a key is enrolled, `public_key_thumbprint` (its RFC 7638 JWK SHA-256 thumbprint, base64url).
