@@ -958,6 +958,15 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// exchange's own resolution of the parent and nothing else.
 	_ = token.Set("mission_id", missionID)
 
+	// tenant_source and resolved_user_id/_source: like mission_id, never from
+	// CustomClaims. Every grant filters caller input against reservedClaims,
+	// but internal callers pass CustomClaims too, and a receiver trusts these
+	// claims to describe how ZeroID itself chose the tenant and the user. No
+	// grant writes them yet, so they are removed from every token.
+	for _, k := range []string{"tenant_source", "resolved_user_id", "resolved_user_source"} {
+		_ = token.Remove(k)
+	}
+
 	// user_idp_iss / user_idp_sub: like mission_id, only ever the grant's own values.
 	_ = token.Remove("user_idp_iss")
 	_ = token.Remove("user_idp_sub")

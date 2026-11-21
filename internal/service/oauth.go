@@ -275,6 +275,17 @@ var reservedClaims = map[string]bool{
 	ClientAuthClaim: true,
 	"may_act":       true,
 	"scope":         true,
+	// Internal service tokens. `tenant_source` says the issuing grant took the
+	// tenant from the caller rather than from a verified credential, and a
+	// receiver refuses such a token wherever the tenant must be proven.
+	// `resolved_user_id` names the user whose delegated credentials the
+	// subject may use, and `resolved_user_source` says how ZeroID resolved
+	// it; a receiver serves that user's credentials and no other. All three
+	// are worth something only if ZeroID alone writes them, so neither
+	// additional_claims nor any other caller input may set or remove them.
+	"tenant_source":        true,
+	"resolved_user_id":     true,
+	"resolved_user_source": true,
 	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
 	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
 	// neither, so additional_claims is the only way either reaches a signed
