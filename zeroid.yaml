@@ -116,6 +116,15 @@ token:
   # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
   # refresh_reuse_grace_seconds: 10
 
+# reserved_client_ids: OAuth client ids only the operator may register, via
+# Server.EnsureClient. POST /oauth/clients, dynamic registration and
+# trusted-issuer bindings refuse them for every caller. Use it for the client
+# ids your own services authenticate as, which resource servers recognise by
+# name. Matching ignores case. Empty (default) reserves nothing.
+# reserved_client_ids:
+#   names: ["billing-service"]
+#   prefixes: ["svc-"]
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.

@@ -38,6 +38,11 @@ var ErrInvalidClientSecret = errors.New("invalid client secret")
 // input was our fault and burying the actionable message in a server log.
 var ErrInvalidClientMetadata = errors.New("invalid client metadata")
 
+// ErrReservedClientID is returned when a registration names a client id the
+// deployment reserved for its operator (ReservedClientIDsConfig). It wraps
+// ErrInvalidClientMetadata, so a handler that maps that to 400 refuses it too.
+var ErrReservedClientID = fmt.Errorf("%w: client_id is reserved", ErrInvalidClientMetadata)
+
 // OAuthClientService manages OAuth2 client registration.
 type OAuthClientService struct {
 	repo *postgres.OAuthClientRepository
@@ -55,6 +60,10 @@ type OAuthClientService struct {
 	// SSRF guard on the fetch itself — the two must move together, since an
 	// http loopback URL is useless if the dialer refuses loopback.
 	allowPrivateJWKSEndpoints bool
+	// reservedNames and reservedPrefixes are the client ids only operator
+	// seeding may register (ReservedClientIDsConfig), lowercased.
+	reservedNames    map[string]struct{}
+	reservedPrefixes []string
 	// bcryptSecrets keeps writing bcrypt client-secret hashes, as builds
 	// before SHA-256 support did, and skips the upgrade of existing ones. Off
 	// (the zero value) means SHA-256. Verification accepts both formats
@@ -80,6 +89,36 @@ func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (strin
 		return "", fmt.Errorf("failed to hash client secret: %w", err)
 	}
 	return string(h), nil
+}
+
+// SetReservedClientIDs reserves client ids for operator seeding: names match
+// whole, prefixes match the start, both ignoring case. Set from
+// ReservedClientIDsConfig in server.go.
+func (s *OAuthClientService) SetReservedClientIDs(names, prefixes []string) {
+	s.reservedNames = make(map[string]struct{}, len(names))
+	for _, n := range names {
+		s.reservedNames[strings.ToLower(n)] = struct{}{}
+	}
+	s.reservedPrefixes = s.reservedPrefixes[:0]
+	for _, p := range prefixes {
+		s.reservedPrefixes = append(s.reservedPrefixes, strings.ToLower(p))
+	}
+}
+
+// IsReservedClientID reports whether clientID is reserved for operator
+// seeding. Case is ignored, so a look-alike differing only in case is
+// reserved too.
+func (s *OAuthClientService) IsReservedClientID(clientID string) bool {
+	id := strings.ToLower(clientID)
+	if _, ok := s.reservedNames[id]; ok {
+		return true
+	}
+	for _, p := range s.reservedPrefixes {
+		if strings.HasPrefix(id, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
@@ -126,6 +165,11 @@ type RegisterClientRequest struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
+	// AllowReservedClientID lets this registration take a reserved client id.
+	// Only the operator's seeding path (Server.EnsureClient) sets it; every
+	// tenant-reachable registration leaves it false and is refused.
+	AllowReservedClientID bool
+
 	// IdentityID optionally binds this OAuth client to an agent identity.
 	// When set, authorization_code and refresh_token grants issued through
 	// this client gate on the linked identity's expires_at + status (fail-
@@ -162,6 +206,12 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	// tokens for two different clients.
 	if strings.Contains(req.ClientID, "#") {
 		return nil, "", fmt.Errorf("%w: client_id must not contain '#'", ErrInvalidClientMetadata)
+	}
+	// A reserved id names one of the deployment's own clients, which resource
+	// servers recognise by that name. Whoever registered it first would own
+	// it, so only the operator's seeding path may (ReservedClientIDsConfig).
+	if !req.AllowReservedClientID && s.IsReservedClientID(req.ClientID) {
+		return nil, "", ErrReservedClientID
 	}
 	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
 	// supplied. Reject http:// / non-URL values at registration so a faulty
@@ -784,6 +834,12 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 	clientID, err := generateSecureToken(16)
 	if err != nil {
 		return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
+	}
+	// The id is random, so it is reserved only if the deployment reserved a
+	// prefix it happens to start with. Refuse rather than register it: the
+	// registrant retries and gets another.
+	if s.IsReservedClientID(clientID) {
+		return nil, "", "", ErrReservedClientID
 	}
 
 	plainRegToken, err := generateSecureToken(32)

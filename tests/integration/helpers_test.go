@@ -299,6 +299,11 @@ func runTests(m *testing.M) int {
 			JWKSPurpose:        "receipt",
 			WellKnownJWKSName:  testSigningJWKSName,
 		},
+		// Client ids only EnsureClient may register (service_token_foundations_test.go).
+		ReservedClientIDs: zeroid.ReservedClientIDsConfig{
+			Names:    []string{testReservedClientID},
+			Prefixes: []string{testReservedClientPrefix},
+		},
 		WIMSEDomain: testWIMSE,
 	}
 
@@ -544,6 +549,12 @@ func decode(t *testing.T, resp *http.Response) map[string]any {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&m))
 	return m
 }
+
+// Reserved client ids configured on the test server.
+const (
+	testReservedClientID     = "platform-gateway"
+	testReservedClientPrefix = "reserved-svc-"
+)
 
 // adminHeaders returns headers required for admin /api/v1 endpoints.
 // ZeroID admin routes have no built-in auth — only tenant context headers.

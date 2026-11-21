@@ -1047,3 +1047,27 @@ func TestLoadForwardedHeaders(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateReservedClientIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		names    []string
+		prefixes []string
+		wantErr  bool
+	}{
+		{"none", nil, nil, false},
+		{"names and prefixes", []string{"billing"}, []string{"svc-"}, false},
+		{"empty name", []string{" "}, nil, true},
+		{"name with #", []string{"https://iss#sub"}, nil, true},
+		{"empty prefix reserves everything", nil, []string{""}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.ReservedClientIDs = ReservedClientIDsConfig{Names: tc.names, Prefixes: tc.prefixes}
+			err := cfg.Validate()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Validate() = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}

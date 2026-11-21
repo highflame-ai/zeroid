@@ -546,6 +546,9 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// useless if the dialer refused loopback, so the two move together.
 	oauthClientSvc.SetAllowPrivateJWKSEndpoints(cfg.ClientAuth.AllowPrivateJWKSEndpoints)
 	oauthClientSvc.SetBcryptClientSecrets(cfg.ClientAuth.BcryptClientSecrets)
+	// Client ids only the operator may register (EnsureClient). Validate()
+	// already refused an empty name or prefix.
+	oauthClientSvc.SetReservedClientIDs(cfg.ReservedClientIDs.Names, cfg.ReservedClientIDs.Prefixes)
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -1726,6 +1729,11 @@ var ErrClientNotOwned = errors.New("oauth client exists and is not owned by this
 // config has changed. Idempotent — safe to call on every startup.
 // Does not regenerate client_secret on update (secrets are rotated explicitly).
 //
+// It is the operator's seeding path, so it may register a client id the
+// deployment reserved (ReservedClientIDsConfig), which every tenant-facing
+// registration path refuses. A deployer that calls it on behalf of anyone
+// else must choose the client id itself, never take it from the caller.
+//
 // An existing row is updated only when it is the seed's own, and is otherwise
 // refused with ErrClientNotOwned (see ownsExistingClient). Link a service's
 // client to its identity with cfg.IdentityID: that link is what proves a row
@@ -1754,6 +1762,7 @@ func (s *Server) EnsureClient(ctx context.Context, cfg OAuthClientConfig) error 
 			IdentityID:                   cfg.IdentityID,
 			ClientNotificationEndpoint:   cfg.ClientNotificationEndpoint,
 			BackchannelTokenDeliveryMode: cfg.BackchannelTokenDeliveryMode,
+			AllowReservedClientID:        true,
 		})
 		if !errors.Is(regErr, service.ErrOAuthClientAlreadyExists) {
 			return regErr
@@ -1977,6 +1986,14 @@ func seedIsPublicClient(cfg OAuthClientConfig) bool {
 		return cfg.TokenEndpointAuthMethod == "none"
 	}
 	return !cfg.Confidential
+}
+
+// IsReservedClientID reports whether clientID is reserved for the operator
+// (ReservedClientIDsConfig). A deployer that registers clients on someone
+// else's behalf through EnsureClient, which accepts reserved ids, can use it
+// to refuse a caller-chosen reserved id itself.
+func (s *Server) IsReservedClientID(clientID string) bool {
+	return s.oauthClientSvc.IsReservedClientID(clientID)
 }
 
 // slicesEqual returns true if two string slices have the same elements in order.

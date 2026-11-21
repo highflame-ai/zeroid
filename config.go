@@ -53,6 +53,10 @@ type Config struct {
 	CIMD        CIMDConfig        `koanf:"cimd"`
 	ClientAuth  ClientAuthConfig  `koanf:"client_auth"`
 
+	// ReservedClientIDs names OAuth client ids that only the operator may
+	// register, through Server.EnsureClient. See ReservedClientIDsConfig.
+	ReservedClientIDs ReservedClientIDsConfig `koanf:"reserved_client_ids"`
+
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
@@ -140,6 +144,28 @@ type ClientAuthConfig struct {
 	// memory. 0 (default) ⇒ 256. Least-recently-used entries are evicted and
 	// closed.
 	JWKSCacheSize int `koanf:"jwks_cache_size"`
+}
+
+// ReservedClientIDsConfig reserves OAuth client ids for the operator.
+//
+// A client_id is a globally unique name chosen by whoever registers it first,
+// and a resource server that attributes a call to a client reads that name.
+// A deployment whose own services authenticate as OAuth clients, and whose
+// resource servers recognise those services by client_id, must stop anyone
+// else from taking those names first. A reserved id can be registered only
+// through Server.EnsureClient (the operator's seeding path); the admin
+// /oauth/clients route, dynamic registration and trusted-issuer bindings
+// refuse it, whoever the caller.
+//
+// Matching ignores case, so a look-alike such as "Billing" is refused when
+// "billing" is reserved. Empty (the default) reserves nothing. Reserving an
+// id does not affect a client already registered under it: Server.EnsureClient
+// refuses to adopt a row it does not own, so an operator finds out at seeding.
+type ReservedClientIDsConfig struct {
+	// Names are reserved client ids, matched whole.
+	Names []string `koanf:"names"`
+	// Prefixes reserve every client id that starts with one of them.
+	Prefixes []string `koanf:"prefixes"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -673,6 +699,17 @@ func (c *Config) Validate() error {
 	if c.Database.URL == "" {
 		return fmt.Errorf("database URL is required: provide ZEROID_DATABASE_URL or individual DB_ vars")
 	}
+	for _, n := range c.ReservedClientIDs.Names {
+		if strings.TrimSpace(n) == "" || strings.Contains(n, "#") {
+			return fmt.Errorf("reserved_client_ids.names: %q is not a client id (empty, or contains '#')", n)
+		}
+	}
+	for _, p := range c.ReservedClientIDs.Prefixes {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
+		}
+	}
+
 	if c.Keys.PrivateKeyPath == "" {
 		return fmt.Errorf("keys.private_key_path is required")
 	}
