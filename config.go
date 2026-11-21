@@ -574,6 +574,18 @@ type TokenConfig struct {
 	// the broker. 0 ⇒ the built-in default (12h).
 	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
 
+	// AllowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a subject_token: accepted without being
+	// verified. By default (false) a presented subject_token must be an active
+	// token this server issued, for the tenant (account_id, project_id) and
+	// the person (user_id) the request names; otherwise the exchange fails
+	// with invalid_grant. A request with no subject_token is unaffected.
+	//
+	// Set it only for a deployment whose trusted services present tokens from
+	// another issuer on that exchange, and only until they move to the
+	// ID-token exchange (subject_token_type id_token) or stop sending one.
+	AllowUnverifiedExternalPrincipalSubject bool `koanf:"allow_unverified_external_principal_subject"`
+
 	// RefreshReuseGraceSeconds is how long after a refresh token is rotated
 	// out a second presentation of it is refused as a concurrent retry rather
 	// than treated as reuse. Within the window the rotated-out token is
@@ -1257,6 +1269,9 @@ var envMapping = map[string]string{
 	// Seconds after a rotation in which re-presenting the rotated-out refresh
 	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
 	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
+	// Accept an external-principal subject_token without verifying it, as
+	// before subject verification. Default false.
+	"ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT": "token.allow_unverified_external_principal_subject",
 
 	// WIMSE
 	"ZEROID_WIMSE_DOMAIN": "wimse_domain",
@@ -1325,7 +1340,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".bcrypt_client_secrets") ||
 			strings.HasSuffix(configPath, ".allow_private_endpoints") ||
-			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
+			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection") ||
+			strings.HasSuffix(configPath, ".allow_unverified_external_principal_subject"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {
 				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)

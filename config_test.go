@@ -1071,3 +1071,29 @@ func TestValidateReservedClientIDs(t *testing.T) {
 		})
 	}
 }
+
+// The external-principal subject verification is on unless a deployment
+// opts out, and the opt-out is reachable from the environment.
+func TestAllowUnverifiedExternalPrincipalSubjectConfig(t *testing.T) {
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		t.Fatal("allow_unverified_external_principal_subject must default to false")
+	}
+
+	t.Setenv("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT", "true")
+	cfg, err = LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		t.Error("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT=true did not reach token")
+	}
+
+	t.Setenv("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT", "ture")
+	if _, err := LoadConfig(""); err == nil {
+		t.Error("a typo'd bool must fail the load, not keep the default")
+	}
+}

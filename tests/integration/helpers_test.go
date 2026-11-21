@@ -40,6 +40,7 @@ import (
 	"github.com/uptrace/bun/driver/pgdriver"
 
 	zeroid "github.com/highflame-ai/zeroid"
+	"github.com/highflame-ai/zeroid/domain"
 )
 
 const (
@@ -363,6 +364,14 @@ func runTests(m *testing.M) int {
 		return "", fmt.Errorf("caller is not a trusted service")
 	})
 
+	// A deployer's session grant: a trusted service names the person and the
+	// tenant and presents no subject_token, the way an embedder wires
+	// Server.ExternalPrincipalExchange behind its own grant. Tests use it to
+	// mint a person's token without a subject (personToken).
+	srv.RegisterGrant(testUserSessionGrant, func(ctx context.Context, req zeroid.GrantRequest) (*domain.AccessToken, error) {
+		return srv.ExternalPrincipalExchange(ctx, req)
+	})
+
 	// Header-based stub for the GET leg. The form-field stub below cannot
 	// serve GET at all: the handler binds AuthorizeRequest.Form to the POST
 	// body only, so on a GET req.Form is empty by construction — that IS the
@@ -550,11 +559,33 @@ func decode(t *testing.T, resp *http.Response) map[string]any {
 	return m
 }
 
+// testUserSessionGrant is the custom grant registered in runTests that
+// reaches the external-principal exchange with no subject_token.
+const testUserSessionGrant = "test_user_session"
+
 // Reserved client ids configured on the test server.
 const (
 	testReservedClientID     = "platform-gateway"
 	testReservedClientPrefix = "reserved-svc-"
 )
+
+// personToken mints a person's token for userID in the tenant through the
+// trusted session grant, which presents no subject_token. Use it wherever a
+// test needs a real token naming a person, including as the subject_token of
+// the external-principal exchange, which verifies the subject it is given.
+func personToken(t *testing.T, accountID, projectID, userID string) string {
+	t.Helper()
+	resp := post(t, "/oauth2/token", map[string]any{
+		"grant_type": testUserSessionGrant,
+		"account_id": accountID,
+		"project_id": projectID,
+		"user_id":    userID,
+	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	tok, _ := decode(t, resp)["access_token"].(string)
+	require.NotEmpty(t, tok)
+	return tok
+}
 
 // adminHeaders returns headers required for admin /api/v1 endpoints.
 // ZeroID admin routes have no built-in auth — only tenant context headers.

@@ -400,6 +400,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// forces allow_unauthenticated_token_inspection=false in production, so
 	// production is strict by default.
 	oauthSvc.SetRequireTokenInspectionAuth(!cfg.Token.AllowUnauthenticatedTokenInspection)
+	oauthSvc.SetAllowUnverifiedExternalPrincipalSubject(cfg.Token.AllowUnverifiedExternalPrincipalSubject)
 
 	// CIMD (Client ID Metadata Documents) — resolve https:// client_id URLs on
 	// the authorization_code flow by fetching + validating their published
@@ -1628,6 +1629,16 @@ func (s *Server) SetRegistrationEndpoint(endpoint string) error {
 // server without restarting it.
 func (s *Server) SetRequireTokenInspectionAuth(require bool) {
 	s.oauthSvc.SetRequireTokenInspectionAuth(require)
+}
+
+// SetAllowUnverifiedExternalPrincipalSubject mirrors the
+// token.allow_unverified_external_principal_subject config key: when true, the
+// external-principal exchange accepts a presented subject_token without
+// verifying it, as it did before subject verification. Exposed for embedders
+// that build Config in code, and so integration tests can exercise both
+// postures on one server.
+func (s *Server) SetAllowUnverifiedExternalPrincipalSubject(allow bool) {
+	s.oauthSvc.SetAllowUnverifiedExternalPrincipalSubject(allow)
 }
 
 // SetRefreshReuseGrace sets the refresh-token reuse grace window: how long

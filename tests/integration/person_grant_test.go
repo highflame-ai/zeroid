@@ -162,12 +162,11 @@ func personMints(f *personGrantFederation) map[string]personMint {
 		"external_principal_exchange": func(t *testing.T, user string, scopes []string, arm func()) (int, map[string]any) {
 			arm()
 			resp := post(t, "/oauth2/token", map[string]any{
-				"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-				"subject_token": "external-principal-assertion",
-				"account_id":    testAccountID,
-				"project_id":    testProjectID,
-				"user_id":       user,
-				"scope":         strings.Join(scopes, " "),
+				"grant_type": testUserSessionGrant,
+				"account_id": testAccountID,
+				"project_id": testProjectID,
+				"user_id":    user,
+				"scope":      strings.Join(scopes, " "),
 			}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 			return resp.StatusCode, decode(t, resp)
 		},
@@ -426,13 +425,12 @@ func TestPersonGrant_ChainsDoNotConsultIt(t *testing.T) {
 	grants.set(alice, &zeroid.PersonGrant{Scopes: scopes, Roles: []string{"member"}}, nil)
 
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    tn.account,
-		"project_id":    tn.project,
-		"user_id":       alice,
-		"scope":         "data:read",
-		"role":          "member",
+		"grant_type": testUserSessionGrant,
+		"account_id": tn.account,
+		"project_id": tn.project,
+		"user_id":    alice,
+		"scope":      "data:read",
+		"role":       "member",
 	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	root := decode(t, resp)["access_token"].(string)
@@ -469,12 +467,11 @@ func TestPersonGrant_LegacyExchangeDoesNotInheritRoles(t *testing.T) {
 	grants.set(bob, &zeroid.PersonGrant{Scopes: scopes, Roles: []string{"member"}}, nil)
 
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    tn.account,
-		"project_id":    tn.project,
-		"user_id":       bob,
-		"scope":         "data:read",
+		"grant_type": testUserSessionGrant,
+		"account_id": tn.account,
+		"project_id": tn.project,
+		"user_id":    bob,
+		"scope":      "data:read",
 	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	root := decode(t, resp)["access_token"].(string)
@@ -494,8 +491,7 @@ func TestPersonGrant_RolesIsReserved(t *testing.T) {
 	mint := func(t *testing.T, user string) map[string]any {
 		t.Helper()
 		resp := post(t, "/oauth2/token", map[string]any{
-			"grant_type":        "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":     "external-principal-assertion",
+			"grant_type":        testUserSessionGrant,
 			"account_id":        testAccountID,
 			"project_id":        testProjectID,
 			"user_id":           user,

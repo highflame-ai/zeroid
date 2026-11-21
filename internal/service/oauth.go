@@ -114,6 +114,10 @@ type OAuthService struct {
 	// so a test can flip it on a shared server without racing concurrent
 	// introspect/revoke reads under -race.
 	requireTokenInspectionAuth atomic.Bool
+	// allowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a presented subject_token: accepted without
+	// verification. Off by default; see SetAllowUnverifiedExternalPrincipalSubject.
+	allowUnverifiedExternalPrincipalSubject atomic.Bool
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -643,6 +647,18 @@ func (s *OAuthService) SetClientAssertionReplayStore(store clientAssertionReplay
 // makes outbound requests to.
 func (s *OAuthService) SetClientJWKSCache(cache *ClientJWKSCache) {
 	s.clientJWKS = cache
+}
+
+// SetAllowUnverifiedExternalPrincipalSubject makes the external-principal
+// exchange accept a presented subject_token without verifying it, as it did
+// before subject verification. Off (the default) means a presented
+// subject_token must be an active token this server issued, for the same
+// tenant and person the request names. For a deployment whose trusted
+// services present tokens from another issuer on that exchange; such a
+// deployment should move them to the ID-token exchange or send no
+// subject_token instead. atomic so a test can flip it on a shared server.
+func (s *OAuthService) SetAllowUnverifiedExternalPrincipalSubject(allow bool) {
+	s.allowUnverifiedExternalPrincipalSubject.Store(allow)
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
@@ -1571,6 +1587,21 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	if req.UserID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id is required for external principal exchange")
 	}
+	// The exchange mints a token whose sub is user_id and whose principal is
+	// a person. A WIMSE/SPIFFE URI names a workload, so minting it as a person
+	// would let a workload be presented downstream as someone's own session.
+	if isWorkloadURI(req.UserID) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id must name a person, not a workload identity URI")
+	}
+	// A subject_token, when the caller presents one, must back the request:
+	// an active token this server issued, in the named tenant, whose person
+	// is user_id. A caller that presents none is trusted on the
+	// TrustedServiceValidator alone, as before.
+	if req.SubjectToken != "" && !s.allowUnverifiedExternalPrincipalSubject.Load() {
+		if err := s.verifyExternalPrincipalSubject(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 
 	// Step 3: Resolve the identity for the token.
 	// When ApplicationID is set, look up the real identity from the DB so the JWT
@@ -1788,6 +1819,97 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 
 	return accessToken, nil
+}
+
+// delegationDepthOf reads delegation_depth whatever numeric type holds it: a
+// parsed token carries float64, a token built in memory may carry an int.
+func delegationDepthOf(tok jwt.Token) int {
+	v, err := jwt.Get[any](tok, "delegation_depth")
+	if err != nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return 0
+}
+
+// isWorkloadURI reports whether v is a SPIFFE/WIMSE workload URI, ignoring
+// case and surrounding space, so "SPIFFE://..." is caught too.
+func isWorkloadURI(v string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "spiffe://")
+}
+
+// verifyExternalPrincipalSubject checks that the external-principal exchange's
+// subject_token backs the request: it is a token this server issued, its
+// signature and expiry hold, it has not been revoked, its tenant is the
+// request's account_id and project_id, and the person it names is user_id.
+// Every failure is invalid_grant, and none says which check failed.
+func (s *OAuthService) verifyExternalPrincipalSubject(ctx context.Context, req TokenRequest) error {
+	refuse := func(cause error) error {
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token does not back this exchange", cause)
+	}
+	parsed, err := s.parseToken(req.SubjectToken, true)
+	if err != nil {
+		return refuse(err)
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return refuse(errors.New("subject_token has no jti"))
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil || cred == nil || !active {
+		return refuse(errors.New("subject_token is inactive or revoked"))
+	}
+	// The credential row, not the token, is the tenant of record.
+	if cred.AccountID != req.AccountID || cred.ProjectID != req.ProjectID {
+		return refuse(errors.New("subject_token is for another tenant"))
+	}
+	if person := subjectPerson(parsed); person == "" || person != req.UserID {
+		return refuse(errors.New("subject_token names a different person, or none"))
+	}
+	return nil
+}
+
+// subjectPerson returns the person a verified token acts for, or "" when it
+// acts for none. Under the rfc8693 profile that is sub when principal_type is
+// user. Under the legacy profile it is the user_id claim, else, on a
+// delegated token, an act.sub that is not a workload URI, else sub when it is
+// not a workload URI. A workload URI never qualifies.
+//
+// This is the ladder resource servers use to find the person behind a chain,
+// so a caller can name in user_id exactly the person a token it verified acts
+// for, and no one else.
+func subjectPerson(tok jwt.Token) string {
+	person := func(v string) string {
+		if v == "" || isWorkloadURI(v) {
+			return ""
+		}
+		return v
+	}
+	sub, _ := tok.Subject()
+	if pt, err := jwt.Get[string](tok, "principal_type"); err == nil && pt != "" {
+		if pt == string(domain.PrincipalUser) {
+			return person(sub)
+		}
+		return ""
+	}
+	if uid, _ := jwt.Get[string](tok, "user_id"); person(uid) != "" {
+		return uid
+	}
+	if delegationDepthOf(tok) >= 1 {
+		if act, err := jwt.Get[map[string]any](tok, "act"); err == nil {
+			if actSub, _ := act["sub"].(string); person(actSub) != "" {
+				return actSub
+			}
+		}
+	}
+	return person(sub)
 }
 
 // APIKeyResolution is the public result of OAuthService.ResolveAPIKey —
