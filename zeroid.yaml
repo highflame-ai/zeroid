@@ -131,7 +131,8 @@ token:
 # Server.EnsureClient. POST /oauth/clients, dynamic registration and
 # trusted-issuer bindings refuse them for every caller. Use it for the client
 # ids your own services authenticate as, which resource servers recognise by
-# name. Matching ignores case. Empty (default) reserves nothing.
+# name. Matching ignores case, surrounding space, invisible characters and
+# Unicode compatibility forms (NFKC). Empty (default) reserves nothing.
 # reserved_client_ids:
 #   names: ["billing-service"]
 #   prefixes: ["svc-"]
