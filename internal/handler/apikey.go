@@ -141,6 +141,9 @@ func (a *API) createAPIKeyOp(ctx context.Context, input *CreateAPIKeyInput) (*Cr
 		if errors.Is(err, service.ErrReservedScopeWriteNotTrusted) {
 			return nil, huma.Error403Forbidden(err.Error())
 		}
+		if errors.Is(err, service.ErrScopeHasWhitespace) {
+			return nil, huma.Error400BadRequest(err.Error())
+		}
 		// Neither identity_id nor product supplied — the key has no identity to
 		// link. A caller-side omission, so return 400 naming both fields
 		// instead of a 500 from the failed UUID cast at insert time.

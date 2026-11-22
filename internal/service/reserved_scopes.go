@@ -88,7 +88,10 @@ func (r *ReservedScopes) Set(prefixes []string, authorize ReservedScopeAuthorize
 	return nil
 }
 
-// in returns the reserved scopes among scopes. Nil-safe.
+// in returns the reserved scopes among scopes. Nil-safe. A scope counts as
+// reserved when any whitespace-separated part of it is: the `scope` claim and
+// token response join scopes with spaces, so "a highflame.x" would otherwise
+// pass here as one string and be read downstream as two.
 func (r *ReservedScopes) in(scopes []string) []string {
 	if r == nil {
 		return nil
@@ -97,11 +100,10 @@ func (r *ReservedScopes) in(scopes []string) []string {
 	defer r.mu.RUnlock()
 	var out []string
 	for _, s := range scopes {
-		for _, p := range r.prefixes {
-			if strings.HasPrefix(s, p) {
-				out = append(out, s)
-				break
-			}
+		if slices.ContainsFunc(strings.Fields(s), func(part string) bool {
+			return slices.ContainsFunc(r.prefixes, func(p string) bool { return strings.HasPrefix(part, p) })
+		}) {
+			out = append(out, s)
 		}
 	}
 	return out

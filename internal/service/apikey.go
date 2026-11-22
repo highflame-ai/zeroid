@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
@@ -26,6 +28,12 @@ import (
 // unlinked key would skip credential-policy resolution at grant time. The
 // omission is caller-fixable, so handlers map this to 400.
 var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
+
+// ErrScopeHasWhitespace is returned by CreateKey for a scope containing
+// whitespace. A scope is one token (RFC 6749 §3.3); "a highflame.x" would be
+// checked as one string here but read as two wherever the space-delimited
+// `scope` claim is split. Handlers map it to 400.
+var ErrScopeHasWhitespace = errors.New("a scope must not contain whitespace")
 
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
@@ -88,6 +96,11 @@ type CreateAPIKeyResponse struct {
 // policy; the tenant's default policy is auto-created and assigned only when the
 // identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	for _, sc := range req.Scopes {
+		if strings.ContainsFunc(sc, unicode.IsSpace) {
+			return nil, fmt.Errorf("%w: %q", ErrScopeHasWhitespace, sc)
+		}
+	}
 	// Approval-channel grants need a trusted caller (approval_channel_write.go).
 	if err := requireTrustedApprovalChannelWrite(ctx, "", req.Scopes); err != nil {
 		return nil, err

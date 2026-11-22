@@ -244,3 +244,32 @@ func grantEqual(a, b ReservedScopeGrant) bool {
 	return a.AccountID == b.AccountID && a.ProjectID == b.ProjectID && a.APIKeyID == b.APIKeyID &&
 		a.CreatedBy == b.CreatedBy && slices.Equal(a.Scopes, b.Scopes)
 }
+
+// A scope with whitespace inside it is read as several scopes wherever the
+// space-delimited `scope` claim is split, so a reserved part must count.
+func TestReservedScopes_InSeesWhitespaceSeparatedParts(t *testing.T) {
+	r := &ReservedScopes{}
+	if err := r.Set([]string{"hf."}, allowAll, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"data:read hf.config.manage", " hf.config.manage", "x\thf.config.manage", "x\nhf.config.manage"} {
+		if got := r.in([]string{s}); len(got) != 1 {
+			t.Errorf("in(%q) = %v, want it reserved", s, got)
+		}
+	}
+	if got := r.in([]string{"data:read other"}); got != nil {
+		t.Errorf("in = %v, want nil", got)
+	}
+}
+
+// CreateKey refuses a scope containing whitespace before any other check, so
+// neither the reserved-scope nor the approval-channel gate can be split around.
+func TestCreateKeyRefusesWhitespaceInScope(t *testing.T) {
+	svc := &APIKeyService{reserved: &ReservedScopes{}}
+	for _, s := range []string{"a b", " a", "a\t", "a\nb"} {
+		_, err := svc.CreateKey(WithReservedScopeWrite(context.Background()), CreateAPIKeyRequest{Scopes: []string{s}})
+		if !errors.Is(err, ErrScopeHasWhitespace) {
+			t.Errorf("scope %q: want ErrScopeHasWhitespace, got %v", s, err)
+		}
+	}
+}

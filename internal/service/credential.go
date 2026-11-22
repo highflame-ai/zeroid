@@ -592,9 +592,9 @@ func (s *CredentialService) issueTTL(req IssueRequest) (ttl int, requested bool,
 	//
 	// Both bounds (identity + per-credential) are min-combined with the
 	// requested TTL. Already-expired authority short-circuits to error
-	// — the IsExpired() check above caught the identity case; here we
-	// defend against per-credential expiry that the chokepoint doesn't
-	// otherwise see.
+	// — IssueCredential's IsExpired() check normally catches the identity
+	// case first; here we also defend against per-credential expiry that
+	// the chokepoint doesn't otherwise see.
 	clampNow := time.Now()
 	if req.Identity.ExpiresAt != nil {
 		remaining := int(req.Identity.ExpiresAt.Sub(clampNow).Seconds())

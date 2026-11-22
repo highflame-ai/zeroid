@@ -136,6 +136,27 @@ func TestReservedScope_ListedKeyIsIssued(t *testing.T) {
 	assert.LessOrEqual(t, lifetime, testReservedMaxTTL.Seconds())
 }
 
+// A key listing a reserved scope, asked for only its ordinary scopes, gets
+// them without the authorizer being consulted: the demoted creator's key is
+// not refused.
+func TestReservedScope_SubsetRequestSkipsAuthorizer(t *testing.T) {
+	status, _, key := createProductKey(t, testDemotedUser, []string{"data:read", testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "data:read")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope)
+}
+
+// A scope with whitespace inside it would hide a reserved scope from the
+// checks and reappear in the space-delimited scope claim, so it is refused.
+func TestReservedScope_WhitespaceInScopeRefused(t *testing.T) {
+	for _, s := range []string{"data:read " + testReservedScope, " " + testReservedScope} {
+		status, _, _ := createProductKey(t, "test-user", []string{s}, false)
+		assert.Equal(t, http.StatusBadRequest, status, "scope=%q", s)
+	}
+}
+
 // The deployer's authorizer can refuse the exchange (Highflame: the creator
 // is no longer an org owner or admin).
 func TestReservedScope_AuthorizerRefuses(t *testing.T) {
