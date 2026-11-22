@@ -84,3 +84,23 @@ func TestClaims_RequireResource(t *testing.T) {
 	assert.ErrorIs(t, unbound.RequireResource("urn:example:svc:a"), ErrResourceMismatch,
 		"a token with no resource claim is not bound to anything")
 }
+
+func TestClaims_OnBehalfAccessors(t *testing.T) {
+	c := claimsFrom(t, map[string]any{
+		"sub":                  "alice",
+		"subject_kind":         SubjectKindPerson,
+		"token_exchange":       TokenExchangeOnBehalf,
+		"resolved_user_id":     "alice",
+		"resolved_user_source": ResolvedUserSourceSubject,
+	})
+	assert.Equal(t, SubjectKindPerson, c.SubjectKind())
+	assert.Equal(t, TokenExchangeOnBehalf, c.TokenExchange())
+	assert.Equal(t, ResolvedUserSourceSubject, c.ResolvedUserSource())
+
+	empty := claimsFrom(t, map[string]any{"sub": "x"})
+	assert.Empty(t, empty.SubjectKind())
+	assert.Empty(t, empty.TokenExchange())
+
+	wrong := claimsFrom(t, map[string]any{"sub": "x", "subject_kind": true})
+	assert.Empty(t, wrong.SubjectKind(), "a claim of the wrong type reads as absent")
+}
