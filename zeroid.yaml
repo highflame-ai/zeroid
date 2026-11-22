@@ -137,6 +137,23 @@ token:
 #   names: ["billing-service"]
 #   prefixes: ["svc-"]
 
+# service_tokens: the grants your own services use to call each other on a
+# tenant's behalf (on-behalf exchange, asserted-tenant grant, session broker).
+# Off unless account_id and project_id name the service tenant, which holds
+# your services' identities (Server.EnsureServiceIdentity) and nothing else.
+# Only a client whose id is reserved above, that authenticates with
+# private_key_jwt, was seeded by Server.EnsureClient and is linked to a
+# service identity there may use them. Lists are exact client ids; a client
+# id used as a served_resources key must not contain ".". Every token is
+# bound to one resource and lives at most 5 minutes.
+# service_tokens:
+#   account_id: "platform"
+#   project_id: "services"
+#   asserted_tenant_clients: ["svc-jobs"]      # may name a tenant (audited)
+#   session_broker_clients: ["svc-sessions"]   # may start a person's session
+#   served_resources:                          # may exchange a subject bound to these
+#     svc-gateway: ["https://gateway.example.com/mcp/"]
+
 wimse_domain: "highflame.ai"
 
 # Admin routes (served at the router root; see server.admin_path_prefix) have no built-in auth.

@@ -236,6 +236,13 @@ What ZeroID checks of the request itself:
 - A deployer's own grant that calls `Server.ExternalPrincipalExchange`
   presents no `subject_token`, so the trusted caller alone vouches for the
   person, as before.
+- With [internal service tokens](spec/zeroid-oauth-extensions.md#58-internal-service-tokens)
+  configured, a client on `service_tokens.session_broker_clients` may call
+  the exchange by authenticating as itself with `private_key_jwt` instead of
+  passing the `TrustedServiceValidator`. Its token names the client in
+  `client_id` and `trusted_by`, and only such a token counts as a person's
+  own session when a service exchanges it on the person's behalf. The
+  service tenant can never be named.
 
 ### When to use it
 

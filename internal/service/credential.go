@@ -279,6 +279,24 @@ type IssueRequest struct {
 	IdPIssuer  string
 	IdPSubject string
 
+	// ServiceAct is the `act` of an internal service token: the service the
+	// grant authenticated as a client, outermost, carrying act.client_id, with
+	// the subject token's own act (if any) nested beneath it unchanged. Only
+	// the on-behalf exchange and the asserted-tenant grant set it. It is
+	// emitted as built under either token profile, and takes precedence over
+	// Actors, ActClaim, DelegatedBy and ActingUserID, because receivers must
+	// find the calling service in the same place whatever the tenant's
+	// profile.
+	ServiceAct map[string]any
+
+	// TenantSource, SubjectKind, ResolvedUserID and ResolvedUserSource are the
+	// reserved claims of the same name, written only from these fields, after
+	// CustomClaims. Only the internal service grants set them.
+	TenantSource       string
+	SubjectKind        string
+	ResolvedUserID     string
+	ResolvedUserSource string
+
 	// personGrant is the person-grant decision already made for these scopes
 	// by a grant that had to decide before burning a single-use credential.
 	personGrant *personGrantDecision
@@ -819,10 +837,12 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// Under rfc8693 a delegated token's top level describes the principal,
 	// so the actor's own attributes move inside the outermost `act`.
 	var rfc8693ActClaim map[string]any
-	if rfc8693 {
+	if rfc8693 && req.ServiceAct == nil {
 		rfc8693ActClaim = rfc8693Act(req.Actors, req.ActClaim)
 	}
-	actorsInAct := rfc8693ActClaim != nil
+	// An internal service token's actor is in its ServiceAct, so under
+	// rfc8693 its top level describes the principal, as on any delegated token.
+	actorsInAct := rfc8693ActClaim != nil || (rfc8693 && req.ServiceAct != nil)
 
 	// Resolve mission_id (issue #81). Caller (token_exchange) propagates it
 	// from the subject_token; first-issuance grants leave it empty and we
@@ -969,10 +989,19 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	// tenant_source and resolved_user_id/_source: like mission_id, never from
 	// CustomClaims. Every grant filters caller input against reservedClaims,
 	// but internal callers pass CustomClaims too, and a receiver trusts these
-	// claims to describe how ZeroID itself chose the tenant and the user. No
-	// grant writes them yet, so they are removed from every token.
-	for _, k := range []string{"tenant_source", "resolved_user_id", "resolved_user_source"} {
+	// claims to describe how ZeroID itself chose the tenant and the user, and
+	// what the subject was. Only the internal service grants set them, from
+	// their own resolution.
+	for k, v := range map[string]string{
+		"tenant_source":        req.TenantSource,
+		"subject_kind":         req.SubjectKind,
+		"resolved_user_id":     req.ResolvedUserID,
+		"resolved_user_source": req.ResolvedUserSource,
+	} {
 		_ = token.Remove(k)
+		if v != "" {
+			_ = token.Set(k, v)
+		}
 	}
 
 	// user_idp_iss / user_idp_sub: like mission_id, only ever the grant's own values.
@@ -1028,9 +1057,14 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// api-key token is a workload-subject token with no actor; the creator
 		// stays identity metadata, carried in owner_user_id and returned by
 		// introspection.
-		if rfc8693ActClaim != nil {
+		if req.ServiceAct != nil {
+			_ = token.Set("act", req.ServiceAct)
+		} else if rfc8693ActClaim != nil {
 			_ = token.Set("act", rfc8693ActClaim)
 		}
+	} else if req.ServiceAct != nil {
+		// An internal service token carries the same act under either profile.
+		_ = token.Set("act", req.ServiceAct)
 	} else {
 		// Legacy "act" claim — two use cases:
 		//   1. NHI delegation: orchestrator delegates to sub-agent. act.sub = orchestrator WIMSE URI.

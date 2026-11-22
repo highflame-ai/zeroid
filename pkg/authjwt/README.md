@@ -79,11 +79,13 @@ if err := claims.RequireResource("urn:example:svc:billing"); err != nil {
 }
 
 claims.ClientID()           // client_id: the client the token was issued to
-claims.ActorClientID()      // act.client_id: the client the current actor authenticated as (no ZeroID grant writes it yet)
+claims.ActorClientID()      // act.client_id: the client the current actor authenticated as (on-behalf and asserted-tenant tokens)
 claims.CurrentActor()       // act.sub (rfc8693 profile), else sub
 claims.TenantSource()       // "asserted" when the caller named the tenant; empty otherwise
 claims.ResolvedUserID()     // the user ZeroID resolved for delegated credentials, if any
-claims.ResolvedUserSource() // how ResolvedUserID was resolved
+claims.ResolvedUserSource() // how ResolvedUserID was resolved: subject, on_behalf or owner
+claims.SubjectKind()        // on an on-behalf token: "person" when its subject was a person's own session
+claims.TokenExchange()      // "on_behalf" on an on-behalf token
 ```
 
 Never trust `ClientID()` or `ActorClientID()` alone. Pair a client id with the

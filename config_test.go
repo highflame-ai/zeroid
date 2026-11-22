@@ -1099,3 +1099,77 @@ func TestAllowUnverifiedExternalPrincipalSubjectConfig(t *testing.T) {
 		t.Error("a typo'd bool must fail the load, not keep the default")
 	}
 }
+
+func TestValidateServiceTokens(t *testing.T) {
+	tenant := ServiceTokensConfig{AccountID: "platform", ProjectID: "services"}
+	with := func(f func(*ServiceTokensConfig)) ServiceTokensConfig {
+		c := tenant
+		f(&c)
+		return c
+	}
+	for _, tc := range []struct {
+		name    string
+		cfg     ServiceTokensConfig
+		wantErr bool
+	}{
+		{"off", ServiceTokensConfig{}, false},
+		{"tenant only", tenant, false},
+		{"full", with(func(c *ServiceTokensConfig) {
+			c.AssertedTenantClients = []string{"svc-jobs"}
+			c.SessionBrokerClients = []string{"svc-broker"}
+			c.ServedResources = map[string][]string{"svc-gw": {"https://mcp.example.test/", "urn:svc:x"}}
+		}), false},
+		{"half a tenant", ServiceTokensConfig{AccountID: "platform"}, true},
+		{"spaced tenant", ServiceTokensConfig{AccountID: " platform", ProjectID: "services"}, true},
+		{"lists with no tenant", ServiceTokensConfig{AssertedTenantClients: []string{"svc-jobs"}}, true},
+		{"brokers with no tenant", ServiceTokensConfig{SessionBrokerClients: []string{"svc-broker"}}, true},
+		{"served with no tenant", ServiceTokensConfig{ServedResources: map[string][]string{"svc-gw": {"urn:x"}}}, true},
+		{"empty client", with(func(c *ServiceTokensConfig) { c.AssertedTenantClients = []string{""} }), true},
+		{"spaced client", with(func(c *ServiceTokensConfig) { c.SessionBrokerClients = []string{"svc-broker "} }), true},
+		{"relative resource", with(func(c *ServiceTokensConfig) { c.ServedResources = map[string][]string{"svc-gw": {"/mcp/"}} }), true},
+		{"resource with fragment", with(func(c *ServiceTokensConfig) { c.ServedResources = map[string][]string{"svc-gw": {"https://x.test/#a"}} }), true},
+		{"empty served client", with(func(c *ServiceTokensConfig) { c.ServedResources = map[string][]string{"": {"urn:x"}} }), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.ServiceTokens = tc.cfg
+			err := cfg.Validate()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Validate() = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadServiceTokensFromYAML(t *testing.T) {
+	path := t.TempDir() + "/zeroid.yaml"
+	yml := `service_tokens:
+  account_id: platform
+  project_id: services
+  asserted_tenant_clients: ["svc-jobs"]
+  session_broker_clients: ["svc-broker"]
+  served_resources:
+    svc-gw: ["https://mcp.example.test/"]
+`
+	if err := os.WriteFile(path, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	st := cfg.ServiceTokens
+	if st.AccountID != "platform" || st.ProjectID != "services" ||
+		len(st.AssertedTenantClients) != 1 || len(st.SessionBrokerClients) != 1 ||
+		len(st.ServedResources["svc-gw"]) != 1 || st.ServedResources["svc-gw"][0] != "https://mcp.example.test/" {
+		t.Fatalf("service_tokens did not load: %+v", st)
+	}
+
+	off, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if off.ServiceTokens.AccountID != "" {
+		t.Fatal("service_tokens must be off by default")
+	}
+}
