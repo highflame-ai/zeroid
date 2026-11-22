@@ -569,6 +569,12 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 	if err != nil || cred == nil || !active {
 		return nil, fmt.Errorf("requesting_token is not active")
 	}
+	// A CIBA chain continues the requesting token's act, so an internal
+	// service token must not start one: the chain would carry a service's
+	// actor, or an asserted tenant, into a token the receiver never asked for.
+	if isInternalServiceToken(parsed, cred, s.serviceTokenCfg(), s.parseWIMSEURI) {
+		return nil, fmt.Errorf("requesting_token is an internal service token")
+	}
 	sub, _ := parsed.Subject()
 	rt := &RequestingToken{
 		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
@@ -1008,6 +1014,11 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	if cfg := s.serviceTokenCfg(); cfg.inServiceTenant(identity.AccountID) {
 		if _, err := s.requireServiceClient(ctx, client, cfg); err != nil {
 			return nil, err
+		}
+		// Bound to the one receiver it is for, like every internal service token.
+		if len(req.Resource) != 1 {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				"a token in the service tenant requires exactly one resource")
 		}
 		exp := time.Now().Add(serviceTokenMaxTTL * time.Second)
 		serviceTokenExpiry = &exp
@@ -1676,6 +1687,12 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 	if req.UserID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id is required for external principal exchange")
+	}
+	// The service tenant holds the deployment's services and no person. A
+	// broker's token there would carry its client_id in that account, which
+	// is how a receiver recognises the service itself.
+	if s.serviceTokenCfg().inServiceTenant(req.AccountID) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "the service tenant cannot be named")
 	}
 	// The exchange mints a token whose sub is user_id and whose principal is
 	// a person. A WIMSE/SPIFFE URI names a workload, so minting it as a person

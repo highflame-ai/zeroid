@@ -615,6 +615,8 @@ mode:
   token then carries `client_id` and `trusted_by` naming the client, set from
   the client authentication. A token from the validator path carries no
   `client_id`, so a resource server can tell the two apart.
+- Refuses the service tenant (§5.8) as `account_id` (`invalid_request`): it
+  holds services, never a person.
 - A token bound to a `resource` lives at most 300 s. A deployer's grant
   registered with `Server.RegisterGrantAcceptingResource` passes `resource`
   through to `Server.ExternalPrincipalExchange`; a grant registered with
@@ -745,7 +747,8 @@ exactly one RFC 8707 `resource` (required; `aud` and `resource` carry it),
 carries no scopes, and lives at most 300 s.
 
 **`client_credentials` into the service tenant.** Only a service client may
-mint one, and an unlinked client may not name the service tenant. A resource
+mint one, it requires exactly one `resource`, and an unlinked client may not
+name the service tenant. A resource
 server identifies the caller by `client_id` together with the service
 tenant's `account_id`.
 
@@ -790,6 +793,10 @@ service client authentication. The client MUST list
        except for a service identity reached through an API key, whose owner
        may be whoever created the first key on a shared placeholder;
     4. nothing: neither claim is set.
+
+An internal service token, or any token in the service tenant, is also
+refused as the subject of an NHI delegation, as the `subject_token` of the
+external-principal exchange, and as a CIBA `requesting_token`.
 
 The request MUST NOT carry `scope`, `account_id`, `project_id`, `user_id`,
 `application_id`, `additional_claims`, `role`, `privilege_scope`, `audience`

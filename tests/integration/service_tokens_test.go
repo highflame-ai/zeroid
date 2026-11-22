@@ -192,6 +192,20 @@ func TestSessionBroker_AuthenticatesAsItsClient(t *testing.T) {
 		assert.LessOrEqual(t, lifetime(t, claims), 5*time.Minute)
 	})
 
+	t.Run("no session is minted in the service tenant", func(t *testing.T) {
+		body := broker(t).auth(t, map[string]any{
+			"grant_type": testUserSessionResourceGrant, "account_id": testServiceAccount,
+			"project_id": testServiceProject, "user_id": user,
+		})
+		code, got := postStatus(t, "/oauth2/token", body, nil)
+		requireSvcRefused(t, http.StatusBadRequest, "invalid_request", got, code)
+		code, got = postStatus(t, "/oauth2/token", map[string]any{
+			"grant_type": testUserSessionGrant, "account_id": testServiceAccount,
+			"project_id": testServiceProject, "user_id": user,
+		}, trustedServiceHeaders)
+		requireSvcRefused(t, http.StatusBadRequest, "invalid_request", got, code)
+	})
+
 	t.Run("a custom grant registered without resource still refuses it", func(t *testing.T) {
 		code, got := postStatus(t, "/oauth2/token", map[string]any{
 			"grant_type": testUserSessionGrant, "account_id": testAccountID, "project_id": testProjectID,
@@ -333,7 +347,9 @@ func TestOnBehalf_RefusesSubjects(t *testing.T) {
 		refused(t, assertTenant(t, jobs(t), testAccountID, testProjectID))
 	})
 	t.Run("a service's own client_credentials token", func(t *testing.T) {
-		code, got := postStatus(t, "/oauth2/token", gw.auth(t, map[string]any{"grant_type": "client_credentials"}), nil)
+		code, got := postStatus(t, "/oauth2/token", gw.auth(t, map[string]any{
+			"grant_type": "client_credentials", "resource": receiverResource,
+		}), nil)
 		require.Equal(t, http.StatusOK, code, "%v", got)
 		refused(t, got["access_token"].(string))
 	})
@@ -528,6 +544,19 @@ func TestOnBehalf_RequestShape(t *testing.T) {
 		requireSvcRefused(t, http.StatusBadRequest, "invalid_grant", body, status)
 	})
 
+	t.Run("nor used to start a CIBA chain", func(t *testing.T) {
+		code, got := postStatus(t, "/oauth2/token", gw.auth(t, onBehalf(subject, receiverResource)), nil)
+		require.Equal(t, http.StatusOK, code, "%v", got)
+		c := newConfidentialCIBAClient(t)
+		resp := post(t, "/oauth2/bc-authorize", map[string]any{
+			"client_id": c.ID, "client_secret": c.Secret, "account_id": testAccountID, "project_id": testProjectID,
+			"login_hint": "user-a", "requesting_token": got["access_token"].(string),
+		}, cibaInitiatorHeaders())
+		body := decode(t, resp)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "%v", body)
+		assert.Empty(t, body["auth_req_id"])
+	})
+
 	t.Run("nor presented as an external-principal subject", func(t *testing.T) {
 		code, got := postStatus(t, "/oauth2/token", gw.auth(t, onBehalf(subject, receiverResource)), nil)
 		require.Equal(t, http.StatusOK, code, "%v", got)
@@ -659,6 +688,11 @@ func TestServiceTenant_ClientCredentials(t *testing.T) {
 		assert.Equal(t, testServiceAccount, claims["account_id"])
 		assert.Equal(t, testOnBehalfClient, claims["client_id"])
 		assert.LessOrEqual(t, lifetime(t, claims), 5*time.Minute)
+	})
+
+	t.Run("exactly one resource is required", func(t *testing.T) {
+		code, got := postStatus(t, "/oauth2/token", gateway(t).auth(t, map[string]any{"grant_type": "client_credentials"}), nil)
+		requireSvcRefused(t, http.StatusBadRequest, "invalid_target", got, code)
 	})
 
 	t.Run("an unlinked client cannot name the service tenant", func(t *testing.T) {
