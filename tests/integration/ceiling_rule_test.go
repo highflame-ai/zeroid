@@ -76,12 +76,11 @@ func TestCeilingRule_GrantsReportUnboundedScopes(t *testing.T) {
 		read := countUnboundedScope(t)
 		tn := newTenant(t, "")
 		resp := post(t, "/oauth2/token", map[string]any{
-			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token": "external-principal-assertion",
-			"account_id":    tn.account,
-			"project_id":    tn.project,
-			"user_id":       uid("hrd-cr-user"),
-			"audience":      "codeoid",
+			"grant_type": testUserSessionGrant,
+			"account_id": tn.account,
+			"project_id": tn.project,
+			"user_id":    uid("hrd-cr-user"),
+			"audience":   "codeoid",
 		}, map[string]string{testTrustedServiceHeader: "trusted-service"})
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 		_ = resp.Body.Close()

@@ -53,6 +53,10 @@ type Config struct {
 	CIMD        CIMDConfig        `koanf:"cimd"`
 	ClientAuth  ClientAuthConfig  `koanf:"client_auth"`
 
+	// ReservedClientIDs names OAuth client ids that only the operator may
+	// register, through Server.EnsureClient. See ReservedClientIDsConfig.
+	ReservedClientIDs ReservedClientIDsConfig `koanf:"reserved_client_ids"`
+
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
@@ -140,6 +144,41 @@ type ClientAuthConfig struct {
 	// memory. 0 (default) ⇒ 256. Least-recently-used entries are evicted and
 	// closed.
 	JWKSCacheSize int `koanf:"jwks_cache_size"`
+}
+
+// ReservedClientIDsConfig reserves OAuth client ids for the operator.
+//
+// A client_id is a globally unique name chosen by whoever registers it first,
+// and a resource server that attributes a call to a client reads that name.
+// A deployment whose own services authenticate as OAuth clients, and whose
+// resource servers recognise those services by client_id, must stop anyone
+// else from taking those names first. A reserved id can be registered only
+// through Server.EnsureClient (the operator's seeding path); the admin
+// /oauth/clients route, dynamic registration and trusted-issuer bindings
+// refuse it, whoever the caller.
+//
+// On a token exchange, where client_id comes from the actor identity's
+// external_id rather than from an authenticated client, a reserved id is
+// written only when the reserved client is linked to that very identity.
+// client_id is still only a name: a resource server identifying one of the
+// deployment's services pairs it with something the deployer controls, such
+// as the account the token was issued in.
+//
+// Matching ignores case, surrounding space, invisible format characters and
+// Unicode compatibility forms (NFKC), so "Billing" or a fullwidth "billing" is
+// refused when "billing" is reserved. Letters of another script that only look
+// alike (Cyrillic for Latin) are not: a resource server compares client_id
+// byte for byte, so such an id never reads as the reserved one. Empty (the
+// default) reserves nothing. Reserving an id does not remove a client already
+// registered under it. A seed linked to an identity refuses such a row with
+// ErrClientNotOwned; an unlinked seed adopts an unlinked, non-dynamic row
+// alike in whether it authenticates, and logs that it did. Seed the deployment's own services
+// with OAuthClientConfig.IdentityID.
+type ReservedClientIDsConfig struct {
+	// Names are reserved client ids, matched whole.
+	Names []string `koanf:"names"`
+	// Prefixes reserve every client id that starts with one of them.
+	Prefixes []string `koanf:"prefixes"`
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -548,6 +587,18 @@ type TokenConfig struct {
 	// the broker. 0 ⇒ the built-in default (12h).
 	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
 
+	// AllowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a subject_token: accepted without being
+	// verified. By default (false) a presented subject_token must be an active
+	// token this server issued, for the tenant (account_id, project_id) and
+	// the person (user_id) the request names; otherwise the exchange fails
+	// with invalid_grant. A request with no subject_token is unaffected.
+	//
+	// Set it only for a deployment whose trusted services present tokens from
+	// another issuer on that exchange, and only until they move to the
+	// ID-token exchange (subject_token_type id_token) or stop sending one.
+	AllowUnverifiedExternalPrincipalSubject bool `koanf:"allow_unverified_external_principal_subject"`
+
 	// RefreshReuseGraceSeconds is how long after a refresh token is rotated
 	// out a second presentation of it is refused as a concurrent retry rather
 	// than treated as reuse. Within the window the rotated-out token is
@@ -673,6 +724,17 @@ func (c *Config) Validate() error {
 	if c.Database.URL == "" {
 		return fmt.Errorf("database URL is required: provide ZEROID_DATABASE_URL or individual DB_ vars")
 	}
+	for _, n := range c.ReservedClientIDs.Names {
+		if service.ReservedClientIDKey(n) == "" || strings.Contains(n, "#") {
+			return fmt.Errorf("reserved_client_ids.names: %q is not a client id (empty, or contains '#')", n)
+		}
+	}
+	for _, p := range c.ReservedClientIDs.Prefixes {
+		if service.ReservedClientIDKey(p) == "" {
+			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
+		}
+	}
+
 	if c.Keys.PrivateKeyPath == "" {
 		return fmt.Errorf("keys.private_key_path is required")
 	}
@@ -1220,6 +1282,9 @@ var envMapping = map[string]string{
 	// Seconds after a rotation in which re-presenting the rotated-out refresh
 	// token is a benign retry, not reuse. 0 = strict RFC 9700; max 300.
 	"ZEROID_REFRESH_REUSE_GRACE_SECONDS": "token.refresh_reuse_grace_seconds",
+	// Accept an external-principal subject_token without verifying it, as
+	// before subject verification. Default false.
+	"ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT": "token.allow_unverified_external_principal_subject",
 
 	// WIMSE
 	"ZEROID_WIMSE_DOMAIN": "wimse_domain",
@@ -1288,7 +1353,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".bcrypt_client_secrets") ||
 			strings.HasSuffix(configPath, ".allow_private_endpoints") ||
-			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
+			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection") ||
+			strings.HasSuffix(configPath, ".allow_unverified_external_principal_subject"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {
 				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)

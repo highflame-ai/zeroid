@@ -1047,3 +1047,55 @@ func TestLoadForwardedHeaders(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateReservedClientIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		names    []string
+		prefixes []string
+		wantErr  bool
+	}{
+		{"none", nil, nil, false},
+		{"names and prefixes", []string{"billing"}, []string{"svc-"}, false},
+		{"empty name", []string{" "}, nil, true},
+		{"name with #", []string{"https://iss#sub"}, nil, true},
+		{"empty prefix reserves everything", nil, []string{""}, true},
+		{"invisible-only prefix reserves everything", nil, []string{"\u200b"}, true},
+		{"invisible-only name", []string{"\u00a0\u200d"}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig(t)
+			cfg.ReservedClientIDs = ReservedClientIDsConfig{Names: tc.names, Prefixes: tc.prefixes}
+			err := cfg.Validate()
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Validate() = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The external-principal subject verification is on unless a deployment
+// opts out, and the opt-out is reachable from the environment.
+func TestAllowUnverifiedExternalPrincipalSubjectConfig(t *testing.T) {
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		t.Fatal("allow_unverified_external_principal_subject must default to false")
+	}
+
+	t.Setenv("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT", "true")
+	cfg, err = LoadConfig("")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.Token.AllowUnverifiedExternalPrincipalSubject {
+		t.Error("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT=true did not reach token")
+	}
+
+	t.Setenv("ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT", "ture")
+	if _, err := LoadConfig(""); err == nil {
+		t.Error("a typo'd bool must fail the load, not keep the default")
+	}
+}

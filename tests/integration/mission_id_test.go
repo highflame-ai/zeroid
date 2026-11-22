@@ -22,11 +22,10 @@ import (
 func TestMissionID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
 	const forgedMission = "forged-mission-of-another-tree"
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    testAccountID,
-		"project_id":    testProjectID,
-		"user_id":       uid("d1-user"),
+		"grant_type": testUserSessionGrant,
+		"account_id": testAccountID,
+		"project_id": testProjectID,
+		"user_id":    uid("d1-user"),
 		"additional_claims": map[string]any{
 			"mission_id":     forgedMission,
 			"principal_type": "forged",
@@ -58,11 +57,10 @@ func TestIdentityID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
 	victimID := registerIdentityWithPolicy(t, victimExtID, "", "", []string{"data:read"}, adminHeaders())
 
 	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
-		"account_id":    testAccountID,
-		"project_id":    testProjectID,
-		"user_id":       uid("d1-user"),
+		"grant_type": testUserSessionGrant,
+		"account_id": testAccountID,
+		"project_id": testProjectID,
+		"user_id":    uid("d1-user"),
 		"additional_claims": map[string]any{
 			"identity_id": victimID,
 			"agent_id":    victimID,

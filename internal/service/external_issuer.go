@@ -815,6 +815,14 @@ func (s *ExternalIssuerService) ensurePresentingClient(ctx context.Context, iden
 	if clientID == "" {
 		clientID = subjectKey
 	}
+	// Checked before the lookup, so a reserved id is refused even when a row
+	// registered under it before it was reserved is this identity's: a
+	// binding must never confirm, let alone create, a client under a name the
+	// deployment keeps for its own services.
+	if s.oauthClientSvc.IsReservedClientID(clientID) {
+		return nil, issuerErr(http.StatusBadRequest, "reserved_client_id",
+			"this client_id is reserved and cannot be registered through a binding")
+	}
 	existing, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
 	switch {
 	case err == nil:

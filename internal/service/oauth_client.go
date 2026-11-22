@@ -12,11 +12,14 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
@@ -38,6 +41,11 @@ var ErrInvalidClientSecret = errors.New("invalid client secret")
 // input was our fault and burying the actionable message in a server log.
 var ErrInvalidClientMetadata = errors.New("invalid client metadata")
 
+// ErrReservedClientID is returned when a registration names a client id the
+// deployment reserved for its operator (ReservedClientIDsConfig). It wraps
+// ErrInvalidClientMetadata, so a handler that maps that to 400 refuses it too.
+var ErrReservedClientID = fmt.Errorf("%w: client_id is reserved", ErrInvalidClientMetadata)
+
 // OAuthClientService manages OAuth2 client registration.
 type OAuthClientService struct {
 	repo *postgres.OAuthClientRepository
@@ -55,6 +63,10 @@ type OAuthClientService struct {
 	// SSRF guard on the fetch itself — the two must move together, since an
 	// http loopback URL is useless if the dialer refuses loopback.
 	allowPrivateJWKSEndpoints bool
+	// reservedNames and reservedPrefixes are the client ids only operator
+	// seeding may register (ReservedClientIDsConfig), lowercased.
+	reservedNames    map[string]struct{}
+	reservedPrefixes []string
 	// bcryptSecrets keeps writing bcrypt client-secret hashes, as builds
 	// before SHA-256 support did, and skips the upgrade of existing ones. Off
 	// (the zero value) means SHA-256. Verification accepts both formats
@@ -80,6 +92,61 @@ func (s *OAuthClientService) hashNewSecret(secret string, bcryptCost int) (strin
 		return "", fmt.Errorf("failed to hash client secret: %w", err)
 	}
 	return string(h), nil
+}
+
+// SetReservedClientIDs reserves client ids for operator seeding: names match
+// whole, prefixes match the start, both compared as ReservedClientIDKey. Set from
+// ReservedClientIDsConfig in server.go.
+func (s *OAuthClientService) SetReservedClientIDs(names, prefixes []string) {
+	s.reservedNames = make(map[string]struct{}, len(names))
+	// An entry that normalises to nothing is skipped: as a prefix it would
+	// reserve every id. Config.Validate refuses one before it gets here.
+	for _, n := range names {
+		if k := ReservedClientIDKey(n); k != "" {
+			s.reservedNames[k] = struct{}{}
+		}
+	}
+	s.reservedPrefixes = nil
+	for _, p := range prefixes {
+		if k := ReservedClientIDKey(p); k != "" {
+			s.reservedPrefixes = append(s.reservedPrefixes, k)
+		}
+	}
+}
+
+// ReservedClientIDKey is the form reserved ids are compared in: surrounding space
+// and invisible format characters (zero-width space and joiners, soft hyphen,
+// bidi marks) removed, case folded, and Unicode compatibility forms
+// normalised (NFKC), so "Billing", "ｂｉｌｌｉｎｇ" and "bil\u200bling" all
+// compare equal to "billing". Letters from different scripts that merely look
+// alike (Cyrillic "а" for Latin "a") stay distinct: a resource server compares
+// client_id byte for byte, so such an id never reads as the reserved one.
+func ReservedClientIDKey(id string) string {
+	id = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, id)
+	id = norm.NFKC.String(cases.Fold().String(norm.NFKC.String(id)))
+	return strings.TrimSpace(id)
+}
+
+// IsReservedClientID reports whether clientID is reserved for operator
+// seeding. Both sides are compared as ReservedClientIDKey, so an id differing from
+// a reserved one only in case, surrounding space, invisible characters or
+// Unicode compatibility forms is reserved too.
+func (s *OAuthClientService) IsReservedClientID(clientID string) bool {
+	id := ReservedClientIDKey(clientID)
+	if _, ok := s.reservedNames[id]; ok {
+		return true
+	}
+	for _, p := range s.reservedPrefixes {
+		if strings.HasPrefix(id, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewOAuthClientService creates a new OAuthClientService.
@@ -126,6 +193,13 @@ type RegisterClientRequest struct {
 	SoftwareVersion         string
 	Contacts                []string
 	Metadata                json.RawMessage
+	// AllowReservedClientID lets this registration take a reserved client id,
+	// and records the row as seeded (RegistrationSourceSeed). Only the
+	// operator's seeding path (Server.EnsureClient) sets it; every
+	// tenant-reachable registration leaves it false and is refused a
+	// reserved id.
+	AllowReservedClientID bool
+
 	// IdentityID optionally binds this OAuth client to an agent identity.
 	// When set, authorization_code and refresh_token grants issued through
 	// this client gate on the linked identity's expires_at + status (fail-
@@ -162,6 +236,12 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 	// tokens for two different clients.
 	if strings.Contains(req.ClientID, "#") {
 		return nil, "", fmt.Errorf("%w: client_id must not contain '#'", ErrInvalidClientMetadata)
+	}
+	// A reserved id names one of the deployment's own clients, which resource
+	// servers recognise by that name. Whoever registered it first would own
+	// it, so only the operator's seeding path may (ReservedClientIDsConfig).
+	if !req.AllowReservedClientID && s.IsReservedClientID(req.ClientID) {
+		return nil, "", ErrReservedClientID
 	}
 	// CIBA Core §4: client_notification_endpoint MUST be an HTTPS URL when
 	// supplied. Reject http:// / non-URL values at registration so a faulty
@@ -316,6 +396,11 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		identityID = &id
 	}
 
+	source := "internal"
+	if req.AllowReservedClientID {
+		source = domain.RegistrationSourceSeed
+	}
+
 	now := time.Now()
 	client := &domain.OAuthClient{
 		ID:                           uuid.New().String(),
@@ -339,7 +424,7 @@ func (s *OAuthClientService) RegisterClient(ctx context.Context, req RegisterCli
 		IdentityID:                   identityID,
 		ClientNotificationEndpoint:   req.ClientNotificationEndpoint,
 		BackchannelTokenDeliveryMode: deliveryMode,
-		RegistrationSource:           "internal",
+		RegistrationSource:           source,
 		ChannelTrusted:               TrustedApprovalChannelWrite(ctx),
 		IsActive:                     true,
 		CreatedAt:                    now,
@@ -395,9 +480,23 @@ func (s *OAuthClientService) GetClientByClientID(ctx context.Context, clientID s
 
 // GetClient retrieves a client by UUID.
 func (s *OAuthClientService) GetClient(ctx context.Context, id string) (*domain.OAuthClient, error) {
-	client, err := s.repo.GetByID(ctx, id)
+	return s.clientByID(ctx, id)
+}
+
+// clientByID loads a client by UUID. A missing row, or an id that is not a
+// UUID and so cannot name one, is ErrOAuthClientNotFound; a store failure is
+// returned as it is, so the caller answers it as a server error.
+func (s *OAuthClientService) clientByID(ctx context.Context, id string) (*domain.OAuthClient, error) {
+	parsed, err := uuid.Parse(id)
 	if err != nil {
 		return nil, ErrOAuthClientNotFound
+	}
+	client, err := s.repo.GetByID(ctx, parsed.String())
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrOAuthClientNotFound
+	}
+	if err != nil {
+		return nil, err
 	}
 	return client, nil
 }
@@ -440,9 +539,9 @@ func (s *OAuthClientService) VerifyClientSecret(ctx context.Context, clientID, s
 // RotateSecret generates and stores a new secret for a client.
 // Returns the new plain-text secret (only shown once).
 func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*domain.OAuthClient, string, error) {
-	client, err := s.repo.GetByID(ctx, id)
+	client, err := s.clientByID(ctx, id)
 	if err != nil {
-		return nil, "", ErrOAuthClientNotFound
+		return nil, "", err
 	}
 	// A client registered in the trusted approval-channel context gets a new
 	// secret only from a caller in that context (approval_channel_write.go).
@@ -471,6 +570,10 @@ func (s *OAuthClientService) RotateSecret(ctx context.Context, id string) (*doma
 	client.ClientSecret = hashed
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
+		// Deleted since it was read: the new secret was never stored.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, "", ErrOAuthClientNotFound
+		}
 		return nil, "", fmt.Errorf("failed to update client secret: %w", err)
 	}
 
@@ -781,9 +884,23 @@ func (s *OAuthClientService) DynamicRegisterClient(ctx context.Context, req Dyna
 		return nil, "", "", fmt.Errorf("name is required")
 	}
 
-	clientID, err := generateSecureToken(16)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
+	// The id is random, so it is reserved only if the deployment reserved a
+	// prefix it happens to start with (a short hex one, say). Draw again
+	// rather than refuse a registrant who chose nothing; refuse only if every
+	// draw lands in the reservation.
+	var clientID string
+	for range 8 {
+		id, err := generateSecureToken(16)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("failed to generate client_id: %w", err)
+		}
+		if !s.IsReservedClientID(id) {
+			clientID = id
+			break
+		}
+	}
+	if clientID == "" {
+		return nil, "", "", ErrReservedClientID
 	}
 
 	plainRegToken, err := generateSecureToken(32)
@@ -995,6 +1112,11 @@ func (s *OAuthClientService) UpdateDynamicClient(ctx context.Context, clientID s
 	client.Metadata = req.Metadata
 	client.UpdatedAt = time.Now()
 	if err := s.repo.Update(ctx, client); err != nil {
+		// Deleted since it was read: the handler answers as it does for a
+		// client that no longer exists, not with a server error.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrOAuthClientNotFound
+		}
 		return nil, fmt.Errorf("failed to update dynamic client: %w", err)
 	}
 	return client, nil

@@ -114,6 +114,10 @@ type OAuthService struct {
 	// so a test can flip it on a shared server without racing concurrent
 	// introspect/revoke reads under -race.
 	requireTokenInspectionAuth atomic.Bool
+	// allowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a presented subject_token: accepted without
+	// verification. Off by default; see SetAllowUnverifiedExternalPrincipalSubject.
+	allowUnverifiedExternalPrincipalSubject atomic.Bool
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -275,6 +279,17 @@ var reservedClaims = map[string]bool{
 	ClientAuthClaim: true,
 	"may_act":       true,
 	"scope":         true,
+	// Internal service tokens. `tenant_source` says the issuing grant took the
+	// tenant from the caller rather than from a verified credential, and a
+	// receiver refuses such a token wherever the tenant must be proven.
+	// `resolved_user_id` names the user whose delegated credentials the
+	// subject may use, and `resolved_user_source` says how ZeroID resolved
+	// it; a receiver serves that user's credentials and no other. All three
+	// are worth something only if ZeroID alone writes them, so neither
+	// additional_claims nor any other caller input may set or remove them.
+	"tenant_source":        true,
+	"resolved_user_id":     true,
+	"resolved_user_source": true,
 	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
 	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
 	// neither, so additional_claims is the only way either reaches a signed
@@ -632,6 +647,18 @@ func (s *OAuthService) SetClientAssertionReplayStore(store clientAssertionReplay
 // makes outbound requests to.
 func (s *OAuthService) SetClientJWKSCache(cache *ClientJWKSCache) {
 	s.clientJWKS = cache
+}
+
+// SetAllowUnverifiedExternalPrincipalSubject makes the external-principal
+// exchange accept a presented subject_token without verifying it, as it did
+// before subject verification. Off (the default) means a presented
+// subject_token must be an active token this server issued, for the same
+// tenant and person the request names. For a deployment whose trusted
+// services present tokens from another issuer on that exchange; such a
+// deployment should move them to the ID-token exchange or send no
+// subject_token instead. atomic so a test can flip it on a shared server.
+func (s *OAuthService) SetAllowUnverifiedExternalPrincipalSubject(allow bool) {
+	s.allowUnverifiedExternalPrincipalSubject.Store(allow)
 }
 
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
@@ -1378,6 +1405,14 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
+	// No OAuth client authenticated here: the actor proved its identity key,
+	// and external_id is a name its tenant chose. A name the deployment
+	// reserved for its own clients is written as client_id only when that
+	// reserved client is linked to this very identity, so an identity merely
+	// named after one cannot mint a token that reads as that client.
+	if s.oauthClientSvc.IsReservedClientID(issue.ClientID) && !s.clientLinkedTo(ctx, issue.ClientID, actorIdentity.ID) {
+		issue.ClientID = ""
+	}
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss
@@ -1531,15 +1566,17 @@ func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *dom
 // resolves tenant context, and calls the token endpoint with:
 //
 //	grant_type=urn:ietf:params:oauth:grant-type:token-exchange
-//	subject_token=<external_jwt>
+//	subject_token=<a token this server issued for user_id>
 //	subject_token_type=urn:ietf:params:oauth:token-type:jwt
 //	account_id=<resolved_tenant>
 //	project_id=<resolved_tenant>
 //	user_id=<external_user_id>
 //
-// ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
-// external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
-// with the external principal's claims embedded.
+// ZeroID trusts the caller (verified by TrustedServiceValidator), refuses a
+// workload URI as user_id, verifies a presented subject_token
+// (verifyExternalPrincipalSubject) unless the deployment opted out, and issues
+// a ZeroID-signed RS256 token with the external principal's claims embedded. A
+// deployer's own grant calling this in-process presents no subject_token.
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
 // Exported so deployers can call it from custom grant handlers.
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
@@ -1559,6 +1596,31 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 	if req.UserID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id is required for external principal exchange")
+	}
+	// The exchange mints a token whose sub is user_id and whose principal is
+	// a person. A WIMSE/SPIFFE URI names a workload, so minting it as a person
+	// would let a workload be presented downstream as someone's own session.
+	if isWorkloadURI(req.UserID) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id must name a person, not a workload identity URI")
+	}
+	// A subject_token, when the caller presents one, must back the request:
+	// an active token this server issued, in the named tenant, whose person
+	// is user_id. A caller that presents none is trusted on the
+	// TrustedServiceValidator alone, as before.
+	if req.SubjectToken != "" && !s.allowUnverifiedExternalPrincipalSubject.Load() {
+		if err := s.verifyExternalPrincipalSubject(ctx, req); err != nil {
+			// The response does not say which check failed; the log does, and
+			// names the opt-out, since a deployment whose trusted service
+			// relays another issuer's token first meets this on upgrade.
+			var oe *OAuthError
+			if errors.As(err, &oe) && oe.Code == oautherror.InvalidGrant {
+				log.Warn().Err(errors.Unwrap(err)).Str("trusted_service", serviceName).
+					Msg("external principal exchange refused its subject_token; a trusted service that presents " +
+						"another issuer's token there needs token.allow_unverified_external_principal_subject " +
+						"until it moves to the ID-token exchange")
+			}
+			return nil, err
+		}
 	}
 
 	// Step 3: Resolve the identity for the token.
@@ -1777,6 +1839,109 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 
 	return accessToken, nil
+}
+
+// delegationDepthOf reads delegation_depth whatever numeric type holds it: a
+// parsed token carries float64, a token built in memory may carry an int.
+func delegationDepthOf(tok jwt.Token) int {
+	v, err := jwt.Get[any](tok, "delegation_depth")
+	if err != nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return 0
+}
+
+// clientLinkedTo reports whether the registered client clientID is linked to
+// identityID. Any lookup failure reads as "not linked": the caller then
+// withholds a claim rather than writes one it could not confirm.
+func (s *OAuthService) clientLinkedTo(ctx context.Context, clientID, identityID string) bool {
+	c, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+	return err == nil && c.IdentityID != nil && *c.IdentityID == identityID
+}
+
+// isWorkloadURI reports whether v is a SPIFFE/WIMSE workload URI, ignoring
+// case and surrounding space, so "SPIFFE://..." is caught too.
+func isWorkloadURI(v string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "spiffe://")
+}
+
+// verifyExternalPrincipalSubject checks that the external-principal exchange's
+// subject_token backs the request: it is a token this server issued, its
+// signature and expiry hold, it has not been revoked, its tenant is the
+// request's account_id and project_id, and the person it names is user_id.
+// Every failure is invalid_grant, and none says which check failed.
+func (s *OAuthService) verifyExternalPrincipalSubject(ctx context.Context, req TokenRequest) error {
+	refuse := func(cause error) error {
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token does not back this exchange", cause)
+	}
+	parsed, err := s.parseToken(req.SubjectToken, true)
+	if err != nil {
+		return refuse(err)
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return refuse(errors.New("subject_token has no jti"))
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil {
+		// A store failure is not a bad token: let the caller retry.
+		return oauthServerError("failed to check subject_token", err)
+	}
+	if cred == nil || !active {
+		return refuse(errors.New("subject_token is inactive or revoked"))
+	}
+	// The credential row, not the token, is the tenant of record.
+	if cred.AccountID != req.AccountID || cred.ProjectID != req.ProjectID {
+		return refuse(errors.New("subject_token is for another tenant"))
+	}
+	if person := subjectPerson(parsed); person == "" || person != req.UserID {
+		return refuse(errors.New("subject_token names a different person, or none"))
+	}
+	return nil
+}
+
+// subjectPerson returns the person a verified token acts for, or "" when it
+// acts for none. Under the rfc8693 profile that is sub when principal_type is
+// user. Under the legacy profile it is the user_id claim, else, on a
+// delegated token, an act.sub that is not a workload URI, else sub when it is
+// not a workload URI. A workload URI never qualifies.
+//
+// This is the ladder resource servers use to find the person behind a chain,
+// so a caller can name in user_id exactly the person a token it verified acts
+// for, and no one else.
+func subjectPerson(tok jwt.Token) string {
+	person := func(v string) string {
+		if v == "" || isWorkloadURI(v) {
+			return ""
+		}
+		return v
+	}
+	sub, _ := tok.Subject()
+	if pt, err := jwt.Get[string](tok, "principal_type"); err == nil && pt != "" {
+		if pt == string(domain.PrincipalUser) {
+			return person(sub)
+		}
+		return ""
+	}
+	if uid, _ := jwt.Get[string](tok, "user_id"); person(uid) != "" {
+		return uid
+	}
+	if delegationDepthOf(tok) >= 1 {
+		if act, err := jwt.Get[map[string]any](tok, "act"); err == nil {
+			if actSub, _ := act["sub"].(string); person(actSub) != "" {
+				return actSub
+			}
+		}
+	}
+	return person(sub)
 }
 
 // APIKeyResolution is the public result of OAuthService.ResolveAPIKey —
