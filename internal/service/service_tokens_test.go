@@ -66,14 +66,20 @@ func TestRequestRouting(t *testing.T) {
 	assert.False(t, s.isSessionBrokerRequest(TokenRequest{ClientID: "SVC-BROKER", UserID: "alice"}), "exact client id only")
 	assert.False(t, s.isSessionBrokerRequest(TokenRequest{ClientID: "svc-gw", UserID: "alice"}))
 
-	assert.True(t, s.isOnBehalfRequest(TokenRequest{ClientID: "x", SubjectTokenType: TokenTypeAccessToken}))
-	assert.True(t, s.isOnBehalfRequest(TokenRequest{ClientAssertion: "a", SubjectTokenType: TokenTypeAccessToken}))
-	assert.False(t, s.isOnBehalfRequest(TokenRequest{SubjectTokenType: TokenTypeAccessToken}), "no client authentication")
-	assert.False(t, s.isOnBehalfRequest(TokenRequest{ClientID: "x", SubjectTokenType: SubjectTokenTypeJWT}), "only an access_token subject")
+	at := TokenTypeAccessToken
+	assert.True(t, s.isOnBehalfCandidate(TokenRequest{ClientID: "x", ClientAssertion: "a", SubjectTokenType: at}))
+	assert.False(t, s.isOnBehalfCandidate(TokenRequest{ClientID: "x", SubjectTokenType: at}),
+		"a client_id alone is not an authentication: the request keeps its old route")
+	assert.False(t, s.isOnBehalfCandidate(TokenRequest{ClientID: "x", ClientSecret: "s", SubjectTokenType: at}),
+		"a service client authenticates with private_key_jwt only")
+	assert.False(t, s.isOnBehalfCandidate(TokenRequest{ClientAssertion: "a", SubjectTokenType: at}), "no client named")
+	assert.False(t, s.isOnBehalfCandidate(TokenRequest{ClientID: "x", ClientAssertion: "a", SubjectTokenType: SubjectTokenTypeJWT}),
+		"only an access_token subject")
 
 	off := &OAuthService{}
-	assert.False(t, off.isOnBehalfRequest(TokenRequest{ClientID: "x", SubjectTokenType: TokenTypeAccessToken}), "disabled by default")
+	assert.False(t, off.isOnBehalfCandidate(TokenRequest{ClientID: "x", ClientAssertion: "a", SubjectTokenType: at}), "disabled by default")
 	assert.False(t, off.isSessionBrokerRequest(TokenRequest{ClientID: "svc-broker", UserID: "alice"}))
+	assert.False(t, off.isReservedClientID("svc-broker"), "no client service: nothing is reserved")
 }
 
 func TestRequireServiceClient_RefusesBeforeTheStore(t *testing.T) {

@@ -1251,8 +1251,19 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		if s.isSessionBrokerRequest(req) {
 			return s.ExternalPrincipalExchange(ctx, req)
 		}
-		if s.isOnBehalfRequest(req) {
-			return s.onBehalfExchange(ctx, req)
+		if s.isOnBehalfCandidate(req) {
+			// Routed on a VERIFIED client only, so a caller of the paths
+			// below that happens to send a client_id or a stray assertion
+			// keeps its route. A reserved client id is one of the
+			// deployment's own services, which has no other route here:
+			// its failure is reported, not retried elsewhere.
+			client, err := s.authenticateRegisteredClient(ctx, req, false)
+			if err == nil {
+				return s.onBehalfExchange(ctx, req, client)
+			}
+			if s.isReservedClientID(req.ClientID) {
+				return nil, err
+			}
 		}
 		if s.jwtSubjectIsIDTokenExchange(ctx, req) {
 			return s.externalIDTokenExchange(ctx, req)
@@ -1676,6 +1687,17 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		name, err := s.trustedServiceValidator(ctx)
 		if err != nil {
 			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "caller is not a trusted service", err)
+		}
+		// The validator's name becomes trusted_by. A reserved client id or a
+		// session broker's id there would let any caller the validator admits
+		// mint a token that reads as one of the deployment's own services,
+		// which a receiver may trust: those names are reached only through
+		// the broker path, which authenticates the client itself.
+		if cfg := s.serviceTokenCfg(); s.isReservedClientID(name) || (cfg != nil && cfg.brokers[name]) {
+			log.Warn().Str("trusted_service", name).
+				Msg("external principal exchange refused a trusted-service caller whose name is a reserved client id " +
+					"or a session broker; that service must authenticate as its client (service_tokens.session_broker_clients)")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "caller is not a trusted service")
 		}
 		serviceName = name
 	}

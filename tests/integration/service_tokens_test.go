@@ -401,11 +401,12 @@ func TestOnBehalf_RefusesClients(t *testing.T) {
 	}
 
 	t.Run("no client authentication", func(t *testing.T) {
+		// Naming the client is not authenticating as it: the request keeps the
+		// external-principal route, which this caller cannot pass.
 		body := onBehalf(subject(t), receiverResource)
 		body["client_id"] = testOnBehalfClient
 		code, got := postStatus(t, "/oauth2/token", body, nil)
-		assert.Equal(t, http.StatusUnauthorized, code, "%v", got)
-		assert.Empty(t, got["access_token"])
+		requireSvcRefused(t, http.StatusBadRequest, "invalid_grant", got, code)
 	})
 
 	t.Run("a tenant's own private_key_jwt client", func(t *testing.T) {
@@ -717,4 +718,114 @@ func signTestToken(t *testing.T, key *ecdsa.PrivateKey, kid, issuer string, iat,
 	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.ES256(), key, jws.WithProtectedHeaders(hdrs)))
 	require.NoError(t, err)
 	return strings.TrimSpace(string(signed))
+}
+
+// ── trusted_by cannot be forged on the validator path ───────────────────────
+
+// A receiver may trust trusted_by naming a session broker. The validator
+// path writes trusted_by from whatever name the deployer's validator returns
+// (here, a header), so ZeroID refuses that path for any name that is a
+// session broker or a reserved client id: such a name is reached only by
+// authenticating as the client.
+func TestSessionBroker_TrustedByNotForgeable(t *testing.T) {
+	user := uid("forge-user")
+	session := func(name string) (int, map[string]any) {
+		return postStatus(t, "/oauth2/token", map[string]any{
+			"grant_type": testUserSessionGrant, "account_id": testAccountID, "project_id": testProjectID, "user_id": user,
+		}, map[string]string{testTrustedServiceHeader: name})
+	}
+	for _, name := range []string{testBrokerClient, "RESERVED-SVC-BROKER", testReservedClientID, testReservedClientPrefix + "anything"} {
+		t.Run("refused as "+name, func(t *testing.T) {
+			code, got := session(name)
+			requireSvcRefused(t, http.StatusBadRequest, "invalid_grant", got, code)
+		})
+	}
+	t.Run("the token-exchange form too", func(t *testing.T) {
+		code, got := postStatus(t, "/oauth2/token",
+			brokerExchange(personToken(t, testAccountID, testProjectID, user), testAccountID, testProjectID, user),
+			map[string]string{testTrustedServiceHeader: testBrokerClient})
+		requireSvcRefused(t, http.StatusBadRequest, "invalid_grant", got, code)
+	})
+	t.Run("an unrelated trusted service still works", func(t *testing.T) {
+		code, got := session("some-trusted-service")
+		require.Equal(t, http.StatusOK, code, "%v", got)
+		assert.Equal(t, "some-trusted-service", decodeJWTPayload(t, got["access_token"].(string))["trusted_by"])
+	})
+	t.Run("the broker, authenticated as its client, still works", func(t *testing.T) {
+		claims := decodeJWTPayload(t, brokerSession(t, testAccountID, testProjectID, user, nil)["access_token"].(string))
+		assert.Equal(t, testBrokerClient, claims["trusted_by"])
+	})
+}
+
+// ── Routing: only a verified client reaches the on-behalf exchange ──────────
+
+// With service tokens on, a token exchange that merely names a client_id, or
+// presents an assertion that does not verify for a client that is not one of
+// the deployment's services, keeps its old route: the external-principal
+// exchange behind the trusted-service validator.
+func TestOnBehalf_RoutingNeedsAVerifiedClient(t *testing.T) {
+	user := uid("route-user")
+	subject := personToken(t, testAccountID, testProjectID, user)
+	epBody := func(extra map[string]any) map[string]any {
+		b := brokerExchange(subject, testAccountID, testProjectID, user)
+		b["subject_token_type"] = issuedTokenTypeAccessToken
+		for k, v := range extra {
+			b[k] = v
+		}
+		return b
+	}
+
+	t.Run("a client_id alone keeps the external-principal route", func(t *testing.T) {
+		code, got := postStatus(t, "/oauth2/token", epBody(map[string]any{"client_id": uid("legacy-client")}), trustedServiceHeaders)
+		require.Equal(t, http.StatusOK, code, "%v", got)
+		claims := decodeJWTPayload(t, got["access_token"].(string))
+		assert.Equal(t, "external_principal", claims["token_exchange"])
+		assert.NotContains(t, claims, "act")
+	})
+
+	t.Run("an unverifiable assertion for an unreserved client keeps it too", func(t *testing.T) {
+		id := uid("legacy-client")
+		code, got := postStatus(t, "/oauth2/token", epBody(map[string]any{
+			"client_id": id, "client_assertion": clientAssertionFor(t, generateKey(t), id), "client_assertion_type": clientAssertionType,
+		}), trustedServiceHeaders)
+		require.Equal(t, http.StatusOK, code, "%v", got)
+		assert.Equal(t, "external_principal", decodeJWTPayload(t, got["access_token"].(string))["token_exchange"])
+	})
+
+	t.Run("a reserved client whose assertion fails is refused, not rerouted", func(t *testing.T) {
+		gateway(t)
+		code, got := postStatus(t, "/oauth2/token", epBody(map[string]any{
+			"client_id": testOnBehalfClient, "client_assertion": clientAssertionFor(t, generateKey(t), testOnBehalfClient),
+			"client_assertion_type": clientAssertionType, "resource": receiverResource,
+		}), trustedServiceHeaders)
+		assert.Equal(t, http.StatusUnauthorized, code, "%v", got)
+		assert.Empty(t, got["access_token"])
+	})
+
+	t.Run("a verified service client takes the on-behalf exchange", func(t *testing.T) {
+		subject := brokerSession(t, testAccountID, testProjectID, user, nil)["access_token"].(string)
+		code, got := postStatus(t, "/oauth2/token", gateway(t).auth(t, onBehalf(subject, receiverResource)), trustedServiceHeaders)
+		require.Equal(t, http.StatusOK, code, "%v", got)
+		assert.Equal(t, "on_behalf", decodeJWTPayload(t, got["access_token"].(string))["token_exchange"])
+	})
+}
+
+// ── Classification of agent-held person tokens ───────────────────────────────
+
+// A person's authorization_code token (a CLI or MCP client acting for them)
+// is held by software, so, as for a resource server's person-only routes, it
+// is not the person's own session. Its principal is still the person, so the
+// user it may spend is the person.
+func TestOnBehalf_AuthorizationCodeSubject(t *testing.T) {
+	tn := newTenant(t, "rfc8693")
+	body := tn.authCodeToken(t, ensureAuthCodeClient(t, 0))
+	subject := body["access_token"].(string)
+	person := decodeJWTPayload(t, subject)["sub"].(string)
+
+	code, got := postStatus(t, "/oauth2/token", gateway(t).auth(t, onBehalf(subject, receiverResource)), nil)
+	require.Equal(t, http.StatusOK, code, "%v", got)
+	claims := decodeJWTPayload(t, got["access_token"].(string))
+	assert.Equal(t, "workload", claims["subject_kind"])
+	assert.Equal(t, person, claims["resolved_user_id"])
+	assert.Equal(t, "subject", claims["resolved_user_source"])
 }

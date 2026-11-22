@@ -614,7 +614,10 @@ mode:
   client authentication MUST succeed; the validator is not consulted. The
   token then carries `client_id` and `trusted_by` naming the client, set from
   the client authentication. A token from the validator path carries no
-  `client_id`, so a resource server can tell the two apart.
+  `client_id`, so a resource server can tell the two apart, and the validator
+  path is refused (`invalid_grant`) when the name the validator returns is a
+  session broker or a reserved client id: those names are reached only by
+  authenticating as the client.
 - Refuses the service tenant (§5.8) as `account_id` (`invalid_request`): it
   holds services, never a person.
 - A token bound to a `resource` lives at most 300 s. A deployer's grant
@@ -754,7 +757,11 @@ tenant's `account_id`.
 
 **On-behalf exchange.** RFC 8693 token exchange with no `actor_token`, a
 `subject_token_type` of `urn:ietf:params:oauth:token-type:access_token` and a
-service client authentication. The client MUST list
+service client authentication. The request takes this route only once its
+`private_key_jwt` assertion verifies; a request that merely names a
+`client_id`, or whose assertion fails for a client id that is not reserved,
+keeps the external-principal route (§5.5). A reserved client whose assertion
+fails is refused with `invalid_client`. The client MUST list
 `urn:ietf:params:oauth:grant-type:token-exchange` in its `grant_types`. ZeroID:
 
 1. verifies the `subject_token`: signature, `iss`, expiry and revocation;
@@ -789,9 +796,11 @@ service client authentication. The client MUST list
        `principal_type` is `user`: its `sub` (`subject`);
     2. under the legacy profile, the `user_id` claim, else at
        `delegation_depth` 1 or more a non-workload `act.sub` (`on_behalf`);
-    3. the `owner_user_id` of the subject's identity record (`owner`),
-       except for a service identity reached through an API key, whose owner
-       may be whoever created the first key on a shared placeholder;
+    3. the `owner_user_id` of the subject's identity record (`owner`).
+       An API key's creator is never consulted, so neither is the owner of
+       a service identity reached through an API key: ZeroID provisions a
+       shared placeholder service identity per product for keys that name
+       no identity, and its recorded owner is whoever created the first key;
     4. nothing: neither claim is set.
 
 An internal service token, or any token in the service tenant, is also

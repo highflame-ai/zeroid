@@ -146,13 +146,23 @@ func (s *OAuthService) isSessionBrokerRequest(req TokenRequest) bool {
 	return cfg != nil && req.ClientID != "" && cfg.brokers[req.ClientID] && req.UserID != ""
 }
 
-// isOnBehalfRequest reports whether a token exchange with no actor_token is
-// the on-behalf exchange: internal service tokens are on, the subject is an
-// access token, and the request carries a client authentication.
-func (s *OAuthService) isOnBehalfRequest(req TokenRequest) bool {
+// isOnBehalfCandidate reports whether a token exchange with no actor_token
+// may be the on-behalf exchange: internal service tokens are on, the subject
+// is an access token, and the request carries a private_key_jwt client
+// assertion, the only way a service client authenticates. The exchange is
+// taken only once that assertion verifies (see tokenExchange); a request
+// that merely names a client_id keeps its old route.
+func (s *OAuthService) isOnBehalfCandidate(req TokenRequest) bool {
 	return s.serviceTokenCfg() != nil &&
 		req.SubjectTokenType == TokenTypeAccessToken &&
-		(req.ClientID != "" || clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType))
+		req.ClientID != "" &&
+		clientAssertionPresented(req.ClientAssertion, req.ClientAssertionType)
+}
+
+// isReservedClientID reports whether id is reserved for the operator's own
+// clients. False when no client service is wired.
+func (s *OAuthService) isReservedClientID(id string) bool {
+	return s.oauthClientSvc != nil && s.oauthClientSvc.IsReservedClientID(id)
 }
 
 // authenticateServiceClient authenticates the request's client and returns it
@@ -179,14 +189,26 @@ func (s *OAuthService) authenticateServiceClient(
 	if err != nil {
 		return nil, nil, err
 	}
-	identity, err := s.requireServiceClient(ctx, client, cfg)
+	identity, err := s.checkServiceClient(ctx, client, cfg, grantType)
 	if err != nil {
 		return nil, nil, err
 	}
-	if grantType != "" && !slices.Contains(client.GrantTypes, grantType) {
-		return nil, nil, oauthBadRequest(oautherror.UnauthorizedClient, "client is not registered for this grant type")
-	}
 	return client, identity, nil
+}
+
+// checkServiceClient is authenticateServiceClient's check of a client that
+// has already authenticated.
+func (s *OAuthService) checkServiceClient(
+	ctx context.Context, client *domain.OAuthClient, cfg *serviceTokenConfig, grantType string,
+) (*domain.Identity, error) {
+	identity, err := s.requireServiceClient(ctx, client, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if grantType != "" && !slices.Contains(client.GrantTypes, grantType) {
+		return nil, oauthBadRequest(oautherror.UnauthorizedClient, "client is not registered for this grant type")
+	}
+	return identity, nil
 }
 
 // requireServiceClient checks that an authenticated client is one of the
@@ -205,7 +227,7 @@ func (s *OAuthService) requireServiceClient(
 		return refuse("internal service tokens are not configured")
 	case client.TokenEndpointAuthMethod != clientAuthMethodPrivateKeyJWT:
 		return refuse("client does not authenticate with private_key_jwt")
-	case !s.oauthClientSvc.IsReservedClientID(client.ClientID):
+	case !s.isReservedClientID(client.ClientID):
 		return refuse("client id is not reserved")
 	case client.RegistrationSource != domain.RegistrationSourceSeed:
 		return refuse("client was not registered by seeding")
@@ -367,7 +389,7 @@ func personValue(v string) string {
 // validator path it is the name the deployer's validator returned.
 func (s *OAuthService) isSessionBrokerToken(tok jwt.Token, cfg *serviceTokenConfig) bool {
 	cid, _ := jwt.Get[string](tok, "client_id")
-	return cfg != nil && cid != "" && cfg.brokers[cid] && s.oauthClientSvc.IsReservedClientID(cid)
+	return cfg != nil && cid != "" && cfg.brokers[cid] && s.isReservedClientID(cid)
 }
 
 // isPersonSession reports whether a verified token is a person's own session,
@@ -424,10 +446,13 @@ func (s *OAuthService) isPersonSession(tok jwt.Token, cfg *serviceTokenConfig) b
 //     whose sub is that person.
 //  2. A legacy-profile workload acting for a person: the user_id claim, else,
 //     at delegation_depth 1 or more, a non-workload act.sub.
-//  3. Otherwise the owner on the subject's identity record. Not an API key's
-//     creator, and not the owner of a service identity reached through an
-//     API key, which may be a shared placeholder whose owner is whoever
-//     created its first key.
+//  3. Otherwise the owner on the subject's identity record. An API key's
+//     creator is never consulted, and so neither is the owner of a service
+//     identity reached through an API key: a key that names no identity is
+//     minted on a shared placeholder service identity per product
+//     (apiKeyOwnerOverride), whose recorded owner is whoever created its first
+//     key, and a registered service identity cannot be told from it. Using
+//     that owner would let one user's key spend another user's credentials.
 //  4. Nothing: no user.
 func resolveUser(tok jwt.Token, person bool, cred *domain.IssuedCredential, identity *domain.Identity) (string, string) {
 	sub, _ := tok.Subject()
@@ -542,7 +567,10 @@ func refuseServiceGrantParams(req TokenRequest, grant string, tenantAllowed bool
 // an external-principal subject not issued to a session broker; and a
 // resource-bound subject unless the client serves every resource it is bound
 // to.
-func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
+//
+// client is the client the request authenticated as; tokenExchange verified
+// its assertion before routing here.
+func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest, client *domain.OAuthClient) (*domain.AccessToken, error) {
 	cfg := s.serviceTokenCfg()
 	if cfg == nil {
 		return nil, oauthBadRequest(oautherror.UnsupportedGrantType, "the on-behalf exchange is not enabled")
@@ -550,7 +578,7 @@ func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest) (
 	if err := refuseServiceGrantParams(req, "on-behalf exchange", false); err != nil {
 		return nil, err
 	}
-	client, svc, err := s.authenticateServiceClient(ctx, req, cfg, "urn:ietf:params:oauth:grant-type:token-exchange")
+	svc, err := s.checkServiceClient(ctx, client, cfg, "urn:ietf:params:oauth:grant-type:token-exchange")
 	if err != nil {
 		return nil, err
 	}
@@ -589,7 +617,7 @@ func (s *OAuthService) onBehalfExchange(ctx context.Context, req TokenRequest) (
 	if te == "external_principal" && !s.isSessionBrokerToken(tok, cfg) {
 		return nil, refuse("an external-principal token not issued to a session broker")
 	}
-	if cid, _ := jwt.Get[string](tok, "client_id"); cid != "" && s.oauthClientSvc.IsReservedClientID(cid) &&
+	if cid, _ := jwt.Get[string](tok, "client_id"); cid != "" && s.isReservedClientID(cid) &&
 		(te != "external_principal" || !cfg.brokers[cid]) {
 		return nil, refuse("issued to one of this deployment's own clients")
 	}
