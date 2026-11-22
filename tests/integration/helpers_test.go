@@ -305,6 +305,17 @@ func runTests(m *testing.M) int {
 			Names:    []string{testReservedClientID},
 			Prefixes: []string{testReservedClientPrefix},
 		},
+		// Internal service tokens (service_tokens_test.go). Every client named
+		// here is under the reserved prefix.
+		ServiceTokens: zeroid.ServiceTokensConfig{
+			AccountID:             testServiceAccount,
+			ProjectID:             testServiceProject,
+			AssertedTenantClients: []string{testAssertingClient},
+			SessionBrokerClients:  []string{testBrokerClient},
+			ServedResources: map[string][]string{
+				testOnBehalfClient: {testServedResourcePrefix},
+			},
+		},
 		WIMSEDomain: testWIMSE,
 	}
 
@@ -369,6 +380,10 @@ func runTests(m *testing.M) int {
 	// Server.ExternalPrincipalExchange behind its own grant. Tests use it to
 	// mint a person's token without a subject (personToken).
 	srv.RegisterGrant(testUserSessionGrant, func(ctx context.Context, req zeroid.GrantRequest) (*domain.AccessToken, error) {
+		return srv.ExternalPrincipalExchange(ctx, req)
+	})
+	// The same session grant, registered as accepting RFC 8707 resource.
+	srv.RegisterGrantAcceptingResource(testUserSessionResourceGrant, func(ctx context.Context, req zeroid.GrantRequest) (*domain.AccessToken, error) {
 		return srv.ExternalPrincipalExchange(ctx, req)
 	})
 

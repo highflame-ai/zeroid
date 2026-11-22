@@ -60,6 +60,16 @@ type GrantRequest struct {
 	// otherwise. The principal presents the Audience name as `client_id` when
 	// rotating; every rotation re-stamps the same `aud`/scope profile.
 	IssueRefreshToken bool
+	// ClientAssertion and ClientAssertionType are the request's RFC 7523 §2.2
+	// private_key_jwt client authentication, unverified. ClientID is the
+	// client the request names. Server.ExternalPrincipalExchange verifies
+	// them when ClientID is a session broker (ServiceTokensConfig); a handler
+	// must not treat them as authenticated on its own.
+	ClientAssertion     string
+	ClientAssertionType string
+	// Resource is the validated RFC 8707 resource list, on a grant registered
+	// with Server.RegisterGrantAcceptingResource. Always empty otherwise.
+	Resource []string
 }
 
 // Principal is the resolved caller at /oauth2/authorize — the tenant +

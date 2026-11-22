@@ -554,6 +554,14 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	// Client ids only the operator may register (EnsureClient). Validate()
 	// already refused an empty name or prefix.
 	oauthClientSvc.SetReservedClientIDs(cfg.ReservedClientIDs.Names, cfg.ReservedClientIDs.Prefixes)
+	// Internal service tokens: off unless service_tokens names the service
+	// tenant. Validate() already refused a half-configured block.
+	oauthSvc.SetAuditLogRepository(auditRepo)
+	oauthSvc.SetServiceTokens(serviceTokenSettings(cfg.ServiceTokens))
+	if cfg.ServiceTokens.AccountID != "" && len(cfg.ReservedClientIDs.Names)+len(cfg.ReservedClientIDs.Prefixes) == 0 {
+		log.Warn().Msg("service_tokens is set but reserved_client_ids is empty: no client can use the internal service " +
+			"grants until the services' client ids are reserved")
+	}
 	backchannelSvc := service.NewBackchannelService(backchannelRepo, oauthClientSvc, credentialSvc, identitySvc, backchannelCfg)
 	oauthSvc.SetBackchannelService(backchannelSvc)
 
@@ -907,23 +915,43 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // RegisterGrant registers a custom OAuth2 grant type handler.
 // The handler is called when the token endpoint receives a grant_type matching name.
 func (s *Server) RegisterGrant(name string, handler GrantHandler) {
-	s.oauthSvc.RegisterGrant(name, func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
+	s.oauthSvc.RegisterGrant(name, grantAdapter(handler))
+}
+
+// RegisterGrantAcceptingResource registers a custom grant that accepts the RFC
+// 8707 resource parameter, which RegisterGrant's grants refuse with
+// invalid_target. The handler receives the validated list in
+// GrantRequest.Resource and must bind the token it issues to it:
+// ExternalPrincipalExchange does, so a handler that passes its GrantRequest
+// through needs nothing more. A handler that drops it issues an unbound token
+// to a caller that asked for a bound one.
+func (s *Server) RegisterGrantAcceptingResource(name string, handler GrantHandler) {
+	s.oauthSvc.RegisterGrantAcceptingResource(name, grantAdapter(handler))
+}
+
+// grantAdapter presents a token request to a deployer's grant handler.
+func grantAdapter(handler GrantHandler) service.CustomGrantHandler {
+	return func(ctx context.Context, req service.TokenRequest) (*domain.AccessToken, error) {
 		return handler(ctx, GrantRequest{
-			GrantType:         req.GrantType,
-			AccountID:         req.AccountID,
-			ProjectID:         req.ProjectID,
-			UserID:            req.UserID,
-			UserEmail:         req.UserEmail,
-			UserName:          req.UserName,
-			ApplicationID:     req.ApplicationID,
-			Scope:             req.Scope,
-			AdditionalClaims:  req.AdditionalClaims,
-			Role:              req.Role,
-			PrivilegeScope:    req.PrivilegeScope,
-			Audience:          req.Audience,
-			IssueRefreshToken: req.IssueRefreshToken,
+			GrantType:           req.GrantType,
+			AccountID:           req.AccountID,
+			ProjectID:           req.ProjectID,
+			ClientID:            req.ClientID,
+			ClientAssertion:     req.ClientAssertion,
+			ClientAssertionType: req.ClientAssertionType,
+			UserID:              req.UserID,
+			UserEmail:           req.UserEmail,
+			UserName:            req.UserName,
+			ApplicationID:       req.ApplicationID,
+			Scope:               req.Scope,
+			AdditionalClaims:    req.AdditionalClaims,
+			Role:                req.Role,
+			PrivilegeScope:      req.PrivilegeScope,
+			Audience:            req.Audience,
+			IssueRefreshToken:   req.IssueRefreshToken,
+			Resource:            slices.Clone(req.Resource),
 		})
-	})
+	}
 }
 
 // ResolveAPIKey looks up a zid_sk_* API key and returns the resolved
@@ -977,21 +1005,44 @@ func (s *Server) ResolveAPIKey(ctx context.Context, apiKey string) (*APIKeyResol
 // This is the building block for custom grant types like "user_session".
 func (s *Server) ExternalPrincipalExchange(ctx context.Context, req GrantRequest) (*domain.AccessToken, error) {
 	return s.oauthSvc.ExternalPrincipalExchange(ctx, service.TokenRequest{
-		GrantType:         req.GrantType,
-		AccountID:         req.AccountID,
-		ProjectID:         req.ProjectID,
-		UserID:            req.UserID,
-		UserEmail:         req.UserEmail,
-		UserName:          req.UserName,
-		ApplicationID:     req.ApplicationID,
-		Scope:             req.Scope,
-		AdditionalClaims:  req.AdditionalClaims,
-		Role:              req.Role,
-		PrivilegeScope:    req.PrivilegeScope,
-		Audience:          req.Audience,
-		IssueRefreshToken: req.IssueRefreshToken,
-		TrustedService:    true,
+		GrantType:           req.GrantType,
+		AccountID:           req.AccountID,
+		ProjectID:           req.ProjectID,
+		ClientID:            req.ClientID,
+		ClientAssertion:     req.ClientAssertion,
+		ClientAssertionType: req.ClientAssertionType,
+		UserID:              req.UserID,
+		UserEmail:           req.UserEmail,
+		UserName:            req.UserName,
+		ApplicationID:       req.ApplicationID,
+		Scope:               req.Scope,
+		AdditionalClaims:    req.AdditionalClaims,
+		Role:                req.Role,
+		PrivilegeScope:      req.PrivilegeScope,
+		Audience:            req.Audience,
+		IssueRefreshToken:   req.IssueRefreshToken,
+		Resource:            slices.Clone(req.Resource),
+		TrustedService:      true,
 	})
+}
+
+// SetServiceTokens replaces the internal service token settings
+// (Config.ServiceTokens) on a running server, for embedders that build them
+// in code and for tests. It does not validate; build the value with
+// Config.Validate's rules (account_id and project_id together, or neither).
+func (s *Server) SetServiceTokens(cfg ServiceTokensConfig) {
+	s.oauthSvc.SetServiceTokens(serviceTokenSettings(cfg))
+}
+
+// serviceTokenSettings converts the config block to the service's settings.
+func serviceTokenSettings(cfg ServiceTokensConfig) service.ServiceTokenSettings {
+	return service.ServiceTokenSettings{
+		AccountID:             cfg.AccountID,
+		ProjectID:             cfg.ProjectID,
+		AssertedTenantClients: cfg.AssertedTenantClients,
+		SessionBrokerClients:  cfg.SessionBrokerClients,
+		ServedResources:       cfg.ServedResources,
+	}
 }
 
 // OnClaimsIssue registers a claims enricher.
