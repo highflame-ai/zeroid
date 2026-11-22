@@ -114,6 +114,18 @@ type OAuthService struct {
 	// so a test can flip it on a shared server without racing concurrent
 	// introspect/revoke reads under -race.
 	requireTokenInspectionAuth atomic.Bool
+	// allowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a presented subject_token: accepted without
+	// verification. Off by default; see SetAllowUnverifiedExternalPrincipalSubject.
+	allowUnverifiedExternalPrincipalSubject atomic.Bool
+	// serviceTokens holds the internal service token settings (see
+	// service_tokens.go). Nil disables every internal service grant.
+	serviceTokens atomic.Pointer[serviceTokenConfig]
+	// auditRepo receives the audit row the asserted-tenant grant writes.
+	auditRepo *postgres.AuditLogRepository
+	// customGrantResource names the custom grants registered as accepting
+	// the RFC 8707 resource parameter (RegisterGrantAcceptingResource).
+	customGrantResource map[string]bool
 }
 
 // CustomGrantHandler implements a custom OAuth2 grant type.
@@ -275,6 +287,21 @@ var reservedClaims = map[string]bool{
 	ClientAuthClaim: true,
 	"may_act":       true,
 	"scope":         true,
+	// Internal service tokens. `tenant_source` says the issuing grant took the
+	// tenant from the caller rather than from a verified credential, and a
+	// receiver refuses such a token wherever the tenant must be proven.
+	// `resolved_user_id` names the user whose delegated credentials the
+	// subject may use, and `resolved_user_source` says how ZeroID resolved
+	// it; a receiver serves that user's credentials and no other.
+	// `subject_kind` says whether the subject of an on-behalf exchange was a
+	// person's own session or a workload, and a receiver gates person-only
+	// routes on it. All four are worth something only if ZeroID alone writes
+	// them, so neither additional_claims nor any other caller input may set or
+	// remove them.
+	"tenant_source":        true,
+	"resolved_user_id":     true,
+	"resolved_user_source": true,
+	"subject_kind":         true,
 	// Agent self-service (AgentAuthMiddleware) takes the identity it acts on
 	// from `identity_id`, and introspection reports `agent_id`. ZeroID sets
 	// neither, so additional_claims is the only way either reaches a signed
@@ -547,6 +574,12 @@ func (s *OAuthService) verifyRequestingToken(ctx context.Context, tokenStr strin
 	if err != nil || cred == nil || !active {
 		return nil, fmt.Errorf("requesting_token is not active")
 	}
+	// A CIBA chain continues the requesting token's act, so an internal
+	// service token must not start one: the chain would carry a service's
+	// actor, or an asserted tenant, into a token the receiver never asked for.
+	if isInternalServiceToken(parsed, cred, s.serviceTokenCfg(), s.parseWIMSEURI) {
+		return nil, fmt.Errorf("requesting_token is an internal service token")
+	}
 	sub, _ := parsed.Subject()
 	rt := &RequestingToken{
 		JTI: jti, Subject: sub, AccountID: cred.AccountID, ProjectID: cred.ProjectID,
@@ -639,6 +672,18 @@ func (s *OAuthService) SetClientJWKSCache(cache *ClientJWKSCache) {
 	s.clientJWKS = cache
 }
 
+// SetAllowUnverifiedExternalPrincipalSubject makes the external-principal
+// exchange accept a presented subject_token without verifying it, as it did
+// before subject verification. Off (the default) means a presented
+// subject_token must be an active token this server issued, for the same
+// tenant and person the request names. For a deployment whose trusted
+// services present tokens from another issuer on that exchange; such a
+// deployment should move them to the ID-token exchange or send no
+// subject_token instead. atomic so a test can flip it on a shared server.
+func (s *OAuthService) SetAllowUnverifiedExternalPrincipalSubject(allow bool) {
+	s.allowUnverifiedExternalPrincipalSubject.Store(allow)
+}
+
 // SetRequireTokenInspectionAuth toggles strict client authentication on the
 // introspection (RFC 7662) and revocation (RFC 7009) endpoints. When true,
 // anonymous callers are rejected; when false, the accept-and-verify posture
@@ -655,6 +700,21 @@ func (s *OAuthService) RegisterGrant(name string, handler CustomGrantHandler) {
 		s.customGrants = make(map[string]CustomGrantHandler)
 	}
 	s.customGrants[name] = handler
+	// Registering again without the resource option withdraws it.
+	delete(s.customGrantResource, name)
+}
+
+// RegisterGrantAcceptingResource registers a custom grant that accepts the RFC
+// 8707 resource parameter. The handler receives the validated list in
+// TokenRequest.Resource and must bind the token it issues to it (the
+// external-principal exchange does); a custom grant registered with
+// RegisterGrant is refused a resource with invalid_target.
+func (s *OAuthService) RegisterGrantAcceptingResource(name string, handler CustomGrantHandler) {
+	s.RegisterGrant(name, handler)
+	if s.customGrantResource == nil {
+		s.customGrantResource = make(map[string]bool)
+	}
+	s.customGrantResource[name] = true
 }
 
 // TokenRequest represents an OAuth2 token request.
@@ -787,7 +847,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return nil, err
 	}
 	req.Resource = validatedResources
-	if len(req.Resource) > 0 && !grantSupportsResource(req.GrantType) {
+	if len(req.Resource) > 0 && !grantSupportsResource(req.GrantType) && !s.customGrantResource[req.GrantType] {
 		return nil, rejectUnsupportedResource(req, req.GrantType)
 	}
 
@@ -813,6 +873,8 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (*domain.Acc
 		return s.authorizationCode(ctx, req)
 	case "refresh_token":
 		return s.refreshToken(ctx, req)
+	case domain.GrantTypeAssertedTenantURN:
+		return s.assertedTenantGrant(ctx, req)
 	case string(domain.GrantTypeCIBA):
 		if s.backchannelSvc == nil {
 			return nil, oauthBadRequest(oautherror.UnsupportedGrantType, "CIBA is not enabled on this deployment")
@@ -932,6 +994,12 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 				"this client's registration links no identity, so its tenant cannot be derived; "+
 					"link one (identity_id) or send account_id and project_id")
 		}
+		// The service tenant is reached only through a client linked to a
+		// service identity there: an unlinked client takes its tenant from
+		// the request, and anyone can register one.
+		if s.serviceTokenCfg().inServiceTenant(req.AccountID) {
+			return nil, oauthBadRequest(oautherror.UnauthorizedClient, "client is not authorized for this tenant")
+		}
 		identity, err = s.identitySvc.repo.GetByExternalID(ctx, req.ClientID, req.AccountID, req.ProjectID)
 		if err != nil {
 			return nil, oauthUnauthorized(fmt.Sprintf("no identity found for client_id %s", req.ClientID), err)
@@ -942,6 +1010,23 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	}
 	if identity.IsExpired() {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "identity_expired")
+	}
+	// A token in the service tenant is one of the deployment's services
+	// calling as itself, which a receiver recognises by client_id and this
+	// account. Only such a service's own client may mint one, and it lives
+	// at most five minutes.
+	var serviceTokenExpiry *time.Time
+	if cfg := s.serviceTokenCfg(); cfg.inServiceTenant(identity.AccountID) {
+		if _, err := s.requireServiceClient(ctx, client, cfg); err != nil {
+			return nil, err
+		}
+		// Bound to the one receiver it is for, like every internal service token.
+		if len(req.Resource) != 1 {
+			return nil, oauthBadRequest(oautherror.InvalidTarget,
+				"a token in the service tenant requires exactly one resource")
+		}
+		exp := time.Now().Add(serviceTokenMaxTTL * time.Second)
+		serviceTokenExpiry = &exp
 	}
 
 	// Resolve the identity policy — the authority ceiling. Without this
@@ -982,6 +1067,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 		ClientID: client.ClientID,
 
 		ChannelTrustedCredential: client.ChannelTrusted,
+		CredentialExpiresAt:      serviceTokenExpiry,
 	}
 	bindResourceOnIssue(&issue, req.Resource)
 
@@ -1162,6 +1248,28 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		return s.externalIDTokenExchange(ctx, req)
 	}
 	if req.ActorToken == "" {
+		// A session broker naming a person, and one of the deployment's own
+		// services exchanging a caller's token, authenticate as clients and
+		// are routed before the ID-token check, which would otherwise read
+		// any authenticated client with a jwt subject as federation. Both
+		// apply only while internal service tokens are configured.
+		if s.isSessionBrokerRequest(req) {
+			return s.ExternalPrincipalExchange(ctx, req)
+		}
+		if s.isOnBehalfCandidate(req) {
+			// Routed on a VERIFIED client only, so a caller of the paths
+			// below that happens to send a client_id or a stray assertion
+			// keeps its route. A reserved client id is one of the
+			// deployment's own services, which has no other route here:
+			// its failure is reported, not retried elsewhere.
+			client, err := s.authenticateRegisteredClient(ctx, req, false)
+			if err == nil {
+				return s.onBehalfExchange(ctx, req, client)
+			}
+			if s.isReservedClientID(req.ClientID) {
+				return nil, err
+			}
+		}
 		if s.jwtSubjectIsIDTokenExchange(ctx, req) {
 			return s.externalIDTokenExchange(ctx, req)
 		}
@@ -1184,6 +1292,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	subjectCred, active, err := s.credentialSvc.IntrospectToken(ctx, subjectJTI)
 	if err != nil || subjectCred == nil || !active {
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token is inactive or has been revoked")
+	}
+	// An internal service token is bound to one receiver and is never the
+	// root of a delegation: delegating from one would carry a tenant a
+	// service asserted, or a service's own authority, into a tenant's chain.
+	if isInternalServiceToken(subjectParsed, subjectCred, s.serviceTokenCfg(), s.parseWIMSEURI) {
+		return nil, oauthBadRequest(oautherror.InvalidGrant, "subject_token is an internal service token and cannot be delegated")
 	}
 
 	// Step 2: Verify the actor_token (sub-agent's signed JWT assertion).
@@ -1383,6 +1497,14 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 		// unlike the sub/act change the token profile gates.
 		ClientID: actorIdentity.ExternalID,
 	}
+	// No OAuth client authenticated here: the actor proved its identity key,
+	// and external_id is a name its tenant chose. A name the deployment
+	// reserved for its own clients is written as client_id only when that
+	// reserved client is linked to this very identity, so an identity merely
+	// named after one cannot mint a token that reads as that client.
+	if s.oauthClientSvc.IsReservedClientID(issue.ClientID) && !s.clientLinkedTo(ctx, issue.ClientID, actorIdentity.ID) {
+		issue.ClientID = ""
+	}
 	issue.PrincipalType = parent.Type
 	issue.PrincipalSub = parent.Sub
 	issue.PrincipalIss = parent.Iss
@@ -1536,25 +1658,53 @@ func (s *OAuthService) parentPrincipal(subjectParsed jwt.Token, subjectCred *dom
 // resolves tenant context, and calls the token endpoint with:
 //
 //	grant_type=urn:ietf:params:oauth:grant-type:token-exchange
-//	subject_token=<external_jwt>
+//	subject_token=<a token this server issued for user_id>
 //	subject_token_type=urn:ietf:params:oauth:token-type:jwt
 //	account_id=<resolved_tenant>
 //	project_id=<resolved_tenant>
 //	user_id=<external_user_id>
 //
-// ZeroID trusts the caller (verified by TrustedServiceValidator), does not re-verify the
-// external JWT (the trusted service already did), and issues a ZeroID-signed RS256 token
-// with the external principal's claims embedded.
+// ZeroID trusts the caller (verified by TrustedServiceValidator), refuses a
+// workload URI as user_id, verifies a presented subject_token
+// (verifyExternalPrincipalSubject) unless the deployment opted out, and issues
+// a ZeroID-signed RS256 token with the external principal's claims embedded. A
+// deployer's own grant calling this in-process presents no subject_token.
 // ExternalPrincipalExchange issues an RS256 token for an externally-authenticated principal.
 // Exported so deployers can call it from custom grant handlers.
 func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
-	// Step 1: Verify the caller is a trusted internal service.
-	if s.trustedServiceValidator == nil {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "external principal exchange is not configured")
-	}
-	serviceName, err := s.trustedServiceValidator(ctx)
-	if err != nil {
-		return nil, oauthBadRequestCause(oautherror.InvalidGrant, "caller is not a trusted service", err)
+	// Step 1: Verify the caller. A session broker (a client on
+	// service_tokens.session_broker_clients) authenticates as that client and
+	// nothing else: its client authentication must pass, the trusted-service
+	// validator is not consulted, and the token names the client in both
+	// client_id and trusted_by. Every other caller must pass the validator,
+	// and its token carries no client_id.
+	var serviceName, brokerClientID string
+	if s.isSessionBrokerRequest(req) {
+		client, _, err := s.authenticateServiceClient(ctx, req, s.serviceTokenCfg(), "")
+		if err != nil {
+			return nil, err
+		}
+		serviceName, brokerClientID = client.ClientID, client.ClientID
+	} else {
+		if s.trustedServiceValidator == nil {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "external principal exchange is not configured")
+		}
+		name, err := s.trustedServiceValidator(ctx)
+		if err != nil {
+			return nil, oauthBadRequestCause(oautherror.InvalidGrant, "caller is not a trusted service", err)
+		}
+		// The validator's name becomes trusted_by. A reserved client id or a
+		// session broker's id there would let any caller the validator admits
+		// mint a token that reads as one of the deployment's own services,
+		// which a receiver may trust: those names are reached only through
+		// the broker path, which authenticates the client itself.
+		if cfg := s.serviceTokenCfg(); s.isReservedClientID(name) || (cfg != nil && cfg.brokers[name]) {
+			log.Warn().Str("trusted_service", name).
+				Msg("external principal exchange refused a trusted-service caller whose name is a reserved client id " +
+					"or a session broker; that service must authenticate as its client (service_tokens.session_broker_clients)")
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "caller is not a trusted service")
+		}
+		serviceName = name
 	}
 
 	// Step 2: Validate required fields. The trusted service is responsible for
@@ -1564,6 +1714,37 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 	if req.UserID == "" {
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id is required for external principal exchange")
+	}
+	// The service tenant holds the deployment's services and no person. A
+	// broker's token there would carry its client_id in that account, which
+	// is how a receiver recognises the service itself.
+	if s.serviceTokenCfg().inServiceTenant(req.AccountID) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "the service tenant cannot be named")
+	}
+	// The exchange mints a token whose sub is user_id and whose principal is
+	// a person. A WIMSE/SPIFFE URI names a workload, so minting it as a person
+	// would let a workload be presented downstream as someone's own session.
+	if isWorkloadURI(req.UserID) {
+		return nil, oauthBadRequest(oautherror.InvalidRequest, "user_id must name a person, not a workload identity URI")
+	}
+	// A subject_token, when the caller presents one, must back the request:
+	// an active token this server issued, in the named tenant, whose person
+	// is user_id. A caller that presents none is trusted on the
+	// TrustedServiceValidator alone, as before.
+	if req.SubjectToken != "" && !s.allowUnverifiedExternalPrincipalSubject.Load() {
+		if err := s.verifyExternalPrincipalSubject(ctx, req); err != nil {
+			// The response does not say which check failed; the log does, and
+			// names the opt-out, since a deployment whose trusted service
+			// relays another issuer's token first meets this on upgrade.
+			var oe *OAuthError
+			if errors.As(err, &oe) && oe.Code == oautherror.InvalidGrant {
+				log.Warn().Err(errors.Unwrap(err)).Str("trusted_service", serviceName).
+					Msg("external principal exchange refused its subject_token; a trusted service that presents " +
+						"another issuer's token there needs token.allow_unverified_external_principal_subject " +
+						"until it moves to the ID-token exchange")
+			}
+			return nil, err
+		}
 	}
 
 	// Step 3: Resolve the identity for the token.
@@ -1706,6 +1887,15 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 		DPoPKeyThumbprint:  req.DPoPKeyThumbprint,
 		TrustedRole:        req.Role,
 		PersonGrantType:    PersonGrantExternalPrincipal,
+		// RFC 9068 §2.2: set only when a session broker authenticated as
+		// this client; empty on the validator path.
+		ClientID: brokerClientID,
+	}
+	// A token bound to one resource server lives no longer than an internal
+	// service token: it is what a broker presents to that server on the
+	// person's behalf.
+	if len(req.Resource) > 0 && issue.TTL > serviceTokenMaxTTL {
+		issue.TTL = serviceTokenMaxTTL
 	}
 	// The external-principal exchange binds too. It cannot collide with the
 	// audience profile above — `audience` and `resource` are mutually exclusive
@@ -1782,6 +1972,112 @@ func (s *OAuthService) ExternalPrincipalExchange(ctx context.Context, req TokenR
 	}
 
 	return accessToken, nil
+}
+
+// delegationDepthOf reads delegation_depth whatever numeric type holds it: a
+// parsed token carries float64, a token built in memory may carry an int.
+func delegationDepthOf(tok jwt.Token) int {
+	v, err := jwt.Get[any](tok, "delegation_depth")
+	if err != nil {
+		return 0
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	}
+	return 0
+}
+
+// clientLinkedTo reports whether the registered client clientID is linked to
+// identityID. Any lookup failure reads as "not linked": the caller then
+// withholds a claim rather than writes one it could not confirm.
+func (s *OAuthService) clientLinkedTo(ctx context.Context, clientID, identityID string) bool {
+	c, err := s.oauthClientSvc.GetClientByClientID(ctx, clientID)
+	return err == nil && c.IdentityID != nil && *c.IdentityID == identityID
+}
+
+// isWorkloadURI reports whether v is a SPIFFE/WIMSE workload URI, ignoring
+// case and surrounding space, so "SPIFFE://..." is caught too.
+func isWorkloadURI(v string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "spiffe://")
+}
+
+// verifyExternalPrincipalSubject checks that the external-principal exchange's
+// subject_token backs the request: it is a token this server issued, its
+// signature and expiry hold, it has not been revoked, its tenant is the
+// request's account_id and project_id, and the person it names is user_id.
+// Every failure is invalid_grant, and none says which check failed.
+func (s *OAuthService) verifyExternalPrincipalSubject(ctx context.Context, req TokenRequest) error {
+	refuse := func(cause error) error {
+		return oauthBadRequestCause(oautherror.InvalidGrant, "subject_token does not back this exchange", cause)
+	}
+	parsed, err := s.parseToken(req.SubjectToken, true)
+	if err != nil {
+		return refuse(err)
+	}
+	jti, _ := parsed.JwtID()
+	if jti == "" {
+		return refuse(errors.New("subject_token has no jti"))
+	}
+	cred, active, err := s.credentialSvc.IntrospectToken(ctx, jti)
+	if err != nil {
+		// A store failure is not a bad token: let the caller retry.
+		return oauthServerError("failed to check subject_token", err)
+	}
+	if cred == nil || !active {
+		return refuse(errors.New("subject_token is inactive or revoked"))
+	}
+	if isInternalServiceToken(parsed, cred, s.serviceTokenCfg(), s.parseWIMSEURI) {
+		return refuse(errors.New("subject_token is an internal service token"))
+	}
+	// The credential row, not the token, is the tenant of record.
+	if cred.AccountID != req.AccountID || cred.ProjectID != req.ProjectID {
+		return refuse(errors.New("subject_token is for another tenant"))
+	}
+	if person := subjectPerson(parsed); person == "" || person != req.UserID {
+		return refuse(errors.New("subject_token names a different person, or none"))
+	}
+	return nil
+}
+
+// subjectPerson returns the person a verified token acts for, or "" when it
+// acts for none. Under the rfc8693 profile that is sub when principal_type is
+// user. Under the legacy profile it is the user_id claim, else, on a
+// delegated token, an act.sub that is not a workload URI, else sub when it is
+// not a workload URI. A workload URI never qualifies.
+//
+// This is the ladder resource servers use to find the person behind a chain,
+// so a caller can name in user_id exactly the person a token it verified acts
+// for, and no one else.
+func subjectPerson(tok jwt.Token) string {
+	person := func(v string) string {
+		if v == "" || isWorkloadURI(v) {
+			return ""
+		}
+		return v
+	}
+	sub, _ := tok.Subject()
+	if pt, err := jwt.Get[string](tok, "principal_type"); err == nil && pt != "" {
+		if pt == string(domain.PrincipalUser) {
+			return person(sub)
+		}
+		return ""
+	}
+	if uid, _ := jwt.Get[string](tok, "user_id"); person(uid) != "" {
+		return uid
+	}
+	if delegationDepthOf(tok) >= 1 {
+		if act, err := jwt.Get[map[string]any](tok, "act"); err == nil {
+			if actSub, _ := act["sub"].(string); person(actSub) != "" {
+				return actSub
+			}
+		}
+	}
+	return person(sub)
 }
 
 // APIKeyResolution is the public result of OAuthService.ResolveAPIKey —

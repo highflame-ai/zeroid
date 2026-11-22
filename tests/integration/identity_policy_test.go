@@ -711,8 +711,7 @@ func TestIdentityPolicy_ExternalPrincipalPolicyRefusal(t *testing.T) {
 
 	exchange := func(scope string) (int, map[string]any) {
 		resp := post(t, "/oauth2/token", map[string]any{
-			"grant_type":     "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":  "external-principal-assertion",
+			"grant_type":     testUserSessionGrant,
 			"account_id":     testAccountID,
 			"project_id":     testProjectID,
 			"user_id":        uid("ep-refusal-user"),

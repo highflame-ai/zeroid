@@ -73,14 +73,10 @@ func TestAPIKeyGrant_CarriesKeyID(t *testing.T) {
 // TestAPIKeyID_CannotBeForgedViaAdditionalClaims: the broker path filters
 // additional_claims by reservedClaims; api_key_id must be dropped.
 func TestAPIKeyID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
-	resp := post(t, "/oauth2/token", map[string]any{
-		"grant_type":        "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token":     "external-principal-assertion",
-		"account_id":        testAccountID,
-		"project_id":        testProjectID,
-		"user_id":           uid("keyid-user"),
-		"additional_claims": map[string]any{"api_key_id": "00000000-0000-0000-0000-000000000001"},
-	}, map[string]string{testTrustedServiceHeader: "trusted-service"})
+	user := uid("keyid-user")
+	body := brokerExchange(personToken(t, testAccountID, testProjectID, user), testAccountID, testProjectID, user)
+	body["additional_claims"] = map[string]any{"api_key_id": "00000000-0000-0000-0000-000000000001"}
+	resp := post(t, "/oauth2/token", body, trustedServiceHeaders)
 	require.Equal(t, http.StatusOK, resp.StatusCode, "reserved claims are dropped, not fatal")
 	defer func() { _ = resp.Body.Close() }()
 	claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))

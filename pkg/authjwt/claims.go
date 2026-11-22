@@ -126,6 +126,15 @@ type ActorClaims struct {
 	TrustLevel   string `json:"trust_level,omitempty"`
 	ExternalID   string `json:"external_id,omitempty"`
 
+	// ClientID is `act.client_id`: the OAuth client the current actor
+	// authenticated as in the grant that minted this token. ZeroID writes it
+	// only from that client authentication, on the current actor only, and
+	// never copies it from a parent token; `act` is reserved, so a caller
+	// cannot set it. Only the on-behalf exchange and the asserted-tenant
+	// grant authenticate the actor as a client; on every other token it is
+	// empty. Read it through Claims.ActorClientID.
+	ClientID string `json:"client_id,omitempty"`
+
 	// Actor is the prior actor, if any (RFC 8693 §4.1 nesting).
 	Actor *ActorClaims `json:"act,omitempty"`
 }
@@ -211,6 +220,113 @@ func (c *Claims) GetCustom(key string) (any, bool) {
 	}
 	v, ok := c.Custom[key]
 	return v, ok
+}
+
+// ClientID returns the RFC 9068 §2.2 `client_id` claim: the OAuth client the
+// token was issued to, set by ZeroID from the client the grant authenticated
+// or resolved. ZeroID reserves the claim, so a caller cannot set it. Empty
+// when the grant involved no OAuth client (an api_key token, for one).
+//
+// A client_id is a name chosen at registration. To identify a calling
+// service, pair it with something the deployer controls, such as the account
+// the token was issued in; do not trust it alone.
+func (c *Claims) ClientID() string {
+	return c.GetCustomString("client_id")
+}
+
+// ActorClientID returns the outermost `act.client_id`: the OAuth client the
+// current actor authenticated as in the grant that minted this token. Empty
+// when the token has no actor, or when its grant did not authenticate the
+// actor as a client. Only the internal service grants write it: the on-behalf
+// exchange and the asserted-tenant grant. ZeroID never copies it from a
+// parent token, so it describes this token's grant only. A resource server
+// identifying the actor checks it together with `act.sub`, never alone.
+func (c *Claims) ActorClientID() string {
+	if c.ActorClaims == nil {
+		return ""
+	}
+	return c.ActorClaims.ClientID
+}
+
+// TenantSource returns the reserved `tenant_source` claim, which says how
+// the issuing grant chose the token's tenant when that was anything other
+// than the credential the token was minted from: "asserted" when the
+// authenticated caller named the tenant. Empty on every token whose tenant
+// came from the credential itself. A resource server that must know the
+// tenant was proven, not asserted, refuses a token where this is non-empty.
+func (c *Claims) TenantSource() string {
+	return c.GetCustomString("tenant_source")
+}
+
+// ResolvedUserID returns the reserved `resolved_user_id` claim: the user
+// whose delegated credentials the token's subject may use, resolved by ZeroID
+// at issuance from verified data only. Empty when ZeroID resolved no user,
+// which a resource server must treat as "no user", never as "any user".
+func (c *Claims) ResolvedUserID() string {
+	return c.GetCustomString("resolved_user_id")
+}
+
+// ResolvedUserSource returns the reserved `resolved_user_source` claim, which
+// says how ResolvedUserID was resolved (for example the subject itself, the
+// person a workload acts for, or the workload's owner). Empty when
+// ResolvedUserID is.
+func (c *Claims) ResolvedUserSource() string {
+	return c.GetCustomString("resolved_user_source")
+}
+
+// Values of the reserved claims internal service tokens carry.
+const (
+	// TenantSourceAsserted is TenantSource on an asserted-tenant token: the
+	// calling service named the tenant.
+	TenantSourceAsserted = "asserted"
+	// SubjectKindPerson and SubjectKindWorkload are SubjectKind on an
+	// on-behalf token: its subject was a person's own session, or anything
+	// else.
+	SubjectKindPerson   = "person"
+	SubjectKindWorkload = "workload"
+	// ResolvedUserSource values: the subject was the person, a workload
+	// acting for the person, or a workload owned by the person.
+	ResolvedUserSourceSubject  = "subject"
+	ResolvedUserSourceOnBehalf = "on_behalf"
+	ResolvedUserSourceOwner    = "owner"
+	// TokenExchangeOnBehalf is TokenExchange on an on-behalf token.
+	TokenExchangeOnBehalf = "on_behalf"
+	// GrantTypeAssertedTenant is GrantType on an asserted-tenant token.
+	GrantTypeAssertedTenant = "asserted_tenant"
+)
+
+// SubjectKind returns the reserved `subject_kind` claim of an on-behalf
+// token: SubjectKindPerson when its subject token was a person's own session
+// (an external-principal token from a session broker, or an ID-token
+// exchange, with no actor and no resource binding), SubjectKindWorkload
+// otherwise. ZeroID classifies the subject from its verified claims, never
+// from `sub` alone, since many workload-held tokens carry a person's sub.
+// Empty on every other token. A route only a person may use requires
+// SubjectKindPerson.
+func (c *Claims) SubjectKind() string {
+	return c.GetCustomString("subject_kind")
+}
+
+// TokenExchange returns the reserved `token_exchange` claim, which names the
+// kind of token exchange that minted the token: TokenExchangeOnBehalf for the
+// on-behalf exchange, and for example "external_principal" or
+// "external_id_token" for a person's session. Empty on tokens no exchange
+// minted.
+func (c *Claims) TokenExchange() string {
+	return c.GetCustomString("token_exchange")
+}
+
+// RequireResource returns ErrResourceMismatch unless the token's reserved
+// RFC 8707 `resource` claim contains id. Use it, after Verify, to check that
+// a token was bound to this resource server at the mint. Audience is not a
+// substitute: ZeroID writes any requested resource to `aud` and defaults
+// `aud` to its issuer, so only the reserved claim records a binding. An
+// empty id never matches.
+func (c *Claims) RequireResource(id string) error {
+	if id != "" && slices.Contains(c.Resource, id) {
+		return nil
+	}
+	return fmt.Errorf("%w: required %q, have %v", ErrResourceMismatch, id, c.Resource)
 }
 
 // HasScope returns true if the token's scopes include the given scope.
@@ -495,6 +611,11 @@ func parseActorClaimsDepth(raw any, depth int) *ActorClaims {
 		act.IdentityType, _ = v["identity_type"].(string)
 		act.TrustLevel, _ = v["trust_level"].(string)
 		act.ExternalID, _ = v["external_id"].(string)
+		// Only the outermost level carries client_id; a nested one is not
+		// read, so a prior actor never looks like an authenticated client.
+		if depth == 0 {
+			act.ClientID, _ = v["client_id"].(string)
+		}
 		if nested, ok := v["act"]; ok && depth+1 < maxActorChain {
 			act.Actor = parseActorClaimsDepth(nested, depth+1)
 		}

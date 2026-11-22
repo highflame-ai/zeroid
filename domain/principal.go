@@ -86,6 +86,14 @@ type Actor struct {
 	IdentityType string `json:"identity_type,omitempty"`
 	TrustLevel   string `json:"trust_level,omitempty"`
 	ExternalID   string `json:"external_id,omitempty"`
+	// ClientID is the OAuth client the current actor authenticated as in the
+	// grant that minted this token, emitted as `act.client_id`. Only a grant
+	// that authenticated the actor as that client sets it. A resource server
+	// pairs it with `act.sub` to identify the actor, so it is never carried
+	// over from a parent token: it records this grant's client
+	// authentication, not an earlier one's. Like the other attributes, it is
+	// emitted on the current actor only.
+	ClientID string `json:"client_id,omitempty"`
 }
 
 // TokenProfile selects the claim shape a tenant's tokens are issued in.
