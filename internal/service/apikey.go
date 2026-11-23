@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
@@ -27,8 +29,15 @@ import (
 // omission is caller-fixable, so handlers map this to 400.
 var ErrIdentityLinkRequired = errors.New("identity_id or product is required")
 
+// ErrScopeHasWhitespace is returned by CreateKey for a scope containing
+// whitespace. A scope is one token (RFC 6749 §3.3); "a highflame.x" would be
+// checked as one string here but read as two wherever the space-delimited
+// `scope` claim is split. Handlers map it to 400.
+var ErrScopeHasWhitespace = errors.New("a scope must not contain whitespace")
+
 // APIKeyService handles CRUD operations for API keys (zid_sk_* keys).
 type APIKeyService struct {
+	reserved            *ReservedScopes
 	repo                *postgres.APIKeyRepository
 	credentialPolicySvc *CredentialPolicyService
 	identitySvc         *IdentityService
@@ -87,12 +96,23 @@ type CreateAPIKeyResponse struct {
 // policy; the tenant's default policy is auto-created and assigned only when the
 // identity has no policy of its own.
 func (s *APIKeyService) CreateKey(ctx context.Context, req CreateAPIKeyRequest) (*CreateAPIKeyResponse, error) {
+	for _, sc := range req.Scopes {
+		if strings.ContainsFunc(sc, unicode.IsSpace) {
+			return nil, fmt.Errorf("%w: %q", ErrScopeHasWhitespace, sc)
+		}
+	}
 	// Approval-channel grants need a trusted caller (approval_channel_write.go).
 	if err := requireTrustedApprovalChannelWrite(ctx, "", req.Scopes); err != nil {
 		return nil, err
 	}
 	if err := requireTrustedPolicyAttachment(ctx, s.credentialPolicySvc, req.CredentialPolicyID, req.AccountID, req.ProjectID); err != nil {
 		return nil, err
+	}
+	// Reserved scopes (the deployer's own, see ReservedScopes) go onto a key
+	// only from the deployer's trusted path. Keys have no scope-update path,
+	// so this create is the only place a key's scopes are written.
+	if len(s.reserved.in(req.Scopes)) > 0 && !ReservedScopeWrite(ctx) {
+		return nil, ErrReservedScopeWriteNotTrusted
 	}
 	// Every key has an identity link, and the caller supplies one of the two
 	// ways to establish it. Reject the empty case here rather than letting an

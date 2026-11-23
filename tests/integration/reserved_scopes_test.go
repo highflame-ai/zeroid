@@ -1,0 +1,233 @@
+package integration_test
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// The harness reserves testReservedPrefix (Server.SetReservedScopes) with an
+// authorizer that refuses keys created by testDemotedUser.
+const (
+	testReservedPrefix           = "testreserved."
+	testReservedScope            = "testreserved.config.manage"
+	testReservedMaxTTL           = 2 * time.Minute // well under the 1h default, so the cap shows
+	testDemotedUser              = "demoted-user"
+	testBrokenAuthorizerUser     = "broken-authorizer-user"
+	testReservedScopeWriteHeader = "X-Test-Reserved-Scope-Write"
+)
+
+// createProductKey creates a product key (linked to an auto-provisioned
+// service identity, created by createdBy) and returns status, key ID and key.
+func createProductKey(t *testing.T, createdBy string, scopes []string, trusted bool) (int, string, string) {
+	t.Helper()
+	headers := adminHeaders()
+	headers["X-User-ID"] = createdBy
+	if trusted {
+		headers[testReservedScopeWriteHeader] = "1"
+	}
+	body := map[string]any{"name": uid("rs-key"), "product": uid("rs-product")}
+	if scopes != nil {
+		body["scopes"] = scopes
+	}
+	resp := post(t, adminPath("/api-keys"), body, headers)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusCreated {
+		return resp.StatusCode, "", ""
+	}
+	created := decode(t, resp)
+	return resp.StatusCode, created["id"].(string), created["key"].(string)
+}
+
+// exchangeKey runs the api_key grant, optionally naming a scope.
+func exchangeKey(t *testing.T, key, scope string) (int, map[string]any) {
+	t.Helper()
+	body := map[string]any{"grant_type": "api_key", "api_key": key}
+	if scope != "" {
+		body["scope"] = scope
+	}
+	resp := post(t, "/oauth2/token", body, nil)
+	defer func() { _ = resp.Body.Close() }()
+	return resp.StatusCode, decode(t, resp)
+}
+
+// TestAPIKeyGrant_CarriesKeyID: ADR 0051 D2. The api_key grant names the key
+// it was minted from, for audit.
+func TestAPIKeyGrant_CarriesKeyID(t *testing.T) {
+	status, keyID, key := createProductKey(t, "test-user", nil, false)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "")
+	require.Equal(t, http.StatusOK, code)
+	claims := decodeJWTPayload(t, body["access_token"].(string))
+	assert.Equal(t, keyID, claims["api_key_id"])
+	assert.Equal(t, "api_key", claims["grant_type"])
+}
+
+// TestAPIKeyID_CannotBeForgedViaAdditionalClaims: the broker path filters
+// additional_claims by reservedClaims; api_key_id must be dropped.
+func TestAPIKeyID_CannotBeForgedViaAdditionalClaims(t *testing.T) {
+	user := uid("keyid-user")
+	body := brokerExchange(personToken(t, testAccountID, testProjectID, user), testAccountID, testProjectID, user)
+	body["additional_claims"] = map[string]any{"api_key_id": "00000000-0000-0000-0000-000000000001"}
+	resp := post(t, "/oauth2/token", body, trustedServiceHeaders)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "reserved claims are dropped, not fatal")
+	defer func() { _ = resp.Body.Close() }()
+	claims := decodeJWTPayload(t, decode(t, resp)["access_token"].(string))
+	assert.NotContains(t, claims, "api_key_id")
+}
+
+// TestAPIKeyID_NotCarriedThroughExchange: a token delegated from an api_key
+// token is not minted from a key, so it must not name one.
+func TestAPIKeyID_NotCarriedThroughExchange(t *testing.T) {
+	scopes := []string{"data:read"}
+	tn := newTenant(t, "rfc8693")
+	root, _ := tn.apiKeyRoot(t, scopes)
+	require.NotEmpty(t, decodeJWTPayload(t, root)["api_key_id"])
+
+	body, _ := tn.exchange(t, tn.policy(t, scopes), uid("keyid-child"), scopes, root)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string)), "api_key_id")
+}
+
+// Only the deployer's trusted path writes a reserved scope onto a key.
+func TestReservedScope_WriteNeedsTrustedPath(t *testing.T) {
+	status, _, _ := createProductKey(t, "test-user", []string{testReservedScope}, false)
+	assert.Equal(t, http.StatusForbidden, status)
+
+	status, _, _ = createProductKey(t, "test-user", []string{testReservedScope}, true)
+	assert.Equal(t, http.StatusCreated, status)
+}
+
+// A key that does not list the scope cannot ask for it, even though its
+// unbounded ceiling would grant any other scope by name.
+func TestReservedScope_UnlistedKeyCannotAsk(t *testing.T) {
+	status, _, key := createProductKey(t, "test-user", nil, false)
+	require.Equal(t, http.StatusCreated, status)
+	code, body := exchangeKey(t, key, testReservedScope)
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_scope", body["error"])
+
+	// An agent's key, the other common shape, is refused the same way.
+	agent := registerAgent(t, uid("rs-agent"))
+	code, body = exchangeKey(t, agent.APIKey, testReservedScope)
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_scope", body["error"])
+}
+
+// A key that lists the scope gets it without asking, named for its creator,
+// tied to the key, and capped at the reserved lifetime.
+func TestReservedScope_ListedKeyIsIssued(t *testing.T) {
+	status, keyID, key := createProductKey(t, "test-user", []string{testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	claims := decodeJWTPayload(t, body["access_token"].(string))
+	assert.Contains(t, claims["scopes"], testReservedScope)
+	assert.Equal(t, "test-user", claims["owner_user_id"])
+	assert.Equal(t, keyID, claims["api_key_id"])
+	lifetime := claims["exp"].(float64) - claims["iat"].(float64)
+	assert.LessOrEqual(t, lifetime, testReservedMaxTTL.Seconds())
+}
+
+// A key listing a reserved scope, asked for only its ordinary scopes, gets
+// them without the authorizer being consulted: the demoted creator's key is
+// not refused.
+func TestReservedScope_SubsetRequestSkipsAuthorizer(t *testing.T) {
+	status, _, key := createProductKey(t, testDemotedUser, []string{"data:read", testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "data:read")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope)
+}
+
+// A scope with whitespace inside it would hide a reserved scope from the
+// checks and reappear in the space-delimited scope claim, so it is refused.
+func TestReservedScope_WhitespaceInScopeRefused(t *testing.T) {
+	for _, s := range []string{"data:read " + testReservedScope, " " + testReservedScope} {
+		status, _, _ := createProductKey(t, "test-user", []string{s}, false)
+		assert.Equal(t, http.StatusBadRequest, status, "scope=%q", s)
+	}
+}
+
+// The deployer's authorizer can refuse the exchange (Highflame: the creator
+// is no longer an org owner or admin).
+func TestReservedScope_AuthorizerRefuses(t *testing.T) {
+	status, _, key := createProductKey(t, testDemotedUser, []string{testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_grant", body["error"])
+}
+
+// An authorizer that fails (not refuses) fails the grant closed, without
+// passing its error text to the client.
+func TestReservedScope_AuthorizerFailureIsServerError(t *testing.T) {
+	status, _, key := createProductKey(t, testBrokenAuthorizerUser, []string{testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+
+	code, body := exchangeKey(t, key, "")
+	assert.Equal(t, http.StatusInternalServerError, code)
+	assert.Equal(t, "server_error", body["error"])
+	assert.NotContains(t, body["error_description"], "internal-admin")
+}
+
+// A token carrying a reserved scope cannot pass it on: an RFC 8693 exchange
+// that names it is refused, while the same subject token still delegates its
+// ordinary scopes. (An exchange naming no scope is refused anyway: it has no
+// default.) The api_key grant issues no refresh token, so there is no refresh
+// path to cover.
+func TestReservedScope_NotCarriedThroughExchange(t *testing.T) {
+	status, _, key := createProductKey(t, "test-user", []string{"data:read", testReservedScope}, true)
+	require.Equal(t, http.StatusCreated, status)
+	code, body := exchangeKey(t, key, "")
+	require.Equal(t, http.StatusOK, code, "%v", body)
+	assert.NotContains(t, body, "refresh_token")
+	root := body["access_token"].(string)
+	require.Contains(t, decodeJWTPayload(t, root)["scopes"], testReservedScope)
+
+	// The actor's ceilings allow the reserved scope, so only the reserved-scope
+	// rule can stop it.
+	tn := hrdTenant{account: testAccountID, project: testProjectID, headers: adminHeaders()}
+	scopes := []string{"data:read", testReservedScope}
+	policyID := tn.policy(t, scopes)
+	exchange := func(scope string) (int, map[string]any) {
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		wimse := tn.register(t, uid("rs-actor"), policyID, ecPublicKeyPEM(t, k), scopes)
+		req := map[string]any{
+			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
+			"subject_token": root,
+			"actor_token":   buildAssertion(t, k, wimse),
+		}
+		if scope != "" {
+			req["scope"] = scope
+		}
+		resp := post(t, "/oauth2/token", req, nil)
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode, decode(t, resp)
+	}
+
+	code, body = exchange("data:read")
+	require.Equal(t, http.StatusOK, code, "the subject token still delegates ordinary scopes: %v", body)
+	assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope)
+
+	for _, scope := range []string{testReservedScope, "data:read " + testReservedScope} {
+		code, body = exchange(scope)
+		if code == http.StatusOK {
+			assert.NotContains(t, decodeJWTPayload(t, body["access_token"].(string))["scopes"], testReservedScope, "scope=%q", scope)
+			continue
+		}
+		// The exchange reports the chokepoint's refusal as insufficient_scope.
+		assert.Equal(t, http.StatusBadRequest, code, "scope=%q: %v", scope, body)
+		assert.Contains(t, body["error_description"], "is issued only on the api_key grant", "scope=%q: %v", scope, body)
+	}
+}
