@@ -13,6 +13,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	internalMiddleware "github.com/highflame-ai/zeroid/internal/middleware"
 	"github.com/highflame-ai/zeroid/internal/service"
+	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
 // ── API key types ────────────────────────────────────────────────────────────
@@ -47,6 +48,8 @@ type APIKeyListInput struct {
 	Product       string `query:"product" doc:"Filter by product namespace"`
 	ApplicationID string `query:"application_id" doc:"Filter by owning identity ID (any identity type)"`
 	IdentityID    string `query:"identity_id" doc:"Filter by owning identity ID. Alias of application_id"`
+	IdentityType  string `query:"identity_type" enum:"agent,application,mcp_server,service" doc:"Filter by the type of the key's identity (agent, application, mcp_server, service); product keys belong to a service identity"`
+	CreatedBy     string `query:"created_by" doc:"Filter by the user who created the key"`
 	State         string `query:"state" enum:"active,revoked,expired" doc:"Filter by key state (active, revoked, expired)"`
 	Label         string `query:"label" doc:"Filter by identity label (key:value, e.g. env:production)"`
 	Page          int    `query:"page" default:"1" doc:"Page number"`
@@ -203,7 +206,14 @@ func (a *API) listAPIKeysOp(ctx context.Context, input *APIKeyListInput) (*APIKe
 		}
 	}
 
-	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, ownerID, input.Product, input.State, input.Label, input.Page, input.Limit)
+	keys, total, err := a.apiKeySvc.ListKeys(ctx, tenant.AccountID, tenant.ProjectID, postgres.APIKeyListFilter{
+		IdentityID:   ownerID,
+		IdentityType: domain.IdentityType(input.IdentityType),
+		CreatedBy:    input.CreatedBy,
+		Product:      input.Product,
+		State:        input.State,
+		Label:        input.Label,
+	}, input.Page, input.Limit)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to list API keys")
 		return nil, huma.Error500InternalServerError("failed to list API keys")

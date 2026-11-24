@@ -201,3 +201,54 @@ func TestCreateAPIKey_IdentityIDOnlyAccepted(t *testing.T) {
 	assert.Equal(t, identityID, decode(t, fetched)["identity_id"],
 		"the created key must stay linked to the identity the caller named")
 }
+
+// TestAPIKeyListFilters_CreatedByAndIdentityType covers the two list filters
+// a key console needs: keys one person created (created_by), and keys bound to
+// one kind of identity (identity_type), e.g. every agent's keys without the
+// shared product keys.
+func TestAPIKeyListFilters_CreatedByAndIdentityType(t *testing.T) {
+	alice, bob := uid("alice"), uid("bob")
+	product := uid("console")
+
+	asUser := func(user string) map[string]string {
+		h := adminHeaders()
+		h["X-User-ID"] = user
+		return h
+	}
+
+	// Alice: a shared product key (bound to the product's service identity).
+	resp := post(t, adminPath("/api-keys"), map[string]any{"name": "alice-product", "product": product}, asUser(alice))
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	productKey := decode(t, resp)
+
+	// Bob: a key for an agent.
+	agent := registerIdentity(t, uid("agent"), nil)
+	resp = post(t, adminPath("/api-keys"), map[string]any{"name": "bob-agent", "identity_id": agent.ID}, asUser(bob))
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	agentKey := decode(t, resp)
+
+	ids := func(path string) []string {
+		t.Helper()
+		resp := get(t, adminPath(path), adminHeaders())
+		require.Equal(t, http.StatusOK, resp.StatusCode, path)
+		var out []string
+		for _, k := range decode(t, resp)["keys"].([]any) {
+			out = append(out, k.(map[string]any)["id"].(string))
+		}
+		return out
+	}
+
+	assert.Equal(t, []string{productKey["id"].(string)}, ids("/api-keys?created_by="+alice), "only Alice's key")
+	assert.Equal(t, []string{agentKey["id"].(string)}, ids("/api-keys?created_by="+bob), "only Bob's key")
+
+	agentKeys := ids("/api-keys?identity_type=agent&limit=100")
+	assert.Contains(t, agentKeys, agentKey["id"], "the agent's key is an agent key")
+	assert.NotContains(t, agentKeys, productKey["id"], "a product key belongs to a service identity, not an agent")
+	assert.Equal(t, []string{productKey["id"].(string)}, ids("/api-keys?identity_type=service&product="+product))
+
+	// Filters combine.
+	assert.Empty(t, ids("/api-keys?created_by="+alice+"&identity_type=agent"))
+
+	resp = get(t, adminPath("/api-keys?identity_type=robot"), adminHeaders())
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, "an unknown identity type is refused by validation")
+}

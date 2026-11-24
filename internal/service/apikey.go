@@ -297,8 +297,8 @@ func (s *APIKeyService) ListExpiringSoon(ctx context.Context, accountID, project
 	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
 }
 
-// ListKeys returns paginated API keys for an account/project.
-func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, applicationID, product, state, label string, page, limit int) ([]*domain.APIKey, int, error) {
+// ListKeys returns paginated API keys for an account/project, narrowed by f.
+func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID string, f postgres.APIKeyListFilter, page, limit int) ([]*domain.APIKey, int, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -307,7 +307,7 @@ func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID, appl
 	}
 	offset := (page - 1) * limit
 
-	return s.repo.ListByAccountProject(ctx, accountID, projectID, applicationID, product, state, label, limit, offset)
+	return s.repo.ListByAccountProject(ctx, accountID, projectID, f, limit, offset)
 }
 
 // GetKey returns an API key by ID, scoped to the given tenant. Cross-tenant

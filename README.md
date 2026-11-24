@@ -998,6 +998,7 @@ only when `Server.EnsureClient` is called with a marked context.
 | GET | `/oauth/clients`, `/oauth/clients/{id}` | List or get OAuth2 clients. With a tenant in context, only clients linked to an identity in that tenant |
 | POST, DELETE | `/oauth/clients/{id}/rotate-secret`, `/oauth/clients/{id}` | Rotate a secret or delete a client, under the same visibility rule: an unlinked client is reached only with no tenant in context |
 | POST | `/api-keys` | Create API key |
+| GET | `/api-keys` | List API keys, filtered by `identity_id`, `identity_type` (e.g. `agent`; product keys belong to a `service` identity), `created_by`, `product`, `state` or `label` |
 | POST | `/credential-policies` | Create credential policy |
 | GET | `/credential-policies/{id}` | Get credential policy |
 | PATCH | `/credential-policies/{id}` | Update credential policy |
