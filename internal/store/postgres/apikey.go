@@ -74,26 +74,16 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id, accountID, projectID
 }
 
 // ListByAccountProject returns paginated API keys for an account/project,
-// optionally filtered by application ID, product, or identity label.
-// The label parameter accepts "key:value" format (e.g. "env:production")
-// and filters by joining on the identities table using JSONB containment.
-// APIKeyListFilter narrows ListByAccountProject. An empty field filters nothing.
-type APIKeyListFilter struct {
-	IdentityID   string              // keys bound to this identity
-	IdentityType domain.IdentityType // keys whose identity is of this type
-	CreatedBy    string              // keys this user created
-	Product      string
-	State        string // active, revoked or expired
-	Label        string // key:value on the key's identity
-}
-
-func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID string, f APIKeyListFilter, limit, offset int) ([]*domain.APIKey, int, error) {
+// newest first, narrowed by f. The label filter ("key:value", e.g.
+// "env:production") and the identity_type filter join the key's identity.
+func (r *APIKeyRepository) ListByAccountProject(ctx context.Context, accountID, projectID string, f domain.APIKeyListFilter, limit, offset int) ([]*domain.APIKey, int, error) {
 	var keys []*domain.APIKey
 
 	q := r.db.NewSelect().
 		Model(&keys).
 		Where("sk.account_id = ?", accountID).
-		OrderExpr("sk.created_at DESC").
+		// id breaks created_at ties, so pages never repeat or skip a key.
+		OrderExpr("sk.created_at DESC, sk.id DESC").
 		Limit(limit).
 		Offset(offset)
 

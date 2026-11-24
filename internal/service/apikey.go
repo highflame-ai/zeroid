@@ -297,14 +297,21 @@ func (s *APIKeyService) ListExpiringSoon(ctx context.Context, accountID, project
 	return s.repo.ListExpiringSoon(ctx, accountID, projectID, now, within)
 }
 
-// ListKeys returns paginated API keys for an account/project, narrowed by f.
-func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID string, f postgres.APIKeyListFilter, page, limit int) ([]*domain.APIKey, int, error) {
+// KeyListPage is the page and limit ListKeys actually uses for a request's
+// page and limit: page at least 1, limit 1-100 (20 when out of range).
+func KeyListPage(page, limit int) (int, int) {
 	if page < 1 {
 		page = 1
 	}
 	if limit < 1 || limit > 100 {
 		limit = 20
 	}
+	return page, limit
+}
+
+// ListKeys returns paginated API keys for an account/project, narrowed by f.
+func (s *APIKeyService) ListKeys(ctx context.Context, accountID, projectID string, f domain.APIKeyListFilter, page, limit int) ([]*domain.APIKey, int, error) {
+	page, limit = KeyListPage(page, limit)
 	offset := (page - 1) * limit
 
 	return s.repo.ListByAccountProject(ctx, accountID, projectID, f, limit, offset)

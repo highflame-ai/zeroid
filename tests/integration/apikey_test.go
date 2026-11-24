@@ -241,14 +241,26 @@ func TestAPIKeyListFilters_CreatedByAndIdentityType(t *testing.T) {
 	assert.Equal(t, []string{productKey["id"].(string)}, ids("/api-keys?created_by="+alice), "only Alice's key")
 	assert.Equal(t, []string{agentKey["id"].(string)}, ids("/api-keys?created_by="+bob), "only Bob's key")
 
-	agentKeys := ids("/api-keys?identity_type=agent&limit=100")
-	assert.Contains(t, agentKeys, agentKey["id"], "the agent's key is an agent key")
-	assert.NotContains(t, agentKeys, productKey["id"], "a product key belongs to a service identity, not an agent")
+	// Narrowed to this test's keys, so other tests' keys in the shared
+	// database can't push them off the page.
+	assert.Equal(t, []string{agentKey["id"].(string)}, ids("/api-keys?identity_type=agent&created_by="+bob), "the agent's key is an agent key")
+	assert.Empty(t, ids("/api-keys?identity_type=agent&created_by="+alice), "a product key belongs to a service identity, not an agent")
 	assert.Equal(t, []string{productKey["id"].(string)}, ids("/api-keys?identity_type=service&product="+product))
 
-	// Filters combine.
-	assert.Empty(t, ids("/api-keys?created_by="+alice+"&identity_type=agent"))
-
 	resp = get(t, adminPath("/api-keys?identity_type=robot"), adminHeaders())
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode, "an unknown identity type is refused by validation")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "an unknown identity type is refused")
+
+	// An empty created_by would filter nothing; it is refused, never ignored.
+	resp = get(t, adminPath("/api-keys?created_by="), adminHeaders())
+	assert.Contains(t, []int{http.StatusBadRequest, http.StatusUnprocessableEntity}, resp.StatusCode, "an empty created_by is refused")
+}
+
+// The list reports the page and limit it used, not the ones requested.
+func TestAPIKeyList_ReportsTheLimitItUsed(t *testing.T) {
+	resp := get(t, adminPath("/api-keys?limit=500&page=0"), adminHeaders())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := decode(t, resp)
+	assert.EqualValues(t, 20, body["limit"], "an out-of-range limit falls back to 20")
+	assert.EqualValues(t, 1, body["page"], "a page below 1 is page 1")
+	assert.LessOrEqual(t, len(body["keys"].([]any)), 20)
 }
