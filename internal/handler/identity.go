@@ -691,6 +691,9 @@ type DiscoveredIdentityOutput struct {
 }
 
 func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDiscoveredIdentityInput) (*DiscoveredIdentityOutput, error) {
+	if err := refuseCallerIdentity(ctx); err != nil {
+		return nil, err
+	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -843,6 +846,9 @@ type BatchDiscoveredOutput struct {
 }
 
 func (a *API) ingestDiscoveredBatchOp(ctx context.Context, input *BatchDiscoveredInput) (*BatchDiscoveredOutput, error) {
+	if err := refuseCallerIdentity(ctx); err != nil {
+		return nil, err
+	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -903,6 +909,9 @@ type PruneDiscoveredOutput struct {
 }
 
 func (a *API) pruneStaleDiscoveredOp(ctx context.Context, input *PruneDiscoveredInput) (*PruneDiscoveredOutput, error) {
+	if err := refuseCallerIdentity(ctx); err != nil {
+		return nil, err
+	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -941,6 +950,9 @@ type ReleaseDiscoveredSourceOutput struct {
 }
 
 func (a *API) releaseDiscoveredSourceOp(ctx context.Context, input *ReleaseDiscoveredSourceInput) (*ReleaseDiscoveredSourceOutput, error) {
+	if err := refuseCallerIdentity(ctx); err != nil {
+		return nil, err
+	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")
@@ -974,6 +986,9 @@ type PurgeDiscoveredSourceOutput struct {
 }
 
 func (a *API) purgeDiscoveredSourceOp(ctx context.Context, input *PurgeDiscoveredSourceInput) (*PurgeDiscoveredSourceOutput, error) {
+	if err := refuseCallerIdentity(ctx); err != nil {
+		return nil, err
+	}
 	tenant, err := internalMiddleware.GetTenant(ctx)
 	if err != nil {
 		return nil, huma.Error401Unauthorized("missing tenant context")

@@ -25,17 +25,17 @@
 -- deactivates; cleared once the walk below it, or its own cleanup, has
 -- finished. The cleanup worker and a repeated deactivation resume every
 -- identity still marked, so a walk cut short by a crash or a failed step
--- finishes. NULL for every existing row. Not indexed: the worker reads it once
--- per pass (hourly).
+-- finishes. NULL for every existing row. 071 indexes the rows that carry it.
 --
 -- The identity audit trigger (066) is redefined to ignore cascade_pending_at,
 -- like updated_at and modified_by, so setting and clearing the mark writes no
 -- audit row of its own.
 --
--- DDL ONLY, like 045. The index is 071, in its own file: golang-migrate runs
--- each file as one implicit transaction, so building the index here would hold
+-- DDL ONLY, like 045. The indexes are 071, in their own file: golang-migrate
+-- runs each file as one implicit transaction, so building them here would hold
 -- this ALTER's ACCESS EXCLUSIVE lock on identities, blocking every read and
--- write, for the whole table scan.
+-- write, for the whole table scan. A large installation can apply this file's
+-- ALTER, and build 071's indexes, by hand first; see 071.
 --
 -- Lock posture: both columns nullable, no default, so a metadata-only ADD
 -- COLUMN on PG 11+, and the trigger swap is catalog-only; the lock is held for

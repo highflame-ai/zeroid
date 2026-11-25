@@ -117,6 +117,71 @@ func ancestorChain(ctx context.Context, db bun.IDB, fromID, accountID, projectID
 	return chain, nil
 }
 
+// MaxLineageDepth is how many credentials CredentialLineage follows up a
+// delegation chain, the same cap the cascade revocation walk uses
+// (migration 031). A chain longer than that is ErrBrokenLineage, and callers
+// fail closed on it.
+const MaxLineageDepth = 50
+
+// ErrBrokenLineage is returned by CredentialLineage when a delegation chain
+// is longer than MaxLineageDepth or loops.
+var ErrBrokenLineage = errors.New("the delegation chain above this credential is too long to check")
+
+// LineageIdentity is an identity that a credential, or one of the credentials
+// it was delegated from, was issued to, in that credential's own tenant.
+type LineageIdentity struct {
+	IdentityID string `bun:"identity_id"`
+	AccountID  string `bun:"account_id"`
+	ProjectID  string `bun:"project_id"`
+	Depth      int    `bun:"depth"`
+	IsCycle    bool   `bun:"is_cycle"`
+}
+
+// credentialLineageSQL follows parent_jti up from one credential, one row per
+// credential, and stops one level past MaxLineageDepth so a longer chain can
+// be told apart from one that ends there.
+const credentialLineageSQL = `
+WITH RECURSIVE lineage(jti, parent_jti, identity_id, account_id, project_id, depth) AS (
+	SELECT jti, parent_jti, identity_id, account_id, project_id, 1
+	FROM issued_credentials
+	WHERE jti = ?
+	UNION ALL
+	SELECT ic.jti, ic.parent_jti, ic.identity_id, ic.account_id, ic.project_id, lineage.depth + 1
+	FROM issued_credentials ic
+	JOIN lineage ON ic.jti = lineage.parent_jti
+	WHERE lineage.depth <= ?
+) CYCLE jti SET is_cycle TO TRUE DEFAULT FALSE USING cycle_path
+SELECT COALESCE(identity_id::text, '') AS identity_id, account_id, project_id, depth, is_cycle FROM lineage`
+
+// CredentialLineage returns the identities that the credential jti and every
+// credential it was delegated from (parent_jti, up to the root) were issued
+// to, each once, in their own tenant. Credentials issued to no identity (a
+// person's session) contribute nothing. A parent row that no longer exists
+// ends the chain. A chain longer than MaxLineageDepth, or one that loops, is
+// ErrBrokenLineage. An unknown jti returns nothing.
+func (r *IdentityRepository) CredentialLineage(ctx context.Context, jti string) ([]LineageIdentity, error) {
+	var rows []LineageIdentity
+	if err := dbOrTx(ctx, r.db).NewRaw(credentialLineageSQL, jti, MaxLineageDepth).Scan(ctx, &rows); err != nil {
+		return nil, fmt.Errorf("read the delegation chain above %s: %w", jti, err)
+	}
+	seen := make(map[LineageIdentity]bool, len(rows))
+	out := make([]LineageIdentity, 0, len(rows))
+	for _, row := range rows {
+		if row.IsCycle || row.Depth > MaxLineageDepth {
+			return nil, ErrBrokenLineage
+		}
+		if row.IdentityID == "" {
+			continue
+		}
+		key := LineageIdentity{IdentityID: row.IdentityID, AccountID: row.AccountID, ProjectID: row.ProjectID}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	return out, nil
+}
+
 // lockUsableChain locks the chain from parentID up, which must be active and
 // unexpired throughout, for the rest of the caller's transaction: the direct
 // parent FOR NO KEY UPDATE when lockParentExclusive (so registrations under
@@ -248,6 +313,12 @@ type IdentityUpdate struct {
 	// write with ErrAncestorNotActive unless every identity above it is
 	// active and unexpired. For a write that makes the identity active.
 	RequireActiveAncestors bool
+	// MaxChildren, with RequireActiveAncestors, locks the parent FOR NO KEY
+	// UPDATE instead of FOR SHARE, as a registration under it does, and
+	// refuses the write with ErrTooManyChildren when the parent already has
+	// that many children that are not deactivated. For a write that brings
+	// a deactivated child back. Zero checks nothing.
+	MaxChildren int
 }
 
 // Update writes every column of identity except cascade_pending_at (which
@@ -265,11 +336,31 @@ func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identi
 			if identity.ParentIdentityID == "" {
 				return errors.New("failed to update identity: RequireActiveAncestors needs a parent")
 			}
-			if _, err := lockUsableChain(ctx, db, identity.ParentIdentityID, identity.AccountID, identity.ProjectID, false); err != nil {
+			if _, err := lockUsableChain(ctx, db, identity.ParentIdentityID, identity.AccountID, identity.ProjectID, u.MaxChildren > 0); err != nil {
 				if errors.Is(err, ErrParentNotActive) {
 					return ErrAncestorNotActive
 				}
 				return err
+			}
+			if u.MaxChildren > 0 {
+				// Under the parent's lock, so this and a concurrent
+				// registration or reactivation under the same parent
+				// cannot together overrun the limit.
+				n, err := db.NewSelect().
+					TableExpr("identities").
+					Where("account_id = ?", identity.AccountID).
+					Where("project_id = ?", identity.ProjectID).
+					Where("parent_identity_id = ?", identity.ParentIdentityID).
+					Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+					Where("id <> ?", identity.ID).
+					Count(ctx)
+				if err != nil {
+					return fmt.Errorf("count the parent identity's children: %w", err)
+				}
+				if n >= u.MaxChildren {
+					return fmt.Errorf("%w: it has %d that are not deactivated; the limit is %d",
+						ErrTooManyChildren, n, u.MaxChildren)
+				}
 			}
 		}
 		q := db.NewUpdate().Model(identity).ExcludeColumn("cascade_pending_at")
@@ -389,10 +480,70 @@ func (r *IdentityRepository) ClearCascadePending(ctx context.Context, ids []stri
 	return nil
 }
 
+// TouchCascadePending moves the mark on the given identities, where it is
+// still set, to now: a resume that failed goes to the back of the queue, so
+// one that keeps failing does not hold the oldest-first batch for ever.
+func (r *IdentityRepository) TouchCascadePending(ctx context.Context, ids []string, accountID, projectID string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if _, err := dbOrTx(ctx, r.db).NewUpdate().
+		TableExpr("identities").
+		Set("cascade_pending_at = now()").
+		Where("id IN (?)", bun.List(ids)).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("cascade_pending_at IS NOT NULL").
+		Exec(ctx); err != nil {
+		return fmt.Errorf("move cascade_pending: %w", err)
+	}
+	return nil
+}
+
+// MarkUnfinishedRetirements marks cascade_pending up to limit retired
+// (deactivated or expired) identities, across every tenant, that are not
+// marked but still have a child that is not deactivated: a retirement no walk
+// will otherwise reach, such as one written by a release that predates the
+// tree (a rollback target, or an old pod during a rollout), which deactivates
+// one row and sets no mark. Returns how many it marked. The statement reads
+// only identities that have a parent (the partial index on
+// parent_identity_id) and their parents by primary key.
+func (r *IdentityRepository) MarkUnfinishedRetirements(ctx context.Context, limit int) (int, error) {
+	res, err := dbOrTx(ctx, r.db).NewRaw(`
+UPDATE identities p SET cascade_pending_at = now()
+WHERE p.id IN (
+	SELECT DISTINCT c.parent_identity_id
+	FROM identities c
+	JOIN identities par
+	  ON par.id = c.parent_identity_id
+	 AND par.account_id = c.account_id
+	 AND par.project_id = c.project_id
+	WHERE c.parent_identity_id IS NOT NULL
+	  AND c.status <> ?
+	  AND par.status IN (?, ?)
+	  AND par.cascade_pending_at IS NULL
+	LIMIT ?
+)
+AND p.status IN (?, ?)
+AND p.cascade_pending_at IS NULL`,
+		string(domain.IdentityStatusDeactivated),
+		string(domain.IdentityStatusDeactivated), string(domain.IdentityStatusExpired),
+		limit,
+		string(domain.IdentityStatusDeactivated), string(domain.IdentityStatusExpired),
+	).Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("mark unfinished retirements: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mark unfinished retirements: %w", err)
+	}
+	return int(n), nil
+}
+
 // ListCascadePending returns up to limit identities, across every tenant,
-// still marked cascade_pending, oldest mark first. There is no index on the
-// mark: the cleanup worker calls this once per pass (hourly), and the scan
-// reads the table once.
+// still marked cascade_pending, oldest mark first, through the partial index
+// on the mark (migration 071).
 func (r *IdentityRepository) ListCascadePending(ctx context.Context, limit int) ([]*domain.Identity, error) {
 	var identities []*domain.Identity
 	if err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).

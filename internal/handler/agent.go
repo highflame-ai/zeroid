@@ -38,6 +38,17 @@ func callerIdentity(ctx context.Context) *service.CallerIdentity {
 	return nil
 }
 
+// refuseCallerIdentity refuses, with 403, a request marked as made by a
+// registered identity on a route that is the deployer's alone: discovery
+// ingest and its source maintenance write identities no identity registered,
+// so no calling identity may reach them (docs/identity-tree.md).
+func refuseCallerIdentity(ctx context.Context) error {
+	if callerIdentity(ctx) != nil {
+		return huma.Error403Forbidden(service.ErrParentIdentityRefused.Error() + ": this route is not open to a calling identity")
+	}
+	return nil
+}
+
 // treeWriteError maps the registration-tree refusals: a registration or
 // change the calling identity may not make, or an owner change outside the
 // trusted path (403); a tree limit, an activation below an inactive

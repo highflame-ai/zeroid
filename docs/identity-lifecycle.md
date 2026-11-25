@@ -156,7 +156,9 @@ SDK / Cedar / DB contract for no functional gain).
   `expired`, by any path, deactivates every identity below it with the same key
   and credential revocation; reactivation and suspension do not cascade, but
   no identity below a suspended, deactivated or expired one receives a token,
-  and none can be reactivated while one above it is not active.
+  and none can be reactivated while one above it is not active. A request
+  authenticated as an identity can lower its children's status but never
+  raise it.
 
 ## Ownership: relaxed for `discovered` only
 

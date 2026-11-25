@@ -528,8 +528,13 @@ type CallerIdentity = service.CallerIdentity
 // owner, takes what the caller and its token hold where the request names no
 // allowed_scopes or credential policy, may hold no scope, policy, trust level
 // or lifetime beyond the caller's and its token's, and is deactivated whenever
-// the caller is. Any other write such a request makes is held to the same
-// bound, and it can change no identity's owner. See docs/identity-tree.md.
+// the caller is. Any other write such a request makes on the identity and
+// agent registry routes is refused unless its target is the caller's own
+// child, is held to the same bound, can lower but never raise that child's
+// status, and can change no identity's owner or identity_type. The routes
+// that manage API keys, credentials, credential policies and attestations do
+// not consult the mark: do not let an identity's own token reach them. See
+// docs/identity-tree.md.
 //
 // Set it in the AdminAuth layer, from an access token that layer verified,
 // and only when the token is the identity's own, issued to it for itself (no

@@ -373,7 +373,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	credentialSvc.SetReservedScopes(reservedScopes)
 	identitySvc.SetReservedScopes(reservedScopes)
 	identitySvc.SetTreeLimits(service.TreeLimits{MaxDepth: cfg.IdentityTree.MaxDepth, MaxChildren: cfg.IdentityTree.MaxChildren})
-	credentialSvc.SetAncestorChain(identityRepo.AncestorChain)
+	credentialSvc.SetIdentityTree(identityRepo)
 	refreshTokenSvc := service.NewRefreshTokenService(refreshTokenRepo, db)
 
 	// RevocationNotifier plumbing. One shared

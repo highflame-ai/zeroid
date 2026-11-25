@@ -554,6 +554,11 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	if err != nil {
 		return nil, err
 	}
+	// A request authenticated as an identity rotates only the keys of the
+	// identities it registered (docs/identity-tree.md).
+	if _, err := s.identitySvc.authorizeCallerWrite(ctx, identity, accountID, projectID); err != nil {
+		return nil, err
+	}
 	if !identity.Status.IsUsable() {
 		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
 	}

@@ -381,6 +381,63 @@ func TestCheckChildPolicy(t *testing.T) {
 	}
 }
 
+// TestCheckChildPolicyHeldToBoth pins that a child under a caller that
+// presented an API key is held to the caller's own policy as well as the
+// key's: a policy within the key's but wider than the identity's (the
+// identity was narrowed after the key was made) is refused, and the policy a
+// child inherits is the narrower of the two, or none when neither is within
+// the other.
+func TestCheckChildPolicyHeldToBoth(t *testing.T) {
+	t.Parallel()
+	mk := func(id, name string, grants []string, ttl int) *domain.CredentialPolicy {
+		return &domain.CredentialPolicy{ID: id, Name: name, IsActive: true, AllowedScopes: []string{"read"}, AllowedGrantTypes: grants, MaxTTLSeconds: ttl}
+	}
+	narrow := mk("11111111-1111-4111-8111-111111111111", "identity", []string{"api_key"}, 300)
+	wide := mk("22222222-2222-4222-8222-222222222222", "key", []string{"api_key", "client_credentials"}, 86400)
+	svc := &IdentityService{policySvc: &CredentialPolicyService{}}
+	b := &treeBound{identity: &domain.Identity{}, identityPolicy: narrow, policy: wide}
+
+	if err := svc.checkChildPolicy(b, wide); !errors.Is(err, ErrExceedsParentPolicy) {
+		t.Fatalf("the key's policy, wider than the identity's, must be refused: %v", err)
+	}
+	if err := svc.checkChildPolicy(b, narrow); err != nil {
+		t.Fatalf("a policy within both must pass: %v", err)
+	}
+	if !svc.policyWithin(narrow, wide) || svc.policyWithin(wide, narrow) {
+		t.Fatal("policyWithin must order the two policies")
+	}
+}
+
+// TestCallerStatusChange pins that a calling identity may lower a child's
+// status but never raise it.
+func TestCallerStatusChange(t *testing.T) {
+	t.Parallel()
+	active, suspended := domain.IdentityStatusActive, domain.IdentityStatusSuspended
+	deactivated, expired := domain.IdentityStatusDeactivated, domain.IdentityStatusExpired
+	for _, tc := range []struct {
+		prior, next domain.IdentityStatus
+		refused     bool
+	}{
+		{active, suspended, false},
+		{active, deactivated, false},
+		{suspended, deactivated, false},
+		{active, expired, false},
+		{expired, deactivated, false},
+		{active, active, false},
+		{suspended, active, true},
+		{deactivated, active, true},
+		{domain.IdentityStatusPending, active, true},
+	} {
+		err := callerStatusChange(tc.prior, tc.next)
+		if (err != nil) != tc.refused {
+			t.Errorf("%s to %s: refused = %v (%v), want %v", tc.prior, tc.next, err != nil, err, tc.refused)
+		}
+		if err != nil && !errors.Is(err, ErrParentIdentityRefused) {
+			t.Errorf("%s to %s: %v must wrap ErrParentIdentityRefused", tc.prior, tc.next, err)
+		}
+	}
+}
+
 // TestCheckWithinToken pins the token layer: a child can hold no scope the
 // caller's token does not, and a token with no scopes lets it hold none.
 func TestCheckWithinToken(t *testing.T) {

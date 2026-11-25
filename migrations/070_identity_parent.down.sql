@@ -1,7 +1,7 @@
 -- 070_identity_parent.down.sql
--- No-op: the columns and the trigger are kept. Dropping parent_identity_id
--- would discard every recorded registration edge, which re-applying 070 could
--- not restore.
+-- IRREVERSIBLE FOR DATA, so a no-op: the columns and the trigger are kept.
+-- Dropping parent_identity_id would discard every recorded registration edge,
+-- which re-applying 070 could not restore.
 --
 -- Keeping the columns is safe only for a binary that tolerates columns it
 -- does not know. An older binary does read them: its writes name their
@@ -10,6 +10,11 @@
 -- that scan. Roll back only to a ZeroID release that tolerates columns it does
 -- not know (v1.31.0 or later), deploying such a release first if the target is
 -- older; an older binary fails those writes while these columns exist.
+--
+-- A rolled-back binary deactivates one identity at a time and never walks the
+-- identities below it. When the tree's release is deployed again, its cleanup
+-- worker marks every retired identity that still has a child that is not
+-- deactivated and finishes the walk (docs/identity-tree.md, "Rolling back").
 --
 -- The redefined audit trigger is kept too: it ignores cascade_pending_at,
 -- which a rolled-back binary never sets, and audits every other change as 066

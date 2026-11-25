@@ -5,8 +5,10 @@ package service
 // (unless the request names its own) its scope ceilings and credential
 // policy, can hold no scope, policy, trust level or lifetime beyond what its
 // parent, and the credential the parent presented, hold, and is deactivated
-// whenever its parent is. While any identity above it is not active, it
-// receives no token. See docs/identity-tree.md.
+// whenever its parent is. While it or any identity above it is not active, no
+// token that speaks for or acts as it is issued or reported active (the
+// guards are in CredentialService). A request authenticated as an identity
+// writes only to that identity's children. See docs/identity-tree.md.
 
 import (
 	"context"
@@ -29,8 +31,9 @@ import (
 // The embedder's admin authentication sets it with zeroid.WithCallerIdentity,
 // from the token it verified. ZeroID never takes it from a header or the
 // request body. An identity registered by such a request records the caller as
-// its parent, and every write such a request makes is bounded by what the
-// caller holds.
+// its parent, and every other write such a request makes on an identity is
+// refused unless the identity is the caller's own child, and bounded by what
+// the caller holds (authorizeCallerWrite).
 //
 // IdentityID or WIMSEURI identifies the caller; when both are set they must
 // name the same identity. The identity must be in the account and project the
@@ -208,10 +211,15 @@ type treeBound struct {
 	// identityPolicy governs identity itself (its own, else the tenant
 	// default).
 	identityPolicy *domain.CredentialPolicy
-	// policy is the effective policy a child is held to and, naming none,
-	// inherits: the presented API key's policy when it has one, otherwise
-	// identityPolicy.
+	// policy is the presented API key's policy when the key names one,
+	// otherwise identityPolicy. A child is held to both: a policy it is
+	// placed on must be within identityPolicy and within policy.
 	policy *domain.CredentialPolicy
+	// inherit is the policy a child that names none is placed on, and the
+	// one naming which counts as inheriting: the narrower of identityPolicy
+	// and policy. Nil when neither is within the other; a child must then
+	// name a policy within both.
+	inherit *domain.CredentialPolicy
 	// tokenScopes, when hasToken, are the scopes of the token the caller
 	// presented: an extra layer that always restricts.
 	tokenScopes []string
@@ -228,6 +236,23 @@ func (b *treeBound) layers() ceilingLayers {
 		policies = append(policies, b.policy)
 	}
 	return ceilingLayers{rowScopes: b.identity.AllowedScopes, policies: policies}
+}
+
+// policies returns the distinct credential policies a child is held to.
+func (b *treeBound) policies() []*domain.CredentialPolicy {
+	var out []*domain.CredentialPolicy
+	for _, p := range []*domain.CredentialPolicy{b.identityPolicy, b.policy} {
+		if p != nil && (len(out) == 0 || !sameUUID(p.ID, out[0].ID)) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// inherits reports whether placing a child on policyID is the same as
+// inheriting: it names the policy a child that names none is placed on.
+func (b *treeBound) inherits(policyID string) bool {
+	return b.inherit != nil && sameUUID(policyID, b.inherit.ID)
 }
 
 // token returns the token's scopes as a bound. It restricts even when empty:
@@ -358,7 +383,7 @@ func (s *IdentityService) boundOfIdentity(ctx context.Context, identity *domain.
 	if err := usablePolicy(policy); err != nil {
 		return nil, fmt.Errorf("%w: identity %s: %w", ErrParentIdentityRefused, identity.ID, err)
 	}
-	return &treeBound{identity: identity, identityPolicy: policy, policy: policy, expiryCap: expiryCap}, nil
+	return &treeBound{identity: identity, identityPolicy: policy, policy: policy, inherit: policy, expiryCap: expiryCap}, nil
 }
 
 // applyPresentedKey narrows b by the API key the caller's token was minted
@@ -391,9 +416,69 @@ func (s *IdentityService) applyPresentedKey(ctx context.Context, b *treeBound, k
 		if err := usablePolicy(keyPolicy); err != nil {
 			return fmt.Errorf("%w: the presented API key: %w", ErrParentIdentityRefused, err)
 		}
+		// The key's policy was a subset of the identity's when the key was
+		// made, but either may have changed since. A child is held to both,
+		// and inherits whichever is within the other.
 		b.policy = keyPolicy
+		switch {
+		case s.policyWithin(keyPolicy, b.identityPolicy):
+			b.inherit = keyPolicy
+		case s.policyWithin(b.identityPolicy, keyPolicy):
+			b.inherit = b.identityPolicy
+		default:
+			b.inherit = nil
+		}
 	}
 	return nil
+}
+
+// policyWithin reports whether narrower is within wider on every axis
+// EnforceSubset checks, and expires no later.
+func (s *IdentityService) policyWithin(narrower, wider *domain.CredentialPolicy) bool {
+	if s.policySvc.EnforceSubset(narrower, wider) != nil {
+		return false
+	}
+	return wider.ExpiresAt == nil || (narrower.ExpiresAt != nil && !narrower.ExpiresAt.After(*wider.ExpiresAt))
+}
+
+// authorizeCallerWrite applies to a write on the existing identity target the
+// rules for a request marked with CallerIdentity, and returns the caller's
+// bound (nil when the request is not marked). The caller must resolve as
+// for a registration (an active, unexpired identity in the request's tenant,
+// with an active, unexpired chain and policy, and its own active key when
+// the token names one), and target must be an identity it registered: its
+// direct child. So a calling identity never writes to itself, its parent, a
+// sibling, a grandchild or any identity an admin registered.
+func (s *IdentityService) authorizeCallerWrite(ctx context.Context, target *domain.Identity, accountID, projectID string) (*treeBound, error) {
+	ref, ok := CallerIdentityFromContext(ctx)
+	if !ok {
+		return nil, nil
+	}
+	caller, err := s.resolveCaller(ctx, ref, accountID, projectID)
+	if err != nil {
+		return nil, err
+	}
+	if target.ParentIdentityID == "" || !sameUUID(target.ParentIdentityID, caller.identity.ID) {
+		return nil, fmt.Errorf("%w: a calling identity can change only the identities it registered", ErrParentIdentityRefused)
+	}
+	return caller, nil
+}
+
+// callerStatusChange refuses a status change a calling identity may not make
+// on a child: it may lower a status (active to suspended, anything to
+// deactivated or expired), never raise one. Reactivating a child, or
+// resuming a suspended one, is for a request not authenticated as an
+// identity, so a parent cannot undo a stop the deployer made.
+func callerStatusChange(prior, next domain.IdentityStatus) error {
+	switch {
+	case prior == next:
+		return nil
+	case next == domain.IdentityStatusSuspended && prior == domain.IdentityStatusActive:
+		return nil
+	case next == domain.IdentityStatusDeactivated, next == domain.IdentityStatusExpired:
+		return nil
+	}
+	return fmt.Errorf("%w: a calling identity cannot raise an identity's status (%s to %s)", ErrParentIdentityRefused, prior, next)
 }
 
 // loadParent loads the bound child's parent places, for a write that changes
@@ -410,7 +495,7 @@ func (s *IdentityService) loadParent(ctx context.Context, child *domain.Identity
 	if err != nil {
 		return nil, fmt.Errorf("resolve the credential policy of parent identity %s: %w", parent.ID, err)
 	}
-	b := &treeBound{identity: parent, identityPolicy: policy, policy: policy}
+	b := &treeBound{identity: parent, identityPolicy: policy, policy: policy, inherit: policy}
 	chain, err := s.repo.AncestorChain(ctx, parent.ID, parent.AccountID, parent.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("read the registration tree above %s: %w", child.ID, err)
@@ -457,19 +542,26 @@ func (s *IdentityService) refuseReserved(what string, scopes []string) error {
 	return nil
 }
 
-// checkChildPolicy refuses placing a child on child when it is broader than
-// the bound's effective policy on any axis: the full subset check
-// (CredentialPolicyService.EnforceSubset) and the policy's own expiry.
+// checkChildPolicy refuses placing a child on child when it is broader, on
+// any axis, than any policy the bound holds it to (the bound identity's own
+// and, when the caller presented an API key that names one, the key's): the
+// full subset check (CredentialPolicyService.EnforceSubset) and the policy's
+// own expiry.
 func (s *IdentityService) checkChildPolicy(b *treeBound, child *domain.CredentialPolicy) error {
-	if child == nil || b.policy == nil || sameUUID(child.ID, b.policy.ID) {
+	if child == nil {
 		return nil
 	}
-	if err := s.policySvc.EnforceSubset(child, b.policy); err != nil {
-		return fmt.Errorf("%w: %w: credential policy %q: %w", ErrInvalidIdentityField, ErrExceedsParentPolicy, child.Name, err)
-	}
-	if b.policy.ExpiresAt != nil && (child.ExpiresAt == nil || child.ExpiresAt.After(*b.policy.ExpiresAt)) {
-		return fmt.Errorf("%w: %w: credential policy %q outlives %q, which expires at %s",
-			ErrInvalidIdentityField, ErrExceedsParentPolicy, child.Name, b.policy.Name, b.policy.ExpiresAt.Format(time.RFC3339))
+	for _, p := range b.policies() {
+		if p == nil || sameUUID(child.ID, p.ID) {
+			continue
+		}
+		if err := s.policySvc.EnforceSubset(child, p); err != nil {
+			return fmt.Errorf("%w: %w: credential policy %q: %w", ErrInvalidIdentityField, ErrExceedsParentPolicy, child.Name, err)
+		}
+		if p.ExpiresAt != nil && (child.ExpiresAt == nil || child.ExpiresAt.After(*p.ExpiresAt)) {
+			return fmt.Errorf("%w: %w: credential policy %q outlives %q, which expires at %s",
+				ErrInvalidIdentityField, ErrExceedsParentPolicy, child.Name, p.Name, p.ExpiresAt.Format(time.RFC3339))
+		}
 	}
 	return nil
 }
@@ -955,6 +1047,11 @@ func (s *IdentityService) finishCascade(ctx context.Context, root *domain.Identi
 		return err
 	}
 	if keepMark {
+		// Root's own cleanup failed: it stays marked, moved to the back so
+		// the worker's oldest-first batch rotates past it.
+		if err := s.repo.TouchCascadePending(context.WithoutCancel(ctx), []string{root.ID}, root.AccountID, root.ProjectID); err != nil {
+			log.Warn().Err(err).Str("identity_id", root.ID).Msg("identity tree: could not move the cascade mark")
+		}
 		return nil
 	}
 	if err := s.repo.ClearCascadePending(context.WithoutCancel(ctx), []string{root.ID}, root.AccountID, root.ProjectID); err != nil {
@@ -978,7 +1075,9 @@ func (s *IdentityService) resumeCascade(ctx context.Context, identity *domain.Id
 	}
 	reason := "identity_deactivated"
 	switch {
-	case identity.Status == domain.IdentityStatusExpired:
+	// The expiry sweep retires an identity past its expires_at as
+	// deactivated; a resume keeps the reason it was retired with.
+	case identity.Status == domain.IdentityStatusExpired, identity.IsExpired():
 		reason = "expired"
 	case identity.ParentIdentityID != "":
 		reason = reasonParentDeactivated
@@ -989,6 +1088,23 @@ func (s *IdentityService) resumeCascade(ctx context.Context, identity *domain.Id
 			Msg("identity tree: resumed cleanup failed; the identity stays marked")
 	}
 	return s.finishCascade(ctx, identity, cleanupErr != nil)
+}
+
+// MarkUnfinishedRetirements marks, up to one batch, the retired identities
+// that still have a child that is not deactivated but carry no mark, so the
+// resume below walks them: retirements written by a release that predates
+// the tree. The cleanup worker calls it on every pass, before
+// ResumePendingCascades. Returns how many it marked.
+func (s *IdentityService) MarkUnfinishedRetirements(ctx context.Context) (int, error) {
+	n, err := s.repo.MarkUnfinishedRetirements(ctx, cascadeResumeBatch)
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		log.Warn().Int("count", n).
+			Msg("identity tree: found retired identities with live children and no pending cascade (retired by an older release?); marked them for the cascade")
+	}
+	return n, nil
 }
 
 // ResumePendingCascades resumes, oldest first, up to one batch of identities
@@ -1012,6 +1128,11 @@ func (s *IdentityService) ResumePendingCascades(ctx context.Context) (int, error
 				Str("account_id", identity.AccountID).
 				Str("project_id", identity.ProjectID).
 				Msg("identity tree: resuming a pending cascade failed; the next pass retries")
+			// To the back of the queue, so a mark that keeps failing does
+			// not keep newer ones out of the batch.
+			if terr := s.repo.TouchCascadePending(context.WithoutCancel(ctx), []string{identity.ID}, identity.AccountID, identity.ProjectID); terr != nil {
+				log.Warn().Err(terr).Str("identity_id", identity.ID).Msg("identity tree: could not move the cascade mark")
+			}
 			continue
 		}
 		resumed++

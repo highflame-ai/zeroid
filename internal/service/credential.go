@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -50,17 +52,26 @@ type CredentialService struct {
 	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
 	// consulted for every person root. Nil-safe: unset, nothing changes.
 	personGrant personGrantState
-	// ancestors reads an identity's registration-tree ancestors for the
-	// issuance guard (SetAncestorChain). Unset, an identity with a parent
-	// receives no token: the guard fails closed.
-	ancestors func(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)
+	// tree reads registration-tree ancestors and credential lineages for
+	// the issuance and introspection guards (SetIdentityTree). Unset, every
+	// check that needs it refuses: the guards fail closed.
+	tree identityTreeReader
 }
 
-// SetAncestorChain wires the read the issuance guard uses to refuse a token
-// to an identity below one that is not active. Wired once at server
-// construction (IdentityRepository.AncestorChain).
-func (s *CredentialService) SetAncestorChain(fn func(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)) {
-	s.ancestors = fn
+// identityTreeReader is what the tree guards read: an identity's ancestor
+// chain (the identity first), and the identities a credential and the
+// credentials it was delegated from were issued to.
+// postgres.IdentityRepository implements it.
+type identityTreeReader interface {
+	AncestorChain(ctx context.Context, fromID, accountID, projectID string) ([]postgres.Ancestor, error)
+	CredentialLineage(ctx context.Context, jti string) ([]postgres.LineageIdentity, error)
+}
+
+// SetIdentityTree wires the reads the issuance and introspection guards use
+// to refuse a token that speaks for, or acts as, an identity at or below one
+// that is not active. Wired once at server construction.
+func (s *CredentialService) SetIdentityTree(t identityTreeReader) {
+	s.tree = t
 }
 
 // checkAncestorsUsable refuses issuance to an identity any of whose ancestors
@@ -73,10 +84,10 @@ func (s *CredentialService) checkAncestorsUsable(ctx context.Context, identity *
 	if identity.ParentIdentityID == "" {
 		return nil
 	}
-	if s.ancestors == nil {
+	if s.tree == nil {
 		return fmt.Errorf("%w: the registration tree above it cannot be checked", domain.ErrIdentityNotUsable)
 	}
-	chain, err := s.ancestors(ctx, identity.ParentIdentityID, identity.AccountID, identity.ProjectID)
+	chain, err := s.tree.AncestorChain(ctx, identity.ParentIdentityID, identity.AccountID, identity.ProjectID)
 	if err != nil {
 		log.Warn().Err(err).Str("identity_id", identity.ID).Msg("issuance: could not read the registration tree above the identity; refusing")
 		return fmt.Errorf("%w: the registration tree above it could not be read", domain.ErrIdentityNotUsable)
@@ -85,6 +96,86 @@ func (s *CredentialService) checkAncestorsUsable(ctx context.Context, identity *
 		return fmt.Errorf("%w: %w, above it in the registration tree", domain.ErrIdentityNotUsable, err)
 	}
 	return nil
+}
+
+// identityChainRefusal reports why a token may not speak for, or act as, the
+// identity id in its tenant: the identity, or an identity above it in the
+// registration tree, is not active and unexpired, or the identity no longer
+// exists. "" means it may. err is a failure to read, never a refusal.
+func (s *CredentialService) identityChainRefusal(ctx context.Context, id, accountID, projectID string) (string, error) {
+	chain, err := s.tree.AncestorChain(ctx, id, accountID, projectID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Sprintf("identity %s no longer exists", id), nil
+	case errors.Is(err, postgres.ErrBrokenAncestorChain):
+		return fmt.Sprintf("the registration tree above identity %s is broken", id), nil
+	case err != nil:
+		return "", err
+	}
+	if err := usableChain(chain); err != nil {
+		return fmt.Sprintf("%s, at or above identity %s in the registration tree", err, id), nil
+	}
+	return "", nil
+}
+
+// lineageRefusal reports why a token delegated from the credential jti may
+// not be issued or honoured: an identity that credential, or any credential
+// it was delegated from, was issued to (the chain's principal and every
+// actor) is not usable, or sits below an identity that is not. "" means
+// every one is usable. err is a failure to read, never a refusal.
+func (s *CredentialService) lineageRefusal(ctx context.Context, jti string) (string, error) {
+	ids, err := s.tree.CredentialLineage(ctx, jti)
+	if errors.Is(err, postgres.ErrBrokenLineage) {
+		return err.Error(), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	for _, li := range ids {
+		if reason, err := s.identityChainRefusal(ctx, li.IdentityID, li.AccountID, li.ProjectID); reason != "" || err != nil {
+			return reason, err
+		}
+	}
+	return "", nil
+}
+
+// checkLineageUsable refuses a delegated issuance whose parent credential
+// (parentJTI) speaks for or acts as an identity that is stopped: not active,
+// expired, or below one that is. The actor the new token is issued to is
+// checked separately (checkAncestorsUsable and the status checks). Any
+// failure to read refuses.
+func (s *CredentialService) checkLineageUsable(ctx context.Context, parentJTI string) error {
+	if s.tree == nil {
+		return fmt.Errorf("%w: the delegation chain cannot be checked", domain.ErrIdentityNotUsable)
+	}
+	reason, err := s.lineageRefusal(ctx, parentJTI)
+	if err != nil {
+		log.Warn().Err(err).Str("parent_jti", parentJTI).Msg("issuance: could not read the identities the delegation chain speaks for; refusing")
+		return fmt.Errorf("%w: the delegation chain could not be checked", domain.ErrIdentityNotUsable)
+	}
+	if reason != "" {
+		return fmt.Errorf("%w: the token it is delegated from speaks for or acts as a stopped identity: %s", domain.ErrIdentityNotUsable, reason)
+	}
+	return nil
+}
+
+// credentialTreeRefusal reports why an issued, unrevoked, unexpired
+// credential is no longer active: the identity it was issued to, an identity
+// a credential it was delegated from was issued to, or an identity above any
+// of them in the registration tree, is not active and unexpired.
+func (s *CredentialService) credentialTreeRefusal(ctx context.Context, cred *domain.IssuedCredential) (string, error) {
+	if s.tree == nil {
+		return "the registration tree cannot be checked", nil
+	}
+	if cred.IdentityID != nil && *cred.IdentityID != "" {
+		if reason, err := s.identityChainRefusal(ctx, *cred.IdentityID, cred.AccountID, cred.ProjectID); reason != "" || err != nil {
+			return reason, err
+		}
+	}
+	if cred.ParentJTI != "" {
+		return s.lineageRefusal(ctx, cred.ParentJTI)
+	}
+	return "", nil
 }
 
 // SetTenantSettingsService wires the per-tenant settings the issuance
@@ -692,10 +783,16 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// authority's expiry window, regardless of worker timing.
 		return nil, nil, fmt.Errorf("%w: identity expired at %s", domain.ErrIdentityExpired, req.Identity.ExpiresAt.Format(time.RFC3339))
 	}
-	// Nor does an identity below one that is no longer active
+	// Nor does an identity below one that is no longer active, nor a token
+	// delegated from one that speaks for or acts as such an identity
 	// (docs/identity-tree.md).
 	if err := s.checkAncestorsUsable(ctx, req.Identity); err != nil {
 		return nil, nil, err
+	}
+	if req.ParentJTI != "" {
+		if err := s.checkLineageUsable(ctx, req.ParentJTI); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	ttl, ttlRequested, err := s.issueTTL(req)
@@ -1563,7 +1660,11 @@ func stringPtrOrNil(s string) *string {
 	return &s
 }
 
-// IntrospectToken checks the validity of a JTI against the credential store.
+// IntrospectToken checks the validity of a JTI against the credential store:
+// a token is active while it is unrevoked, unexpired, and its identity, every
+// identity a token it was delegated from was issued to, and every identity
+// above any of them in the registration tree is active and unexpired. A
+// failure to read those returns an error with active false.
 func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*domain.IssuedCredential, bool, error) {
 	cred, err := s.repo.GetByJTI(ctx, jti)
 	if err != nil {
@@ -1573,6 +1674,19 @@ func (s *CredentialService) IntrospectToken(ctx context.Context, jti string) (*d
 		return cred, false, nil
 	}
 	if time.Now().After(cred.ExpiresAt) {
+		return cred, false, nil
+	}
+	// Nor is a token whose identity, or an identity a token it was
+	// delegated from was issued to, is stopped or sits below a stopped
+	// identity in the registration tree (docs/identity-tree.md). Suspending
+	// an identity does not revoke the tokens of the identities below it, so
+	// this is what makes them inactive.
+	reason, err := s.credentialTreeRefusal(ctx, cred)
+	if err != nil {
+		return cred, false, fmt.Errorf("check the identities the token speaks for: %w", err)
+	}
+	if reason != "" {
+		log.Debug().Str("jti", jti).Str("reason", reason).Msg("introspection: token inactive, its identity chain is stopped")
 		return cred, false, nil
 	}
 	return cred, true, nil
