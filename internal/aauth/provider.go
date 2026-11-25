@@ -66,6 +66,7 @@ type Config struct {
 type Deps struct {
 	OAuth       *service.OAuthService
 	Credentials *service.CredentialService
+	Identities  *service.IdentityService
 	DB          *bun.DB
 }
 
@@ -76,6 +77,7 @@ type Provider struct {
 	key         *signingKey
 	oauth       *service.OAuthService
 	creds       *service.CredentialService
+	identities  *service.IdentityService
 	redemptions *redemptions
 	now         func() time.Time
 }
@@ -95,21 +97,24 @@ func New(cfg Config, deps Deps) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aauth: %w", err)
 	}
-	if deps.OAuth == nil || deps.Credentials == nil || deps.DB == nil {
+	if deps.OAuth == nil || deps.Credentials == nil || deps.Identities == nil || deps.DB == nil {
 		return nil, errors.New("aauth: missing dependencies")
 	}
 	if cfg.AgentTokenTTL <= 0 {
 		cfg.AgentTokenTTL = DefaultAgentTokenTTL
 	}
-	return &Provider{
+	p := &Provider{
 		cfg:         cfg,
 		authority:   host,
 		key:         key,
 		oauth:       deps.OAuth,
 		creds:       deps.Credentials,
+		identities:  deps.Identities,
 		redemptions: &redemptions{db: deps.DB},
 		now:         time.Now,
-	}, nil
+	}
+	p.registerBridge(deps.OAuth)
+	return p, nil
 }
 
 // ServerIdentifierHost checks s against the AAuth server identifier rules
@@ -132,7 +137,8 @@ func ServerIdentifierHost(s string) (string, error) {
 	return u.Host, nil
 }
 
-// Mount registers the Agent Provider's routes.
+// Mount registers the Agent Provider's routes. (The bridge grant is
+// registered on the token endpoint by New.)
 func (p *Provider) Mount(r chi.Router) {
 	r.Post(PathToken, p.handleToken)
 	r.Get(PathJWKS, p.handleJWKS)
@@ -319,13 +325,22 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			return "", 0, &bootstrapRefusal{code: "temporarily_unavailable", status: http.StatusServiceUnavailable, retryAfter: 1,
 				description: "a redemption of this attestation by this key is still in progress; retry"}
 		}
+		// Claimed long ago and never finished: the request died mid-flight.
+		return "", 0, &bootstrapRefusal{code: "invalid_grant",
+			description: "an earlier redemption of this attestation by this key did not complete; retry with a fresh platform token"}
+	case claimRefusedEarlier:
 		return "", 0, &bootstrapRefusal{code: "invalid_grant",
 			description: "an earlier redemption of this attestation by this key was refused; retry with a fresh platform token"}
+	case claimExpired:
+		return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation has expired"}
 	case claimFresh:
 		if err := p.oauth.SpendWorkloadAssertion(ctx, wa); err != nil {
 			if errors.Is(err, dpop.ErrReplay) {
-				// Spent at the token endpoint. The claim stays unminted, so
-				// every later redemption is refused too.
+				// Spent at the token endpoint. The claim is marked refused,
+				// so every later redemption is refused too.
+				if mErr := p.redemptions.refuse(ctx, wa.ReplayKey); mErr != nil {
+					log.Warn().Err(mErr).Msg("aauth: could not record a refused redemption")
+				}
 				return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation has already been used"}
 			}
 			p.forget(ctx, wa)
@@ -333,6 +348,16 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		}
 	}
 	fresh := claim == claimFresh
+	// A refusal after a fresh claim is recorded, so the same key is refused
+	// at once next time instead of being told to retry.
+	refused := func(err error) error {
+		if fresh && isRefusal(err) {
+			if mErr := p.redemptions.refuse(ctx, wa.ReplayKey); mErr != nil {
+				log.Warn().Err(mErr).Msg("aauth: could not record a refused redemption")
+			}
+		}
+		return err
+	}
 	// cleanup undoes a fresh claim after a server-side failure minted
 	// nothing, so a retry with the same platform token works.
 	cleanup := func() {
@@ -348,7 +373,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		if !isRefusal(failure) {
 			cleanup()
 		}
-		return "", 0, failure
+		return "", 0, refused(failure)
 	}
 	policy, err := p.oauth.ResolveWorkloadPolicy(ctx, identity)
 	if err != nil {
@@ -364,8 +389,8 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		// of five minutes or less is due for refresh as it is issued, and the
 		// agent would loop on /ap/token. A refusal keeps the attestation
 		// spent, as every refusal does.
-		return "", 0, &bootstrapRefusal{code: "access_denied",
-			description: fmt.Sprintf("the identity's credential policy allows tokens of at most %ds; an agent token needs over %ds", ttl, minAgentTokenTTL)}
+		return "", 0, refused(&bootstrapRefusal{code: "access_denied",
+			description: fmt.Sprintf("the identity's credential policy allows tokens of at most %ds; an agent token needs over %ds", ttl, minAgentTokenTTL)})
 	}
 	sub := "aauth:" + identity.ID + "@" + p.authority
 	issued, _, err := p.creds.IssueCredential(ctx, service.IssueRequest{
@@ -382,7 +407,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 	if err != nil {
 		if errors.Is(err, service.ErrPolicyViolation) || errors.Is(err, service.ErrScopesNotAllowed) ||
 			errors.Is(err, domain.ErrIdentityNotUsable) || errors.Is(err, domain.ErrIdentityExpired) {
-			return "", 0, &bootstrapRefusal{code: "access_denied", description: err.Error(), cause: err}
+			return "", 0, refused(&bootstrapRefusal{code: "access_denied", description: err.Error(), cause: err})
 		}
 		cleanup()
 		return "", 0, fmt.Errorf("issuing the agent token: %w", err)

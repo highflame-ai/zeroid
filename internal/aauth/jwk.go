@@ -1,7 +1,7 @@
 // Package aauth is ZeroID's AAuth Agent Provider: it turns a workload's
 // platform identity token into an AAuth agent token (aa-agent+jwt) bound to
-// the agent's own key. (Exchanging that agent token for an OAuth access token
-// at the token endpoint, the bridge grant, is the next step and not yet here.)
+// the agent's own key, and lets that agent token be exchanged for a
+// DPoP-bound OAuth access token at the token endpoint (bridge.go).
 //
 // Everything AAuth lives here. It reuses ZeroID rather than running beside
 // it: the workload checks are the federated grant's (service.VerifyWorkload-

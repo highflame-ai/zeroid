@@ -59,7 +59,8 @@ const (
 	// GrantTypeAAuthBridge is the stored form of an OAuth access token
 	// exchanged for an AAuth agent token at the token endpoint
 	// (GrantTypeAAuthBridgeURN). It is always the child of that agent token
-	// (parent_jti), so revoking the agent token revokes it.
+	// (parent_jti), so revoking the agent token revokes it. A tenant opts in
+	// separately, by listing it beside aauth_agent.
 	GrantTypeAAuthBridge GrantType = "aauth_bridge"
 )
 

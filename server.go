@@ -696,7 +696,7 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 			SigningKeyID:   cfg.AAuth.SigningKeyID,
 			AgentTokenTTL:  time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
 			Name:           cfg.AAuth.Name,
-		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, DB: db})
+		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, Identities: identitySvc, DB: db})
 		if err != nil {
 			return nil, err
 		}

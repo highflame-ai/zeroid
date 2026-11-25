@@ -1,4 +1,5 @@
--- 069_aauth_bootstrap_redemptions.up.sql
+-- 073_aauth_bootstrap_redemptions.up.sql
+-- (073, not 069: main took 069-072 while this branch was open.)
 -- AAuth Agent Provider (internal/aauth): which agent key redeemed each
 -- workload assertion at POST /ap/token.
 --
@@ -14,6 +15,9 @@ CREATE TABLE IF NOT EXISTS aauth_bootstrap_redemptions (
     replay_key  VARCHAR(512) PRIMARY KEY,
     jkt         VARCHAR(64)  NOT NULL,
     minted      BOOLEAN      NOT NULL DEFAULT FALSE,
+    -- refused: the first redemption was refused (no binding, not opted in,
+    -- spent elsewhere). Its key is then refused at once, never told to retry.
+    refused     BOOLEAN      NOT NULL DEFAULT FALSE,
     expires_at  TIMESTAMPTZ  NOT NULL,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );

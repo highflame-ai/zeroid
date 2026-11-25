@@ -71,3 +71,10 @@ func oauthForbidden(code, description string) *OAuthError {
 func oauthServerError(description string, cause error) *OAuthError {
 	return &OAuthError{Code: oautherror.ServerError, Description: description, HTTPStatus: http.StatusInternalServerError, err: cause}
 }
+
+// NewOAuthError is an OAuth error with an HTTP status, for grants registered
+// from outside this package (the AAuth bridge grant in internal/aauth). The
+// token endpoint answers it as code and description with status.
+func NewOAuthError(code, description string, status int) *OAuthError {
+	return &OAuthError{Code: code, Description: description, HTTPStatus: status}
+}

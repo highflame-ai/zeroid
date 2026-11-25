@@ -100,8 +100,9 @@ type Config struct {
 
 // AAuthConfig configures the AAuth Agent Provider. A workload presents its
 // platform token (federation.issuer_store=db workload rows and bindings) and
-// gets an AAuth agent token bound to its own key. Each tenant still opts in by
-// listing aauth_agent in a credential policy's allowed_grant_types.
+// gets an AAuth agent token bound to its own key. Each tenant still opts in
+// through a credential policy's allowed_grant_types: aauth_agent to bootstrap,
+// and aauth_bridge as well to exchange agent tokens for OAuth tokens.
 type AAuthConfig struct {
 	Enabled bool `koanf:"enabled"`
 	// SigningKeyPath is a PKCS#8 PEM Ed25519 private key that signs agent

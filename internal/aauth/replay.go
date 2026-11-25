@@ -10,7 +10,7 @@ import (
 )
 
 // redemptions records which agent key redeemed each workload assertion at
-// POST /ap/token (migration 069). The assertion is spent once, in the shared
+// POST /ap/token (migration 073). The assertion is spent once, in the shared
 // single-use store; this adds the key it was bound to, so the same key may
 // redeem it again and any other key is refused.
 //
@@ -29,7 +29,8 @@ import (
 //     unminted and every later redemption is refused.
 //  3. After a successful mint, confirm sets minted=true. Only then may the
 //     same key redeem again, so a refusal (no binding, an inactive identity, a
-//     policy) can't be replayed for its events.
+//     policy) can't be replayed for its events. A refusal sets refused=true,
+//     so the same key is refused at once rather than told to retry.
 //  4. A server-side failure forgets the claim and releases the spend, so a
 //     retry with the same platform token works.
 type redemptions struct {
@@ -45,9 +46,14 @@ const (
 	claimRepeat
 	// claimRefused: another key holds it.
 	claimRefused
-	// claimPending: this key claimed it, and has not minted: the first
-	// request is still in flight, or was refused.
+	// claimPending: this key claimed it and the first request is still in
+	// flight.
 	claimPending
+	// claimRefusedEarlier: this key's first redemption was refused, and the
+	// refusal stands for the attestation's life.
+	claimRefusedEarlier
+	// claimExpired: the record was swept mid-claim: the attestation expired.
+	claimExpired
 )
 
 // pendingInFlight is how long after a claim an unminted redemption by the same
@@ -67,15 +73,16 @@ func (s *redemptions) claim(ctx context.Context, replayKey, jkt string, expiresA
 		return claimFresh, 0, nil
 	}
 	var row struct {
-		JKT    string        `bun:"jkt"`
-		Minted bool          `bun:"minted"`
-		Age    time.Duration `bun:"age"`
+		JKT     string        `bun:"jkt"`
+		Minted  bool          `bun:"minted"`
+		Refused bool          `bun:"refused"`
+		Age     time.Duration `bun:"age"`
 	}
-	err = s.db.NewRaw(`SELECT jkt, minted, (EXTRACT(EPOCH FROM NOW() - created_at) * 1000000000)::bigint AS age
+	err = s.db.NewRaw(`SELECT jkt, minted, refused, (EXTRACT(EPOCH FROM NOW() - created_at) * 1000000000)::bigint AS age
 		FROM aauth_bootstrap_redemptions WHERE replay_key = ?`, replayKey).Scan(ctx, &row)
 	if errors.Is(err, sql.ErrNoRows) {
 		// Swept between the insert and the read: the assertion has expired.
-		return claimRefused, 0, nil
+		return claimExpired, 0, nil
 	}
 	if err != nil {
 		return claimRefused, 0, err
@@ -85,9 +92,17 @@ func (s *redemptions) claim(ctx context.Context, replayKey, jkt string, expiresA
 		return claimRefused, 0, nil
 	case row.Minted:
 		return claimRepeat, 0, nil
+	case row.Refused:
+		return claimRefusedEarlier, 0, nil
 	default:
 		return claimPending, row.Age, nil
 	}
+}
+
+// refuse marks a claim whose first redemption was refused.
+func (s *redemptions) refuse(ctx context.Context, replayKey string) error {
+	_, err := s.db.NewRaw(`UPDATE aauth_bootstrap_redemptions SET refused = TRUE WHERE replay_key = ? AND NOT minted`, replayKey).Exec(ctx)
+	return err
 }
 
 func (s *redemptions) confirm(ctx context.Context, replayKey string) error {

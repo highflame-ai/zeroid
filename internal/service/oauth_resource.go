@@ -536,3 +536,11 @@ func rejectUnsupportedResource(req TokenRequest, grant string) error {
 	return oauthBadRequest(oautherror.InvalidTarget,
 		fmt.Sprintf("the resource parameter is not supported on the %s grant", grant))
 }
+
+// BindResourceOnIssue binds the token issue will mint to resources (RFC
+// 8707), exactly as the built-in grants do: aud and the reserved resource
+// claim. For grants registered with RegisterGrantAcceptingResource from
+// outside this package.
+func BindResourceOnIssue(issue *IssueRequest, resources []string) {
+	bindResourceOnIssue(issue, resources)
+}

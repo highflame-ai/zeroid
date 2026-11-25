@@ -53,7 +53,7 @@ type aauthFed struct {
 func newAAuthFed(t *testing.T, grantTypes ...string) *aauthFed {
 	t.Helper()
 	if len(grantTypes) == 0 {
-		grantTypes = []string{"aauth_agent", "client_credentials"}
+		grantTypes = []string{"aauth_agent", "aauth_bridge", "client_credentials"}
 	}
 	idp, err := mockidp.New("https://placeholder")
 	require.NoError(t, err)
@@ -352,13 +352,13 @@ func TestAAuthAgentProvider(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, res.status)
 		assert.Equal(t, "access_denied", res.body["error"])
 
-		// The same key retrying straight away is told the truth, not that
-		// another key holds the token: a refused claim looks in flight for a
-		// moment, then refused for good.
+		// The same key retrying is told the truth at once: its earlier
+		// redemption was refused. Not "another key", not "retry".
 		retry := off.bootstrap(t, k, platform)
-		assert.Equal(t, http.StatusServiceUnavailable, retry.status, "body=%v", retry.body)
-		assert.Equal(t, "1", retry.headers.Get("Retry-After"))
-		assert.NotContains(t, retry.body["error_description"], "another key")
+		assert.Equal(t, http.StatusForbidden, retry.status, "body=%v", retry.body)
+		assert.Equal(t, "invalid_grant", retry.body["error"])
+		assert.Contains(t, retry.body["error_description"], "was refused")
+		assert.Empty(t, retry.headers.Get("Retry-After"))
 	})
 
 	t.Run("a policy too short for the refresh margin is refused, not looped on", func(t *testing.T) {
@@ -416,4 +416,144 @@ func decodeJWTHeader(t *testing.T, token string) map[string]any {
 	var out map[string]any
 	require.NoError(t, json.Unmarshal(raw, &out))
 	return out
+}
+
+// dpopProof is an RFC 9449 proof signed by k for POST htu. Ed25519 DPoP uses
+// the JOSE name EdDSA, which pkg/dpop requires; AAuth itself names the same
+// key Ed25519.
+func (k agentKey) dpopProof(t *testing.T, htu string) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		require.NoError(t, err)
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	head := enc(map[string]any{"typ": "dpop+jwt", "alg": "EdDSA", "jwk": map[string]string{"kty": "OKP", "crv": "Ed25519", "x": k.x}})
+	body := enc(map[string]any{"jti": uid("dpop"), "htm": "POST", "htu": htu, "iat": time.Now().Unix()})
+	return head + "." + body + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(k.priv, []byte(head+"."+body)))
+}
+
+// bridge exchanges agentToken at the token endpoint. proofKey, when set,
+// signs the DPoP proof.
+func (a *aauthFed) bridge(t *testing.T, agentToken string, proofKey *agentKey, extra map[string]any) apResponse {
+	t.Helper()
+	body := map[string]any{
+		"grant_type":    "urn:highflame:params:oauth:grant-type:aauth-agent-token",
+		"subject_token": agentToken,
+		"resource":      "https://mcp.example/tools",
+		"scope":         "tools:read",
+	}
+	for k, v := range extra {
+		if v == nil {
+			delete(body, k)
+			continue
+		}
+		body[k] = v
+	}
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodPost, a.f.http.URL+"/oauth2/token", strings.NewReader(string(b)))
+	require.NoError(t, err)
+	req.Host = aauthHost
+	req.Header.Set("Content-Type", "application/json")
+	if proofKey != nil {
+		// No TLS in the test, and forwarded headers aren't trusted, so the
+		// token endpoint sees http://<host>/oauth2/token.
+		req.Header.Set("DPoP", proofKey.dpopProof(t, "http://"+aauthHost+"/oauth2/token"))
+	}
+	return a.do(t, req)
+}
+
+func TestAAuthBridge(t *testing.T) {
+	a := newAAuthFed(t)
+	newAgentToken := func(t *testing.T) (agentKey, string) {
+		k := newAgentKey(t)
+		res := a.bootstrap(t, k, a.assertion(t, nil))
+		require.Equal(t, http.StatusOK, res.status, "bootstrap: %v", res.body)
+		return k, res.body["agent_token"].(string)
+	}
+
+	t.Run("an agent token and a DPoP proof by its key get a DPoP-bound OAuth token", func(t *testing.T) {
+		k, agentToken := newAgentToken(t)
+		agentClaims := decodeJWTPayload(t, agentToken)
+		res := a.bridge(t, agentToken, &k, nil)
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		assert.Equal(t, "DPoP", res.body["token_type"])
+
+		claims := decodeJWTPayload(t, res.body["access_token"].(string))
+		assert.Equal(t, a.wimse, claims["sub"], "an ordinary token of the identity")
+		assert.Equal(t, "aauth_bridge", claims["grant_type"])
+		assert.Equal(t, agentClaims["sub"], claims["aauth_agent"], "names the agent it was exchanged for")
+		assert.Equal(t, k.thumbprint(), claims["cnf"].(map[string]any)["jkt"], "bound to the agent's own key")
+		assert.Contains(t, fmt.Sprint(claims["aud"]), "https://mcp.example/tools")
+		assert.Contains(t, fmt.Sprint(claims["resource"]), "https://mcp.example/tools")
+		assert.LessOrEqual(t, claims["exp"].(float64), agentClaims["exp"].(float64), "never outlives the agent token")
+
+		row := a.credential(t, claims["jti"].(string))
+		require.NotNil(t, row)
+		assert.Equal(t, agentClaims["jti"], row["parent_jti"], "the child of the agent token")
+	})
+
+	t.Run("revoking the agent token revokes what was bridged from it", func(t *testing.T) {
+		k, agentToken := newAgentToken(t)
+		res := a.bridge(t, agentToken, &k, nil)
+		require.Equal(t, http.StatusOK, res.status, "body=%v", res.body)
+		bridgedJTI := decodeJWTPayload(t, res.body["access_token"].(string))["jti"].(string)
+		agentRow := a.credential(t, decodeJWTPayload(t, agentToken)["jti"].(string))
+		require.NotNil(t, agentRow)
+
+		status, body := a.f.call(t, http.MethodPost, "/credentials/"+agentRow["id"].(string)+"/revoke",
+			map[string]any{"reason": "test"}, a.tn.headers)
+		require.Contains(t, []int{http.StatusOK, http.StatusNoContent}, status, "revoke: %v", body)
+		assert.Equal(t, true, a.credential(t, bridgedJTI)["is_revoked"], "cascade through parent_jti")
+
+		again := a.bridge(t, agentToken, &k, nil)
+		assert.Equal(t, http.StatusBadRequest, again.status)
+		assert.Equal(t, "invalid_grant", again.body["error"], "a revoked agent token can't be exchanged")
+	})
+
+	t.Run("possession of the agent key is required", func(t *testing.T) {
+		_, agentToken := newAgentToken(t)
+		none := a.bridge(t, agentToken, nil, nil)
+		assert.Equal(t, http.StatusBadRequest, none.status)
+		assert.Equal(t, "invalid_request", none.body["error"])
+
+		other := newAgentKey(t)
+		wrong := a.bridge(t, agentToken, &other, nil)
+		assert.Equal(t, http.StatusBadRequest, wrong.status)
+		assert.Equal(t, "invalid_grant", wrong.body["error"], "a DPoP proof by another key")
+	})
+
+	t.Run("only agent tokens from this Agent Provider are exchanged", func(t *testing.T) {
+		k := newAgentKey(t)
+		oauth := a.clientCredentials(t, a.assertion(t, nil), nil)
+		require.Equal(t, http.StatusOK, oauth.StatusCode, "body=%s", oauth.RawBody)
+		res := a.bridge(t, oauth.AccessToken, &k, nil)
+		assert.Equal(t, http.StatusBadRequest, res.status)
+		assert.Equal(t, "invalid_grant", res.body["error"], "an OAuth access token is not an agent token")
+	})
+
+	t.Run("a scope outside the ceiling is invalid_scope, not a bad agent token", func(t *testing.T) {
+		k, agentToken := newAgentToken(t)
+		res := a.bridge(t, agentToken, &k, map[string]any{"scope": "nhi:manage"})
+		assert.Equal(t, http.StatusBadRequest, res.status, "body=%v", res.body)
+		assert.Equal(t, "invalid_scope", res.body["error"])
+	})
+
+	t.Run("the token is for exactly one resource", func(t *testing.T) {
+		k, agentToken := newAgentToken(t)
+		res := a.bridge(t, agentToken, &k, map[string]any{"resource": nil})
+		assert.Equal(t, http.StatusBadRequest, res.status)
+		assert.Equal(t, "invalid_target", res.body["error"])
+	})
+
+	t.Run("a tenant whose policy does not list aauth_bridge can't bridge", func(t *testing.T) {
+		off := newAAuthFed(t, "aauth_agent")
+		k := newAgentKey(t)
+		boot := off.bootstrap(t, k, off.assertion(t, nil))
+		require.Equal(t, http.StatusOK, boot.status, "body=%v", boot.body)
+		res := off.bridge(t, boot.body["agent_token"].(string), &k, nil)
+		assert.Equal(t, http.StatusBadRequest, res.status, "body=%v", res.body)
+		assert.Equal(t, "invalid_grant", res.body["error"])
+	})
 }
