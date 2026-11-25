@@ -733,6 +733,9 @@ func (a *API) ingestDiscoveredIdentityOp(ctx context.Context, input *CreateDisco
 		if herr := approvalChannelWriteError(err); herr != nil {
 			return nil, herr
 		}
+		if errors.Is(err, service.ErrExternalIDHeldByFirstContact) {
+			return nil, huma.Error409Conflict(err.Error())
+		}
 		if errors.Is(err, service.ErrIdentityAlreadyExists) {
 			return nil, huma.Error409Conflict("external_id already belongs to a native identity in this tenant")
 		}

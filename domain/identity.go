@@ -385,6 +385,16 @@ const (
 	FirstContactMetadataKey = "first_contact"
 )
 
+// FirstContactExternalIDPrefix starts the external_id of every identity
+// first contact registers. Reserved like OriginFirstContact: no API caller may
+// create an identity whose external_id starts with it, and the discovered
+// ingest refuses one. So a first-contact identity's external_id never equals
+// an id an inventory sync supplies, even when the agent's subject key is also
+// the id of another record the inventory holds (an IdP app the agent uses as
+// its client, say), and an ingest reaches a first-contact identity only
+// through its issuer_binding metadata.
+const FirstContactExternalIDPrefix = "first_contact."
+
 // IsExternal reports whether the identity was discovered in an external IdP
 // (origin is set and not `native`). External-origin identities enter the
 // lifecycle in `discovered` and may be owner-less until adopted.

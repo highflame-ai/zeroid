@@ -15,8 +15,12 @@ import (
 func TestFirstContactExternalID(t *testing.T) {
 	const row = "6f1c2b9e-0000-4000-8000-000000000001"
 
-	t.Run("an opaque client id is used as is", func(t *testing.T) {
-		assert.Equal(t, "0oa8f5j3ecb5w3dF35d7", firstContactExternalID(row, "0oa8f5j3ecb5w3dF35d7"))
+	t.Run("an opaque client id keeps its form, in the reserved namespace", func(t *testing.T) {
+		id := firstContactExternalID(row, "0oa8f5j3ecb5w3dF35d7")
+		assert.Equal(t, "first_contact.0oa8f5j3ecb5w3dF35d7", id)
+		assert.NotEqual(t, "0oa8f5j3ecb5w3dF35d7", id, "never the id another record has under the same key")
+		assert.True(t, reservedFirstContactExternalID(id))
+		require.NoError(t, domain.ValidateSPIFFEPathSegment("external_id", id))
 	})
 
 	for _, key := range []string{
@@ -30,6 +34,7 @@ func TestFirstContactExternalID(t *testing.T) {
 		t.Run("a subject that is not a path segment: "+key[:min(len(key), 40)], func(t *testing.T) {
 			id := firstContactExternalID(row, key)
 			require.NoError(t, domain.ValidateSPIFFEPathSegment("external_id", id), id)
+			assert.True(t, reservedFirstContactExternalID(id), id)
 			assert.LessOrEqual(t, len(id), 255)
 			assert.Equal(t, id, firstContactExternalID(row, key), "deterministic")
 			assert.NotEqual(t, id, firstContactExternalID("6f1c2b9e-0000-4000-8000-000000000002", key),
@@ -41,8 +46,32 @@ func TestFirstContactExternalID(t *testing.T) {
 		a := firstContactExternalID(row, "system:serviceaccount:a:b")
 		b := firstContactExternalID(row, "system:serviceaccount:a/b")
 		assert.NotEqual(t, a, b)
-		assert.True(t, strings.HasPrefix(a, "system_serviceaccount_a_b-"), a)
+		assert.True(t, strings.HasPrefix(a, "first_contact.system_serviceaccount_a_b-"), a)
 	})
+}
+
+// No caller but first contact can take an external_id in its namespace: not
+// an admin registration, and not a discovered ingest, which is refused before
+// it looks up the external_id, so an inventory record never reconciles into a
+// first-contact identity by external_id.
+func TestFirstContactExternalIDReserved(t *testing.T) {
+	s := &IdentityService{}
+	ctx := context.Background()
+	_, err := s.RegisterIdentity(ctx, RegisterIdentityRequest{
+		AccountID: "a", ProjectID: "p", ExternalID: "first_contact.0oa1", OwnerUserID: "o",
+	})
+	require.ErrorIs(t, err, ErrInvalidIdentityField)
+	assert.ErrorIs(t, err, errFirstContactExternalIDReserved)
+
+	_, _, err = s.UpsertDiscoveredIdentity(ctx, DiscoveredIdentityRequest{
+		AccountID: "a", ProjectID: "p", ExternalID: "first_contact.0oa1", Origin: "inventory",
+	})
+	require.ErrorIs(t, err, ErrInvalidIdentityField)
+	assert.ErrorIs(t, err, errFirstContactExternalIDReserved)
+
+	assert.False(t, reservedFirstContactExternalID("0oa1"))
+	assert.False(t, reservedFirstContactExternalID("first_contact"), "the origin name alone is no external_id in the namespace")
+	assert.False(t, reservedFirstContactExternalID("First_Contact.0oa1"), "external ids are case-sensitive")
 }
 
 func TestFirstContactName(t *testing.T) {

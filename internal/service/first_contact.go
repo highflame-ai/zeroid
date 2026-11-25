@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -63,6 +64,17 @@ type FirstContactConfig struct {
 // caller but first contact itself.
 var errFirstContactOriginReserved = fmt.Errorf("%w: origin %q is reserved for identities registered on first contact",
 	ErrInvalidIdentityField, domain.OriginFirstContact)
+
+// errFirstContactExternalIDReserved refuses an external_id in first
+// contact's namespace to every caller but first contact itself.
+var errFirstContactExternalIDReserved = fmt.Errorf("%w: an external_id starting with %q is reserved for identities registered on first contact",
+	ErrInvalidIdentityField, domain.FirstContactExternalIDPrefix)
+
+// reservedFirstContactExternalID reports whether externalID is in first
+// contact's namespace.
+func reservedFirstContactExternalID(externalID string) bool {
+	return strings.HasPrefix(externalID, domain.FirstContactExternalIDPrefix)
+}
 
 // FirstContactRegistrar registers agents on first contact.
 type FirstContactRegistrar struct {
@@ -325,17 +337,21 @@ func (r *FirstContactRegistrar) register(ctx context.Context, a firstContactArri
 }
 
 // firstContactExternalID is the external_id of the identity first contact
-// registers for subjectKey under the issuer row issuerID. It is the subject
-// key itself when that is a valid SPIFFE path segment of at most 128 bytes,
-// as an opaque IdP client id is. Otherwise (an AWS role ARN, a Kubernetes
-// service account, a SPIFFE ID or a URL), the external_id lands in the WIMSE
-// URI and must be a path segment, so it is the key's last 160 bytes with
-// every other byte replaced by '_', then '-' and 20 hex digits of
-// SHA-256(issuer row id, subject key), which keep two keys that map to the
-// same readable part apart. Deterministic, so a retry computes the same id.
+// registers for subjectKey under the issuer row issuerID, always in the
+// reserved namespace domain.FirstContactExternalIDPrefix: an inventory sync
+// may ingest another record under the subject key itself (an IdP app whose id
+// is the agent's client id), and the two must never meet on one identity.
+// After the prefix comes the subject key when that is a valid SPIFFE path
+// segment of at most 128 bytes, as an opaque IdP client id is. Otherwise (an
+// AWS role ARN, a Kubernetes service account, a SPIFFE ID or a URL), the
+// external_id lands in the WIMSE URI and must be a path segment, so it is the
+// key's last 160 bytes with every other byte replaced by '_', then '-' and 20
+// hex digits of SHA-256(issuer row id, subject key), which keep two keys that
+// map to the same readable part apart. At most 195 bytes. Deterministic, so a
+// retry computes the same id.
 func firstContactExternalID(issuerID, subjectKey string) string {
 	if len(subjectKey) <= 128 && domain.ValidateSPIFFEPathSegment("external_id", subjectKey) == nil {
-		return subjectKey
+		return domain.FirstContactExternalIDPrefix + subjectKey
 	}
 	readable := subjectKey
 	if len(readable) > 160 {
@@ -348,7 +364,7 @@ func firstContactExternalID(issuerID, subjectKey string) string {
 		}
 	}
 	sum := sha256.Sum256([]byte(issuerID + "\x00" + subjectKey))
-	return string(b) + "-" + hex.EncodeToString(sum[:10])
+	return domain.FirstContactExternalIDPrefix + string(b) + "-" + hex.EncodeToString(sum[:10])
 }
 
 func spiffeSegmentByte(c byte) bool {

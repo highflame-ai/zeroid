@@ -26,11 +26,12 @@ import (
 )
 
 const (
-	fcOwner         = "user-fc-owner"
-	fcActor         = "system:first_contact"
-	fcLabelFilter   = "discovered_via:first_contact"
-	fcJWTBearer     = "urn:ietf:params:oauth:grant-type:jwt-bearer"
-	fcTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
+	fcOwner           = "user-fc-owner"
+	fcActor           = "system:first_contact"
+	fcLabelFilter     = "discovered_via:first_contact"
+	fcJWTBearer       = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+	fcTokenExchange   = "urn:ietf:params:oauth:grant-type:token-exchange"
+	fcInventoryOrigin = "inventory"
 )
 
 // fcTenant is a tenant plus the project first contact registers into.
@@ -368,8 +369,8 @@ func TestFirstContact_Workload(t *testing.T) {
 		bindings := bindingsFor(t, w.f, w.tn.tiTenant, w.rowID, sub)
 		require.Len(t, bindings, 1)
 		id := w.tn.identity(t, bindings[0]["identity_id"].(string))
-		assert.Regexp(t, `^arn_aws_iam__123456789012_role_AgentRuntime.*-[0-9a-f]{20}$`, id["external_id"],
-			"an ARN is no path segment, so the external_id is its readable form and a hash")
+		assert.Regexp(t, `^first_contact\.arn_aws_iam__123456789012_role_AgentRuntime.*-[0-9a-f]{20}$`, id["external_id"],
+			"an ARN is no path segment, so the external_id is its readable form and a hash, in the reserved namespace")
 		record := id["metadata"].(map[string]any)["first_contact"].(map[string]any)
 		assert.Equal(t, sub, record["subject_key"])
 		assert.Equal(t, map[string]any{
@@ -595,7 +596,7 @@ func TestFirstContact_IDJAG(t *testing.T) {
 		assert.Equal(t, false, bindings[0]["enabled"])
 		id := p.tn.identity(t, bindings[0]["identity_id"].(string))
 		assert.Equal(t, "discovered", id["status"])
-		assert.Equal(t, agent, id["external_id"], "an opaque client id is the external_id")
+		assert.Equal(t, "first_contact."+agent, id["external_id"], "an opaque client id keeps its form, in the reserved namespace")
 		record := id["metadata"].(map[string]any)["first_contact"].(map[string]any)
 		assert.Equal(t, p.f.idp.OktaIssuer(), record["issuer"])
 		assert.Equal(t, agent, record["subject_key"])
@@ -690,19 +691,145 @@ func TestFirstContact_IDJAG(t *testing.T) {
 		assert.Empty(t, bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent))
 	})
 
-	t.Run("an external_id another identity holds is never taken over", func(t *testing.T) {
+	t.Run("an identity that holds the agent's external_id is never taken over", func(t *testing.T) {
 		set(t, discoverSettings(p.tn))
 		agent := uid("0oa-agent")
-		resp := post(t, adminPath("/identities"), map[string]any{
-			"external_id": agent, "identity_type": "agent", "owner_user_id": "someone",
-		}, p.tn.mappedHeaders)
-		require.Equal(t, http.StatusCreated, resp.StatusCode)
-		_ = resp.Body.Close()
+		requireRefused(t, p.redeem(t, p.idJAG(t, p.clientID, agent, p.aliceSub), p.keyed), "invalid_grant")
+		bindings := bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent)
+		require.Len(t, bindings, 1)
+		// A person removes the binding; the identity keeps its external_id.
+		status, _ := p.f.call(t, http.MethodDelete, "/external-issuers/"+p.rowID+"/bindings/"+bindings[0]["id"].(string), nil, p.tn.headers)
+		require.Equal(t, http.StatusNoContent, status)
 
 		tr := p.redeem(t, p.idJAG(t, p.clientID, agent, p.aliceSub), p.keyed)
 		requireRefused(t, tr, "invalid_grant")
 		assert.Contains(t, tr.RawBody, "no enabled binding")
-		assert.Empty(t, bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent))
+		assert.Empty(t, bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent), "nothing bound to the identity that holds it")
+		var held int
+		for _, id := range p.tn.firstContactIdentities(t) {
+			if id["external_id"] == "first_contact."+agent {
+				held++
+			}
+		}
+		assert.Equal(t, 1, held, "no second identity")
+	})
+
+	t.Run("no caller can take an external_id in first contact's namespace", func(t *testing.T) {
+		resp := post(t, adminPath("/identities"), map[string]any{
+			"external_id": "first_contact." + uid("0oa-agent"), "identity_type": "agent", "owner_user_id": "someone",
+		}, p.tn.mappedHeaders)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		_ = resp.Body.Close()
+		resp = post(t, adminPath("/identities/discovered"), map[string]any{
+			"external_id": "first_contact." + uid("0oa-agent"), "origin": fcInventoryOrigin,
+		}, p.tn.mappedHeaders)
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		_ = resp.Body.Close()
+	})
+
+	// An IdP can let an agent use an existing app as its OAuth client, and an
+	// inventory sync ingests that app under its own id, which is the agent's
+	// client id: the subject key first contact saw. The app and the agent stay
+	// two identities, whichever arrives first.
+	t.Run("an inventory record whose id is the agent's client id is a separate identity", func(t *testing.T) {
+		set(t, discoverSettings(p.tn))
+		ingestApp := func(t *testing.T, appID, name string) map[string]any {
+			t.Helper()
+			resp := post(t, adminPath("/identities/discovered"), map[string]any{
+				"external_id": appID, "origin": fcInventoryOrigin, "identity_type": "application", "name": name,
+				"labels": map[string]any{"kind": "oauth_app"}, "metadata": map[string]any{"app_id": appID},
+			}, p.tn.mappedHeaders)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			return decode(t, resp)
+		}
+
+		t.Run("after first contact", func(t *testing.T) {
+			agent := uid("0oa-agent")
+			requireRefused(t, p.redeem(t, p.idJAG(t, p.clientID, agent, p.aliceSub), p.keyed), "invalid_grant")
+			bindings := bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent)
+			require.Len(t, bindings, 1)
+			fcID := bindings[0]["identity_id"].(string)
+
+			out := ingestApp(t, agent, "OAuth app")
+			assert.Equal(t, true, out["created"], "a new identity, not a merge into the agent")
+			app := out["identity"].(map[string]any)
+			assert.NotEqual(t, fcID, app["id"])
+			assert.Equal(t, agent, app["external_id"])
+
+			// The agent's own inventory record names the subject, and merges.
+			resp := post(t, adminPath("/identities/discovered"), map[string]any{
+				"external_id": uid("agent-record"), "origin": fcInventoryOrigin, "name": "Inventoried agent",
+				"metadata": map[string]any{"issuer_binding": map[string]any{"issuer_id": p.rowID, "subject_key": agent}},
+			}, p.tn.mappedHeaders)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			merged := decode(t, resp)
+			assert.Equal(t, false, merged["created"])
+			assert.Equal(t, fcID, merged["identity"].(map[string]any)["id"])
+
+			// A re-sync of the app reconciles into the app, never the agent.
+			again := ingestApp(t, agent, "OAuth app, renamed")
+			assert.Equal(t, app["id"], again["identity"].(map[string]any)["id"])
+
+			fc := p.tn.identity(t, fcID)
+			assert.Equal(t, "Inventoried agent", fc["name"], "the agent keeps the agent's data, not the app's")
+			assert.NotContains(t, fc["labels"], "kind")
+			assert.NotContains(t, fc["metadata"], "app_id")
+			assert.Equal(t, "first_contact."+agent, fc["external_id"])
+			assert.Equal(t, "first_contact", fc["origin"])
+		})
+
+		t.Run("before first contact", func(t *testing.T) {
+			agent := uid("0oa-agent")
+			app := ingestApp(t, agent, "OAuth app")["identity"].(map[string]any)
+
+			tr := p.redeem(t, p.idJAG(t, p.clientID, agent, p.aliceSub), p.keyed)
+			requireRefused(t, tr, "invalid_grant")
+			assert.Contains(t, tr.RawBody, "agent identity is discovered", "registered: the app's id does not block it")
+			bindings := bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent)
+			require.Len(t, bindings, 1)
+			assert.NotEqual(t, app["id"], bindings[0]["identity_id"])
+			assert.Equal(t, "first_contact."+agent, p.tn.identity(t, bindings[0]["identity_id"].(string))["external_id"])
+		})
+
+		// An identity first contact registered before its external_ids moved
+		// into the reserved namespace holds the bare subject key. The ingest
+		// lookup is scoped away from first-contact identities, so the app's
+		// record is refused as a conflict rather than merged into the agent.
+		t.Run("an agent registered with the bare subject key", func(t *testing.T) {
+			agent := uid("0oa-agent")
+			requireRefused(t, p.redeem(t, p.idJAG(t, p.clientID, agent, p.aliceSub), p.keyed), "invalid_grant")
+			bindings := bindingsFor(t, p.f, p.tn.tiTenant, p.rowID, agent)
+			require.Len(t, bindings, 1)
+			fcID := bindings[0]["identity_id"].(string)
+			_, err := testDB.NewUpdate().Table("identities").Set("external_id = ?", agent).
+				Where("id = ?", fcID).Exec(context.Background())
+			require.NoError(t, err)
+			before := p.tn.identity(t, fcID)
+
+			resp := post(t, adminPath("/identities/discovered"), map[string]any{
+				"external_id": agent, "origin": fcInventoryOrigin, "identity_type": "application", "name": "OAuth app",
+				"labels": map[string]any{"kind": "oauth_app"}, "metadata": map[string]any{"app_id": agent},
+			}, p.tn.mappedHeaders)
+			assert.Equal(t, http.StatusConflict, resp.StatusCode)
+			assert.Contains(t, decode(t, resp)["detail"], "issuer_binding")
+
+			fc := p.tn.identity(t, fcID)
+			assert.Equal(t, before["name"], fc["name"], "the agent is not renamed by the app's record")
+			assert.Equal(t, before["identity_type"], fc["identity_type"])
+			assert.NotContains(t, fc["labels"], "kind")
+			assert.NotContains(t, fc["metadata"], "app_id")
+			assert.Equal(t, "first_contact", fc["origin"])
+
+			// The agent's own inventory record still merges through issuer_binding.
+			resp = post(t, adminPath("/identities/discovered"), map[string]any{
+				"external_id": uid("agent-record"), "origin": fcInventoryOrigin, "name": "Inventoried agent",
+				"metadata": map[string]any{"issuer_binding": map[string]any{"issuer_id": p.rowID, "subject_key": agent}},
+			}, p.tn.mappedHeaders)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			merged := decode(t, resp)
+			assert.Equal(t, false, merged["created"])
+			assert.Equal(t, fcID, merged["identity"].(map[string]any)["id"])
+		})
 	})
 }
 
