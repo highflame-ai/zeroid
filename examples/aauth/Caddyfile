@@ -1,0 +1,15 @@
+# TLS for the two demo hosts from Caddy's local CA. AAuth server identifiers
+# are https and host only, so ZeroID is reached as https://auth.zeroid.test.
+# Demo containers trust the CA at /data/caddy/pki/authorities/local/root.crt.
+{
+	local_certs
+	skip_install_trust
+}
+
+auth.zeroid.test {
+	reverse_proxy zeroid:8899
+}
+
+resource.zeroid.test {
+	reverse_proxy demo-resource:8080
+}

@@ -1,0 +1,120 @@
+# ZeroID as an AAuth Agent Provider, end to end, on one machine and with
+# nothing leaving it. See README.md.
+#
+#   docker compose up --build --abort-on-container-exit demo-agent
+#
+# Build context is the repository root (two levels up).
+name: zeroid-aauth-demo
+
+x-demo-image: &demo-image
+  image: zeroid-aauth-demo:local
+  build:
+    context: ../..
+    dockerfile: examples/aauth/Dockerfile
+
+x-trust-caddy: &trust-caddy
+  CA_FILE: /caddy/caddy/pki/authorities/local/root.crt
+
+services:
+  postgres:
+    image: postgres:17-alpine3.22
+    environment:
+      POSTGRES_USER: zeroid
+      POSTGRES_PASSWORD: zeroid
+      POSTGRES_DB: zeroid
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeroid -d zeroid"]
+      interval: 2s
+      retries: 30
+
+  keygen:
+    image: alpine:3.22
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache openssl >/dev/null && sh /keygen.sh"]
+    volumes:
+      - ./keygen.sh:/keygen.sh:ro
+      - keys:/keys
+
+  zeroid:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: zeroid:aauth-demo
+    depends_on:
+      postgres: { condition: service_healthy }
+      keygen: { condition: service_completed_successfully }
+    environment:
+      ZEROID_DATABASE_URL: postgres://zeroid:zeroid@postgres:5432/zeroid?sslmode=disable
+      ZEROID_ENV: development
+      ZEROID_ISSUER: https://auth.zeroid.test
+      ZEROID_WIMSE_DOMAIN: zeroid.test
+      ZEROID_HMAC_SECRET: demo-only-hmac-secret-0123456789abcdef
+      ZEROID_PRIVATE_KEY_PATH: /keys/private.pem
+      ZEROID_PUBLIC_KEY_PATH: /keys/public.pem
+      ZEROID_RSA_PRIVATE_KEY_PATH: /keys/rsa_private.pem
+      ZEROID_RSA_PUBLIC_KEY_PATH: /keys/rsa_public.pem
+      # Behind Caddy: trust its X-Forwarded-Proto, so DPoP htu is https.
+      ZEROID_FORWARDED_HEADERS: proto
+      # Workload issuer rows, and a plain-http mock cluster issuer (dev only).
+      ZEROID_FEDERATION_ISSUER_STORE: db
+      ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS: "true"
+      # The demo resource introspects without client credentials (dev only).
+      ZEROID_ALLOW_UNAUTHENTICATED_TOKEN_INSPECTION: "true"
+      ZEROID_AAUTH_ENABLED: "true"
+      ZEROID_AAUTH_SIGNING_KEY_PATH: /keys/aauth_ed25519.pem
+      ZEROID_AAUTH_NAME: ZeroID demo Agent Provider
+    volumes:
+      - keys:/keys:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8899/health"]
+      interval: 2s
+      retries: 60
+
+  caddy:
+    image: caddy:2.10-alpine
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    networks:
+      default:
+        aliases: [auth.zeroid.test, resource.zeroid.test]
+
+  mockidp:
+    <<: *demo-image
+    command: ["zeroid-mockidp", "-addr", ":8080", "-base-url", "http://mockidp:8080"]
+
+  demo-setup:
+    <<: *demo-image
+    command: ["demo-setup"]
+    depends_on:
+      zeroid: { condition: service_healthy }
+      mockidp: { condition: service_started }
+    environment:
+      ZEROID_ADMIN_URL: http://zeroid:8899
+
+  demo-resource:
+    <<: *demo-image
+    command: ["demo-resource"]
+    depends_on: [caddy]
+    environment:
+      <<: *trust-caddy
+    volumes:
+      - caddy-data:/caddy:ro
+
+  demo-agent:
+    <<: *demo-image
+    command: ["demo-agent"]
+    depends_on:
+      demo-setup: { condition: service_completed_successfully }
+      demo-resource: { condition: service_started }
+    environment:
+      <<: *trust-caddy
+      PLATFORM: mockidp
+      KEY_FILE: /pod/agent.key
+    volumes:
+      - caddy-data:/caddy:ro
+      - pod:/pod
+
+volumes:
+  keys:
+  caddy-data:
+  pod:
