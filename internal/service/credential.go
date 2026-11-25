@@ -318,6 +318,13 @@ type IssueRequest struct {
 	// FederatedClientAuth marks a token whose client authenticated with a
 	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
 	FederatedClientAuth bool
+	// AgentTokenSigner, set only by the AAuth Agent Provider (internal/aauth),
+	// signs the issued token instead of the OAuth access token below: an
+	// aa-agent+jwt carrying jti, iat and exp as issued here. Everything else
+	// is the same as for any grant: identity checks, policy enforcement, the
+	// issued_credentials row and revocation. Required with, and only with,
+	// GrantTypeAAuthAgent.
+	AgentTokenSigner func(jti string, issuedAt, expiresAt time.Time) (string, error)
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
 	CustomClaims map[string]any
@@ -641,6 +648,36 @@ func (s *CredentialService) resolvePrincipal(req IssueRequest) resolvedPrincipal
 	return resolvedPrincipal{Type: domain.PrincipalUser, Sub: req.SubjectOverride, Iss: iss}
 }
 
+// ErrGrantTypeNotIssuable is returned when a grant type is requested outside
+// the endpoint that alone may mint it: an AAuth agent token anywhere but the
+// Agent Provider, an AAuth bridge token without its parent agent token.
+var ErrGrantTypeNotIssuable = errors.New("grant type is issued only by its own endpoint")
+
+// ErrCredentialNotRotatable is returned for a credential that rotation would
+// turn into a different kind of token: AAuth tokens are re-issued by their own
+// endpoints, never rotated.
+var ErrCredentialNotRotatable = errors.New("credential cannot be rotated")
+
+// checkAAuthIssuance keeps the AAuth grant types to their own endpoints, so
+// no other path (an admin issue, a rotation) mints an OAuth token labelled as
+// an agent token, or an agent token under another grant type.
+//
+// The grant type is compared in its short form: a caller may send the URN.
+// The bridge rule only requires a parent; the bridge grant itself checks that
+// the parent is a live agent token before it asks for one.
+func checkAAuthIssuance(req IssueRequest) error {
+	g := domain.NormalizeGrantType(string(req.GrantType))
+	switch {
+	case req.AgentTokenSigner != nil && g != domain.GrantTypeAAuthAgent:
+		return fmt.Errorf("%w: an agent token signer is only for %s", ErrGrantTypeNotIssuable, domain.GrantTypeAAuthAgent)
+	case g == domain.GrantTypeAAuthAgent && req.AgentTokenSigner == nil:
+		return fmt.Errorf("%w: %s is minted only at the AAuth Agent Provider", ErrGrantTypeNotIssuable, req.GrantType)
+	case g == domain.GrantTypeAAuthBridge && req.ParentJTI == "":
+		return fmt.Errorf("%w: %s needs its parent agent token", ErrGrantTypeNotIssuable, req.GrantType)
+	}
+	return nil
+}
+
 // ErrScopesNotAllowed is returned when one or more requested scopes are not in the identity's AllowedScopes list.
 var ErrScopesNotAllowed = fmt.Errorf("one or more requested scopes are not permitted for this identity")
 
@@ -809,6 +846,9 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	}
 	if req.GrantType == "" {
 		req.GrantType = domain.GrantTypeClientCredentials
+	}
+	if err := checkAAuthIssuance(req); err != nil {
+		return nil, nil, err
 	}
 
 	// The principal is decided first: the person-grant ceiling applies only
@@ -1304,7 +1344,16 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	typ := accessTokenTyp(identityPolicy)
 	var signed []byte
 	var signErr error
-	if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
+	if req.AgentTokenSigner != nil {
+		// An AAuth agent token: its own format and key. The OAuth claims
+		// built above are not signed.
+		var agentToken string
+		agentToken, signErr = req.AgentTokenSigner(jti, now, expiresAt)
+		if signErr == nil && agentToken == "" {
+			signErr = errors.New("agent token signer returned no token")
+		}
+		signed = []byte(agentToken)
+	} else if req.UseRS256 && s.jwksSvc.HasRSAKeys() {
 		hdrs := jws.NewHeaders()
 		_ = hdrs.Set(jws.KeyIDKey, s.jwksSvc.RSAKeyID())
 		_ = hdrs.Set(jws.TypeKey, typ)
@@ -1654,6 +1703,12 @@ func (s *CredentialService) RotateCredential(ctx context.Context, credID, accoun
 	// "rotate" would degrade to minting a fresh token off a dead row.
 	if time.Now().After(old.ExpiresAt) {
 		return nil, nil, fmt.Errorf("%w: issue a new credential instead of rotating", domain.ErrCredentialExpired)
+	}
+
+	// AAuth tokens are re-issued by their own endpoints. Refused before
+	// anything is revoked, so a refused rotation leaves the token alive.
+	if old.GrantType.IsAAuth() {
+		return nil, nil, fmt.Errorf("%w: %s tokens are re-issued by their AAuth endpoint", ErrCredentialNotRotatable, old.GrantType)
 	}
 
 	// A credential carrying ciba:approve is rotated only by a trusted

@@ -153,7 +153,7 @@ func (a *API) issueCredentialOp(ctx context.Context, input *IssueCredentialInput
 		ChannelTrustedCredential: service.TrustedApprovalChannelWrite(ctx),
 	})
 	if err != nil {
-		if errors.Is(err, service.ErrScopesNotAllowed) {
+		if errors.Is(err, service.ErrScopesNotAllowed) || errors.Is(err, service.ErrGrantTypeNotIssuable) {
 			return nil, huma.Error400BadRequest(err.Error())
 		}
 		log.Error().Err(err).Str("identity_id", input.Body.IdentityID).Msg("failed to issue credential")
@@ -274,7 +274,8 @@ func (a *API) rotateCredentialOp(ctx context.Context, input *CredentialIDInput) 
 		// map them to 409 so they neither fire 5xx alerting nor tell the
 		// caller to retry something that can never succeed. A dead
 		// credential can't be rotated — the caller must issue a new one.
-		if errors.Is(err, domain.ErrCredentialExpired) || errors.Is(err, domain.ErrCredentialAlreadyRevoked) {
+		if errors.Is(err, domain.ErrCredentialExpired) || errors.Is(err, domain.ErrCredentialAlreadyRevoked) ||
+			errors.Is(err, service.ErrCredentialNotRotatable) {
 			return nil, huma.Error409Conflict(err.Error())
 		}
 		log.Error().Err(err).Str("credential_id", input.ID).Msg("failed to rotate credential")

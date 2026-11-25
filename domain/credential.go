@@ -50,7 +50,29 @@ const (
 	// grant_type claim. Credential policies cannot name it: server
 	// configuration governs the grant, not a tenant's policy.
 	GrantTypeAssertedTenant GrantType = "asserted_tenant"
+	// GrantTypeAAuthAgent is the stored form of an AAuth agent token
+	// (aa-agent+jwt) minted at the Agent Provider endpoint, POST /ap/token
+	// (internal/aauth). It is issued only there, never by an admin issue or a
+	// rotation. A tenant opts in by listing it in a credential policy's
+	// allowed_grant_types; the default policy does not.
+	GrantTypeAAuthAgent GrantType = "aauth_agent"
+	// GrantTypeAAuthBridge is the stored form of an OAuth access token
+	// exchanged for an AAuth agent token at the token endpoint
+	// (GrantTypeAAuthBridgeURN). It is always the child of that agent token
+	// (parent_jti), so revoking the agent token revokes it.
+	GrantTypeAAuthBridge GrantType = "aauth_bridge"
 )
+
+// GrantTypeAAuthBridgeURN is the grant_type a client sends to exchange an
+// AAuth agent token for an OAuth access token.
+const GrantTypeAAuthBridgeURN = "urn:highflame:params:oauth:grant-type:aauth-agent-token"
+
+// IsAAuth reports whether g, in its short or URN form, is minted only by the
+// AAuth endpoints.
+func (g GrantType) IsAAuth() bool {
+	n := NormalizeGrantType(string(g))
+	return n == GrantTypeAAuthAgent || n == GrantTypeAAuthBridge
+}
 
 // GrantTypeAssertedTenantURN is the grant_type a client sends for the
 // asserted-tenant grant.
@@ -60,6 +82,7 @@ const GrantTypeAssertedTenantURN = "urn:highflame:params:oauth:grant-type:assert
 var urnToShortGrantType = map[string]GrantType{
 	"urn:ietf:params:oauth:grant-type:jwt-bearer":     GrantTypeJWTBearer,
 	"urn:ietf:params:oauth:grant-type:token-exchange": GrantTypeTokenExchange,
+	GrantTypeAAuthBridgeURN:                           GrantTypeAAuthBridge,
 }
 
 // allValidGrantTypes is the set of all recognised canonical short forms.
@@ -71,6 +94,8 @@ var allValidGrantTypes = map[GrantType]bool{
 	GrantTypeAuthorizationCode: true,
 	GrantTypeRefreshToken:      true,
 	GrantTypeCIBA:              true,
+	GrantTypeAAuthAgent:        true,
+	GrantTypeAAuthBridge:       true,
 }
 
 // NormalizeGrantType converts a grant type string to its canonical short form.
