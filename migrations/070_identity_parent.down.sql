@@ -1,18 +1,18 @@
--- 069_identity_parent.down.sql
+-- 070_identity_parent.down.sql
 -- No-op: the columns and the trigger are kept. Dropping parent_identity_id
--- would discard every recorded registration edge, which re-applying 069 could
+-- would discard every recorded registration edge, which re-applying 070 could
 -- not restore.
 --
 -- Keeping the columns is safe only for a binary that tolerates columns it
 -- does not know. An older binary does read them: its writes name their
 -- columns, but a `RETURNING *` (the conditional status updates) scans every
 -- column back into its model, and a model with no field for a column fails
--- that scan. Before rolling back past 069, deploy a ZeroID release that
--- tolerates unknown columns (or roll back only to one); an older binary than
--- that fails those writes while these columns exist.
+-- that scan. Roll back only to a ZeroID release that tolerates columns it does
+-- not know (v1.31.0 or later), deploying such a release first if the target is
+-- older; an older binary fails those writes while these columns exist.
 --
 -- The redefined audit trigger is kept too: it ignores cascade_pending_at,
 -- which a rolled-back binary never sets, and audits every other change as 066
--- did. 069's up is idempotent (ADD COLUMN IF NOT EXISTS, DROP/CREATE TRIGGER),
+-- did. 070's up is idempotent (ADD COLUMN IF NOT EXISTS, DROP/CREATE TRIGGER),
 -- so re-applying it after a revert is a no-op.
 SELECT 1;

@@ -1,4 +1,4 @@
--- 069_identity_parent.up.sql
+-- 070_identity_parent.up.sql
 -- Record which identity registered an identity, and mark a deactivation
 -- cascade that has not finished.
 --
@@ -32,7 +32,7 @@
 -- like updated_at and modified_by, so setting and clearing the mark writes no
 -- audit row of its own.
 --
--- DDL ONLY, like 045. The index is 070, in its own file: golang-migrate runs
+-- DDL ONLY, like 045. The index is 071, in its own file: golang-migrate runs
 -- each file as one implicit transaction, so building the index here would hold
 -- this ALTER's ACCESS EXCLUSIVE lock on identities, blocking every read and
 -- write, for the whole table scan.
@@ -41,7 +41,7 @@
 -- COLUMN on PG 11+, and the trigger swap is catalog-only; the lock is held for
 -- well under a millisecond once acquired. The risk is the lock queue behind
 -- in-flight transactions, hence lock_timeout. A timeout abort leaves
--- schema_migrations at (69, dirty); recover with `migrate force 68` and run it
+-- schema_migrations at (70, dirty); recover with `migrate force 69` and run it
 -- again.
 SET LOCAL lock_timeout = '3s';
 

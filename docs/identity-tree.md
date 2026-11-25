@@ -296,15 +296,15 @@ the walk passes through them.
 
 ## Schema
 
-`identities.parent_identity_id` is a nullable `UUID` (migration 069), indexed
+`identities.parent_identity_id` is a nullable `UUID` (migration 070), indexed
 by `(account_id, project_id, parent_identity_id)` for the rows that have one
-(migration 070). Existing identities have no parent; there is no backfill.
-`identities.cascade_pending_at` (`TIMESTAMPTZ`, also 069) is the mark; it is
+(migration 071). Existing identities have no parent; there is no backfill.
+`identities.cascade_pending_at` (`TIMESTAMPTZ`, also 070) is the mark; it is
 not indexed, since only the hourly worker scans for it, and the identity audit
 trigger ignores it.
 
-Rolling back past 069 keeps both columns, so roll back only to a release that
-tolerates columns it does not know. A large deployment can build 070's index
+Rolling back past 070 keeps both columns, so roll back only to a release that
+tolerates columns it does not know (v1.31.0 or later). A large deployment can build 071's index
 out of band first, `CONCURRENTLY` from one session, and check
 `pg_index.indisvalid` before deploying (see the migration).
 There is no foreign key: identities are soft-deleted, and the write path
