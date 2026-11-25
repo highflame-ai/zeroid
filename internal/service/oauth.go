@@ -838,8 +838,14 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (tok *domain
 	ctx = withPolicyMemo(ctx)
 	// With token.scope_rules=shadow, record what the stricter scope rules
 	// would change about this request once its outcome is known. The trace
-	// only observes: the token and the error returned are untouched.
+	// only observes: the token and the error returned are untouched. With
+	// enforce, the same trace decides where the token is minted, and records
+	// what it changed.
 	ctx, trace := s.credentialSvc.traceScopes(ctx, scopeTraceGrant(req.GrantType))
+	// With enforce, a scope refusal is answered invalid_scope (rule D).
+	// Deferred first so it runs last, after done has judged the refusal as
+	// today's rules answered it.
+	defer func() { err = trace.answer(err) }()
 	defer func() { trace.done(ctx, err) }()
 	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
 	// grant dispatch so every grant — including custom ones registered via
@@ -1065,6 +1071,9 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// policy and row ceilings. client.Scopes is non-empty, so grantScopes
 	// always sees a restricting ceiling and never returns an empty grant.
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
+	trace.strictCeiling(clientCeilingName(client), client.Scopes)
+	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
+	trace.ceiling(ceilingIdentityScopes, rowScopes)
 	scopes, err := grantScopes(req.Scope, client.Scopes, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
@@ -1207,6 +1216,8 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	trace.setIdentity(identity)
 	trace.ask(parseScopeString(req.Scope), true)
 	policyScopes, rowScopes := identityScopeCeilings(policy, identity)
+	trace.ceiling(policyCeilingName(ownerIdentity, false), policyScopes)
+	trace.ceiling(ceilingIdentityScopes, rowScopes)
 	scopes, err := grantScopes(req.Scope, policyScopes, rowScopes)
 	if err != nil {
 		return nil, err
@@ -1446,6 +1457,12 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	for _, s := range subjectCred.Scopes {
 		orchSet[s] = true
 	}
+	// The terms below, in the order they narrow, for the stricter scope
+	// rules' refusal text: in delegation the subject token is one more
+	// ceiling.
+	trace.strictCeiling(ceilingSubjectToken, subjectCred.Scopes)
+	trace.ceiling(policyCeilingName(ownerActor, userGrantCeiling), actorPolicyScopes)
+	trace.ceiling(ceilingActorScopes, actorRowScopes)
 	// The orchestrator term is filtered explicitly rather than through
 	// narrowScopes: an orchestrator holding no scopes can delegate nothing,
 	// whereas narrowScopes reads an empty ceiling as "no restriction".
@@ -1457,7 +1474,13 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	}
 	scopes = narrowScopes(narrowScopes(scopes, actorPolicyScopes), actorRowScopes)
 	if len(scopes) == 0 {
-		return nil, delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
+		denial := delegationScopeDenial(requestedScopes, orchSet, actorPolicyScopes, actorRowScopes, userGrantCeiling)
+		// With token.scope_rules=enforce, rule C issues a delegation that
+		// names no scope with none, where today's rules refuse it. Every
+		// other empty result stays refused.
+		if !trace.issuesRefusedDelegation(denial) {
+			return nil, denial
+		}
 	}
 
 	// Step 5: the child's delegation depth is the parent's plus one
@@ -2318,7 +2341,15 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 	trace.ask(parseScopeString(req.Scope), len(sk.Scopes) == 0)
 	trace.addListing(sk.Scopes)
 	trace.addListing(keyPolicyScopes)
+	trace.listableIn(ceilingAPIKeyScopes)
+	if sk.CredentialPolicyID != "" {
+		trace.listableIn(policyCeilingName(ownerAPIKey, false))
+	}
 	identityPolicyScopes, rowScopes := identityScopeCeilings(identityPolicy, identity)
+	trace.ceiling(ceilingAPIKeyScopes, sk.Scopes)
+	trace.ceiling(policyCeilingName(ownerAPIKey, false), keyPolicyScopes)
+	trace.ceiling(policyCeilingName(identityPolicyOwner(identity), false), identityPolicyScopes)
+	trace.ceiling(ceilingIdentityScopes, rowScopes)
 	scopes, err := grantScopes(req.Scope, sk.Scopes, keyPolicyScopes, identityPolicyScopes, rowScopes)
 	if err != nil {
 		return nil, err
@@ -2731,6 +2762,8 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	// result. With token.scope_rules=shadow, record what the stricter rules
 	// would change about it; the code and the error are untouched.
 	ctx, trace := s.credentialSvc.traceScopes(ctx, string(domain.GrantTypeAuthorizationCode))
+	// Rule D's answer in enforce mode, after done judges today's (see Token).
+	defer func() { err = trace.answer(err) }()
 	defer func() { trace.done(ctx, err) }()
 	trace.setClientID(req.ClientID)
 	trace.setTenant(req.AccountID, req.ProjectID)
@@ -2807,6 +2840,11 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 	narrow := intersectScopes
 	if len(parseScopeString(req.RequestedScope)) > 0 {
 		narrow = narrowScopes
+		// What narrowed a named request, for the stricter scope rules'
+		// refusal text: the principal's scopes, folded into Scopes upstream,
+		// then the client's.
+		trace.strictCeiling(ceilingPrincipalScopes, req.Scopes)
+		trace.ceiling(clientCeilingName(oauthClient), oauthClient.Scopes)
 	}
 	scopes := narrow(req.Scopes, oauthClient.Scopes)
 	if err := requireGrantableScope(req.RequestedScope, scopes); err != nil {
@@ -2840,6 +2878,13 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		if err := s.credentialSvc.decidePersonGrant(ctx, &probe); err != nil {
 			return "", personGrantOAuthError(err, oautherror.InvalidScope)
 		}
+	}
+	// With token.scope_rules=enforce the stricter rules decide the code's
+	// scopes here, as shadow mode judges them: no default for a request that
+	// named none (rule A), or invalid_scope for one that would be narrowed
+	// (rule C). A no-op in any other mode.
+	if scopes, err = trace.enforceScopes(scopes); err != nil {
+		return "", err
 	}
 	trace.codeIssued(scopes)
 

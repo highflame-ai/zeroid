@@ -116,13 +116,20 @@ token:
   # Env: ZEROID_REFRESH_REUSE_GRACE_SECONDS
   # refresh_reuse_grace_seconds: 10
 
-  # scope_rules counts what stricter scope issuance rules would change, before
-  # any of them is enforced (docs/scope-ceilings.md, "Stricter scope rules"):
+  # scope_rules is what the stricter scope issuance rules do
+  # (docs/scope-ceilings.md, "Stricter scope rules"):
   #   off     (default) no rule is evaluated, and nothing is logged or counted.
   #   shadow  every grant is evaluated, and each request whose outcome the
   #           rules would change is logged as scope_rule_would_change and
   #           counted in zeroid_scope_rule_would_change_total. Tokens and
   #           responses are exactly as with off.
+  #   enforce the same evaluation decides the outcome: an omitted scope gets
+  #           only an API key's own scopes or an audience profile's, a scope
+  #           no admin-controlled ceiling lists or a narrowed request is
+  #           refused whole with invalid_scope, and every scope refusal at
+  #           the token endpoint answers invalid_scope. Changes are recorded
+  #           as in shadow, with mode=enforce.
+  # Roll out off -> shadow -> enforce.
   # Any other value fails startup. Also settable at runtime with
   # Server.SetScopeRulesMode.
   # Env: ZEROID_SCOPE_RULES

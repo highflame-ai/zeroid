@@ -235,6 +235,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	// for the stricter rules' shadow count that is a request naming none.
 	trace := scopeTraceFrom(ctx)
 	trace.ask(authorityScopes(req.Scopes), true)
+	trace.strictCeiling(ceilingRequestingToken, cred.Scopes)
 	scopes, err := requestingChainScopes(cred.Scopes, req.Scopes)
 	if err != nil {
 		return true, err
@@ -263,6 +264,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if refused := scopeRefusedForIdentityType(ident.IdentityType, req.Scopes); refused != "" {
 		return true, oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to this identity", refused))
 	}
+	trace.ceiling(ceilingRequesterScopes, ident.AllowedScopes)
 	if err := requireScopesWithin(req.Scopes, ident.AllowedScopes, "the requesting identity's allowed_scopes"); err != nil {
 		return true, err
 	}
@@ -286,6 +288,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	if userGrant {
 		policyCeiling, ceilingName = policy.UserGrantScopes, "the requesting identity's credential policy user_grant_scopes"
 	}
+	trace.ceiling(policyCeilingName(ownerRequestingIdentity, userGrant), policyCeiling)
 	if err := requireScopesWithin(req.Scopes, policyCeiling, ceilingName); err != nil {
 		return true, err
 	}
@@ -384,6 +387,8 @@ func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueReq
 	if refused := scopeRefusedForIdentityType(req.Identity.IdentityType, req.Scopes); refused != "" {
 		return oauthBadRequest(oautherror.InvalidScope, fmt.Sprintf("scope %q is not issued to the bound identity", refused))
 	}
+	trace := scopeTraceFrom(ctx)
+	trace.ceiling(ceilingBoundScopes, req.Identity.AllowedScopes)
 	if err := requireScopesWithin(req.Scopes, req.Identity.AllowedScopes, "the bound identity's allowed_scopes"); err != nil {
 		return err
 	}
@@ -408,6 +413,7 @@ func (s *BackchannelService) boundAnchorGates(ctx context.Context, req *IssueReq
 		PrincipalType:    req.PrincipalType,
 		UserGrantBounded: req.UserGrantBounded,
 	}
+	trace.ceiling(policyCeilingName(ownerBoundIdentity, req.UserGrantBounded && req.PrincipalType == domain.PrincipalUser), scopeCeiling(policy, enforce))
 	if err := requireScopesWithin(req.Scopes, scopeCeiling(policy, enforce), "the bound identity's credential policy"); err != nil {
 		return err
 	}
