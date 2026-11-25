@@ -540,6 +540,13 @@ func TestAAuthBridge(t *testing.T) {
 		assert.Equal(t, "invalid_scope", res.body["error"])
 	})
 
+	t.Run("a request naming another tenant is refused", func(t *testing.T) {
+		k, agentToken := newAgentToken(t)
+		res := a.bridge(t, agentToken, &k, map[string]any{"account_id": "someone-else", "project_id": a.tn.project})
+		assert.Equal(t, http.StatusBadRequest, res.status, "body=%v", res.body)
+		assert.Equal(t, "invalid_grant", res.body["error"])
+	})
+
 	t.Run("the token is for exactly one resource", func(t *testing.T) {
 		k, agentToken := newAgentToken(t)
 		res := a.bridge(t, agentToken, &k, map[string]any{"resource": nil})

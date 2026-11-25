@@ -82,12 +82,9 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 
 	// The row, not only the signature: revoked or unknown agent tokens are
 	// refused, and so is anything that isn't one.
-	row, active, err := p.creds.IntrospectToken(ctx, agent.JTI)
+	row, err := p.liveAgentRow(ctx, agent.JTI, now)
 	if err != nil {
-		return nil, service.NewOAuthError(oautherror.ServerError, "the agent token could not be checked", http.StatusInternalServerError)
-	}
-	if !active || row == nil || row.GrantType != domain.GrantTypeAAuthAgent || row.IdentityID == nil {
-		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token is revoked, expired or unknown")
+		return nil, err
 	}
 	identity, err := p.identities.GetIdentity(ctx, *row.IdentityID, row.AccountID, row.ProjectID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -95,6 +92,12 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 	}
 	if err != nil {
 		return nil, service.NewOAuthError(oautherror.ServerError, "the agent token's identity could not be loaded", http.StatusInternalServerError)
+	}
+	// A request that names a tenant must name the agent's, as on the
+	// federated grant (ADR 0042 D5): a tenant-routed embedder must not mint
+	// for another tenant through its endpoint.
+	if (req.AccountID != "" && req.AccountID != identity.AccountID) || (req.ProjectID != "" && req.ProjectID != identity.ProjectID) {
+		return nil, bridgeRefusal(oautherror.InvalidGrant, "account_id or project_id does not match the agent token's tenant")
 	}
 
 	grant, err := p.oauth.ResolveWorkloadGrant(ctx, identity, req.Scope)
@@ -139,8 +142,14 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 
 	// The agent token may have been revoked after the check above and before
 	// the child row was written, which the revoke's cascade then missed.
-	// Re-check, and revoke the child if so.
-	if _, stillActive, err := p.creds.IntrospectToken(ctx, agent.JTI); err != nil || !stillActive {
+	// Re-check, and revoke the child if so. A failure to read is not a
+	// revocation: the child stands, and the error is the caller's to retry.
+	if _, err := p.liveAgentRow(ctx, agent.JTI, p.now()); err != nil {
+		var oe *service.OAuthError
+		if errors.As(err, &oe) && oe.HTTPStatus >= http.StatusInternalServerError {
+			log.Warn().Err(err).Str("jti", child.JTI).Msg("aauth: could not re-check the agent token after an exchange")
+			return token, nil
+		}
 		if rErr := p.creds.RevokeCredential(ctx, child.ID, child.AccountID, child.ProjectID, "parent agent token revoked during exchange"); rErr != nil {
 			log.Error().Err(rErr).Str("jti", child.JTI).Msg("aauth: could not revoke a bridged token whose agent token was revoked")
 			return nil, service.NewOAuthError(oautherror.ServerError, "the exchange could not be completed", http.StatusInternalServerError)
@@ -148,4 +157,21 @@ func (p *Provider) bridgeGrant(ctx context.Context, req service.TokenRequest) (*
 		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token was revoked during the exchange")
 	}
 	return token, nil
+}
+
+// liveAgentRow returns the agent token's row if it is an unrevoked,
+// unexpired aauth_agent credential with an identity. A storage failure is a
+// server error, never "revoked".
+func (p *Provider) liveAgentRow(ctx context.Context, jti string, now time.Time) (*domain.IssuedCredential, error) {
+	row, err := p.creds.CredentialByJTI(ctx, jti)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token is revoked, expired or unknown")
+	}
+	if err != nil {
+		return nil, service.NewOAuthError(oautherror.ServerError, "the agent token could not be checked", http.StatusInternalServerError)
+	}
+	if row.IsRevoked || !now.Before(row.ExpiresAt) || row.GrantType != domain.GrantTypeAAuthAgent || row.IdentityID == nil {
+		return nil, bridgeRefusal(oautherror.InvalidGrant, "the agent token is revoked, expired or unknown")
+	}
+	return row, nil
 }

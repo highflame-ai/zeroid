@@ -313,7 +313,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		return "", 0, notAccepted(err)
 	}
 
-	claim, age, err := p.redemptions.claim(ctx, wa.ReplayKey, jkt, wa.ExpiresAt.Add(assertionClockSkew))
+	claim, _, err := p.redemptions.claim(ctx, wa.ReplayKey, jkt, wa.ExpiresAt.Add(assertionClockSkew))
 	if err != nil {
 		return "", 0, fmt.Errorf("claiming the attestation: %w", err)
 	}
@@ -321,13 +321,12 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 	case claimRefused:
 		return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation was already redeemed by another key"}
 	case claimPending:
-		if age < pendingInFlight {
-			return "", 0, &bootstrapRefusal{code: "temporarily_unavailable", status: http.StatusServiceUnavailable, retryAfter: 1,
-				description: "a redemption of this attestation by this key is still in progress; retry"}
-		}
-		// Claimed long ago and never finished: the request died mid-flight.
-		return "", 0, &bootstrapRefusal{code: "invalid_grant",
-			description: "an earlier redemption of this attestation by this key did not complete; retry with a fresh platform token"}
+		// Still in flight, however long it takes: the first request either
+		// mints (and a retry then repeats) or is refused or cleaned up (and a
+		// retry is told so). Only a crashed process leaves it pending, until
+		// the attestation expires.
+		return "", 0, &bootstrapRefusal{code: "temporarily_unavailable", status: http.StatusServiceUnavailable, retryAfter: 1,
+			description: "a redemption of this attestation by this key is still in progress; retry"}
 	case claimRefusedEarlier:
 		return "", 0, &bootstrapRefusal{code: "invalid_grant",
 			description: "an earlier redemption of this attestation by this key was refused; retry with a fresh platform token"}
@@ -338,7 +337,7 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			if errors.Is(err, dpop.ErrReplay) {
 				// Spent at the token endpoint. The claim is marked refused,
 				// so every later redemption is refused too.
-				if mErr := p.redemptions.refuse(ctx, wa.ReplayKey); mErr != nil {
+				if mErr := p.redemptions.refuse(context.WithoutCancel(ctx), wa.ReplayKey); mErr != nil {
 					log.Warn().Err(mErr).Msg("aauth: could not record a refused redemption")
 				}
 				return "", 0, &bootstrapRefusal{code: "invalid_grant", description: "the attestation has already been used"}
@@ -348,11 +347,18 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 		}
 	}
 	fresh := claim == claimFresh
+	// Bookkeeping after the claim must outlive the request: a client that
+	// disconnects mid-issuance must not leave its attestation half-redeemed.
+	bookkeeping := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	}
 	// A refusal after a fresh claim is recorded, so the same key is refused
 	// at once next time instead of being told to retry.
 	refused := func(err error) error {
 		if fresh && isRefusal(err) {
-			if mErr := p.redemptions.refuse(ctx, wa.ReplayKey); mErr != nil {
+			bctx, cancel := bookkeeping()
+			defer cancel()
+			if mErr := p.redemptions.refuse(bctx, wa.ReplayKey); mErr != nil {
 				log.Warn().Err(mErr).Msg("aauth: could not record a refused redemption")
 			}
 		}
@@ -362,8 +368,10 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 	// nothing, so a retry with the same platform token works.
 	cleanup := func() {
 		if fresh {
-			p.oauth.ReleaseWorkloadAssertion(ctx, wa)
-			p.forget(ctx, wa)
+			bctx, cancel := bookkeeping()
+			defer cancel()
+			p.oauth.ReleaseWorkloadAssertion(bctx, wa)
+			p.forget(bctx, wa)
 		}
 	}
 
@@ -419,7 +427,9 @@ func (p *Provider) bootstrap(ctx context.Context, attestation string, key JWK) (
 			Msg("aauth: agent token issued inside the five-minute refresh margin")
 	}
 	if fresh {
-		if err := p.redemptions.confirm(ctx, wa.ReplayKey); err != nil {
+		bctx, cancel := bookkeeping()
+		defer cancel()
+		if err := p.redemptions.confirm(bctx, wa.ReplayKey); err != nil {
 			// The token is issued; only a repeat redemption by this key is lost.
 			log.Warn().Err(err).Msg("aauth: could not confirm a redemption; a repeat by the same key will be refused")
 		}

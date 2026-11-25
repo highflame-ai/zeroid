@@ -1795,3 +1795,11 @@ func clampDefaultTTLToPolicy(ttl int, requested bool, policy *domain.CredentialP
 	}
 	return policy.MaxTTLSeconds
 }
+
+// CredentialByJTI returns the credential row for jti. Unlike IntrospectToken
+// it keeps storage errors apart from absence: a missing row wraps
+// sql.ErrNoRows, anything else is a failure to read. For grants that must not
+// answer "revoked" because the database blinked (the AAuth bridge).
+func (s *CredentialService) CredentialByJTI(ctx context.Context, jti string) (*domain.IssuedCredential, error) {
+	return s.repo.GetByJTI(ctx, jti)
+}

@@ -56,10 +56,6 @@ const (
 	claimExpired
 )
 
-// pendingInFlight is how long after a claim an unminted redemption by the same
-// key is taken to be still in flight rather than refused.
-const pendingInFlight = 30 * time.Second
-
 // claim returns the result, and for claimPending how long ago the claim was
 // made.
 func (s *redemptions) claim(ctx context.Context, replayKey, jkt string, expiresAt time.Time) (claimResult, time.Duration, error) {
