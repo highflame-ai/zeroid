@@ -226,7 +226,9 @@ func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accoun
 // "external" — any non-native (discovered) provenance. The status filter is an
 // exact lifecycle match (e.g. "discovered") — the discovery adoption inbox is
 // status="discovered". Both are independent of the legacy is_active boolean.
-func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int) ([]*domain.Identity, int, error) {
+// parentIdentityID, when set, keeps only the identities that identity
+// registered (its direct children); the caller validates it as a UUID.
+func (r *IdentityRepository) List(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless, parentIdentityID string, limit, offset int) ([]*domain.Identity, int, error) {
 	var identities []*domain.Identity
 	db := dbOrTx(ctx, r.db)
 	q := db.NewSelect().Model(&identities).
@@ -300,6 +302,9 @@ func (r *IdentityRepository) List(ctx context.Context, accountID, projectID stri
 			q = q.Where("(owner_user_id IS NULL OR owner_user_id = '')")
 		}
 	}
+	if parentIdentityID != "" {
+		q = q.Where("parent_identity_id = ?", parentIdentityID)
+	}
 	if isActive != "" {
 		if active, err := strconv.ParseBool(isActive); err == nil {
 			if active {
@@ -363,7 +368,9 @@ func (r *IdentityRepository) ListByOwnerForOffboard(ctx context.Context, ownerUs
 	err := dbOrTx(ctx, r.db).NewSelect().Model(&identities).
 		Where("account_id = ?", accountID).
 		Where("owner_user_id = ?", ownerUserID).
-		Where("status <> ?", string(domain.IdentityStatusDeactivated)).
+		// A deactivated identity still marked cascade_pending is listed too:
+		// its deactivation cascade did not finish, and the retry finishes it.
+		Where("(status <> ? OR cascade_pending_at IS NOT NULL)", string(domain.IdentityStatusDeactivated)).
 		OrderExpr("created_at ASC").
 		Scan(ctx)
 	if err != nil {
@@ -554,17 +561,6 @@ func (r *IdentityRepository) GetFacets(ctx context.Context, accountID, projectID
 // Update saves changes to an existing identity. Participates in a caller-
 // provided transaction via postgres.WithTx(ctx, tx); falls through to a
 // single auto-commit update otherwise.
-func (r *IdentityRepository) Update(ctx context.Context, identity *domain.Identity) error {
-	identity.ModifiedBy = middleware.GetCallerName(ctx)
-	db := dbOrTx(ctx, r.db)
-	_, err := db.NewUpdate().Model(identity).
-		Where("id = ? AND account_id = ? AND project_id = ?", identity.ID, identity.AccountID, identity.ProjectID).
-		Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update identity: %w", err)
-	}
-	return nil
-}
 
 // Delete removes an identity.
 //
@@ -619,8 +615,12 @@ func (r *IdentityRepository) DeactivateIfActive(ctx context.Context, id, account
 	// modified_by must be set in the UPDATE itself — the audit trigger
 	// reads NEW.modified_by, so a caller_name on the context only reaches
 	// the audit log when it's written into this row's column.
+	// cascade_pending_at is set in the same UPDATE: the caller walks the
+	// identities below this one next, and a walk that does not finish is
+	// resumed from the mark (docs/identity-tree.md).
 	q := db.NewUpdate().Model(identity).
 		Set("status = ?", string(domain.IdentityStatusDeactivated)).
+		Set("cascade_pending_at = now()").
 		Set("updated_at = ?", time.Now())
 	if callerID := middleware.GetCallerName(ctx); callerID != "" {
 		q = q.Set("modified_by = ?", callerID)

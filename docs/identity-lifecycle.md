@@ -160,6 +160,14 @@ SDK / Cedar / DB contract for no functional gain).
   newest adoption first, with native identities keeping their creation time.
 - All existing transitions (`pending→active`, `active→suspended|deactivated|expired`,
   `suspended→active`, …) are unchanged.
+- An identity that another identity registered is that identity's child
+  ([identity-tree.md](identity-tree.md)). A transition into `deactivated` or
+  `expired`, by any path, deactivates every identity below it with the same key
+  and credential revocation; reactivation and suspension do not cascade, but
+  no identity below a suspended, deactivated or expired one receives a token,
+  and none can be reactivated while one above it is not active. A request
+  authenticated as an identity can lower its children's status but never
+  raise it.
 
 ## Ownership: relaxed for `discovered` only
 

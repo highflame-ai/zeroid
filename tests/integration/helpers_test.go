@@ -108,6 +108,25 @@ const testApproverSubHeader = "X-Test-Approver-Sub"
 // zeroid.WithTrustedApprovalChannelWrite.
 const testApprovalChannelWriteHeader = "X-Test-Approval-Channel-Write"
 
+// testCallerIdentityIDHeader and testCallerWIMSEHeader stand in for a
+// deployer's admin authentication having verified that the request was made
+// by a registered identity acting as itself: when either is present, the test
+// AdminAuth middleware marks the request with zeroid.WithCallerIdentity. A
+// real deployer derives the value from the credential it verified, never from
+// a header the client sets.
+//
+// testCallerScopesHeader (space-separated) and testCallerAPIKeyIDHeader stand
+// in for the verified token's scopes and api_key_id claims; a request that
+// sends no scopes header stands for a token with no scopes.
+// testTrustedOwnerWriteHeader marks the request zeroid.WithTrustedOwnerWrite.
+const (
+	testCallerIdentityIDHeader  = "X-Test-Caller-Identity-ID"
+	testCallerWIMSEHeader       = "X-Test-Caller-WIMSE-URI"
+	testCallerScopesHeader      = "X-Test-Caller-Scopes"
+	testCallerAPIKeyIDHeader    = "X-Test-Caller-API-Key-ID"
+	testTrustedOwnerWriteHeader = "X-Test-Trusted-Owner-Write"
+)
+
 // testInteractiveLoginURL is the stub consent surface for the #276 tests.
 const testInteractiveLoginURL = "https://studio.example.test/login"
 
@@ -375,6 +394,25 @@ func runTests(m *testing.M) int {
 					Email:   sub + "@approver.example.test",
 					Name:    "Approver " + sub,
 				}))
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	// The admin authentication layer, which is where a deployer marks a
+	// request made by a registered identity acting as itself.
+	srv.AdminAuth(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, uri := r.Header.Get(testCallerIdentityIDHeader), r.Header.Get(testCallerWIMSEHeader)
+			if id != "" || uri != "" {
+				r = r.WithContext(zeroid.WithCallerIdentity(r.Context(), zeroid.CallerIdentity{
+					IdentityID: id,
+					WIMSEURI:   uri,
+					Scopes:     strings.Fields(r.Header.Get(testCallerScopesHeader)),
+					APIKeyID:   r.Header.Get(testCallerAPIKeyIDHeader),
+				}))
+			}
+			if r.Header.Get(testTrustedOwnerWriteHeader) != "" {
+				r = r.WithContext(zeroid.WithTrustedOwnerWrite(r.Context()))
 			}
 			next.ServeHTTP(w, r)
 		})

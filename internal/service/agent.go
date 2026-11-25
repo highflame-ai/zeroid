@@ -85,6 +85,10 @@ type RegisterAgentRequest struct {
 	// ExpiresAt time-bounds both the identity and (if non-nil) the auto-
 	// created API key. Nil means "no expiry".
 	ExpiresAt *time.Time
+	// RegisteredBy is the identity the request was authenticated as, acting as
+	// itself; the agent is then registered as its child. Handlers set it from
+	// CallerIdentityFromContext only. See RegisterIdentityRequest.RegisteredBy.
+	RegisteredBy *CallerIdentity
 }
 
 // AgentResponse is the API response for a single agent identity.
@@ -101,6 +105,7 @@ type AgentResponse struct {
 	TrustLevel         domain.TrustLevel     `json:"trust_level"`
 	Status             domain.IdentityStatus `json:"status"`
 	Origin             domain.Origin         `json:"origin"`
+	ParentIdentityID   string                `json:"parent_identity_id,omitempty"`
 	OwnerUserID        string                `json:"owner_user_id,omitempty"`
 	CredentialPolicyID string                `json:"credential_policy_id,omitempty"`
 	Framework          string                `json:"framework"`
@@ -209,6 +214,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 		PublicKeyPEM:       req.PublicKeyPEM,
 		CredentialPolicyID: req.CredentialPolicyID,
 		ExpiresAt:          req.ExpiresAt,
+		RegisteredBy:       req.RegisteredBy,
 	})
 	if err != nil {
 		return nil, err
@@ -223,14 +229,26 @@ func (s *AgentService) RegisterAgent(ctx context.Context, req RegisterAgentReque
 	if apiKeyPolicyID == "" {
 		apiKeyPolicyID = req.CredentialPolicyID
 	}
+	// The key's creator is read as the human behind the agent (see
+	// rotationAttribution). A child agent's human is the owner it inherited
+	// from its parent; the request's created_by is the caller's to choose and
+	// must not name someone else.
+	keyCreatedBy := req.CreatedBy
+	keyExpiresAt := req.ExpiresAt
+	if identity.ParentIdentityID != "" {
+		keyCreatedBy = identity.OwnerUserID
+		// A child's expiry may have been capped at its parent's bound; the
+		// key goes no further.
+		keyExpiresAt = identity.ExpiresAt
+	}
 	skResp, err := s.apiKeySvc.CreateKey(ctx, CreateAPIKeyRequest{
 		AccountID:          req.AccountID,
 		ProjectID:          req.ProjectID,
-		CreatedBy:          req.CreatedBy,
+		CreatedBy:          keyCreatedBy,
 		Name:               fmt.Sprintf("Agent: %s", req.Name),
 		IdentityID:         identity.ID,
 		CredentialPolicyID: apiKeyPolicyID,
-		ExpiresAt:          req.ExpiresAt,
+		ExpiresAt:          keyExpiresAt,
 	})
 	if err != nil {
 		// Compensating action — hard-purge the half-created identity if key
@@ -275,8 +293,9 @@ func (s *AgentService) GetAgent(ctx context.Context, id, accountID, projectID st
 }
 
 // ListAgents lists agents for a tenant, optionally filtered by identity_type(s),
-// label, and metadata (key presence or key:value).
-func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless string, limit, offset int, includeParents bool) (*AgentListResponse, error) {
+// label, metadata (key presence or key:value), and the identity that
+// registered them (parentIdentityID).
+func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID string, identityTypes []string, label string, trustLevels []string, isActive, search, metadata, identityClass, origin string, statuses []string, ownerUserID, ownerless, parentIdentityID string, limit, offset int, includeParents bool) (*AgentListResponse, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
@@ -286,7 +305,7 @@ func (s *AgentService) ListAgents(ctx context.Context, accountID, projectID stri
 
 	// origin/status surface the unified native∪discovered inventory through the
 	// agent registry list endpoint — the same filters the identities list exposes.
-	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, limit, offset)
+	identities, total, err := s.identitySvc.ListIdentities(ctx, accountID, projectID, identityTypes, label, trustLevels, isActive, search, metadata, identityClass, origin, statuses, ownerUserID, ownerless, parentIdentityID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -535,6 +554,11 @@ func (s *AgentService) RotateKey(ctx context.Context, id, accountID, projectID s
 	if err != nil {
 		return nil, err
 	}
+	// A request authenticated as an identity rotates only the keys of the
+	// identities it registered (docs/identity-tree.md).
+	if _, err := s.identitySvc.authorizeCallerWrite(ctx, identity, accountID, projectID); err != nil {
+		return nil, err
+	}
 	if !identity.Status.IsUsable() {
 		return nil, fmt.Errorf("%w (status: %s)", domain.ErrIdentityNotUsable, identity.Status)
 	}
@@ -608,6 +632,7 @@ func identityToAgentResponse(identity *domain.Identity, keyPrefix string) AgentR
 		TrustLevel:          identity.TrustLevel,
 		Status:              identity.Status,
 		Origin:              identity.Origin,
+		ParentIdentityID:    identity.ParentIdentityID,
 		OwnerUserID:         identity.OwnerUserID,
 		CredentialPolicyID:  identity.CredentialPolicyID,
 		Framework:           identity.Framework,
