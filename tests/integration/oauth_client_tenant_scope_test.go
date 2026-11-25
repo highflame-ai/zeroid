@@ -2,7 +2,8 @@
 // columns, but a client linked to an identity (identity_id) takes that
 // identity's tenant, and the link decides where client_credentials and ID-JAG
 // tokens are minted. A caller in another tenant must not see, rotate or delete
-// such a client; an unlinked client stays global.
+// such a client. An unlinked client belongs to no tenant: only a caller with no
+// tenant in context (the operator) sees, rotates or deletes it.
 package integration_test
 
 import (
@@ -67,11 +68,23 @@ func TestOAuthClientAdminRoutes_TenantScoped(t *testing.T) {
 		require.False(t, listedClientIDs(t, tenantB)[linked])
 	})
 
-	t.Run("an unlinked client stays global", func(t *testing.T) {
-		require.Equal(t, http.StatusOK, get(t, adminPath("/oauth/clients/"+unlinked), tenantB).StatusCode)
-		require.True(t, listedClientIDs(t, tenantB)[unlinked])
-		resp := post(t, adminPath("/oauth/clients/"+unlinked+"/rotate-secret"), nil, tenantB)
+	t.Run("an unlinked client is the operator's, not any tenant's", func(t *testing.T) {
+		for name, tenant := range map[string]map[string]string{"registering tenant": tenantA, "other tenant": tenantB} {
+			require.Equal(t, http.StatusNotFound, get(t, adminPath("/oauth/clients/"+unlinked), tenant).StatusCode, name)
+			require.False(t, listedClientIDs(t, tenant)[unlinked], name)
+			resp := post(t, adminPath("/oauth/clients/"+unlinked+"/rotate-secret"), nil, tenant)
+			require.Equal(t, http.StatusNotFound, resp.StatusCode, name)
+			resp = doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+unlinked), nil, tenant)
+			require.Equal(t, http.StatusOK, resp.StatusCode, "%s: answers like a missing client", name)
+		}
+		// Still there, and the operator (no tenant in context) reaches it.
+		require.Equal(t, http.StatusOK, get(t, adminPath("/oauth/clients/"+unlinked), nil).StatusCode)
+		require.True(t, listedClientIDs(t, nil)[unlinked])
+		resp := post(t, adminPath("/oauth/clients/"+unlinked+"/rotate-secret"), nil, nil)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
+		resp = doRequest(t, http.MethodDelete, adminPath("/oauth/clients/"+unlinked), nil, nil)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Equal(t, http.StatusNotFound, get(t, adminPath("/oauth/clients/"+unlinked), nil).StatusCode)
 	})
 
 	t.Run("delete from another tenant leaves the client in place", func(t *testing.T) {
@@ -87,7 +100,7 @@ func TestOAuthClientAdminRoutes_TenantScoped(t *testing.T) {
 
 // A hard delete of an identity (migration 061) removes the clients linked to
 // it. With the old ON DELETE SET NULL they became unlinked, and an unlinked
-// client is global, so another tenant could then reach them.
+// client was then reachable from any tenant.
 func TestOAuthClient_HardDeletingIdentityRemovesLinkedClient(t *testing.T) {
 	tenantA := tenantHeaders(uid("acct-a"), uid("proj-a"))
 	tenantB := tenantHeaders(uid("acct-b"), uid("proj-b"))
@@ -108,6 +121,6 @@ func TestOAuthClient_HardDeletingIdentityRemovesLinkedClient(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	require.False(t, listedClientIDs(t, tenantB)[linked])
 
-	// A client that was never linked is untouched.
-	require.Equal(t, http.StatusOK, get(t, adminPath("/oauth/clients/"+unlinked), tenantA).StatusCode)
+	// A client that was never linked is untouched (and reached by the operator).
+	require.Equal(t, http.StatusOK, get(t, adminPath("/oauth/clients/"+unlinked), nil).StatusCode)
 }

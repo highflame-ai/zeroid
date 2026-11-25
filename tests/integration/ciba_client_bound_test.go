@@ -113,7 +113,7 @@ func TestCIBAScopeBoundByClient(t *testing.T) {
 	t.Run("ConfidentialWithRegisteredScopes_Bounded", func(t *testing.T) {
 		c := newConfidentialCIBAClient(t)
 		require.NoError(t, testZeroIDServer.EnsureClient(context.Background(), zeroid.OAuthClientConfig{
-			ClientID: c.ID, Name: c.ID, GrantTypes: []string{zeroidGrantTypeCIBA}, Scopes: []string{"tools:read"},
+			ClientID: c.ID, Name: c.ID, Confidential: true, GrantTypes: []string{zeroidGrantTypeCIBA}, Scopes: []string{"tools:read"},
 		}))
 		resp := bcAuthorizeAs(t, c, map[string]any{"login_hint": "user-a", "scope": "tools:admin"})
 		require.Equal(t, http.StatusBadRequest, resp.StatusCode)

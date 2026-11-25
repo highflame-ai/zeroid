@@ -53,6 +53,15 @@ type Config struct {
 	CIMD        CIMDConfig        `koanf:"cimd"`
 	ClientAuth  ClientAuthConfig  `koanf:"client_auth"`
 
+	// ReservedClientIDs names OAuth client ids that only the operator may
+	// register, through Server.EnsureClient. See ReservedClientIDsConfig.
+	ReservedClientIDs ReservedClientIDsConfig `koanf:"reserved_client_ids"`
+
+	// ServiceTokens enables the grants a deployment's own services use to
+	// call each other on a tenant's behalf. See ServiceTokensConfig. Off by
+	// default.
+	ServiceTokens ServiceTokensConfig `koanf:"service_tokens"`
+
 	SigningCreds SigningCredsConfig `koanf:"signing_credentials"`
 
 	// WIMSEDomain is the domain prefix for SPIFFE/WIMSE URIs (e.g. "zeroid.dev").
@@ -140,6 +149,133 @@ type ClientAuthConfig struct {
 	// memory. 0 (default) ⇒ 256. Least-recently-used entries are evicted and
 	// closed.
 	JWKSCacheSize int `koanf:"jwks_cache_size"`
+}
+
+// ReservedClientIDsConfig reserves OAuth client ids for the operator.
+//
+// A client_id is a globally unique name chosen by whoever registers it first,
+// and a resource server that attributes a call to a client reads that name.
+// A deployment whose own services authenticate as OAuth clients, and whose
+// resource servers recognise those services by client_id, must stop anyone
+// else from taking those names first. A reserved id can be registered only
+// through Server.EnsureClient (the operator's seeding path); the admin
+// /oauth/clients route, dynamic registration and trusted-issuer bindings
+// refuse it, whoever the caller.
+//
+// On a token exchange, where client_id comes from the actor identity's
+// external_id rather than from an authenticated client, a reserved id is
+// written only when the reserved client is linked to that very identity.
+// client_id is still only a name: a resource server identifying one of the
+// deployment's services pairs it with something the deployer controls, such
+// as the account the token was issued in.
+//
+// Matching ignores case, surrounding space, invisible format characters and
+// Unicode compatibility forms (NFKC), so "Billing" or a fullwidth "billing" is
+// refused when "billing" is reserved. Letters of another script that only look
+// alike (Cyrillic for Latin) are not: a resource server compares client_id
+// byte for byte, so such an id never reads as the reserved one. Empty (the
+// default) reserves nothing. Reserving an id does not remove a client already
+// registered under it. A seed linked to an identity refuses such a row with
+// ErrClientNotOwned; an unlinked seed adopts an unlinked, non-dynamic row
+// alike in whether it authenticates, and logs that it did. Seed the deployment's own services
+// with OAuthClientConfig.IdentityID.
+type ReservedClientIDsConfig struct {
+	// Names are reserved client ids, matched whole.
+	Names []string `koanf:"names"`
+	// Prefixes reserve every client id that starts with one of them.
+	Prefixes []string `koanf:"prefixes"`
+}
+
+// ServiceTokensConfig configures internal service tokens: the tokens a
+// deployment's own services present to each other, bound to one receiver by
+// an RFC 8707 resource and living at most five minutes.
+//
+// A service is a service identity (Server.EnsureServiceIdentity) in the
+// service tenant named here, with a client linked to it (EnsureClient with
+// OAuthClientConfig.IdentityID) whose client id is reserved
+// (ReservedClientIDsConfig) and which authenticates with private_key_jwt.
+// Only such a client may use the grants below; ZeroID checks every condition
+// on each request.
+//
+// With AccountID and ProjectID set:
+//
+//   - client_credentials into the service tenant needs such a client, and
+//     its token lives at most five minutes.
+//   - The on-behalf exchange is enabled: an RFC 8693 token exchange with no
+//     actor_token, an access_token subject_token and a client authentication.
+//     It returns a token for the subject's tenant with the calling service as
+//     the outermost actor (act.sub and act.client_id). The client must list
+//     urn:ietf:params:oauth:grant-type:token-exchange in its grant_types.
+//
+// Empty AccountID (the default) disables all of it, and every list below.
+type ServiceTokensConfig struct {
+	// AccountID and ProjectID name the service tenant: the tenant that holds
+	// the deployment's service identities and nothing else. No tenant may be
+	// given access to it.
+	AccountID string `koanf:"account_id"`
+	ProjectID string `koanf:"project_id"`
+	// AssertedTenantClients are the client ids allowed the asserted-tenant
+	// grant (urn:highflame:params:oauth:grant-type:asserted-tenant), in which
+	// the service names the tenant itself. For background work with no caller
+	// to act for. Its tokens carry tenant_source=asserted, which a receiver
+	// refuses wherever the tenant must be proven. The client must also list
+	// the grant in its grant_types. Settable only here, never through the
+	// client registration routes. Empty (the default) disables the grant.
+	AssertedTenantClients []string `koanf:"asserted_tenant_clients"`
+	// SessionBrokerClients are the client ids that start a person's session:
+	// they may call the external-principal exchange by authenticating as
+	// themselves, with no trusted-service validator, and the token then
+	// carries client_id and trusted_by naming the client. Only such a token
+	// counts as a person's own session on the on-behalf exchange; an
+	// external-principal token issued any other way is refused as its
+	// subject. Empty (the default): none.
+	SessionBrokerClients []string `koanf:"session_broker_clients"`
+	// ServedResources maps a client id to the RFC 8707 resources its service
+	// serves. A subject_token bound to a resource may be exchanged on behalf
+	// only by a client that serves every resource the subject is bound to.
+	// An entry ending in "/" matches every resource under it; any other entry
+	// matches exactly. A resource-bound subject is refused when no entry
+	// covers it, which is the default.
+	ServedResources map[string][]string `koanf:"served_resources"`
+}
+
+// validate refuses a service_tokens block that would not mean what it says:
+// half a tenant, a list with no tenant to give it effect, or an empty entry.
+func (c ServiceTokensConfig) validate() error {
+	if c.AccountID != strings.TrimSpace(c.AccountID) || c.ProjectID != strings.TrimSpace(c.ProjectID) {
+		return fmt.Errorf("service_tokens: account_id and project_id must not have surrounding space")
+	}
+	if (c.AccountID == "") != (c.ProjectID == "") {
+		return fmt.Errorf("service_tokens: account_id and project_id must be set together")
+	}
+	if c.AccountID == "" {
+		if len(c.AssertedTenantClients) > 0 || len(c.SessionBrokerClients) > 0 || len(c.ServedResources) > 0 {
+			return fmt.Errorf("service_tokens: asserted_tenant_clients, session_broker_clients and served_resources need account_id and project_id")
+		}
+		return nil
+	}
+	for name, list := range map[string][]string{
+		"asserted_tenant_clients": c.AssertedTenantClients,
+		"session_broker_clients":  c.SessionBrokerClients,
+	} {
+		for _, id := range list {
+			if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) {
+				return fmt.Errorf("service_tokens.%s: %q is not a client id", name, id)
+			}
+		}
+	}
+	for clientID, resources := range c.ServedResources {
+		if strings.TrimSpace(clientID) == "" || clientID != strings.TrimSpace(clientID) {
+			return fmt.Errorf("service_tokens.served_resources: %q is not a client id", clientID)
+		}
+		for _, r := range resources {
+			u, err := url.Parse(r)
+			if err != nil || u.Scheme == "" || u.Fragment != "" || r != strings.TrimSpace(r) {
+				return fmt.Errorf("service_tokens.served_resources[%s]: %q is not an absolute URI without a fragment", clientID, r)
+			}
+		}
+	}
+	return nil
 }
 
 // BackchannelConfig governs CIBA (OpenID CIBA Core 1.0) behavior. All fields
@@ -548,6 +684,18 @@ type TokenConfig struct {
 	// the broker. 0 ⇒ the built-in default (12h).
 	ExternalPrincipalRefreshTokenTTL int `koanf:"external_principal_refresh_token_ttl"`
 
+	// AllowUnverifiedExternalPrincipalSubject restores the external-principal
+	// exchange's old handling of a subject_token: accepted without being
+	// verified. By default (false) a presented subject_token must be an active
+	// token this server issued, for the tenant (account_id, project_id) and
+	// the person (user_id) the request names; otherwise the exchange fails
+	// with invalid_grant. A request with no subject_token is unaffected.
+	//
+	// Set it only for a deployment whose trusted services present tokens from
+	// another issuer on that exchange, and only until they move to the
+	// ID-token exchange (subject_token_type id_token) or stop sending one.
+	AllowUnverifiedExternalPrincipalSubject bool `koanf:"allow_unverified_external_principal_subject"`
+
 	// RefreshReuseGraceSeconds is how long after a refresh token is rotated
 	// out a second presentation of it is refused as a concurrent retry rather
 	// than treated as reuse. Within the window the rotated-out token is
@@ -689,6 +837,20 @@ func (c *Config) Validate() error {
 	if c.Database.URL == "" {
 		return fmt.Errorf("database URL is required: provide ZEROID_DATABASE_URL or individual DB_ vars")
 	}
+	for _, n := range c.ReservedClientIDs.Names {
+		if service.ReservedClientIDKey(n) == "" || strings.Contains(n, "#") {
+			return fmt.Errorf("reserved_client_ids.names: %q is not a client id (empty, or contains '#')", n)
+		}
+	}
+	for _, p := range c.ReservedClientIDs.Prefixes {
+		if service.ReservedClientIDKey(p) == "" {
+			return fmt.Errorf("reserved_client_ids.prefixes: an empty prefix would reserve every client id")
+		}
+	}
+	if err := c.ServiceTokens.validate(); err != nil {
+		return err
+	}
+
 	if c.Keys.PrivateKeyPath == "" {
 		return fmt.Errorf("keys.private_key_path is required")
 	}
@@ -1246,6 +1408,9 @@ var envMapping = map[string]string{
 	// The stricter scope rules: off (default) or shadow (count what they
 	// would change, enforce nothing).
 	"ZEROID_SCOPE_RULES": "token.scope_rules",
+	// Accept an external-principal subject_token without verifying it, as
+	// before subject verification. Default false.
+	"ZEROID_ALLOW_UNVERIFIED_EXTERNAL_PRINCIPAL_SUBJECT": "token.allow_unverified_external_principal_subject",
 
 	// WIMSE
 	"ZEROID_WIMSE_DOMAIN": "wimse_domain",
@@ -1314,7 +1479,8 @@ func loadEnvVars(k *koanf.Koanf) error {
 			strings.HasSuffix(configPath, ".allow_private_jwks_endpoints") ||
 			strings.HasSuffix(configPath, ".bcrypt_client_secrets") ||
 			strings.HasSuffix(configPath, ".allow_private_endpoints") ||
-			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection"):
+			strings.HasSuffix(configPath, ".allow_unauthenticated_token_inspection") ||
+			strings.HasSuffix(configPath, ".allow_unverified_external_principal_subject"):
 			boolVal, err := strconv.ParseBool(value)
 			if err != nil {
 				return fmt.Errorf("%s=%q: not a valid bool (use true/false)", envVar, value)

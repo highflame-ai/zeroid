@@ -30,11 +30,10 @@ func TestExternalPrincipalRefreshToken(t *testing.T) {
 	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}
 	baseExchange := func(userID string) map[string]any {
 		return map[string]any{
-			"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token": "external-principal-assertion",
-			"account_id":    testAccountID,
-			"project_id":    testProjectID,
-			"user_id":       userID,
+			"grant_type": testUserSessionGrant,
+			"account_id": testAccountID,
+			"project_id": testProjectID,
+			"user_id":    userID,
 		}
 	}
 

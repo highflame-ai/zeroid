@@ -176,12 +176,13 @@ func TestResourceIndicator_Rejections(t *testing.T) {
 // denied every MCP-targeted request in prod (shield#366); refusing the
 // combination means there is no precedence to get wrong.
 func TestResourceIndicator_MutuallyExclusiveWithAudience(t *testing.T) {
+	user := uid("res-excl-user")
 	body := map[string]any{
 		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
+		"subject_token": personToken(t, testAccountID, testProjectID, user),
 		"account_id":    testAccountID,
 		"project_id":    testProjectID,
-		"user_id":       uid("res-excl-user"),
+		"user_id":       user,
 		"audience":      "codeoid",
 		"resource":      mcpGithub,
 	}
@@ -469,12 +470,13 @@ func TestResourceIndicator_BindsExternalPrincipalExchange(t *testing.T) {
 	// no audience profile).
 	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}
 
+	user := uid("res-extprin")
 	resp := post(t, "/oauth2/token", map[string]any{
 		"grant_type":    "urn:ietf:params:oauth:grant-type:token-exchange",
-		"subject_token": "external-principal-assertion",
+		"subject_token": personToken(t, testAccountID, testProjectID, user),
 		"account_id":    testAccountID,
 		"project_id":    testProjectID,
-		"user_id":       uid("res-extprin"),
+		"user_id":       user,
 		"resource":      mcpGithub,
 	}, trusted)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -496,10 +498,10 @@ func TestResourceIndicator_BindsExternalPrincipalExchange(t *testing.T) {
 // request, and the rotated token would come back unbound with nothing failing.
 func TestResourceIndicator_ExternalPrincipalBoundGetsNoRefreshToken(t *testing.T) {
 	trusted := map[string]string{testTrustedServiceHeader: "trusted-service"}
-	base := func(userID string) map[string]any {
+	base := func(t *testing.T, userID string) map[string]any {
 		return map[string]any{
 			"grant_type":          "urn:ietf:params:oauth:grant-type:token-exchange",
-			"subject_token":       "external-principal-assertion",
+			"subject_token":       personToken(t, testAccountID, testProjectID, userID),
 			"account_id":          testAccountID,
 			"project_id":          testProjectID,
 			"user_id":             userID,
@@ -509,7 +511,7 @@ func TestResourceIndicator_ExternalPrincipalBoundGetsNoRefreshToken(t *testing.T
 
 	t.Run("baseline: a profiled audience DOES get a refresh token", func(t *testing.T) {
 		// Guards the assertion below from passing for the wrong reason.
-		b := base(uid("res-ep-base"))
+		b := base(t, uid("res-ep-base"))
 		b["audience"] = "codeoid"
 
 		resp := post(t, "/oauth2/token", b, trusted)
@@ -520,7 +522,7 @@ func TestResourceIndicator_ExternalPrincipalBoundGetsNoRefreshToken(t *testing.T
 	})
 
 	t.Run("resource-bound gets none even with issue_refresh_token", func(t *testing.T) {
-		b := base(uid("res-ep-bound"))
+		b := base(t, uid("res-ep-bound"))
 		b["resource"] = mcpGithub
 
 		resp := post(t, "/oauth2/token", b, trusted)

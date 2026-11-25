@@ -24,6 +24,7 @@ var (
 	ErrUnsupportedAlg    = errors.New("authjwt: unsupported signing algorithm")
 	ErrNoKeySet          = errors.New("authjwt: no JWKS available")
 	ErrInsufficientScope = errors.New("authjwt: insufficient scope")
+	ErrResourceMismatch  = errors.New("authjwt: token is not bound to this resource")
 	ErrTokenRevoked      = errors.New("authjwt: token revoked or inactive")
 	ErrIntrospectFailed  = errors.New("authjwt: introspection request failed")
 )

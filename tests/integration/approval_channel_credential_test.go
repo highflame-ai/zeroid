@@ -219,8 +219,10 @@ func TestApprovalChannelCredentialsRequireTrustedContext(t *testing.T) {
 		client, _ := body["client"].(map[string]any)
 		id, _ := client["id"].(string)
 		require.NotEmpty(t, id)
-		requireForbidden(t, post(t, adminPath("/oauth/clients/"+id+"/rotate-secret"), nil, adminHeaders()), "untrusted rotate-secret")
-		rot := post(t, adminPath("/oauth/clients/"+id+"/rotate-secret"), nil, channelWriteHeaders())
+		// The client is unlinked, so it is the operator's to manage: rotate it
+		// with no tenant in context.
+		requireForbidden(t, post(t, adminPath("/oauth/clients/"+id+"/rotate-secret"), nil, nil), "untrusted rotate-secret")
+		rot := post(t, adminPath("/oauth/clients/"+id+"/rotate-secret"), nil, operatorChannelWriteHeaders())
 		require.Equal(t, http.StatusOK, rot.StatusCode)
 		_ = rot.Body.Close()
 	})
