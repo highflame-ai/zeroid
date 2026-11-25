@@ -415,3 +415,44 @@ func TestReservedMappingKeysIn(t *testing.T) {
 		t.Fatalf("got %v, want none", got)
 	}
 }
+
+func TestExternalIssuerValidate_FirstContact(t *testing.T) {
+	cases := []struct {
+		name           string
+		mode           FirstContactMode
+		project, owner string
+		code           string
+	}{
+		{"off by default", "", "", "", ""},
+		{"off keeps a stored mapping", FirstContactOff, "proj-1", "user-1", ""},
+		{"discover with a project", FirstContactDiscover, "proj-1", "", ""},
+		{"discover with a project and an owner", FirstContactDiscover, "proj-1", "user-1", ""},
+		{"adopt with both", FirstContactAdopt, "proj-1", "user-1", ""},
+		{"discover without a project", FirstContactDiscover, "", "user-1", "first_contact_mapping_required"},
+		{"adopt without an owner", FirstContactAdopt, "proj-1", "", "first_contact_mapping_required"},
+		{"adopt without a project", FirstContactAdopt, "", "user-1", "first_contact_mapping_required"},
+		{"an unknown mode", "sometimes", "proj-1", "user-1", "invalid_first_contact"},
+		{"a project that is not a path segment", FirstContactDiscover, "proj/1", "", "invalid_first_contact"},
+		{"an over-long owner", FirstContactAdopt, "proj-1", strings.Repeat("u", 256), "invalid_first_contact"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := validRow()
+			e.FirstContact, e.FirstContactProjectID, e.FirstContactOwnerUserID = tc.mode, tc.project, tc.owner
+			e.Normalize()
+			err := e.Validate(IssuerValidation{})
+			if tc.code == "" {
+				if err != nil {
+					t.Fatalf("want valid, got %v", err)
+				}
+				if e.FirstContact == "" {
+					t.Fatal("Normalize must default first_contact to off")
+				}
+				return
+			}
+			if got := issuerCode(err); got != tc.code {
+				t.Fatalf("code = %q (%v), want %q", got, err, tc.code)
+			}
+		})
+	}
+}

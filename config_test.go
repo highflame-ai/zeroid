@@ -865,6 +865,38 @@ func TestConfig_FederationIssuerStore(t *testing.T) {
 	}
 }
 
+// TestConfig_FirstContactBounds: the first-contact bounds default from the
+// loader, read from the environment, and refuse a negative value.
+func TestConfig_FirstContactBounds(t *testing.T) {
+	cfg := baseValidConfig(t)
+	cfg.Federation.FirstContact = FirstContactConfig{RatePerMinute: -1}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "first_contact") {
+		t.Fatalf("a negative rate: err = %v", err)
+	}
+	cfg.Federation.FirstContact = FirstContactConfig{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero means the defaults: %v", err)
+	}
+
+	t.Setenv("ZEROID_HMAC_SECRET", "this-is-a-sufficiently-long-secret-key")
+	loaded, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := loaded.Federation.FirstContact; got.RatePerMinute != 10 || got.MaxDiscoveredPerAccount != 500 {
+		t.Fatalf("defaults = %+v, want 10 and 500", got)
+	}
+	t.Setenv("ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE", "3")
+	t.Setenv("ZEROID_FEDERATION_FIRST_CONTACT_MAX_DISCOVERED_PER_ACCOUNT", "40")
+	loaded, err = LoadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := loaded.Federation.FirstContact; got.RatePerMinute != 3 || got.MaxDiscoveredPerAccount != 40 {
+		t.Fatalf("from the environment = %+v, want 3 and 40", got)
+	}
+}
+
 // TestForwardedHeadersMode pins resolution of the forwarded-header trust mode,
 // including the deprecated all-or-nothing flag it replaces.
 func TestForwardedHeadersMode(t *testing.T) {

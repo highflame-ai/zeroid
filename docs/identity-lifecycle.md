@@ -13,7 +13,11 @@ enumerate via a connector) is **not** a separate inventory — it is an identity
 the same store as a native agent, distinguished by two orthogonal fields:
 
 - **`origin`** — provenance: `native` (we issued it) vs an external ecosystem
-  (`okta` / `entra` / `google_workspace` / …).
+  (`okta` / `entra` / `google_workspace` / …), or `first_contact`: registered by ZeroID
+  itself on the agent's first verified call through a trusted issuer row whose
+  `first_contact` is on ([external-issuers.md](external-issuers.md#first-contact)). Such
+  an identity enters `discovered` (`discover`), or `active` directly under the row's
+  standing adoption mapping (`adopt`).
 - **`status`** — lifecycle state, extending the existing `IdentityStatus` machine with one
   new state, `discovered`, that sits *below* the existing states.
 

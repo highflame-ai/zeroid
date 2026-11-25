@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/lestrrat-go/jwx/v4/jwt"
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
@@ -238,9 +239,43 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// through an enabled binding (ADR 0042 D6), and the tenant is that
 	// identity's; a registered client linked to another identity is refused.
 	// This also gives a CIMD client its tenant.
-	var boundAgent *domain.Identity
+	//
+	// An agent no binding maps may be registered on first contact, as the
+	// row's first_contact says (firstContactIDJAG). The tenant is then the
+	// row's account and its first-contact project, and the agent is registered
+	// only further down, once the person has been resolved.
+	var (
+		boundAgent *domain.Identity
+		agentKey   string
+		pending    bool
+	)
 	if entry.Row != nil {
-		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, federatedAgentKey(rawClaims, idJAGClientID), authedClient, federatedGrantIDJAG)
+		agentKey = federatedAgentKey(rawClaims, idJAGClientID)
+		pending, err = s.firstContactIDJAGPending(ctx, entry.Row, agentKey, authedClient)
+		if err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case pending:
+		row := entry.Row
+		if (req.AccountID != "" && req.AccountID != row.AccountID) || (req.ProjectID != "" && req.ProjectID != row.FirstContactProjectID) {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "account_id or project_id does not match the tenant derived from the issuer")
+		}
+		if req.ApplicationID != "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG is bound to")
+		}
+		req.AccountID, req.ProjectID = row.AccountID, row.FirstContactProjectID
+	case entry.Row != nil:
+		// With first contact on, a registered client's ID-JAG still registers
+		// nothing; firstContactFor's step only logs why.
+		var declined firstContactFunc
+		if !authedClient.SelfAsserted() {
+			declined = s.firstContactFor(entry.Row, agentKey, federatedGrantIDJAG, nil, func(context.Context) (firstContactOutcome, error) {
+				return firstContactRegisteredClient, nil
+			})
+		}
+		boundAgent, err = s.bindFederatedAgent(ctx, entry.Row, agentKey, authedClient, federatedGrantIDJAG, declined)
 		if err != nil {
 			return nil, err
 		}
@@ -251,7 +286,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "application_id is not the agent the ID-JAG is bound to")
 		}
 		req.AccountID, req.ProjectID = boundAgent.AccountID, boundAgent.ProjectID
-	} else {
+	default:
 		tenant, err := deriveIDJAGTenant(ctx, &cfg, authedClient,
 			s.identitySvc.repo.GetByIDInAccounts, req.AccountID, req.ProjectID)
 		if err != nil {
@@ -364,6 +399,25 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, err
 	}
 
+	// First contact: the person is resolved before anything is registered, so
+	// a person the resolver refuses leaves no identity and no binding behind.
+	// Then the jti is spent, so a captured ID-JAG cannot replay the
+	// registration, and the agent is registered and bound. discover refuses
+	// here, naming the new identity's state; adopt goes on to the mint with
+	// the person already resolved and the jti already spent.
+	var (
+		resolvedPerson *federatedPerson
+		jtiSpent       bool
+	)
+	if pending {
+		var person federatedPerson
+		boundAgent, person, err = s.firstContactIDJAG(ctx, req, entry, verified, rawClaims, cfg, upstreamIss, userID, agentKey, authedClient)
+		if err != nil {
+			return nil, err
+		}
+		resolvedPerson, jtiSpent = &person, true
+	}
+
 	// Resolve the application identity if requested (IDOR-guarded, same as the
 	// id_token-exchange path); otherwise synthesize a service identity for the
 	// external principal.
@@ -460,57 +514,51 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	// jti, or an attacker could burn a victim's single-use grant by deliberately
 	// failing a later-but-not-last check. The store INSERT is the atomic
 	// check-and-mark: a replay surfaces as ErrIDJAGReplay.
-	if s.idJAGReplayStore == nil {
-		// Fail closed: ID-JAG is single-use and we cannot enforce that without a
-		// replay store. Never mint while replay protection is unavailable.
-		return nil, oauthServerError("ID-JAG replay store is not configured", nil)
-	}
-	jti, ok := verified.JwtID()
-	if !ok || jti == "" {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
-	}
-	// expires_at is the ID-JAG's own exp: past it the grant fails its exp check
-	// before the jti is consulted, so the row is no longer load-bearing and the
-	// cleanup worker may reap it. validateExternalAssertion already required exp
-	// to be present, so this lookup succeeds.
-	jtiExpiry, _ := verified.Expiration()
-	// The person's ceiling can refuse too, so it is decided before the burn
-	// and reused at the mint. A replay is refused first, so it never reaches
-	// the deployer's resolver; Insert below is still the single-use gate.
-	redeemed, err := s.idJAGReplayStore.Redeemed(ctx, jti)
-	if err != nil {
-		return nil, oauthServerError("failed to check ID-JAG single-use jti", err)
-	}
-	if redeemed {
-		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+	//
+	// The one exception is first contact (above): it spends the jti before it
+	// registers the agent, and jtiSpent says so.
+	jti, _ := verified.JwtID()
+	if !jtiSpent {
+		if s.idJAGReplayStore == nil {
+			// Fail closed: ID-JAG is single-use and we cannot enforce that without a
+			// replay store. Never mint while replay protection is unavailable.
+			return nil, oauthServerError("ID-JAG replay store is not configured", nil)
+		}
+		if jti == "" {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
+		}
+		// The person's ceiling can refuse too, so it is decided before the burn
+		// and reused at the mint. A replay is refused first, so it never reaches
+		// the deployer's resolver; Insert below is still the single-use gate.
+		redeemed, err := s.idJAGReplayStore.Redeemed(ctx, jti)
+		if err != nil {
+			return nil, oauthServerError("failed to check ID-JAG single-use jti", err)
+		}
+		if redeemed {
+			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+		}
 	}
 	// The person must be a member of the tenant (ADR 0042 D5a). Resolved here,
 	// before the burn, so a non-member does not consume the grant, and before
-	// the ceiling, which is keyed on the resolved user.
-	person, err := s.resolveFederatedPerson(ctx, entry.Row != nil, FederatedPersonRequest{
-		GrantType:       PersonGrantIDJAG,
-		AccountID:       req.AccountID,
-		ProjectID:       req.ProjectID,
-		Issuer:          upstreamIss,
-		IssuerID:        issuerRowID(entry),
-		Subject:         userID,
-		Email:           userEmail,
-		EmailVerified:   issuerEmailVerified(rawClaims, cfg, userEmail),
-		ClientID:        authedClient.ClientID,
-		AgentIdentityID: identity.ID,
-	})
-	if err != nil {
-		return nil, err
+	// the ceiling, which is keyed on the resolved user. First contact resolved
+	// it already, before registering the agent.
+	var person federatedPerson
+	if resolvedPerson != nil {
+		person = *resolvedPerson
+	} else {
+		person, err = s.resolveFederatedPerson(ctx, entry.Row != nil, idJAGPersonRequest(req, entry, rawClaims, cfg, upstreamIss, userID, authedClient, identity.ID))
+		if err != nil {
+			return nil, err
+		}
 	}
 	person.apply(&issue)
 	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
 		return nil, personGrantOAuthError(err, oautherror.InvalidScope)
 	}
-	if err := s.idJAGReplayStore.Insert(ctx, jti, jtiExpiry); err != nil {
-		if errors.Is(err, postgres.ErrIDJAGReplay) {
-			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+	if !jtiSpent {
+		if err := s.spendIDJAG(ctx, verified); err != nil {
+			return nil, err
 		}
-		return nil, oauthServerError("failed to record ID-JAG single-use jti", err)
 	}
 
 	accessToken, _, err := s.credentialSvc.IssueCredential(ctx, issue)
@@ -539,6 +587,116 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	logIDJAGRedeemed(upstreamIss, jti, upstreamSub, req.AccountID, req.ProjectID, person.sub, resources)
 
 	return accessToken, nil
+}
+
+// idJAGPersonRequest is the person-resolver request for an ID-JAG minted
+// into req's (derived) tenant. agentID is the agent's identity, "" when it is
+// not registered yet.
+func idJAGPersonRequest(req TokenRequest, entry *ExternalIssuerEntry, rawClaims map[string]any, cfg domain.ExternalIssuerConfig,
+	upstreamIss, userID string, client *domain.OAuthClient, agentID string,
+) FederatedPersonRequest {
+	userEmail, _ := extractMappedClaimString(rawClaims, cfg.ClaimMapping["email"])
+	return FederatedPersonRequest{
+		GrantType:       PersonGrantIDJAG,
+		AccountID:       req.AccountID,
+		ProjectID:       req.ProjectID,
+		Issuer:          upstreamIss,
+		IssuerID:        issuerRowID(entry),
+		Subject:         userID,
+		Email:           userEmail,
+		EmailVerified:   issuerEmailVerified(rawClaims, cfg, userEmail),
+		ClientID:        client.ClientID,
+		AgentIdentityID: agentID,
+	}
+}
+
+// firstContactIDJAGPending reports whether an ID-JAG under row takes the
+// first-contact path: first contact is on for the row, the redeeming client
+// is a CIMD client, and no binding at all maps the agent key. Only a CIMD
+// client, whose registration is the IdP-signed ID-JAG itself: a registered
+// client must be linked to the agent it redeems for, and first contact
+// neither creates nor links clients.
+func (s *OAuthService) firstContactIDJAGPending(ctx context.Context, row *domain.ExternalIssuer, agentKey string, client *domain.OAuthClient) (bool, error) {
+	if s.firstContactFor(row, agentKey, federatedGrantIDJAG, nil, nil) == nil || !client.SelfAsserted() || agentKey == "" || s.issuerBindings == nil {
+		return false, nil
+	}
+	existing, err := s.issuerBindings.BindingsFor(ctx, row.ID, agentKey)
+	if err != nil {
+		return false, oauthServerError("failed to read the agent's credential binding", err)
+	}
+	return len(existing) == 0, nil
+}
+
+// firstContactIDJAG registers the agent an ID-JAG names on first contact,
+// in this order: the replay check; the person, through the resolver, in the
+// row's account and first-contact project; the jti, spent; then the
+// registration, and the binding read as for any agent. A refusal at any step
+// before the registration leaves nothing behind. It returns the bound agent
+// (adopt) and the resolved person, or the refusal (discover refuses naming
+// the new identity's state; a bound past the row's limits refuses as with
+// no binding).
+func (s *OAuthService) firstContactIDJAG(ctx context.Context, req TokenRequest, entry *ExternalIssuerEntry, verified jwt.Token,
+	rawClaims map[string]any, cfg domain.ExternalIssuerConfig, upstreamIss, userID, agentKey string, client *domain.OAuthClient,
+) (*domain.Identity, federatedPerson, error) {
+	if s.idJAGReplayStore == nil {
+		return nil, federatedPerson{}, oauthServerError("ID-JAG replay store is not configured", nil)
+	}
+	jti, ok := verified.JwtID()
+	if !ok || jti == "" {
+		return nil, federatedPerson{}, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
+	}
+	// A replay is refused before it reaches the resolver.
+	redeemed, err := s.idJAGReplayStore.Redeemed(ctx, jti)
+	if err != nil {
+		return nil, federatedPerson{}, oauthServerError("failed to check ID-JAG single-use jti", err)
+	}
+	if redeemed {
+		return nil, federatedPerson{}, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+	}
+	person, err := s.resolveFederatedPerson(ctx, true, idJAGPersonRequest(req, entry, rawClaims, cfg, upstreamIss, userID, client, ""))
+	if err != nil {
+		return nil, federatedPerson{}, err
+	}
+	// Spent whatever happens next, so the caller never spends it again: a
+	// registration, a binding someone else made meanwhile, or a refusal.
+	if err := s.spendIDJAG(ctx, verified); err != nil {
+		return nil, federatedPerson{}, err
+	}
+	firstContact := s.firstContactFor(entry.Row, agentKey, federatedGrantIDJAG, nil, nil)
+	agent, err := s.bindFederatedAgent(ctx, entry.Row, agentKey, client, federatedGrantIDJAG, firstContact)
+	if err != nil {
+		return nil, federatedPerson{}, err
+	}
+	// A binding made concurrently by someone else may name another project.
+	if err := federatedTenant(agent, req.AccountID, req.ProjectID); err != nil {
+		return nil, federatedPerson{}, err
+	}
+	return agent, person, nil
+}
+
+// spendIDJAG records the ID-JAG's jti in the single-use ledger: the atomic
+// check-and-mark, where a replay surfaces as "already redeemed". The row
+// expires with the ID-JAG's own exp: past it the grant fails its exp check
+// before the jti is consulted, so the cleanup worker may reap it.
+// validateExternalAssertion already required exp.
+func (s *OAuthService) spendIDJAG(ctx context.Context, verified jwt.Token) error {
+	if s.idJAGReplayStore == nil {
+		// Fail closed: ID-JAG is single-use and we cannot enforce that without a
+		// replay store. Never mint while replay protection is unavailable.
+		return oauthServerError("ID-JAG replay store is not configured", nil)
+	}
+	jti, ok := verified.JwtID()
+	if !ok || jti == "" {
+		return oauthBadRequest(oautherror.InvalidGrant, "ID-JAG missing jti — single-use grants require jti")
+	}
+	jtiExpiry, _ := verified.Expiration()
+	if err := s.idJAGReplayStore.Insert(ctx, jti, jtiExpiry); err != nil {
+		if errors.Is(err, postgres.ErrIDJAGReplay) {
+			return oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
+		}
+		return oauthServerError("failed to record ID-JAG single-use jti", err)
+	}
+	return nil
 }
 
 // logIDJAGRedeemed writes the success line of an ID-JAG redemption. Beside the

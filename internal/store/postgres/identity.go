@@ -138,6 +138,45 @@ func (r *IdentityRepository) GetByExternalID(ctx context.Context, externalID, ac
 	return identity, nil
 }
 
+// CountByOriginAndStatus counts an account's identities of one origin in one
+// status, across its projects: the per-account first-contact cap. Served by
+// the partial origin index (migration 035).
+func (r *IdentityRepository) CountByOriginAndStatus(ctx context.Context, accountID string, origin domain.Origin, status domain.IdentityStatus) (int, error) {
+	n, err := dbOrTx(ctx, r.db).NewSelect().Model((*domain.Identity)(nil)).
+		Where("account_id = ?", accountID).
+		Where("origin = ?", origin).
+		Where("origin <> 'native'").
+		Where("status = ?", status).
+		Count(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count identities: %w", err)
+	}
+	return n, nil
+}
+
+// GetByOriginAndMetadata returns the oldest identity in a tenant with the
+// given origin whose metadata contains doc (JSONB containment, served by the
+// metadata GIN index). sql.ErrNoRows (wrapped) when there is none.
+func (r *IdentityRepository) GetByOriginAndMetadata(ctx context.Context, accountID, projectID string, origin domain.Origin, doc map[string]any) (*domain.Identity, error) {
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode metadata filter: %w", err)
+	}
+	identity := &domain.Identity{}
+	err = dbOrTx(ctx, r.db).NewSelect().Model(identity).
+		Where("account_id = ?", accountID).
+		Where("project_id = ?", projectID).
+		Where("origin = ?", origin).
+		Where("metadata @> ?::jsonb", string(raw)).
+		OrderExpr("created_at, id").
+		Limit(1).
+		Scan(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get identity by metadata: %w", err)
+	}
+	return identity, nil
+}
+
 // GetByWIMSEURI retrieves an identity by its WIMSE URI, scoped to tenant.
 func (r *IdentityRepository) GetByWIMSEURI(ctx context.Context, wimseURI, accountID, projectID string) (*domain.Identity, error) {
 	identity := &domain.Identity{}
