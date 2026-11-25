@@ -248,3 +248,13 @@ func (s *OAuthService) ResolveWorkloadGrant(ctx context.Context, identity *domai
 	}
 	return &WorkloadGrant{Policy: policy, Scopes: scopes, TTL: federatedAccessTokenTTL(policy)}, nil
 }
+
+// ResolveWorkloadPolicy returns identity's governing credential policy: its
+// own, else the tenant default.
+func (s *OAuthService) ResolveWorkloadPolicy(ctx context.Context, identity *domain.Identity) (*domain.CredentialPolicy, error) {
+	policy, err := s.identitySvc.ResolveCredentialPolicy(ctx, identity)
+	if err != nil {
+		return nil, oauthServerError("failed to resolve identity credential policy", err)
+	}
+	return policy, nil
+}

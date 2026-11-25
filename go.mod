@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/danielgtaylor/huma/v2 v2.37.3
+	github.com/dunglas/httpsfv v1.1.2
 	github.com/go-chi/chi/v5 v5.4.0
 	github.com/goccy/go-json v0.10.6
 	github.com/golang-migrate/migrate/v4 v4.20.1

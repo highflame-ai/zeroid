@@ -30,6 +30,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 	"github.com/highflame-ai/zeroid/pkg/dpop"
 
+	"github.com/highflame-ai/zeroid/internal/aauth"
 	"github.com/highflame-ai/zeroid/internal/attestation"
 	"github.com/highflame-ai/zeroid/internal/database"
 	"github.com/highflame-ai/zeroid/internal/handler"
@@ -685,6 +686,23 @@ func NewServer(cfg Config, opts ...ServerOption) (*Server, error) {
 	}))
 	humaPublic := handler.NewHumaAPI(r)
 	apiHandler.RegisterPublic(humaPublic, r)
+
+	// AAuth Agent Provider (internal/aauth), on the public router behind
+	// RequestURLMiddleware, which records the authority a signature covers.
+	if cfg.AAuth.Enabled {
+		provider, err := aauth.New(aauth.Config{
+			Issuer:         cfg.Token.Issuer,
+			SigningKeyPath: cfg.AAuth.SigningKeyPath,
+			SigningKeyID:   cfg.AAuth.SigningKeyID,
+			AgentTokenTTL:  time.Duration(cfg.AAuth.AgentTokenTTLSeconds) * time.Second,
+			Name:           cfg.AAuth.Name,
+		}, aauth.Deps{OAuth: oauthSvc, Credentials: credentialSvc, DB: db})
+		if err != nil {
+			return nil, err
+		}
+		provider.Mount(r)
+		log.Info().Str("issuer", cfg.Token.Issuer).Msg("AAuth Agent Provider enabled")
+	}
 
 	// AgentAuthMiddleware config — verifies an agent's own ZeroID-issued ES256
 	// access token and sets tenant/identity from the validated claims. Shared by

@@ -187,6 +187,18 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired id_jag jti records")
 	}
 
+	// AAuth bootstrap redemptions (internal/aauth) bind a workload assertion to
+	// the agent key that redeemed it, only until the assertion expires.
+	aauthRes, err := w.db.NewDelete().
+		TableExpr("aauth_bootstrap_redemptions").
+		Where("expires_at < ?", now).
+		Exec(ctx)
+	if err != nil {
+		log.Error().Err(err).Msg("Cleanup: failed to delete expired aauth bootstrap redemptions")
+	} else if n, err := aauthRes.RowsAffected(); err == nil && n > 0 {
+		log.Info().Int64("count", n).Msg("Cleanup: deleted expired aauth bootstrap redemptions")
+	}
+
 	// Refresh tokens: under rotation every refresh inserts a successor row and
 	// revokes its predecessor, so the table grows linearly with token traffic
 	// if never swept. Delete rows whose expires_at is past now minus

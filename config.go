@@ -21,6 +21,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/highflame-ai/zeroid/domain"
+	"github.com/highflame-ai/zeroid/internal/aauth"
 	"github.com/highflame-ai/zeroid/internal/service"
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
@@ -90,6 +91,32 @@ type Config struct {
 	// Federation chooses where trusted issuers come from and how they are
 	// fetched (ADR 0042 D4). See docs/external-issuers.md.
 	Federation FederationConfig `koanf:"federation"`
+
+	// AAuth turns on the AAuth Agent Provider (internal/aauth): POST
+	// /ap/token, /ap/jwks.json and /.well-known/aauth-agent.json. Off by
+	// default.
+	AAuth AAuthConfig `koanf:"aauth"`
+}
+
+// AAuthConfig configures the AAuth Agent Provider. A workload presents its
+// platform token (federation.issuer_store=db workload rows and bindings) and
+// gets an AAuth agent token bound to its own key. Each tenant still opts in by
+// listing aauth_agent in a credential policy's allowed_grant_types.
+type AAuthConfig struct {
+	Enabled bool `koanf:"enabled"`
+	// SigningKeyPath is a PKCS#8 PEM Ed25519 private key that signs agent
+	// tokens and nothing else. Required when enabled; there is no ephemeral
+	// fallback.
+	SigningKeyPath string `koanf:"signing_key_path"`
+	// SigningKeyID is the key's kid in /ap/jwks.json. Empty means its RFC 7638
+	// thumbprint.
+	SigningKeyID string `koanf:"signing_key_id"`
+	// AgentTokenTTLSeconds is the agent token's lifetime, held to the
+	// identity's credential policy. 0 means 900 (15 minutes). It must be over
+	// 300: an agent refreshes when fewer than five minutes remain.
+	AgentTokenTTLSeconds int `koanf:"agent_token_ttl_seconds"`
+	// Name is the display name in /.well-known/aauth-agent.json. Optional.
+	Name string `koanf:"name"`
 }
 
 // IdentityTreeConfig bounds registration trees: the identities an identity
@@ -1023,6 +1050,21 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("federation.issuer_store must be config or db, got %q", c.Federation.IssuerStore)
 	}
 
+	if c.AAuth.Enabled {
+		if _, err := aauth.ServerIdentifierHost(c.Token.Issuer); err != nil {
+			return fmt.Errorf("aauth.enabled needs token.issuer to be an AAuth server identifier (https, host only, lower case), got %q: %w", c.Token.Issuer, err)
+		}
+		if c.AAuth.SigningKeyPath == "" {
+			return fmt.Errorf("aauth.signing_key_path is required when aauth.enabled is true")
+		}
+		if c.Federation.IssuerStore != "db" {
+			return fmt.Errorf("aauth.enabled needs federation.issuer_store=db: agents bootstrap from workload issuer rows and bindings")
+		}
+		if t := c.AAuth.AgentTokenTTLSeconds; t != 0 && (t <= 300 || t > 3600) {
+			return fmt.Errorf("aauth.agent_token_ttl_seconds must be over 300 and at most 3600, got %d", t)
+		}
+	}
+
 	seen := make(map[string]struct{}, len(c.ExternalIssuers))
 	for i := range c.ExternalIssuers {
 		c.ExternalIssuers[i].Defaults()
@@ -1389,6 +1431,7 @@ func loadDefaults(k *koanf.Koanf) error {
 		// Trusted issuers from static config unless the deployment opts
 		// into account rows.
 		"federation.issuer_store":            "config",
+		"aauth.enabled":                      false,
 		"federation.allow_private_endpoints": false,
 		// First-contact bounds, per issuer row and per account.
 		"federation.first_contact.rate_per_minute":            10,
@@ -1505,7 +1548,14 @@ var envMapping = map[string]string{
 
 	// Trusted issuers: config (static external_issuers) or db (account
 	// rows). The private-endpoint relaxation is for local development only.
-	"ZEROID_FEDERATION_ISSUER_STORE":            "federation.issuer_store",
+	"ZEROID_FEDERATION_ISSUER_STORE": "federation.issuer_store",
+
+	// AAuth Agent Provider (internal/aauth). Off by default.
+	"ZEROID_AAUTH_ENABLED":                      "aauth.enabled",
+	"ZEROID_AAUTH_SIGNING_KEY_PATH":             "aauth.signing_key_path",
+	"ZEROID_AAUTH_SIGNING_KEY_ID":               "aauth.signing_key_id",
+	"ZEROID_AAUTH_AGENT_TOKEN_TTL_SECONDS":      "aauth.agent_token_ttl_seconds",
+	"ZEROID_AAUTH_NAME":                         "aauth.name",
 	"ZEROID_FEDERATION_ALLOW_PRIVATE_ENDPOINTS": "federation.allow_private_endpoints",
 	// First-contact bounds.
 	"ZEROID_FEDERATION_FIRST_CONTACT_RATE_PER_MINUTE":            "federation.first_contact.rate_per_minute",
