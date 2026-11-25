@@ -1,6 +1,6 @@
 # zeroid-mockidp
 
-A fake upstream IdP for running trusted issuers (ADR 0042) end to end without a real Entra tenant or Okta org.
+A fake upstream IdP for running trusted issuers end to end without a real Entra tenant or Okta org.
 It signs whatever it is asked to sign, so it is a test fixture and never a deployment component.
 
 It publishes three issuers, each with its own RSA key:

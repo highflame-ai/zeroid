@@ -12,12 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// These tests pin the subagent-delegation half of epic slice S9 (T5,
-// highflame-ai/highflame-architecture#138): a parent code-agent's delegated
-// token plus a child subagent's signed assertion are exchanged via
-// token_exchange (RFC 8693) for an ATTENUATED child token. They assert the
-// CAP-IDN-018 attenuation invariants specifically for the coding-agent scope
-// vocabulary (tools:*), on top of the generic delegation coverage in
+// These tests pin the subagent-delegation half of the delegation design: a
+// parent code-agent's delegated token plus a child subagent's signed assertion
+// are exchanged via token_exchange (RFC 8693) for an ATTENUATED child token.
+// They assert the attenuation invariants specifically for the coding-agent
+// scope vocabulary (tools:*), on top of the generic delegation coverage in
 // delegation_test.go:
 //
 //   - child scopes = requested ∩ parent.granted ∩ child-policy.allowed
@@ -33,7 +32,7 @@ import (
 // these tests are black-box regression coverage that it holds end-to-end for
 // the code-agent case. Tool-scope strings are used as literals here (as in
 // id_jag_test.go). The canonical tool-scope vocabulary lives in
-// highflame-policy (codegen'd), consumed by Shield/Guardian.
+// the policy definitions (codegen'd), consumed by Shield.
 
 // attemptSubagentExchange registers a fresh child subagent identity bound to
 // policyID, then performs a token_exchange WITHOUT asserting success — so

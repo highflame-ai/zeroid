@@ -53,7 +53,7 @@ changelog:
       - "Merge branch"
       - "^Revert "
   # Groups map our enforced commit-prefix convention
-  # (highflame-workflow's pr-check regex:
+  # (the shared pr-check regex:
   # `^(feat:|fix:|devops:|Merge|Revert|build\(deps\)|\[Snyk\]|Bump)`)
   # into per-section release notes. `order` controls section order in the
   # output; the catch-all `Other Changes` group at order 999 absorbs

@@ -61,11 +61,11 @@ type VerifierConfig struct {
 	//
 	// NOT an authorization signal, and not proof a token was minted for you.
 	// ZeroID stamps `aud` on every token it issues (defaulting to the issuer URL
-	// to satisfy JWT-SVID §3), and since CAP-IDN-026 a caller may set it to any
-	// absolute URI by passing the RFC 8707 `resource` parameter at the token
-	// endpoint. So pinning this to your own identifier does not establish that
-	// the authorization server intended the token for your service — any tenant
-	// principal can request that value.
+	// to satisfy JWT-SVID §3), and since RFC 8707 resource binding a caller may
+	// set it to any absolute URI by passing the RFC 8707 `resource` parameter at
+	// the token endpoint. So pinning this to your own identifier does not
+	// establish that the authorization server intended the token for your service
+	// — any tenant principal can request that value.
 	//
 	// Use it as a routing/hygiene filter if you like. Authorize on the claims
 	// that carry authority: `scopes`, the principal (`sub` / identity_type /

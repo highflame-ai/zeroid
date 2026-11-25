@@ -124,7 +124,7 @@ deployment can count what they would change before any is enforced; see
 ZeroID does not know a deployer's roles, so it cannot decide which scopes a
 person may hold. A deployer that can supplies a `PersonGrantResolver` with
 `Server.SetPersonGrantResolver(fn, mode)`. Highflame's deployment uses it to
-apply each role's scopes (ADR 0041 D15).
+apply each role's scopes.
 
 **Which tokens.** Every grant that mints for a person consults it:
 `authorization_code`, `refresh_token`, a root CIBA grant, ID-JAG, ID-token
@@ -140,7 +140,7 @@ and, on the external-principal exchange only, the role the trusted service
 asserted. It returns a ceiling and the person's roles.
 
 On ID-JAG and the ID-token exchange, when a federated person resolver is
-installed (`Server.SetFederatedPersonResolver`, ADR 0042 D5a), it runs first:
+installed (`Server.SetFederatedPersonResolver`), it runs first:
 the person this resolver sees is the deployer's user it returned, not the IdP
 subject, which the token carries as `user_idp_iss`/`user_idp_sub`
 ([external-issuers.md](external-issuers.md#person-resolution)).

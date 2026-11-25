@@ -34,7 +34,7 @@ type issuerRowSource interface {
 // Static mode (standalone ZeroID): entries come from external_issuers config
 // and are fixed for the life of the process.
 //
-// Database mode (ADR 0042 D4): rows are read live on every federated grant,
+// Database mode: rows are read live on every federated grant,
 // with no row cache, so disabling or deleting a row takes effect at the next
 // request on every replica. Only the JWKS clients are cached, shared by
 // (jwks_uri, refresh interval).
@@ -143,8 +143,8 @@ func (r *ExternalIssuerRegistry) ResolvePerson(ctx context.Context, iss string, 
 	return r.resolveKind(ctx, iss, claims, domain.IssuerKindPerson, errIssuerNotPerson)
 }
 
-// ResolveWorkload returns the row a federated client assertion (ADR 0042
-// D8) verifies iss against: an enabled workload row whose constraints the
+// ResolveWorkload returns the row a federated client assertion
+// verifies iss against: an enabled workload row whose constraints the
 // unverified claims meet. Database mode only, since the assertion resolves
 // to an agent through a binding on the row.
 func (r *ExternalIssuerRegistry) ResolveWorkload(ctx context.Context, iss string, claims map[string]any) (*ExternalIssuerEntry, error) {

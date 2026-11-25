@@ -13,7 +13,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// Workload issuer proof of control (ADR 0042 open question 8, for workload
+// Workload issuer proof of control (for workload
 // issuers): the deployer hands the account a one-time challenge, the account
 // obtains a token from its issuer with the challenge as the audience
 // (`aws sts get-web-identity-token --audience`, `kubectl create token

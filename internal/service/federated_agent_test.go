@@ -148,7 +148,7 @@ func TestIsCurrentActor(t *testing.T) {
 	}
 	legacy := sign(map[string]any{"sub": "user_1", "act": map[string]any{"sub": agentA.WIMSEURI}})
 	if isCurrentActor(priorActorsOf(legacy), agentA) {
-		t.Fatal("legacy never collapses (ADR 0043 D1)")
+		t.Fatal("legacy never collapses")
 	}
 
 	if got := delegatorBefore(rfcPerson, actors); got != "user_1" {

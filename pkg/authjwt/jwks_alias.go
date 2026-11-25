@@ -11,7 +11,7 @@ import (
 // the dependency graph of the authorization server.
 //
 // These are aliases, not wrappers: `type A = B` makes the names
-// interchangeable at the type level, so existing callers — cerberus, shield,
+// interchangeable at the type level, so existing callers —
 // authn — compile unchanged and can pass jwks.Option and authjwt.JWKSOption
 // values to the same function. Nothing here needs to be kept in sync with the
 // upstream package beyond the names themselves.

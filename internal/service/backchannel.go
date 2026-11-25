@@ -1179,7 +1179,7 @@ func (s *BackchannelService) issueTokenForApprovedRow(ctx context.Context, row *
 		return nil, cerr
 	}
 	// A root grant mints for the approved person, so the person's ceiling
-	// applies, before the burn (ADR 0041 D15). A step-up carries its chain's
+	// applies, before the burn. A step-up carries its chain's
 	// principal and is never a person root, so this is a no-op for it.
 	if err := s.credentialSvc.decidePersonGrant(ctx, &issue); err != nil {
 		return nil, personGrantOAuthError(err, oautherror.InvalidScope)

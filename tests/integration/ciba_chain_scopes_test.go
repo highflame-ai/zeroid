@@ -11,10 +11,10 @@ import (
 	"github.com/highflame-ai/zeroid/internal/store/postgres"
 )
 
-// A CIBA step-up approved into a requesting chain extends that chain (ADR 0041
-// D15): the approved token's scopes are the chain's own, the chain's principal
-// decides which policy rules apply, and the requesting identity's policy still
-// shapes the token. These tests pin each of those.
+// A CIBA step-up approved into a requesting chain extends that chain: the
+// approved token's scopes are the chain's own, the chain's principal decides
+// which policy rules apply, and the requesting identity's policy still shapes
+// the token. These tests pin each of those.
 
 // bcAuthorizeIn posts bc-authorize for c in the given tenant.
 func bcAuthorizeIn(t *testing.T, c cibaClient, account, project string, body map[string]any) string {
@@ -143,7 +143,7 @@ func TestCIBAStepUp_RequiredPrincipalTypeUsesTheChainsPrincipal(t *testing.T) {
 }
 
 // Bug 3: a chain acting for a person is capped by the requesting identity's
-// policy user_grant_scopes, not its allowed_scopes (ADR 0041 D2).
+// policy user_grant_scopes, not its allowed_scopes.
 func TestCIBAStepUp_UserChainCappedByUserGrantScopes(t *testing.T) {
 	tn := newTenant(t, "rfc8693")
 	own := []string{"nhi:manage"}

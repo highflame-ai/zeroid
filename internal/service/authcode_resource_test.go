@@ -10,12 +10,12 @@ import (
 )
 
 // Tests for the `rsc` claim — the consented RFC 8707 resource ceiling carried on
-// the authorization code (CAP-IDN-027).
+// the authorization code.
 //
 // These exist because the ceiling's decode path is FAIL-CLOSED in a way `scp`'s
 // is not, and the asymmetry is security-load-bearing rather than stylistic. An
 // ABSENT ceiling means "none was recorded", which permits the token request to
-// bind to any resource it names (CAP-IDN-026). So any shape that reads as an
+// bind to any resource it names. So any shape that reads as an
 // EMPTY ceiling silently widens what the code allows — the opposite of a skipped
 // scope, which narrows. Everything below is a statement about which shapes are
 // allowed to become "no ceiling".
@@ -73,8 +73,8 @@ func TestAuthCodeResourceCeiling_DecodeShapes(t *testing.T) {
 
 	t.Run("multi-valued array round-trips", func(t *testing.T) {
 		// The authorize LEG caps the ceiling at one value, but the claim itself
-		// must carry more than one — cardinality is a constant, not a shape
-		// (ADR 0037 D2). If this ever fails, raising the cap has become a
+		// must carry more than one — cardinality is a constant, not a shape.
+		// If this ever fails, raising the cap has become a
 		// wire-format change.
 		claims, err := decodeAuthCodeJWT(
 			mintRawAuthCode(t, []any{github, slack}), testMintHMAC, testMintIssuer)
@@ -146,7 +146,7 @@ func TestAuthCodeResourceCeiling_DecodeShapes(t *testing.T) {
 	// The shapes below are PRESENT but name nothing. Each one has to be an
 	// error rather than an empty ceiling, because an empty ceiling is
 	// indistinguishable from "no ceiling was ever recorded" — which permits the
-	// token request to bind to anything (CAP-IDN-026). Presence is therefore
+	// token request to bind to anything. Presence is therefore
 	// tested with token.Has, not by whether a typed read succeeds.
 
 	t.Run("empty array is rejected, not read as no ceiling", func(t *testing.T) {

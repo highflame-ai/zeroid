@@ -15,7 +15,7 @@ import (
 )
 
 // FederatedPersonRequest names the person in a verified IdP token, for the
-// deployer to resolve to its own user (ADR 0042 D5a).
+// deployer to resolve to its own user.
 type FederatedPersonRequest struct {
 	// GrantType is PersonGrantIDJAG or PersonGrantExternalIDToken.
 	GrantType string
@@ -79,7 +79,7 @@ type federatedPerson struct {
 
 // apply sets the person on req. A resolved person's sub is the deployer's
 // user, whose issuer is ZeroID's: user_id_iss names sub's issuer, so the
-// IdP's issuer moves to user_idp_iss with user_idp_sub (ADR 0042 D5a), and the token
+// IdP's issuer moves to user_idp_iss with user_idp_sub, and the token
 // carries the same user_id_iss as other person grants.
 func (p federatedPerson) apply(req *IssueRequest) {
 	req.SubjectOverride = p.sub
@@ -93,7 +93,7 @@ func (p federatedPerson) apply(req *IssueRequest) {
 // resolveFederatedPerson maps the IdP subject to the deployer's user.
 //
 // Without a resolver, a static issuer keeps today's behaviour (sub is the
-// IdP subject); an issuer row refuses, because ADR 0042 D5a requires the
+// IdP subject); an issuer row refuses, because issuer rows require the
 // person to be a member of the row's account and only the deployer knows.
 func (s *OAuthService) resolveFederatedPerson(ctx context.Context, fromRow bool, r FederatedPersonRequest) (federatedPerson, error) {
 	p := s.federatedPerson.fn.Load()

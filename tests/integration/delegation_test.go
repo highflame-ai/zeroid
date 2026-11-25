@@ -427,7 +427,7 @@ func TestRevokeCredential_TenantMismatch_Returns404(t *testing.T) {
 	require.NotEmpty(t, creds, "identity must have at least one credential")
 	realID := creds[0].(map[string]any)["id"].(string)
 
-	// Forge wrong-tenant headers by overriding the X-Account-ID +
+	// Spoof wrong-tenant headers by overriding the X-Account-ID +
 	// X-Project-ID on the request. The internal-service auth still
 	// matches; only the tenant scope differs.
 	wrongHeaders := adminHeaders()

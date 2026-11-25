@@ -379,7 +379,7 @@ func TestRejectUnsupportedResource(t *testing.T) {
 }
 
 // TestValidateAuthorizeResource covers the authorize-leg validator, whose caps
-// are deliberately TIGHTER than the token endpoint's (CAP-IDN-027).
+// are deliberately TIGHTER than the token endpoint's.
 //
 // Worth pinning separately from validateResourceIndicators because the two caps
 // exist for different reasons and are allowed to diverge: the token endpoint
@@ -513,12 +513,12 @@ func TestValidateAuthorizeResource(t *testing.T) {
 // refresh_token was absent from resourceSupportedGrants. That exclusion was the
 // right control only while the binding was not carried across rotation — it was
 // what the code called the "second lock", the first being that a resource-bound
-// exchange was issued no refresh token at all. CAP-IDN-027 carries the ceiling
-// on the refresh family, so the property worth defending is no longer "refuse
-// the parameter" — which 400s the exact request a conformant MCP client makes,
-// since the SDK sends `resource` on the refresh leg too — but "the parameter can
-// only ever narrow". Same invariant, enforced by a subset check against the
-// consented ceiling instead of by blanket exclusion.
+// exchange was issued no refresh token at all. The resource ceiling carries the
+// ceiling on the refresh family, so the property worth defending is no longer
+// "refuse the parameter" — which 400s the exact request a conformant MCP client
+// makes, since the SDK sends `resource` on the refresh leg too — but "the
+// parameter can only ever narrow". Same invariant, enforced by a subset check
+// against the consented ceiling instead of by blanket exclusion.
 //
 // Kept separate from the rollout table above for the reason the original was:
 // this is a durable property, not slice-by-slice rollout state.
@@ -656,7 +656,7 @@ func TestBindResourceOnIssue(t *testing.T) {
 // TestResourceIsReserved is a tripwire: bindResourceOnIssue is only the sole
 // writer of the `resource` claim for as long as additional_claims cannot reach
 // it. If reservedClaims ever loses the entry, the claim stops being proof that
-// ZeroID recorded a binding and INV-IDN-006 enforcement becomes forgeable.
+// ZeroID recorded a binding and resource-binding enforcement becomes forgeable.
 func TestResourceIsReserved(t *testing.T) {
 	if !reservedClaims["resource"] {
 		t.Fatal("resource must stay in reservedClaims — the claim's presence is the security signal")

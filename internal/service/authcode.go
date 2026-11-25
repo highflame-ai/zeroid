@@ -34,8 +34,8 @@ type AuthCodeClaims struct {
 	UserEmail string // "uem" — user email (optional)
 	UserName  string // "unm" — user display name (optional)
 
-	// Resources is the consented RFC 8707 resource ceiling — "rsc"
-	// (CAP-IDN-027). Optional: absent on every code issued before this
+	// Resources is the consented RFC 8707 resource ceiling — "rsc".
+	// Optional: absent on every code issued before this
 	// existed, and on any request that did not name a resource.
 	//
 	// A signed CLAIM rather than a database row, for the same reason Scopes
@@ -49,7 +49,7 @@ type AuthCodeClaims struct {
 	// Capped at one value on the authorize leg
 	// (maxAuthorizeResourceIndicators) but carried as a slice: cardinality
 	// is a constant, not a shape, so raising the cap must not change what
-	// is on the wire (ADR 0037 D2).
+	// is on the wire.
 	Resources []string // "rsc" — consented resource ceiling (optional)
 }
 
@@ -116,12 +116,12 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 		}
 	}
 
-	// Extract the consented resource ceiling (CAP-IDN-027).
+	// Extract the consented resource ceiling.
 	//
 	// This one FAILS CLOSED, unlike `scp` above, which skips an element it
 	// cannot read. The asymmetry is deliberate: an ABSENT ceiling means "none
 	// was recorded", which permits the token request to bind to any resource it
-	// names (CAP-IDN-026). So silently dropping an unreadable element would
+	// names. So silently dropping an unreadable element would
 	// WIDEN what the code allows — in the limit, a fully malformed claim would
 	// read as no ceiling at all and hand back exactly the unconstrained binding
 	// the ceiling exists to prevent. A skipped scope narrows; a skipped
@@ -142,7 +142,7 @@ func decodeAuthCodeJWT(code, hmacSecret, expectedIssuer string) (*AuthCodeClaims
 	//   - token.Has("rsc") distinguishes ABSENT from PRESENT. It exists so an
 	//     absent claim does NOT fall into decodeResourceCeiling's fail-closed
 	//     branch — without it every unbound authorization code would stop
-	//     decoding, breaking the CAP-IDN-026 flow entirely.
+	//     decoding, breaking the resource-binding flow entirely.
 	//   - the len(out)==0 check INSIDE decodeResourceCeiling is what actually
 	//     catches `"rsc": null` and `"rsc": []`. Measured against jwx v4.4.0:
 	//     after a sign/parse round trip `null` and `[]` BOTH succeed through
@@ -204,8 +204,8 @@ func decodeResourceCeiling(token jwt.Token) ([]string, error) {
 	}
 
 	// Present but naming nothing. Distinct from absent, and NOT equivalent to
-	// it: absent means the client may still bind at the token endpoint
-	// (CAP-IDN-026), so silently accepting an empty ceiling here would convert
+	// it: absent means the client may still bind at the token endpoint,
+	// so silently accepting an empty ceiling here would convert
 	// a corrupt consent record into an unconstrained one.
 	//
 	// This is the guard that catches BOTH `"rsc": null` and `"rsc": []` — both
@@ -360,7 +360,7 @@ func mintAuthCodeJWT(claims *AuthCodeClaims, hmacSecret, issuer string, now time
 	if len(claims.Resources) > 0 {
 		// Emitted as []any for the same round-trip reason as "scp" above, and
 		// ALWAYS as an array even though the authorize leg caps the ceiling at
-		// one value. Cardinality is a constant, not a shape (ADR 0037 D2):
+		// one value. Cardinality is a constant, not a shape:
 		// raising the cap must not change the claim's serialization, or every
 		// code minted before the change becomes a compatibility case.
 		anyResources := make([]any, len(claims.Resources))

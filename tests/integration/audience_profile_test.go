@@ -35,7 +35,7 @@ var codeoidScopeProfile = []string{
 
 // agentSandboxScopeProfile mirrors defaultAudienceScopeProfiles["agent-sandbox"]:
 // just nhi:manage — the one capability a broker's token needs to register a
-// per-sandbox identity on the user's behalf (forge #25).
+// per-sandbox identity on the user's behalf.
 var agentSandboxScopeProfile = []string{"nhi:manage"}
 
 // audienceOf normalizes a decoded JWT `aud` claim (which JSON-encodes as either
@@ -187,7 +187,7 @@ func TestExternalPrincipalExchange_AudienceProfile(t *testing.T) {
 		assert.Equal(t, []string{"agent-sandbox"}, audienceOf(t, claims),
 			"aud must be stamped to agent-sandbox")
 		assert.Equal(t, "codeoid-user-005", claims["sub"],
-			"sub must remain the external user — the forge-brokered token acts AS the user")
+			"sub must remain the external user — the broker-minted token acts AS the user")
 		got := scopesOf(t, claims)
 		assert.ElementsMatch(t, agentSandboxScopeProfile, got,
 			"agent-sandbox carries exactly nhi:manage — the one mint capability")

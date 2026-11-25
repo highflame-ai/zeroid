@@ -52,11 +52,11 @@ func TestResourceClaimSingleString(t *testing.T) {
 	}
 }
 
-// TestResourceClaimAbsent is the shield#366 regression at the library boundary.
-// baseClaims carries an `aud` (ZeroID stamps one on EVERY token, defaulting to
-// the issuer URL for JWT-SVID §3) but no `resource`. Resource must stay empty:
-// it is the sole signal a PEP may gate resource enforcement on, and a non-empty
-// `aud` must never be mistaken for a binding.
+// TestResourceClaimAbsent is the absent-resource-claim regression at the
+// library boundary. baseClaims carries an `aud` (ZeroID stamps one on EVERY
+// token, defaulting to the issuer URL for JWT-SVID §3) but no `resource`.
+// Resource must stay empty: it is the sole signal a PEP may gate resource
+// enforcement on, and a non-empty `aud` must never be mistaken for a binding.
 func TestResourceClaimAbsent(t *testing.T) {
 	ks := newTestKeySet(t)
 	issuer := "https://auth.test.com"
@@ -75,6 +75,6 @@ func TestResourceClaimAbsent(t *testing.T) {
 
 	if len(claims.Resource) != 0 {
 		t.Errorf("Resource = %#v, want empty — a token with aud but no `resource` "+
-			"is NOT resource-bound (shield#366)", claims.Resource)
+			"is NOT resource-bound", claims.Resource)
 	}
 }

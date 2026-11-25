@@ -34,11 +34,10 @@ const (
 )
 
 // bindFederatedAgent maps the agent a federated person grant names to its
-// own identity through an enabled binding under the issuer row (ADR 0042
-// D6), and refuses an identity that is not active (D7). subjectKey is the
-// value the credential carries at runtime: the ID-JAG's act.sub (its
-// client_id when it names no actor), or the presenting client's client_id on
-// the ID-token exchange.
+// own identity through an enabled binding under the issuer row, and refuses an
+// identity that is not active. subjectKey is the value the credential carries
+// at runtime: the ID-JAG's act.sub (its client_id when it names no actor), or
+// the presenting client's client_id on the ID-token exchange.
 //
 // There is no synthetic identity: no binding, or a client registered to a
 // different identity, is invalid_grant and an unmatched-agent event.
@@ -125,8 +124,8 @@ func bindAgent(ctx context.Context, bindings issuerBindingSource, lookup linkedI
 	return identity, nil
 }
 
-// federatedTenant applies ADR 0042 D5: the tenant is the bound identity's,
-// and a request that names one must name the same.
+// federatedTenant applies the derived-tenant rule: the tenant is the bound
+// identity's, and a request that names one must name the same.
 func federatedTenant(identity *domain.Identity, reqAccountID, reqProjectID string) error {
 	if reqAccountID != "" && reqAccountID != identity.AccountID {
 		return oauthBadRequest(oautherror.InvalidGrant, "account_id does not match the tenant derived from the issuer and the agent's binding")
@@ -137,7 +136,7 @@ func federatedTenant(identity *domain.Identity, reqAccountID, reqProjectID strin
 	return nil
 }
 
-// recordUnmatchedAgent is the unmatched-agent event (ADR 0027): a credential
+// recordUnmatchedAgent is the unmatched-agent event: a credential
 // from a trusted issuer that maps to no adopted identity. A log line and a
 // metric; ZeroID has no event bus.
 func recordUnmatchedAgent(ctx context.Context, row *domain.ExternalIssuer, subjectKey, grant, reason string) {

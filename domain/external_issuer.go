@@ -39,7 +39,7 @@ type ExternalIssuerConfig struct {
 	Audiences []string `koanf:"audiences"`
 
 	// Kind is person (the default) or workload. Person grants (ID-JAG and the
-	// ID-token exchange) accept only person issuers (ADR 0042 D4).
+	// ID-token exchange) accept only person issuers.
 	Kind IssuerKind `koanf:"kind"`
 
 	// Algorithms is the allow-list of JWS algorithms accepted on incoming ID

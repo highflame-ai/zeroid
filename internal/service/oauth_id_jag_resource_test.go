@@ -8,9 +8,9 @@ import (
 )
 
 // TestBuildIDJAGCustomClaims_StampsResourceBinding pins the claim that
-// INV-IDN-006 enforcement depends on. Shield gates entirely on the presence of
-// `resource`, so if this stops being stamped the invariant silently stops
-// enforcing — an un-enforced security control, which fails quiet.
+// resource-binding enforcement depends on. Shield gates entirely on the
+// presence of `resource`, so if this stops being stamped the invariant silently
+// stops enforcing — an un-enforced security control, which fails quiet.
 func TestBuildIDJAGCustomClaims_StampsResourceBinding(t *testing.T) {
 	t.Parallel()
 
@@ -77,7 +77,7 @@ func TestBuildIDJAGCustomClaims_PropagateClaimsCannotClobberResource(t *testing.
 
 // TestBuildIDJAGCustomClaims_IgnoresReservedMappings: a row stored before
 // role and privilege_scope were reserved may still map them; the ID-JAG grant
-// never copies either from the IdP's claims (ADR 0044 D16, EC-D16-04).
+// never copies either from the IdP's claims.
 func TestBuildIDJAGCustomClaims_IgnoresReservedMappings(t *testing.T) {
 	t.Parallel()
 

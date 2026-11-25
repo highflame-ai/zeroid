@@ -74,7 +74,7 @@ func bindListIdentitiesInput(t *testing.T, rawQuery string) ListIdentitiesInput 
 func TestListAgentsInput_RepeatedStatusBindsEveryValue(t *testing.T) {
 	// The exact shape Studio's inventory sends on every page load. Before
 	// `,explode` this bound to ["active"], so the inventory silently filtered to
-	// active-only and pending/expired agents were invisible (studio#1405).
+	// active-only and pending/expired agents were invisible.
 	in := bindListAgentsInput(t, "status=active&status=pending&status=expired")
 	assert.Equal(t, []string{"active", "pending", "expired"}, splitCSV(in.Status))
 }

@@ -165,14 +165,14 @@ func TestRegisterAgent_CrossTenantCredentialPolicyRejected(t *testing.T) {
 		"cross-tenant credential_policy_id must be rejected at register-agent with 400")
 }
 
-// TestDeleteAgent_WithServiceKey_SoftDeletes is the regression for authn#109:
-// DELETE /agents/registry/{id} on an agent that has a service key must SOFT
-// delete (deactivate) it, not hard-delete. Previously the hard delete returned
-// 500 on the non-cascading service_keys FK (every registered agent gets a
-// bootstrap key, so all agent deletes failed). The fix deactivates instead:
-// the request succeeds, the identity row is retained as deactivated (audit
-// trail preserved + matches the "soft delete" contract), and the agent's
-// credentials are revoked on the way out.
+// TestDeleteAgent_WithServiceKey_SoftDeletes is the regression for an
+// embedder's report: DELETE /agents/registry/{id} on an agent that has a
+// service key must SOFT delete (deactivate) it, not hard-delete. Previously the
+// hard delete returned 500 on the non-cascading service_keys FK (every
+// registered agent gets a bootstrap key, so all agent deletes failed). The fix
+// deactivates instead: the request succeeds, the identity row is retained as
+// deactivated (audit trail preserved + matches the "soft delete" contract), and
+// the agent's credentials are revoked on the way out.
 func TestDeleteAgent_WithServiceKey_SoftDeletes(t *testing.T) {
 	ext := uid("delete-agent-softdelete")
 	reg := registerAgent(t, ext) // registration auto-creates a service key

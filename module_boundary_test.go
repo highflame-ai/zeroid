@@ -8,7 +8,7 @@ import (
 )
 
 // RATCHET. pkg/authjwt is the token-VERIFICATION library that resource servers
-// (cerberus, shield, authn) import to validate zeroid-issued tokens. The
+// (downstream resource servers) import to validate zeroid-issued tokens. The
 // authorization server must not depend on it: that is backwards layering, and it
 // drags a consumer-facing API — with its compatibility obligations — into the
 // server's graph.

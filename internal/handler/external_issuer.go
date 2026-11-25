@@ -14,7 +14,7 @@ import (
 	"github.com/highflame-ai/zeroid/internal/service"
 )
 
-// Trusted issuers and credential bindings (ADR 0042 D4, D4a, D6). The
+// Trusted issuers and credential bindings. The
 // account is always the caller's tenant; another account's rows are 404.
 // The contract is docs/external-issuers.md.
 

@@ -861,7 +861,7 @@ func TestDiscovered_ReleaseSourceValidation(t *testing.T) {
 	}
 }
 
-// ── Source purge on connector delete (highflame-discovery#65) ───────────────
+// ── Source purge on connector delete ───────────────
 
 // purgeDiscoveredSource POSTs /identities/discovered/purge-source and returns
 // the decoded body ({removed}).

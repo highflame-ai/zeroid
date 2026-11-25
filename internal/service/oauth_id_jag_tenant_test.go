@@ -79,7 +79,7 @@ func TestDeriveIDJAGTenant(t *testing.T) {
 		wantStatus  int
 		wantNoQuery bool
 	}{
-		// ── #630's table, under ADR 0042 D5 ────────────────────────────────
+		// ── Derived-tenant table ─────────────────────────────────────────────
 		{
 			name:       "client tenant in allowed_accounts, no request fields → derived",
 			allowed:    []string{tAcctA},
@@ -182,7 +182,7 @@ func TestDeriveIDJAGTenant(t *testing.T) {
 
 		// ── The linked identity itself ───────────────────────────────────────
 		{
-			name:    "linked identity suspended → invalid_grant (ADR 0042 D7)",
+			name:    "linked identity suspended → invalid_grant",
 			allowed: []string{tAcctA},
 			client:  linkedClient(tLinkedID),
 			store: &fakeIdentityStore{rows: map[string]*domain.Identity{tLinkedID: func() *domain.Identity {
@@ -218,7 +218,7 @@ func TestDeriveIDJAGTenant(t *testing.T) {
 			wantCode: "server_error", wantStatus: http.StatusInternalServerError,
 		},
 
-		// ── CIMD clients (firehog#701): no D6 binding exists yet ─────────────
+		// ── CIMD clients: no D6 binding exists yet ─────────────
 		//
 		// Every one of these is refused. None of the inputs a CIMD client
 		// arrives with may choose a tenant: not the request, not a single

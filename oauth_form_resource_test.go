@@ -10,7 +10,7 @@ import (
 )
 
 // Tests for the RFC 8707 §2 repeatable-`resource` carve-out in
-// oauthFormCompatMiddleware (CAP-IDN-026).
+// oauthFormCompatMiddleware.
 //
 // RFC 6749 §3.1 says a request parameter MUST NOT appear more than once, and
 // the middleware enforces that. RFC 8707 §2 overrides it for `resource`

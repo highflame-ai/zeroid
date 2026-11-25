@@ -205,7 +205,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 	}
 	// The approval extends the chain, so the chain's principal carries over
 	// unchanged (RFC 8693 §4.1) and the token is not a request-bounded root:
-	// no role applies and the approver is evidence only (ADR 0041 D15).
+	// no role applies and the approver is evidence only.
 	req.RequestBoundedRoot = false
 	p := requestingChainPrincipal(cred, row.RequesterSub, s.credentialSvc.issuer)
 	req.PrincipalType, req.PrincipalSub, req.PrincipalIss = p.Type, p.Sub, p.Iss
@@ -277,7 +277,7 @@ func (s *BackchannelService) requestingChainIssue(ctx context.Context, row *doma
 		return true, oauthServerError("failed to resolve the requesting identity's credential policy", err)
 	}
 	// A chain acting for a person is capped by the policy's user_grant_scopes
-	// in place of its allowed_scopes (ADR 0041 D2, #385 D10); the identity's
+	// in place of its allowed_scopes; the identity's
 	// own allowed_scopes, checked above, binds either way. The chain bounds
 	// the person's grant, as on a token exchange, so the split applies to
 	// every user-rooted chain.

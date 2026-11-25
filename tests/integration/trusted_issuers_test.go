@@ -1,9 +1,8 @@
 package integration_test
 
-// Per-account trusted issuers (ADR 0042 D3a, D4, D5, D5a, D6, D7): the admin
+// Per-account trusted issuers: the admin
 // API, then both person paths end to end against the mock IdP, then every
-// INV-IDN-014 negative. CAP-IDN-028 and INV-IDN-014 in
-// highflame-architecture capabilities.yaml.
+// trusted-issuer negative.
 
 import (
 	"bytes"
@@ -427,7 +426,7 @@ func TestTrustedIssuers_AdminAPI(t *testing.T) {
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "shared_issuer_requires_constraints"},
 		"unreachable discovery": {map[string]any{"kind": "person", "issuer": "https://127.0.0.1:1",
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub"}}, 422, "discovery_unreachable"},
-		// ADR 0044 D16 (EC-D16-03): an IdP claim never sets a token's role or capabilities.
+		// An IdP claim never sets a token's role or capabilities.
 		"role in claim_mapping": {map[string]any{"kind": "person", "issuer": "https://rr.example",
 			"audiences": []string{"a"}, "claim_mapping": map[string]string{"user_id": "sub", "role": "groups"}}, 400, "claim_mapping_reserved"},
 		"privilege_scope in claim_mapping": {map[string]any{"kind": "person", "issuer": "https://rp.example",
@@ -681,7 +680,7 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 	assert.Equal(t, p.appID, claims["client_id"])
 	assert.Equal(t, []string{p.agent.wimse}, actChain(t, claims), "the bound agent is the current actor")
 	assert.Equal(t, p.agent.extID, claims["act"].(map[string]any)["external_id"])
-	assert.ElementsMatch(t, []any{resource}, claims["aud"], "audience-restricted to resource (ADR 0041 D4)")
+	assert.ElementsMatch(t, []any{resource}, claims["aud"], "audience-restricted to resource")
 	assert.ElementsMatch(t, []any{"tools:read"}, claims["scopes"])
 
 	p.f.mu.Lock()
@@ -730,8 +729,8 @@ func TestTrustedIssuers_P1C_EntraIDTokenEndToEnd(t *testing.T) {
 	})
 }
 
-// TestTrustedIssuers_ReScopeLegacyProfile: the legacy profile is frozen
-// (ADR 0043 D1), so the same agent exchanging its person token delegates
+// TestTrustedIssuers_ReScopeLegacyProfile: the legacy profile is frozen,
+// so the same agent exchanging its person token delegates
 // exactly as before, and the IdP pair is not stamped on a token whose sub
 // is the agent.
 func TestTrustedIssuers_ReScopeLegacyProfile(t *testing.T) {
@@ -1063,7 +1062,7 @@ func TestTrustedIssuers_P1B_OktaIDJAGEndToEnd(t *testing.T) {
 }
 
 // TestTrustedIssuers_ReservedMappingOnStoredRow: a row stored before role and
-// privilege_scope were reserved may still map them (ADR 0044 D16). The ID-JAG
+// privilege_scope were reserved may still map them. The ID-JAG
 // grant ignores both (EC-D16-04); a rename or a disable still works, and any
 // other edit must drop them.
 func TestTrustedIssuers_ReservedMappingOnStoredRow(t *testing.T) {

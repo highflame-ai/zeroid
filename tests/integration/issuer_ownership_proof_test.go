@@ -1,6 +1,6 @@
 package integration_test
 
-// Issuer ownership proof (ADR 0042 open question 8, person issuers): the two
+// Issuer ownership proof (person issuers): the two
 // routes a deployer builds the owner's test sign-in on. GET
 // /external-issuers/{id}/discovery hands back the sign-in endpoints; POST
 // /external-issuers/{id}/verify-id-token verifies the resulting ID token

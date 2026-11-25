@@ -17,7 +17,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// A body client_id beside an HTTP Basic header (highflame-firehog#700).
+// A body client_id beside an HTTP Basic header.
 //
 // RFC 6749 §2.3 forbids more than one client authentication METHOD per request.
 // A bare client_id is an identifier, not a method (RFC 6749 §3.2.1: "A client
@@ -148,8 +148,8 @@ func TestBasicAuthBodyClientID_ReferenceSDKRedeemsIDJAG(t *testing.T) {
 	defer fedHTTPSrv.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	// The ID-JAG tenant is derived from the client's linked identity (ADR 0042
-	// D5, highflame-firehog#630), so the client is registered with one.
+	// The ID-JAG tenant is derived from the client's linked identity, so the
+	// client is registered with one.
 	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"data:read", "tools:read"})
 
 	now := time.Now()

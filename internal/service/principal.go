@@ -134,7 +134,7 @@ type AuthorizeRequest struct {
 	Scope               string
 
 	// Resource carries every occurrence of the RFC 8707 `resource`
-	// parameter (CAP-IDN-027). A slice because §2 permits the parameter to
+	// parameter. A slice because §2 permits the parameter to
 	// repeat, and reading only the first occurrence would silently drop a
 	// resource the client asked to be bound to.
 	//

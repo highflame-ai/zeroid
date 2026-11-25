@@ -18,7 +18,7 @@ import (
 // idJAGTyp is the JWS `typ` header value that identifies an assertion as an
 // MCP Enterprise-Managed-Authorization ID-JAG (Identity Assertion Authorization
 // Grant), per the ext-auth STABLE spec
-// (draft-ietf-oauth-identity-assertion-authz-grant §4.4.1 / ADR 0010). The
+// (draft-ietf-oauth-identity-assertion-authz-grant §4.4.1). The
 // jwt-bearer grant branches on this value: an assertion carrying it is an
 // ID-JAG signed by a corporate IdP and MUST be validated against that IdP's
 // JWKS via the #88 external-issuer substrate, NOT the NHI self-signed
@@ -26,7 +26,7 @@ import (
 const idJAGTyp = "oauth-id-jag+jwt"
 
 // idJAGGrantProfile is the authorization grant profile URN ZeroID advertises in
-// the AS metadata's authorization_grant_profiles_supported field (ADR 0010 D6).
+// the AS metadata's authorization_grant_profiles_supported field.
 const idJAGGrantProfile = "urn:ietf:params:oauth:grant-profile:id-jag"
 
 // isIDJAGAssertion reports whether the compact JWS in assertion carries the
@@ -50,7 +50,7 @@ func isIDJAGAssertion(assertion string) bool {
 //
 // role and privilege_scope are never set here, whatever the issuer's
 // claim_mapping says: an IdP claim must not place a role or capabilities in a
-// token (ADR 0044 D16). Validation refuses both as mapping keys, and a row
+// token. Validation refuses both as mapping keys, and a row
 // stored before that refusal may still name them, so they are not read.
 func buildIDJAGCustomClaims(
 	rawClaims map[string]any,
@@ -84,7 +84,7 @@ func buildIDJAGCustomClaims(
 	// serve as the signal: ZeroID stamps `aud` on every token it issues,
 	// defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
 	// says nothing about whether a binding exists. Shield treating it as if it did
-	// denied every MCP-targeted request in prod (shield#366). Presence of THIS
+	// denied every MCP-targeted request in prod. Presence of THIS
 	// claim is the discriminator; its absence means "not resource-bound".
 	//
 	// Set LAST, after the PropagateClaims loop, so a deployer who lists "resource"
@@ -118,7 +118,7 @@ func idJAGActors(identity *domain.Identity) []domain.Actor {
 
 // idJAGBearer mints an audience-restricted ZeroID access token from an MCP
 // ID-JAG presented at POST /oauth2/token with
-// grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer (ADR 0010 D2-D4).
+// grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer.
 //
 // ZeroID plays the MCP Authorization Server role: the corporate IdP (Okta /
 // Entra) has already evaluated admission policy and minted the ID-JAG carrying
@@ -127,7 +127,7 @@ func idJAGActors(identity *domain.Identity) []domain.Actor {
 // — the same #88 substrate the id_token-exchange path uses), maps the external
 // identity to a Highflame principal, and mints a ZeroID access token
 // audience-restricted to `resource`. The ID-JAG terminates here; only the minted
-// ZeroID token travels downstream to Firehog/Shield (ADR 0010 D5).
+// ZeroID token travels downstream to the gateway and Shield.
 //
 // Fail closed (OAuth invalid_grant, never mint) when: the issuer is not a
 // configured external issuer, no tenant can be derived from the issuer's
@@ -137,12 +137,12 @@ func idJAGActors(identity *domain.Identity) []domain.Actor {
 // claim is absent (D3, D4).
 func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*domain.AccessToken, error) {
 	// No account_id / project_id requirement. The tenant is derived below from
-	// the issuer and the authenticated client (ADR 0042 D5); a conformant
+	// the issuer and the authenticated client; a conformant
 	// client sends neither field (draft §4.4, EMA §5).
 	trace := scopeTraceFrom(ctx)
 	trace.setGrant(scopeTraceGrantIDJAG)
 
-	// Confidential-client authentication (ADR 0010 D2b). A leaked ID-JAG must
+	// Confidential-client authentication. A leaked ID-JAG must
 	// not be redeemable by another party: the draft (with §9.1) requires
 	// redemption to come from an authenticated confidential client. Require
 	// client_id (no client auth presented → invalid_client) and verify the
@@ -181,7 +181,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		// ID-JAG against, so fail closed rather than fall back to any other path.
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG federation is not configured (no external issuers)")
 	}
-	// Any issuer refusal is one generic invalid_grant (ADR 0010 D3 fails
+	// Any issuer refusal is one generic invalid_grant (fails
 	// closed here); resolved only after the client authenticated.
 	entry, upstreamIss, err := s.resolvePersonIssuer(ctx, req.Assertion, "ID-JAG assertion")
 	if err != nil {
@@ -215,7 +215,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		}
 	}
 
-	// client_id binding (ADR 0010 D2b). Signature validity alone is not enough:
+	// client_id binding. Signature validity alone is not enough:
 	// the ID-JAG's `client_id` claim MUST equal the authenticated client, so a
 	// stolen-but-validly-signed ID-JAG cannot be redeemed by a different client
 	// at the mint boundary. This binding (not the signature) is the control.
@@ -227,7 +227,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG client_id does not match the authenticated client")
 	}
 
-	// Tenant binding (ADR 0042 D5). Derived from the issuer's allowed_accounts
+	// Tenant binding. Derived from the issuer's allowed_accounts
 	// and the authenticated client's registration, never chosen by the request;
 	// a request that also names a tenant must name this one. Runs after the
 	// client_id binding, so a CIMD client is held to the same binding before
@@ -239,7 +239,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	//
 	// For an issuer row the agent is the ID-JAG's act.sub, or its client_id
 	// when the IdP names no actor (act is OPTIONAL in the draft), mapped
-	// through an enabled binding (ADR 0042 D6), and the tenant is that
+	// through an enabled binding, and the tenant is that
 	// identity's; a registered client linked to another identity is refused.
 	// This also gives a CIMD client its tenant.
 	//
@@ -362,7 +362,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		return nil, oauthBadRequest(oautherror.InvalidGrant, fmt.Sprintf("ID-JAG missing claim %q (mapped to user_id) and has no usable sub_id — cannot map to a Highflame principal", cfg.ClaimMapping["user_id"]))
 	}
 	// The ID-JAG names a person; a workload subject would mint
-	// principal_type=user for a machine (zeroid#415, ADR 0043 D3).
+	// principal_type=user for a machine.
 	if err := refuseWorkloadSubject(rawClaims, userID); err != nil {
 		return nil, err
 	}
@@ -393,7 +393,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 
 	// RFC 8707 `resource` on the token request NARROWS the binding to a subset of
-	// what the IdP authorized (CAP-IDN-026). Where an ID-JAG names several
+	// what the IdP authorized. Where an ID-JAG names several
 	// servers, the client — which knows which one it is about to call — selects;
 	// without the parameter the claim decides for it and the token is minted good
 	// for every server in the assertion, which is wider than any single call
@@ -469,7 +469,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 	}
 
 	// Scopes come from the ID-JAG's scope claim — the IdP already evaluated
-	// policy and scoped the grant (ADR 0010). The minted token's scopes are
+	// policy and scoped the grant. The minted token's scopes are
 	// that set, gated through the identity-policy ceiling as defense in depth
 	// (a real identity row enforces it via IssueCredential; the synthetic
 	// service-identity carrier is governed by the tenant default policy through
@@ -522,7 +522,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 		CustomClaims:      customClaims,
 		DPoPKeyThumbprint: req.DPoPKeyThumbprint,
 	}
-	// Single-use enforcement (ADR 0010 D2a) — CONSUMED LAST, only after every
+	// Single-use enforcement — CONSUMED LAST, only after every
 	// other check (D2b client auth + client_id binding, ID-JAG validation,
 	// identity mapping, resource, policy resolution) has passed and immediately
 	// before issuance. A request that fails an earlier check must NOT consume the
@@ -553,7 +553,7 @@ func (s *OAuthService) idJAGBearer(ctx context.Context, req TokenRequest) (*doma
 			return nil, oauthBadRequest(oautherror.InvalidGrant, "ID-JAG has already been redeemed")
 		}
 	}
-	// The person must be a member of the tenant (ADR 0042 D5a). Resolved here,
+	// The person must be a member of the tenant. Resolved here,
 	// before the burn, so a non-member does not consume the grant, and before
 	// the ceiling, which is keyed on the resolved user. First contact resolved
 	// it already, before registering the agent.
@@ -816,7 +816,7 @@ func (s *OAuthService) recordObservedResources(
 //
 //   - token_endpoint_auth_method must be private_key_jwt. The profile "SHOULD
 //     only be supported for confidential clients" (draft-ietf-oauth-identity-
-//     assertion-authz-grant-04 §9.1), ADR 0010 D2b requires an authenticated
+//     assertion-authz-grant-04 §9.1), ZeroID requires an authenticated
 //     redeeming client, and a document can carry no shared secret (CIMD §4.1),
 //     so a key is the only credential it can have. authenticateRegisteredClient
 //     already refuses a CIMD client with any other method; this re-states it at

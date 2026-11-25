@@ -2,12 +2,13 @@
 --
 -- ── Blast radius ────────────────────────────────────────────────────────────
 --
--- Dropping this column while the CAP-IDN-027 binary is still deployed breaks
--- EVERY refresh-token operation, bound or not. Bun enumerates model columns
--- explicitly, so `refresh_tokens.resource` appears in the SELECT list of
--- GetByTokenHash and in every INSERT built from domain.RefreshToken — against a
--- schema without the column that is `ERROR: column rt.resource does not exist`
--- (SQLSTATE 42703). Consequences, which differ in how visible they are:
+-- Dropping this column while a binary that records the resource ceiling is
+-- still deployed breaks EVERY refresh-token operation, bound or not. Bun
+-- enumerates model columns explicitly, so `refresh_tokens.resource` appears in
+-- the SELECT list of GetByTokenHash and in every INSERT built from
+-- domain.RefreshToken — against a schema without the column that is `ERROR:
+-- column rt.resource does not exist` (SQLSTATE 42703). Consequences, which
+-- differ in how visible they are:
 --
 --   * the refresh_token grant fails outright on every request;
 --   * the authorization_code grant degrades SILENTLY — the refresh-token error
@@ -30,8 +31,9 @@
 --    unidentifiable — and the ceiling exists nowhere else to reconstruct from
 --    (it was consented at authorize time and the code is long spent). Skip this
 --    and up to 90 days of silently-widened families keep rotating: their
---    successors carry no `resource` claim, and INV-IDN-006 treats a token with
---    no claim as unbound and honours it at EVERY MCP server in the tenant.
+--    successors carry no `resource` claim, and resource-binding enforcement
+--    treats a token with no claim as unbound and honours it at EVERY MCP
+--    server in the tenant.
 --    That is fail-OPEN, the opposite of migration 039's down (whose successors
 --    are merely rejected by the daemon).
 --
@@ -39,7 +41,7 @@
 --    migration for why an index was NOT added for it — and acceptable for a
 --    one-off emergency step.
 --
--- 2. Roll the binary back to a pre-CAP-IDN-027 release.
+-- 2. Roll the binary back to a release from before the resource ceiling.
 --
 -- 3. Then run this migration.
 --

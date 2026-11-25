@@ -21,7 +21,7 @@ import (
 	"github.com/highflame-ai/zeroid/domain"
 )
 
-// Human-rooted delegation, phase 1 (highflame-architecture#359). The tests in
+// Human-rooted delegation, phase 1. The tests in
 // this file follow the design's test plan (§9); the names it gives are kept so
 // the plan and the suite can be read side by side.
 
@@ -1198,7 +1198,7 @@ func TestIDTokenExchange_RequiresBoundClient(t *testing.T) {
 		assert.Equal(t, "invalid_client", body["error"])
 	})
 	t.Run("a static issuer keeps the client's registered method, secrets included", func(t *testing.T) {
-		// ADR 0042 D3a's secret-free rule is for issuer rows; standalone
+		// The secret-free rule is for issuer rows; standalone
 		// ZeroID on static config keeps main's client authentication.
 		secretRP := registerOAuthClient(t, uid("d13-secret-rp"), nil)
 		status, body := redeem(idToken(map[string]any{"aud": []string{aud, secretRP.ClientID}, "azp": secretRP.ClientID}), &secretRP)

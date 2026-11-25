@@ -1,5 +1,5 @@
 -- 034_id_jag_jti.down.sql
--- Drops the ID-JAG single-use replay-prevention store (ADR 0010 D2a).
+-- Drops the ID-JAG single-use replay-prevention store.
 --
 -- DESTROYS REPLAY STATE: after this down runs, every ID-JAG `jti` redeemed
 -- before the rollback is forgotten, so a captured-but-already-redeemed ID-JAG

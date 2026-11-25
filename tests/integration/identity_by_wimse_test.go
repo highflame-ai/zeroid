@@ -35,7 +35,7 @@ func TestGetIdentityByWIMSE_Found(t *testing.T) {
 	assert.Equal(t, externalID, body["external_id"])
 	assert.Equal(t, testAccountID, body["account_id"])
 	assert.Equal(t, testProjectID, body["project_id"])
-	// status must round-trip — this is the field firehog gates on.
+	// status must round-trip — this is the field gateways gate on.
 	assert.Equal(t, "active", body["status"])
 }
 

@@ -71,12 +71,12 @@ var (
 
 	// FederationUnmatchedAgent counts federated person grants refused
 	// because no enabled credential binding maps the agent, or the presenting
-	// client is registered to a different identity (ADR 0042 D6, ADR 0027).
+	// client is registered to a different identity.
 	// Attributes: account_id, grant_type, reason.
 	FederationUnmatchedAgent metric.Int64Counter
 
 	// FederationAgentNotAdopted counts federated grants refused because the
-	// bound agent is not active (ADR 0042 D7): the adoption queue's demand.
+	// bound agent is not active: the adoption queue's demand.
 	// Attributes: account_id, grant_type, status.
 	FederationAgentNotAdopted metric.Int64Counter
 

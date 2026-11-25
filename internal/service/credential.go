@@ -49,7 +49,7 @@ type CredentialService struct {
 	// claim shape of every token this service issues. Nil-safe: when unset,
 	// every tenant is on the legacy profile.
 	tenantSettings *TenantSettingsService
-	// personGrant is the deployer's person-grant ceiling (ADR 0041 D15),
+	// personGrant is the deployer's person-grant ceiling,
 	// consulted for every person root. Nil-safe: unset, nothing changes.
 	personGrant personGrantState
 	// tree reads registration-tree ancestors and credential lineages for
@@ -316,7 +316,7 @@ type IssueRequest struct {
 	MaxTTL int
 
 	// FederatedClientAuth marks a token whose client authenticated with a
-	// federated client assertion (ADR 0042 D8); see ClientAuthClaim.
+	// federated client assertion; see ClientAuthClaim.
 	FederatedClientAuth bool
 	// CustomClaims allows callers to add arbitrary key-value pairs to the JWT.
 	// This is the extensibility hook for deployment-specific claims.
@@ -555,7 +555,7 @@ func (s *CredentialService) recordUnboundedScope(ctx context.Context, req IssueR
 	case req.ScopeCeilingUnbounded && principal.Type == domain.PrincipalWorkload:
 		root = "workload"
 	case req.RequestBoundedRoot && principal.Type == domain.PrincipalUser:
-		// An enforced person-grant ceiling bounds the root (ADR 0041 D15).
+		// An enforced person-grant ceiling bounds the root.
 		bounded := len(req.Identity.AllowedScopes) > 0 || (req.personGrant != nil && req.personGrant.enforced)
 		if identityPolicy != nil {
 			bounded = bounded || len(identityPolicy.AllowedScopes) > 0 || len(identityPolicy.UserGrantScopes) > 0
@@ -817,7 +817,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 	principal := s.resolvePrincipal(req)
 
 	// A person's own token is bounded by the deployer's ceiling for that
-	// person (ADR 0041 D15) before any other check sees its scopes.
+	// person before any other check sees its scopes.
 	if err := s.decidePersonGrant(ctx, &req); err != nil {
 		return nil, nil, err
 	}
@@ -1242,7 +1242,7 @@ func (s *CredentialService) IssueCredential(ctx context.Context, req IssueReques
 		// sets it, to the key's creator, and the creator is not acting: §4.1
 		// reserves `act` for the party currently acting, and reading it as
 		// "the human" is what let one person's brokered credentials be used
-		// for every agent whose key they created (highflame-firehog#669). An
+		// for every agent whose key they created. An
 		// api-key token is a workload-subject token with no actor; the creator
 		// stays identity metadata, carried in owner_user_id and returned by
 		// introspection.

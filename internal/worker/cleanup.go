@@ -172,7 +172,7 @@ func (w *CleanupWorker) RunOnce(ctx context.Context) {
 		log.Info().Int64("count", n).Msg("Cleanup: deleted expired dpop jti records")
 	}
 
-	// ID-JAG redeemed jti records (ADR 0010 D2a) are only needed within the
+	// ID-JAG redeemed jti records are only needed within the
 	// grant's own freshness window: past expires_at (the ID-JAG exp) the grant
 	// would fail its exp check before the jti is ever consulted, so the row is
 	// no longer load-bearing. Purge expired rows to bound table growth under

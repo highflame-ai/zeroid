@@ -424,7 +424,7 @@ func TestAuthorize_WhitespaceOnlyScopeDoesNotWiden(t *testing.T) {
 // intersection on an omitted-scope api_key grant. apiKeyGrant used to skip the
 // row-level narrowing whenever the policy had scopes of its own, then
 // IssueCredential's legacy subset check rejected the policy's extra scope —
-// so every such key failed to exchange at all. Forge's per-sandbox inference
+// so every such key failed to exchange at all. A broker's per-sandbox inference
 // identity (tools:* on the row, tenant default policy carrying nhi:manage)
 // hit exactly this, and the gateway answered 401 invalid_credential.
 func TestAPIKeyGrant_IdentityAllowedScopesNarrowPolicyCeiling(t *testing.T) {

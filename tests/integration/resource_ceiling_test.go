@@ -16,7 +16,7 @@ import (
 )
 
 // End-to-end contract for the consented resource ceiling carried on the
-// authorization code (CAP-IDN-027, zeroid#327, ADR 0037).
+// authorization code.
 //
 // The ceiling is the `rsc` claim on the auth-code JWT — a signed claim rather
 // than a database row, because auth codes are stateless and `auth_codes` is a
@@ -33,7 +33,7 @@ import (
 // Deliberately a separate helper rather than a new parameter on buildAuthCode:
 // every existing caller wants a code with NO ceiling, and that case has to keep
 // working untouched — an absent ceiling means "the client may still bind at the
-// token endpoint", which is the pre-CAP-IDN-027 behaviour CAP-IDN-026 defines
+// token endpoint", which is the pre-ceiling behaviour resource binding defines
 // and which this change must not regress.
 func buildAuthCodeWithResource(t *testing.T, clientID, userID, redirectURI, codeChallenge string, scopes, resources []string) string {
 	t.Helper()
@@ -51,7 +51,7 @@ func buildAuthCodeWithResource(t *testing.T, clientID, userID, redirectURI, code
 		Claim("ruri", redirectURI).
 		Claim("scp", scopes).
 		// Emitted as an array even though the authorize leg caps the ceiling at
-		// one value. Cardinality is a constant, not a shape (ADR 0037 D2), so
+		// one value. Cardinality is a constant, not a shape, so
 		// raising the cap must not change the claim's serialization.
 		Claim("rsc", resources).
 		Build()
@@ -315,18 +315,18 @@ func TestResourceCeiling_WrongResourceDoesNotBurnTheCode(t *testing.T) {
 // single-valued-ceiling invariant at the one place it could be violated.
 //
 // The authorize leg caps the ceiling at one, but a token-only binding
-// (CAP-IDN-026) passes through the token endpoint's cap of eight. Seeding a
+// passes through the token endpoint's cap of eight. Seeding a
 // refresh family from that would make multi-audience tokens durable for the
 // family's life AND make re-targeting expressible — the client could alternate
 // which value it selects on each rotation. That directly contradicts the
 // reasoning used to retire the blanket `resource`-on-refresh rejection.
 //
-// So this shape gets no refresh token, exactly as it did before CAP-IDN-027.
-// The access token is still bound to both resources; only the long-lived half
-// is withheld.
+// So this shape gets no refresh token, exactly as it did before the resource
+// ceiling. The access token is still bound to both resources; only the
+// long-lived half is withheld.
 func TestResourceCeiling_MultiResourceBindingGetsNoRefreshToken(t *testing.T) {
 	verifier, challenge := buildPKCEPair(t)
-	// No ceiling on the code — this is the CAP-IDN-026 token-only binding path.
+	// No ceiling on the code — this is the token-only resource-binding path.
 	code := buildAuthCode(t, testMCPClientID, uid("res-multi"),
 		testRedirectURI, challenge, []string{"data:read"})
 
@@ -354,7 +354,7 @@ func TestResourceCeiling_MultiResourceBindingGetsNoRefreshToken(t *testing.T) {
 // the audience/resource exclusivity hole that adding `refresh_token` to
 // resourceSupportedGrants opened.
 //
-// `audience` and `resource` are mutually exclusive (CAP-IDN-026), but
+// `audience` and `resource` are mutually exclusive, but
 // checkResourceAudienceExclusive compares two REQUEST parameters. On the refresh
 // grant the audience comes from the stored family, so it could not see the
 // conflict — and bindResourceOnIssue OVERWRITES issue.Audience, so a
@@ -362,7 +362,7 @@ func TestResourceCeiling_MultiResourceBindingGetsNoRefreshToken(t *testing.T) {
 // `aud` that rotation exists to preserve. The harness daemon validates `aud` on
 // every message, so the client would have broken its own session, and the token
 // would carry the profiled-audience-plus-resource-binding combination that
-// CAP-IDN-026 states cannot exist.
+// resource binding says cannot exist.
 //
 // Rejected on a non-consuming peek, so a refused request does not burn the
 // token — asserted below by rotating successfully afterwards.
@@ -520,10 +520,11 @@ func TestResourceCeiling_AuthorizeEndpointRejectsMalformedResource(t *testing.T)
 // on the second rotation"). The second rotation is what proves the copy.
 //
 // Getting this wrong is not a degraded feature, it is a silently UNBOUND token:
-// INV-IDN-006 keys on the presence of the `resource` claim and passes the
-// request through to detectors and Cedar unchanged when it is absent. So a
-// dropped ceiling yields a token honoured at every MCP server in the tenant,
-// with no error anywhere — precisely what zeroid#327 exists to close.
+// Resource-binding enforcement keys on the presence of the `resource` claim and
+// passes the request through to detectors and Cedar unchanged when it is
+// absent. So a dropped ceiling yields a token honoured at every MCP server in
+// the tenant, with no error anywhere — precisely what zeroid#327 exists to
+// close.
 func TestResourceCeiling_SurvivesTwoRotations(t *testing.T) {
 	// ── Step 1: redeem a code carrying a ceiling, WITHOUT `resource` on the
 	// token request. The access token must still bind, from the code's ceiling.
@@ -549,7 +550,7 @@ func TestResourceCeiling_SurvivesTwoRotations(t *testing.T) {
 	// A resource-bound exchange must now be issued a refresh token. Suppressing
 	// it was correct only while the binding could not survive rotation; keeping
 	// the suppression is what sent a binding client to a browser every hour and
-	// made NOT binding the path of least resistance (CAP-IDN-026, as amended).
+	// made NOT binding the path of least resistance.
 	refreshToken, ok := initial["refresh_token"].(string)
 	require.True(t, ok, "a resource-bound authorization_code exchange must return a refresh token")
 	require.NotEmpty(t, refreshToken)
@@ -585,7 +586,7 @@ func TestResourceCeiling_SurvivesTwoRotations(t *testing.T) {
 		resourceClaimOf(t, decodeJWTUnsafe(t, refreshed2["access_token"].(string))),
 		"the resource ceiling must survive a SECOND rotation — proves it is copied onto "+
 			"the successor row, not just seeded once. Losing it here yields an unbound "+
-			"token that INV-IDN-006 honours at every MCP server in the tenant")
+			"token that resource-binding enforcement honours at every MCP server in the tenant")
 }
 
 // TestResourceCeiling_TokenRequestCannotEscapeCeiling pins the direction that
@@ -594,7 +595,7 @@ func TestResourceCeiling_SurvivesTwoRotations(t *testing.T) {
 //
 // Under the single-value cap this degenerates to equality, but it is written
 // against the ceiling rather than against a hardcoded single value so it keeps
-// its meaning when the cap moves (ADR 0037 D2).
+// its meaning when the cap moves.
 func TestResourceCeiling_TokenRequestCannotEscapeCeiling(t *testing.T) {
 	verifier, challenge := buildPKCEPair(t)
 	code := buildAuthCodeWithResource(t, testMCPClientID, "user-ceiling-escape",
@@ -625,7 +626,7 @@ func TestResourceCeiling_TokenRequestCannotEscapeCeiling(t *testing.T) {
 // No ceiling is needed to permit this. A resource binding only ever NARROWS —
 // it grants no authority the grant did not already carry — so there is nothing
 // for a ceiling to protect against here. Rejecting this shape would break every
-// existing CAP-IDN-026 caller.
+// existing resource-binding caller.
 func TestResourceCeiling_AbsentCeilingStillBindsAtToken(t *testing.T) {
 	verifier, challenge := buildPKCEPair(t)
 	code := buildAuthCode(t, testMCPClientID, "user-no-ceiling",
@@ -643,5 +644,5 @@ func TestResourceCeiling_AbsentCeilingStillBindsAtToken(t *testing.T) {
 
 	assert.Equal(t, []string{mcpGithub},
 		resourceClaimOf(t, decodeJWTUnsafe(t, decode(t, resp)["access_token"].(string))),
-		"a code with no ceiling must still allow the token request to bind (CAP-IDN-026)")
+		"a code with no ceiling must still allow the token request to bind")
 }

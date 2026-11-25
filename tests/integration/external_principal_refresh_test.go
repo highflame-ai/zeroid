@@ -12,7 +12,7 @@ import (
 // TestExternalPrincipalRefreshToken is the behavioral contract for the
 // self-reliant refresh-token feature that lets an embedded harness (codeoid)
 // keep its session alive by rotating its own token, instead of the broker
-// (Forge/Studio) re-minting on a timer.
+// re-minting on a timer.
 //
 // The trusted external-principal exchange, when asked (issue_refresh_token) AND
 // only for a PROFILED audience:

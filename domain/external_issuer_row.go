@@ -14,7 +14,7 @@ import (
 	"github.com/uptrace/bun"
 )
 
-// IssuerKind says what an external issuer's tokens name (ADR 0042 D4).
+// IssuerKind says what an external issuer's tokens name.
 type IssuerKind string
 
 const (
@@ -76,7 +76,7 @@ const (
 	DefaultIssuerJWKSCacheTTLSeconds = 300
 )
 
-// ExternalIssuer is a trusted issuer owned by one account (ADR 0042 D4).
+// ExternalIssuer is a trusted issuer owned by one account.
 // See docs/external-issuers.md.
 type ExternalIssuer struct {
 	bun.BaseModel `bun:"table:external_issuers,alias:ei"`
@@ -121,7 +121,7 @@ type ExternalIssuer struct {
 }
 
 // IssuerBinding maps a credential's runtime subject key, under one issuer
-// row, to a ZeroID identity (ADR 0042 D6).
+// row, to a ZeroID identity.
 type IssuerBinding struct {
 	bun.BaseModel `bun:"table:external_issuer_bindings,alias:eib"`
 
@@ -199,7 +199,7 @@ var knownMappingKeys = []string{"user_id", "email", "email_verified", "name", "s
 
 // reservedMappingKeys are token claims an IdP claim must never set: a
 // person's role and privilege scope come only from the deployer's own
-// membership store, never from the customer's IdP (ADR 0044 D16). A
+// membership store, never from the customer's IdP. A
 // claim_mapping naming one is refused with claim_mapping_reserved.
 var reservedMappingKeys = []string{"role", "privilege_scope"}
 
@@ -540,7 +540,7 @@ func CanonicalIssuer(iss string) string {
 	return strings.TrimRight(strings.TrimSpace(iss), "/")
 }
 
-// SharedIssuer is an issuer many customers share (ADR 0042 D4) and the one
+// SharedIssuer is an issuer many customers share and the one
 // claim whose value says which customer a token belongs to. Every row on it
 // pins that claim, and rows are told apart on that claim alone.
 type SharedIssuer struct {

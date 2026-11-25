@@ -1,25 +1,24 @@
 // Baseline for agents whose identity lives in a customer IdP or a hosting
 // platform: what ZeroID supports TODAY on the standard paths that
-// highflame-architecture ADR 0042 builds on.
+// trusted-issuer federation (docs/external-issuers.md) builds on.
 //
 // These tests pin CURRENT behaviour, gaps included. Each gap assertion is
-// annotated "Flips with ADR 0042 Dx", naming the decision expected to change
+// annotated "Flips with <feature>", naming the feature expected to change
 // it. When a feature lands and a test here fails, update the assertion to the
 // new behaviour in the same PR (and drop the note), rather than deleting the
-// test. Assertions with no note are invariants the ADR keeps.
+// test. Assertions with no note are invariants the design keeps.
 //
-// Test names follow the ADR's paths (D3):
+// Test names follow the federation paths:
 //
 //   - P1a, interactive person: MCP authorization (authorization code + PKCE,
 //     CIMD, RFC 8707) against ZeroID, with sign-in handed to a login surface.
-//   - P1b, enterprise-managed person: an ID-JAG redeemed with jwt-bearer
-//     (ADR 0010).
+//   - P1b, enterprise-managed person: an ID-JAG redeemed with jwt-bearer.
 //   - P2, agent as itself: client_credentials with private_key_jwt, either
 //     with a key the client registered or with a federated client assertion
 //     from a trusted workload issuer (Kubernetes, AWS STS, SPIFFE, GitHub).
 //
-// The id_token exchange is P1c (ADR 0042 D3a); its client binding (zeroid#385
-// D13) is pinned at the end of this file, and the rest of D3a in
+// The id_token exchange is P1c; its client binding (zeroid#385
+// D13) is pinned at the end of this file, and the rest of its rules in
 // trusted_issuers_test.go.
 package integration_test
 
@@ -132,8 +131,8 @@ func postSharedToken(t *testing.T, body map[string]any) (int, map[string]any) {
 // document advertises on the shared server, which has PrincipalResolvers
 // registered (so authorization_code is servable) but CIMD disabled.
 //
-// ZeroID's side of ADR 0042 D2's metadata list is already complete here; what
-// D2 still needs is in Firehog, AuthN and Studio, not in this document.
+// ZeroID's side of the metadata list is already complete here; what remains
+// is in the embedding services, not in this document.
 func TestIdPAgentBaseline_P1a_ASMetadataAdvertisement(t *testing.T) {
 	resp := get(t, "/.well-known/oauth-authorization-server", nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -212,7 +211,7 @@ func TestIdPAgentBaseline_P1a_ASMetadataWithoutResolver(t *testing.T) {
 // TestIdPAgentBaseline_P1a_AuthorizeDoesNotFederateLogin covers what a standard
 // MCP client (a browser GET with no Highflame credential) gets from
 // /oauth2/authorize. ZeroID never redirects the browser to an upstream OIDC
-// IdP itself. The sign-in hand-off ADR 0042 D2 relies on is a resolver
+// IdP itself. The sign-in hand-off federation relies on is a resolver
 // returning ErrPrincipalInteractionRequired, which sends the browser to the
 // deployer's login surface (SetInteractiveLoginURL); that hand-off is covered
 // by oauth_authorize_interactive_test.go.
@@ -263,7 +262,7 @@ func TestIdPAgentBaseline_P1a_AuthorizeDoesNotFederateLogin(t *testing.T) {
 // TestIdPAgentBaseline_P2_WorkloadJWTOnUnconfiguredServer presents a
 // k8s-SA-shaped JWT through the RFC 7523 and RFC 8693 grant shapes on the
 // shared server, which has NO external issuers configured, and records the
-// error each returns. None of these grants is where ADR 0042 P2 lands (P2 is
+// error each returns. None of these grants is where P2 lands (P2 is
 // client_credentials with a federated client assertion), so these refusals
 // are invariants, not gaps.
 func TestIdPAgentBaseline_P2_WorkloadJWTOnUnconfiguredServer(t *testing.T) {
@@ -340,10 +339,10 @@ func TestIdPAgentBaseline_P2_WorkloadJWTWithIssuerConfigured(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	// Flips with ADR 0042 D8 (federated client assertions from a trusted
-	// workload issuer, a D4 row, mapped to the agent through a D6 binding on
-	// sub). Today a client assertion verifies only against keys a client
-	// registered, so a platform-signed one is refused.
+	// Flips with federated client assertions (from a trusted workload
+	// issuer row, mapped to the agent through a binding on sub). Today a client
+	// assertion verifies only against keys a client registered, so a
+	// platform-signed one is refused.
 	t.Run("client_credentials with the k8s SA token as a federated client assertion is refused", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, map[string]any{
 			"grant_type":            "client_credentials",
@@ -407,7 +406,7 @@ func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 	}, nil)
 	require.Equal(t, http.StatusCreated, reg.StatusCode)
 	regBody := decode(t, reg)
-	assert.Empty(t, regBody["client_secret"], "a key-based client gets no secret (ADR 0042 D8: no secrets for agents)")
+	assert.Empty(t, regBody["client_secret"], "a key-based client gets no secret (no secrets for agents)")
 
 	const mcpResource = "https://gw.example.test/mcp/github"
 
@@ -437,7 +436,7 @@ func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 		assert.ElementsMatch(t, []any{"data:read"}, c["scopes"])
 	})
 
-	// Flips with ADR 0042 D5: with a registered key, the tenant comes from the
+	// Flips with tenant derivation: with a registered key, the tenant comes from the
 	// client's registration.
 	t.Run("account_id/project_id are mandatory request params (tenant is not derived from the client)", func(t *testing.T) {
 		code, body := postSharedToken(t, map[string]any{
@@ -464,10 +463,10 @@ func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 		assert.Equal(t, clientID, decodeIssuedTokenClaims(t, at)["external_id"])
 	})
 
-	// Not a gap: D8's federated assertions carry the workload issuer as iss
+	// Not a gap: federated assertions carry the workload issuer as iss
 	// (see TestIdPAgentBaseline_P2_WorkloadJWTWithIssuerConfigured). An
 	// assertion claiming to BE the client must verify against the client's
-	// own keys, now and after ADR 0042.
+	// own keys, with or without federation.
 	t.Run("a client_assertion signed by a key outside the client's registration is refused", func(t *testing.T) {
 		other := newProbeRSAIdP(t)
 		now := time.Now()
@@ -498,7 +497,7 @@ func TestIdPAgentBaseline_P2_ClientCredentialsPrivateKeyJWT(t *testing.T) {
 // client_credentials from the declared grants. The same document shape
 // completes authorization_code (TestCIMD_PrivateKeyJWTClient).
 //
-// Flips with ADR 0042 D8: CIMD clients gain client_credentials.
+// Flips when CIMD clients gain client_credentials.
 func TestIdPAgentBaseline_P2_CIMDClientCredentials(t *testing.T) {
 	key := generateKey(t)
 	jwks, err := json.Marshal(clientJWKS(t, key))
@@ -529,7 +528,7 @@ func TestIdPAgentBaseline_P2_CIMDClientCredentials(t *testing.T) {
 	assert.Empty(t, resp.AccessToken)
 }
 
-// ── P1b: ID-JAG (ADR 0010) identity and tenant semantics ────────────────────
+// ── P1b: ID-JAG identity and tenant semantics ────────────────────
 
 func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	upstreamIss := "https://okta.probe-idjag.test"
@@ -549,7 +548,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	defer fedHTTP.Close()
 	defer func() { _ = fedSrv.Shutdown(context.Background()) }()
 
-	// ADR 0042 D5: the client's registration carries the tenant (it links an
+	// The client's registration carries the tenant (it links an
 	// identity in acct-fed-001), which is how the grant derives it.
 	client := registerTenantBoundClient(t, fedCfg.AccountID, fedCfg.ProjectID, []string{"tools:read"})
 
@@ -584,7 +583,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	}
 
 	// Static issuers only (standalone ZeroID keeps this). With issuer rows
-	// (federation.issuer_store=db, ADR 0042 D6) the ID-JAG maps through a
+	// (federation.issuer_store=db) the ID-JAG maps through a
 	// binding on act.sub to the agent's own identity, and no binding is
 	// invalid_grant rather than a synthetic identity:
 	// TestTrustedIssuers_P1B_Refusals.
@@ -616,7 +615,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 		assert.Empty(t, resp.AccessToken)
 	})
 
-	// ADR 0042 D5: with two allowed accounts the request still cannot choose.
+	// With two allowed accounts the request still cannot choose.
 	// Naming the OTHER admitted account is a mismatch, not a selection.
 	t.Run("naming another allowed account is refused", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, nil), "acct-fed-002", fedCfg.ProjectID))
@@ -644,8 +643,8 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 		assert.Empty(t, resp.AccessToken)
 	})
 
-	// ADR 0042 D3 leaves this open: ZeroID MAY accept a sub_profile=service
-	// ID-JAG if Okta documents third-party issuance, under D4-D7.
+	// Left open: ZeroID MAY accept a sub_profile=service ID-JAG if Okta
+	// documents third-party issuance, under the issuer-row rules.
 	t.Run("sub_profile=service is accepted (not inspected)", func(t *testing.T) {
 		resp := postFederation(t, fedHTTP.URL, body(sign(t, map[string]any{"sub_profile": "service"}),
 			fedCfg.AccountID, fedCfg.ProjectID))
@@ -663,7 +662,7 @@ func TestIdPAgentBaseline_P1b_IDJAGIdentityAndTenantSemantics(t *testing.T) {
 	})
 }
 
-// ── id_token exchange (P1c, ADR 0042 D3a) ────────────────────────────────────
+// ── id_token exchange (P1c) ────────────────────────────────────
 
 // TestIdPAgentBaseline_IDTokenExchange_RejectsForeignAudience pins the
 // relying-party rules on the id_token exchange: the redeeming client must

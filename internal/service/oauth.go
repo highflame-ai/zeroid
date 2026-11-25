@@ -64,14 +64,14 @@ type OAuthService struct {
 	// disabled in that case and only the broker path remains.
 	externalIssuerRegistry *ExternalIssuerRegistry
 	// issuerBindings maps federated agents to identities when issuers are
-	// account rows (ADR 0042 D6). Nil in static mode.
+	// account rows. Nil in static mode.
 	issuerBindings issuerBindingSource
 	// firstContact registers an agent a verified credential names when no
 	// binding maps it yet, as its issuer row's first_contact says. Nil keeps
 	// first contact off. Wired via SetFirstContact.
 	firstContact *FirstContactRegistrar
 	// federatedPerson resolves the person in an IdP token to the deployer's
-	// user (ADR 0042 D5a).
+	// user.
 	federatedPerson federatedPersonHook
 	// backchannelSvc handles the urn:openid:params:grant-type:ciba grant.
 	// Wired after construction via SetBackchannelService.
@@ -82,7 +82,7 @@ type OAuthService struct {
 	// client registry. Wired after construction via SetCIMDService.
 	cimdSvc *CIMDService
 	// idJAGReplayStore is the single-use ledger for redeemed MCP ID-JAG jti
-	// values (ADR 0010 D2a). The ID-JAG path consumes the jti here LAST (after
+	// values. The ID-JAG path consumes the jti here LAST (after
 	// every other check passes) so a replayed ID-JAG is rejected with
 	// invalid_grant. Wired after construction via SetIDJAGReplayStore. Nil when
 	// ID-JAG federation is not configured; idJAGBearer already fails closed in
@@ -136,7 +136,7 @@ type OAuthService struct {
 type CustomGrantHandler func(ctx context.Context, req TokenRequest) (*domain.AccessToken, error)
 
 // IDJAGReplayStore is the durable single-use ledger for redeemed MCP ID-JAG jti
-// values (ADR 0010 D2a). Insert records a previously-unredeemed jti and MUST
+// values. Insert records a previously-unredeemed jti and MUST
 // return a replay sentinel (postgres.ErrIDJAGReplay) when the jti is already
 // present. The check-and-insert must be atomic (a unique-constraint violation
 // is the replay signal) — a non-atomic read-then-write is a TOCTOU bug that
@@ -196,7 +196,7 @@ var reservedClaims = map[string]bool{
 	// RFC 7519 registered claims
 	"iss": true, "sub": true, "aud": true, "exp": true, "nbf": true, "iat": true, "jti": true,
 	// RFC 8707 resource binding. Shield reads `resource` as proof that ZeroID
-	// recorded a resource restriction AT THE MINT and enforces INV-IDN-006 on
+	// recorded a resource restriction AT THE MINT and enforces resource binding on
 	// it — so the claim only means that if ZeroID is the only party who can set
 	// it. Reserving it keeps the presence of the claim load-bearing: a caller
 	// must never be able to make a token look resource-bound when it isn't, or
@@ -211,7 +211,7 @@ var reservedClaims = map[string]bool{
 	// ZeroID internal claims
 	"act": true, "token_exchange": true, "trusted_by": true, "user_id_iss": true,
 	// The IdP's issuer and subject for a person ZeroID resolved to the
-	// deployer's user (ADR 0042 D5a); only the federated grants write them.
+	// deployer's user; only the federated grants write them.
 	"user_idp_iss": true, "user_idp_sub": true,
 	// RFC 9449 — cnf.jkt is set only from a validated DPoP proof. Block
 	// callers from injecting it via additional_claims, which would otherwise
@@ -313,8 +313,8 @@ var reservedClaims = map[string]bool{
 	// on it through POST /agents/self/public-key.
 	"identity_id": true,
 	"agent_id":    true,
-	// `api_key_id` names the API key an api_key-grant token was minted from
-	// (ADR 0051 D2). An embedding service records it in its audit trail, so a
+	// `api_key_id` names the API key an api_key-grant token was minted from.
+	// An embedding service records it in its audit trail, so a
 	// forged value would attribute a change to another key. Set only from the
 	// key apiKeyGrant resolved.
 	"api_key_id": true,
@@ -328,10 +328,10 @@ var reservedClaims = map[string]bool{
 const audienceCodeoid = "codeoid"
 
 // audienceAgentSandbox is the audience profile for provisioning a per-sandbox
-// workload identity. A trusted broker (e.g. highflame-forge) requests it on the
+// workload identity. A trusted broker requests it on the
 // user_session exchange to obtain a short-lived, user-identity token that
 // registers a per-sandbox agent identity (POST /agents/register) in the user's
-// OWN tenant — the workload-identity mint (forge #25). Deliberately harness-
+// OWN tenant — the workload-identity mint. Deliberately harness-
 // AGNOSTIC (any agent workspace, not just codeoid) and scoped to just
 // `nhi:manage` — the ONE capability the register call needs; the registered
 // badge's own scopes are set separately in the register request.
@@ -644,7 +644,7 @@ func cimdOAuthError(err error) error {
 }
 
 // SetIDJAGReplayStore wires the single-use ledger for redeemed MCP ID-JAG jti
-// values (ADR 0010 D2a). Required whenever ID-JAG federation is enabled — the
+// values. Required whenever ID-JAG federation is enabled — the
 // idJAGBearer path consumes jti against this store as its final gate. Wired in
 // server.go alongside the external-issuer registry.
 func (s *OAuthService) SetIDJAGReplayStore(store IDJAGReplayStore) {
@@ -791,12 +791,12 @@ type TokenRequest struct {
 	// `aud`/scope profile on every rotation). Ignored when Audience is empty.
 	IssueRefreshToken bool
 	// Resource carries the RFC 8707 `resource` request parameter — the protected
-	// resource(s) the minted token is being bound to (CAP-IDN-026). A single
+	// resource(s) the minted token is being bound to. A single
 	// value or several; the wire accepts a bare string or an array, and a
 	// form-encoded request may repeat the parameter (RFC 8707 §2).
 	//
 	// It only ever NARROWS. The values are stamped as the token's `aud` AND as
-	// the reserved `resource` claim that Shield enforces INV-IDN-006 on, and
+	// the reserved `resource` claim that Shield enforces resource binding on, and
 	// grant no authority the grant did not already carry — which is why an
 	// arbitrary caller-supplied identifier is safe to accept without a registry
 	// of known resource servers.
@@ -841,7 +841,7 @@ func (s *OAuthService) Token(ctx context.Context, req TokenRequest) (tok *domain
 	// only observes: the token and the error returned are untouched.
 	ctx, trace := s.credentialSvc.traceScopes(ctx, scopeTraceGrant(req.GrantType))
 	defer func() { trace.done(ctx, err) }()
-	// RFC 8707 resource indicators (CAP-IDN-026). Resolved here, once, BEFORE
+	// RFC 8707 resource indicators. Resolved here, once, BEFORE
 	// grant dispatch so every grant — including custom ones registered via
 	// RegisterGrant — sees the same validated list and no grant can forget the
 	// exclusivity rule. Order matters: the audience/resource conflict is a
@@ -922,7 +922,7 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// the request: a caller could otherwise name any tenant it likes.
 
 	// A client_assertion from a trusted workload issuer authenticates the
-	// agent with no registered client (ADR 0042 D8).
+	// agent with no registered client.
 	if entry, ok, err := s.workloadIssuerFor(ctx, req); err != nil {
 		return nil, err
 	} else if ok {
@@ -965,8 +965,8 @@ func (s *OAuthService) clientCredentials(ctx context.Context, req TokenRequest) 
 	// that identity, in that identity's tenant, whether or not the request
 	// names a tenant. The link is written by an administrator inside the
 	// identity's own tenant, so the caller cannot steer it. A request that
-	// does name a tenant must name the link's (the rule ADR 0042 D5 applies to
-	// the ID-JAG grant); otherwise the request is refused rather than quietly
+	// does name a tenant must name the link's (the rule the ID-JAG grant
+	// applies); otherwise the request is refused rather than quietly
 	// minted into the other tenant's external_id match, which would let the
 	// caller pick between two identities. A conformant client (RFC 6749
 	// §4.4.2 defines only grant_type and scope) names none.
@@ -1104,7 +1104,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 		return nil, oauthBadRequest(oautherror.InvalidRequest, "assertion is required for the jwt-bearer grant (RFC 7523 §2.1)")
 	}
 
-	// MCP Enterprise-Managed-Authorization ID-JAG (ADR 0010 D2): an assertion
+	// MCP Enterprise-Managed-Authorization ID-JAG: an assertion
 	// whose JWS typ header is oauth-id-jag+jwt is an Identity Assertion
 	// Authorization Grant signed by a corporate IdP — it MUST be validated
 	// against that IdP's JWKS (the #88 external-issuer substrate), NOT this
@@ -1121,7 +1121,7 @@ func (s *OAuthService) jwtBearer(ctx context.Context, req TokenRequest) (*domain
 	// authorized set — the assertion proves possession of a registered key and
 	// says nothing about which resources the agent may reach — so there is
 	// nothing to narrow against and binding would be an unreviewed grant of
-	// exactly the kind CAP-IDN-026 avoids by only ever narrowing. Reject rather
+	// exactly the kind resource binding avoids by only ever narrowing. Reject rather
 	// than ignore: the grant type is marked as supporting `resource`, so without
 	// this the parameter would be silently dropped here.
 	if err := rejectUnsupportedResource(req, "self-signed jwt-bearer (RFC 7523)"); err != nil {
@@ -1536,7 +1536,7 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 	issue.UserGrantBounded = true
 
 	// The principal's IdP pair (user_idp_iss, user_idp_sub) describes sub, which the
-	// chain keeps, so it is carried like user_id_iss (ADR 0042 D5a). Read
+	// chain keeps, so it is carried like user_id_iss. Read
 	// from the verified parent; never from the request. The person's groups
 	// describe sub too and travel the same way.
 	if parent.Type == domain.PrincipalUser {
@@ -1581,9 +1581,9 @@ func (s *OAuthService) tokenExchange(ctx context.Context, req TokenRequest) (*do
 }
 
 // isCurrentActor reports whether actor is already the subject token's
-// current actor: its act.sub under rfc8693 (ADR 0043 D2). parentActors is
-// empty for a legacy token, which keeps today's nesting (ADR 0043 D1: no
-// new behaviour for legacy).
+// current actor: its act.sub under rfc8693. parentActors is
+// empty for a legacy token, which keeps today's nesting (no new
+// behaviour for legacy).
 func isCurrentActor(parentActors []domain.Actor, actor *domain.Identity) bool {
 	return len(parentActors) > 0 && parentActors[0].Sub == actor.WIMSEURI
 }
@@ -2374,7 +2374,7 @@ func (s *OAuthService) apiKeyGrant(ctx context.Context, req TokenRequest) (*doma
 // minted from sk, or "" to keep the identity's registered owner. A key with no
 // identity_id shares one placeholder identity per (account, project, product)
 // whose owner is frozen at first creation, so it names the wrong human for every
-// later key. Registered identities keep their registrant (INV-IDN-012).
+// later key. Registered identities keep their registrant.
 //
 // Known gap: an explicitly registered identity_type=service identity is not
 // distinguishable from the auto-provisioned placeholder (both leave created_by
@@ -2471,9 +2471,9 @@ type IssueAuthCodeRequest struct {
 	RequestedScope string
 
 	// Resources is the RFC 8707 resource ceiling the resource owner
-	// consented to, baked into the code's "rsc" claim (CAP-IDN-027).
+	// consented to, baked into the code's "rsc" claim.
 	// Optional; empty means no ceiling was recorded, and the token exchange
-	// may then bind to whatever it names (CAP-IDN-026).
+	// may then bind to whatever it names.
 	//
 	// IssueAuthCode validates these itself via ValidateAuthorizeResource
 	// rather than trusting the caller, for the same reason it re-runs
@@ -2813,8 +2813,8 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 		return "", err
 	}
 
-	// Validate the consented resource ceiling here as well as in the handler
-	// (CAP-IDN-027). Re-validating rather than trusting req.Resources is the
+	// Validate the consented resource ceiling here as well as in the handler.
+	// Re-validating rather than trusting req.Resources is the
 	// same posture checkAuthorizeClientPolicy takes above: a programmatic
 	// caller supplying a pre-resolved Client cannot skip a gate, and a
 	// ceiling is a security claim — a value that reaches the "rsc" claim
@@ -2891,7 +2891,7 @@ func (s *OAuthService) IssueAuthCode(ctx context.Context, req IssueAuthCodeReque
 // This is safe: the loopback interface is reachable only from the same host, so
 // no remote attacker can stand up a listener to intercept the redirect, and
 // PKCE binds the code to the verifier regardless. Without it, the embedded
-// Overwatch/ramparts Guardian (which listens on an ephemeral loopback port)
+// the ramparts Guardian (which listens on an ephemeral loopback port)
 // is rejected here even though its redirect is a legitimate loopback callback.
 func redirectURIAllowed(candidate string, registered []string) bool {
 	normCand := normalizeLoopback(candidate)
@@ -3023,7 +3023,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	trace.ask(authCode.Scopes, false)
 
 	// Resolve the RFC 8707 binding against the ceiling the code recorded
-	// (CAP-IDN-027) BEFORE the code is consumed.
+	// BEFORE the code is consumed.
 	//
 	// Three shapes, all correct after this:
 	//   - ceiling present, request omits `resource` → binds to the ceiling.
@@ -3031,7 +3031,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	//     client following RFC 8707 §2 alone sends `resource` at the
 	//     authorization request only, and nothing carried it to the mint.
 	//   - ceiling present, request names a subset → binds to the selection.
-	//   - no ceiling → binds to whatever the request names (CAP-IDN-026).
+	//   - no ceiling → binds to whatever the request names.
 	//
 	// Anything outside the ceiling is invalid_target. The client selects; it
 	// can never add.
@@ -3136,14 +3136,14 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 		identityPolicyID = policy.ID
 	}
 
-	// A resource-bound exchange IS now issued a refresh token (CAP-IDN-027,
-	// amending CAP-IDN-026).
+	// A resource-bound exchange IS now issued a refresh token, carrying
+	// its resource ceiling.
 	//
 	// It previously was not, and that was the fail-closed answer at the time:
 	// the refresh path re-mints from state carried on the refresh-token row,
 	// the RFC 8707 binding lived only in CustomClaims, and rotation did not
 	// carry it — so a rotated token came back silently UNBOUND. Bind to server
-	// X, refresh, use anywhere, with INV-IDN-006 enforcement gone quiet because
+	// X, refresh, use anywhere, with resource-binding enforcement gone quiet because
 	// its discriminator claim had simply vanished.
 	//
 	// The binding is now carried (resourceCeiling below → the refresh row →
@@ -3155,7 +3155,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	//
 	// The ceiling stored is the CODE's ceiling where there is one, and
 	// otherwise whatever the token request bound to. The second case matters:
-	// a client using CAP-IDN-026's token-only binding has no code ceiling, and
+	// a client using the token-only resource binding has no code ceiling, and
 	// storing nothing there would reintroduce exactly the silent unbinding
 	// above on its first rotation.
 	resourceCeiling := authCode.Resources
@@ -3182,7 +3182,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 	//     actually hold.
 	//
 	// So a multi-resource token-only binding gets no refresh token, which is
-	// precisely what it got before CAP-IDN-027 — no regression, just no new
+	// precisely what it got before the resource ceiling — no regression, just no new
 	// capability for the one shape that cannot carry it safely. The access
 	// token is still bound to every resource requested; only the long-lived
 	// half is withheld.
@@ -3263,7 +3263,7 @@ func (s *OAuthService) authorizationCode(ctx context.Context, req TokenRequest) 
 			// same delegation tree (issue #81).
 			MissionID: cred.MissionID,
 			// Seed the family with the resource ceiling so every rotation
-			// re-stamps the same binding (CAP-IDN-027). Copied forward onto each
+			// re-stamps the same binding. Copied forward onto each
 			// successor row, like MissionID.
 			Resources: resourceCeiling,
 			// Seed the family with the principal's issuer, so it is revoked
@@ -3406,13 +3406,13 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// cannot see the conflict and lets it through.
 	//
 	// That was unreachable while the refresh grant rejected `resource` outright.
-	// Removing the blanket rejection (CAP-IDN-027) opened it, and the
+	// Removing the blanket rejection opened it, and the
 	// consequence is not benign: bindResourceOnIssue sets issue.Audience, so a
 	// resource-bound refresh of an audience-profile family would OVERWRITE the
 	// profile `aud` that rotation exists to preserve — the harness daemon
 	// validates `aud` on every message, so the client would break its own
 	// session — while also producing the profiled-audience-plus-resource-binding
-	// token that CAP-IDN-026 states can never exist.
+	// token that resource binding says can never exist.
 	//
 	// Checked here, against a non-consuming peek and before any rotation, so a
 	// rejected request never burns the token. invalid_request (not
@@ -3533,8 +3533,8 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		}
 
 		// Resource selection is validated HERE, on the peek, for the same
-		// session-bricking reason every other gate in this block is
-		// (CAP-IDN-027). A request naming a resource outside the family's
+		// session-bricking reason every other gate in this block is.
+		// A request naming a resource outside the family's
 		// ceiling is a bad request against an otherwise-valid token — if it
 		// were checked after RotateRefreshToken committed, an invalid_target
 		// would consume the client's refresh token and its retry would trip
@@ -3705,7 +3705,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 		applicationID = ""
 	}
 
-	// Re-stamp the RFC 8707 binding on rotation (CAP-IDN-027). Computed against
+	// Re-stamp the RFC 8707 binding on rotation. Computed against
 	// the authoritative CLAIMED row rather than the earlier peek — the peek was
 	// the gate, this is the value. Re-running it cannot newly fail in practice
 	// (the ceiling is copied verbatim across rotation, so claimed and peeked
@@ -3788,7 +3788,7 @@ func (s *OAuthService) refreshToken(ctx context.Context, req TokenRequest) (*dom
 	// issue.Audience, so if that check is ever bypassed — a transient peek
 	// failure, or a future edit that reorders it — the failure mode is a
 	// silently re-audienced token rather than an error. Fail closed instead:
-	// the two are mutually exclusive by contract (CAP-IDN-026), so their
+	// the two are mutually exclusive by contract, so their
 	// coexistence here is a server bug, not a client one.
 	if len(refreshAudience) > 0 && len(refreshResources) > 0 {
 		return nil, oauthServerError(

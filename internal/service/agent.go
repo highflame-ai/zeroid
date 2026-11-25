@@ -486,7 +486,7 @@ func (s *AgentService) SetPublicKey(ctx context.Context, identityID, accountID, 
 //
 // A hard delete here previously returned 500 for any agent that had a service
 // key, because service_keys carries a non-cascading FK to identities on
-// existing deployments (authn#109). Deactivation sidesteps that entirely and
+// existing deployments. Deactivation sidesteps that entirely and
 // keeps the audit trail. Idempotent: deleting an already-deactivated agent is
 // a no-op success (DeactivateIdentity short-circuits the status-transition
 // guard).

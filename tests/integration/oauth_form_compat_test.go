@@ -196,7 +196,7 @@ func TestOAuthFormCompatOpenAPIAdvertisesFormContentType(t *testing.T) {
 }
 
 // TestOpenAPIAdvertisesResourceUnionShape pins the RFC 8707 `resource` parameter's
-// documented wire shape (CAP-IDN-026).
+// documented wire shape.
 //
 // resourceParam implements huma.SchemaProvider specifically so the OpenAPI
 // document shows `oneOf: [string, array<string>]` — without it Huma infers an

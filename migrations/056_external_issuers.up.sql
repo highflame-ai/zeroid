@@ -1,5 +1,5 @@
 -- 056_external_issuers.up.sql
--- Per-account trusted issuers and credential bindings (ADR 0042 D4, D6).
+-- Per-account trusted issuers and credential bindings.
 -- docs/external-issuers.md describes the model; this file only states the
 -- constraints the database holds itself.
 --

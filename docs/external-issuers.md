@@ -3,7 +3,6 @@
 ZeroID accepts tokens from a customer's IdP on two person grants: an ID-JAG redeemed with `jwt-bearer` (P1b) and an OpenID Connect ID token exchanged with RFC 8693 (P1c).
 The IdP has to be a **trusted issuer**.
 This page is the reference for how trusted issuers are stored, how the two grants use them, and the admin API that manages them.
-The design is highflame-architecture ADR 0042 (D3a, D4, D4a, D5, D5a, D6, D7); the capability is CAP-IDN-028 and the invariant INV-IDN-014.
 
 ## Two stores
 
@@ -70,7 +69,7 @@ A row (`external_issuers`, migration 056) belongs to one account and holds:
 Issuers are compared without trailing slashes, so `https://acme.okta.com/` and `https://acme.okta.com` are one issuer; a token's `iss` is still matched against the row exactly.
 Writers check these rules under a per-issuer Postgres advisory lock (on the canonical issuer), backed by a unique index on `(rtrim(issuer, '/'), kind, constraints_key)`; `constraints_key` is empty for a customer-unique issuer and a hash of the pinning claim's values for a shared one.
 
-**Known limitation.** ZeroID itself does not prove that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them (ADR 0042 open question 8).
+**Known limitation.** ZeroID itself does not prove that an account owns the values it pins (`hd`, `tid`, `repository_owner_id`) or a customer-unique issuer it adds: the first account to claim them holds them.
 For `person` rows the deployer closes the impersonation half with an ownership proof built on two routes, [`GET /external-issuers/{id}/discovery`](#get-external-issuersiddiscovery--200) and [`POST /external-issuers/{id}/verify-id-token`](#post-external-issuersidverify-id-token--200): the account's owner signs in through the issuer, ZeroID verifies the ID token as the ID-token exchange would, and the deployer (in SaaS, Admin) refuses person resolution through a row it has not verified.
 For `workload` rows the deployer closes it with a challenge, [`POST /external-issuers/{id}/verify-workload-token`](#post-external-issuersidverify-workload-token--200): it writes the row disabled, hands the account a one-time audience, and enables the row only once ZeroID verifies a token the issuer minted for that audience under the row.
 
@@ -120,11 +119,11 @@ Turn it on only for an issuer whose emails its users cannot set to someone else'
 On every federated grant ZeroID reads the issuer's rows with one indexed query and caches no row, so a disable or delete applies at the next request on every replica.
 Only JWKS clients are cached: shared by every row with the same `(jwks_uri, jwks_cache_ttl_seconds)`; created on first use, with one fetch however many requests race for a cold key set; a use by an account is dropped after 30 idle minutes and a client with no users is closed; capped at 20 per account (evicting only that account's use of a shared client) and 1000 in total.
 A refresh triggered by an unknown `kid` is single-flight and at most one per 10 seconds per key set, since the kid comes from an unverified token.
-Tokens already issued under a deleted row live out their 15 minutes; bulk revocation on delete is ADR 0042 open question 6.
+Tokens already issued under a deleted row live out their 15 minutes; bulk revocation on delete is an open question.
 
 ## Bindings
 
-A binding (`external_issuer_bindings`) maps `(issuer row, subject key)` to one identity in the row's account (ADR 0042 D6).
+A binding (`external_issuer_bindings`) maps `(issuer row, subject key)` to one identity in the row's account.
 The subject key is the value the credential carries at runtime:
 
 | Grant | Subject key |
@@ -143,7 +142,7 @@ Until then the mint refuses it as not adopted (D7), naming the state.
 
 ## The workload path: federated client assertions
 
-An agent acting as itself, with no person behind it, gets a token with `grant_type=client_credentials` and a `client_assertion` that its platform signed for it (ADR 0042 D8, path P2): an AWS STS web identity token, a Kubernetes service account token, or a SPIFFE JWT-SVID. The agent holds no secret and registers no OAuth client. Entra app-only tokens are not accepted yet: they carry `uti` rather than `jti`, and live far longer than the age cap allows.
+An agent acting as itself, with no person behind it, gets a token with `grant_type=client_credentials` and a `client_assertion` that its platform signed for it: an AWS STS web identity token, a Kubernetes service account token, or a SPIFFE JWT-SVID. The agent holds no secret and registers no OAuth client. Entra app-only tokens are not accepted yet: they carry `uti` rather than `jti`, and live far longer than the age cap allows.
 
 ```
 POST /oauth2/token
@@ -209,7 +208,7 @@ Some credential brokers do this when they exchange, on a workload's behalf, the 
 The request is then an ID-token exchange too, when it authenticates a client and the caller is not a trusted service, and the same rules apply.
 Any other request with that type keeps the broker path.
 
-All of these must hold (ADR 0042 D3a), or the exchange is refused with `invalid_grant` (`invalid_client` for client authentication):
+All of these must hold, or the exchange is refused with `invalid_grant` (`invalid_client` for client authentication):
 
 1. The client authenticates with `private_key_jwt`; a client secret is `invalid_client`.
    This rule is for issuer rows: a static issuer (standalone ZeroID) keeps the client's registered method, secrets included.
@@ -239,12 +238,12 @@ The exception is [first contact](#first-contact), which spends the `jti` before 
 
 ### Refusals that are events
 
-- **Unmatched agent** (ADR 0027): no binding for the subject key, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
+- **Unmatched agent**: no binding for the subject key, only a disabled binding for an active identity, a binding to no identity in the account, or a registered client not linked to the bound identity.
   On both grants the binding is read only after the token's signature and the checks that need no binding have passed, so a forged token raises no event under an account and learns nothing of its bindings.
   Logged as `federation_unmatched_agent` (account, issuer, subject key, grant, reason) and counted in `zeroid.federation.unmatched_agent{account_id, grant_type, reason}`.
 - **Agent not adopted** (D7): the bound identity, through an enabled or disabled binding, is not `active`; the error names the state (`agent identity is discovered; ...`); logged as `federation_agent_not_adopted` and counted in `zeroid.federation.agent_not_adopted{account_id, grant_type, status}`, the adoption queue's demand.
 
-ZeroID has no event bus; an embedder that needs ADR 0027 findings reads these.
+ZeroID has no event bus; an embedder that needs these findings reads them.
 
 ## First contact
 
@@ -365,7 +364,7 @@ srv.SetFederatedPersonResolver(func(ctx context.Context, r zeroid.FederatedPerso
 The person-grant ceiling ([scope-ceilings.md](scope-ceilings.md#a-persons-ceiling)) then sees the resolved user id.
 
 When the agent exchanges the person token (RFC 8693, `actor_token` = its own assertion) to narrow it, it is already the token's current actor, so under the `rfc8693` profile the child keeps `act` = the agent with no extra nesting and no added `delegation_depth`.
-The legacy profile is frozen (ADR 0043 D1): there the exchange delegates as before, adding a level.
+The legacy profile is frozen: there the exchange delegates as before, adding a level.
 `user_idp_iss` and `user_idp_sub` travel with `sub` onto every exchanged `rfc8693` token; a different agent becomes a new actor level as usual.
 
 ## Groups
@@ -397,7 +396,7 @@ The routes are on the admin router (`server.admin_path_prefix`), behind the depl
 The account is always the caller's tenant: `TenantContextMiddleware` reads `X-Account-ID` and `X-Project-ID` (both required; the project is not used for issuer rows).
 `X-User-ID` names the actor, recorded as `created_by`/`updated_by` and in `identity_audit_logs`.
 Another account's rows answer 404.
-In AuthN these routes are reached only through Admin, which checks the org role and forwards with its verified tenant (ADR 0042 D4a).
+In AuthN these routes are reached only through Admin, which checks the org role and forwards with its verified tenant.
 
 ### Errors
 
@@ -631,7 +630,7 @@ Another account's row is 404.
 
 ### `POST /external-issuers/{id}/verify-workload-token` → 200
 
-The proof of control for a `workload` row (ADR 0042 open question 8).
+The proof of control for a `workload` row.
 The deployer issues a one-time challenge; the account mints a token from its issuer for that audience and nothing else, for example `aws sts get-web-identity-token --audience <challenge>`, `kubectl create token <sa> --audience <challenge>`, a SPIFFE JWT-SVID for it, or `core.getIDToken('<challenge>')` in a GitHub Actions workflow; and the deployer has ZeroID verify it here.
 
 ```json
@@ -762,12 +761,12 @@ What first contact writes names `system:first_contact` as the actor: a registrat
 ## Running it locally
 
 `cmd/zeroid-mockidp` serves an Entra-shaped tenant, an Okta org and a Kubernetes issuer and mints every token shape above; see its [README](../cmd/zeroid-mockidp/README.md).
-`tests/integration/trusted_issuers_test.go` drives both person paths and every INV-IDN-014 refusal against it.
+`tests/integration/trusted_issuers_test.go` drives both person paths and every trusted-issuer refusal against it.
 
 ## Not yet
 
 - Every issuer row needs OpenID discovery at `{issuer}/.well-known/openid-configuration` (Entra, Okta, Google, GitHub Actions, AWS STS and Kubernetes service-account issuer discovery all serve it). An issuer without it, such as a bare SPIFFE trust-domain bundle endpoint, cannot be a row yet.
-- The connector "Trust for agent access" toggle (ADR 0042 open question 7) is not built; `source: connector` rows can be written through the API.
+- The connector "Trust for agent access" toggle is not built; `source: connector` rows can be written through the API.
 - Proof of issuer control (open question 8): the first account to add a customer-unique issuer holds it. For `person` rows the deployer gates person resolution on an ownership proof (`/discovery` and `/verify-id-token` above); for `workload` rows, including a shared issuer's pinning value, it enables a row only after a challenge token verifies under it (`/verify-workload-token` above). ZeroID does not enforce either itself: a row written enabled through this API mints.
 - Account lifecycle (D4a follow-up a): deleting an account in Admin does not yet remove its rows.
 - First contact maps a row to one project, one owner and the project's default credential policy. A per-row credential policy, labels or tags from the mapping are not built. Nor is first contact on the ID-token exchange, or an inventory sync naming a subject by anything but `metadata.issuer_binding`. A standing adoption adopts only into the row's own project, and enables only the binding the credential arrived through.

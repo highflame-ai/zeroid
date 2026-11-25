@@ -13,7 +13,7 @@ import (
 // ── RFC 8707 resource indicators ─────────────────────────────────────────────
 //
 // `resource` is a REQUEST parameter naming the protected resource(s) a token is
-// being minted for (CAP-IDN-026). It is the minting half of INV-IDN-006, whose
+// being minted for. It is the minting half of resource-binding enforcement, whose
 // enforcement half (Shield) gates on the `resource` CLAIM this parameter
 // produces.
 //
@@ -171,8 +171,7 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 }
 
 // maxAuthorizeResourceIndicators bounds how many resources may be consented at
-// /oauth2/authorize — the CEILING recorded on the authorization code
-// (CAP-IDN-027).
+// /oauth2/authorize — the CEILING recorded on the authorization code.
 //
 // One, deliberately, and tighter than the token endpoint's cap. A multi-valued
 // ceiling is what makes a multi-audience access token expressible, and RFC 8707
@@ -185,7 +184,7 @@ func validateResourceIndicators(resources []string) ([]string, error) {
 // This is a CONSTANT, not a shape. The `rsc` claim, the refresh row's column
 // and the subset check are all multi-valued, so raising this to 2 or 3 is this
 // one line plus the multi-audience policy gate — no migration, no claim-shape
-// change, no compatibility window (ADR 0037 D2). Raising it also obliges a
+// change, no compatibility window. Raising it also obliges a
 // second look at the refresh rule, which rejects an omitted `resource` against
 // a ceiling holding more than one value precisely so this cap and that rule
 // cannot drift apart silently.
@@ -287,7 +286,7 @@ func ValidateAuthorizeResource(resources []string) ([]string, error) {
 
 // narrowToCeiling restricts a token request's `resource` to the ceiling the
 // authorization code recorded, and supplies the ceiling when the request names
-// nothing (CAP-IDN-027).
+// nothing.
 //
 // This is the whole point of recording a ceiling: the client SELECTS from what
 // the human consented to and can never add to it. Under the single-value cap the
@@ -297,11 +296,11 @@ func ValidateAuthorizeResource(resources []string) ([]string, error) {
 // would have to be rewritten at that point.
 //
 // An empty ceiling means the code carried no consented resource, and the request
-// binds directly (bindResourceOnIssue) exactly as it did before CAP-IDN-027.
-// That case MUST keep working: a resource binding only ever narrows, granting no
-// authority the grant did not already carry, so there is nothing a ceiling would
-// protect against — and rejecting it would break every CAP-IDN-026 caller that
-// sends `resource` only at the token endpoint.
+// binds directly (bindResourceOnIssue) exactly as it did before the resource
+// ceiling. That case MUST keep working: a resource binding only ever narrows,
+// granting no authority the grant did not already carry, so there is nothing a
+// ceiling would protect against — and rejecting it would break every
+// resource-binding caller that sends `resource` only at the token endpoint.
 func narrowToCeiling(ceiling, requested []string) ([]string, error) {
 	if len(ceiling) == 0 {
 		return requested, nil
@@ -310,8 +309,7 @@ func narrowToCeiling(ceiling, requested []string) ([]string, error) {
 }
 
 // resolveRefreshResources decides what RFC 8707 binding a rotation re-stamps,
-// given the ceiling recorded on the refresh family and what the request named
-// (CAP-IDN-027).
+// given the ceiling recorded on the refresh family and what the request named.
 //
 // The rule is CARDINALITY-AWARE, and that is the point rather than an
 // implementation detail. RFC 8707 §2.2 says a refresh token "is bound to the
@@ -342,7 +340,7 @@ func resolveRefreshResources(ceiling, requested []string) ([]string, error) {
 	switch len(ceiling) {
 	case 0:
 		// Unbound family: rotation carries no `resource` claim, exactly as
-		// before CAP-IDN-027.
+		// before the resource ceiling.
 		return nil, nil
 	case 1:
 		return ceiling, nil
@@ -361,7 +359,7 @@ func resolveRefreshResources(ceiling, requested []string) ([]string, error) {
 // it adds that profile's fixed scope set), while `resource` names a protected
 // resource (it only narrows). Letting them coexist would put two meanings on one
 // claim with no discriminator — which is exactly the failure that made Shield
-// deny every MCP-targeted request in prod (shield#366, INV-IDN-006). Refusing
+// deny every MCP-targeted request in prod. Refusing
 // the combination outright means there is no precedence rule to get wrong, and
 // no profiled-audience token ever also carries a resource binding.
 //
@@ -389,7 +387,7 @@ func checkResourceAudienceExclusive(req TokenRequest) error {
 // "https://gw.example/mcp/github".
 //
 // An empty request returns the full authorized set unchanged: omitting the
-// parameter keeps the pre-CAP-IDN-026 behaviour, where the claim decides.
+// parameter keeps the pre-resource-indicator behaviour, where the claim decides.
 func narrowResourcesTo(authorized, requested []string) ([]string, error) {
 	if len(requested) == 0 {
 		return authorized, nil
@@ -408,10 +406,10 @@ func narrowResourcesTo(authorized, requested []string) ([]string, error) {
 // listed rejects the parameter outright (rejectUnsupportedResource) rather than
 // accepting and ignoring it.
 //
-// refresh_token was deliberately absent until CAP-IDN-027, on the grounds that
-// accepting a binding there would let a client re-target a token it already
-// holds — the code called it "the second lock on that door", the first being
-// that a resource-bound request was issued no refresh token at all.
+// refresh_token was deliberately absent until the resource ceiling, on the
+// grounds that accepting a binding there would let a client re-target a token
+// it already holds — the code called it "the second lock on that door", the
+// first being that a resource-bound request was issued no refresh token at all.
 //
 // Both have been retired together, and the order matters: the lock existed
 // ONLY because the binding was not carried across rotation. Now that the
@@ -463,11 +461,11 @@ func grantSupportsResource(grantType string) bool {
 //   - `aud` — RFC 8707 §2 conformance. A resource-indicator request produces a
 //     token audienced to the resource, which is what a spec-following resource
 //     server checks.
-//   - `resource` — the discriminator INV-IDN-006 enforcement keys on. It cannot
-//     read `aud` for this: ZeroID stamps `aud` on every token it issues,
+//   - `resource` — the discriminator resource-binding enforcement keys on. It
+//     cannot read `aud` for this: ZeroID stamps `aud` on every token it issues,
 //     defaulting to the issuer URL to satisfy JWT-SVID §3, so a non-empty `aud`
 //     says nothing about whether a binding exists. Treating it as if it did
-//     denied every MCP-targeted request in prod (shield#366). Presence of the
+//     denied every MCP-targeted request in prod. Presence of the
 //     `resource` claim is the signal; its absence means "not bound".
 //
 // `resource` is in reservedClaims, so setting it here — the same direct-to-
@@ -482,9 +480,9 @@ func grantSupportsResource(grantType string) bool {
 // deliberate and safe only because nothing on this platform treats `aud` as an
 // authorization input:
 //
-//   - Shield, Observatory, Cerberus, Discovery and AuthN all construct
+//   - Every downstream consumer constructs
 //     authjwt.VerifierConfig with Issuer + JWKSURL and leave Audience unset.
-//   - INV-IDN-006 enforcement keys on the `resource` claim precisely because
+//   - Resource-binding enforcement keys on the `resource` claim precisely because
 //     `aud` cannot carry that meaning — ZeroID stamps it on every token,
 //     defaulting to the issuer URL for JWT-SVID §3.
 //
@@ -526,9 +524,9 @@ func bindResourceOnIssue(issue *IssueRequest, resources []string) {
 //
 // Fail loud, never silently ignore. A caller that asks for a resource-bound
 // token and receives an UNBOUND one has a token that works everywhere while
-// believing it works in one place — the exact confusion INV-IDN-006 exists to
-// prevent. RFC 8707 §2 specifies `invalid_target` for a resource the AS cannot
-// honour, which covers "not on this grant" as well as "not a valid URI".
+// believing it works in one place — the exact confusion resource binding exists
+// to prevent. RFC 8707 §2 specifies `invalid_target` for a resource the AS
+// cannot honour, which covers "not on this grant" as well as "not a valid URI".
 func rejectUnsupportedResource(req TokenRequest, grant string) error {
 	if len(req.Resource) == 0 {
 		return nil

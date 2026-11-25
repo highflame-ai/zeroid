@@ -88,7 +88,7 @@ type Config struct {
 	ExternalIssuers []domain.ExternalIssuerConfig `koanf:"external_issuers"`
 
 	// Federation chooses where trusted issuers come from and how they are
-	// fetched (ADR 0042 D4). See docs/external-issuers.md.
+	// fetched. See docs/external-issuers.md.
 	Federation FederationConfig `koanf:"federation"`
 }
 
@@ -534,7 +534,7 @@ type ServerConfig struct {
 	// credentials, etc.). Defaults to "" — admin routes at the router root.
 	//
 	// Deployers that mount ZeroID under their own path structure can override this.
-	// For example, highflame-authn mounts the router at "/v1/auth" so admin routes
+	// For example, an embedder that mounts the router at "/v1/auth" so admin routes
 	// become /v1/auth/identities/schema; a standalone deployment wanting the
 	// pre-flip shape sets "/api/v1".
 	AdminPathPrefix *string `koanf:"admin_path_prefix"`
@@ -1003,7 +1003,7 @@ func (c *Config) Validate() error {
 	switch c.Federation.IssuerStore {
 	case "", "config":
 	case "db":
-		// ADR 0042 D4: one source of trusted issuers, never both.
+		// One source of trusted issuers, never both.
 		if len(c.ExternalIssuers) > 0 {
 			return fmt.Errorf("federation.issuer_store=db and static external_issuers are both set; " +
 				"trusted issuers come from one source only (move the static entries to account rows, or use issuer_store=config)")
@@ -1020,7 +1020,7 @@ func (c *Config) Validate() error {
 		}
 		iss := c.ExternalIssuers[i].Issuer
 		// A static issuer is not refused for a reserved key, so an existing
-		// config still boots; the grant ignores the key (ADR 0044 D16), and
+		// config still boots; the grant ignores the key, and
 		// this says so rather than dropping it silently.
 		for _, k := range domain.ReservedMappingKeysIn(c.ExternalIssuers[i].ClaimMapping) {
 			log.Warn().Str("issuer", iss).Str("key", k).

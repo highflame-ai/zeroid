@@ -8,7 +8,7 @@ import (
 )
 
 // TestOffboardOwner_RejectsEmptyOwnerAndAccount pins the argument guard on the
-// human-offboarding composition (INV-IDN-010 / ADR 0028 D5), mirroring the
+// human-offboarding composition, mirroring the
 // guard on RevokeAllActiveForOwner: identities.owner_user_id is NOT NULL, so
 // ownerless identities store the empty string, and a blank owner would match
 // every ownerless identity in the account — turning "offboard one departing

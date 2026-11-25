@@ -95,7 +95,7 @@ func TestExternalIssuerValidate(t *testing.T) {
 		{name: "groups mapping too long", mutate: func(e *ExternalIssuer) {
 			e.ClaimMapping["groups"] = strings.Repeat("g", maxClaimNameBytes+1)
 		}, want: "invalid_claim_mapping"},
-		// ADR 0044 D16: an IdP claim never sets a token's role or capabilities.
+		// An IdP claim never sets a token's role or capabilities.
 		{name: "role is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["role"] = "groups" }, want: "claim_mapping_reserved"},
 		{name: "privilege_scope is a reserved mapping key", mutate: func(e *ExternalIssuer) { e.ClaimMapping["privilege_scope"] = "scp" }, want: "claim_mapping_reserved"},
 		{name: "reserved on a workload row too", mutate: func(e *ExternalIssuer) {
@@ -388,7 +388,7 @@ func TestExternalIssuerConfigAudienceAndKind(t *testing.T) {
 }
 
 // A reserved key wins over any other claim_mapping fault, whatever order the
-// map iterates in (ADR 0044 D16).
+// map iterates in.
 func TestExternalIssuerValidate_ReservedKeyCodeIsDeterministic(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		e := validRow()

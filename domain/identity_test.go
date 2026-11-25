@@ -138,7 +138,7 @@ func TestBuildWIMSEURI_LengthCap(t *testing.T) {
 
 // TestSubTypeValidForIdentityType pins the sub_type ↔ identity_type matrix.
 // Regression: code_agent must be valid for identity_type=agent (a delegated
-// code agent, e.g. forge's per-sandbox mint) — it was previously accepted only
+// code agent, e.g. a broker's per-sandbox mint) — it was previously accepted only
 // for application, so registering a code agent as an agent (the correct type)
 // failed validation and 500'd.
 func TestSubTypeValidForIdentityType(t *testing.T) {

@@ -240,7 +240,7 @@ func TestUniquenessConflict_SharedPin(t *testing.T) {
 
 // TestExternalIssuerCreateRefusesReservedMapping: role and privilege_scope are
 // reserved claim_mapping keys, refused with 400 claim_mapping_reserved before
-// anything is fetched or stored (ADR 0044 D16, EC-D16-03). The service has no
+// anything is fetched or stored. The service has no
 // repository, so a refusal that came later than validation would panic.
 func TestExternalIssuerCreateRefusesReservedMapping(t *testing.T) {
 	svc := NewExternalIssuerService(nil, nil, nil, ExternalIssuerServiceConfig{Store: IssuerStoreDB})

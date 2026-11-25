@@ -140,7 +140,7 @@ usually the better one:
 Highflame's own deployment takes route 2 — Studio authenticates the user, mints
 an assertion, and POSTs; AuthN's assertion resolver verifies it and ZeroID mints
 the code. (For MCP clients specifically that routing is in flight: today Studio
-mints their codes locally with its own CIMD check, and highflame-studio#1392
+mints their codes locally with its own CIMD check, and the embedding console
 brings them back through this path.) Route 1 exists for deployers with no such
 surface. Either way ZeroID stays the engine: it validates the CIMD document,
 enforces the `redirect_uri` allow-list, and issues the code.

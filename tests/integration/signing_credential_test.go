@@ -19,13 +19,13 @@ import (
 //   - Shield (the signer): generates an ephemeral Ed25519 keypair in
 //     memory, attests the PUBLIC half, signs receipts locally with the
 //     private half.
-//   - Observatory / any auditor (the verifier): fetches the public JWKS
+//   - Any auditor (the verifier): fetches the public JWKS
 //     by kid and verifies offline — never trusting ZeroID's verdict.
 //
 // If these pass, AuthZ and Shield can build their signing features on
 // this primitive with confidence the full loop works.
 
-const signingWorkload = "highflame-shield"
+const signingWorkload = "policy-engine"
 
 // attestKey simulates a workload: generate an ephemeral keypair, attest
 // the public half, return the kid + the private key kept locally.
@@ -60,7 +60,7 @@ func attestKey(t *testing.T, purpose string, ttlSeconds int) (kid string, priv e
 
 // jwksKey fetches the public verification JWKS and returns the raw
 // Ed25519 public key for kid, or nil if absent. This is the exact path
-// Observatory's resolver takes — public route, no auth.
+// An auditor's resolver takes — public route, no auth.
 func jwksKey(t *testing.T, kid string) ed25519.PublicKey {
 	t.Helper()
 

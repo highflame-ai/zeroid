@@ -1,5 +1,5 @@
 -- 034_id_jag_jti.up.sql
--- ID-JAG single-use replay-prevention store (ADR 0010 D2a).
+-- ID-JAG single-use replay-prevention store.
 --
 -- An MCP ID-JAG (Identity Assertion Authorization Grant) is a single-use
 -- authorization grant — auth-code-like, not a reusable bearer token. Its `jti`

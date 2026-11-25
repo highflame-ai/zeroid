@@ -28,7 +28,7 @@ type Claims struct {
 
 	// Resource is the RFC 8707 `resource` claim — the resource(s) this token
 	// was bound to AT THE MINT. Non-empty ONLY when ZeroID recorded an explicit
-	// binding (today: the ID-JAG grant, ADR 0010 D4). ZeroID reserves the claim,
+	// binding (today: the ID-JAG grant). ZeroID reserves the claim,
 	// so a caller cannot inject or widen it via additional_claims.
 	//
 	// This — not Audience — is what a PEP must gate resource enforcement on.

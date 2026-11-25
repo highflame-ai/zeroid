@@ -606,7 +606,7 @@ func TestSampleConfigEnvVarsAreAllWired(t *testing.T) {
 func TestValidateRegistrationEndpoint(t *testing.T) {
 	const (
 		httpsIssuer = "https://auth.example.com"
-		httpIssuer  = "http://highflame-authn:8051"
+		httpIssuer  = "http://zeroid:8051"
 	)
 	cases := []struct {
 		name    string
@@ -622,11 +622,11 @@ func TestValidateRegistrationEndpoint(t *testing.T) {
 		{"http_localhost", "http://localhost:3000/register", "", ""},
 		{"http_loopback_v4", "http://127.0.0.1:3000/register", "", ""},
 		{"http_loopback_v6", "http://[::1]:3000/register", "", ""},
-		{"http_beside_http_issuer", "http://highflame-studio:3000/oauth/register", httpIssuer, ""},
+		{"http_beside_http_issuer", "http://console:3000/oauth/register", httpIssuer, ""},
 		{"https_beside_http_issuer", "https://register.example.com/r", httpIssuer, ""},
 
 		{"http_non_loopback", "http://register.example.com/register", "", "http is accepted only for a loopback host or when token.issuer is itself http"},
-		{"http_non_loopback_https_issuer_cluster_name", "http://highflame-studio:3000/oauth/register", "", "must use https"},
+		{"http_non_loopback_https_issuer_cluster_name", "http://console:3000/oauth/register", "", "must use https"},
 		{"http_name_resolving_loopback_is_not_trusted", "http://localhost.example.com/register", "", "http is accepted only for a loopback host"},
 		{"relative", "/oauth2/register", "", "absolute URL with a host"},
 		{"no_scheme", "register.example.com/register", "", "absolute URL with a host"},
@@ -786,12 +786,12 @@ func TestRegistrationEndpointConfig(t *testing.T) {
 	// accepted beside an http issuer and refused beside an https one.
 	t.Run("validate_uses_issuer_scheme", func(t *testing.T) {
 		cfg := baseValidConfig(t)
-		cfg.Token.Issuer = "http://highflame-authn:8051"
-		cfg.Token.RegistrationEndpoint = "http://highflame-studio:3000/oauth/register"
+		cfg.Token.Issuer = "http://zeroid:8051"
+		cfg.Token.RegistrationEndpoint = "http://console:3000/oauth/register"
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate must accept an http registration endpoint beside an http issuer: %v", err)
 		}
-		cfg.Token.Issuer = "https://highflame-authn:8051"
+		cfg.Token.Issuer = "https://zeroid:8051"
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "token.registration_endpoint") {
 			t.Fatalf("Validate must refuse an http registration endpoint beside an https issuer, got: %v", err)
 		}
@@ -867,7 +867,7 @@ func TestRefreshReuseGraceConfig(t *testing.T) {
 	})
 }
 
-// ADR 0042 D4: trusted issuers come from one source. A deployment that reads
+// Trusted issuers come from one source. A deployment that reads
 // account rows must not also carry static entries, which would be a second,
 // unaudited trust list.
 func TestConfig_FederationIssuerStore(t *testing.T) {
@@ -987,7 +987,7 @@ func TestForwardedHeadersMode(t *testing.T) {
 }
 
 // A static issuer mapping a reserved key still loads, with one warning per
-// key naming the issuer and the key: the grant ignores it (ADR 0044 D16).
+// key naming the issuer and the key: the grant ignores it.
 func TestConfig_StaticIssuerReservedMappingWarns(t *testing.T) {
 	var buf bytes.Buffer
 	orig := log.Logger

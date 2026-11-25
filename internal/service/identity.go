@@ -489,7 +489,7 @@ type DiscoveredIdentityRequest struct {
 	TrustLevel   domain.TrustLevel
 	OwnerUserID  string // optional
 	// OwnerResolved attests that the connector DEFINITIVELY computed owner
-	// attribution this sync (CAP-DSC-004): it verified the IdP-asserted owner
+	// attribution this sync: it verified the IdP-asserted owner
 	// against the tenant human directory and OwnerUserID/TrustLevel carry the
 	// result — including an empty owner (verification failed or the agent is
 	// ownerless). Only with this attestation does a reconcile apply owner and
@@ -545,7 +545,7 @@ func (s *IdentityService) UpsertDiscoveredIdentity(ctx context.Context, req Disc
 		return nil, false, errFirstContactExternalIDReserved
 	}
 	// The discovery path can only carry trust it can EARN: unverified or
-	// verified_third_party (directory verification, CAP-DSC-004). first_party
+	// verified_third_party (directory verification). first_party
 	// is reserved for natively-registered identities, and anything else is a
 	// caller bug that must not be written — this guard is the single entry
 	// point for both the create and reconcile paths, so the attested
@@ -642,7 +642,7 @@ func (s *IdentityService) inventoryByExternalID(ctx context.Context, req Discove
 }
 
 // applyDiscoveredOwnerAttribution applies a connector's verified owner
-// attribution (CAP-DSC-004) to a still-discovered row. Declarative on
+// attribution to a still-discovered row. Declarative on
 // purpose: with the OwnerResolved attestation, OwnerUserID and TrustLevel are
 // the definitive result of directory verification — including an empty owner
 // (verification failed, or the agent is ownerless) — and an empty trust level
@@ -668,7 +668,7 @@ func applyDiscoveredOwnerAttribution(identity *domain.Identity, req DiscoveredId
 // non-empty inputs overwrite, so a connector that omits a field leaves the
 // curated value intact. Returns (identity, created=false).
 //
-// One deliberate exception (CAP-DSC-004): when the request carries the
+// One deliberate exception: when the request carries the
 // OwnerResolved attestation AND the row is still in the `discovered` state,
 // owner_user_id and trust_level are applied DECLARATIVELY — including clearing
 // them — because pre-adoption those fields are connector-owned (the verified
@@ -738,8 +738,8 @@ func (s *IdentityService) reconcileDiscovered(ctx context.Context, identity *dom
 	keepFirstContactProvenance(identity, prevLabels, prevMetadata)
 	keepStandingAdoptionMarkers(identity, prevLabels, prevMetadata)
 	// Re-type a still-discovered row from the connector's current classification
-	// (e.g. application → mcp_server once it's recognised as an MCP server,
-	// CAP-DSC-003). domain.CanRetypeDiscovered leaves adopted rows untouched and
+	// (e.g. application → mcp_server once it's recognised as an MCP server).
+	// domain.CanRetypeDiscovered leaves adopted rows untouched and
 	// validates the incoming (identity_type, sub_type) pair. Adopt both from the
 	// connector so the pair stays consistent — e.g. a row that was ingested as
 	// agent (defaulted to a tool_agent sub_type, invalid for mcp_server) has its
@@ -902,7 +902,7 @@ func (s *IdentityService) ReleaseDiscoveredSource(ctx context.Context, accountID
 //
 // Called when a connector is DELETED: the agents it found are inventory
 // belonging to that connection, so removing the connection removes them
-// (highflame-discovery#65) — no stale agents left visible, and nothing left for
+// — no stale agents left visible, and nothing left for
 // a user to act on.
 //
 // Only `discovered` rows. Anything a human has acted on — `pending` (an owner
@@ -992,7 +992,7 @@ func (s *IdentityService) GetIdentityByExternalID(ctx context.Context, externalI
 
 // GetIdentityByWIMSEURI resolves an identity by its WIMSE/SPIFFE URI within a
 // tenant. Used by the /identities/by-wimse lookup endpoint that downstream
-// gateways (firehog) hit to confirm a JWT's sub claim still resolves to an
+// gateways hit to confirm a JWT's sub claim still resolves to an
 // active identity row before forwarding the request.
 //
 // Tenant isolation is enforced at the store layer: the same URI in a
@@ -1559,7 +1559,7 @@ func (s *IdentityService) SweepExpiredIdentities(ctx context.Context) (int, erro
 // DELETE /agents/registry/{id} are SOFT deletes (DeactivateIdentity /
 // DeactivateAgent) per the platform "never hard DELETE" convention, which also
 // preserves the audit trail. A hard delete additionally trips the
-// non-cascading service_keys FK on existing deployments (authn#109); that is
+// non-cascading service_keys FK on existing deployments; that is
 // safe in the rollback path only because it runs before any service key is
 // persisted (CreateKey writes its row last).
 //
@@ -1604,7 +1604,7 @@ func (s *IdentityService) PurgeIdentity(ctx context.Context, id, accountID, proj
 // signal on a fresh transition. This is what DELETE /identities/{id} and
 // DELETE /agents/registry/{id} resolve to — the identity row is RETAINED
 // (preserving the audit trail) and no hard DELETE is issued, so the
-// non-cascading service_keys FK (authn#109) is never touched.
+// non-cascading service_keys FK is never touched.
 //
 // Idempotent: an already-deactivated identity is a no-op success. Without this
 // short-circuit a repeated DELETE would hit UpdateIdentity's status-transition
@@ -1669,10 +1669,10 @@ type OffboardResult struct {
 	CredentialsRevoked int64
 }
 
-// OffboardOwner is the human-offboarding composition (INV-IDN-010 / ADR 0028
-// D5): when the org IdP deactivates a person, every agent identity they own in
-// the account — across all projects — is deactivated, and the owner-scoped
-// credential cascade sweeps anything delegation reached beyond them.
+// OffboardOwner is the human-offboarding composition: when the org IdP
+// deactivates a person, every agent identity they own in the account — across
+// all projects — is deactivated, and the owner-scoped credential cascade sweeps
+// anything delegation reached beyond them.
 //
 // Order matters and both halves are required:
 //
@@ -1693,7 +1693,7 @@ type OffboardResult struct {
 // already-revoked credentials emit no duplicate revocation events).
 //
 // Re-activation is deliberately NOT offered here: a SCIM active:true after an
-// offboarding restores org membership only (ADR 0028 D6); agents are never
+// offboarding restores org membership only; agents are never
 // silently resurrected.
 func (s *IdentityService) OffboardOwner(ctx context.Context, ownerUserID, accountID, reason string) (*OffboardResult, error) {
 	// Offboarding is the deployer's, keyed by a person: a request

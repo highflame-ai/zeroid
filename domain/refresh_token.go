@@ -103,7 +103,7 @@ type RefreshToken struct {
 	// flow, or any pre-migration family): rotation is unchanged, no `aud`.
 	Audience string `bun:"audience,nullzero" json:"audience,omitempty"`
 	// Resources is the RFC 8707 resource CEILING this refresh family was issued
-	// for (CAP-IDN-027). Copied verbatim onto every successor row on rotation
+	// for. Copied verbatim onto every successor row on rotation
 	// and read back when the refresh grant mints a new access token, so the
 	// binding survives rotation instead of silently vanishing — which is what
 	// made suppressing the refresh token necessary before this existed.
@@ -132,6 +132,6 @@ type RefreshToken struct {
 	// refuses it outright; set nil, never []string{}.
 	//
 	// TEXT[] though the ceiling is single-valued today: cardinality is a
-	// constant, not a shape (ADR 0037 D2).
+	// constant, not a shape.
 	Resources []string `bun:"resource,array,nullzero" json:"resource,omitempty"`
 }

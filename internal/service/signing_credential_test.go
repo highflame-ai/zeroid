@@ -80,7 +80,7 @@ func TestMintKID(t *testing.T) {
 	seen := make(map[string]struct{}, n)
 
 	for i := 0; i < n; i++ {
-		k, err := mintKID("receipt", "highflame-shield")
+		k, err := mintKID("receipt", "policy-engine")
 		if err != nil {
 			t.Fatalf("mintKID error: %v", err)
 		}
@@ -93,8 +93,8 @@ func TestMintKID(t *testing.T) {
 	}
 
 	// Format: <purpose>-<workload>-<16 hex>.
-	k, _ := mintKID("receipt", "highflame-shield")
-	if !strings.HasPrefix(k, "receipt-highflame-shield-") {
+	k, _ := mintKID("receipt", "policy-engine")
+	if !strings.HasPrefix(k, "receipt-policy-engine-") {
 		t.Fatalf("unexpected kid prefix: %q", k)
 	}
 
@@ -122,7 +122,7 @@ func TestAttest_RejectsInvalidInput(t *testing.T) {
 
 	valid := func() AttestRequest {
 		return AttestRequest{
-			Workload:  "highflame-shield",
+			Workload:  "policy-engine",
 			PublicKey: strings.Repeat("A", 43), // 32 bytes base64url ≈ 43 chars
 			Algorithm: domain.SigningAlgorithmEdDSA,
 			Purpose:   "receipt", // in the test service's AllowedPurposes

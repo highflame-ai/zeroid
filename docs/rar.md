@@ -259,5 +259,4 @@ RFC 9396 normative MUSTs are pinned by [`tests/integration/rar_compliance_test.g
 ## Related
 
 - ZeroID CIBA reference: README → [Pattern 6: Agent pauses for out-of-band user approval](../README.md#pattern-6-agent-pauses-for-out-of-band-user-approval-ciba)
-- Highflame ADR 0002 — AARM STEP_UP via CIBA + RAR: [`highflame-architecture/adrs/0002-aarm-stepup-defer-protocol.md`](https://github.com/highflame-ai/highflame-architecture/blob/main/adrs/0002-aarm-stepup-defer-protocol.md)
 - RFC 9396 — Rich Authorization Requests: https://datatracker.ietf.org/doc/html/rfc9396

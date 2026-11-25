@@ -13,7 +13,7 @@ import (
 )
 
 // ExternalIssuerRepository stores per-account trusted issuers and their
-// credential bindings (ADR 0042 D4, D6). The grant paths read it on every
+// credential bindings. The grant paths read it on every
 // federated mint, by issuer and by (issuer row, subject key); both are
 // indexed lookups.
 type ExternalIssuerRepository struct {

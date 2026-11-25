@@ -1,6 +1,5 @@
 -- 048_delegation_profile.up.sql
--- Human-rooted delegation, phase 1 (highflame-architecture#359; zeroid work is
--- tracked in highflame-authn#223).
+-- Human-rooted delegation, phase 1.
 --
 -- Two things land here:
 --
